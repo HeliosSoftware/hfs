@@ -321,11 +321,11 @@ mod sof_conformance_tests {
         //
         // 124 -> 132: the upstream sync added `row_index.json` (9 fixtures for
         // the `%rowIndex` environment variable) and the in-DB compiler now
-        // supports `%rowIndex` for SQLite. 8 of the 9 pass; the 9th
-        // (`%rowIndex in unionAll inside forEach`) still hits the pre-existing
-        // "unionAll nested inside another select" gap, like the nested-`repeat`
-        // fixtures it shares the failure floor with.
-        const PASS_FLOOR: usize = 132;
+        // supports `%rowIndex` for SQLite.
+        //
+        // 132 -> 144: nested/sibling `repeat` and `unionAll` nested inside
+        // another `select` now compile, so the whole corpus passes.
+        const PASS_FLOOR: usize = 144;
         assert!(
             passed >= PASS_FLOOR,
             "regression: only {passed} fixtures pass (floor: {PASS_FLOOR}). \

@@ -2319,3 +2319,170 @@ async fn bare_validate_code_prefers_owning_package_over_republished_copy_pg() {
     .unwrap();
     assert!(!pinned.result, "version=4.0.1 pins the truncated copy");
 }
+
+// ---------------------------------------------------------------------------
+// Compose filter ops used by VCL translation (compose_ops_*)
+// ---------------------------------------------------------------------------
+
+/// Imports a small hierarchy `ROOT > {A > A1, B}` with a `color` property
+/// (A=red, A1=blue, B=green, ROOT unset) and returns the CodeSystem URL.
+async fn compose_ops_setup(backend: &PostgresTerminologyBackend, base: &str, uid: &str) -> String {
+    let cs = format!("{base}cs");
+    let prop = |v: &str| serde_json::json!([{"code": "color", "valueString": v}]);
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
+            "url": cs, "name": "ComposeOps", "status": "active",
+            "content": "complete", "hierarchyMeaning": "is-a",
+            "property": [{"code": "color", "type": "string"}],
+            "concept": [{
+                "code": "ROOT", "display": "Root",
+                "concept": [
+                    {"code": "A", "display": "Alpha", "property": prop("red"),
+                     "concept": [{"code": "A1", "display": "Alpha one", "property": prop("blue")}]},
+                    {"code": "B", "display": "Beta", "property": prop("green")}
+                ]
+            }]
+        }}]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+    cs
+}
+
+async fn compose_ops_expand(
+    backend: &PostgresTerminologyBackend,
+    compose: serde_json::Value,
+    count: Option<u32>,
+) -> Vec<String> {
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                value_set: Some(serde_json::json!({
+                    "resourceType": "ValueSet", "status": "active", "compose": compose
+                })),
+                count,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut codes: Vec<String> = resp.contains.iter().map(|c| c.code.clone()).collect();
+    codes.sort();
+    codes
+}
+
+#[tokio::test]
+async fn compose_ops_is_not_a_excludes_closure_of_root() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-nota");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({"include": [{"system": cs,
+            "filter": [{"property": "concept", "op": "is-not-a", "value": "A"}]}]}),
+        None,
+    )
+    .await;
+    assert_eq!(codes, vec!["B", "ROOT"]);
+}
+
+#[tokio::test]
+async fn compose_ops_generalizes_returns_self_and_ancestors() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-gen");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({"include": [{"system": cs,
+            "filter": [{"property": "concept", "op": "generalizes", "value": "A1"}]}]}),
+        None,
+    )
+    .await;
+    assert_eq!(codes, vec!["A", "A1", "ROOT"]);
+}
+
+#[tokio::test]
+async fn compose_ops_in_multi_value_is_union() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-in");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({"include": [{"system": cs,
+            "filter": [{"property": "color", "op": "in", "value": "red,green"}]}]}),
+        None,
+    )
+    .await;
+    assert_eq!(codes, vec!["A", "B"]);
+}
+
+#[tokio::test]
+async fn compose_ops_not_in_multi_value_excludes_all_listed() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-notin");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({"include": [{"system": cs,
+            "filter": [{"property": "color", "op": "not-in", "value": "red,green"}]}]}),
+        None,
+    )
+    .await;
+    // A1 is blue; ROOT has no color and therefore passes.
+    assert_eq!(codes, vec!["A1", "ROOT"]);
+}
+
+#[tokio::test]
+async fn compose_ops_is_a_with_exclude_filter_and_count() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-exc");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({
+            "include": [{"system": cs,
+                "filter": [{"property": "concept", "op": "is-a", "value": "ROOT"}]}],
+            "exclude": [{"system": cs,
+                "filter": [{"property": "concept", "op": "is-a", "value": "A"}]}]
+        }),
+        Some(10),
+    )
+    .await;
+    assert_eq!(codes, vec!["B", "ROOT"]);
+}
+
+#[tokio::test]
+async fn compose_ops_enumerated_include_with_whole_system_exclude_and_count() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-fast");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    // Whole-system and filter excludes must not be dropped by the paged
+    // enumerated-concept fast path.
+    let whole = compose_ops_expand(
+        &backend,
+        serde_json::json!({
+            "include": [{"system": cs, "concept": [{"code": "A"}, {"code": "B"}]}],
+            "exclude": [{"system": cs}]
+        }),
+        Some(10),
+    )
+    .await;
+    assert!(whole.is_empty(), "whole-system exclude ignored: {whole:?}");
+
+    let filtered = compose_ops_expand(
+        &backend,
+        serde_json::json!({
+            "include": [{"system": cs, "concept": [{"code": "A"}, {"code": "B"}]}],
+            "exclude": [{"system": cs,
+                "filter": [{"property": "concept", "op": "is-a", "value": "A"}]}]
+        }),
+        Some(10),
+    )
+    .await;
+    assert_eq!(filtered, vec!["B"]);
+}

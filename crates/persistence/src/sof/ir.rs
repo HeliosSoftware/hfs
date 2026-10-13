@@ -230,6 +230,17 @@ pub enum SqlExpr {
         chain_sql: String,
         /// Alias of the chain's innermost iteration row.
         leaf_alias: String,
+        /// Optional `WHERE` criterion over the chain's innermost element
+        /// (`<chain>.where(crit)[N]`). Only used with `offset`.
+        filter: Option<Box<SqlExpr>>,
+        /// When set, the array holds ONLY the element at this position of the
+        /// (filtered) flattened chain — `[]` when absent. A trailing-`[N]`
+        /// `forEach` with a nested `select` unnests it like any other
+        /// iteration, so nested clauses resolve against that one element.
+        offset: Option<i64>,
+        /// Focus the chain navigates from (`r.data`, `fe.value`, ...), used to
+        /// place this source in the iteration scope chain.
+        scope_root: String,
     },
 
     /// FHIRPath `%rowIndex` environment variable — the 0-based position of the
@@ -522,11 +533,20 @@ pub enum PlanNode {
     Union(Vec<PlanNode>),
 
     /// Recursive-CTE descent — used for SoF `repeat:` clauses.
+    ///
+    /// Placement contract: a `Recurse` may sit on a `Scan`, a `Filter`, a
+    /// `LateralUnnest` or another `Recurse`, i.e. anywhere in the linear
+    /// chain below a `Project`. Each node names its enclosing scope by alias
+    /// (`r.data`, `fe.value`, `rec_N.node`), and `seed_root` is that alias for
+    /// this descent. Emitters that give a descent a seed-row key (`pkey`) only
+    /// need it when `seed_root` is not the resource itself (`r.data`).
     Recurse {
         /// Plan producing the seed rows.
         parent: Box<PlanNode>,
-        /// Seed projection (currently unused; emitter walks `parent`).
-        seed: SqlExpr,
+        /// Alias of the scope the step paths are evaluated against for the
+        /// first hop: `r.data` for the resource, `fe.value` for a `forEach`
+        /// element, `rec_N.node` for the node of an enclosing `repeat`.
+        seed_root: String,
         /// Paths walked on each iteration.
         step_paths: Vec<JsonPath>,
         /// CTE alias also used as the `node` column alias.
@@ -564,3 +584,69 @@ pub struct SubQuery {
 
 /// Boxed dialect handle used by emission helpers.
 pub type DialectRef = Arc<dyn super::dialect::Dialect>;
+
+/// The alias (and whether it is an indexed `[N]` step) of the nearest
+/// `forEachOrNull` that the scope `root` (a focus such as `fe.value` or
+/// `rec_0.node`) depends on, walking the chain of
+/// enclosing iteration steps; `None` when the scope is the resource or has no
+/// `forEachOrNull` ancestor.
+pub(super) fn nearest_left_scope(parent: &PlanNode, root: &str) -> Option<(String, bool)> {
+    let mut alias = root.rsplit_once('.').map(|(a, _)| a.to_string())?;
+    if alias == "r" {
+        return None;
+    }
+    loop {
+        let mut cur = parent;
+        let step = loop {
+            match cur {
+                PlanNode::LateralUnnest {
+                    out_alias, parent, ..
+                } if *out_alias == alias => break Some(cur),
+                PlanNode::Recurse {
+                    out_alias, parent, ..
+                } if *out_alias == alias => break Some(cur),
+                PlanNode::LateralUnnest { parent: p, .. }
+                | PlanNode::Recurse { parent: p, .. }
+                | PlanNode::Filter { parent: p, .. } => cur = p,
+                _ => break None,
+            }
+        }?;
+        match step {
+            PlanNode::LateralUnnest {
+                left_join: true,
+                flat_index,
+                ..
+            } => return Some((alias, flat_index.is_some())),
+            PlanNode::LateralUnnest {
+                source: SqlExpr::JsonPath { root, .. },
+                ..
+            }
+            | PlanNode::LateralUnnest {
+                source:
+                    SqlExpr::ChainArray {
+                        scope_root: root, ..
+                    },
+                ..
+            }
+            | PlanNode::Recurse {
+                seed_root: root, ..
+            } => {
+                alias = root.rsplit_once('.').map(|(a, _)| a.to_string())?;
+                if alias == "r" {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The focus an unnest source navigates from: the root of a plain path, or the
+/// scope a computed [`SqlExpr::ChainArray`] hangs off.
+pub(super) fn unnest_source_root(source: &SqlExpr) -> Option<&str> {
+    match source {
+        SqlExpr::JsonPath { root, .. } => Some(root),
+        SqlExpr::ChainArray { scope_root, .. } => Some(scope_root),
+        _ => None,
+    }
+}

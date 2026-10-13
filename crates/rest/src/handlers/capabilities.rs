@@ -186,6 +186,7 @@ where
                 supports_contained,
                 &modifier_map,
                 &revinclude_by_target,
+                version,
             )
         })
         .collect();
@@ -410,6 +411,7 @@ fn build_resource_capability(
     supports_contained: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
     revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+    version: FhirVersion,
 ) -> serde_json::Value {
     let interactions = if resource_type == "AuditEvent" {
         serde_json::json!([
@@ -440,7 +442,7 @@ fn build_resource_capability(
         "versioning": "versioned",
         "readHistory": true,
         "conditionalRead": "full-support",
-        "searchParam": build_search_params(resource_type, registry, supports_contained, modifier_map)
+        "searchParam": build_search_params(resource_type, registry, supports_contained, modifier_map, version)
     });
 
     if resource_type != "AuditEvent" {
@@ -502,8 +504,9 @@ fn build_search_params(
     registry: &SearchParameterRegistry,
     supports_contained: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
+    version: FhirVersion,
 ) -> Vec<serde_json::Value> {
-    let mut params = build_common_search_params(supports_contained);
+    let mut params = build_common_search_params(supports_contained, version);
     let mut seen: std::collections::HashSet<String> = params
         .iter()
         .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
@@ -609,8 +612,13 @@ fn build_search_includes(
 ///
 /// `_contained` / `_containedType` are only included when `supports_contained`
 /// is set (the backend can evaluate contained search). `_list` is always
-/// advertised (resolved application-side on every backend).
-fn build_common_search_params(supports_contained: bool) -> Vec<serde_json::Value> {
+/// advertised (resolved application-side on every backend). `_in` (List/Group
+/// membership) exists only in R5 and later, so it is advertised only there; it
+/// is likewise resolved application-side.
+fn build_common_search_params(
+    supports_contained: bool,
+    version: FhirVersion,
+) -> Vec<serde_json::Value> {
     let mut params = vec![
         serde_json::json!({
             "name": "_id",
@@ -653,6 +661,14 @@ fn build_common_search_params(supports_contained: bool) -> Vec<serde_json::Value
             "documentation": "Resources referenced by the given List resource"
         }),
     ];
+
+    if matches!(version.as_mime_param(), "5.0" | "6.0") {
+        params.push(serde_json::json!({
+            "name": "_in",
+            "type": "reference",
+            "documentation": "Resources that are active members of the given List or Group"
+        }));
+    }
 
     if supports_contained {
         params.push(serde_json::json!({
@@ -775,18 +791,40 @@ mod tests {
 
     #[test]
     fn common_params_always_advertise_list() {
-        let names = param_names(&build_common_search_params(false));
+        let names = param_names(&build_common_search_params(
+            false,
+            FhirVersion::default_enabled(),
+        ));
         assert!(names.contains(&"_list".to_string()));
         assert!(names.contains(&"_text".to_string()));
     }
 
     #[test]
+    fn membership_param_advertised_only_on_r5_and_later() {
+        for version in FhirVersion::enabled_versions() {
+            let names = param_names(&build_common_search_params(false, *version));
+            let expected = matches!(version.as_mime_param(), "5.0" | "6.0");
+            assert_eq!(
+                names.contains(&"_in".to_string()),
+                expected,
+                "_in advertisement for {version:?}"
+            );
+        }
+    }
+
+    #[test]
     fn contained_params_gated_on_capability() {
-        let without = param_names(&build_common_search_params(false));
+        let without = param_names(&build_common_search_params(
+            false,
+            FhirVersion::default_enabled(),
+        ));
         assert!(!without.contains(&"_contained".to_string()));
         assert!(!without.contains(&"_containedType".to_string()));
 
-        let with = param_names(&build_common_search_params(true));
+        let with = param_names(&build_common_search_params(
+            true,
+            FhirVersion::default_enabled(),
+        ));
         assert!(with.contains(&"_contained".to_string()));
         assert!(with.contains(&"_containedType".to_string()));
     }
@@ -867,7 +905,13 @@ mod tests {
         let mut modifier_map: HashMap<SearchParamType, Vec<&'static str>> = HashMap::new();
         modifier_map.insert(SearchParamType::String, vec!["exact", "contains"]);
 
-        let params = build_search_params("Patient", &reg, false, &modifier_map);
+        let params = build_search_params(
+            "Patient",
+            &reg,
+            false,
+            &modifier_map,
+            FhirVersion::default_enabled(),
+        );
         let name = params
             .iter()
             .find(|p| p["name"] == "name")

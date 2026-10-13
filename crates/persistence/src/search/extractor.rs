@@ -132,12 +132,27 @@ pub struct MissingParameter {
     pub name: String,
 }
 
+/// A parameter that carries absence metadata and produced at least one value.
+///
+/// A backend that can drop a value while building its index rows (an
+/// unparseable date, say) checks these against the rows it actually writes:
+/// a parameter whose values all dropped out is missing too (#2000).
+#[derive(Debug)]
+pub struct PresentParameter {
+    /// Search parameter code.
+    pub name: String,
+    /// The parameter's declared type, which decides what a presence check reads.
+    pub param_type: SearchParamType,
+}
+
 /// Values and known absences, without treating extraction failures as missing.
 pub struct ExtractionWithMissing {
     /// Successfully extracted values.
     pub values: Vec<ExtractedValue>,
     /// Successfully evaluated parameters without values.
     pub missing: Vec<MissingParameter>,
+    /// Parameters that support absence metadata and produced values.
+    pub present: Vec<PresentParameter>,
     /// Extraction failures, retained for reindex reporting.
     pub failures: Vec<String>,
 }
@@ -316,6 +331,7 @@ impl SearchParameterExtractor {
         let mut extraction = ExtractionWithMissing {
             values: Vec::new(),
             missing: Vec::new(),
+            present: Vec::new(),
             failures: Vec::new(),
         };
         extraction.values =
@@ -390,13 +406,12 @@ impl SearchParameterExtractor {
         for param in &params {
             match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
                 Ok(values) => {
-                    if values.is_empty() {
-                        self.record_missing(
-                            resource_type,
-                            param,
-                            extraction.as_deref_mut().map(|result| &mut result.missing),
-                        );
-                    }
+                    self.record_absence(
+                        resource_type,
+                        param,
+                        !values.is_empty(),
+                        extraction.as_deref_mut(),
+                    );
                     results.extend(values);
                 }
                 Err(e) => {
@@ -431,13 +446,12 @@ impl SearchParameterExtractor {
                 }
                 match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
                     Ok(values) => {
-                        if values.is_empty() {
-                            self.record_missing(
-                                resource_type,
-                                param,
-                                extraction.as_deref_mut().map(|result| &mut result.missing),
-                            );
-                        }
+                        self.record_absence(
+                            resource_type,
+                            param,
+                            !values.is_empty(),
+                            extraction.as_deref_mut(),
+                        );
                         results.extend(values);
                     }
                     Err(e) => {
@@ -457,19 +471,27 @@ impl SearchParameterExtractor {
         Ok(results)
     }
 
-    fn record_missing(
+    fn record_absence(
         &self,
         resource_type: &str,
         param: &SearchParameterDefinition,
-        missing: Option<&mut Vec<MissingParameter>>,
+        has_values: bool,
+        extraction: Option<&mut ExtractionWithMissing>,
     ) {
-        let Some(missing) = missing else { return };
+        let Some(extraction) = extraction else { return };
         if !self.supports_missing(resource_type, param) {
             return;
         }
-        missing.push(MissingParameter {
-            name: param.code.clone(),
-        });
+        if has_values {
+            extraction.present.push(PresentParameter {
+                name: param.code.clone(),
+                param_type: param.param_type,
+            });
+        } else {
+            extraction.missing.push(MissingParameter {
+                name: param.code.clone(),
+            });
+        }
     }
 
     /// Writer and query planner must agree which parameters carry absence metadata.
@@ -1037,9 +1059,10 @@ impl SearchParameterExtractor {
 /// Indexing it writes one reference row per resource pointing at the resource
 /// itself, so `?_in=42` would match `Patient/42` through the ordinary bare-id
 /// reference branch and answer a membership question with an identity test,
-/// while every reindex adds a junk row per resource. Membership resolution is
-/// not implemented (#638); `helios-rest` rejects `_in` outright rather than
-/// answer it wrongly.
+/// while every reindex adds a junk row per resource. Membership is resolved
+/// application-side instead (#638): the `_in` resolver reads the referenced
+/// List or Group and rewrites the parameter into an `_id` filter, so the
+/// spec expression stays a placeholder and `_in` stays out of the index.
 ///
 /// This list is deliberately about *expressions that lie*, not about
 /// `_`-prefixed parameters in general: `_id`, `_lastUpdated` and the `meta`
@@ -1548,6 +1571,17 @@ mod tests {
                 .filter(|value| value.param_name == "missing-test-present")
                 .count(),
             2
+        );
+        let present: Vec<_> = extraction
+            .present
+            .iter()
+            .filter(|parameter| parameter.name.starts_with("missing-test-"))
+            .map(|parameter| (parameter.name.as_str(), parameter.param_type))
+            .collect();
+        assert_eq!(
+            present,
+            [("missing-test-present", SearchParamType::String)],
+            "a parameter with values is reported once, with its declared type"
         );
         assert_eq!(
             extractor.extract(&resource, "Patient").unwrap().len(),
