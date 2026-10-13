@@ -255,16 +255,6 @@ fn plan_alternative(
             "no columns found in select clauses".to_string(),
         ));
     }
-    // The extra filters come from trailing-`[N]` forEach lowering and are
-    // correlated against the resource row; the recursive emitter cannot carry
-    // them.
-    if !filters.is_empty() && steps.iter().any(|s| matches!(s, IterStep::Recurse(_))) {
-        return Err(SofError::Uncompilable {
-            reason: "select.repeat combined with a sibling indexed forEach is not yet supported"
-                .to_string(),
-        });
-    }
-
     let plan = apply_filters(apply_steps(parent_plan.clone(), steps), filters);
     Ok(PlanNode::Project {
         parent: Box::new(plan),
@@ -387,6 +377,7 @@ fn read_clause_columns_and_iter(
         // projects answer rows). Each nested step is hoisted onto the plan
         // after this descent, in document order, and resolves against the
         // node focus.
+        let mut extra_filters: Vec<SqlExpr> = Vec::new();
         let mut steps: Vec<IterStep> = vec![IterStep::Recurse(RecurseInfo {
             step_paths,
             seed_root: parent_focus.to_string(),
@@ -396,12 +387,7 @@ fn read_clause_columns_and_iter(
             for sub in nested {
                 let sub_parts =
                     read_clause_columns_and_iter(sub, &focus, env, alias_seq, dialect, target)?;
-                if !sub_parts.extra_filters.is_empty() {
-                    return Err(SofError::Uncompilable {
-                        reason: "select.repeat with a nested indexed forEach is not yet supported"
-                            .to_string(),
-                    });
-                }
+                extra_filters.extend(sub_parts.extra_filters);
                 steps.extend(sub_parts.steps);
                 columns.extend(sub_parts.columns);
             }
@@ -409,7 +395,7 @@ fn read_clause_columns_and_iter(
         return Ok(ClauseParts {
             columns,
             steps,
-            extra_filters: Vec::new(),
+            extra_filters,
         });
     }
 

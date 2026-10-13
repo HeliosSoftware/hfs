@@ -1071,24 +1071,39 @@ mod tests {
     }
 
     #[test]
-    fn test_indexed_foreach_combined_with_repeat_is_still_rejected() {
-        // `sof-cli` evaluates both shapes, but the trailing-`[N]` forEach
-        // lowers to a filter correlated against the resource row, which the
-        // recursive emitter cannot carry (known gap, #1945).
+    fn test_indexed_foreach_combined_with_repeat_compiles() {
+        // A trailing-`[N]` forEach next to / under a `repeat` lowers to a
+        // filter the keyed-CTE emitter applies in the main query.
         let sibling = questionnaire_view(json!([
             {"forEach": "item[0]", "column": [{"path": "linkId", "name": "first"}]},
             {"repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
         ]));
-        let err = compile(sibling).unwrap_err().to_string();
-        assert!(err.contains("sibling indexed forEach"), "{err}");
-
         let nested = questionnaire_view(json!([
             {"repeat": ["item"], "select": [
                 {"forEach": "item[0]", "column": [{"path": "linkId", "name": "l"}]}
             ]}
         ]));
-        let err = compile(nested).unwrap_err().to_string();
-        assert!(err.contains("nested indexed forEach"), "{err}");
+        for view in [sibling, nested] {
+            let (sqlite, postgres) = compile_both(view);
+            for q in [&sqlite, &postgres] {
+                assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_for_each_or_null_keeps_the_null_row_below_a_repeat() {
+        let view = questionnaire_view(json!([
+            {"forEachOrNull": "item", "select": [
+                {"column": [{"path": "linkId", "name": "top"}]},
+                {"repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert!(q.sql.contains("LEFT JOIN rec_1 ON"), "{}", q.sql);
+            assert!(q.sql.contains("rec_1.rid IS NOT NULL OR"), "{}", q.sql);
+        }
     }
 
     #[test]

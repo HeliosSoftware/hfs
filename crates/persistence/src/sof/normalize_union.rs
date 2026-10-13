@@ -132,6 +132,15 @@ fn clause_alternatives(clause: &Value) -> Result<Vec<Value>, SofError> {
                 sel.push(branch.clone());
             }
             let mut alt = base.clone();
+            // An empty `forEachOrNull` yields ONE null-scope row, not one per
+            // union alternative: keep the null row in the first alternative
+            // only and iterate the rest with plain `forEach` (identical for a
+            // non-empty iteration).
+            if !out.is_empty()
+                && let Some(path) = alt.remove("forEachOrNull")
+            {
+                alt.insert("forEach".to_string(), path);
+            }
             if !sel.is_empty() {
                 alt.insert("select".to_string(), Value::Array(sel));
             }

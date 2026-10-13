@@ -17,6 +17,7 @@ use super::dialect::{Dialect, pg_key_literal, pg_path_array_literal, sqlite_json
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, Column, CompartmentFilter, JsonPath, JsonType, LitValue,
     PathStep, PlanNode, ResourceFilter, RowIndexScope, SqlExpr, SqlType, UnaryOp,
+    nearest_left_scope,
 };
 
 /// Column the recursive `repeat` CTE projects to order the flattened traversal
@@ -680,6 +681,52 @@ fn scope_key(
     }
 }
 
+/// For a step that is not itself a `forEachOrNull` but sits below one: the SQL
+/// predicates "this step matched" and "its nearest `forEachOrNull` ancestor
+/// missed". Indexed (`[N]`) steps are not covered.
+fn optional_scope_guard(
+    i: usize,
+    steps: &[ScopeStep<'_>],
+    is_sqlite: bool,
+) -> Option<(String, String)> {
+    let matched = match steps[i].node {
+        PlanNode::Recurse { .. } => format!("{}.rid IS NOT NULL", steps[i].alias),
+        PlanNode::LateralUnnest {
+            left_join: false,
+            flat_index: None,
+            ..
+        } => format!("{} IS NOT NULL", miss_signal(steps[i].alias, is_sqlite)),
+        _ => return None,
+    };
+    let mut p = steps[i].parent;
+    while let Some(j) = p {
+        if let PlanNode::LateralUnnest {
+            left_join: true,
+            flat_index,
+            ..
+        } = steps[j].node
+        {
+            let missed = if flat_index.is_some() {
+                format!("{}.value IS NULL", steps[j].alias)
+            } else {
+                format!("{} IS NULL", miss_signal(steps[j].alias, is_sqlite))
+            };
+            return Some((matched, missed));
+        }
+        p = steps[j].parent;
+    }
+    None
+}
+
+/// Column that is NULL exactly when a LEFT-joined unnest found no element.
+fn miss_signal(alias: &str, is_sqlite: bool) -> String {
+    if is_sqlite {
+        format!("{alias}.rowid")
+    } else {
+        format!("{alias}.ordinality")
+    }
+}
+
 /// FROM-clause join for one step of a general repeat plan: an unnest renders
 /// like [`walk_body`] does; a recursive CTE joins on `rid` plus its scope key.
 fn render_step_join(
@@ -908,19 +955,24 @@ fn emit_recurse_general(
         keyed.push(out_alias.clone());
     }
 
-    // Main query: the resource, then every step in chain order.
+    // Main query: the resource, then every step in chain order. A step below
+    // a `forEachOrNull` is LEFT-joined and kept when that ancestor missed
+    // (an empty `forEachOrNull` yields one null row whatever is nested in
+    // it); a present ancestor with no match still drops the row.
     let mut from_clause = format!("{table} r");
+    let mut where_parts = vec![seed_where];
     for i in 0..steps.len() {
         from_clause.push('\n');
-        from_clause.push_str(&render_step_join(
-            i,
-            &steps,
-            dialect,
-            &mut frame.next_param,
-        )?);
+        let mut join = render_step_join(i, &steps, dialect, &mut frame.next_param)?;
+        if let Some((matched, missed)) = optional_scope_guard(i, &steps, is_sqlite)
+            && let Some(rest) = join.strip_prefix("JOIN ")
+        {
+            join = format!("LEFT JOIN {rest}");
+            where_parts.push(format!("({matched} OR {missed})"));
+        }
+        from_clause.push_str(&join);
     }
 
-    let mut where_parts = vec![seed_where];
     for pred in &mid_filters {
         let mut ctx = ExprCtx::new(dialect, frame.next_param);
         ctx.keyed_repeats = keyed.clone();
@@ -1138,9 +1190,33 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
             flat_index,
         } => {
             walk_body(parent, dialect, frame)?;
+            let joins_before = frame.joins.len();
             push_lateral_unnest(
                 source, out_alias, left_join, on_filter, flat_index, dialect, frame,
-            )
+            )?;
+            // A plain `forEach` below an EMPTY `forEachOrNull` keeps the null
+            // row: LEFT-join it and accept "no match" only when the ancestor
+            // missed (a present ancestor with no match still drops the row).
+            if !*left_join
+                && flat_index.is_none()
+                && let SqlExpr::JsonPath { root, .. } = source
+                && let Some((left, left_flat)) = nearest_left_scope(parent, root)
+                && let Some(join) = frame.joins.get_mut(joins_before)
+                && let Some(rest) = join.sql.strip_prefix("JOIN ")
+            {
+                let is_sqlite = dialect.lateral_keyword().is_empty();
+                join.sql = format!("LEFT JOIN {rest}");
+                let missed = if left_flat {
+                    format!("{left}.value IS NULL")
+                } else {
+                    format!("{} IS NULL", miss_signal(&left, is_sqlite))
+                };
+                frame.predicates.push(format!(
+                    "({} IS NOT NULL OR {missed})",
+                    miss_signal(out_alias, is_sqlite)
+                ));
+            }
+            Ok(())
         }
         PlanNode::Project { .. } => Err(SofError::InvalidViewDefinition(
             "nested Project nodes are not supported by the current emitter".to_string(),

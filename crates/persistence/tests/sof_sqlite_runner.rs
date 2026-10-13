@@ -1295,75 +1295,15 @@ mod sqlite_runner_tests {
             "UnionAllInsideForEach",
             "UnionAllInsideRepeat",
             "SelectPlusUnionInForEach",
+            "IndexedForEachSiblingRepeat",
+            "RepeatNestedIndexedForEach",
+            "EmptyForEachOrNullNestedRepeat",
+            "EmptyForEachOrNullRepeatForEach",
+            "NonEmptyForEachOrNullLeafRepeat",
+            "EmptyForEachOrNullNestedUnionAll",
+            "EmptyForEachOrNullNestedForEach",
         ])
         .await;
-    }
-
-    /// Two shapes outside the conformance corpus where the in-DB runners
-    /// deliberately differ from the in-process engine (`sof-cli`), pinned so a
-    /// change in either direction is noticed (#1945):
-    ///
-    /// - an *empty* `forEachOrNull` with a nested `repeat`: `sof-cli` keeps one
-    ///   all-null row, the in-DB runners drop the resource's row (the inner
-    ///   join over the empty iteration yields nothing);
-    /// - an empty `forEachOrNull` with a nested `unionAll`: `sof-cli` emits one
-    ///   null row without evaluating the union, the in-DB runners emit one row
-    ///   per union branch (`'x'` and null).
-    #[cfg(feature = "R4")]
-    #[tokio::test]
-    async fn test_pr410_empty_for_each_or_null_nested_divergences() {
-        use super::sof_pr410_views as pr410;
-        let backend = make_backend().await;
-        let tenant = test_tenant();
-        for (resource_type, resource) in pr410::resources() {
-            backend
-                .create(&tenant, &resource_type, resource, FhirVersion::R4)
-                .await
-                .expect("seed PR #410 resource");
-        }
-        let runner = backend.sof_runner().expect("in-DB runner");
-        let repeat_view = json!({
-            "resourceType": "ViewDefinition", "resource": "CodeSystem", "status": "active",
-            "select": [
-                {"column": [{"path": "id", "name": "id"}]},
-                {"forEachOrNull": "concept.where(code='zzz')", "select": [
-                    {"column": [{"path": "code", "name": "top"}]},
-                    {"repeat": ["concept"], "column": [{"path": "code", "name": "desc"}]}
-                ]}
-            ]
-        });
-        // `sof-cli` returns [{"id":"cs1","top":null,"desc":null}].
-        let rows = collect_rows(runner.as_ref(), &tenant, repeat_view).await;
-        assert!(rows.is_empty(), "{rows:?}");
-
-        let union_view = json!({
-            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
-            "select": [
-                {"column": [{"path": "id", "name": "id"}]},
-                {"forEachOrNull": "contact.where(name.family='zzz')", "select": [
-                    {"unionAll": [
-                        {"column": [{"path": "name.family", "name": "v"}]},
-                        {"column": [{"path": "'x'", "name": "v"}]}
-                    ]}
-                ]}
-            ]
-        });
-        // `sof-cli` returns one {"id": .., "v": null} row per patient.
-        let rows = collect_rows(runner.as_ref(), &tenant, union_view).await;
-        let got: Vec<(String, Value)> = rows
-            .iter()
-            .map(|r| (r["id"].as_str().unwrap().to_string(), r["v"].clone()))
-            .collect();
-        let mut want = vec![
-            ("p1".to_string(), json!("x")),
-            ("p1".to_string(), Value::Null),
-            ("p2".to_string(), json!("x")),
-            ("p2".to_string(), Value::Null),
-        ];
-        let mut got = got;
-        got.sort_by_key(|r| format!("{r:?}"));
-        want.sort_by_key(|r| format!("{r:?}"));
-        assert_eq!(got, want);
     }
 
     /// Columns whose FHIR type can't be resolved keep strings as strings.

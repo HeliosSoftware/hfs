@@ -37,7 +37,7 @@ use crate::core::sof_runner::SofError;
 
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, JsonPath, LitValue, PathStep, PlanNode, RowIndexScope,
-    SqlExpr, UnaryOp,
+    SqlExpr, UnaryOp, nearest_left_scope,
 };
 
 /// Output of [`emit_mongo`]: a ready-to-run pipeline plus its output columns.
@@ -263,13 +263,25 @@ fn lower_source(
             // `%rowIndex` (see `lower_expr`'s `RowIndex` arm). It is `null` for a
             // `forEachOrNull` miss (empty/missing array), which `%rowIndex` maps
             // to 0. The field is dropped by the final inclusion `$project`.
+            // A plain `forEach` below an EMPTY `forEachOrNull` keeps the null row.
+            let optional = if *left_join {
+                None
+            } else {
+                match source {
+                    SqlExpr::JsonPath { root, .. } => {
+                        nearest_left_scope(parent, root).map(|(a, _)| a)
+                    }
+                    _ => None,
+                }
+            };
             pipeline.push(doc! {
                 "$unwind": {
                     "path": format!("${base}"),
-                    "preserveNullAndEmptyArrays": *left_join,
+                    "preserveNullAndEmptyArrays": *left_join || optional.is_some(),
                     "includeArrayIndex": unnest_index_field(out_alias),
                 }
             });
+            push_optional_scope_guard(pipeline, &base, optional.as_deref());
             // `forEach: "x.where(crit)"` — filter the unwound elements by the
             // criterion (rooted at `<out_alias>.value` → the `$__<out_alias>`
             // field). `forEachOrNull` was already filtered above.
@@ -331,16 +343,31 @@ fn lower_source(
             }
             .into();
             pipeline.push(doc! { "$set": { &base: traversed } });
+            let optional = nearest_left_scope(parent, seed_root).map(|(a, _)| a);
             pipeline.push(doc! {
                 "$unwind": {
                     "path": format!("${base}"),
-                    "preserveNullAndEmptyArrays": false,
+                    "preserveNullAndEmptyArrays": optional.is_some(),
                     "includeArrayIndex": unnest_index_field(out_alias),
                 }
             });
+            push_optional_scope_guard(pipeline, &base, optional.as_deref());
             Ok(())
         }
     }
+}
+
+/// After an `$unwind` that preserves empties for a step below a
+/// `forEachOrNull`: keep a row when the step matched OR that ancestor missed.
+fn push_optional_scope_guard(pipeline: &mut Vec<Document>, base: &str, left_alias: Option<&str>) {
+    let Some(left) = left_alias else { return };
+    let null_of = |field: String| doc! { "$ifNull": [format!("${field}"), Bson::Null] };
+    pipeline.push(doc! {
+        "$match": { "$expr": { "$or": [
+            doc! { "$ne": [null_of(base.to_string()), Bson::Null] },
+            doc! { "$eq": [null_of(unnest_base(left)), Bson::Null] },
+        ] } }
+    });
 }
 
 /// Step paths as a nested BSON array for the `$function` argument.

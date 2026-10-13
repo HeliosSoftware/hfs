@@ -570,3 +570,52 @@ pub struct SubQuery {
 
 /// Boxed dialect handle used by emission helpers.
 pub type DialectRef = Arc<dyn super::dialect::Dialect>;
+
+/// The alias (and whether it is an indexed `[N]` step) of the nearest
+/// `forEachOrNull` that the scope `root` (a focus such as `fe.value` or
+/// `rec_0.node`) depends on, walking the chain of
+/// enclosing iteration steps; `None` when the scope is the resource or has no
+/// `forEachOrNull` ancestor.
+pub(super) fn nearest_left_scope(parent: &PlanNode, root: &str) -> Option<(String, bool)> {
+    let mut alias = root.rsplit_once('.').map(|(a, _)| a.to_string())?;
+    if alias == "r" {
+        return None;
+    }
+    loop {
+        let mut cur = parent;
+        let step = loop {
+            match cur {
+                PlanNode::LateralUnnest {
+                    out_alias, parent, ..
+                } if *out_alias == alias => break Some(cur),
+                PlanNode::Recurse {
+                    out_alias, parent, ..
+                } if *out_alias == alias => break Some(cur),
+                PlanNode::LateralUnnest { parent: p, .. }
+                | PlanNode::Recurse { parent: p, .. }
+                | PlanNode::Filter { parent: p, .. } => cur = p,
+                _ => break None,
+            }
+        }?;
+        match step {
+            PlanNode::LateralUnnest {
+                left_join: true,
+                flat_index,
+                ..
+            } => return Some((alias, flat_index.is_some())),
+            PlanNode::LateralUnnest {
+                source: SqlExpr::JsonPath { root, .. },
+                ..
+            }
+            | PlanNode::Recurse {
+                seed_root: root, ..
+            } => {
+                alias = root.rsplit_once('.').map(|(a, _)| a.to_string())?;
+                if alias == "r" {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+}
