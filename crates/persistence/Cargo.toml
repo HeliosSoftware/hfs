@@ -187,9 +187,9 @@ required-features = ["mongodb"]
 name = "extract_probe"
 required-features = ["sqlite"]
 
-# Shared chain resolver vs. native SQL chain builders (#1341).
+# Chained and `_has` search as REST runs it: resolve, then the first page.
 [[example]]
-name = "chain_bench"
+name = "chain_resolver_bench"
 required-features = ["sqlite", "postgres"]
 
 # Benchmarks will be added later

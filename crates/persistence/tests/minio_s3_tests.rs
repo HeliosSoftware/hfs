@@ -27,7 +27,7 @@ use helios_persistence::core::{
     TenantDataEvidence, VersionedStorage,
 };
 use helios_persistence::error::{
-    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError,
+    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TenantError,
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{CursorValue, PageCursor, Pagination, PaginationMode};
@@ -1701,6 +1701,194 @@ async fn test_minio_validate_buckets_missing_bucket_is_bucket_flavored() {
         }
         other => panic!("expected Backend(Unavailable), got {other:?}"),
     }
+}
+
+/// Every key in `bucket`, for asserting what landed where.
+async fn all_keys(client: &Client, bucket: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let page = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .set_continuation_token(continuation.take())
+            .send()
+            .await
+            .expect("list bucket");
+        keys.extend(
+            page.contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string)),
+        );
+        match page.next_continuation_token() {
+            Some(token) => continuation = Some(token.to_string()),
+            None => break,
+        }
+    }
+    keys.sort();
+    keys
+}
+
+/// Bucket-per-tenant on a real S3-compatible store (#1598): each tenant's
+/// resources land in its own bucket with no tenant prefix, the registry and
+/// the per-user settings document land in the system bucket, a tenant outside
+/// the map is refused on request and on registration alike, and startup
+/// validation covers every mapped bucket. The mock proves the routing logic;
+/// this proves it against real buckets, which is what the mode exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_bucket_per_tenant_routes_each_tenant_to_its_own_bucket() {
+    if skip_if_disabled("test_minio_bucket_per_tenant_routes_each_tenant_to_its_own_bucket") {
+        return;
+    }
+
+    let shared = shared_minio().await;
+    ensure_backend_env_credentials(shared);
+    let sdk_client = build_minio_sdk_client(shared).await;
+
+    let run = Uuid::new_v4().simple();
+    let bucket_a = format!("hfs-bpt-a-{run}");
+    let bucket_b = format!("hfs-bpt-b-{run}");
+    let system_bucket = format!("hfs-bpt-system-{run}");
+    for bucket in [&bucket_a, &bucket_b, &system_bucket] {
+        ensure_bucket_exists(&sdk_client, bucket).await;
+    }
+
+    let config = |map: &[(&str, &str)], validate: bool| S3BackendConfig {
+        tenancy_mode: S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map: map
+                .iter()
+                .map(|(t, b)| (t.to_string(), b.to_string()))
+                .collect(),
+            default_system_bucket: Some(system_bucket.clone()),
+        },
+        region: Some("us-east-1".to_string()),
+        endpoint_url: Some(shared.endpoint_url.clone()),
+        force_path_style: true,
+        allow_http: true,
+        validate_buckets_on_startup: validate,
+        ..Default::default()
+    };
+
+    // Startup validation reaches every mapped bucket, not just the first.
+    let absent = format!("hfs-bpt-absent-{run}");
+    let err = S3Backend::from_env(config(
+        &[("tenant-a", &bucket_a), ("tenant-b", &absent)],
+        true,
+    ))
+    .expect_err("a mapped bucket that does not exist must fail startup");
+    match &err {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            assert!(
+                message.contains(&absent),
+                "must name the absent bucket: {message}"
+            );
+        }
+        other => panic!("expected Backend(Unavailable), got {other:?}"),
+    }
+
+    let backend = S3Backend::from_env(config(
+        &[("tenant-a", &bucket_a), ("tenant-b", &bucket_b)],
+        true,
+    ))
+    .expect("bucket-per-tenant backend against MinIO");
+    assert!(backend.supports_tenant_registry());
+    assert!(backend.supports_user_settings());
+
+    let (ta, tb) = (tenant("tenant-a"), tenant("tenant-b"));
+    backend
+        .create(
+            &ta,
+            "Patient",
+            json!({"resourceType":"Patient","id":"pa"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create in tenant-a");
+    backend
+        .create(
+            &tb,
+            "Patient",
+            json!({"resourceType":"Patient","id":"pb"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create in tenant-b");
+    backend
+        .register_tenant("tenant-a", Some("Tenant A"))
+        .await
+        .expect("register a mapped tenant");
+
+    // Each tenant's data is in its own bucket, directly under the root (no
+    // tenant prefix: the bucket is the tenant boundary).
+    let keys_a = all_keys(&sdk_client, &bucket_a).await;
+    let keys_b = all_keys(&sdk_client, &bucket_b).await;
+    assert!(
+        keys_a.contains(&"resources/Patient/pa/current.json".to_string()),
+        "tenant-a's resource must be at the bucket root: {keys_a:?}"
+    );
+    assert!(
+        keys_b.contains(&"resources/Patient/pb/current.json".to_string()),
+        "tenant-b's resource must be at the bucket root: {keys_b:?}"
+    );
+    assert!(
+        keys_a.iter().all(|k| !k.contains("/pb/")) && keys_b.iter().all(|k| !k.contains("/pa/")),
+        "no object may cross buckets: a={keys_a:?} b={keys_b:?}"
+    );
+    assert!(
+        keys_a
+            .iter()
+            .chain(&keys_b)
+            .all(|k| !k.starts_with("tenants/")),
+        "the registry must not be in a tenant bucket: a={keys_a:?} b={keys_b:?}"
+    );
+    assert!(
+        backend.read(&tb, "Patient", "pa").await.unwrap().is_none(),
+        "a read in tenant-b must not see tenant-a's resource"
+    );
+
+    // Cross-tenant state is in the system bucket and nowhere else.
+    let keys_system = all_keys(&sdk_client, &system_bucket).await;
+    assert!(
+        keys_system.iter().any(|k| k.starts_with("tenants/")),
+        "the registry record must be in the system bucket: {keys_system:?}"
+    );
+    assert!(
+        keys_system.iter().all(|k| !k.starts_with("resources/")),
+        "no tenant resource may land in the system bucket: {keys_system:?}"
+    );
+    assert_eq!(
+        backend
+            .get_tenant("tenant-a")
+            .await
+            .unwrap()
+            .map(|r| r.display_name),
+        Some(Some("Tenant A".to_string()))
+    );
+
+    // A tenant outside the map has no bucket: refused on request and refused
+    // at the mint point, with nothing written.
+    let tc = tenant("tenant-c");
+    assert!(matches!(
+        backend
+            .create(
+                &tc,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pc"}),
+                FhirVersion::default(),
+            )
+            .await,
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+    ));
+    assert!(matches!(
+        backend.register_tenant("tenant-c", None).await,
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+    ));
+    assert!(backend.get_tenant("tenant-c").await.unwrap().is_none());
+    assert_eq!(
+        all_keys(&sdk_client, &system_bucket).await,
+        keys_system,
+        "a refused registration must write nothing"
+    );
 }
 
 /// #330: on the real SDK path, a tenant deregistered without purge must stay

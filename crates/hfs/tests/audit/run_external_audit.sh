@@ -302,7 +302,24 @@ cat > "$RESULTS_DIR/payloads/transaction_bundle.json" <<JSON
 JSON
 
 run_call "batch_bundle" "POST" "/" "200" "$(mint_full_token)" "application/fhir+json" "$RESULTS_DIR/payloads/batch_bundle.json"
-run_call "transaction_bundle" "POST" "/" "200" "$(mint_full_token)" "application/fhir+json" "$RESULTS_DIR/payloads/transaction_bundle.json"
+
+# A transaction Bundle is honoured only where the storage backend can make it
+# atomic, and the server's CapabilityStatement says where: `transaction` is
+# listed under `rest.interaction` only then (#489). Anywhere else the server
+# must refuse the bundle with 501 before applying a single entry — an
+# s3-elasticsearch primary does exactly that. The expectation follows the
+# server's own advertisement rather than a per-backend list in this script,
+# and the validator then checks that a refused transaction audited nothing.
+TRANSACTION_ADVERTISED="$(curl -sS -H "Authorization: Bearer $(mint_full_token)" -H "Accept: application/fhir+json" "${BASE_URL}/metadata" \
+  | jq -r '[.rest[]?.interaction[]?.code] | any(. == "transaction")')"
+if [ "$TRANSACTION_ADVERTISED" = "true" ]; then
+  TRANSACTION_STATUS="200"
+else
+  TRANSACTION_ADVERTISED="false"
+  TRANSACTION_STATUS="501"
+fi
+echo "CapabilityStatement advertises transaction: ${TRANSACTION_ADVERTISED} (expecting HTTP ${TRANSACTION_STATUS})"
+run_call "transaction_bundle" "POST" "/" "$TRANSACTION_STATUS" "$(mint_full_token)" "application/fhir+json" "$RESULTS_DIR/payloads/transaction_bundle.json"
 
 run_call "delete_observation" "DELETE" "/Observation/${OBSERVATION_ID}" "204" "$(mint_full_token)"
 run_call "delete_patient" "DELETE" "/Patient/${PATIENT_ID}" "204" "$(mint_full_token)"
@@ -316,7 +333,8 @@ cat > "$CONTEXT_FILE" <<JSON
   "patient_id": "${PATIENT_ID}",
   "observation_id": "${OBSERVATION_ID}",
   "run_tag": "${RUN_TAG}",
-  "ranges_file": "${RANGES_FILE}"
+  "ranges_file": "${RANGES_FILE}",
+  "transaction_advertised": ${TRANSACTION_ADVERTISED}
 }
 JSON
 

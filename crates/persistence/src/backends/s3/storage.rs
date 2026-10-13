@@ -739,6 +739,16 @@ impl S3Backend {
         else {
             return Ok(None);
         };
+        self.load_history_entry_for_event(location, event).await
+    }
+
+    /// Reads the version snapshot an already-loaded index event points at, or
+    /// `None` when the snapshot is gone.
+    async fn load_history_entry_for_event(
+        &self,
+        location: &TenantLocation,
+        event: HistoryIndexEvent,
+    ) -> StorageResult<Option<HistoryEntry>> {
         let history_key = location.keyspace.history_version_key(
             &event.resource_type,
             &event.id,
@@ -757,14 +767,19 @@ impl S3Backend {
     /// Pages the history index events under `prefix` without reading them all.
     ///
     /// Event keys start with the event time in milliseconds, so one LIST is
-    /// enough to order and window the feed; only the requested page is then
-    /// fetched (two GETs per entry, run concurrently, in page order). The
-    /// reported `total` counts index events.
+    /// enough to order and window the feed, and `since` / `before` are decided
+    /// from the key for every event except those in the single millisecond a
+    /// bound falls in. Only those boundary events, events whose key does not
+    /// parse, and — when deletes are excluded — every event in the window need
+    /// their index body (the key carries neither the sub-millisecond time nor
+    /// the delete flag), and only that small body is read for them, never the
+    /// version snapshot. The snapshots are then fetched for the requested page
+    /// alone. Every GET runs concurrently, in page order. The reported `total`
+    /// counts the index events that pass the filters.
     ///
-    /// Filtering by `since`/`before` or dropping deletes needs the event body
-    /// (the key carries neither the sub-millisecond time nor the delete flag),
-    /// and a key that does not parse cannot be ordered; those cases keep the
-    /// exhaustive read.
+    /// This is what keeps system `_history` on an S3 primary inside the
+    /// request timeout: the work is bounded by the page, not by how many
+    /// mutations the tenant has ever made (#1356).
     pub(crate) async fn history_page_for_prefix(
         &self,
         location: &TenantLocation,
@@ -775,45 +790,91 @@ impl S3Backend {
 
         let objects = self.list_objects_all(&location.bucket, prefix).await?;
 
-        let mut keyed: Vec<(i64, String)> = Vec::new();
-        let mut orderable =
-            params.include_deleted && params.since.is_none() && params.before.is_none();
-        if orderable {
-            for object in &objects {
-                match parse_millis_from_event_key(&object.key) {
-                    Some(millis) => keyed.push((millis, object.key.clone())),
-                    None => {
-                        orderable = false;
-                        break;
+        // A bound at millisecond precision. An event's key millis is the floor
+        // of its timestamp, so the key alone decides `timestamp >= since` and
+        // `timestamp < before` for every millisecond other than the bound's own.
+        let since_ms = params.since.map(|t| t.timestamp_millis());
+        let before_ms = params.before.map(|t| t.timestamp_millis());
+
+        // One candidate per key that may be on the feed, in LIST order; `event`
+        // is filled for the ones whose index body had to be read.
+        struct Candidate {
+            millis: i64,
+            key: String,
+            event: Option<HistoryIndexEvent>,
+            keep: bool,
+        }
+
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(objects.len());
+        let mut undecided: Vec<usize> = Vec::new();
+        for object in objects {
+            let key = object.key;
+            match parse_millis_from_event_key(&key) {
+                Some(millis) => {
+                    let below = since_ms.is_some_and(|since| millis < since);
+                    let above = before_ms.is_some_and(|before| millis > before);
+                    if below || above {
+                        continue;
                     }
+                    let on_boundary = since_ms == Some(millis) || before_ms == Some(millis);
+                    if on_boundary || !params.include_deleted {
+                        undecided.push(candidates.len());
+                    }
+                    candidates.push(Candidate {
+                        millis,
+                        key,
+                        event: None,
+                        keep: true,
+                    });
+                }
+                None => {
+                    undecided.push(candidates.len());
+                    candidates.push(Candidate {
+                        millis: 0,
+                        key,
+                        event: None,
+                        keep: true,
+                    });
                 }
             }
         }
 
-        if !orderable {
-            let mut entries = Vec::new();
-            for object in &objects {
-                if let Some(entry) = self.load_history_entry(location, &object.key).await? {
-                    entries.push(entry);
+        // Read the index bodies the key could not decide, concurrently and in
+        // order, then apply the exact filters to them.
+        let bucket = &location.bucket;
+        let undecided_keys: Vec<String> = undecided
+            .iter()
+            .map(|&i| candidates[i].key.clone())
+            .collect();
+        let events = futures::stream::iter(undecided_keys)
+            .map(|key| async move {
+                self.get_json_object::<HistoryIndexEvent>(bucket, &key)
+                    .await
+                    .map(|found| found.map(|(event, _)| event))
+            })
+            .buffered(self.bulk_write_concurrency())
+            .collect::<Vec<_>>()
+            .await;
+
+        for (&i, event) in undecided.iter().zip(events) {
+            let candidate = &mut candidates[i];
+            match event? {
+                Some(event) => {
+                    candidate.keep = (params.include_deleted || !event.deleted)
+                        && params.since.is_none_or(|since| event.timestamp >= since)
+                        && params.before.is_none_or(|before| event.timestamp < before);
+                    candidate.millis = event.timestamp.timestamp_millis();
+                    candidate.event = Some(event);
                 }
+                // The event object vanished between LIST and GET.
+                None => candidate.keep = false,
             }
-            entries.retain(|entry| {
-                (params.include_deleted || !entry.resource.is_deleted())
-                    && params
-                        .since
-                        .map(|since| entry.timestamp >= since)
-                        .unwrap_or(true)
-                    && params
-                        .before
-                        .map(|before| entry.timestamp < before)
-                        .unwrap_or(true)
-            });
-            return self.page_history(entries, &params.pagination);
         }
+        candidates.retain(|c| c.keep);
 
         // Stable sort: ties keep LIST order, as `page_history`'s sort does.
-        keyed.sort_by_key(|(millis, _)| std::cmp::Reverse(*millis));
-        let total = keyed.len();
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.millis));
+        let total = candidates.len();
         let offset = decode_pagination_offset(&params.pagination)?;
         let count = params.pagination.count as usize;
         let end = offset.saturating_add(count).min(total);
@@ -821,10 +882,14 @@ impl S3Backend {
         let items = if offset >= total {
             Vec::new()
         } else {
-            let page_keys: Vec<String> =
-                keyed[offset..end].iter().map(|(_, k)| k.clone()).collect();
-            futures::stream::iter(page_keys)
-                .map(|key| async move { self.load_history_entry(location, &key).await })
+            let page: Vec<Candidate> = candidates.drain(offset..end).collect();
+            futures::stream::iter(page)
+                .map(|candidate| async move {
+                    match candidate.event {
+                        Some(event) => self.load_history_entry_for_event(location, event).await,
+                        None => self.load_history_entry(location, &candidate.key).await,
+                    }
+                })
                 .buffered(self.bulk_write_concurrency())
                 .collect::<Vec<_>>()
                 .await
@@ -1543,6 +1608,11 @@ impl ResourceStorage for S3Backend {
         // `purge_tenant_data("a")` deletes. `TenantId::parse` rejects the
         // reserved segment, making that shape unconstructible.
         self.ensure_canonical_tenant_id(id)?;
+        // Bucket-per-tenant: a tenant outside the map has no bucket, so a
+        // registration would be a record for a tenant every request then
+        // refuses. Refuse the registration instead, with the error that names
+        // the fix (map it and restart). The admin handler turns it into a 400.
+        self.ensure_tenant_mapped(id)?;
         let location = self
             .registry_location()
             .ok_or_else(|| self.tenant_registry_unsupported())?;

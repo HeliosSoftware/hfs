@@ -69,7 +69,10 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild after a bulk import (all backends). `POST $reindex` keeps its own `batchSize`, capped at 10,000 |
 | `HFS_REINDEX_STREAMS` | `auto` | Page streams per resource type of the automatic search-index rebuild: each type is split into that many id ranges, fetched and written at once. `auto` is half the cores, at most 8; `1` keeps one serial page loop. Every writer caps it: SQLite runs one stream (one writer), standalone PostgreSQL at most `HFS_POSTGRES_REINDEX_WIDTH`, MongoDB at most 8 (and its pool), Elasticsearch 8. Manual `POST $reindex` runs use `auto` |
 | `HFS_POSTGRES_REINDEX_WIDTH` | `auto` | Concurrent write groups of the search-index rebuild on the standalone `postgres` backend. `auto` is a quarter of the connection pool, at most 8 (pools of 32 and more reach 8); an explicit value is capped by the pool. No longer follows `HFS_BULK_SUBMIT_FILE_CONCURRENCY`. Ignored on composites (pg-es), where PostgreSQL is not a rebuild writer |
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | `prefix-per-tenant` (one shared bucket, tenant key prefixes) or `bucket-per-tenant` (a dedicated bucket per mapped tenant) |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket (prefix-per-tenant only) |
+| `HFS_S3_TENANT_BUCKETS` | *(none)* | Bucket-per-tenant: `tenant=bucket,…`, required; must include `HFS_DEFAULT_TENANT` |
+| `HFS_S3_SYSTEM_BUCKET` | *(none)* | Bucket-per-tenant: optional tenant-independent bucket for the tenant registry, user settings, login sessions, the bulk-submit worker index and AuditEvents |
 | `HFS_S3_REGION` | *(AWS chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix for all S3 object keys |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
