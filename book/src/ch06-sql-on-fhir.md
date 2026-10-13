@@ -275,6 +275,8 @@ Types come from the `type` declared on each ViewDefinition column; a column with
 
 Parquet and Arrow IPC are encoded incrementally: the schema is fixed before the first row, rows are encoded in batches, and a Parquet row group is written each time its encoded size reaches the configured row group size. Memory therefore stays bounded by about one row group rather than the whole result, and `$sql-run` sends the response as the row groups are written. If a row fails after the response has started, the body is aborted instead of ending in a truncated file with a clean `200`. When a maximum file size is set, splitting happens between batches, so a file can exceed the limit by one batch plus the footer.
 
+On the HTTP side, a streamed Parquet or Arrow response has no `Content-Length` and uses chunked transfer encoding. The request timeout covers only the handler, not the body, so a slow client is bounded by backpressure rather than by a timeout. Arrow responses are still subject to response compression. If the client disconnects, encoding stops and the row stream is dropped. Typed columns accept numeric and boolean text (some runners return text); a value that does not fit its declared type becomes null. The Binary envelope, `_format=fhir`, inline resources and SQLQuery/Library subjects are still built in memory.
+
 ---
 
 ## Using the sof-server HTTP API

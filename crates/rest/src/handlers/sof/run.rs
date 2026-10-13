@@ -1362,6 +1362,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_columnar_client_disconnect_drops_the_row_stream() {
+        // An endless stream: it can only stop if the response body being
+        // dropped makes the encoder and the reader give up.
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let stream: RowStream = Box::pin(futures::stream::unfold(0usize, move |i| {
+            let _keep = &flag;
+            async move {
+                tokio::task::yield_now().await;
+                Some((Ok(json!({ "id": format!("p{i}"), "n": i })), i + 1))
+            }
+        }));
+        let options = ParquetOptions {
+            row_group_size_mb: 0,
+            ..ParquetOptions::default()
+        };
+        let response = streaming_columnar_response(
+            stream,
+            ContentType::Parquet,
+            &typed_view(),
+            Some(options),
+            None,
+            "parquet",
+        )
+        .await
+        .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.is_some(), "expected a first chunk");
+        drop(body);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "row stream still alive after the client disconnected"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn streaming_columnar_error_inside_prefix_is_a_real_status() {
         let mut rows = numbered_rows(3);
         rows.push(Err(SofError::Cancelled));
