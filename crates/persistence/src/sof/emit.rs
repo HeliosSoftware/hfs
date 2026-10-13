@@ -15,8 +15,9 @@ use crate::core::sof_runner::SofError;
 use super::decode::ColumnDecode;
 use super::dialect::{Dialect, pg_key_literal, pg_path_array_literal, sqlite_json_path_literal};
 use super::ir::{
-    BinOp, BoundaryKind, BoundarySide, CompartmentFilter, JsonPath, JsonType, LitValue, PathStep,
-    PlanNode, ResourceFilter, RowIndexScope, SqlExpr, SqlType, UnaryOp,
+    BinOp, BoundaryKind, BoundarySide, Column, CompartmentFilter, JsonPath, JsonType, LitValue,
+    PathStep, PlanNode, ResourceFilter, RowIndexScope, SqlExpr, SqlType, UnaryOp,
+    nearest_left_scope, unnest_source_root,
 };
 
 /// Column the recursive `repeat` CTE projects to order the flattened traversal
@@ -237,6 +238,9 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         PlanNode::Project { parent, columns } => (columns.as_slice(), parent.as_ref()),
         _ => unreachable!("emit_recurse_select called on non-Project plan"),
     };
+    if !is_legacy_recurse_shape(body) {
+        return emit_recurse_general(project_cols, body, dialect);
+    }
 
     // Walk down past any LateralUnnest layers wrapping the Recurse — those
     // are nested-forEach unnests that get JOINed onto the recursive CTE
@@ -286,7 +290,6 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
 
     // Build seed branches — one SELECT per step path.
     let mut seed_branches: Vec<String> = Vec::with_capacity(step_paths.len());
-    let mut step_branches: Vec<String> = Vec::with_capacity(step_paths.len());
     for path in step_paths {
         let src = SqlExpr::JsonPath {
             root: "r.data".to_string(),
@@ -330,6 +333,110 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         seed_branches.push(branch);
     }
 
+    let step_branches = build_step_branches(step_paths, out_alias, dialect, emit_ord_path, false)?;
+
+    let cte_body = assemble_cte_body(seed_branches, step_branches, dialect);
+
+    // Determine which columns reference `r.data` (sibling root cols from
+    // sibling clauses) — they need a JOIN back to `resources r`.
+    let needs_resource_join = project_cols
+        .iter()
+        .any(|c| column_refers_to_resource(&c.expr));
+
+    // Build SELECT clause.
+    let mut select_parts: Vec<String> = Vec::with_capacity(project_cols.len());
+    let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
+    let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
+    for col in project_cols {
+        let mut ctx = ExprCtx::new(dialect, frame.next_param);
+        let (casted, decode) = project_column(col, &mut ctx)?;
+        frame.next_param = ctx.next_param;
+        select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
+        columns.push(col.name.clone());
+        column_decodes.push(decode);
+    }
+
+    let mut from_clause = if needs_resource_join {
+        format!(
+            "{} JOIN {} r ON r.id = {}.rid AND {}",
+            out_alias, scan.table, out_alias, tenant_pred
+        )
+    } else {
+        out_alias.to_string()
+    };
+
+    // Append any forEach unnests stacked above the recurse — emitted in
+    // outer-to-inner order matching how walk_body would assemble them.
+    // Iterate `extra_unnests` in reverse since we collected from outermost
+    // (closest to Project) downward.
+    for layer in extra_unnests.iter().rev() {
+        if let PlanNode::LateralUnnest {
+            source,
+            out_alias: alias,
+            left_join,
+            on_filter,
+            flat_index,
+            ..
+        } = layer
+        {
+            // Rendered through the shared unnest renderer so PostgreSQL keeps
+            // `WITH ORDINALITY` (needed by `%rowIndex`) over a repeat.
+            let mut scratch = Frame::new();
+            scratch.next_param = frame.next_param;
+            push_lateral_unnest(
+                source,
+                alias,
+                left_join,
+                on_filter,
+                flat_index,
+                dialect,
+                &mut scratch,
+            )?;
+            frame.next_param = scratch.next_param;
+            for join in scratch.joins {
+                from_clause.push('\n');
+                from_clause.push_str(&join.sql);
+            }
+        }
+    }
+
+    // The CTE carries the extra `ord_path` column (used by `%rowIndex` ranking)
+    // whenever we emit it; otherwise it keeps the original `(rid, node)` shape.
+    let cte_cols = if emit_ord_path {
+        format!("rid, node, {REPEAT_ORD_PATH_COL}")
+    } else {
+        "rid, node".to_string()
+    };
+    let sql = format!(
+        "WITH RECURSIVE {out_alias}({cte_cols}) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}\nORDER BY 1",
+        select_parts.join(",\n  ")
+    );
+
+    Ok(EmittedSql {
+        sql,
+        columns,
+        column_decodes,
+        next_param_index: frame.next_param,
+    })
+}
+
+/// Builds the recursive (step) branches of a `repeat` CTE: one `SELECT` per
+/// step path walking off `<out_alias>.node`. `with_pkey` carries the scope-key
+/// column of a keyed CTE (see [`emit_recurse_general`]) through the recursion.
+fn build_step_branches(
+    step_paths: &[JsonPath],
+    out_alias: &str,
+    dialect: &dyn Dialect,
+    emit_ord_path: bool,
+    with_pkey: bool,
+) -> Result<Vec<String>, SofError> {
+    let is_sqlite = dialect.lateral_keyword().is_empty();
+    let pk = if with_pkey {
+        format!(", {out_alias}.pkey")
+    } else {
+        String::new()
+    };
+    let mut step_branches: Vec<String> = Vec::with_capacity(step_paths.len());
     // Step branches — walk each path off `<alias>.node`. Multi-segment
     // step paths (`answer.item`) chain a lateral unnest per Field so
     // path-through-array flattening matches FHIRPath semantics.
@@ -405,7 +512,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
             let from_clause = format!("{out_alias}, {}", from_parts.join(", "));
             step_branches.push(format!(
                 "SELECT {out_alias}.rid, {leaf_alias}.value AS node, \
-                 {out_alias}.{ord} || '.' || printf('%010d', {leaf_alias}.key) AS {ord}\n  \
+                 {out_alias}.{ord} || '.' || printf('%010d', {leaf_alias}.key) AS {ord}{pk}\n  \
                  FROM {from_clause}",
                 ord = REPEAT_ORD_PATH_COL,
             ));
@@ -420,13 +527,13 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
                 // Extend the parent's `ord_path` with this child's position.
                 step_branches.push(format!(
                     "SELECT {out_alias}.rid, {leaf_alias}.value AS node, \
-                     {out_alias}.{ord} || '.' || lpad(({leaf_alias}.ord - 1)::text, 10, '0') AS {ord}\n  \
+                     {out_alias}.{ord} || '.' || lpad(({leaf_alias}.ord - 1)::text, 10, '0') AS {ord}{pk}\n  \
                      FROM {s}",
                     ord = REPEAT_ORD_PATH_COL,
                 ));
             } else {
                 step_branches.push(format!(
-                    "SELECT {out_alias}.rid, {leaf_alias}.value AS node\n  FROM {s}"
+                    "SELECT {out_alias}.rid, {leaf_alias}.value AS node{pk}\n  FROM {s}"
                 ));
             }
         }
@@ -436,17 +543,23 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         // explores all step paths via a lateral UNION ALL of leaf values.
         let unioned = pg_lateral_branches.join("\n    UNION ALL\n    ");
         step_branches.push(format!(
-            "SELECT {out_alias}.rid, _step.value AS node\n  \
+            "SELECT {out_alias}.rid, _step.value AS node{pk}\n  \
              FROM {out_alias}, LATERAL ({unioned}) AS _step(value)"
         ));
     }
+    Ok(step_branches)
+}
 
-    // PG's `WITH RECURSIVE` requires exactly one `UNION ALL` separating
-    // the non-recursive term from the recursive term. Wrap each side in
-    // parens so multiple seed/step paths stay on the correct side of the
-    // split. SQLite is permissive, so the flat `UNION ALL` form is fine.
+/// Joins seed and step branches into one CTE body. PG requires exactly one
+/// `UNION ALL` between the non-recursive and recursive terms, so multi-branch
+/// sides are parenthesised there; SQLite is fine with the flat form.
+fn assemble_cte_body(
+    mut seed_branches: Vec<String>,
+    mut step_branches: Vec<String>,
+    dialect: &dyn Dialect,
+) -> String {
     let is_pg = !dialect.lateral_keyword().is_empty();
-    let cte_body = if is_pg && (seed_branches.len() > 1 || step_branches.len() > 1) {
+    if is_pg && (seed_branches.len() > 1 || step_branches.len() > 1) {
         let seeds = if seed_branches.len() == 1 {
             seed_branches.remove(0)
         } else {
@@ -468,20 +581,426 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         let mut all = seed_branches;
         all.extend(step_branches);
         all.join("\n  UNION ALL\n  ")
+    }
+}
+
+/// True for the original single-descent shape: exactly one `Recurse` seeded
+/// from the resource, sitting directly on `Scan`/`Filter` nodes, with only
+/// unnests above it. Those plans keep the unkeyed `(rid, node[, ord_path])` CTE.
+fn is_legacy_recurse_shape(body: &PlanNode) -> bool {
+    fn scan_filter_chain(node: &PlanNode) -> bool {
+        match node {
+            PlanNode::Scan { .. } => true,
+            PlanNode::Filter { parent, .. } => scan_filter_chain(parent),
+            _ => false,
+        }
+    }
+    let mut cur = body;
+    while let PlanNode::LateralUnnest { parent, .. } = cur {
+        cur = parent.as_ref();
+    }
+    match cur {
+        PlanNode::Recurse {
+            parent, seed_root, ..
+        } => seed_root == "r.data" && scan_filter_chain(parent),
+        _ => false,
+    }
+}
+
+/// One iteration step (`LateralUnnest` or `Recurse`) of a general repeat plan,
+/// with the step that produces its focus (`None` = the resource document).
+struct ScopeStep<'a> {
+    node: &'a PlanNode,
+    alias: &'a str,
+    parent: Option<usize>,
+}
+
+/// Alias behind a focus root (`fe.value` → `fe`, `rec_0.node` → `rec_0`);
+/// `None` for the resource document.
+fn scope_root_alias(root: &str) -> Option<&str> {
+    if root.starts_with("r.data") {
+        None
+    } else {
+        Some(root.rsplit_once('.').map_or(root, |(alias, _)| alias))
+    }
+}
+
+fn resolve_scope(root: &str, steps: &[ScopeStep<'_>]) -> Result<Option<usize>, SofError> {
+    match scope_root_alias(root) {
+        None => Ok(None),
+        Some(alias) => steps
+            .iter()
+            .position(|s| s.alias == alias)
+            .map(Some)
+            .ok_or_else(|| SofError::Uncompilable {
+                reason: format!("repeat/forEach focus '{root}' has no enclosing iteration"),
+            }),
+    }
+}
+
+/// A `repeat` node is identified by `(pkey, ord_path)` only when `ord_path`
+/// is unique per node: one path of one segment (the leaf index alone is not
+/// unique for `a.b` paths, and multi-path ids collide across paths).
+fn repeat_node_is_identifiable(step_paths: &[JsonPath]) -> bool {
+    step_paths.len() == 1
+        && step_paths[0]
+            .0
+            .iter()
+            .filter(|s| matches!(s, PathStep::Field(_)))
+            .count()
+            == 1
+}
+
+/// SQL expression identifying the iteration row that produced `scope`, built
+/// from the aliases visible in a FROM clause that contains `scope`'s chain.
+/// Equal keys mean "same enclosing element", which is what a keyed CTE joins on.
+fn scope_key(
+    scope: Option<usize>,
+    steps: &[ScopeStep<'_>],
+    dialect: &dyn Dialect,
+) -> Result<String, SofError> {
+    let is_sqlite = dialect.lateral_keyword().is_empty();
+    let Some(i) = scope else {
+        return Ok(if is_sqlite { "''" } else { "''::text" }.to_string());
     };
+    let step = &steps[i];
+    let alias = step.alias;
+    match step.node {
+        PlanNode::LateralUnnest { flat_index, .. } => {
+            let parent = scope_key(step.parent, steps, dialect)?;
+            let idx = if flat_index.is_some() {
+                "'0'".to_string()
+            } else if is_sqlite {
+                format!("printf('%010d', COALESCE({alias}.rowid, -1))")
+            } else {
+                format!("lpad(COALESCE({alias}.ordinality, -1)::text, 10, '0')")
+            };
+            Ok(format!("{parent} || '/' || {idx}"))
+        }
+        PlanNode::Recurse { step_paths, .. } => {
+            if !repeat_node_is_identifiable(step_paths) {
+                return Err(SofError::Uncompilable {
+                    reason: "a repeat with several or multi-segment paths cannot enclose another \
+                             repeat or forEach yet"
+                        .to_string(),
+                });
+            }
+            Ok(format!(
+                "{alias}.pkey || '/' || {alias}.{REPEAT_ORD_PATH_COL}"
+            ))
+        }
+        _ => Err(SofError::InvalidViewDefinition(
+            "scope step must be an unnest or a recurse".to_string(),
+        )),
+    }
+}
 
-    // Determine which columns reference `r.data` (sibling root cols from
-    // sibling clauses) — they need a JOIN back to `resources r`.
-    let needs_resource_join = project_cols
+/// For a step that is not itself a `forEachOrNull` but sits below one: the SQL
+/// predicates "this step matched" and "its nearest `forEachOrNull` ancestor
+/// missed". Indexed (`[N]`) steps are not covered.
+fn optional_scope_guard(
+    i: usize,
+    steps: &[ScopeStep<'_>],
+    is_sqlite: bool,
+) -> Option<(String, String)> {
+    let matched = match steps[i].node {
+        PlanNode::Recurse { .. } => format!("{}.rid IS NOT NULL", steps[i].alias),
+        PlanNode::LateralUnnest {
+            left_join: false,
+            flat_index: None,
+            ..
+        } => format!("{} IS NOT NULL", miss_signal(steps[i].alias, is_sqlite)),
+        _ => return None,
+    };
+    let mut p = steps[i].parent;
+    while let Some(j) = p {
+        if let PlanNode::LateralUnnest {
+            left_join: true,
+            flat_index,
+            ..
+        } = steps[j].node
+        {
+            let missed = if flat_index.is_some() {
+                format!("{}.value IS NULL", steps[j].alias)
+            } else {
+                format!("{} IS NULL", miss_signal(steps[j].alias, is_sqlite))
+            };
+            return Some((matched, missed));
+        }
+        p = steps[j].parent;
+    }
+    None
+}
+
+/// Column that is NULL exactly when a LEFT-joined unnest found no element.
+fn miss_signal(alias: &str, is_sqlite: bool) -> String {
+    if is_sqlite {
+        format!("{alias}.rowid")
+    } else {
+        format!("{alias}.ordinality")
+    }
+}
+
+/// FROM-clause join for one step of a general repeat plan: an unnest renders
+/// like [`walk_body`] does; a recursive CTE joins on `rid` plus its scope key.
+fn render_step_join(
+    i: usize,
+    steps: &[ScopeStep<'_>],
+    dialect: &dyn Dialect,
+    next_param: &mut usize,
+) -> Result<String, SofError> {
+    let step = &steps[i];
+    match step.node {
+        PlanNode::LateralUnnest {
+            source,
+            out_alias,
+            left_join,
+            on_filter,
+            flat_index,
+            ..
+        } => {
+            let mut scratch = Frame::new();
+            scratch.next_param = *next_param;
+            push_lateral_unnest(
+                source,
+                out_alias,
+                left_join,
+                on_filter,
+                flat_index,
+                dialect,
+                &mut scratch,
+            )?;
+            *next_param = scratch.next_param;
+            scratch
+                .joins
+                .into_iter()
+                .next()
+                .map(|j| j.sql)
+                .ok_or_else(|| {
+                    SofError::InvalidViewDefinition("unnest rendered no join".to_string())
+                })
+        }
+        _ => {
+            let alias = step.alias;
+            let key = scope_key(step.parent, steps, dialect)?;
+            Ok(format!(
+                "JOIN {alias} ON {alias}.rid = r.id AND {alias}.pkey = {key}"
+            ))
+        }
+    }
+}
+
+/// Emits a plan with `Recurse` nodes anywhere in the iteration chain: nested
+/// in a `forEach`, in another `repeat`, or as siblings.
+///
+/// Every recursive CTE is keyed: besides `(rid, node[, ord_path])` it carries
+/// `pkey`, the scope key of the row it was seeded from (see [`scope_key`]). Its
+/// seed replays only the ancestors of its seed alias, and the main query joins
+/// it back on `rid` and the same key, so each enclosing element sees exactly
+/// its own descendants. Siblings share a key and cross-multiply, as `select`
+/// siblings do.
+fn emit_recurse_general(
+    project_cols: &[Column],
+    body: &PlanNode,
+    dialect: &dyn Dialect,
+) -> Result<EmittedSql, SofError> {
+    let is_sqlite = dialect.lateral_keyword().is_empty();
+
+    // Flatten the chain bottom-up: Scan, leading filters, then iteration steps.
+    let mut chain: Vec<&PlanNode> = Vec::new();
+    let mut cur = body;
+    loop {
+        chain.push(cur);
+        match cur {
+            PlanNode::Scan { .. } => break,
+            PlanNode::Filter { parent, .. }
+            | PlanNode::LateralUnnest { parent, .. }
+            | PlanNode::Recurse { parent, .. } => cur = parent.as_ref(),
+            _ => {
+                return Err(SofError::InvalidViewDefinition(
+                    "unexpected node in a repeat plan chain".to_string(),
+                ));
+            }
+        }
+    }
+    chain.reverse();
+    let first_step = chain
         .iter()
-        .any(|c| column_refers_to_resource(&c.expr));
+        .position(|n| matches!(n, PlanNode::LateralUnnest { .. } | PlanNode::Recurse { .. }))
+        .unwrap_or(chain.len());
 
-    // Build SELECT clause.
+    // Scan plus the top-level `where[]` filters: they guard every seed.
+    let mut frame = Frame::new();
+    walk_body(chain[first_step - 1], dialect, &mut frame)?;
+    let scan = frame
+        .scan
+        .as_ref()
+        .ok_or_else(|| SofError::InvalidViewDefinition("plan has no Scan node".to_string()))?;
+    let table = scan.table;
+    let tenant_pred = resource_scan_predicate(&scan.filter, dialect);
+    let mut seed_where = tenant_pred.clone();
+    for p in &frame.predicates {
+        seed_where.push_str("\n  AND ");
+        seed_where.push_str(p);
+    }
+
+    let mut steps: Vec<ScopeStep<'_>> = Vec::new();
+    let mut mid_filters: Vec<&SqlExpr> = Vec::new();
+    for node in &chain[first_step..] {
+        match node {
+            PlanNode::Filter { predicate, .. } => mid_filters.push(predicate),
+            PlanNode::LateralUnnest {
+                source,
+                out_alias,
+                flat_index,
+                ..
+            } => {
+                if is_sqlite && flat_index.is_some() {
+                    return Err(SofError::Uncompilable {
+                        reason: "an indexed forEach cannot be combined with repeat on SQLite"
+                            .to_string(),
+                    });
+                }
+                let parent = match unnest_source_root(source) {
+                    Some(root) => resolve_scope(root, &steps)?,
+                    None => steps.len().checked_sub(1),
+                };
+                steps.push(ScopeStep {
+                    node,
+                    alias: out_alias,
+                    parent,
+                });
+            }
+            PlanNode::Recurse {
+                seed_root,
+                out_alias,
+                ..
+            } => {
+                let parent = resolve_scope(seed_root, &steps)?;
+                steps.push(ScopeStep {
+                    node,
+                    alias: out_alias,
+                    parent,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // One keyed CTE per Recurse, in chain order.
+    let mut ctes: Vec<String> = Vec::new();
+    let mut keyed: Vec<String> = Vec::new();
+    for step in &steps {
+        let PlanNode::Recurse {
+            step_paths,
+            out_alias,
+            seed_root,
+            ..
+        } = step.node
+        else {
+            continue;
+        };
+        let emit_ord_path = is_sqlite || step_paths.len() == 1;
+
+        // Seed prefix: only the ancestors the seed alias depends on.
+        let mut ancestors: Vec<usize> = Vec::new();
+        let mut p = step.parent;
+        while let Some(i) = p {
+            ancestors.push(i);
+            p = steps[i].parent;
+        }
+        ancestors.sort_unstable();
+        let mut prefix = String::new();
+        for i in ancestors {
+            prefix.push('\n');
+            prefix.push_str(&render_step_join(
+                i,
+                &steps,
+                dialect,
+                &mut frame.next_param,
+            )?);
+        }
+        let key = scope_key(step.parent, &steps, dialect)?;
+
+        let mut seeds: Vec<String> = Vec::with_capacity(step_paths.len());
+        for path in step_paths {
+            let src = SqlExpr::JsonPath {
+                root: seed_root.clone(),
+                path: path.clone(),
+            };
+            let branch = if is_sqlite {
+                format!(
+                    "SELECT r.id AS rid, je.value AS node, printf('%010d', je.key) AS {ord}, \
+                     {key} AS pkey\n  FROM {table} r{prefix}\n  JOIN {} je ON 1=1\n  WHERE {seed_where}",
+                    emit_sqlite_unnest_source(&src)?,
+                    ord = REPEAT_ORD_PATH_COL,
+                )
+            } else {
+                let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src)?);
+                let lateral = dialect.lateral_keyword();
+                if emit_ord_path {
+                    format!(
+                        "SELECT r.id AS rid, je.value AS node, \
+                         lpad((je.ord - 1)::text, 10, '0') AS {ord}, {key} AS pkey\n  \
+                         FROM {table} r{prefix}\n  \
+                         JOIN {lateral}{unnest} WITH ORDINALITY AS je(value, ord) ON TRUE\n  \
+                         WHERE {seed_where}",
+                        ord = REPEAT_ORD_PATH_COL,
+                    )
+                } else {
+                    format!(
+                        "SELECT r.id AS rid, je.value AS node, {key} AS pkey\n  \
+                         FROM {table} r{prefix}\n  \
+                         JOIN {lateral}{unnest} AS je(value) ON TRUE\n  WHERE {seed_where}"
+                    )
+                }
+            };
+            seeds.push(branch);
+        }
+        let step_branches =
+            build_step_branches(step_paths, out_alias, dialect, emit_ord_path, true)?;
+        let cte_body = assemble_cte_body(seeds, step_branches, dialect);
+        let cols = if emit_ord_path {
+            format!("rid, node, {REPEAT_ORD_PATH_COL}, pkey")
+        } else {
+            "rid, node, pkey".to_string()
+        };
+        ctes.push(format!("{out_alias}({cols}) AS (\n  {cte_body}\n)"));
+        keyed.push(out_alias.clone());
+    }
+
+    // Main query: the resource, then every step in chain order. A step below
+    // a `forEachOrNull` is LEFT-joined and kept when that ancestor missed
+    // (an empty `forEachOrNull` yields one null row whatever is nested in
+    // it); a present ancestor with no match still drops the row.
+    let mut from_clause = format!("{table} r");
+    let mut where_parts = vec![seed_where];
+    for i in 0..steps.len() {
+        from_clause.push('\n');
+        let mut join = render_step_join(i, &steps, dialect, &mut frame.next_param)?;
+        if let Some((matched, missed)) = optional_scope_guard(i, &steps, is_sqlite)
+            && let Some(rest) = join.strip_prefix("JOIN ")
+        {
+            join = format!("LEFT JOIN {rest}");
+            where_parts.push(format!("({matched} OR {missed})"));
+        }
+        from_clause.push_str(&join);
+    }
+
+    for pred in &mid_filters {
+        let mut ctx = ExprCtx::new(dialect, frame.next_param);
+        ctx.keyed_repeats = keyed.clone();
+        let sql = lower_expr(pred, &mut ctx)?;
+        frame.next_param = ctx.next_param;
+        where_parts.push(dialect.truthy_predicate(&sql));
+    }
+
     let mut select_parts: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
         let mut ctx = ExprCtx::new(dialect, frame.next_param);
+        ctx.keyed_repeats = keyed.clone();
         let (casted, decode) = project_column(col, &mut ctx)?;
         frame.next_param = ctx.next_param;
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
@@ -489,74 +1008,12 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         column_decodes.push(decode);
     }
 
-    let mut from_clause = if needs_resource_join {
-        format!(
-            "{} JOIN {} r ON r.id = {}.rid AND {}",
-            out_alias, scan.table, out_alias, tenant_pred
-        )
-    } else {
-        out_alias.to_string()
-    };
-
-    // Append any forEach unnests stacked above the recurse — emitted in
-    // outer-to-inner order matching how walk_body would assemble them.
-    // Iterate `extra_unnests` in reverse since we collected from outermost
-    // (closest to Project) downward.
-    for layer in extra_unnests.iter().rev() {
-        if let PlanNode::LateralUnnest {
-            source,
-            out_alias: alias,
-            left_join,
-            on_filter,
-            ..
-        } = layer
-        {
-            let join_kw = if *left_join { "LEFT JOIN" } else { "JOIN" };
-            let extra_on = if let Some(filter) = on_filter {
-                let mut ctx = ExprCtx::new(dialect, frame.next_param);
-                let s = lower_expr(filter, &mut ctx)?;
-                frame.next_param = ctx.next_param;
-                Some(s)
-            } else {
-                None
-            };
-            if dialect.lateral_keyword().is_empty() {
-                let source_sql = emit_sqlite_unnest_source(source)?;
-                let on = match &extra_on {
-                    Some(f) => format!("1=1 AND {f}"),
-                    None => "1=1".to_string(),
-                };
-                from_clause.push('\n');
-                from_clause.push_str(&format!("{join_kw} {source_sql} {alias} ON {on}"));
-            } else {
-                let source_sql = emit_pg_unnest_source(source)?;
-                let unnest = dialect.unnest_array(&source_sql);
-                let on = match &extra_on {
-                    Some(f) => format!("TRUE AND {f}"),
-                    None => "TRUE".to_string(),
-                };
-                from_clause.push('\n');
-                from_clause.push_str(&format!(
-                    "{join_kw} {}{} AS {alias}(value) ON {on}",
-                    dialect.lateral_keyword(),
-                    unnest
-                ));
-            }
-        }
-    }
-
-    // The CTE carries the extra `ord_path` column (used by `%rowIndex` ranking)
-    // whenever we emit it; otherwise it keeps the original `(rid, node)` shape.
-    let cte_cols = if emit_ord_path {
-        format!("rid, node, {REPEAT_ORD_PATH_COL}")
-    } else {
-        "rid, node".to_string()
-    };
     let sql = format!(
-        "WITH RECURSIVE {out_alias}({cte_cols}) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}\nORDER BY 1",
-        select_parts.join(",\n  ")
+        "WITH RECURSIVE {}\nSELECT\n  {}\nFROM {from_clause}\nWHERE {}\nORDER BY 1",
+        ctes.join(",\n"),
+        select_parts.join(",\n  "),
+        where_parts.join("\n  AND "),
     );
-
     Ok(EmittedSql {
         sql,
         columns,
@@ -747,87 +1204,32 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
             flat_index,
         } => {
             walk_body(parent, dialect, frame)?;
-            let join_kw = if *left_join { "LEFT JOIN" } else { "JOIN" };
-            let lateral = dialect.lateral_keyword();
-            // Lower the optional ON-clause filter (used by `forEach` paths
-            // that contain a trailing `where(crit)`).
-            let extra_on = if let Some(filter) = on_filter {
-                let mut ctx = ExprCtx::new(dialect, frame.next_param);
-                let sql = lower_expr(filter, &mut ctx)?;
-                frame.next_param = ctx.next_param;
-                Some(sql)
-            } else {
-                None
-            };
-            let join_sql = if lateral.is_empty() {
-                // SQLite — `json_each(<root>, '$.path')` two-arg form when the
-                // source is a simple JSON path off the resource document;
-                // falls back to `json_each(<sql_expr>)` for anything richer.
-                let source_sql = emit_sqlite_unnest_source(source)?;
-                let on = match &extra_on {
-                    Some(f) => format!("1=1 AND {f}"),
-                    None => "1=1".to_string(),
-                };
-                if let Some(idx) = flat_index {
-                    // `forEach: "<chain>[N]"` — FHIRPath indexes the
-                    // FLATTENED collection, not each per-step iteration.
-                    // Hoist any prior joins (collected for this select) into
-                    // the LIMITed subquery so the outer SELECT sees at most
-                    // one row per resource.
-                    let inner = format!("{out_alias}_src");
-                    let prior = std::mem::take(&mut frame.joins);
-                    let prior_sources: Vec<String> = prior
-                        .iter()
-                        .map(|j| {
-                            j.sql
-                                .strip_prefix("JOIN ")
-                                .and_then(|s| s.find(" ON ").map(|i| s[..i].to_string()))
-                                .unwrap_or_else(|| j.sql.clone())
-                        })
-                        .collect();
-                    let from_chain = if prior_sources.is_empty() {
-                        format!("{source_sql} {inner}")
-                    } else {
-                        format!("{}, {source_sql} {inner}", prior_sources.join(", "))
-                    };
-                    format!(
-                        "{join_kw} (SELECT {inner}.value AS value FROM {from_chain} \
-                         WHERE {on} LIMIT 1 OFFSET {idx}) {out_alias} ON 1=1"
-                    )
+            let joins_before = frame.joins.len();
+            push_lateral_unnest(
+                source, out_alias, left_join, on_filter, flat_index, dialect, frame,
+            )?;
+            // A plain `forEach` below an EMPTY `forEachOrNull` keeps the null
+            // row: LEFT-join it and accept "no match" only when the ancestor
+            // missed (a present ancestor with no match still drops the row).
+            if !*left_join
+                && flat_index.is_none()
+                && let Some(root) = unnest_source_root(source)
+                && let Some((left, left_flat)) = nearest_left_scope(parent, root)
+                && let Some(join) = frame.joins.get_mut(joins_before)
+                && let Some(rest) = join.sql.strip_prefix("JOIN ")
+            {
+                let is_sqlite = dialect.lateral_keyword().is_empty();
+                join.sql = format!("LEFT JOIN {rest}");
+                let missed = if left_flat {
+                    format!("{left}.value IS NULL")
                 } else {
-                    format!("{join_kw} {source_sql} {out_alias} ON {on}")
-                }
-            } else {
-                // PostgreSQL — `jsonb_array_elements(<json_value>)` over the
-                // JSON-valued navigation (note: must use `->`, not `->>`).
-                let source_sql = emit_pg_unnest_source(source)?;
-                let unnest = dialect.unnest_array(&source_sql);
-                let on = match &extra_on {
-                    Some(f) => format!("TRUE AND {f}"),
-                    None => "TRUE".to_string(),
+                    format!("{} IS NULL", miss_signal(&left, is_sqlite))
                 };
-                if let Some(idx) = flat_index {
-                    format!(
-                        "{join_kw} LATERAL (SELECT value FROM {unnest} AS sub(value) \
-                         WHERE {on} LIMIT 1 OFFSET {idx}) AS {out_alias}(value) ON TRUE"
-                    )
-                } else {
-                    // `WITH ORDINALITY` exposes a 1-based `ordinality` column so
-                    // `%rowIndex` (see `lower_row_index`) can read the element's
-                    // position. Harmless for forEach queries that don't use it.
-                    format!(
-                        "{join_kw} {lateral}{unnest} WITH ORDINALITY AS {out_alias}(value, ordinality) ON {on}"
-                    )
-                }
-            };
-            frame.joins.push(JoinClause {
-                sql: join_sql,
-                // Indexed sources emit at most one row and don't expose an
-                // ordinal. Preserve their existing pick/index semantics.
-                occurrence_order: flat_index
-                    .is_none()
-                    .then(|| occurrence_order(out_alias, dialect)),
-            });
+                frame.predicates.push(format!(
+                    "({} IS NOT NULL OR {missed})",
+                    miss_signal(out_alias, is_sqlite)
+                ));
+            }
             Ok(())
         }
         PlanNode::Project { .. } => Err(SofError::InvalidViewDefinition(
@@ -840,6 +1242,101 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
             reason: "Recurse (repeat:) is not yet implemented in the emitter".to_string(),
         }),
     }
+}
+
+/// Renders one `LateralUnnest` as a FROM-clause join and pushes it onto
+/// `frame.joins`. Shared by [`walk_body`] and the recursive-CTE emitter.
+fn push_lateral_unnest(
+    source: &SqlExpr,
+    out_alias: &String,
+    left_join: &bool,
+    on_filter: &Option<SqlExpr>,
+    flat_index: &Option<i64>,
+    dialect: &dyn Dialect,
+    frame: &mut Frame,
+) -> Result<(), SofError> {
+    let join_kw = if *left_join { "LEFT JOIN" } else { "JOIN" };
+    let lateral = dialect.lateral_keyword();
+    // Lower the optional ON-clause filter (used by `forEach` paths
+    // that contain a trailing `where(crit)`).
+    let extra_on = if let Some(filter) = on_filter {
+        let mut ctx = ExprCtx::new(dialect, frame.next_param);
+        let sql = lower_expr(filter, &mut ctx)?;
+        frame.next_param = ctx.next_param;
+        Some(sql)
+    } else {
+        None
+    };
+    let join_sql = if lateral.is_empty() {
+        // SQLite — `json_each(<root>, '$.path')` two-arg form when the
+        // source is a simple JSON path off the resource document;
+        // falls back to `json_each(<sql_expr>)` for anything richer.
+        let source_sql = emit_sqlite_unnest_source(source)?;
+        let on = match &extra_on {
+            Some(f) => format!("1=1 AND {f}"),
+            None => "1=1".to_string(),
+        };
+        if let Some(idx) = flat_index {
+            // `forEach: "<chain>[N]"` — FHIRPath indexes the
+            // FLATTENED collection, not each per-step iteration.
+            // Hoist any prior joins (collected for this select) into
+            // the LIMITed subquery so the outer SELECT sees at most
+            // one row per resource.
+            let inner = format!("{out_alias}_src");
+            let prior = std::mem::take(&mut frame.joins);
+            let prior_sources: Vec<String> = prior
+                .iter()
+                .map(|j| {
+                    j.sql
+                        .strip_prefix("JOIN ")
+                        .and_then(|s| s.find(" ON ").map(|i| s[..i].to_string()))
+                        .unwrap_or_else(|| j.sql.clone())
+                })
+                .collect();
+            let from_chain = if prior_sources.is_empty() {
+                format!("{source_sql} {inner}")
+            } else {
+                format!("{}, {source_sql} {inner}", prior_sources.join(", "))
+            };
+            format!(
+                "{join_kw} (SELECT {inner}.value AS value FROM {from_chain} \
+                     WHERE {on} LIMIT 1 OFFSET {idx}) {out_alias} ON 1=1"
+            )
+        } else {
+            format!("{join_kw} {source_sql} {out_alias} ON {on}")
+        }
+    } else {
+        // PostgreSQL — `jsonb_array_elements(<json_value>)` over the
+        // JSON-valued navigation (note: must use `->`, not `->>`).
+        let source_sql = emit_pg_unnest_source(source)?;
+        let unnest = dialect.unnest_array(&source_sql);
+        let on = match &extra_on {
+            Some(f) => format!("TRUE AND {f}"),
+            None => "TRUE".to_string(),
+        };
+        if let Some(idx) = flat_index {
+            format!(
+                "{join_kw} LATERAL (SELECT value FROM {unnest} AS sub(value) \
+                     WHERE {on} LIMIT 1 OFFSET {idx}) AS {out_alias}(value) ON TRUE"
+            )
+        } else {
+            // `WITH ORDINALITY` exposes a 1-based `ordinality` column so
+            // `%rowIndex` (see `lower_row_index`) can read the element's
+            // position. Harmless for forEach queries that don't use it.
+            format!(
+                "{join_kw} {lateral}{unnest} WITH ORDINALITY AS {out_alias}(value, ordinality) ON {on}"
+            )
+        }
+    };
+    frame.joins.push(JoinClause {
+        sql: join_sql,
+        // Indexed sources emit at most one row and don't expose an
+        // ordinal. Preserve their existing pick/index semantics.
+        occurrence_order: flat_index
+            .is_none()
+            .then(|| occurrence_order(out_alias, dialect)),
+    });
+    Ok(())
 }
 
 /// SQL occurrence position, separate from the public `%rowIndex` value.
@@ -863,6 +1360,9 @@ fn occurrence_order(alias: &str, dialect: &dyn Dialect) -> String {
 struct ExprCtx<'a> {
     dialect: &'a dyn Dialect,
     next_param: usize,
+    /// Aliases of keyed `repeat` CTEs (those carrying a `pkey` scope column);
+    /// their `%rowIndex` ranks restart per seed scope.
+    keyed_repeats: Vec<String>,
 }
 
 impl<'a> ExprCtx<'a> {
@@ -870,6 +1370,7 @@ impl<'a> ExprCtx<'a> {
         Self {
             dialect,
             next_param,
+            keyed_repeats: Vec::new(),
         }
     }
 }
@@ -879,7 +1380,11 @@ impl<'a> ExprCtx<'a> {
 /// `COALESCE(.., 0)` on the `forEach` case covers the `forEachOrNull` empty
 /// case: a LEFT JOIN miss yields a NULL key/ordinality, which the spec maps to a
 /// null row with `%rowIndex` = 0.
-fn lower_row_index(scope: &RowIndexScope, dialect: &dyn Dialect) -> Result<String, SofError> {
+fn lower_row_index(
+    scope: &RowIndexScope,
+    dialect: &dyn Dialect,
+    keyed_repeats: &[String],
+) -> Result<String, SofError> {
     let is_sqlite = dialect.lateral_keyword().is_empty();
     Ok(match scope {
         // Top level and non-iterating scopes are always 0.
@@ -896,9 +1401,18 @@ fn lower_row_index(scope: &RowIndexScope, dialect: &dyn Dialect) -> Result<Strin
         // Both dialects: the recursive CTE carries a sortable pre-order
         // `ord_path`; ranking it per resource yields the 0-based pre-order
         // position.
-        RowIndexScope::Repeat(alias) => format!(
-            "(DENSE_RANK() OVER (PARTITION BY {alias}.rid ORDER BY {alias}.{REPEAT_ORD_PATH_COL}) - 1)"
-        ),
+        RowIndexScope::Repeat(alias) => {
+            // A keyed CTE holds one traversal per seed scope (`pkey`), so the
+            // rank restarts for each enclosing element, not just per resource.
+            let partition = if keyed_repeats.contains(alias) {
+                format!("{alias}.rid, {alias}.pkey")
+            } else {
+                format!("{alias}.rid")
+            };
+            format!(
+                "(DENSE_RANK() OVER (PARTITION BY {partition} ORDER BY {alias}.{REPEAT_ORD_PATH_COL}) - 1)"
+            )
+        }
     })
 }
 
@@ -908,7 +1422,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
         SqlExpr::JsonPath { root, path } => Ok(lower_json_path(root, path, ctx.dialect)),
         SqlExpr::Param(n) => Ok(ctx.dialect.placeholder(*n)),
         SqlExpr::ColRef(name) => Ok(name.clone()),
-        SqlExpr::RowIndex(scope) => lower_row_index(scope, ctx.dialect),
+        SqlExpr::RowIndex(scope) => lower_row_index(scope, ctx.dialect, &ctx.keyed_repeats),
         SqlExpr::Cast { inner, ty } => {
             let inner = lower_expr(inner, ctx)?;
             Ok(ctx.dialect.cast(&inner, *ty))
@@ -982,6 +1496,40 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
         SqlExpr::ChainArray {
             chain_sql,
             leaf_alias,
+            filter,
+            offset: Some(offset),
+            ..
+        } => {
+            // One-element array: the element at `offset` of the (filtered)
+            // flattened chain, or NULL (read as `[]` by the unnest guard)
+            // when absent.
+            let where_sql = match filter {
+                Some(f) => format!(
+                    " WHERE {}",
+                    ctx.dialect.truthy_predicate(&lower_expr(f, ctx)?)
+                ),
+                None => String::new(),
+            };
+            let element = if ctx.dialect.lateral_keyword().is_empty() {
+                format!(
+                    "json_array(CASE {leaf_alias}.type \
+                     WHEN 'object' THEN json({leaf_alias}.value) \
+                     WHEN 'array' THEN json({leaf_alias}.value) \
+                     WHEN 'true' THEN json('true') \
+                     WHEN 'false' THEN json('false') \
+                     ELSE {leaf_alias}.value END)"
+                )
+            } else {
+                format!("jsonb_build_array({leaf_alias}.value)")
+            };
+            Ok(format!(
+                "(SELECT {element} FROM {chain_sql}{where_sql} LIMIT 1 OFFSET {offset})"
+            ))
+        }
+        SqlExpr::ChainArray {
+            chain_sql,
+            leaf_alias,
+            ..
         } => {
             if ctx.dialect.lateral_keyword().is_empty() {
                 // SQLite's `json_each.value` is plain text for containers and
@@ -2114,7 +2662,7 @@ mod tests {
                 let plan = project(
                     PlanNode::Recurse {
                         parent: Box::new(scan()),
-                        seed: SqlExpr::Lit(LitValue::Null),
+                        seed_root: "r.data".to_string(),
                         step_paths: vec![JsonPath(vec![field("item")])],
                         out_alias: "rec_0".into(),
                     },
@@ -2130,6 +2678,204 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn rec(parent: PlanNode, seed_root: &str, paths: &[&[&str]], alias: &str) -> PlanNode {
+        PlanNode::Recurse {
+            parent: Box::new(parent),
+            seed_root: seed_root.to_string(),
+            step_paths: paths
+                .iter()
+                .map(|p| JsonPath(p.iter().map(|n| field(n)).collect()))
+                .collect(),
+            out_alias: alias.to_string(),
+        }
+    }
+
+    fn link_of(root: &str) -> SqlExpr {
+        json_path(root, vec![field("linkId")])
+    }
+
+    #[test]
+    fn single_repeat_on_the_resource_keeps_the_unkeyed_cte() {
+        let plan = project(
+            rec(scan(), "r.data", &[&["item"]], "rec_0"),
+            SqlExpr::RowIndex(RowIndexScope::Repeat("rec_0".into())),
+        );
+        for (label, dialect, _) in targets() {
+            let sql = emit_plan(&plan, dialect).unwrap().sql;
+            assert!(!sql.contains("pkey"), "{label}: {sql}");
+            assert!(
+                sql.contains("PARTITION BY rec_0.rid ORDER BY"),
+                "{label}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeat_seeded_from_a_foreach_is_keyed_by_the_iteration_row() {
+        let each = unnest(json_path("r.data", vec![field("item")]));
+        let plan = project(
+            rec(each, "fe.value", &[&["item"]], "rec_1"),
+            link_of("rec_1.node"),
+        );
+        for (label, dialect, _) in targets() {
+            let sql = emit_plan(&plan, dialect).unwrap().sql;
+            assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{label}: {sql}");
+            assert!(
+                sql.contains("rec_1(rid, node, ord_path, pkey)"),
+                "{label}: {sql}"
+            );
+            // The seed replays the enclosing forEach before descending.
+            let seed = sql.split("UNION ALL").next().unwrap();
+            assert!(
+                seed.contains("fe.ordinality") || seed.contains("fe.rowid"),
+                "{label}: {sql}"
+            );
+            // The main query joins the CTE back on resource and scope key.
+            assert!(
+                sql.contains("JOIN rec_1 ON rec_1.rid = r.id AND rec_1.pkey = "),
+                "{label}: {sql}"
+            );
+            assert!(sql.contains("rec_1.node"), "{label}: {sql}");
+        }
+    }
+
+    #[test]
+    fn repeat_nested_in_a_repeat_reads_the_parent_cte() {
+        let plan = project(
+            rec(
+                rec(scan(), "r.data", &[&["item"]], "rec_0"),
+                "rec_0.node",
+                &[&["item"]],
+                "rec_1",
+            ),
+            link_of("rec_1.node"),
+        );
+        for (label, dialect, _) in targets() {
+            let sql = emit_plan(&plan, dialect).unwrap().sql;
+            assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{label}: {sql}");
+            let rec_1 = sql.split("rec_1(rid").nth(1).unwrap();
+            assert!(
+                rec_1.contains("JOIN rec_0 ON rec_0.rid = r.id AND rec_0.pkey = "),
+                "{label}: {sql}"
+            );
+            assert!(
+                sql.contains("rec_0.pkey || '/' || rec_0.ord_path"),
+                "{label}: {sql}"
+            );
+            // The parent CTE keeps the resource-level (empty) scope key.
+            assert!(
+                sql.contains("rec_0(rid, node, ord_path, pkey)"),
+                "{label}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_repeats_share_a_scope_and_both_join_the_main_query() {
+        let plan = project(
+            rec(
+                rec(scan(), "r.data", &[&["item"]], "rec_0"),
+                "r.data",
+                &[&["item"]],
+                "rec_1",
+            ),
+            link_of("rec_1.node"),
+        );
+        for (label, dialect, _) in targets() {
+            let sql = emit_plan(&plan, dialect).unwrap().sql;
+            assert!(
+                sql.contains("JOIN rec_0 ON rec_0.rid = r.id AND rec_0.pkey = "),
+                "{label}: {sql}"
+            );
+            assert!(
+                sql.contains("JOIN rec_1 ON rec_1.rid = r.id AND rec_1.pkey = "),
+                "{label}: {sql}"
+            );
+            // A sibling seed never replays the other repeat.
+            let rec_1 = sql.split("rec_1(rid").nth(1).unwrap();
+            let seed = rec_1.split("UNION ALL").next().unwrap();
+            assert!(!seed.contains("JOIN rec_0"), "{label}: {sql}");
+        }
+    }
+
+    #[test]
+    fn keyed_repeat_row_index_restarts_per_seed_scope() {
+        let each = unnest(json_path("r.data", vec![field("item")]));
+        let plan = project(
+            rec(each, "fe.value", &[&["item"]], "rec_1"),
+            SqlExpr::RowIndex(RowIndexScope::Repeat("rec_1".into())),
+        );
+        for (label, dialect, _) in targets() {
+            let sql = emit_plan(&plan, dialect).unwrap().sql;
+            assert!(
+                sql.contains("PARTITION BY rec_1.rid, rec_1.pkey ORDER BY rec_1.ord_path"),
+                "{label}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeat_that_cannot_be_identified_refuses_to_enclose_another() {
+        for paths in [
+            &[&["item"][..], &["answer", "item"][..]][..],
+            &[&["answer", "item"][..]][..],
+        ] {
+            let plan = project(
+                rec(
+                    rec(scan(), "r.data", paths, "rec_0"),
+                    "rec_0.node",
+                    &[&["item"]],
+                    "rec_1",
+                ),
+                link_of("rec_1.node"),
+            );
+            for (label, dialect, _) in targets() {
+                let err = emit_plan(&plan, dialect).unwrap_err();
+                assert!(
+                    matches!(err, SofError::Uncompilable { .. }),
+                    "{label}: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filter_above_a_repeat_is_applied_not_a_panic() {
+        let plan = project(
+            PlanNode::Filter {
+                parent: Box::new(rec(scan(), "r.data", &[&["item"]], "rec_0")),
+                predicate: SqlExpr::Lit(LitValue::Bool(true)),
+            },
+            link_of("rec_0.node"),
+        );
+        for (label, dialect, _) in targets() {
+            let sql = emit_plan(&plan, dialect).unwrap().sql;
+            assert!(sql.contains("JOIN rec_0 ON"), "{label}: {sql}");
+        }
+    }
+
+    #[test]
+    fn unnest_over_a_repeat_keeps_postgres_ordinality() {
+        let plan = project(
+            PlanNode::LateralUnnest {
+                parent: Box::new(rec(scan(), "r.data", &[&["item"]], "rec_0")),
+                source: json_path("rec_0.node", vec![field("answer")]),
+                out_alias: "fe".to_string(),
+                left_join: false,
+                on_filter: None,
+                flat_index: None,
+            },
+            SqlExpr::RowIndex(RowIndexScope::ForEach("fe".into())),
+        );
+        let sql = emit_plan(&plan, &super::super::dialect::PgDialect)
+            .unwrap()
+            .sql;
+        assert!(
+            sql.contains("WITH ORDINALITY AS fe(value, ordinality)"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -2370,7 +3116,7 @@ mod tests {
                 project(
                     PlanNode::Recurse {
                         parent: Box::new(scan()),
-                        seed: SqlExpr::Lit(LitValue::Null),
+                        seed_root: "r.data".to_string(),
                         step_paths: vec![JsonPath(vec![n()]), JsonPath(vec![n(), n()])],
                         out_alias: "rec_0".to_string(),
                     },
@@ -2781,7 +3527,7 @@ mod tests {
         };
         **parent = PlanNode::Recurse {
             parent: Box::new(scan()),
-            seed: SqlExpr::Lit(LitValue::Null),
+            seed_root: "r.data".to_string(),
             step_paths: vec![JsonPath(vec![field("extension")])],
             out_alias: "rec_0".to_string(),
         };

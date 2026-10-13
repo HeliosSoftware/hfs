@@ -129,11 +129,34 @@ struct SubBatchDocs {
     own_docs: Vec<Document>,
     contained_owners: Vec<usize>,
     contained_docs: Vec<Document>,
+    missing_params: Vec<(usize, Option<Vec<String>>)>,
 }
 
 impl SubBatchDocs {
     fn len(&self) -> usize {
         self.own_docs.len() + self.contained_docs.len()
+    }
+
+    fn missing_updates(
+        &mut self,
+        tenant_id: &str,
+        resources: &[StoredResource],
+    ) -> Vec<(usize, Document)> {
+        std::mem::take(&mut self.missing_params)
+            .into_iter()
+            .map(|(owner, names)| {
+                let resource = &resources[owner];
+                (
+                    owner,
+                    doc! {
+                        "q": resource_version_filter(tenant_id, resource),
+                        "u": super::storage::with_missing_metadata_update(doc! {}, names.as_deref()),
+                        "multi": false,
+                        "upsert": false,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -153,11 +176,13 @@ fn flatten_sub_batch(
         own_docs: Vec::new(),
         contained_owners: Vec::new(),
         contained_docs: Vec::new(),
+        missing_params: Vec::new(),
     };
     for (offset, (docs, failure)) in prepared.into_iter().enumerate() {
         let i = start + offset;
         doc_counts[i] = docs.own.len() + docs.contained.len();
         extract_failures[i] = failure;
+        batch.missing_params.push((i, docs.missing_params));
         for d in docs.own {
             batch.own_owners.push(i);
             batch.own_docs.push(d);
@@ -197,6 +222,81 @@ fn delete_filters(tenant_id: &str, resources: &[StoredResource]) -> Vec<Document
             }
         })
         .collect()
+}
+
+fn resource_version_filter(tenant_id: &str, resource: &StoredResource) -> Document {
+    doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource.resource_type(),
+        "id": resource.id(),
+        "version_id": resource.version_id(),
+        "is_deleted": false,
+    }
+}
+
+/// Parse the actual update-command reply, attributing statement errors to the
+/// original page owners rather than the sub-batch's local statement positions.
+fn metadata_update_result(
+    reply: &Document,
+    updates: &[(usize, Document)],
+) -> Result<(usize, HashMap<usize, String>), String> {
+    if let Some(error) = reply.get("writeConcernError") {
+        return Err(format!(
+            "Unacknowledged reindex missing metadata update: {error}"
+        ));
+    }
+    let mut failures = HashMap::new();
+    if reply.contains_key("writeErrors") {
+        let errors = reply
+            .get_array("writeErrors")
+            .map_err(|_| "Invalid reindex metadata write errors")?;
+        for error in errors {
+            let error = error
+                .as_document()
+                .ok_or("Invalid reindex metadata write error")?;
+            let index = error
+                .get_i32("index")
+                .map_err(|_| "Missing reindex metadata error index")?;
+            let owner = updates
+                .get(usize::try_from(index).map_err(|_| "Invalid reindex metadata error index")?)
+                .ok_or("Reindex metadata error index outside batch")?
+                .0;
+            failures.insert(owner, format!("Failed to update missing metadata: {error}"));
+        }
+    }
+    let matched = reply
+        .get_i64("n")
+        .or_else(|_| reply.get_i32("n").map(i64::from))
+        .map_err(|_| "Missing reindex metadata matched count")?;
+    let matched = usize::try_from(matched).map_err(|_| "Invalid reindex metadata matched count")?;
+    if matched > updates.len() {
+        return Err("Reindex metadata matched count exceeds batch".into());
+    }
+    Ok((matched, failures))
+}
+
+/// Update metadata in bounded commands, never overwriting a newer live version.
+/// A nonmatch leaves superseded, deleted or absent resources alone. The existing
+/// catch-up walk handles concurrent writes; command and acknowledgement errors fail.
+async fn update_missing_metadata(
+    db: &mongodb::Database,
+    updates: &[(usize, Document)],
+) -> Result<HashMap<usize, String>, String> {
+    let mut failures = HashMap::new();
+    for chunk in updates.chunks(REINDEX_SUBBATCH_MAX) {
+        let statements: Vec<_> = chunk.iter().map(|(_, update)| update.clone()).collect();
+        let reply = db
+            .run_command(doc! {
+                "update": super::MongoBackend::RESOURCES_COLLECTION,
+                "updates": statements,
+                "ordered": false,
+            })
+            .await
+            .map_err(|error| format!("Failed to update reindex missing metadata: {error}"))?;
+        let (_, write_failures) = metadata_update_result(&reply, chunk)?;
+        failures.extend(write_failures);
+    }
+    Ok(failures)
 }
 
 /// What a database task hands back to the page's own thread when joined:
@@ -407,6 +507,8 @@ async fn delete_page(
 async fn insert_sub_batch(
     own: mongodb::Collection<Document>,
     contained: mongodb::Collection<Document>,
+    db: mongodb::Database,
+    missing_updates: Vec<(usize, Document)>,
     docs: SubBatchDocs,
 ) -> DbTask<InsertFailures> {
     let mut stats = ReindexPageStats::default();
@@ -420,7 +522,7 @@ async fn insert_sub_batch(
     )
     .await;
     stats.insert += started.elapsed();
-    let own_failures = match own_result {
+    let mut own_failures = match own_result {
         Ok(failures) => failures,
         Err(msg) => {
             return DbTask {
@@ -450,6 +552,22 @@ async fn insert_sub_batch(
                 };
             }
         };
+    }
+    let started = std::time::Instant::now();
+    let metadata_result = update_missing_metadata(&db, &missing_updates).await;
+    stats.insert += started.elapsed();
+    match metadata_result {
+        Ok(failures) => {
+            for (owner, message) in failures {
+                own_failures.entry(owner).or_insert(message);
+            }
+        }
+        Err(message) => {
+            return DbTask {
+                stats,
+                result: Err(message),
+            };
+        }
     }
     DbTask {
         stats,
@@ -486,6 +604,7 @@ impl super::MongoBackend {
         multi_thread: bool,
     ) -> Vec<StorageResult<usize>> {
         let n = resources.len();
+
         let own = db.collection::<Document>(Self::SEARCH_INDEX_COLLECTION);
         let contained = db.collection::<Document>(Self::SEARCH_INDEX_CONTAINED_COLLECTION);
         let prepare = |i: usize| self.extract_one(tenant_id, &resources[i]);
@@ -507,7 +626,8 @@ impl super::MongoBackend {
         };
         let mut extract_failures: Vec<Option<String>> = vec![None; n];
         let mut doc_counts: Vec<usize> = vec![0; n];
-        let batch = flatten_sub_batch(0, prepared, &mut extract_failures, &mut doc_counts);
+        let mut batch = flatten_sub_batch(0, prepared, &mut extract_failures, &mut doc_counts);
+        let missing_updates = batch.missing_updates(tenant_id, resources);
         stats.extract += started.elapsed();
         stats.sub_batches += 1;
         stats.pool_sub_batches += u64::from(on_pool);
@@ -522,7 +642,7 @@ impl super::MongoBackend {
             return fan_out(n, &msg);
         }
 
-        let done = insert_sub_batch(own, contained, batch).await;
+        let done = insert_sub_batch(own, contained, db.clone(), missing_updates, batch).await;
         absorb_db_task(stats, &done.stats);
         stats.db_wait = Some(stats.delete + stats.insert);
         let insert_failures = match done.result {
@@ -555,6 +675,7 @@ impl super::MongoBackend {
         stats: &mut ReindexPageStats,
     ) -> Vec<StorageResult<usize>> {
         let n = resources.len();
+
         let own = db.collection::<Document>(Self::SEARCH_INDEX_COLLECTION);
         let contained = db.collection::<Document>(Self::SEARCH_INDEX_CONTAINED_COLLECTION);
         let pool = self.reindex_prepare_pool();
@@ -591,12 +712,13 @@ impl super::MongoBackend {
             // previous sub-batch's insert.
             let started = std::time::Instant::now();
             let (prepared, on_pool) = extract_range(&env, range.clone(), &prepare);
-            let batch = flatten_sub_batch(
+            let mut batch = flatten_sub_batch(
                 range.start,
                 prepared,
                 &mut extract_failures,
                 &mut doc_counts,
             );
+            let missing_updates = batch.missing_updates(tenant_id, resources);
             stats.extract += started.elapsed();
             stats.sub_batches += 1;
             stats.pool_sub_batches += u64::from(on_pool);
@@ -627,6 +749,8 @@ impl super::MongoBackend {
             in_flight = Some(AbortOnDrop::spawn(insert_sub_batch(
                 own.clone(),
                 contained.clone(),
+                db.clone(),
+                missing_updates,
                 batch,
             )));
         }
@@ -684,6 +808,54 @@ impl super::MongoBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_update_errors_keep_page_owners_and_unmatched_counts() {
+        let updates = vec![(7, doc! {}), (12, doc! {})];
+        let (matched, failures) = metadata_update_result(
+            &doc! {
+                "n": 1_i32,
+                "writeErrors": [{ "index": 1, "code": 121, "errmsg": "metadata rejected" }],
+            },
+            &updates,
+        )
+        .unwrap();
+        assert_eq!(matched, 1);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[&12].contains("metadata rejected"));
+        assert!(!failures.contains_key(&7));
+
+        let (matched, failures) = metadata_update_result(&doc! { "n": 0_i64 }, &updates).unwrap();
+        assert_eq!(
+            matched, 0,
+            "superseded resources do not match the guarded update"
+        );
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn metadata_update_requires_acknowledgement_and_valid_reply() {
+        let updates = vec![(7, doc! {})];
+        let reply = doc! {
+            "n": 1,
+            "writeConcernError": { "code": 64, "errmsg": "replication timed out" },
+        };
+        assert!(
+            metadata_update_result(&reply, &updates)
+                .unwrap_err()
+                .contains("Unacknowledged")
+        );
+        for reply in [
+            doc! {},
+            doc! { "n": -1 },
+            doc! { "n": 2 },
+            doc! { "n": 0, "writeErrors": [{ "index": 3, "errmsg": "out of range" }] },
+            doc! { "n": 0, "writeErrors": [{ "index": -1, "errmsg": "negative index" }] },
+            doc! { "n": 0, "writeErrors": "invalid" },
+        ] {
+            assert!(metadata_update_result(&reply, &updates).is_err(), "{reply}");
+        }
+    }
 
     #[test]
     fn planner_first_range_is_first_without_a_seed() {
@@ -777,6 +949,7 @@ mod tests {
                 SearchIndexDocuments {
                     own: vec![own_a.clone()],
                     contained: vec![contained_a.clone()],
+                    missing_params: Some(vec!["absent".into()]),
                 },
                 None,
             ),
@@ -784,6 +957,7 @@ mod tests {
                 SearchIndexDocuments {
                     own: vec![own_b.clone()],
                     contained: Vec::new(),
+                    missing_params: None,
                 },
                 Some("boom".to_string()),
             ),
@@ -800,6 +974,10 @@ mod tests {
         assert_eq!(batch.contained_owners, vec![5]);
         assert_eq!(batch.contained_docs, vec![contained_a]);
         assert_eq!(batch.len(), 3);
+        assert_eq!(
+            batch.missing_params,
+            vec![(5, Some(vec!["absent".to_owned()])), (6, None)]
+        );
         assert_eq!(doc_counts[5], 2);
         assert_eq!(doc_counts[6], 1);
         assert_eq!(doc_counts[0], 0);

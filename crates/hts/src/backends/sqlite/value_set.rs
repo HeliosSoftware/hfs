@@ -563,7 +563,14 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 inline_ctx
                     .default_value_set_versions
                     .clone_from(&req.default_value_set_versions);
-                let codes = if let Some(filter) = req.filter.as_deref() {
+                // `expand_inline_filtered` reads neither `exclude`, nor
+                // `include[].valueSet`, nor `contained`; composes that use them
+                // go through the general path and the text filter is applied
+                // afterwards over the full result.
+                let text_filter_fast = !compose_needs_general_path(compose)
+                    && inline_ctx.contained.is_empty();
+                let codes = if let Some(filter) = req.filter.as_deref().filter(|_| text_filter_fast)
+                {
                     let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
                     let compose_str = compose.to_string();
                     let prop_key = format!("prop-result:{:016x}", fnv64(compose_str.as_bytes()));
@@ -662,7 +669,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // on the full ECL expansion (which can take >30 s for large
                         // SNOMED hierarchies). We skip background cache population to
                         // avoid exhausting the r2d2 pool with long-running writes.
-                        if let Some(count) = req.count.filter(|&c| c > 0) {
+                        if let Some(count) = req
+                            .count
+                            .filter(|&c| c > 0)
+                            .filter(|_| req.filter.is_none())
+                        {
                             let bfs_offset = req.offset.unwrap_or(0) as usize;
 
                             // Single-include is-a / descendent-of: BFS with LIMIT.
@@ -889,8 +900,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             // materialisation and concept-id ordering on filtered typeahead.
                             let codes = if let Some(filter) = req.filter.as_deref() {
                                 if let Some(compose_str) = compose_json.as_deref() {
-                                    if let Ok(compose) =
+                                    if let Some(compose) =
                                         serde_json::from_str::<serde_json::Value>(compose_str)
+                                            .ok()
+                                            .filter(|c| !compose_needs_general_path(c))
                                     {
                                         let limit_hint =
                                             req.count.map(|c| ((c as usize) * 10).max(100));
@@ -4040,8 +4053,13 @@ fn apply_compose_filters(
         let op = f["op"].as_str().unwrap_or("");
         let property = f["property"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
-        let in_single_value = op == "in" && !value.contains(',');
+        let in_single_value = op == "in" && !value.contains(',') && !is_concept_prop(property);
         (op == "=" || in_single_value) && property != "constraint"
+    });
+    // Multi-value `in` (comma-separated list) and `in` on the concept identifier
+    // (`concept` / `code`): the union of the per-value matches.
+    let (property_in_filters, mut rest): (Vec<_>, Vec<_>) = rest.drain(..).partition(|f| {
+        f["op"].as_str() == Some("in") && f["property"].as_str() != Some("constraint")
     });
     // `not-in` (single-value) and `!=` filters select concepts whose property
     // is NOT equal to the value (treating concepts with no such property as
@@ -4051,9 +4069,7 @@ fn apply_compose_filters(
     let (property_ne_filters, mut rest_ne): (Vec<_>, Vec<_>) = rest.drain(..).partition(|f| {
         let op = f["op"].as_str().unwrap_or("");
         let property = f["property"].as_str().unwrap_or("");
-        let value = f["value"].as_str().unwrap_or("");
-        let not_in_single_value = op == "not-in" && !value.contains(',');
-        (op == "!=" || not_in_single_value) && property != "constraint"
+        (op == "!=" || op == "not-in") && property != "constraint"
     });
     let (regex_filters, hierarchy_filters): (Vec<_>, Vec<_>) = rest_ne
         .drain(..)
@@ -4122,7 +4138,22 @@ fn apply_compose_filters(
         }
     }
 
-    // ── Phase 1.5: property-NOT-equality filters (`!=`, `not-in` single value) ─
+    // ── Phase 1.2: `in` filters (multi-value, or on the concept identifier) ───
+    for f in &property_in_filters {
+        let property = f["property"].as_str().unwrap_or("");
+        let value = f["value"].as_str().unwrap_or("");
+        any_filter_seen = true;
+        let concepts = query_property_in(conn, system_url, system_id, property, value)?;
+        match result.as_mut() {
+            Some(prev) => {
+                let keep: HashSet<String> = concepts.iter().map(|c| c.code.clone()).collect();
+                prev.retain(|c| keep.contains(&c.code));
+            }
+            None => result = Some(concepts),
+        }
+    }
+
+    // ── Phase 1.5: property-NOT-equality filters (`!=`, `not-in`) ─────────────
     // The IG `notSelectable/notSelectable-prop-out*` fixtures use
     // `filter: { property: notSelectable, op: not-in, value: "true" }` which
     // means "select all concepts whose `notSelectable` property is NOT true
@@ -4132,11 +4163,14 @@ fn apply_compose_filters(
         let property = f["property"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
         any_filter_seen = true;
-        let excluded: HashSet<String> =
+        let excluded: HashSet<String> = if f["op"].as_str() == Some("not-in") {
+            query_property_in(conn, system_url, system_id, property, value)?
+        } else {
             query_property_eq(conn, system_url, system_id, property, value)?
-                .into_iter()
-                .map(|c| c.code)
-                .collect();
+        }
+        .into_iter()
+        .map(|c| c.code)
+        .collect();
         match result.as_mut() {
             Some(prev) => {
                 prev.retain(|c| !excluded.contains(&c.code));
@@ -4180,6 +4214,34 @@ fn apply_compose_filters(
             }
             let children = query_direct_children(conn, system_url, system_id, value)?;
             result = Some(children);
+            continue;
+        }
+
+        // `is-not-a`: every concept of the system outside the closure of
+        // `value` (the root itself is excluded too).
+        if is_concept_prop(property) && op == "is-not-a" {
+            if value.is_empty() {
+                return Err(HtsError::VsInvalid(
+                    "ValueSet compose filter with op='is-not-a' is missing a value".to_string(),
+                ));
+            }
+            any_filter_seen = true;
+            let closure: HashSet<String> =
+                ecl::parse_and_evaluate(conn, system_id, &format!("<< {value}"))?
+                    .into_iter()
+                    .map(|c| c.code)
+                    .collect();
+            match result.as_mut() {
+                Some(prev) => prev.retain(|c| !closure.contains(&c.code)),
+                None => {
+                    let all = query_all_concepts_in_system(conn, system_url, system_id)?;
+                    result = Some(
+                        all.into_iter()
+                            .filter(|c| !closure.contains(&c.code))
+                            .collect(),
+                    );
+                }
+            }
             continue;
         }
 
@@ -4613,6 +4675,44 @@ fn query_subtree_with_property(
         };
 
     Ok(pairs.into_iter().map(make).collect())
+}
+
+/// `concept` and `code` both name the concept identifier in compose filters.
+fn is_concept_prop(property: &str) -> bool {
+    property == "concept" || property == "code"
+}
+
+/// Concepts matching any of the comma-separated `values` for `property`
+/// (the `in` operator). On the concept identifier the values are codes.
+fn query_property_in(
+    conn: &Connection,
+    system_url: &str,
+    system_id: &str,
+    property: &str,
+    values: &str,
+) -> Result<Vec<ExpansionContains>, HtsError> {
+    let wanted: Vec<&str> = values
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect();
+    if is_concept_prop(property) {
+        let set: HashSet<&str> = wanted.into_iter().collect();
+        return Ok(query_all_concepts_in_system(conn, system_url, system_id)?
+            .into_iter()
+            .filter(|c| set.contains(c.code.as_str()))
+            .collect());
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for v in wanted {
+        for c in query_property_eq(conn, system_url, system_id, property, v)? {
+            if seen.insert(c.code.clone()) {
+                out.push(c);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Look up all concepts in `system_id` that have a property matching
@@ -5299,6 +5399,11 @@ fn apply_compose_filters_to_candidates(
                     candidates.retain(|c| keep.contains(&c.code));
                 }
             }
+            ("concept", "is-not-a") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let closure = batch_descendants_in_set(conn, system_id, value, true, &codes)?;
+                candidates.retain(|c| !closure.contains(&c.code));
+            }
             (_, "=") => {
                 let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
                 let valid = batch_property_eq_in_set(conn, system_id, property, value, &codes)?;
@@ -5309,12 +5414,41 @@ fn apply_compose_filters_to_candidates(
             // notSelectable-prop-out*` fixtures rely on `not-in` semantics
             // — concepts with no matching property entry pass too.
             (_, "not-in") | (_, "!=") => {
-                if !value.contains(',') {
-                    let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
-                    let excluded =
-                        batch_property_eq_in_set(conn, system_id, property, value, &codes)?;
-                    candidates.retain(|c| !excluded.contains(&c.code));
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let values: Vec<&str> = if op == "not-in" {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .collect()
+                } else {
+                    vec![value]
+                };
+                let mut excluded: HashSet<String> = HashSet::new();
+                for v in values {
+                    if property_norm == "concept" {
+                        excluded.insert(v.to_owned());
+                    } else {
+                        excluded.extend(batch_property_eq_in_set(
+                            conn, system_id, property, v, &codes,
+                        )?);
+                    }
                 }
+                candidates.retain(|c| !excluded.contains(&c.code));
+            }
+            (_, "in") => {
+                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
+                let mut keep: HashSet<String> = HashSet::new();
+                for v in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    if property_norm == "concept" {
+                        keep.insert(v.to_owned());
+                    } else {
+                        keep.extend(batch_property_eq_in_set(
+                            conn, system_id, property, v, &codes,
+                        )?);
+                    }
+                }
+                candidates.retain(|c| keep.contains(&c.code));
             }
             _ => {}
         }
@@ -5377,6 +5511,9 @@ fn try_multiinclude_hierarchy_page(
     offset: usize,
     warnings: &mut Vec<String>,
 ) -> Result<Option<Vec<ExpansionContains>>, HtsError> {
+    if compose_needs_general_path(compose) {
+        return Ok(None);
+    }
     let includes = match compose["include"].as_array() {
         Some(a) if a.len() >= 2 => a,
         _ => return Ok(None),
@@ -5685,6 +5822,17 @@ fn compose_page_fast(
     Ok(Some((result, total)))
 }
 
+/// True when the compose uses `exclude` or `include[].valueSet`, which the
+/// BFS page fast paths and the text-filter route (`expand_inline_filtered`)
+/// do not evaluate. Those requests must take the general path.
+fn compose_needs_general_path(compose: &serde_json::Value) -> bool {
+    compose["exclude"].as_array().is_some_and(|a| !a.is_empty())
+        || compose["include"].as_array().is_some_and(|incs| {
+            incs.iter()
+                .any(|i| i["valueSet"].as_array().is_some_and(|a| !a.is_empty()))
+        })
+}
+
 /// Matches composes with exactly one include clause that carries exactly one
 /// filter of type `concept is-a` or `concept descendent-of`.  Richer composes
 /// (multi-filter, property= filters, multiple includes) fall through to the
@@ -5697,11 +5845,17 @@ fn extract_simple_hierarchy_compose(
     compose: &serde_json::Value,
     warnings: &mut Vec<String>,
 ) -> Result<Option<(String, String, String, bool)>, HtsError> {
+    if compose_needs_general_path(compose) {
+        return Ok(None);
+    }
     let includes = match compose["include"].as_array() {
         Some(a) if a.len() == 1 => a,
         _ => return Ok(None),
     };
     let inc = &includes[0];
+    if inc["concept"].as_array().is_some_and(|a| !a.is_empty()) {
+        return Ok(None);
+    }
 
     let filters = match inc["filter"].as_array() {
         Some(f) if f.len() == 1 => f,
@@ -12380,5 +12534,139 @@ mod tests {
             ),
             sys2_rowid
         );
+    }
+
+    // ── compose op coverage (VCL front-end relies on these) ─────────────────
+
+    async fn compose_ops_codes(
+        compose: serde_json::Value,
+        count: Option<u32>,
+        filter: Option<&str>,
+    ) -> Vec<String> {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_with_hierarchy().as_bytes())
+            .await
+            .unwrap();
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(serde_json::json!({
+                        "resourceType": "ValueSet",
+                        "compose": compose
+                    })),
+                    count,
+                    filter: filter.map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut codes: Vec<String> = resp.contains.iter().map(|c| c.code.clone()).collect();
+        codes.sort();
+        codes
+    }
+
+    const COMPOSE_OPS_SYS: &str = "http://example.org/cs-hier";
+
+    #[tokio::test]
+    async fn compose_ops_is_not_a_excludes_closure_including_root() {
+        let codes = compose_ops_codes(
+            serde_json::json!({"include": [{"system": COMPOSE_OPS_SYS,
+                "filter": [{"property": "concept", "op": "is-not-a", "value": "root"}]}]}),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(codes, vec!["orphan"]);
+    }
+
+    #[tokio::test]
+    async fn compose_ops_in_multi_value_on_concept() {
+        let codes = compose_ops_codes(
+            serde_json::json!({"include": [{"system": COMPOSE_OPS_SYS,
+                "filter": [{"property": "concept", "op": "in", "value": "child1,orphan"}]}]}),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(codes, vec!["child1", "orphan"]);
+    }
+
+    #[tokio::test]
+    async fn compose_ops_not_in_multi_value_on_concept() {
+        let codes = compose_ops_codes(
+            serde_json::json!({"include": [{"system": COMPOSE_OPS_SYS,
+                "filter": [{"property": "concept", "op": "not-in", "value": "child1,child2"}]}]}),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(codes, vec!["orphan", "root"]);
+    }
+
+    #[tokio::test]
+    async fn compose_ops_is_a_with_exclude_filter_and_count_honours_exclude() {
+        let codes = compose_ops_codes(
+            serde_json::json!({
+                "include": [{"system": COMPOSE_OPS_SYS,
+                    "filter": [{"property": "concept", "op": "is-a", "value": "root"}]}],
+                "exclude": [{"system": COMPOSE_OPS_SYS,
+                    "filter": [{"property": "concept", "op": "is-a", "value": "child1"}]}]
+            }),
+            Some(10),
+            None,
+        )
+        .await;
+        assert_eq!(codes, vec!["child2", "root"]);
+    }
+
+    #[tokio::test]
+    async fn compose_ops_multi_include_with_exclude_and_count_honours_exclude() {
+        let codes = compose_ops_codes(
+            serde_json::json!({
+                "include": [
+                    {"system": COMPOSE_OPS_SYS,
+                     "filter": [{"property": "concept", "op": "is-a", "value": "child1"}]},
+                    {"system": COMPOSE_OPS_SYS,
+                     "filter": [{"property": "concept", "op": "is-a", "value": "child2"}]}
+                ],
+                "exclude": [{"system": COMPOSE_OPS_SYS, "concept": [{"code": "child2"}]}]
+            }),
+            Some(10),
+            None,
+        )
+        .await;
+        assert_eq!(codes, vec!["child1"]);
+    }
+
+    #[tokio::test]
+    async fn compose_ops_exclude_with_text_filter_honours_exclude() {
+        let codes = compose_ops_codes(
+            serde_json::json!({
+                "include": [{"system": COMPOSE_OPS_SYS,
+                    "filter": [{"property": "concept", "op": "is-a", "value": "root"}]}],
+                "exclude": [{"system": COMPOSE_OPS_SYS, "concept": [{"code": "child1"}]}]
+            }),
+            None,
+            Some("child"),
+        )
+        .await;
+        assert_eq!(codes, vec!["child2"]);
+    }
+
+    #[tokio::test]
+    async fn compose_ops_filtered_candidates_support_is_not_a_and_in() {
+        let codes = compose_ops_codes(
+            serde_json::json!({"include": [{"system": COMPOSE_OPS_SYS,
+            "filter": [
+                {"property": "concept", "op": "is-not-a", "value": "child1"},
+                {"property": "concept", "op": "in", "value": "child1,child2,orphan"}
+            ]}]}),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(codes, vec!["child2", "orphan"]);
     }
 }

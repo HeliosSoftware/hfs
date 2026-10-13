@@ -1042,6 +1042,14 @@ impl QueryBuilder {
                 // _filter uses advanced filter expression syntax
                 self.build_filter_condition(&param.values, param_offset)
             }
+            "_in" => {
+                // `_in` (List/Group membership) is resolved application-side
+                // into an `_id` filter before the backend runs, and nothing
+                // indexes it. One that still arrives here was never resolved;
+                // fail closed rather than drop the filter and answer with
+                // every resource of the type (#638).
+                Some(SqlFragment::new("1 = 0"))
+            }
             _ => {
                 // Not "fall through to regular handling", as this comment used
                 // to claim: the caller returns whatever this yields, so `None`
@@ -1498,12 +1506,10 @@ mod tests {
         }
     }
 
-    /// `_in` never reaches the index — nothing writes rows for it, and the
-    /// SQLite special-parameter path has no arm for it, so a query naming it
-    /// would silently return the whole type. `helios-rest` rejects it before
-    /// the backend is asked; this pins the backend half of that contract so a
-    /// future "just let it through" change has to confront the drop. Update it
-    /// when membership resolution lands (#638).
+    /// `_in` never reaches the index — nothing writes rows for it — and is
+    /// resolved into an `_id` filter before the backend runs. This pins the
+    /// backstop: an `_in` that arrives unresolved matches nothing instead of
+    /// being dropped, which would return the whole type (#638).
     #[test]
     fn membership_parameter_has_no_backend_condition() {
         let builder = QueryBuilder::new("tenant1", "Patient");
@@ -1516,9 +1522,12 @@ mod tests {
             components: vec![],
         };
 
-        assert!(
-            builder.build_parameter_condition(&param, 2).is_none(),
-            "_in must not be answered by the index; it is rejected at the REST layer"
+        let fragment = builder
+            .build_parameter_condition(&param, 2)
+            .expect("an unresolved _in must not be dropped");
+        assert_eq!(
+            fragment.sql, "1 = 0",
+            "an unresolved _in must match nothing"
         );
     }
 
