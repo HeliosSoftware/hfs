@@ -2,10 +2,8 @@
 #
 # Cross-leg comparison for the FHIR Benchmark run summary: three metric tables
 # (throughput, p95 latency, errors) with suites as rows and legs as columns,
-# an indexing table (the seconds and resource counts behind the reindex row,
-# read from indexing.txt; shown when any leg wrote indexing.txt), a legend, and
-# a leg-health table, so a reader does not have to scroll six stacked per-leg
-# summaries. The three rows that load the corpus sit together (LOADING_ROWS)
+# a legend, and a leg-health table, so a reader does not have to scroll six
+# stacked per-leg summaries. The three rows that load the corpus sit together (LOADING_ROWS)
 # and name the operation each one times (ROW_LABELS): import is k6 POSTing
 # transaction Bundles to the base URL (HFS has no `$import`), bulk-import is
 # `$bulk-submit` into a fresh database, reindex is the `indexing` suite's one
@@ -91,7 +89,7 @@ BULK_FILE = "bulk-import.txt"
 # Nor is indexing: "Run benchmark suites" runs it after search, before insert,
 # in the suite loop (run_indexing_suite in suite-lib.sh) and it writes
 # indexing.txt (key=value). Its row is labelled reindex, the operation it times;
-# _indexing_table adds the seconds and resource counts behind it.
+# its seconds and resource counts are in the leg's job summary (REINDEX_NOTE).
 INDEXING_SUITE = "indexing"
 INDEXING_FILE = "indexing.txt"
 # The rows that load or reindex the corpus, shown together in this order where
@@ -120,7 +118,7 @@ LEGEND = (
     "`(partial)` · bulk-import is resources/s through `$bulk-submit` into a fresh database, "
     "kick-off until the search index covers it; reindex is resources/s of one `$reindex` of the "
     "type its row names, in the corpus import loaded, `(partial)` when it did not finish (the "
-    "reason is beside its seconds in Indexing); each is one asynchronous job, so its p95 is n/a · "
+    "reason is in that leg's job summary); each is one asynchronous job, so its p95 is n/a · "
     "n/a = no result (reason in brackets)"
 )
 FOOTER = (
@@ -163,18 +161,16 @@ INSERT_NOTE = (
     "row is creates/s. It runs last, after search and after the result-size snapshot, so its "
     "resources are in neither, and it never carries `†` because it does not read the corpus."
 )
-INDEXING_NOTE = (
-    "_One timed `POST /<type>/$reindex` per leg (the `indexing` suite, after search and before `insert`): "
-    "HFS re-reads every stored resource of that type, re-extracts its search parameters and "
-    "rewrites the index that serves search (the primary's own index on sqlite/postgres/mongodb, "
-    "Elasticsearch on the +ES legs). Its rate is the `reindex` row of the tables above: "
-    "processed (the first number of **resources reindexed**) ÷ **seconds**, completedAt − "
-    "startedAt from `$reindex-status`. This is not the index cost paid inside import, which stays "
-    "in the import row. A job still running at "
-    "the budget (`budget_s` in indexing.txt) is cancelled and its rate covers the part that ran "
-    "(`(partial)` on the row, the reason beside its seconds here). Index entries per resource and "
-    "the job's phase split are in each leg's job summary (writer-reported, so not comparable "
-    "across backends)._"
+REINDEX_NOTE = (
+    "Reindex row: one timed `POST /<type>/$reindex` per leg (the `indexing` suite, after search "
+    "and before `insert`): HFS re-reads every stored resource of that type, re-extracts its "
+    "search parameters and rewrites the index that serves search (the primary's own index on "
+    "sqlite/postgres/mongodb, Elasticsearch on the +ES legs). **resources/s** = processed ÷ "
+    "(completedAt − startedAt) from `$reindex-status`. This is not the index cost paid inside "
+    "import, which stays in the import row. A job still running at the budget (`budget_s` in "
+    "indexing.txt) is cancelled and its rate covers the part that ran (`(partial)`). Its "
+    "seconds, resources reindexed, index entries per resource and phase split are in each "
+    "leg's job summary (writer-reported, so not comparable across backends)."
 )
 
 
@@ -870,36 +866,6 @@ def _indexing_markers(d):
     return out
 
 
-def _indexing_table(datas, loaded):
-    """The detail behind the reindex row; its rate, markers and n/a reasons are in that row."""
-    if not any(d.get("indexing") is not None for d in loaded):
-        return []
-    rtype = _reindex_type(loaded)
-    what = "`$reindex` of %s" % rtype if rtype else "`$reindex`"
-    cells = {"seconds": [], "resources": []}
-    for d in datas:
-        s = (d.get("suites") or {}).get(INDEXING_SUITE)
-        if d["status"] in _LEG_NA or not s or s["reason"] is not None:
-            for k in cells:
-                cells[k].append("n/a")
-            continue
-        ix = d["indexing"]
-        secs = _fnum(ix.get("seconds"))
-        text = "?" if secs is None else "{:.1f}".format(secs)
-        if s.get("partial"):
-            text += " (%s)" % md_cell(ix.get("reason") or "?")
-        cells["seconds"].append(text)
-        cells["resources"].append("%s/%s" % (_n(_int(ix.get("processed"))),
-                                             _n(_int(ix.get("total")))))
-    lines = ["### Indexing (%s)" % what, ""]
-    lines.append("| | " + " | ".join(label(d["leg"]) for d in datas) + " |")
-    lines.append("|---|" + "---:|" * len(datas))
-    for key, name in (("seconds", "seconds"), ("resources", "resources reindexed")):
-        lines.append("| %s | %s |" % (name, " | ".join(cells[key])))
-    lines += ["", INDEXING_NOTE, ""]
-    return lines
-
-
 def _runner_cell(d):
     ri = d["ri"]
     name = ri.get("runner_name")
@@ -1215,13 +1181,13 @@ def _render(root, env, warn, zips):
                            datas, loaded, rows, nocrown)
     lines += _metric_table("p95 latency (ms)", "p95", datas, loaded, rows, nocrown)
     lines += _metric_table("Errors (Err% · failed checks)", "err", datas, loaded, rows, nocrown)
-    lines += _indexing_table(datas, loaded)
     lines += [LEGEND, "", IMPORT_NOTE, "", "### Leg health", "",
               "| Leg | Results | Runner | Import | Result sizes | ES drain | Host at crud start |",
               "|---|---|---|---|---|---|---|"]
     lines += [_health_row(d, rows) for d in datas]
     lines += _bulk_table(datas, rows)
-    for note in _notes(loaded) + ([INSERT_NOTE] if "insert" in rows else []) + [FOOTER]:
+    for note in (_notes(loaded) + ([REINDEX_NOTE] if INDEXING_SUITE in rows else [])
+                 + ([INSERT_NOTE] if "insert" in rows else []) + [FOOTER]):
         lines += ["", note]
     return lines, k, len(datas)
 

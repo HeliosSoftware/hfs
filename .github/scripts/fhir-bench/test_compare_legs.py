@@ -279,7 +279,7 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(row(md, "Throughput", INSERT_ROW), "| insert (creates/s) | 900 ‡ | 500 |")
         self.assertIn("**2.0%** · **30 ✗**", row(md, "Errors", "insert"))
 
-    def test_indexing_table_and_crown(self):
+    def test_reindex_row_and_crown(self):
         put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
         put_dir(self.root, "postgres", leg_files("postgres", **{
             "indexing.txt": indexing(rate="800")}))
@@ -288,13 +288,8 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(row(md, "p95", REINDEX),
                          "| " + REINDEX + " | n/a (one async job) | n/a (one async job) |")
         self.assertEqual(row(md, "Errors", REINDEX), "| " + REINDEX + " | 0.0% | 0.0% |")
-        self.assertIn("### Indexing (`$reindex` of Encounter)", md)
-        self.assertEqual(row(md, "Indexing", "seconds"), "| seconds | 4.2 | 4.2 |")
-        self.assertEqual(row(md, "Indexing", "resources reindexed"),
-                         "| resources reindexed | 5,000/5,000 | 5,000/5,000 |")
-        indexing_block = md.split("### Indexing", 1)[1].split("###", 1)[0]
-        self.assertNotIn("| resources/s |", indexing_block)  # the rate is the reindex row, once
-        self.assertIn("Its rate is the `reindex` row of the tables above", indexing_block)
+        self.assertNotIn("### Indexing", md)  # the detail is in each leg's job summary
+        self.assertIn(cl.REINDEX_NOTE, md)
         self.assertNotIn("| indexing |", md)
 
     def test_indexing_partial_errors_and_short_import(self):
@@ -306,8 +301,6 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(row(md, "Throughput", REINDEX_ROW),
                          "| " + REINDEX_ROW + " | 500 (partial) | 1,200 †‡ |")
         self.assertEqual(row(md, "Errors", REINDEX), "| " + REINDEX + " | 0.0% | 0.0% · **2 ✗** |")
-        self.assertEqual(row(md, "Indexing", "seconds"), "| seconds | 180.2 (time-cap) | 4.2 |")
-        self.assertIn("3,000/5,000", row(md, "Indexing", "resources reindexed"))
 
     def test_reindex_partial_or_failed_blocks_crown(self):
         put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(
@@ -333,7 +326,6 @@ class CompareLegsTest(unittest.TestCase):
         md = render(self.root, ["sqlite", "postgres"])
         self.assertEqual(row(md, "Throughput", REINDEX_ROW),
                          "| " + REINDEX_ROW + " | n/a (no data) (partial) | 800 |")
-        self.assertEqual(row(md, "Indexing", "seconds"), "| seconds | ? (cancel-unconfirmed) | 4.2 |")
         # bulk-import with no rate used to raise AttributeError (its na was a str)
         self.assertEqual(row(md, "Throughput", BULK_ROW), "| " + BULK_ROW + " | n/a (not run) | n/a (no data) |")
         # a failed job with no rate (no startedAt) keeps its `‡`
@@ -349,13 +341,12 @@ class CompareLegsTest(unittest.TestCase):
         put_dir(self.root, "postgres", leg_files("postgres"))
         md = render(self.root, ["sqlite", "postgres"], tests="prewarm,import,crud,search")
         self.assertNotIn("| reindex", md)  # not requested, nothing written (older runs)
-        self.assertNotIn("### Indexing", md)
+        self.assertNotIn(cl.REINDEX_NOTE, md)
         md = render(self.root, ["sqlite", "postgres", "mongodb"])  # tests=all includes indexing
         for heading, name in (("Throughput", REINDEX_ROW), ("p95", REINDEX), ("Errors", REINDEX)):
             name = name.replace(" Encounter", "")  # no leg reindexed anything
             self.assertEqual(row(md, heading, name),
                              "| %s | n/a (not run) | n/a (not run) | n/a (no artifact) |" % name)
-        self.assertNotIn("### Indexing", md)  # nothing to detail; the reasons are in the rows
         other = os.path.join(self.root, "x")
         put_dir(other, "sqlite", leg_files("sqlite", **{
             "indexing.txt": "status=kickoff-failed\nreason=http-501\nkickoff_http=501\n"}))
@@ -364,12 +355,11 @@ class CompareLegsTest(unittest.TestCase):
         name = "reindex, `$reindex` (resources/s)"
         self.assertEqual(row(md, "Throughput", name),
                          "| %s | n/a (kick-off HTTP 501) | n/a (weird) |" % name)
-        self.assertEqual(row(md, "Indexing", "seconds"), "| seconds | n/a | n/a |")
         unasked = os.path.join(self.root, "unasked")  # written but not requested: still shown
         put_dir(unasked, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
         md = render(unasked, ["sqlite"], tests="prewarm,import,crud,search")
         self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 |")
-        self.assertIn("### Indexing (`$reindex` of Encounter)", md)
+        self.assertIn(cl.REINDEX_NOTE, md)
 
     def test_reindex_label_names_one_type_only(self):
         put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
@@ -378,7 +368,6 @@ class CompareLegsTest(unittest.TestCase):
         md = render(self.root, ["sqlite", "postgres"])
         self.assertEqual(row(md, "Throughput", "reindex, `$reindex` (resources/s)"),
                          "| reindex, `$reindex` (resources/s) | **1,200** | 800 |")
-        self.assertIn("### Indexing (`$reindex`)", md)
 
     def test_reindex_type_must_be_a_plain_name(self):
         for i, bad in enumerate(("Enc|ounter", "", "Enc`ounter")):
@@ -388,7 +377,6 @@ class CompareLegsTest(unittest.TestCase):
             md = render(root, ["sqlite", "postgres"])
             self.assertEqual(row(md, "Throughput", "reindex, `$reindex` (resources/s)"),
                              "| reindex, `$reindex` (resources/s) | **1,200** | **1,200** |")
-            self.assertIn("### Indexing (`$reindex`)\n", md)
             self.assertNotIn("ounter", md)
 
     def test_indexing_no_crown_on_hardware_mismatch(self):

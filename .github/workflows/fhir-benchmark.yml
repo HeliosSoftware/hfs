@@ -2160,9 +2160,8 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
   # errors; the import, bulk-import and reindex rows name the operation each
-  # times and sit together), an indexing detail table (the `indexing` suite)
-  # and a leg-health table, so a reader does not have to scroll six stacked
-  # per-leg summaries.
+  # times and sit together) and a leg-health table, so a reader does not
+  # have to scroll six stacked per-leg summaries.
   # Display only: the job is continue-on-error and
   # compare_legs.py always exits 0, so it can never change the run's
   # conclusion, and it adds nothing to the per-leg jobs.
