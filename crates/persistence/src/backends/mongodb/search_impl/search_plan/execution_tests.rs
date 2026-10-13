@@ -11,6 +11,9 @@ use std::path::PathBuf;
 #[path = "resource_page_tests.rs"]
 mod resource_page_tests;
 
+#[path = "deadline_tests.rs"]
+mod deadline_tests;
+
 /// One standalone `mongod` per test binary; every fixture owns a database on it.
 ///
 /// Prefers `HFS_TEST_MONGODB_URL`, otherwise starts a container with test
@@ -171,6 +174,23 @@ impl Fixture {
     }
 
     async fn with_probe_timeout(label: &str, count: usize, probe_timeout_ms: u64) -> Option<Self> {
+        Self::with_timeouts(label, count, probe_timeout_ms, None).await
+    }
+
+    async fn with_search_timeout(
+        label: &str,
+        count: usize,
+        search_timeout_ms: Option<u64>,
+    ) -> Option<Self> {
+        Self::with_timeouts(label, count, DEFAULT_PROBE_TIMEOUT_MS, search_timeout_ms).await
+    }
+
+    async fn with_timeouts(
+        label: &str,
+        count: usize,
+        probe_timeout_ms: u64,
+        search_timeout_ms: Option<u64>,
+    ) -> Option<Self> {
         let uri = match shared_mongo::connection_string().await {
             Ok(uri) => uri,
             Err(reason) => {
@@ -180,6 +200,8 @@ impl Fixture {
         };
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: uri,
+            search_timeout_ms,
+            broad_search_concurrency: search_timeout_ms.map(|_| 1),
             database_name: format!("hfs_plan_{}", uuid::Uuid::new_v4().simple()),
             app_name: format!("hfs-plan-{label}-{}", uuid::Uuid::new_v4().simple()),
             probe_timeout_ms,
@@ -1600,6 +1622,20 @@ fn hint_rejection_is_bad_value_about_a_missing_index() {
 const MISSING_INDEX: &str = "planner returned error :: caused by :: \
                              hint provided does not correspond to an existing index";
 
+impl<T> SearchCommand for std::future::Ready<mongodb::error::Result<T>> {
+    fn search_deadline(self) -> StorageResult<Self> {
+        search_deadline::check()?;
+        Ok(self)
+    }
+
+    fn search_probe_deadline(
+        self,
+        probe: Duration,
+    ) -> StorageResult<(Self, search_deadline::ProbeBudget)> {
+        Ok((self, search_deadline::ProbeBudget::new(probe)?))
+    }
+}
+
 /// Runs `with_hint_fallback` over scripted outcomes, one per call, and
 /// returns the result together with the hints the operation saw.
 async fn scripted_fallback(
@@ -1617,7 +1653,8 @@ async fn scripted_fallback(
                 .expect("more calls than outcomes"),
         )
     })
-    .await;
+    .await
+    .unwrap();
     (result, seen.into_inner())
 }
 

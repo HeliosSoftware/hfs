@@ -27,6 +27,7 @@ use crate::types::{
 
 use super::MongoBackend;
 use super::schema::RESOURCES_IDENTITY_INDEX;
+use super::search_deadline::{self, SearchCommand};
 use super::search_index_catalog::{
     COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, SEARCH_COMPOSITE_INDEX,
 };
@@ -268,6 +269,7 @@ const MAX_RESULT_ID_SET: usize = 300_000;
 const MAX_IDENTIFIER_TARGETS: usize = 10_000;
 
 async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Document>> {
+    search_deadline::check()?;
     let mut docs = Vec::new();
     while cursor
         .advance()
@@ -365,6 +367,7 @@ async fn collect_id_set(
     mut cursor: Cursor<Document>,
     field: &str,
 ) -> StorageResult<HashSet<String>> {
+    search_deadline::check()?;
     let mut ids = HashSet::new();
     while cursor
         .advance()
@@ -385,6 +388,7 @@ async fn read_cursor_batch(
     cursor: &mut Cursor<Document>,
     limit: usize,
 ) -> StorageResult<Vec<Document>> {
+    search_deadline::check()?;
     let mut docs = Vec::with_capacity(limit);
     while docs.len() < limit {
         if !cursor
@@ -889,6 +893,57 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        let Some(timeout) = self
+            .config()
+            .search_timeout_ms
+            .filter(|_| !search_deadline::is_active())
+        else {
+            return self.search_inner(tenant, query).await;
+        };
+        search_deadline::run(timeout, self.search_inner(tenant, query)).await
+    }
+
+    async fn search_count(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<u64> {
+        let Some(timeout) = self
+            .config()
+            .search_timeout_ms
+            .filter(|_| !search_deadline::is_active())
+        else {
+            return self.search_count_inner(tenant, query).await;
+        };
+        search_deadline::run(timeout, self.search_count_inner(tenant, query)).await
+    }
+
+    fn search_param_registry(
+        &self,
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.tenant_registry(tenant.tenant_id().as_str())
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        true
+    }
+
+    fn modifiers_for_param_type(
+        &self,
+        param_type: crate::types::SearchParamType,
+    ) -> Vec<&'static str> {
+        Self::modifiers_for_type(param_type)
+    }
+}
+
+impl MongoBackend {
+    async fn search_inner(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        search_deadline::check()?;
         reject_contained_composite(query)?;
 
         // `_contained` search uses a dedicated path (separate index rows and
@@ -1111,6 +1166,7 @@ impl SearchProvider for MongoBackend {
                 collect_documents(
                     resources
                         .find(doc! { "$and": [filter, { "id": { "$in": matches.ids } }] })
+                        .search_deadline()?
                         .sort(sort)
                         .await
                         .or_query_error("Failed to fetch matched search page")?,
@@ -1144,13 +1200,14 @@ impl SearchProvider for MongoBackend {
                     None => aggregate,
                 }
             })
-            .await
+            .await?
             .or_query_error("Failed to page resource-filtered search")?;
             collect_documents(cursor).await?
         } else {
             collect_documents(
                 resources
                     .find(filter)
+                    .search_deadline()?
                     .sort(sort)
                     .skip(u64::from(offset))
                     .limit((page_size + 1) as i64)
@@ -1261,11 +1318,12 @@ impl SearchProvider for MongoBackend {
         })
     }
 
-    async fn search_count(
+    async fn search_count_inner(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        search_deadline::check()?;
         reject_contained_composite(query)?;
         self.validate_query_support(query)?;
 
@@ -1286,24 +1344,6 @@ impl SearchProvider for MongoBackend {
 
         let _permit = self.admit_broad_search_for(query, true).await?;
         self.count_standard(tenant, query).await
-    }
-
-    fn search_param_registry(
-        &self,
-        tenant: &crate::tenant::TenantContext,
-    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-        self.tenant_registry(tenant.tenant_id().as_str())
-    }
-
-    fn supports_contained_search(&self) -> bool {
-        true
-    }
-
-    fn modifiers_for_param_type(
-        &self,
-        param_type: crate::types::SearchParamType,
-    ) -> Vec<&'static str> {
-        Self::modifiers_for_type(param_type)
     }
 }
 
@@ -1597,6 +1637,7 @@ impl MongoBackend {
                         return collect_documents(
                             resources
                                 .find(filter)
+                                .search_deadline()?
                                 .sort(sort)
                                 .skip(u64::from(offset))
                                 .limit((page_size + 1) as i64)
@@ -1616,6 +1657,7 @@ impl MongoBackend {
         collect_documents(
             resources
                 .find(doc! { "$and": [filter, { "id": { "$in": ids } }] })
+                .search_deadline()?
                 .sort(sort)
                 .await
                 .or_query_error("Failed to fetch resource-filtered page")?,
@@ -1669,8 +1711,8 @@ impl MongoBackend {
         if !broad {
             return Ok(None);
         }
-        gate.acquire()
-            .await
+        search_deadline::wait(gate.acquire())
+            .await?
             .map(Some)
             .map_err(|_| internal_error("MongoDB broad search gate closed".to_string()))
     }
@@ -1755,7 +1797,7 @@ impl MongoBackend {
                     None => aggregate,
                 }
             })
-            .await
+            .await?
             .or_query_error("Failed to count resource-filtered search results")?;
             let documents = collect_documents(cursor).await?;
             return match documents.first() {
@@ -1767,6 +1809,7 @@ impl MongoBackend {
         record_total_strategy("exact_resources");
         resources
             .count_documents(filter)
+            .search_deadline()?
             .await
             .or_query_error("Failed to count MongoDB search results")
     }
@@ -2258,6 +2301,7 @@ impl MongoBackend {
 
         let cursor = contained_rows
             .aggregate(pipeline)
+            .search_deadline()?
             .await
             .or_query_error("Failed to aggregate contained search")?;
         let docs = collect_documents(cursor).await?;
@@ -2333,6 +2377,7 @@ impl MongoBackend {
                 "is_deleted": { "$ne": true },
                 "$or": or,
             })
+            .search_deadline()?
             .hint(mongodb::options::Hint::Name(
                 RESOURCES_IDENTITY_INDEX.to_string(),
             ))
@@ -2563,6 +2608,7 @@ impl MongoBackend {
         let docs = collect_documents(
             resources_coll
                 .find(filter)
+                .search_deadline()?
                 .await
                 .or_query_error("Failed to execute MongoDB search")?,
         )
@@ -2656,6 +2702,7 @@ impl MongoBackend {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let cursor = resources
             .find(filter)
+            .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
             .await
             .or_query_error("Failed to resolve _id/_lastUpdated filters")?;
@@ -2678,6 +2725,7 @@ impl MongoBackend {
                 doc! { "$match": filter },
                 doc! { "$group": { "_id": "$resource_id" } },
             ])
+            .search_deadline()?
             .allow_disk_use(true)
             .await
             .or_query_error("Failed to query search_index")?;
@@ -2699,6 +2747,7 @@ impl MongoBackend {
                 "resource_type": resource_type,
                 "is_deleted": false,
             })
+            .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
             .await
             .or_query_error("Failed to enumerate resource ids")?;
@@ -2759,6 +2808,7 @@ impl MongoBackend {
                 ];
                 let cursor = search_index
                     .aggregate(pipeline)
+                    .search_deadline()?
                     .allow_disk_use(true)
                     .hint(mongodb::options::Hint::Name(
                         SEARCH_COMPOSITE_INDEX.to_string(),
@@ -2833,6 +2883,7 @@ impl MongoBackend {
         ];
         let cursor = search_index
             .aggregate(pipeline)
+            .search_deadline()?
             .allow_disk_use(true)
             .await
             .or_query_error("Failed to sort by search parameter")?;
@@ -2985,6 +3036,7 @@ impl MongoBackend {
                         compartment_membership_filter(tenant_id, resource_type, comp);
                     let count = search_index
                         .count_documents(probe_filter)
+                        .search_deadline()?
                         .limit(seed.len() as u64 + 1)
                         .await
                         .or_query_error(
@@ -3101,6 +3153,7 @@ impl MongoBackend {
                 let filter = normal_filter(0)?;
                 let count = search_index
                     .count_documents(filter)
+                    .search_deadline()?
                     .limit(seed.len() as u64 + 1)
                     .await
                     .or_query_error("Failed to probe search_index against the _id seed")?;
@@ -3175,6 +3228,7 @@ impl MongoBackend {
                         let filter = normal_filter(i)?;
                         let count = search_index
                             .count_documents(filter)
+                            .search_deadline()?
                             .limit(probe_limit)
                             .await
                             .or_query_error("Failed to probe search_index for driver selection")?;
@@ -3226,6 +3280,7 @@ impl MongoBackend {
 
         let mut driver_cursor = search_index
             .find(driver_filter)
+            .search_deadline()?
             .projection(doc! { "resource_id": 1, "_id": 0 })
             .await
             .or_query_error("Failed to open driver cursor")?;
@@ -3326,6 +3381,7 @@ impl MongoBackend {
         hint: bool,
         mut candidates: HashSet<String>,
     ) -> StorageResult<HashSet<String>> {
+        search_deadline::check()?;
         for (i, param) in normal.iter().enumerate() {
             if candidates.is_empty() {
                 continue;
@@ -3371,6 +3427,7 @@ impl MongoBackend {
                 };
                 let cursor = search_index
                     .find(bounded)
+                    .search_deadline()?
                     .projection(doc! { "resource_id": 1, "_id": 0 })
                     .hint(mongodb::options::Hint::Name(
                         SEARCH_COMPOSITE_INDEX.to_string(),
@@ -3391,6 +3448,7 @@ impl MongoBackend {
                 };
                 search_index
                     .distinct("resource_id", bounded)
+                    .search_deadline()?
                     .await
                     .or_query_error("Failed to intersect search_index")?
                     .into_iter()
@@ -3420,6 +3478,7 @@ impl MongoBackend {
                 };
                 let cursor = search_index
                     .find(bounded)
+                    .search_deadline()?
                     .projection(doc! { "resource_id": 1, "_id": 0 })
                     .hint(mongodb::options::Hint::Name(
                         SEARCH_COMPOSITE_INDEX.to_string(),
@@ -3442,6 +3501,7 @@ impl MongoBackend {
                             "param_name": &param.name,
                         },
                     )
+                    .search_deadline()?
                     .await
                     .or_query_error("Failed to check :missing")?
                     .into_iter()
@@ -3474,6 +3534,7 @@ impl MongoBackend {
                 };
                 let cursor = search_index
                     .find(bounded)
+                    .search_deadline()?
                     .projection(doc! { "resource_id": 1, "_id": 0 })
                     .hint(mongodb::options::Hint::Name(
                         SEARCH_COMPOSITE_INDEX.to_string(),
@@ -3494,6 +3555,7 @@ impl MongoBackend {
                 };
                 search_index
                     .distinct("resource_id", bounded)
+                    .search_deadline()?
                     .await
                     .or_query_error("Failed to check :not")?
                     .into_iter()
@@ -3525,6 +3587,7 @@ impl MongoBackend {
                 };
                 let cursor = search_index
                     .find(bounded)
+                    .search_deadline()?
                     .projection(doc! { "resource_id": 1, "_id": 0 })
                     .hint(mongodb::options::Hint::Name(
                         SEARCH_COMPOSITE_INDEX.to_string(),
@@ -3553,6 +3616,7 @@ impl MongoBackend {
                 };
                 search_index
                     .distinct("resource_id", comp_filter)
+                    .search_deadline()?
                     .await
                     .or_query_error("Failed to check compartment membership")?
                     .into_iter()
@@ -4034,6 +4098,7 @@ impl MongoBackend {
                         Some(s) => {
                             collection
                                 .find_one(legacy)
+                                .search_deadline()?
                                 .hint(mongodb::options::Hint::Name(probe_index.to_string()))
                                 .session(s)
                                 .await
@@ -4041,6 +4106,7 @@ impl MongoBackend {
                         None => {
                             collection
                                 .find_one(legacy)
+                                .search_deadline()?
                                 .hint(mongodb::options::Hint::Name(probe_index.to_string()))
                                 .await
                         }
@@ -4095,6 +4161,7 @@ impl MongoBackend {
                 ];
                 let cursor = search_index
                     .aggregate(pipeline)
+                    .search_deadline()?
                     .session(&mut *s)
                     .await
                     .or_query_error(
@@ -4109,6 +4176,7 @@ impl MongoBackend {
             }
             None => search_index
                 .count_documents(filter)
+                .search_deadline()?
                 .limit(limit)
                 .await
                 .or_query_error("Failed to probe search_index for composite driver"),
@@ -4262,7 +4330,10 @@ impl MongoBackend {
 
                 let pairs: HashSet<(String, i32)> = match session.as_deref_mut() {
                     Some(s) => {
-                        let mut find = search_index.find(bounded).projection(projection.clone());
+                        let mut find = search_index
+                            .find(bounded)
+                            .search_deadline()?
+                            .projection(projection.clone());
                         if let Some(name) = hint {
                             find = find.hint(mongodb::options::Hint::Name(name.to_string()));
                         }
@@ -4288,7 +4359,10 @@ impl MongoBackend {
                         out
                     }
                     None => {
-                        let mut find = search_index.find(bounded).projection(projection.clone());
+                        let mut find = search_index
+                            .find(bounded)
+                            .search_deadline()?
+                            .projection(projection.clone());
                         if let Some(name) = hint {
                             find = find.hint(mongodb::options::Hint::Name(name.to_string()));
                         }
@@ -4594,6 +4668,7 @@ impl MongoBackend {
 
         let mut cursor = search_index
             .find(lookup)
+            .search_deadline()?
             .projection(doc! { "resource_type": 1, "resource_id": 1, "_id": 0 })
             .await
             .or_query_error("Failed to resolve :identifier targets")?;
@@ -5480,6 +5555,7 @@ impl MongoBackend {
     ) -> StorageResult<(Vec<String>, bool)> {
         let mut cursor = search_index
             .find(filter)
+            .search_deadline()?
             .projection(doc! { "resource_id": 1_i32, "_id": 0_i32 })
             .batch_size(1000)
             .await
@@ -5602,6 +5678,7 @@ impl RevincludeProvider for MongoBackend {
             let docs = collect_documents(
                 resources_collection
                     .find(resource_filter)
+                    .search_deadline()?
                     .await
                     .or_query_error("Failed to fetch revinclude resources")?,
             )

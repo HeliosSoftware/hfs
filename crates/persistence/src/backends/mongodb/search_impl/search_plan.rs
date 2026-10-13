@@ -5,6 +5,7 @@
 //! indexed matches without live-resource validation.
 
 use super::super::probe_cache::{OffsetPageDecision, ProbeCache, ProbeEstimate, ProbeKey};
+use super::super::search_deadline::{self, SearchCommand};
 use super::super::search_index_catalog::SEARCH_DATE_RANGE_INDEX;
 use super::collect_documents;
 use super::{
@@ -13,7 +14,7 @@ use super::{
 };
 use crate::error::{QueryErrorExt, StorageResult};
 use crate::types::{SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery};
-use futures::{TryStreamExt, stream::FuturesUnordered};
+use futures::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use mongodb::{
     bson::{Bson, Document, doc},
     options::Hint,
@@ -890,6 +891,7 @@ impl MongoBackend {
                 facts.requests += 1;
                 let count = search_index
                     .count_documents(filter.clone())
+                    .search_deadline()?
                     .limit(SELECTIVE_SEARCH_ROW_LIMIT + 1)
                     .await
                     .or_query_error("Failed to probe resource-filtered search")?;
@@ -1046,6 +1048,7 @@ async fn count_capped_predicates(
     {
         return Ok(None);
     }
+    search_deadline::check()?;
     let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
     let budget = probe_timeout.saturating_mul(CAPPED_TIE_BREAK_BUDGETS);
     let started = tokio::time::Instant::now();
@@ -1080,7 +1083,7 @@ async fn count_capped_predicates(
                     return Ok(None);
                 }
                 facts.requests += 1;
-                let operation = with_hint_fallback(filter.hint(), |hint| {
+                let operation = |hint| {
                     let count = index
                         .count_documents(filter.filter.clone())
                         .max_time(remaining);
@@ -1088,10 +1091,28 @@ async fn count_capped_predicates(
                         Some(hint) => count.hint(hint),
                         None => count,
                     }
-                });
-                let count = match tokio::time::timeout(remaining, operation).await {
-                    Ok(result) => probe_count(result)?,
-                    Err(_) => None,
+                };
+                let count = if search_deadline::is_active() {
+                    // A configured soft deadline must not cancel a driver
+                    // future. Await it and distinguish expiry before caching.
+                    with_probe_hint_fallback(
+                        filter.hint(),
+                        || budget.saturating_sub(started.elapsed()),
+                        operation,
+                    )
+                    .await?
+                } else {
+                    // Preserve the original hard optional-probe timeout when
+                    // no whole-search deadline has been configured.
+                    match tokio::time::timeout(
+                        remaining,
+                        with_hint_fallback(filter.hint(), operation),
+                    )
+                    .await
+                    {
+                        Ok(result) => probe_count(result?)?,
+                        Err(_) => None,
+                    }
                 };
                 if let Some(cache_key) = cache_key {
                     cache.insert(
@@ -1144,6 +1165,7 @@ fn optional_probe_timed_out(error: &mongodb::error::Error) -> bool {
 }
 
 fn probe_count(result: mongodb::error::Result<u64>) -> StorageResult<Option<u64>> {
+    search_deadline::check()?;
     match result {
         Err(error) if optional_probe_timed_out(&error) => Ok(None),
         result => result
@@ -1158,22 +1180,63 @@ fn probe_count(result: mongodb::error::Result<u64>) -> StorageResult<Option<u64>
 /// (rolling upgrade), runs the operation once more without it. The identity
 /// index is required, so a rejection of that hint propagates.
 pub(super) async fn with_hint_fallback<T, F>(
-    hint: Option<Hint>,
+    mut hint: Option<Hint>,
     operation: impl Fn(Option<Hint>) -> F,
-) -> mongodb::error::Result<T>
+) -> StorageResult<mongodb::error::Result<T>>
 where
-    F: IntoFuture<Output = mongodb::error::Result<T>>,
+    F: SearchCommand + IntoFuture<Output = mongodb::error::Result<T>>,
 {
-    let Some(hint) = hint else {
-        return operation(None).await;
-    };
-    let may_be_missing = hint == Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned());
-    match operation(Some(hint.clone())).await {
-        Err(error) if may_be_missing && hint_rejected(&error) => {
+    loop {
+        // Build a fresh command budget for the unhinted retry as well.
+        let result = operation(hint.clone()).search_deadline()?.await;
+        if let Err(error) = &result
+            && hint == Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
+            && hint_rejected(error)
+        {
+            search_deadline::check()?;
             tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
-            operation(None).await
+            hint = None;
+            continue;
         }
-        result => result,
+        return Ok(result);
+    }
+}
+
+/// Optional probes retain their own budget, capped by the shared search
+/// deadline. The duration supplier also preserves a shared tie-break budget
+/// across a missing-index retry.
+async fn with_probe_hint_fallback<T, F>(
+    mut hint: Option<Hint>,
+    probe_timeout: impl Fn() -> Duration,
+    operation: impl Fn(Option<Hint>) -> F,
+) -> StorageResult<Option<T>>
+where
+    F: SearchCommand + IntoFuture<Output = mongodb::error::Result<T>>,
+{
+    loop {
+        search_deadline::check()?;
+        let remaining = probe_timeout();
+        if remaining < Duration::from_millis(1) {
+            return Ok(None);
+        }
+        let (command, budget) = operation(hint.clone()).search_probe_deadline(remaining)?;
+        let result = command.await;
+        budget.check_timeout(result.as_ref().is_err_and(optional_probe_timed_out))?;
+        match result {
+            Err(error)
+                if hint == Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
+                    && hint_rejected(&error) =>
+            {
+                tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
+                hint = None;
+            }
+            Err(error) if optional_probe_timed_out(&error) => return Ok(None),
+            result => {
+                return result
+                    .map(Some)
+                    .or_query_error("Failed to probe search candidates");
+            }
+        }
     }
 }
 
@@ -1221,17 +1284,20 @@ async fn probe_candidates(
             continue;
         }
         facts.requests += 1;
-        let probe = with_hint_fallback(filter.hint(), |hint| {
-            let probe = index
-                .count_documents(filter.filter.clone())
-                .limit(MAX_CANDIDATE_ROWS + 1)
-                .max_time(probe_timeout);
-            match hint {
-                Some(hint) => probe.hint(hint),
-                None => probe,
-            }
-        });
-        let count = probe_count(probe.await)?;
+        let count = with_probe_hint_fallback(
+            filter.hint(),
+            || probe_timeout,
+            |hint| {
+                let probe = index
+                    .count_documents(filter.filter.clone())
+                    .limit(MAX_CANDIDATE_ROWS + 1);
+                match hint {
+                    Some(hint) => probe.hint(hint),
+                    None => probe,
+                }
+            },
+        )
+        .await?;
         if let Some(key) = key {
             facts.remember(key, count);
         }
@@ -1296,7 +1362,7 @@ async fn bounded_candidates(
             None => seed,
         }
     })
-    .await
+    .await?
     .or_query_error("Failed to read search candidates")?;
     let mut candidates = CandidateIds::default();
     let mut rows = 0;
@@ -1384,6 +1450,7 @@ async fn matching_index_ids(
             doc! { "$match": filter },
             doc! { "$group": { "_id": "$resource_id" } },
         ])
+        .search_deadline()?
         .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
         .await
         .or_query_error("Failed to filter search candidates")?;
@@ -1535,6 +1602,7 @@ impl ResourcePageRun<'_> {
     /// Reads one batch of candidates and matches it. Returns true when the page
     /// is complete or the stream is exhausted.
     async fn step(&mut self, db: &mongodb::Database) -> StorageResult<bool> {
+        search_deadline::check()?;
         if self.exhausted {
             return Ok(true);
         }
@@ -1616,6 +1684,7 @@ impl<'a> ResourcePageScan<'a> {
     }
 
     async fn match_batch(&mut self, db: &mongodb::Database) -> StorageResult<()> {
+        search_deadline::check()?;
         let mut matched = self.batch.iter().cloned().collect();
         filter_candidates(db, &mut matched, &self.predicates).await?;
         exclude_candidates(db, &mut matched, &self.exclusions).await?;
@@ -1713,6 +1782,7 @@ impl ResourcePageCursor {
     ) -> StorageResult<mongodb::Cursor<Document>> {
         resources
             .find(filter)
+            .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1, "last_updated": 1 })
             .sort(sort)
             .hint(Self::hint())
@@ -1770,6 +1840,7 @@ impl TimestampGroupCursor {
             let next = self
                 .resources
                 .find_one(filter)
+                .search_deadline()?
                 .projection(doc! { "_id": 0, "last_updated": 1 })
                 .sort(doc! {
                     "last_updated": self.timestamp_direction, "id": self.timestamp_direction,
@@ -2003,7 +2074,7 @@ impl BatchedIndexPlan {
                 None => aggregate,
             }
         })
-        .await
+        .await?
         .or_query_error("Failed to count estimated index driver")?;
         let Some(document) = cursor
             .try_next()
@@ -2080,7 +2151,7 @@ impl BatchedIndexPlan {
                 None => aggregate,
             }
         })
-        .await
+        .await?
         .or_query_error("Failed to stream search candidates")?;
         self.consume_batches(db, &resource_filter, cursor, selection, Vec::new())
             .await
@@ -2132,26 +2203,51 @@ impl BatchedIndexPlan {
         let mut pending_counts = FuturesUnordered::new();
         let mut batch = Vec::with_capacity(batch_rows);
         let mut bytes = 0usize;
-        while cursor
-            .advance()
-            .await
-            .or_query_error("Failed to read candidate batch")?
-        {
-            let document = cursor
-                .deserialize_current()
-                .or_query_error("Invalid candidate row")?;
-            let id = document.get_str("_id").map_err(|_| {
-                internal_error("Search candidate is missing resource_id".to_owned())
-            })?;
-            let size = id.len().saturating_add(16);
-            if size > MAX_CANDIDATE_BYTES {
-                return Err(internal_error(
-                    "Search candidate exceeds the BSON batch budget".to_owned(),
-                ));
-            }
-            if !batch.is_empty()
-                && (batch.len() == batch_rows || bytes.saturating_add(size) > MAX_CANDIDATE_BYTES)
+        let outcome = async {
+            while cursor
+                .advance()
+                .await
+                .or_query_error("Failed to read candidate batch")?
             {
+                let document = cursor
+                    .deserialize_current()
+                    .or_query_error("Invalid candidate row")?;
+                let id = document.get_str("_id").map_err(|_| {
+                    internal_error("Search candidate is missing resource_id".to_owned())
+                })?;
+                let size = id.len().saturating_add(16);
+                if size > MAX_CANDIDATE_BYTES {
+                    return Err(internal_error(
+                        "Search candidate exceeds the BSON batch budget".to_owned(),
+                    ));
+                }
+                if !batch.is_empty()
+                    && (batch.len() == batch_rows
+                        || bytes.saturating_add(size) > MAX_CANDIDATE_BYTES)
+                {
+                    pending_counts.push(self.count_batch(
+                        db,
+                        resource_filter,
+                        match &page_ids {
+                            Some(page) => page.constrain(&selection)?,
+                            None => selection.clone(),
+                        },
+                        std::mem::replace(&mut batch, Vec::with_capacity(batch_rows)),
+                    ));
+                    if pending_counts.len() == COUNT_BATCH_CONCURRENCY
+                        && let Some(matches) = pending_counts.try_next().await?
+                    {
+                        result.count += matches.count;
+                        if let Some(page) = &mut page_ids {
+                            page.extend(matches.ids);
+                        }
+                    }
+                    bytes = 0;
+                }
+                batch.push(id.to_owned());
+                bytes += size;
+            }
+            if !batch.is_empty() {
                 pending_counts.push(self.count_batch(
                     db,
                     resource_filter,
@@ -2159,48 +2255,33 @@ impl BatchedIndexPlan {
                         Some(page) => page.constrain(&selection)?,
                         None => selection.clone(),
                     },
-                    std::mem::replace(&mut batch, Vec::with_capacity(batch_rows)),
+                    batch,
                 ));
-                if pending_counts.len() == COUNT_BATCH_CONCURRENCY
-                    && let Some(matches) = pending_counts.try_next().await?
-                {
-                    result.count += matches.count;
-                    if let Some(page) = &mut page_ids {
-                        page.extend(matches.ids);
-                    }
+            }
+            while let Some(matches) = pending_counts.try_next().await? {
+                result.count += matches.count;
+                if let Some(page) = &mut page_ids {
+                    page.extend(matches.ids);
                 }
-                bytes = 0;
             }
-            batch.push(id.to_owned());
-            bytes += size;
-        }
-        if !batch.is_empty() {
-            pending_counts.push(self.count_batch(
-                db,
-                resource_filter,
-                match &page_ids {
-                    Some(page) => page.constrain(&selection)?,
-                    None => selection.clone(),
-                },
-                batch,
-            ));
-        }
-        while let Some(matches) = pending_counts.try_next().await? {
-            result.count += matches.count;
-            if let Some(page) = &mut page_ids {
-                page.extend(matches.ids);
+            if let Some(page) = page_ids {
+                let offset = match selection {
+                    BatchSelection::PageAndCount { offset, .. }
+                    | BatchSelection::BoundedPage { offset, .. }
+                    | BatchSelection::EstimatedPageAndCount { offset, .. } => offset as usize,
+                    _ => 0,
+                };
+                result.ids = page.into_ids().into_iter().skip(offset).collect();
             }
+            Ok(result)
         }
-        if let Some(page) = page_ids {
-            let offset = match selection {
-                BatchSelection::PageAndCount { offset, .. }
-                | BatchSelection::BoundedPage { offset, .. }
-                | BatchSelection::EstimatedPageAndCount { offset, .. } => offset as usize,
-                _ => 0,
-            };
-            result.ids = page.into_ids().into_iter().skip(offset).collect();
+        .await;
+        if outcome.is_err() {
+            // Another batch may already be inside a driver call. Poll it to
+            // completion before releasing the search's admission permit.
+            while pending_counts.next().await.is_some() {}
         }
-        Ok(result)
+        outcome
     }
 
     fn record_page_decision(
@@ -2266,7 +2347,7 @@ impl BatchedIndexPlan {
                 None => aggregate,
             }
         })
-        .await
+        .await?
         .or_query_error("Failed to open adaptive page candidates")?;
         let mut batch = Vec::with_capacity(PAGE_CANDIDATE_BATCH_ROWS);
         let mut bytes = 0usize;
@@ -2413,7 +2494,7 @@ impl BatchedIndexPlan {
                     None => aggregate,
                 }
             })
-            .await
+            .await?
             .or_query_error("Failed to open candidate page window")?;
             let mut batch = Vec::with_capacity(PAGE_CANDIDATE_BATCH_ROWS);
             let mut bytes = 0usize;
@@ -2488,15 +2569,18 @@ impl BatchedIndexPlan {
             None => self.driver.filter.clone(),
         };
         let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let budget = search_deadline::ProbeBudget::new(self.probe_timeout)?;
         let opened = index
             .find(filter)
+            .search_deadline()?
             .projection(doc! { "_id": 0, "resource_id": 1 })
             .sort(doc! { "resource_id": direction })
             .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
             .limit(PAGE_CANDIDATE_BATCH_ROWS as i64)
             .batch_size(PAGE_CANDIDATE_BATCH_ROWS as u32)
-            .max_time(self.probe_timeout)
+            .max_time(budget.duration())
             .await;
+        budget.check_timeout(opened.as_ref().is_err_and(optional_probe_timed_out))?;
         let mut cursor = match opened {
             Err(error) if optional_probe_timed_out(&error) => {
                 return Ok(None);
@@ -2510,7 +2594,11 @@ impl BatchedIndexPlan {
         };
         let mut bytes = 0usize;
         loop {
-            let row = match cursor.try_next().await {
+            let read = cursor.try_next().await;
+            if let Err(error) = &read {
+                budget.check_timeout(optional_probe_timed_out(error))?;
+            }
+            let row = match read {
                 Err(error) if optional_probe_timed_out(&error) => {
                     return Ok(None);
                 }
@@ -2689,6 +2777,7 @@ impl BatchedIndexPlan {
         let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let mut cursor = index
             .aggregate(pipeline)
+            .search_deadline()?
             .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
             .await
             .or_query_error("Failed to count indexed candidate batch")?;
@@ -2733,6 +2822,7 @@ impl BatchedIndexPlan {
         let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let mut cursor = index
             .aggregate(pipeline)
+            .search_deadline()?
             .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
             .await
             .or_query_error("Failed to count and match indexed page candidates")?;
@@ -2784,6 +2874,7 @@ impl BatchedIndexPlan {
         collect_documents(
             resources
                 .find(doc! { "$and": filters })
+                .search_deadline()?
                 .projection(doc! { "_id": 0, "id": 1 })
                 .sort(doc! { "id": direction })
                 .limit(retained_page_limit(offset, limit)?)
@@ -2809,6 +2900,7 @@ impl BatchedIndexPlan {
         batch: &[String],
         result: &mut BatchMatches,
     ) -> StorageResult<bool> {
+        search_deadline::check()?;
         if batch.is_empty() {
             return Ok(false);
         }
@@ -2867,6 +2959,7 @@ impl BatchedIndexPlan {
             // timestamp partitions for an otherwise bounded ID lookup.
             result.count += resources
                 .count_documents(live_filter)
+                .search_deadline()?
                 .await
                 .or_query_error("Failed to count live candidates")?;
             return Ok(false);
@@ -2900,6 +2993,7 @@ impl BatchedIndexPlan {
                         "page": page_stages,
                     } },
                 ])
+                .search_deadline()?
                 .await
                 .or_query_error("Failed to count and select live candidates")?;
             let facet = cursor
@@ -2923,6 +3017,7 @@ impl BatchedIndexPlan {
         }
         let mut cursor = resources
             .find(live_filter)
+            .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
             .await
             .or_query_error("Failed to validate live candidates")?;
