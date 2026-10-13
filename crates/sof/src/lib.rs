@@ -292,6 +292,25 @@ pub enum SofViewDefinition {
 }
 
 impl SofViewDefinition {
+    /// The columns declared by this ViewDefinition (name, optional FHIR `type`,
+    /// `collection`), used to fix the Parquet / Arrow schema before any row is
+    /// seen. Empty if the definition cannot be serialised.
+    pub fn declared_columns(&self) -> Vec<sqlquery::engine::DeclaredColumn> {
+        let value = match self {
+            #[cfg(feature = "R4")]
+            SofViewDefinition::R4(vd) => serde_json::to_value(vd),
+            #[cfg(feature = "R4B")]
+            SofViewDefinition::R4B(vd) => serde_json::to_value(vd),
+            #[cfg(feature = "R5")]
+            SofViewDefinition::R5(vd) => serde_json::to_value(vd),
+            #[cfg(feature = "R6")]
+            SofViewDefinition::R6(vd) => serde_json::to_value(vd),
+        };
+        value
+            .map(|v| sqlquery::engine::declared_columns(&v))
+            .unwrap_or_default()
+    }
+
     /// Returns the FHIR specification version of this ViewDefinition.
     ///
     /// This method provides version detection for multi-version applications,
@@ -2539,6 +2558,8 @@ fn run_view_definition_inner(
     options: RunOptions,
     external: Vec<helios_fhir::FhirResource>,
 ) -> Result<Vec<u8>, SofError> {
+    // Declared column types fix the Parquet / Arrow schema, as on the REST path.
+    let declared = view_definition.declared_columns();
     // Process the ViewDefinition to generate tabular data
     let processed_result =
         process_view_definition_with_external(view_definition, bundle, external)?;
@@ -2551,10 +2572,11 @@ fn run_view_definition_inner(
     };
 
     // Format the result according to the requested content type
-    format_output(
+    format_output_with_schema(
         processed_result,
         content_type,
         options.parquet_options.as_ref(),
+        &declared,
     )
 }
 
@@ -4298,7 +4320,7 @@ where
 /// their schema — the engine-side seam for columnar consumers (Parquet, Arrow
 /// IPC, and external bindings such as pysof).
 ///
-/// Schema inference and type mapping are identical to the Parquet output, so
+/// Declared column types and inference are identical to the Parquet output, so
 /// every columnar representation of the same result agrees.
 pub fn run_view_definition_record_batches(
     view_definition: SofViewDefinition,
@@ -4310,8 +4332,9 @@ pub fn run_view_definition_record_batches(
     ),
     SofError,
 > {
+    let declared = view_definition.declared_columns();
     let result = process_view_definition(view_definition, bundle)?;
-    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    let schema = parquet_schema::resolve_arrow_schema(&result.columns, &declared, &result.rows)?;
     let schema_ref = std::sync::Arc::new(schema);
     let batch_size = columnar_stream::STREAM_BATCH_ROWS;
     let mut batches = Vec::new();
@@ -4350,9 +4373,11 @@ fn format_arrow_ipc_with_schema(
 
 /// Encodes a [`ProcessedResult`] as a single Parquet file in memory.
 ///
-/// Schema is inferred from `result.columns` and the row values; type mapping
-/// follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
-/// integer→INT32, decimal→FLOAT64, dateTime/date→UTF8). Row groups are cut
+/// The schema is inferred from `result.columns` and the row values (see
+/// [`format_output_with_schema`] to fix it from declared column types). Type
+/// mapping follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
+/// integer/positiveInt/unsignedInt→INT32, integer64→INT64, decimal→FLOAT64,
+/// dateTime/date→UTF8, `collection: true`→List<UTF8>). Row groups are cut
 /// by encoded size (`row_group_size_mb`). Use [`format_parquet_multi_file`]
 /// when the output needs to be split across files by size.
 pub fn format_parquet(

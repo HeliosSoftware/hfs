@@ -1031,8 +1031,22 @@ async fn streaming_columnar_response(
     }
 
     let declared: Vec<DeclaredColumn> = declared_columns(view_json);
+    // Column order follows the first row; a key that only shows up later in the
+    // prefix is appended, so it is not dropped once the schema is fixed.
     let columns: Vec<String> = match prefix.first() {
-        Some(Value::Object(map)) => map.keys().cloned().collect(),
+        Some(Value::Object(first)) => {
+            let mut columns: Vec<String> = first.keys().cloned().collect();
+            for row in &prefix {
+                if let Value::Object(map) = row {
+                    for key in map.keys() {
+                        if !columns.contains(key) {
+                            columns.push(key.clone());
+                        }
+                    }
+                }
+            }
+            columns
+        }
         _ => declared.iter().map(|d| d.name.clone()).collect(),
     };
     let prefix_rows = to_processed_rows(&columns, &prefix);
@@ -1105,7 +1119,14 @@ async fn streaming_columnar_response(
             return;
         }
         let mut batch: Vec<ProcessedRow> = Vec::new();
-        while let Some(item) = stream.next().await {
+        loop {
+            // Stop as soon as the encoder is gone (client disconnected or the
+            // encoder failed), even if the runner is slow to produce a row.
+            let item = tokio::select! {
+                _ = row_tx.closed() => return,
+                item = stream.next() => item,
+            };
+            let Some(item) = item else { break };
             match item {
                 Ok(row) => {
                     batch.extend(to_processed_rows(&columns, std::slice::from_ref(&row)));
@@ -1448,6 +1469,75 @@ mod tests {
             .map(|b| b.unwrap().num_rows())
             .sum();
         assert_eq!(total, 20_000);
+    }
+
+    #[tokio::test]
+    async fn streamed_parquet_matches_the_buffered_formatter() {
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        // Same rows through the streaming response and through the buffered
+        // formatter with the same declared types: schema and rows must agree.
+        let raw = numbered_rows(9_000);
+        let rows: Vec<Value> = raw.iter().map(|r| r.as_ref().unwrap().clone()).collect();
+        let streamed = axum::body::to_bytes(
+            columnar(raw, ContentType::Parquet, None)
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+
+        let columns = vec!["id".to_string(), "n".to_string()];
+        let buffered = helios_sof::format_output_with_schema(
+            helios_sof::ProcessedResult {
+                rows: to_processed_rows(&columns, &rows),
+                columns,
+            },
+            ContentType::Parquet,
+            None,
+            &declared_columns(&typed_view()),
+        )
+        .unwrap();
+
+        let read = |bytes: Vec<u8>| {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes)).unwrap();
+            let schema = builder.schema().clone();
+            let batches: Vec<_> = builder.build().unwrap().map(|b| b.unwrap()).collect();
+            (
+                schema,
+                arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap(),
+            )
+        };
+        let (s_schema, s_rows) = read(streamed.to_vec());
+        let (b_schema, b_rows) = read(buffered);
+        assert_eq!(s_schema, b_schema);
+        assert_eq!(s_rows, b_rows);
+    }
+
+    #[tokio::test]
+    async fn streaming_columnar_keeps_a_column_that_first_shows_up_later() {
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let rows = vec![
+            Ok(json!({ "id": "a", "n": 1 })),
+            Ok(json!({ "id": "b", "n": 2, "extra": "x" })),
+        ];
+        let bytes = axum::body::to_bytes(
+            columnar(rows, ContentType::Parquet, None)
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.to_vec())).unwrap();
+        assert!(builder.schema().field_with_name("extra").is_ok());
     }
 
     #[tokio::test]

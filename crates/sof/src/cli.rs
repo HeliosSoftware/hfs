@@ -203,7 +203,7 @@ struct Args {
         long,
         value_parser = clap::value_parser!(u32).range(64..=1024),
         default_value = "256",
-        help = "Target row group size in MB for Parquet files. Larger values improve compression and columnar efficiency but require more memory."
+        help = "Target row group size in MB for Parquet files. Row groups are cut once their encoded size reaches this value; larger values improve compression but peak memory is about three times this value."
     )]
     parquet_row_group_size: u32,
 
@@ -229,7 +229,7 @@ struct Args {
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(10..=10000),
-        help = "Maximum file size in MB for Parquet files. When exceeded, creates multiple numbered files (e.g., output_001.parquet, output_002.parquet). Range: 10-10000MB"
+        help = "Maximum file size in MB for Parquet files. When exceeded, keeps writing to numbered files (output.parquet, output_002.parquet, ...). The size is checked after each batch, so a file can exceed it by one batch plus the footer. Range: 10-10000MB"
     )]
     max_file_size: Option<u32>,
 
@@ -810,7 +810,7 @@ fn merge_bundles(
 ///
 /// Files are encoded incrementally and written straight to disk. The first
 /// file keeps the requested name; later ones get `_002`, `_003`, ... before
-/// the extension. Splitting happens at row-group granularity, so a file can
+/// the extension. The size is checked after each 8,192-row batch, so a file can
 /// overshoot the limit by up to one batch plus its footer.
 fn write_parquet_with_splitting(
     view_definition: SofViewDefinition,
@@ -827,10 +827,11 @@ fn write_parquet_with_splitting(
         .map(|mb| mb as usize * 1024 * 1024)
         .unwrap_or(usize::MAX); // No limit if not specified
 
+    let declared = view_definition.declared_columns();
     let processed_result = helios_sof::process_view_definition(view_definition, bundle)?;
     let schema = std::sync::Arc::new(resolve_arrow_schema(
         &processed_result.columns,
-        &[],
+        &declared,
         &processed_result.rows,
     )?);
 

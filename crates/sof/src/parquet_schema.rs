@@ -182,8 +182,12 @@ fn build_array_from_values(
             for value in values {
                 match value {
                     Some(Value::Bool(b)) => builder.append_value(b),
-                    Some(Value::String(s)) if s == "true" => builder.append_value(true),
-                    Some(Value::String(s)) if s == "false" => builder.append_value(false),
+                    Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                        // Postgres text renders booleans as `t` / `f`.
+                        "true" | "t" => builder.append_value(true),
+                        "false" | "f" => builder.append_value(false),
+                        _ => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -430,6 +434,23 @@ mod tests {
         assert!(array.is_null(1));
         assert!(!bool_array.value(2));
         assert!(bool_array.value(3));
+    }
+
+    #[test]
+    fn test_boolean_array_accepts_postgres_text() {
+        let values = vec![
+            Some(json!("t")),
+            Some(json!("F")),
+            Some(json!("TRUE")),
+            Some(json!("maybe")),
+        ];
+        let array = build_array_from_values(values, &DataType::Boolean).unwrap();
+        let b = array
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert!(b.value(0) && !b.value(1) && b.value(2));
+        assert!(array.is_null(3));
     }
 
     #[test]

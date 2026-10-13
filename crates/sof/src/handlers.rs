@@ -370,6 +370,30 @@ pub async fn sql_run_handler(
                     max_file_size_mb: None,
                 });
 
+        // Query parameters are range-checked in `validate_query_params`; the
+        // body values must obey the same limits (a zero would cut a row group
+        // or a file after every batch).
+        let out_of_range = |name: &str, lo: u32, hi: u32, unit: &str| {
+            ServerError::BadRequest(format!("{name} must be between {lo} and {hi} {unit}"))
+        };
+        if extracted_params
+            .max_file_size
+            .is_some_and(|v| !(10..=10000).contains(&v))
+        {
+            return Err(out_of_range("maxFileSize", 10, 10000, "MB"));
+        }
+        if extracted_params
+            .row_group_size
+            .is_some_and(|v| !(64..=1024).contains(&v))
+        {
+            return Err(out_of_range("rowGroupSize", 64, 1024, "MB"));
+        }
+        if extracted_params
+            .page_size
+            .is_some_and(|v| !(64..=8192).contains(&v))
+        {
+            return Err(out_of_range("pageSize", 64, 8192, "KB"));
+        }
         if let Some(max_size) = extracted_params.max_file_size {
             parquet_opts.max_file_size_mb = Some(max_size);
         }
