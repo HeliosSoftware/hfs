@@ -134,10 +134,24 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
         create_schema_v1(conn)?;
         set_schema_version(conn, 1)?;
         // Run migrations from v1 to latest
-        migrate_schema(conn, 1)?;
+        migrate_schema(conn, 1, false)?;
     } else if current_version < SCHEMA_VERSION {
-        // Run migrations
-        migrate_schema(conn, current_version)?;
+        // An existing database: on a large one a step that builds an index
+        // over `search_index` runs for minutes before the server listens,
+        // so say so (#1961).
+        tracing::info!(
+            from = current_version,
+            to = SCHEMA_VERSION,
+            "Migrating the SQLite schema; on a large database this can take minutes"
+        );
+        let started = std::time::Instant::now();
+        migrate_schema(conn, current_version, true)?;
+        tracing::info!(
+            from = current_version,
+            to = SCHEMA_VERSION,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "SQLite schema migrated"
+        );
     }
 
     // Safety net for the tenant registry (schema v14). A pre-release build could
@@ -419,10 +433,11 @@ fn create_fts_table(conn: &Connection) -> StorageResult<()> {
 }
 
 /// Run schema migrations from current version to latest.
-fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
+fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> StorageResult<()> {
     let mut version = from_version;
 
     while version < SCHEMA_VERSION {
+        let step_started = std::time::Instant::now();
         match version {
             1 => migrate_v1_to_v2(conn)?,
             2 => migrate_v2_to_v3(conn)?,
@@ -473,6 +488,13 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
         }
         version += 1;
         set_schema_version(conn, version)?;
+        if log_steps {
+            tracing::info!(
+                to = version,
+                elapsed_ms = step_started.elapsed().as_millis() as u64,
+                "SQLite schema migration step applied"
+            );
+        }
     }
 
     Ok(())
@@ -3288,6 +3310,26 @@ mod tests {
     /// A database upgraded through the ladder must end up with exactly the
     /// index set a fresh one gets — otherwise a long-lived server keeps paying
     /// for indexes new installs no longer create.
+    /// #1961: upgrading an existing database logs the migration at `info` —
+    /// a start line, one line per step with its duration, and a finish line —
+    /// while creating a fresh database stays quiet.
+    #[test]
+    #[tracing_test::traced_test]
+    fn upgrading_an_existing_database_logs_the_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        assert!(!logs_contain("Migrating the SQLite schema"));
+        assert!(!logs_contain("SQLite schema migration step applied"));
+
+        set_schema_version(&conn, SCHEMA_VERSION - 1).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(logs_contain("Migrating the SQLite schema"));
+        assert!(logs_contain("SQLite schema migration step applied"));
+        assert!(logs_contain("SQLite schema migrated"));
+        assert!(logs_contain("elapsed_ms"));
+    }
+
     #[test]
     fn upgraded_database_has_the_same_search_index_indexes_as_a_fresh_one() {
         let index_set = |conn: &Connection| -> Vec<(String, Option<String>)> {
@@ -3423,7 +3465,7 @@ mod tests {
         create_schema_v1(&conn).unwrap();
         let _ = get_schema_version(&conn).unwrap();
         set_schema_version(&conn, 1).unwrap();
-        migrate_schema(&conn, 1).unwrap();
+        migrate_schema(&conn, 1, false).unwrap();
         conn.execute("DROP TABLE IF EXISTS resource_fts_map", [])
             .unwrap();
         set_schema_version(&conn, 22).unwrap();

@@ -1889,13 +1889,13 @@ async fn migrate_v27_to_v28(client: &deadpool_postgres::Client) -> StorageResult
 /// `texteq`, which is byte equality for any deterministic collation and is
 /// therefore shared by both families. So every equality this backend emits on
 /// `value_reference` (`value_reference = $n`, the `IN (subquery)` of
-/// `_revinclude` and of `ChainQueryBuilder`'s links) seeks the pattern index
+/// `_revinclude`) seeks the pattern index
 /// exactly as it seeks this one.
 ///
 /// The converse does not hold, which is why the pattern index is the survivor:
 /// `build_reference_condition` emits `value_reference LIKE $n || '/_history/%'`
-/// and `ChainQueryBuilder` emits `value_reference LIKE 'Patient/%'`, and
-/// Postgres can only turn a prefix `LIKE` into index bounds (`~>=~` / `~<~`)
+/// (and the native chain builder, removed since in #1341, emitted
+/// `value_reference LIKE 'Patient/%'`), and Postgres can only turn a prefix `LIKE` into index bounds (`~>=~` / `~<~`)
 /// inside the `text_pattern_ops` family. Dropping the pattern index instead
 /// would strand those; dropping this one strands nothing.
 ///
@@ -2718,9 +2718,10 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 /// - `_revinclude` (`search_impl.rs`) builds `si.value_reference IN ($3, $4, …)`
 ///   from `format!("{}/{}", type, id)`. A stored `Patient/123/_history/4` never
 ///   matched, so a versioned reference was invisible to `_revinclude`.
-/// - `ChainQueryBuilder` links on `si.value_reference IN (SELECT '{type}/' ||
-///   resource_id …)` and extracts the target with `SUBSTRING(value_reference
-///   FROM POSITION('/' IN value_reference) + 1)`, which yields
+/// - The native chain builder (removed since, #1341) linked on
+///   `si.value_reference IN (SELECT '{type}/' || resource_id …)` and extracted
+///   the target with `SUBSTRING(value_reference FROM POSITION('/' IN
+///   value_reference) + 1)`, which yields
 ///   `123/_history/4` — matching no resource id.
 /// - `build_reference_identifier_condition` uses the same `SUBSTRING`, with the
 ///   same result.
