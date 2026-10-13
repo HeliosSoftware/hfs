@@ -97,7 +97,7 @@
              hx-get="/ui/sql/view-definitions" hx-include="closest form"
              hx-trigger="input changed delay:300ms" hx-sync="this:replace"
              hx-target="#vd-rail-list" hx-select="#vd-rail-list" hx-swap="outerHTML"
-             hx-select-oob="#vd-rail-recent,#vd-rail-pagination,#sql-selection-filtered"
+             hx-select-oob="#vd-rail-recent,#vd-rail-pagination,#sql-selection-filtered,#sql-empty-state"
              hx-replace-url="true" hx-headers='{"X-Rail-Filter":"1"}'>
     </form>
     {% call recent::group("vd-rail-recent", "vd-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
@@ -253,7 +253,8 @@
         (#839). -#}
     {{ run_results.render()?|safe }}
     {% else %}
-    <section class="card">
+    {#- `id`: the live rail filter swaps this card with the list (#1275). -#}
+    <section class="card" id="sql-empty-state">
       <div class="card-head">
         <h3>{% if !filter.is_empty() && rail.is_empty() %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% else %}{{ i18n.t("vd-none") }}{% endif %}</h3>
       </div>

@@ -8514,9 +8514,12 @@ async fn view_definitions_selection_survives_a_filter_that_excludes_it() {
     assert!(list.contains(r#"data-type="other""#));
     assert!(!list.contains(r#"data-type="keep""#));
     // ...and the "Recently used" group above it follows the same filter
-    // (#1275), so it is only rendered (as an element) here, not asserted on
-    // beyond its presence.
-    assert!(html.contains(r#"id="vd-rail-recent""#));
+    // (#1275): it is always emitted (the live filter swaps it by id) and the
+    // excluded selection is not in it.
+    let group_start = html.find(r#"id="vd-rail-recent""#).expect("group emitted");
+    let group =
+        &html[group_start..html[group_start..].find("filter-rail__divider").unwrap() + group_start];
+    assert!(!group.contains(r#"data-type="keep""#));
     // ...and the editor still holds the selected view the filter excluded.
     assert!(html.contains(r#"name="json""#));
     assert!(html.contains("keep_me"));

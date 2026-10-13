@@ -756,7 +756,7 @@ async fn sql_rail_filter_inputs_carry_the_live_filter_htmx_wiring() {
         r#"hx-trigger="input changed delay:300ms""#,
         r#"hx-sync="this:replace""#,
         r##"hx-target="#vd-rail-list""##,
-        r##"hx-select-oob="#vd-rail-recent,#vd-rail-pagination,#sql-selection-filtered""##,
+        r##"hx-select-oob="#vd-rail-recent,#vd-rail-pagination,#sql-selection-filtered,#sql-empty-state""##,
         r#"hx-replace-url="true""#,
         r#"hx-history="false""#,
         r#"hx-headers='{"X-Rail-Filter":"1"}'"#,
@@ -786,7 +786,8 @@ async fn sql_rail_filter_inputs_carry_the_live_filter_htmx_wiring() {
         for needle in [
             format!(r#"hx-get="{path}""#),
             r##"hx-target="#lib-rail-list""##.to_string(),
-            r##"hx-select-oob="#lib-rail-recent,#sql-selection-filtered""##.to_string(),
+            r##"hx-select-oob="#lib-rail-recent,#sql-selection-filtered,#sql-empty-state""##
+                .to_string(),
             r#"hx-headers='{"X-Rail-Filter":"1"}'"#.to_string(),
             r#"hx-history="false""#.to_string(),
         ] {
@@ -938,6 +939,9 @@ async fn live_rail_filter_keeps_an_empty_selection_empty() {
     let list = rail_list_html(&html, "vd-rail-list");
     assert!(list.contains(r#"data-type="vd1""#));
     assert!(!list.contains("aria-current"));
+    // The centre's empty-state card is swappable by id (its "No matches for"
+    // heading follows the filter).
+    assert!(html.contains(r#"id="sql-empty-state""#));
     assert!(!html.contains(r#"<h2 class="page-head__title">"#));
 
     let html = get_ok_html(

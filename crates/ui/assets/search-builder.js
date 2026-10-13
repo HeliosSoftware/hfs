@@ -2328,18 +2328,16 @@
     var needle = railFilter.value.trim().toLowerCase();
     function filterItems(host) {
       var visible = 0;
-      var total = 0;
       host.querySelectorAll("a.filter-rail__item[data-type]").forEach(function (item) {
         item.hidden =
           !!needle && item.dataset.type.toLowerCase().indexOf(needle) < 0;
-        total += 1;
         if (!item.hidden) visible += 1;
       });
-      return { visible: visible, total: total };
+      return visible;
     }
     if (railList) filterItems(railList);
     if (railRecentGroup) {
-      railRecentGroup.hidden = filterItems(railRecentGroup).visible === 0;
+      railRecentGroup.hidden = filterItems(railRecentGroup) === 0;
     }
   }
 

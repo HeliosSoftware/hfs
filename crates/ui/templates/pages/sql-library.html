@@ -111,7 +111,7 @@
              hx-get="{{ base_href }}" hx-include="closest form"
              hx-trigger="input changed delay:300ms" hx-sync="this:replace"
              hx-target="#lib-rail-list" hx-select="#lib-rail-list" hx-swap="outerHTML"
-             hx-select-oob="#lib-rail-recent,#sql-selection-filtered"
+             hx-select-oob="#lib-rail-recent,#sql-selection-filtered,#sql-empty-state"
              hx-replace-url="true" hx-headers='{"X-Rail-Filter":"1"}'>
     </form>
     {% call recent::group("lib-rail-recent", "lib-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
@@ -338,7 +338,8 @@
     {{ notice.render()?|safe }}
     {% endmatch %}
     {% else %}
-    <section class="card">
+    {#- `id`: the live rail filter swaps this card with the list (#1275). -#}
+    <section class="card" id="sql-empty-state">
       <div class="card-head">
         <h3>{% if collection_unverified %}{{ i18n.t("sql-library-unavailable-title") }}{% else if !rail.is_empty() %}{{ i18n.t("sql-library-select-title") }}{% else if !filter.is_empty() && rail.is_empty() %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% else %}{{ i18n.t(empty_title_key) }}{% endif %}</h3>
       </div>

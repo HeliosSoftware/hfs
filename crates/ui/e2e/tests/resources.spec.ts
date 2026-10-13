@@ -58,8 +58,8 @@ test("the rail filter narrows the Recently used group too (#1275)", async ({ res
   await expect(resources.recentItem("Observation")).toBeVisible();
   await expect(resources.recentItem("Account")).toBeHidden();
 
-  // A pick the filter excludes cannot be made from the list, but the group
-  // stays hidden rather than reappearing empty under a no-match term.
+  // Under a term matching nothing the group stays hidden, and clearing the
+  // box brings back both entries.
   await resources.railFilter.fill("zzzznomatch");
   await expect(resources.recentGroup).toBeHidden();
   await resources.railFilter.fill("");
