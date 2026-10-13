@@ -22,6 +22,11 @@
 //! flush with the same inference [`create_arrow_schema`] uses (the first 100
 //! values), so later batches keep that type.
 //!
+//! Columns the ViewDefinition declares a `type` or `collection: true` for can
+//! be pinned to the row path's declared mapping with
+//! [`ColumnarBatchBuilder::pin_declared_types`] (`integer64` is `Int64`, a
+//! collection is `List<Utf8>`), so both paths emit the same schema.
+//!
 //! [`create_arrow_schema`]: crate::parquet_schema::create_arrow_schema
 
 use std::sync::Arc;
@@ -33,7 +38,8 @@ use serde_json::{Number, Value};
 use tracing::warn;
 
 use crate::SofError;
-use crate::parquet_schema::{build_array_from_values, infer_arrow_type};
+use crate::parquet_schema::{build_array_from_values, infer_arrow_type, resolve_arrow_schema};
+use crate::sqlquery::engine::DeclaredColumn;
 
 /// Rows per batch used by the in-DB runners.
 ///
@@ -130,6 +136,43 @@ impl ColumnarBatchBuilder {
             rows: 0,
             schema: None,
         })
+    }
+
+    /// Gives every column the ViewDefinition declares a `type` or
+    /// `collection: true` for the Arrow type the row path uses
+    /// ([`resolve_arrow_schema`]), so both paths produce the same schema.
+    ///
+    /// A column whose kind already maps to that type is left alone. Any other
+    /// one (`integer64` text, a collection, a complex type) buffers its values
+    /// like `Deferred` with the type fixed up front, so it is built exactly as
+    /// the row path builds it, including for a first batch of nulls. Call
+    /// before the first row.
+    pub fn pin_declared_types(&mut self, declared: &[DeclaredColumn]) -> Result<(), SofError> {
+        let resolved = resolve_arrow_schema(&self.names, declared, &[])?;
+        for (i, name) in self.names.iter().enumerate() {
+            let is_declared = declared
+                .iter()
+                .find(|d| &d.name == name)
+                .is_some_and(|d| d.fhir_type.is_some() || d.collection);
+            if !is_declared {
+                continue;
+            }
+            let target = resolved.field(i).data_type();
+            let natural = match self.kinds[i] {
+                ColumnKind::Text => Some(DataType::Utf8),
+                ColumnKind::Boolean => Some(DataType::Boolean),
+                ColumnKind::Integer => Some(DataType::Int32),
+                ColumnKind::Decimal => Some(DataType::Float64),
+                ColumnKind::Deferred => None,
+            };
+            if natural.as_ref() != Some(target) {
+                self.cols[i] = ColumnBuf::Deferred {
+                    values: Vec::new(),
+                    data_type: Some(target.clone()),
+                };
+            }
+        }
+        Ok(())
     }
 
     /// Number of columns.
@@ -419,6 +462,78 @@ mod tests {
         ColumnarBatchBuilder::new(names, kinds.to_vec(), batch_rows).unwrap()
     }
 
+    fn declared(name: &str, fhir_type: Option<&str>, collection: bool) -> DeclaredColumn {
+        DeclaredColumn {
+            name: name.to_string(),
+            fhir_type: fhir_type.map(crate::sqlquery::ColumnFhirType::from_code),
+            collection,
+        }
+    }
+
+    #[test]
+    fn pinned_columns_take_the_declared_row_path_types() {
+        // c0 integer64 text, c1 collection, c2 complex, c3 integer, c4 undeclared.
+        let mut b = builder(
+            &[
+                ColumnKind::Text,
+                ColumnKind::Deferred,
+                ColumnKind::Deferred,
+                ColumnKind::Integer,
+                ColumnKind::Deferred,
+            ],
+            10,
+        );
+        b.pin_declared_types(&[
+            declared("c0", Some("integer64"), false),
+            declared("c1", Some("string"), true),
+            declared("c2", Some("CodeableConcept"), false),
+            declared("c3", Some("integer"), false),
+        ])
+        .unwrap();
+        // A first batch of nulls still gets the declared types.
+        for i in 0..5 {
+            b.append_null(i);
+        }
+        b.end_row();
+        b.append_str(0, "9007199254740993");
+        b.append_deferred(1, json!(["a", "b"]));
+        b.append_deferred(2, json!({ "text": "x" }));
+        b.append_i64(3, 7);
+        b.append_i64(4, 1);
+        b.end_row();
+        let batch = b.flush().unwrap().unwrap();
+        let types: Vec<_> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                DataType::Int64,
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                DataType::Utf8,
+                DataType::Int32,
+                DataType::Int32,
+            ]
+        );
+        let c0 = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert!(c0.is_null(0));
+        assert_eq!(c0.value(1), 9_007_199_254_740_993);
+        let c1 = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(c1.is_null(0));
+        assert_eq!(c1.value(1).len(), 2);
+    }
+
     #[test]
     fn mismatched_lengths_are_rejected() {
         assert!(ColumnarBatchBuilder::new(vec!["a".into()], vec![], 10).is_err());
@@ -611,14 +726,22 @@ mod tests {
         assert_eq!(inner.iter().collect::<Vec<_>>(), vec![Some("x"), Some("y")]);
     }
 
-    /// Pins an inherited limitation: inference can yield `List<Int32>` but the
-    /// list builder always writes `List<Utf8>`, so the batch cannot be built.
+    /// Like the row path, a list of non-strings is `List<Utf8>` with each
+    /// element stringified.
     #[test]
-    fn deferred_non_string_list_is_an_error_as_in_the_row_path() {
+    fn deferred_non_string_list_is_a_string_list_as_in_the_row_path() {
         let mut b = builder(&[ColumnKind::Deferred], 10);
         b.append_deferred(0, json!([1, 2]));
         b.end_row();
-        assert!(b.flush().is_err());
+        let batch = b.flush().unwrap().unwrap();
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let inner = list.value(0);
+        let inner = inner.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(inner.iter().collect::<Vec<_>>(), vec![Some("1"), Some("2")]);
     }
 
     #[test]

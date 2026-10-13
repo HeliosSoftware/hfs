@@ -418,11 +418,14 @@ fn render_output(
                     ),
                 }
             })?;
-            let body = helios_sof::format_output(processed, ct, None).map_err(|e| {
-                RestError::InternalError {
+            let declared = helios_sof::sqlquery::engine::declared_from_query_types(
+                &result.columns,
+                &result.column_types,
+            );
+            let body = helios_sof::format_output_with_schema(processed, ct, None, &declared)
+                .map_err(|e| RestError::InternalError {
                     message: format!("output formatter failed: {e}"),
-                }
-            })?;
+                })?;
             let inner_ct = content_type_for(ct);
             if wrap_in_binary {
                 let bytes = helios_sof::fhir_format::wrap_in_binary_envelope(inner_ct, &body)

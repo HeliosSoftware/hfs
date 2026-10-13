@@ -50,6 +50,7 @@ pub async fn evaluate_fhirpath(
 
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
 
     // Set variables
     for var in &extracted.variables {
@@ -251,6 +252,7 @@ async fn evaluate_fhirpath_with_version(
 
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
 
     // Preserve underscore properties in context
     preserve_underscore_properties(&mut context, &resource_json);

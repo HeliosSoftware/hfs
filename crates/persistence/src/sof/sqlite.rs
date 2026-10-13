@@ -24,6 +24,7 @@ use tracing::{debug, trace};
 
 use helios_sof::arrow::record_batch::RecordBatch;
 use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnarBatchBuilder};
+use helios_sof::sqlquery::engine::declared_columns;
 
 use crate::core::sof_runner::{
     BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
@@ -155,9 +156,12 @@ impl SofRunner for SqliteInDbRunner {
             .iter()
             .map(|d| d.column_kind())
             .collect();
-        let builder =
+        let mut builder =
             ColumnarBatchBuilder::new(compiled.columns.clone(), kinds, COLUMNAR_BATCH_ROWS)
                 .map_err(|e| SofError::Backend(format!("columnar builder: {e}")))?;
+        builder
+            .pin_declared_types(&declared_columns(&view_definition))
+            .map_err(|e| SofError::Backend(format!("columnar builder: {e}")))?;
         debug!(runner = "sqlite-indb", tenant = %tenant_id, "executing compiled ViewDefinition (columnar)");
         let params = prepared
             .params

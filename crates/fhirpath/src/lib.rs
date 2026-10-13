@@ -312,7 +312,7 @@ pub mod evaluator;
 pub mod parser;
 
 // Public API exports - this is what users of the fhirpath crate should use
-pub use evaluator::EvaluationContext;
+pub use evaluator::{EvaluationContext, UnresolvedIdentifierPolicy};
 pub use functions::{FunctionCategory, FunctionInfo, builtin_functions};
 pub use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 pub use terminology_functions::TerminologySession;

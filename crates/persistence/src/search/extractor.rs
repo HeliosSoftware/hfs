@@ -1163,13 +1163,15 @@ pub(crate) fn split_union_members(expression: &str) -> Vec<&str> {
 /// expression, returning the resource-relative remainder.
 ///
 /// The `Resource`-level SearchParameters carry expressions like
-/// `Resource.meta.source` (`_source`) and `Resource.id` (`_id`). Evaluated
-/// against a concrete resource these resolve to nothing — FHIRPath matches the
-/// leading identifier against the resource's own type, so `Patient.meta.source`
-/// and `meta.source` both work but `Resource.meta.source` yields an empty
-/// collection, and the parameter is never indexed (#523). Since these
-/// expressions apply to every resource, the prefix is dropped and the rest is
-/// evaluated relative to the resource.
+/// `Resource.meta.source` (`_source`) and `Resource.id` (`_id`). The FHIRPath
+/// evaluator now resolves a leading `Resource.`/`DomainResource.` against any
+/// resource that conforms to it (#640), so evaluation no longer needs this
+/// strip. It is kept because the extractor uses it as a union-member
+/// selector, not only as an evaluator workaround: `retained_parts` treats an
+/// abstract member as "applies to every type" (so `Patient.name |
+/// Resource.meta.source` keeps the abstract member on a Patient and drops
+/// foreign-type members), and `resolve_target_types` and the composite-base
+/// memo key are derived from the same filtered text (#523, #535).
 ///
 /// Leading parentheses are carried across, so a parenthesized member
 /// (`(Resource.meta.source)`) strips to `(meta.source)` rather than falling
@@ -2236,6 +2238,62 @@ mod tests {
             .evaluate_fhirpath(&patient, &filtered)
             .expect("the filtered expression must parse");
         assert!(!values.is_empty());
+    }
+
+    /// When no union member names the resource type, the whole union is
+    /// evaluated, so foreign-type heads (`Observation.code`) run against a
+    /// Patient. That cross-type silence is load-bearing (#640): it must stay an
+    /// `Ok` and the matching member must still extract.
+    #[test]
+    fn fallback_union_with_foreign_heads_still_extracts() {
+        let extractor = create_test_extractor();
+        let expr = "Observation.code.text | Condition.code.text | (Patient.name.family)";
+
+        // No member is retained for Encounter, so the full union is the fallback.
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "e1",
+            "status": "finished"
+        });
+        assert_eq!(
+            extractor.filter_expression_for_resource(expr, "Encounter"),
+            expr
+        );
+        let values = extractor
+            .evaluate_fhirpath(&encounter, expr)
+            .expect("foreign-type heads must not fail the evaluation");
+        assert!(values.is_empty());
+
+        // A member naming a type other than the context's still contributes
+        // when that is the resource at hand.
+        let observation = json!({
+            "resourceType": "Observation",
+            "id": "o1",
+            "code": {"text": "BP"}
+        });
+        let values = extractor
+            .evaluate_fhirpath(&observation, expr)
+            .expect("the union must evaluate against an Observation");
+        assert_eq!(values.len(), 1);
+    }
+
+    /// An identifier that is neither a known type nor an element is diagnosed
+    /// by the evaluator (warn by default in the extractor's context). It must
+    /// not turn into an error that drops the whole parameter, or valid union
+    /// members would lose their index rows.
+    #[test]
+    fn unknown_leading_identifier_does_not_discard_the_parameter() {
+        let extractor = create_test_extractor();
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "name": [{"family": "Smith"}]
+        });
+
+        let values = extractor
+            .evaluate_fhirpath(&patient, "Bogus.name.family | Patient.name.family")
+            .expect("an unknown leading identifier must not fail extraction");
+        assert_eq!(values.len(), 1);
     }
 
     /// The `DomainResource` half of `ABSTRACT_BASE_TYPES` has to be reachable:

@@ -21,6 +21,7 @@ use deadpool_postgres::Pool;
 use futures::StreamExt as _;
 use helios_fhir::FhirVersion;
 use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnKind, ColumnarBatchBuilder};
+use helios_sof::sqlquery::engine::{DeclaredColumn, declared_columns};
 use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace};
@@ -220,6 +221,7 @@ impl SofRunner for PgInDbRunner {
         if !compiled.columns.iter().all(|c| seen.insert(c.as_str())) {
             return Ok(None);
         }
+        let declared = declared_columns(&view_definition);
         debug!(runner = "postgres-indb", tenant = %tenant_id, "executing compiled ViewDefinition (columnar)");
         trace!(
             runner = "postgres-indb", sql = %compiled.sql, columns = ?compiled.columns,
@@ -241,6 +243,7 @@ impl SofRunner for PgInDbRunner {
                 params,
                 compiled.columns,
                 compiled.column_decodes,
+                declared,
                 prepared.client_limit,
                 tx,
             )
@@ -640,26 +643,32 @@ async fn stream_pg_pages_inner(
 // Columnar fetch loop
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_pg_batches(
     pool: Pool,
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
     decodes: Vec<ColumnDecode>,
+    declared: Vec<DeclaredColumn>,
     limit: Option<usize>,
     tx: BatchSender,
 ) {
-    if let Err(e) = stream_pg_batches_inner(pool, sql, params, columns, decodes, limit, &tx).await {
+    if let Err(e) =
+        stream_pg_batches_inner(pool, sql, params, columns, decodes, &declared, limit, &tx).await
+    {
         let _ = tx.send(Err(e)).await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_pg_batches_inner(
     pool: Pool,
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
     decodes: Vec<ColumnDecode>,
+    declared: &[DeclaredColumn],
     limit: Option<usize>,
     tx: &BatchSender,
 ) -> Result<(), SofError> {
@@ -688,6 +697,9 @@ async fn stream_pg_batches_inner(
         .map(|i| decodes.get(i).copied().unwrap_or_default().column_kind())
         .collect();
     let mut builder = ColumnarBatchBuilder::new(columns.clone(), kinds, COLUMNAR_BATCH_ROWS)
+        .map_err(|e| SofError::Backend(format!("columnar builder: {e}")))?;
+    builder
+        .pin_declared_types(declared)
         .map_err(|e| SofError::Backend(format!("columnar builder: {e}")))?;
 
     let mut count = 0usize;
