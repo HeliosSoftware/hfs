@@ -72,8 +72,10 @@
 //!
 //! The S3 backend additionally supports a per-tenant *physical* boundary — a
 //! dedicated bucket, with its own IAM/policy surface — via
-//! `S3TenancyMode::BucketPerTenant` (tenants absent from the bucket map fall
-//! back to the shared system bucket). Schema-per-tenant and database-per-tenant
+//! `S3TenancyMode::BucketPerTenant` (a tenant absent from the bucket map is
+//! refused with `TenantError::UnmappedTenant`; only the `__system__` tenant
+//! falls back, to the optional `default_system_bucket`, which also holds the
+//! cross-tenant control-plane state). Schema-per-tenant and database-per-tenant
 //! are **not** offered for the SQL backends; unwired SQL generators for them
 //! were removed in
 //! [#370](https://github.com/HeliosSoftware/hfs/issues/370).

@@ -239,6 +239,13 @@ pub trait SofRunner: Send + Sync {
     /// reads a type by scanning storage (S3) would scan it once per view. The
     /// runner returned here may keep what it read for the life of the job, so
     /// views over the same type read it once and the job sees one snapshot.
+    ///
+    /// A runner may also return a differently configured clone for the job
+    /// because an export, unlike a preview, reads a whole type: the PostgreSQL
+    /// runner reads each view in keyset pages over the resource id, so no
+    /// statement sorts or holds the entire type, and its rows come out in
+    /// bytewise id order (not `(last_updated, id)`) without a single snapshot
+    /// across pages.
     fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
         None
     }

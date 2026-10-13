@@ -6,7 +6,7 @@
 //! - [`ResourceStorage`] - Core CRUD operations
 //! - [`VersionedStorage`] - Version-aware operations
 //! - [`InstanceHistoryProvider`], [`TypeHistoryProvider`], [`SystemHistoryProvider`] - History access
-//! - [`SearchProvider`], [`MultiTypeSearchProvider`], [`ChainedSearchProvider`] - Search capability
+//! - [`SearchProvider`], [`MultiTypeSearchProvider`] - Search capability
 //! - [`Transaction`] - ACID transaction support
 //! - [`CapabilityProvider`] - Runtime capability discovery
 //!
@@ -27,7 +27,6 @@
 //!             ├── MultiTypeSearchProvider
 //!             ├── IncludeProvider
 //!             ├── RevincludeProvider
-//!             ├── ChainedSearchProvider
 //!             ├── TerminologySearchProvider
 //!             └── TextSearchProvider
 //!
@@ -175,9 +174,9 @@ pub use preconditions::{
     precondition_failed_entry,
 };
 pub use search::{
-    ChainedSearchProvider, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider,
-    MAX_ITERATE_INCLUDED, MultiTypeSearchProvider, RevincludeProvider, SearchProvider,
-    SearchResult, TerminologySearchProvider, TextSearchProvider, include_truncation_outcome,
+    FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider, MAX_ITERATE_INCLUDED,
+    MultiTypeSearchProvider, RevincludeProvider, SearchProvider, SearchResult,
+    TerminologySearchProvider, TextSearchProvider, include_truncation_outcome,
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
