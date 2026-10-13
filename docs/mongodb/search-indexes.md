@@ -83,6 +83,106 @@ Outside those limits, a resource can keep stale search rows until it is next wri
 
 The walk's position lives in memory: after a restart, a rebuild starts every type from the beginning.
 
+## Missing-parameter metadata
+
+MongoDB stores `missing_params` on each `resources` document, outside the
+FHIR payload. It is a sorted, deduplicated array of supported search-parameter
+codes for which extraction found no indexed value. For example,
+`missing_params: ["method"]` records that this resource has no indexed
+`method` value. It does not create a separate `search_index` row for absence.
+An empty array is different from an absent field: an absent field means the
+resource has no absence metadata and requires the compatibility path.
+Parameters that fail extraction are not recorded as confirmed absence.
+Other parameters can still produce rows and metadata, so a present field does
+not prove that every parameter extracted successfully. Affected missing-field
+results can remain incomplete until the extraction problem is corrected and
+the resource is rewritten or reindexed. This metadata describes top-level
+resources; it does not add contained `:missing` support.
+
+The shared `idx_resources_missing_params` multikey index has this key order:
+
+```javascript
+{ tenant_id: 1, resource_type: 1, is_deleted: 1,
+  missing_params: 1, last_updated: 1, id: 1 }
+```
+
+HFS creates it during resource-index initialization, before serving, including
+when `HFS_MONGODB_INDEX_BUILD=off`. Readiness requires it to be present, built
+and visible. Building it over an existing collection can lengthen startup.
+The array and its index entries add storage and write work; an unchanged
+numeric schema version does not mean the stored representation is unchanged.
+
+### Search and write behavior
+
+For supported `parameter:missing=true` searches, HFS uses absence metadata on
+resources and checks the existing typed value index for resources whose
+metadata field is absent. Old and new resources can therefore coexist without
+requiring an immediate reindex. This fallback uses stored index rows, not a
+fresh extraction from the FHIR payload. Unsupported metadata parameters retain
+their existing search behavior. `:missing=false` uses typed value presence.
+Ordinary queries do not acquire a missing-metadata lookup, although writes
+still maintain the array and its index.
+
+Selective positive predicates keep candidate-driven execution. When the
+planner has chosen a metadata-aware resource plan, search and count retain it
+instead of first collecting every matching resource ID. Eligible ID-sorted
+pages with positive predicates use bounded candidate checks; timestamp pages
+can use the metadata index. Pages still enforce tenant, type and deletion
+scope. This does not guarantee that every search is covered or faster.
+
+Create, update, restore, transaction writes and non-deferred bulk ingestion
+carry metadata from the same extraction that produces value-index rows.
+Deferred or offloaded indexing leaves metadata unknown and removes any old
+array on update; a whole-resource extraction failure does the same. Reindex
+updates metadata only when the resource version still matches the version
+read for that page.
+
+Reindex can write metadata even when that resource's value-index insertion
+fails. The resource is reported as failed, but its index may remain incomplete
+until a successful rewrite. Check job errors and repair failed resources;
+metadata is not proof that all value-index writes succeeded. Metadata-update
+time is included in the insert timing statistic.
+
+### Upgrade and definition maintenance
+
+1. Drain older writers before allowing metadata-aware writers to update the
+   same resources. Older writers do not maintain or invalidate this field;
+   they can leave stale metadata on a resource previously written by a newer
+   node. The same restriction applies to a writer downgrade.
+2. Start the upgraded nodes and wait for index creation and readiness. Existing
+   resources without metadata remain searchable through the compatibility
+   path while their value indexes remain valid.
+3. Run the tenant's `POST /$reindex` to populate metadata for existing resources.
+   Poll `GET /$reindex-status/{job_id}` on the same node and resolve reported
+   failures before treating the rebuild as complete.
+
+There is no definition fingerprint or automatic metadata invalidation when a
+SearchParameter is added, changed or removed. Coordinate definition
+maintenance across all nodes serving the affected tenant:
+
+1. Pause affected searches and drain writers, including background indexing.
+2. Apply the definition change and refresh or restart every affected node so
+   they use the same definitions.
+3. Remove the complete `missing_params` field for the affected tenant and
+   resource types, using an explicitly scoped MongoDB update, for example:
+
+   ```javascript
+   db.resources.updateMany(
+     { tenant_id: "TENANT_ID", resource_type: { $in: ["Observation"] } },
+     { $unset: { missing_params: "" } }
+   );
+   ```
+
+4. Reindex the affected resources with the new definitions, check job errors,
+   and resume requests after the rebuild succeeds.
+
+Do not merely remove one parameter name from the array: a present array would
+still be trusted, so that would claim the parameter is not absent instead of
+marking its state unknown. Unsetting the field restores compatibility checks,
+but those checks cannot repair value-index rows extracted from old definitions;
+the rebuild is still required. Include every affected type when a definition
+applies to an abstract base or multiple resource types.
+
 ## Composite parameters
 
 Composite search (`code-value-quantity`, `component-code-value-quantity`, ...) uses the existing value indexes for matching (#1206). The extractor writes one row per component value in `search_index`, or in `search_index_contained` for a contained resource. Rows in one composite instance share `param_name` (the composite's code) and `composite_group` (the base-instance index). Each row also has a `composite_slot`, the component's position among components of the same type. The existing value indexes bound each component predicate by its type and value.
