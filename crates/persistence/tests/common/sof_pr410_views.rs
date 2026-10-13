@@ -154,5 +154,133 @@ pub fn extra_cases() -> Vec<Case> {
             r#"{"resourceType":"ViewDefinition","resource":"Basic","status":"active","select":[{"column":[{"path":"id","name":"id"},{"path":"zip","name":"zip"},{"path":"num","name":"num"},{"path":"count","name":"count"},{"path":"flag","name":"flag"}]}]}"#,
             r#"[{"id":"b1","zip":"02101","num":"2.1","count":42,"flag":true}]"#,
         ),
+        // `repeat` seeded from each `forEach` element: the descendants of
+        // concept A only (B has none, so its row drops).
+        case(
+            "RepeatInsideForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"concept","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"column":[{"path":"code","name":"descendant"}]}]}]}"#,
+            r#"[{"id":"cs1","top":"A","descendant":"A1"},{"id":"cs1","top":"A","descendant":"A2"},{"id":"cs1","top":"A","descendant":"A2a"}]"#,
+        ),
+        // The inner `repeat` restarts from every node the outer one visits.
+        case(
+            "RepeatInsideRepeat",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"repeat":["concept"],"select":[{"column":[{"path":"code","name":"parent"}]},{"repeat":["concept"],"column":[{"path":"code","name":"child"}]}]}]}"#,
+            r#"[{"id":"cs1","parent":"A","child":"A1"},{"id":"cs1","parent":"A","child":"A2"},{"id":"cs1","parent":"A","child":"A2a"},{"id":"cs1","parent":"A2","child":"A2a"}]"#,
+        ),
+        // Sibling `repeat`s multiply: 3 x 3 descendants of concept A.
+        case(
+            "SiblingRepeatsInsideForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"concept","select":[{"repeat":["concept"],"column":[{"path":"code","name":"a"}]},{"repeat":["concept"],"column":[{"path":"code","name":"b"}]}]}]}"#,
+            r#"[{"id":"cs1","a":"A1","b":"A1"},{"id":"cs1","a":"A1","b":"A2"},{"id":"cs1","a":"A1","b":"A2a"},{"id":"cs1","a":"A2","b":"A1"},{"id":"cs1","a":"A2","b":"A2"},{"id":"cs1","a":"A2","b":"A2a"},{"id":"cs1","a":"A2a","b":"A1"},{"id":"cs1","a":"A2a","b":"A2"},{"id":"cs1","a":"A2a","b":"A2a"}]"#,
+        ),
+        // `unionAll` nested in a `select` under `forEach`; the branch without
+        // iteration runs once per name, the other once per given.
+        case(
+            "UnionAllInsideForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name","select":[{"unionAll":[{"column":[{"path":"family","name":"value"}]},{"forEach":"given","column":[{"path":"$this","name":"value","type":"string"}]}]}]}]}"#,
+            r#"[{"id":"p1","value":"Smith"},{"id":"p1","value":"Jane"},{"id":"p1","value":"Q"},{"id":"p1","value":null},{"id":"p1","value":"JJ"},{"id":"p2","value":"Jones"},{"id":"p2","value":"Bob"}]"#,
+        ),
+        // The descent survives a `unionAll` in the same clause: one row per
+        // visited node per branch.
+        case(
+            "UnionAllInsideRepeat",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"repeat":["concept"],"unionAll":[{"column":[{"path":"'code'","name":"kind"},{"path":"code","name":"value"}]},{"column":[{"path":"'first-child'","name":"kind"},{"path":"concept.code.first()","name":"value"}]}]}]}"#,
+            r#"[{"kind":"code","value":"A"},{"kind":"code","value":"A1"},{"kind":"code","value":"A2"},{"kind":"code","value":"A2a"},{"kind":"code","value":"B"},{"kind":"first-child","value":"A1"},{"kind":"first-child","value":null},{"kind":"first-child","value":"A2a"},{"kind":"first-child","value":null},{"kind":"first-child","value":null}]"#,
+        ),
+        // A `select` and a `unionAll` in one `forEach` clause: the union
+        // branches multiply the sibling `select`'s rows per name.
+        case(
+            "SelectPlusUnionInForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name","select":[{"column":[{"path":"family","name":"fam"}]}],"unionAll":[{"column":[{"path":"'a'","name":"u"}]},{"forEach":"given","column":[{"path":"$this","name":"u","type":"string"}]}]}]}"#,
+            r#"[{"id":"p1","fam":"Smith","u":"a"},{"id":"p1","fam":"Smith","u":"Jane"},{"id":"p1","fam":"Smith","u":"Q"},{"id":"p1","fam":null,"u":"a"},{"id":"p1","fam":null,"u":"JJ"},{"id":"p2","fam":"Jones","u":"a"},{"id":"p2","fam":"Jones","u":"Bob"}]"#,
+        ),
+        // A trailing-`[N]` forEach next to a `repeat` (the index filter is applied in the main query).
+        case(
+            "IndexedForEachSiblingRepeat",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"concept[0]","column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"column":[{"path":"code","name":"d"}]}]}"#,
+            r#"[{"id":"cs1","top":"A","d":"A"},{"id":"cs1","top":"A","d":"A1"},{"id":"cs1","top":"A","d":"A2"},{"id":"cs1","top":"A","d":"A2a"},{"id":"cs1","top":"A","d":"B"}]"#,
+        ),
+        // A trailing-`[N]` forEach nested under a `repeat`.
+        case(
+            "RepeatNestedIndexedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"repeat":["concept"],"select":[{"forEach":"concept[0]","column":[{"path":"code","name":"c0"}]}]}]}"#,
+            r#"[{"id":"cs1","c0":"A1"},{"id":"cs1","c0":"A2a"}]"#,
+        ),
+        // An EMPTY `forEachOrNull` keeps one null row through a nested `repeat`.
+        case(
+            "EmptyForEachOrNullNestedRepeat",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='zzz')","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"column":[{"path":"code","name":"desc"}]}]}]}"#,
+            r#"[{"id":"cs1","top":null,"desc":null}]"#,
+        ),
+        // ...and through a `repeat` that itself holds a `forEach`.
+        case(
+            "EmptyForEachOrNullRepeatForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='zzz')","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"select":[{"forEach":"concept","column":[{"path":"code","name":"c"}]}]}]}]}"#,
+            r#"[{"id":"cs1","top":null,"c":null}]"#,
+        ),
+        // A NON-empty `forEachOrNull` element without descendants still drops its row.
+        case(
+            "NonEmptyForEachOrNullLeafRepeat",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='B')","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"column":[{"path":"code","name":"desc"}]}]}]}"#,
+            r#"[]"#,
+        ),
+        // An empty `forEachOrNull` yields ONE null row, not one per union branch.
+        case(
+            "EmptyForEachOrNullNestedUnionAll",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"contact.where(name.family='zzz')","select":[{"unionAll":[{"column":[{"path":"name.family","name":"v"}]},{"column":[{"path":"'x'","name":"v"}]}]}]}]}"#,
+            r#"[{"id":"p1","v":null},{"id":"p2","v":null}]"#,
+        ),
+        // ...and through a plain nested `forEach` (no `repeat` involved).
+        case(
+            "EmptyForEachOrNullNestedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='zzz')","select":[{"column":[{"path":"code","name":"top"}]},{"forEach":"concept","column":[{"path":"code","name":"c"}]}]}]}"#,
+            r#"[{"id":"cs1","top":null,"c":null}]"#,
+        ),
+        case(
+            "EmptyForEachOrNullNestedIndexedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='zzz')","select":[{"column":[{"path":"code","name":"top"}]},{"forEach":"concept[0]","column":[{"path":"code","name":"c0"}]}]}]}"#,
+            r#"[{"id":"cs1","top":null,"c0":null}]"#,
+        ),
+        case(
+            "EmptyForEachOrNullRepeatIndexedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='zzz')","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"select":[{"forEach":"concept[0]","column":[{"path":"code","name":"c0"}]}]}]}]}"#,
+            r#"[{"id":"cs1","top":null,"c0":null}]"#,
+        ),
+        // A trailing-`[N]` forEach with a nested select that iterates.
+        case(
+            "IndexedForEachNestedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name[0]","select":[{"column":[{"path":"family","name":"fam"}]},{"forEach":"given","column":[{"path":"$this","name":"g","type":"string"}]}]}]}"#,
+            r#"[{"id":"p1","fam":"Smith","g":"Jane"},{"id":"p1","fam":"Smith","g":"Q"},{"id":"p2","fam":"Jones","g":"Bob"}]"#,
+        ),
+        // A `forEachOrNull` with `[N]`: the element is the iteration scope (p2 has none: null row).
+        case(
+            "EmptyIndexedForEachOrNullNestedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"name[1]","select":[{"column":[{"path":"family","name":"fam"}]},{"forEach":"given","column":[{"path":"$this","name":"g","type":"string"}]}]}]}"#,
+            r#"[{"id":"p1","fam":null,"g":"JJ"},{"id":"p2","fam":null,"g":null}]"#,
+        ),
+        // `where(...).first()` with a nested select; `%rowIndex` is 0.
+        case(
+            "FilteredFirstForEachNestedSelect",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name.where(use='nickname').first()","select":[{"column":[{"path":"family","name":"fam"},{"path":"%rowIndex","name":"ri","type":"integer"}]}]}]}"#,
+            r#"[{"id":"p1","fam":null,"ri":0}]"#,
+        ),
+        // A nested select that only adds columns.
+        case(
+            "IndexedForEachNestedColumns",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name[0]","select":[{"column":[{"path":"use","name":"u"}]}]}]}"#,
+            r#"[{"id":"p1","u":"official"},{"id":"p2","u":"usual"}]"#,
+        ),
+        // `forEachOrNull` with an out-of-range index keeps one null row.
+        case(
+            "MissingIndexedForEachOrNullNestedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"name[5]","select":[{"column":[{"path":"family","name":"fam"}]},{"forEach":"given","column":[{"path":"$this","name":"g","type":"string"}]}]}]}"#,
+            r#"[{"id":"p1","fam":null,"g":null},{"id":"p2","fam":null,"g":null}]"#,
+        ),
+        // A `repeat` nested under a trailing-`[N]` forEach.
+        case(
+            "IndexedForEachNestedRepeat",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"concept[0]","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"column":[{"path":"code","name":"d"}]}]}]}"#,
+            r#"[{"id":"cs1","top":"A","d":"A1"},{"id":"cs1","top":"A","d":"A2"},{"id":"cs1","top":"A","d":"A2a"}]"#,
+        ),
     ]
 }

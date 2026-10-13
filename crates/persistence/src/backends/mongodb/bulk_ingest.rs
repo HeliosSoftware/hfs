@@ -145,6 +145,8 @@ struct ExistingResource {
 struct PlannedBatch {
     results: Vec<BulkEntryResult>,
     plans: Vec<ResourcePlan>,
+    /// Index extraction shared by each resource write and its later index write.
+    search_documents: Vec<super::storage::SearchIndexDocuments>,
     /// `(plan index, history document)` — one per written version.
     history: Vec<(usize, Document)>,
     /// `(plan index, result index, change)` — one per entry that wrote.
@@ -254,7 +256,7 @@ impl MongoBackend {
             .await?;
         self.write_history(db, &mut planned, &failed, cancel)
             .await?;
-        self.write_search_index(db, tenant_id, &planned, &failed, options)
+        self.write_search_index(db, tenant_id, &mut planned, &failed, options)
             .await?;
 
         // A resource the batch could not write takes its entry's result down
@@ -367,6 +369,7 @@ impl MongoBackend {
         let mut planned = PlannedBatch {
             results: Vec::with_capacity(entries.len()),
             plans: Vec::new(),
+            search_documents: Vec::new(),
             history: Vec::new(),
             changes: Vec::new(),
             error_count: 0,
@@ -599,6 +602,22 @@ impl MongoBackend {
             planned.changes.push((plan_idx, result_idx, change));
         }
 
+        planned.search_documents = planned
+            .plans
+            .iter()
+            .map(|plan| {
+                if options.defer_indexing {
+                    super::storage::SearchIndexDocuments::default()
+                } else {
+                    self.search_index_documents(
+                        tenant_id,
+                        &plan.resource_type,
+                        &plan.id,
+                        &plan.content,
+                    )
+                }
+            })
+            .collect();
         Ok(planned)
     }
 
@@ -628,7 +647,7 @@ impl MongoBackend {
             match &plan.base_version {
                 None => {
                     create_plans.push(plan_idx);
-                    create_docs.push(doc! {
+                    create_docs.push(planned.search_documents[plan_idx].resource_document(doc! {
                         "tenant_id": tenant_id,
                         "resource_type": &plan.resource_type,
                         "id": &plan.id,
@@ -639,7 +658,7 @@ impl MongoBackend {
                         "is_deleted": false,
                         "deleted_at": Bson::Null,
                         "fhir_version": plan.fhir_version.as_mime_param(),
-                    });
+                    }));
                 }
                 Some(base_version) => {
                     update_ops.push((
@@ -651,14 +670,14 @@ impl MongoBackend {
                             "version_id": base_version,
                             "is_deleted": false,
                         },
-                        doc! { "$set": {
+                        planned.search_documents[plan_idx].resource_update(doc! { "$set": {
                             "version_id": &plan.version,
                             "data": payload,
                             "last_updated": last_updated,
                             "is_deleted": false,
                             "deleted_at": Bson::Null,
                             "fhir_version": plan.fhir_version.as_mime_param(),
-                        }},
+                        }}),
                     ));
                 }
             }
@@ -903,7 +922,7 @@ impl MongoBackend {
         &self,
         db: &Database,
         tenant_id: &str,
-        planned: &PlannedBatch,
+        planned: &mut PlannedBatch,
         failed: &HashMap<usize, String>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<()> {
@@ -971,12 +990,7 @@ impl MongoBackend {
                 .entry(plan.resource_type.as_str())
                 .or_default()
                 .push(Bson::from(plan.id.as_str()));
-            let docs = self.search_index_documents(
-                tenant_id,
-                &plan.resource_type,
-                &plan.id,
-                &plan.content,
-            );
+            let docs = std::mem::take(&mut planned.search_documents[plan_idx]);
             documents.extend(docs.own);
             contained_documents.extend(docs.contained);
         }
