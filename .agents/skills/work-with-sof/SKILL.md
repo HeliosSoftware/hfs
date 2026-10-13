@@ -19,6 +19,9 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 | `SOF_ENABLE_CORS` | `true` | Enable CORS |
 | `SOF_CORS_ORIGINS` | `*` | Allowed origins |
 | `SOF_TERMINOLOGY_SERVER` | none | Terminology server URL for FHIRPath memberOf and subsumes |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | `1000` | (helios-fhirpath setting) Max distinct terminology calls per ViewDefinition run (`0` disables) |
+
+All rows, where clauses, forEach/repeat items and streamed chunks of one view run share one FHIRPath `TerminologySession` (held by the public `PreparedViewDefinition`), so identical `memberOf()` lookups are sent once per run and the cap bounds the run, not each row. Raise the cap or set it to `0` for views that check many distinct codes. Any terminology error (cap, no server, failed request) fails the run in where clauses, top-level columns and forEach/forEachOrNull/unionAll/repeat item columns alike; `evaluate_path_on_item` detects it with `helios_fhirpath::evaluate_expression_typed` + `ExpressionError::is_terminology_error()`, not message text. Deterministic failures (4xx, invalid body) are cached for the run; transient ones (timeout, connection error, 408/429/5xx except 501) are retried by the next identical lookup and count against the cap again.
 
 ## API Endpoints
 
@@ -44,6 +47,50 @@ limits, read the
 [stored-data ordering contract](../../../book/src/ch06-sql-on-fhir.md#hfs-stored-data-ordering).
 
 Parameter precedence is request body, then query params, then Accept header.
+
+## Structural Validation (Lint) — the Single Source of Truth (#821)
+
+`helios_sof::lint::lint_view_definition` is the one engine that answers "is
+this JSON document a well-formed ViewDefinition": it walks a raw
+`serde_json::Value` (never a typed `helios_fhir` resource — a document being
+edited is often not valid enough to deserialize) and returns every problem it
+finds, located by RFC 6901 JSON pointer — unknown/missing/wrong-typed/empty
+keys, a `select` with no output or more than one iteration directive,
+duplicate column names, FHIRPath syntax errors, and undeclared `%constant`
+references. It is deliberately structural and syntactic only; it never
+evaluates FHIRPath, resolves terminology, or touches storage.
+
+Every `Diagnostic` carries `args` (the values its English `message`
+interpolates — `message` itself is always English, never localized here) and
+`fixes` (structural, pointer-addressed edits a client believes resolve it —
+`rename-key`/`remove-key`/`set-string`; never a text position, since this
+module never sees source text). `node_keys` exposes the same key model these
+checks are built on, for anything that wants "what keys are valid here" (the
+`helios-ui` completion endpoint, below).
+
+`$sql-run` lints the inline ViewDefinition JSON as received, before any typed
+parse — a round-trip through the typed `Parameters`/`ViewDefinition` structs
+would silently drop unknown keys, since no generated struct denies them, so
+linting *after* that parse would never catch `unknown-key` at all. A lint
+failure responds `422` with one `OperationOutcome.issue` per diagnostic,
+`issue.expression` carrying the pointer and `issue.details.coding` a code
+under `http://heliossoftware.com/fhir/CodeSystem/view-definition-lint`
+matching `Diagnostic::code`. The crate's own `validate_view_definition`
+delegates to the same lint (serializing the typed struct back to JSON first),
+so `sof-cli` and `pysof` see identical rules and messages — one engine, not
+three. A few checks that depend on evaluation context rather than structure
+(`collection: false` outside `forEach`, cross-branch column consistency in
+`unionAll`) stay as `validate_view_definition`'s own residual checks; the
+lint does not model them.
+
+The ViewDefinition editor's own `POST /ui/sql/view-definitions/lint` and
+`POST /ui/sql/view-definitions/complete` endpoints (`helios-ui`, see
+`/work-with-ui`) build directly on this module — `/lint` translates `code` +
+`args` into the negotiated locale and adds a translated `label` to each fix;
+`/complete` answers "what fits here" from the same key model plus
+`helios_fhirpath`'s function/constant/variable catalogs, re-exported through
+`helios_sof::lint` so `helios-ui` never takes a direct `helios-fhirpath`
+dependency of its own.
 
 ## Parquet Export
 
@@ -71,6 +118,51 @@ Parquet type mapping follows Pathling conventions:
 Declared column `type` wins; columns without one are inferred from the first 100 rows only, and a later value that does not fit (e.g. a non-integer or an integer above `i32::MAX` in an Int32 column) becomes null. `collection: true` and arrays map to `List<UTF8>`. All fields are OPTIONAL. Snappy compression is the default.
 
 Parquet/Arrow are encoded incrementally (`helios_sof::columnar_stream`): schema fixed up front, 8,192-row batches, row groups cut by encoded bytes (`row_group_size_mb`), and the `$sql-run` response streams with an aborted body on a mid-stream error. File splitting by size is per batch, so a file can overshoot by one batch plus the footer. Streamed responses have no `Content-Length` (chunked), the timeout layer does not cover the body, Arrow stays compressible, and a client disconnect stops the encoder and drops the `RowStream` (test: `streaming_columnar_client_disconnect_drops_the_row_stream`). Values that do not fit a declared type become null; the Postgres runner's text cells are parsed by the builders (unit-tested, not run against a live Postgres). Peak-memory evidence: `docs/sof-parquet-streaming-benchmark.md` (`cargo run -p helios-sof --example parquet_peak_memory`). Row groups are cut at `row_group_size_mb` encoded bytes (REST/CLI minimum 64 MB), so per-request peak memory is about 3x that (~190 MB at the minimum). The first split file keeps the plain name and later files are `_002`, `_003` (no `_001`).
+
+## Async Export in the HFS Server
+
+The `hfs` binary embeds SQL-on-FHIR via `helios-rest` and exposes the async
+`$sql-export` operation. These run in the
+background and write tabular shards to an *export sink*, configured with the
+`HFS_EXPORT_*` variables below (distinct from the standalone `sof-server`
+`SOF_*` vars above, and from Bulk Data Export's `HFS_BULK_EXPORT_*`).
+
+The subsystem is gated by `HFS_SOF_ENABLED`, and the configured storage backend
+must provide an in-DB SOF runner (`sqlite` or `postgres`) — there is no
+in-process fallback.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR ops (`$sql-run`, `$sql-export`) |
+| `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`); rows beyond it are silently dropped, not an error |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized in full before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. Narrow it with a ViewDefinition `where`, or raise this limit |
+| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's); does not cover materializing a dependency |
+| `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3` |
+| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3` |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink |
+| `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for `s3`, seconds (spec requires ≥ 24h) |
+| `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs |
+| `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum queued + running export jobs per tenant; beyond it `$sql-export` returns `429` with `Retry-After: 5` |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger results split across files |
+| `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory` in-process; `kafka`/`sqs` reserved) |
+| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`) |
+| `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval, seconds (clamped to ≥ 1) |
+
+Cancelling a job (`DELETE` on the status URL) deletes its partial shards
+immediately and stops it: a queued job never starts, a running one stops at its
+next checkpoint (before each subject and shard, every 4096 rows) and frees its
+slot. A SQL statement already executing is not interrupted;
+`HFS_SOF_SQLQUERY_TIMEOUT_SECS` bounds it. A mid-run failure also deletes the
+partial shards. The reaper reclaims every finished job (completed, failed or
+cancelled) once it ages past `HFS_EXPORT_OUTPUT_TTL`; a failed delete leaves the
+job unreachable (404) and is retried, with a warning, on every sweep. Request
+inputs have fixed limits, each a `400` naming the limit: 64 `subject` entries,
+1000 `patient` plus `group` values, 256 `context` entries, and 4 ×
+`HFS_SOF_SQLQUERY_MAX_VDS` `depends-on` entries per Library. Full
+`HFS_EXPORT_*` reference lives in the
+[helios-rest README](../../../crates/rest/README.md#sql-on-fhir-async-export).
 
 ## Testing
 

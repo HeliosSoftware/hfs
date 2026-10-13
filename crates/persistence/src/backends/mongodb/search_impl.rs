@@ -1593,6 +1593,13 @@ impl MongoBackend {
         resource_type: &str,
         param: &SearchParameter,
     ) -> bool {
+        // Until `idx_resources_missing_params` is built (#2001) every
+        // parameter takes the value-index route, as an unsupported one does:
+        // same results, no full `resources` scan, and no hint naming an
+        // index that does not exist yet.
+        if !self.missing_params_index_ready() {
+            return false;
+        }
         let registry = self.tenant_registry(tenant_id);
         let definition = {
             let registry = registry.read();
