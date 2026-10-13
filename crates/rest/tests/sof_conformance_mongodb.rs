@@ -6,10 +6,8 @@
 //! same comparator, same regression-floor pattern.
 //!
 //! The MongoDB aggregation emitter is at parity with the SQL backends: it
-//! passes the same 132 fixtures. The remaining 12 failures are the identical
-//! structural-coverage gaps shared with SQLite/PostgreSQL (nested/sibling
-//! `repeat`, `unionAll` nested inside another `select`), absorbed by the
-//! regression floor.
+//! passes all 144 fixtures, including nested/sibling `repeat` and `unionAll`
+//! nested inside another `select`.
 //!
 //! The Stage-1 emitter (`$unwind`/`$function`/`$facet`/server-side JS for
 //! `repeat`) requires server-side JavaScript to be enabled (the default for the
@@ -434,13 +432,10 @@ mod sof_conformance_mongodb_tests {
             "\nSoF v2 conformance (MongoDB): {passed} passed, {failed} failed, {skipped} skipped"
         );
 
-        // Regression floor — the Mongo aggregation emitter now passes the SAME
-        // 132 fixtures as the SQL backends. The remaining 12 failures are the
-        // identical structural-coverage gaps shared with SQLite/PostgreSQL
-        // (nested/sibling `repeat`, `unionAll` nested inside another `select`),
-        // so the floor matches the SQL suites exactly. A drop signals a
-        // Mongo-emitter regression; raise it only alongside the SQL floors.
-        const MONGO_PASS_FLOOR: usize = 132;
+        // Regression floor — the Mongo aggregation emitter passes the SAME
+        // 144 fixtures as the SQL backends, so the floor matches the SQL
+        // suites exactly. A drop signals a Mongo-emitter regression.
+        const MONGO_PASS_FLOOR: usize = 144;
         assert!(
             passed >= MONGO_PASS_FLOOR,
             "regression: only {passed} fixtures pass (floor: {MONGO_PASS_FLOOR}). \

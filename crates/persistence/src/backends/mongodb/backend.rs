@@ -13,6 +13,7 @@ use tokio::sync::OnceCell;
 
 use helios_fhir::FhirVersion;
 
+use super::missing_index_builder::MissingIndexBuilder;
 use super::search_index_builder::{BuildOutcome, IndexBuildMode, SearchIndexBuilder};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageError, StorageResult};
@@ -100,6 +101,13 @@ pub struct MongoBackend {
     /// "`init_schema` has run". A `Mutex` only to make `take()` safe from
     /// `&self`; never held across an `.await`.
     search_index_tx:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<Option<BuildOutcome>>>>>,
+    /// Publishes the post-boot `idx_resources_missing_params` build's outcome
+    /// (#2001), from its own task so a long `resources` build never delays
+    /// the `search_index` outcome. `None` until that task finishes.
+    missing_index_rx: tokio::sync::watch::Receiver<Option<BuildOutcome>>,
+    /// The sending half, taken by `init_schema` alongside `search_index_tx`.
+    missing_index_tx:
         Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<Option<BuildOutcome>>>>>,
     /// Rayon pool for `$reindex` sub-batch extraction; built lazily and only
     /// on a multi-thread runtime (#1403). `Err` remembers a failed build so
@@ -788,6 +796,8 @@ impl MongoBackend {
         };
 
         let (search_index_tx, search_index_rx) = tokio::sync::watch::channel(None::<BuildOutcome>);
+        let (missing_index_tx, missing_index_rx) =
+            tokio::sync::watch::channel(None::<BuildOutcome>);
 
         let transaction_bundle_gate = super::transaction_bundle_gate::TransactionBundleGate::new(
             config.max_concurrent_transaction_bundles,
@@ -802,6 +812,8 @@ impl MongoBackend {
             stored_by_tenant,
             search_index_rx,
             search_index_tx: Arc::new(tokio::sync::Mutex::new(Some(search_index_tx))),
+            missing_index_rx,
+            missing_index_tx: Arc::new(tokio::sync::Mutex::new(Some(missing_index_tx))),
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
             transaction_bundle_gate,
@@ -1031,10 +1043,20 @@ impl MongoBackend {
     /// which moves any contained rows out of `search_index` first, in every
     /// mode (#1160): spawned and left running in `background` mode, awaited
     /// in `inline` mode, and only inspected in `off` mode (see
-    /// `IndexBuildMode`).
+    /// `IndexBuildMode`). `idx_resources_missing_params` follows the same
+    /// mode from its own task, `MissingIndexBuilder` (#2001).
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
         schema::initialize_schema_async(&db).await?;
+
+        let missing_tx = self.missing_index_tx.lock().await.take();
+        let missing_handle = missing_tx.map(|tx| {
+            let builder = MissingIndexBuilder::new(db.clone(), self.config.index_build);
+            tokio::spawn(async move {
+                let outcome = builder.run().await;
+                let _ = tx.send(Some(outcome));
+            })
+        });
 
         // Taken once: `init_schema` runs once per backend instance (boot). A
         // second call finds `None` here and skips spawning another build —
@@ -1066,6 +1088,25 @@ impl MongoBackend {
             }
         }
 
+        if let Some(handle) = missing_handle
+            && self.config.index_build == IndexBuildMode::Inline
+        {
+            handle.await.map_err(|e| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message: format!("missing_params index build task panicked: {e}"),
+                    source: None,
+                })
+            })?;
+            if let Some(BuildOutcome::Failed { message }) = self.missing_index_rx.borrow().clone() {
+                return Err(StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message,
+                    source: None,
+                }));
+            }
+        }
+
         // Populate the per-tenant stored-param cache so the registries can build
         // each tenant's overlay lazily.
         self.reload_stored_cache().await?;
@@ -1080,6 +1121,37 @@ impl MongoBackend {
             self.search_index_rx.borrow().as_ref(),
             Some(BuildOutcome::UpToDate | BuildOutcome::Built { .. })
         )
+    }
+
+    /// `:missing=true` may use `missing_params` metadata, and hint
+    /// `idx_resources_missing_params`, only once `MissingIndexBuilder` has
+    /// confirmed the index is built and visible (#2001). Until then it takes
+    /// the value-index route, which returns the same results.
+    pub(super) fn missing_params_index_ready(&self) -> bool {
+        matches!(
+            self.missing_index_rx.borrow().as_ref(),
+            Some(BuildOutcome::UpToDate | BuildOutcome::Built { .. })
+        )
+    }
+
+    /// Waits for the post-boot `idx_resources_missing_params` build started
+    /// by `init_schema` and returns its outcome; `None` if `init_schema` has
+    /// not run. Same contract as [`Self::wait_for_search_index_build`].
+    pub async fn wait_for_missing_index_build(&self) -> Option<BuildOutcome> {
+        if self.missing_index_tx.lock().await.is_some() {
+            return None;
+        }
+        let mut rx = self.missing_index_rx.clone();
+        loop {
+            if let Some(outcome) = rx.borrow().clone() {
+                return Some(outcome);
+            }
+            if rx.changed().await.is_err() {
+                return Some(BuildOutcome::Failed {
+                    message: "missing_params index build task ended without reporting".to_string(),
+                });
+            }
+        }
     }
 
     /// Waits for the post-boot `search_index` build started by `init_schema`
