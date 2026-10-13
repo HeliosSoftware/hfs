@@ -330,13 +330,18 @@ impl S3Backend {
             &suffix,
         );
 
-        // The three objects are independent, so they are written concurrently:
-        // one PUT latency per mutation instead of three. A reader already
-        // tolerates an event whose snapshot is missing (history listing skips
-        // it; `vread` reads the snapshot key directly), which is also the
-        // window a crash between the old sequential PUTs left.
+        // The snapshot lands first, then the two index events together: two
+        // PUT latencies per mutation instead of three. The snapshot must not
+        // share the join with the events. The key-paged `_history` reader
+        // counts `total` from index events and only fetches snapshots for the
+        // page, so an event whose snapshot PUT failed (a 5xx or timeout while
+        // the event PUTs succeeded) would stay counted in every later
+        // `_history` total with nothing behind it. Writing the snapshot first
+        // keeps "an index event implies its snapshot" for every failure short
+        // of the store losing an acknowledged write.
+        self.put_json_object(&location.bucket, &history_key, &payload, None, None)
+            .await?;
         futures::try_join!(
-            self.put_json_object(&location.bucket, &history_key, &payload, None, None),
             self.put_json_object(&location.bucket, &type_key, &event_payload, None, None),
             self.put_json_object(&location.bucket, &system_key, &event_payload, None, None),
         )?;

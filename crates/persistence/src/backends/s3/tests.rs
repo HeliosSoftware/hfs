@@ -120,6 +120,11 @@ struct MockState {
     /// When true, every `put_object` fails its precondition, simulating a writer
     /// that loses the compare-and-swap race on every attempt.
     fail_all_puts_with_precondition: bool,
+    /// `put_object` calls whose key contains one of these fragments wait a
+    /// moment (outside the state lock) and then fail with an internal error,
+    /// simulating a PUT that dies after a round trip (a 5xx or timeout) while
+    /// requests issued alongside it succeed.
+    failing_put_key_fragments: Vec<String>,
     /// Preconditions carried by each `put_object` call, in order.
     recorded_puts: Vec<RecordedPut>,
     /// A [`StealHook`] to run before the next `put_object` evaluates its
@@ -277,6 +282,17 @@ impl MockS3Client {
         self.state.lock().unwrap().fail_all_puts_with_precondition = true;
     }
 
+    /// Makes every subsequent `put_object` whose key contains `fragment` fail
+    /// with an internal error after a short delay, so PUTs issued concurrently
+    /// with it get to complete first.
+    fn fail_puts_after_round_trip_containing(&self, fragment: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_put_key_fragments
+            .push(fragment.to_string());
+    }
+
     /// Arranges for a concurrent writer to overwrite `key` with `body` exactly
     /// once, immediately before the next `put_object` call evaluates its
     /// preconditions.
@@ -377,6 +393,20 @@ impl S3Api for MockS3Client {
         if_match: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<ObjectMetadata, S3ClientError> {
+        let fails_after_round_trip = {
+            let state = self.state.lock().unwrap();
+            state
+                .failing_put_key_fragments
+                .iter()
+                .any(|fragment| key.contains(fragment.as_str()))
+        };
+        if fails_after_round_trip {
+            self.state.lock().unwrap().put_count += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            return Err(S3ClientError::Internal(format!(
+                "injected PUT failure for {key}"
+            )));
+        }
         let mut state = self.state.lock().unwrap();
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
@@ -1174,6 +1204,58 @@ async fn type_history_reads_only_the_requested_page() {
     let system = backend.history_system(&tenant, &params).await.unwrap();
     assert_eq!(system.items.len(), 3);
     assert_eq!(mock.get_count() - gets_before, 6);
+}
+
+/// A version snapshot PUT that fails after a round trip must not leave its
+/// history index events behind. The key-paged `_history` reader counts
+/// `total` from the events and only fetches snapshots for the page, so an
+/// orphan event would read as `total=1` with no entries on every later
+/// `_history` query. Writing the snapshot before the events keeps "an event
+/// implies its snapshot"; joining all three PUTs let the events land while
+/// the snapshot PUT was still in flight.
+#[tokio::test]
+async fn failed_history_snapshot_put_leaves_no_index_event() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let started = Utc::now() - chrono::Duration::seconds(5);
+
+    mock.fail_puts_after_round_trip_containing("/_history/");
+    let err = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "orphan"}),
+            FhirVersion::default(),
+        )
+        .await;
+    assert!(err.is_err(), "the snapshot PUT failure must surface");
+
+    let events: Vec<String> = mock
+        .keys("test-bucket")
+        .into_iter()
+        .filter(|key| key.contains("/history/"))
+        .collect();
+    assert!(
+        events.is_empty(),
+        "no history index event may outlive a failed snapshot PUT: {events:?}"
+    );
+
+    for params in [
+        HistoryParams::new().include_deleted(true),
+        HistoryParams::new(),
+        HistoryParams::new().since(started),
+    ] {
+        let page = backend.history_system(&tenant, &params).await.unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.page_info.total.unwrap_or(0), 0, "{params:?}");
+        let page = backend
+            .history_type(&tenant, "Patient", &params)
+            .await
+            .unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.page_info.total.unwrap_or(0), 0, "{params:?}");
+    }
 }
 
 /// Creates `n` Patients a few milliseconds apart so every history event key
