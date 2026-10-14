@@ -1093,7 +1093,14 @@ falls through to the normal REST surface.
   write. Tenant-derived keys live under a reserved `byTenant` map so a tenant
   purge can reach them. The server renders the "Recently used" group from
   `recent` on every rail but Compartments — its 4-5 definitions make a group
-  noise, so it remembers only `last`; with no settings store configured, there
+  noise, so it remembers only `last`. The rail's filter box narrows that group
+  together with the list below it (a term matching nothing hides the group);
+  the SQL rails and Search Parameters filter as you type (htmx, 300 ms
+  debounce; the term is trimmed server-side; on the SQL rails typing never
+  prompts over an unsaved draft and never records a selection) and Enter
+  still applies it
+  without JavaScript. With no settings
+  store configured, there
   is nothing to render and every rail opens on its page default instead. The
   async export workspaces' job lists live there too —
   `byTenant.<tenant>.bulkExport.jobs` and `byTenant.<tenant>.sqlExport.jobs` —

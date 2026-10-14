@@ -162,7 +162,13 @@ fn test_basic_fhirpath_expressions() {
     let total = test_cases.len();
 
     for (expr, expected) in &test_cases {
-        match run_fhir_test(expr, &context, std::slice::from_ref(expected), false) {
+        match run_fhir_test(
+            expr,
+            &TestScope::default(),
+            &context,
+            std::slice::from_ref(expected),
+            false,
+        ) {
             Ok(_) => {
                 println!("  PASS: '{}'", expr);
                 passed += 1;
@@ -591,8 +597,13 @@ fn test_r4_test_suite() {
 
             // Run the test
             let is_predicate_test = test.predicate == "true";
+            let scope = TestScope {
+                context: &test.context,
+                context_type: &test.context_type,
+            };
             let test_run_result = run_fhir_test(
                 &test.expression,
+                &scope,
                 &context,
                 &expected_results,
                 is_predicate_test,
@@ -623,7 +634,7 @@ fn test_r4_test_suite() {
                 // expressions that must error with the `invalid` attribute, handled
                 // above. This arm used to score `Err` as a PASS, hiding evaluator
                 // errors across the 35 R4 tests in this class (issue #307).
-                match helios_fhirpath::evaluate_expression(&test.expression, &context) {
+                match evaluate_test_expression(&test.expression, &scope, &context) {
                     Ok(EvaluationResult::Empty) => {
                         println!("  PASS: {} - '{}'", test.name, test.expression);
                         Ok(())

@@ -19,7 +19,7 @@ use axum::{
 };
 use helios_audit::{AuditAction, AuditAgent, AuditEventBuilder, AuditSink, ExclusionFilter};
 use helios_auth::{
-    AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartPermissions,
+    AccessScope, AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartPermissions,
     SmartScopePolicy,
 };
 use helios_fhir::FhirVersion;
@@ -208,11 +208,22 @@ pub async fn auth_middleware(
 /// Checks the [`Principal`]'s SMART scopes against the requested FHIR operation
 /// and resource type. Returns 403 Forbidden if the principal lacks sufficient scopes.
 ///
+/// The grant's [`AccessScope`] is stored in the request extensions for the
+/// handlers. When it is [`AccessScope::PatientCompartment`] — the operation is
+/// granted only by a `patient/` scope — the request is confined to the launch
+/// patient's compartment (#1618): the path must be one the handlers know how to
+/// confine ([`patient_compartment_path_check`]), and the handlers then filter
+/// searches and check instance payloads through
+/// [`crate::patient_compartment::PatientCompartment`]. A token whose resource
+/// scopes are all `patient/` scopes is also refused every endpoint this layer
+/// does not classify, except the root batch endpoint whose handler authorizes
+/// each entry itself.
+///
 /// If no [`Principal`] is present in extensions (exempt path or auth disabled),
 /// the request passes through.
 pub async fn authz_middleware(
     State(auth_state): State<Arc<AuthMiddlewareState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // If no principal, pass through (exempt path or auth disabled)
@@ -227,47 +238,162 @@ pub async fn authz_middleware(
     // Determine the FHIR operation and resource type from the path. Under
     // URL-path tenant routing the tenant prefix has not been stripped yet (that
     // happens downstream, inside the FHIR router), so strip it here first.
-    if let Some((resource_type, operation)) =
-        extract_operation_for_routing(&path, method.as_str(), auth_state.tenant_url_routing)
-    {
-        match SmartScopePolicy::check(&principal, &resource_type, operation) {
-            Ok(()) => {
-                debug!(
-                    sub = %principal.subject(),
-                    resource_type = %resource_type,
-                    operation = %operation,
-                    "Authorization granted"
-                );
-                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
-                    .action(AuditAction::Execute)
-                    .outcome("0")
-                    .outcome_desc(format!("Granted: {operation} on {resource_type}"))
-                    .agent(principal.subject(), None, true)
-                    .resource(&resource_type, "")
-                    .build();
-                auth_state.audit_sink.record(event).await;
-            }
-            Err(err) => {
-                warn!(
-                    sub = %principal.subject(),
-                    resource_type = %resource_type,
-                    operation = %operation,
-                    "Authorization denied"
-                );
-                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
-                    .action(AuditAction::Execute)
-                    .outcome("8")
-                    .outcome_desc(format!("Forbidden: {operation} on {resource_type}"))
-                    .agent(principal.subject(), None, true)
-                    .resource(&resource_type, "")
-                    .build();
-                auth_state.audit_sink.record(event).await;
-                return forbidden_response(&err.to_string());
+    let routed = routed_path(&path, auth_state.tenant_url_routing);
+    match extract_operation(&routed, method.as_str()) {
+        Some((resource_type, operation)) => {
+            match SmartScopePolicy::check(&principal, &resource_type, operation) {
+                Ok(scope) => {
+                    if let AccessScope::PatientCompartment { patient_id } = &scope
+                        && let Err(reason) =
+                            patient_compartment_path_check(&routed, method.as_str(), patient_id)
+                    {
+                        warn!(
+                            sub = %principal.subject(),
+                            resource_type = %resource_type,
+                            operation = %operation,
+                            "Authorization denied: not available under a patient/ scope"
+                        );
+                        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                            .action(AuditAction::Execute)
+                            .outcome("8")
+                            .outcome_desc(format!(
+                                "Forbidden: {operation} on {resource_type} under a patient/ scope"
+                            ))
+                            .agent(principal.subject(), None, true)
+                            .resource(&resource_type, "")
+                            .build();
+                        auth_state.audit_sink.record(event).await;
+                        return forbidden_response(&reason);
+                    }
+                    debug!(
+                        sub = %principal.subject(),
+                        resource_type = %resource_type,
+                        operation = %operation,
+                        access = ?scope,
+                        "Authorization granted"
+                    );
+                    let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                        .action(AuditAction::Execute)
+                        .outcome("0")
+                        .outcome_desc(format!("Granted: {operation} on {resource_type}"))
+                        .agent(principal.subject(), None, true)
+                        .resource(&resource_type, "")
+                        .build();
+                    auth_state.audit_sink.record(event).await;
+                    request.extensions_mut().insert(scope);
+                }
+                Err(err) => {
+                    warn!(
+                        sub = %principal.subject(),
+                        resource_type = %resource_type,
+                        operation = %operation,
+                        "Authorization denied"
+                    );
+                    let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                        .action(AuditAction::Execute)
+                        .outcome("8")
+                        .outcome_desc(format!("Forbidden: {operation} on {resource_type}"))
+                        .agent(principal.subject(), None, true)
+                        .resource(&resource_type, "")
+                        .build();
+                    auth_state.audit_sink.record(event).await;
+                    return forbidden_response(&err.to_string());
+                }
             }
         }
+        // An endpoint this layer does not classify (system history, system
+        // `$export`, `$bulk-submit`, the console, …) is either unauthorized
+        // here or authorizes itself in its handler. None of them can be
+        // confined to a patient compartment, so a token that holds nothing
+        // but `patient/` scopes is refused all of them — except the root
+        // batch/transaction endpoint, whose handler judges every entry.
+        None if principal.scopes.is_patient_only()
+            && !patient_only_unclassified_path_allowed(&routed) =>
+        {
+            warn!(
+                sub = %principal.subject(),
+                path = %path,
+                "Authorization denied: endpoint not available under a patient/ scope"
+            );
+            let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                .action(AuditAction::Execute)
+                .outcome("8")
+                .outcome_desc(format!("Forbidden: {path} under a patient/ scope"))
+                .agent(principal.subject(), None, true)
+                .build();
+            auth_state.audit_sink.record(event).await;
+            return forbidden_response(PATIENT_SCOPE_ENDPOINT_REFUSED);
+        }
+        None => {}
     }
 
     next.run(request).await
+}
+
+/// The refusal for an endpoint a `patient/` scope cannot reach.
+const PATIENT_SCOPE_ENDPOINT_REFUSED: &str = "This endpoint is not available under a patient/ scope: it cannot be confined to the launch patient's compartment";
+
+/// Whether an unclassified path may proceed for a token holding only
+/// `patient/` scopes: the root batch/transaction endpoint only, whose handler
+/// authorizes each entry itself.
+fn patient_only_unclassified_path_allowed(routed_path: &str) -> bool {
+    routed_path.split('/').all(str::is_empty)
+}
+
+/// The request shapes a compartment-confined grant may proceed with — those
+/// whose handlers confine themselves to the launch patient's compartment
+/// (#1618). Anything else is refused with the reason returned.
+///
+/// Allowed:
+/// - `GET|HEAD /{type}` and `POST /{type}/_search` (the search is filtered to
+///   the compartment), `POST /{type}` (the payload is checked);
+/// - `GET|HEAD|PUT|PATCH|DELETE /{type}/{id}` and `GET /{type}/{id}/_history`,
+///   `GET /{type}/{id}/_history/{vid}` (the stored payload is checked);
+/// - `GET /Patient/{launch}/{type}` and `/Patient/{launch}/*` compartment
+///   searches, and `Patient/{launch}/$everything`, for the launch patient only;
+/// - type-level `Patient/$everything` and `Patient/$export`, which narrow to the
+///   launch patient themselves.
+///
+/// Refused: type and system history, conditional (type-level) update, patch
+/// and delete, another patient's or another compartment's searches and
+/// `$everything`, `Group/{id}/$export`, and every other `$`-operation.
+fn patient_compartment_path_check(
+    routed_path: &str,
+    method: &str,
+    patient_id: &str,
+) -> Result<(), String> {
+    let segments: Vec<&str> = routed_path.split('/').filter(|s| !s.is_empty()).collect();
+    let refuse = |what: &str| {
+        Err(format!(
+            "{what} is not available under a patient/ scope: it cannot be confined to the launch patient's compartment"
+        ))
+    };
+    let is_control = |s: &str| s.starts_with('_') || s.starts_with('$');
+    match segments.as_slice() {
+        // Type-level: search and create confine themselves; conditional
+        // update/patch/delete resolve their target by criteria the handler
+        // cannot vouch for.
+        [_type] => match method {
+            "GET" | "HEAD" | "POST" => Ok(()),
+            _ => refuse("a conditional update, patch or delete"),
+        },
+        [_type, "_search"] => Ok(()),
+        [_type, "_history"] => refuse("type-level history"),
+        ["Patient", "$everything"] | ["Patient", "$export"] => Ok(()),
+        [_type, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
+        [_type, second] if is_control(second) => refuse(routed_path),
+        // Instance level: the handler checks the stored payload.
+        [_type, _id] => Ok(()),
+        [_type, _id, "_history"] => Ok(()),
+        ["Patient", id, "$everything"] if *id == patient_id => Ok(()),
+        [_type, _id, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
+        [_type, _id, third] if third.starts_with('_') => refuse(routed_path),
+        // Compartment search: the launch patient's own compartment only.
+        ["Patient", id, _target] if *id == patient_id => Ok(()),
+        [_compartment, _id, _target] => refuse("a search in another compartment"),
+        [_type, _id, "_history", _vid] => Ok(()),
+        _ => refuse(routed_path),
+    }
 }
 
 /// Authorization middleware for the console's **cross-tenant** admin endpoints
@@ -347,31 +473,35 @@ pub async fn admin_authz_middleware(
 ///
 /// In `header_only` mode `tenant_url_routing` is `false` and the raw path is
 /// used verbatim, leaving behaviour byte-for-byte unchanged.
+#[cfg(test)]
 fn extract_operation_for_routing(
     path: &str,
     method: &str,
     tenant_url_routing: bool,
 ) -> Option<(String, FhirOperation)> {
-    // Strip a URL-path tenant prefix BEFORE classifying, mirroring the router.
-    // Classifying the raw path first would wrongly `None`-out (and thus skip the
-    // scope check for) a path whose tenant segment happens to look system-like to
-    // `extract_operation` — e.g. `/_x/Patient/123`, where `_x` is a valid,
-    // non-reserved tenant the router strips, yet `extract_operation` sees the
-    // leading `_` and returns `None`. `extract_tenant_from_path` returns `None`
-    // for reserved first segments (real FHIR resource types, `metadata`,
-    // `_history`, `console`, …), so those fall through to the raw classification
-    // and behave exactly as before.
-    if tenant_url_routing {
-        if let Some((_tenant, remaining)) =
-            extract_tenant_from_path(path, &FhirVersion::default_enabled())
-        {
-            // Classify against the tenant-stripped path the router will actually
-            // dispatch to.
-            return extract_operation(&remaining, method);
-        }
-    }
+    extract_operation(&routed_path(path, tenant_url_routing), method)
+}
 
-    extract_operation(path, method)
+/// The path the FHIR router will dispatch to: the request path with its
+/// URL-path tenant prefix stripped, when that routing mode is on.
+///
+/// Strip a URL-path tenant prefix BEFORE classifying, mirroring the router.
+/// Classifying the raw path first would wrongly `None`-out (and thus skip the
+/// scope check for) a path whose tenant segment happens to look system-like to
+/// `extract_operation` — e.g. `/_x/Patient/123`, where `_x` is a valid,
+/// non-reserved tenant the router strips, yet `extract_operation` sees the
+/// leading `_` and returns `None`. `extract_tenant_from_path` returns `None`
+/// for reserved first segments (real FHIR resource types, `metadata`,
+/// `_history`, `console`, …), so those fall through to the raw classification
+/// and behave exactly as before.
+fn routed_path(path: &str, tenant_url_routing: bool) -> String {
+    if tenant_url_routing
+        && let Some((_tenant, remaining)) =
+            extract_tenant_from_path(path, &FhirVersion::default_enabled())
+    {
+        return remaining;
+    }
+    path.to_string()
 }
 
 /// Operation endpoints whose handlers run their own scope check, so the
@@ -573,6 +703,89 @@ mod tests {
         assert!(!is_exempt_path("/Patient/.well-known/smart-configuration"));
         assert!(!is_exempt_path("/tenant/metadata"));
         assert!(!is_exempt_path("/tenant/$versions"));
+    }
+
+    fn allowed(path: &str, method: &str) -> bool {
+        patient_compartment_path_check(path, method, "p1").is_ok()
+    }
+
+    #[test]
+    fn patient_compartment_path_check_allows_what_handlers_confine() {
+        for (path, method) in [
+            ("/Observation", "GET"),
+            ("/Observation", "HEAD"),
+            ("/Observation", "POST"),
+            ("/Observation/_search", "POST"),
+            ("/Observation/o1", "GET"),
+            ("/Observation/o1", "HEAD"),
+            ("/Observation/o1", "PUT"),
+            ("/Observation/o1", "PATCH"),
+            ("/Observation/o1", "DELETE"),
+            ("/Observation/o1/_history", "GET"),
+            ("/Observation/o1/_history/3", "GET"),
+            ("/Patient/p1/Observation", "GET"),
+            ("/Patient/p1/*", "GET"),
+            ("/Patient/p1/$everything", "GET"),
+            ("/Patient/p1/$everything", "POST"),
+            ("/Patient/$everything", "GET"),
+            ("/Patient/$export", "GET"),
+            ("/Patient/$export", "POST"),
+        ] {
+            assert!(allowed(path, method), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn patient_compartment_path_check_refuses_what_cannot_be_confined() {
+        for (path, method) in [
+            // Type-level conditional writes.
+            ("/Observation", "PUT"),
+            ("/Observation", "PATCH"),
+            ("/Observation", "DELETE"),
+            // Type history.
+            ("/Observation/_history", "GET"),
+            ("/Patient/_history", "GET"),
+            // Operations other than the two that narrow themselves.
+            ("/Observation/$validate", "POST"),
+            ("/ValueSet/$expand", "GET"),
+            ("/Observation/$export", "GET"),
+            ("/Group/$export", "GET"),
+            ("/Observation/o1/$validate", "POST"),
+            ("/Group/g1/$export", "GET"),
+            // Another patient, another compartment.
+            ("/Patient/p2/Observation", "GET"),
+            ("/Patient/p2/*", "GET"),
+            ("/Patient/p2/$everything", "GET"),
+            ("/Encounter/e1/Observation", "GET"),
+            ("/Encounter/p1/Observation", "GET"),
+            // Unknown shapes.
+            ("/Observation/o1/_tags", "GET"),
+            ("/Observation/o1/_history/3/x", "GET"),
+            ("/Observation/o1/sub/4/5", "GET"),
+        ] {
+            let outcome = patient_compartment_path_check(path, method, "p1");
+            assert!(outcome.is_err(), "{method} {path}");
+            assert!(
+                outcome.unwrap_err().contains("patient/ scope"),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn patient_only_unclassified_paths_allow_the_batch_root_only() {
+        assert!(patient_only_unclassified_path_allowed("/"));
+        assert!(patient_only_unclassified_path_allowed(""));
+        for path in [
+            "/_history",
+            "/$export",
+            "/$bulk-submit",
+            "/_user/settings",
+            "/console/metrics/resource-counts",
+            "/_search",
+        ] {
+            assert!(!patient_only_unclassified_path_allowed(path), "{path}");
+        }
     }
 
     #[test]

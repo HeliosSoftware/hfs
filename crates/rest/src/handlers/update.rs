@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider};
 use helios_persistence::error::{ResourceError, StorageError};
 use tracing::debug;
 
@@ -19,6 +19,7 @@ use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
@@ -61,18 +62,49 @@ pub async fn update_handler<S>(
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync,
 {
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     admit_resource_type(&resource_type, &resource, fhir_version)?;
+
+    // A `patient/` scope updates inside the launch patient's compartment only
+    // (#1618). Both ends are checked: the submitted payload must stay in the
+    // compartment, and the resource being replaced must already be in it —
+    // otherwise another patient's resource could be overwritten by one that
+    // names the launch patient. A deleted resource has no current payload to
+    // prove membership with, so it cannot be restored under this grant.
+    if compartment.is_confined() {
+        let registry = || state.storage().search_param_registry(tenant.context());
+        compartment.assert_member(registry, fhir_version, &resource, "update")?;
+        match state
+            .storage()
+            .read(tenant.context(), &resource_type, &id)
+            .await
+        {
+            Ok(Some(existing)) => compartment.assert_member(
+                registry,
+                existing.fhir_version(),
+                existing.content(),
+                "update",
+            )?,
+            Ok(None) => {}
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                return Err(compartment.outside_compartment(format!(
+                    "update of the deleted {resource_type}/{id} is not permitted under a patient/ scope: a deleted resource has no current payload to place it in the launch patient's compartment"
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
