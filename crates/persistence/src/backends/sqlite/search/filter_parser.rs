@@ -505,7 +505,7 @@ impl FilterSqlGenerator {
         self.param_offset += binds.len();
 
         // `tenant_id = ?1` is not optional — see the sibling non-`_filter` path
-        // in `query_builder::build_parameter_condition`, which has always
+        // in `query_builder::parameter_condition`, which has always
         // carried it. Without it this sub-select scans every tenant's
         // `search_index` and returns a bare `resource_id` set that the outer
         // query intersects with this tenant's resources, so tenant A's
@@ -563,7 +563,7 @@ impl FilterSqlGenerator {
     }
 
     /// The comparison for a date parameter: the FHIR range comparison against
-    /// the stored `[value_date, value_date_end)` (#456, #1391), as the
+    /// the stored `[value_date_start, value_date_end)` (#456, #1391), as the
     /// unchained date search makes it. `None` when `param` is not a date or
     /// `op` is not a date prefix; the generic text operators then apply.
     fn build_date_condition(
@@ -595,7 +595,7 @@ impl FilterSqlGenerator {
         // have made of it.
         Some(
             super::parameter_handlers::date::date_range_condition_or_nothing(
-                "value_date",
+                "value_date_start",
                 "value_date_end",
                 prefix,
                 value,

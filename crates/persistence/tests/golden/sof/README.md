@@ -1,7 +1,8 @@
 These snapshots contain the complete generated SQLite/PostgreSQL query,
 typed bindings in slot order, output columns/decodes and client cap. Inline
 views cover flat/forEach, nullable/nested/chained/cartesian, legacy
-union/repeat/indexed, collections/join/first picks, constants and runtime
+union/repeat/indexed, collections/join/first picks, `exists(criteria)` over
+a path with several repeating steps, constants and runtime
 filters including deterministically resolved Group documents.
 
 Normal tests compare every byte and never update files. Regenerate explicitly
