@@ -780,9 +780,9 @@ impl EngineCore {
                                 endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                                 "Email channel requested but no SMTP settings configured"
                             );
-                            return Ok(DispatchResult::PermanentError(
+                            Ok(DispatchResult::PermanentError(
                                 "Channel is not configured".to_string(),
-                            ));
+                            ))
                         }
                     },
                     ChannelType::Message => match self.messaging_channel.as_ref() {
@@ -794,9 +794,9 @@ impl EngineCore {
                                 endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                                 "Messaging channel requested but messaging settings not configured"
                             );
-                            return Ok(DispatchResult::PermanentError(
+                            Ok(DispatchResult::PermanentError(
                                 "Channel is not configured".to_string(),
-                            ));
+                            ))
                         }
                     },
                     _ => {
@@ -807,9 +807,9 @@ impl EngineCore {
                             endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                             "Handshake not supported for channel type"
                         );
-                        return Ok(DispatchResult::PermanentError(
+                        Ok(DispatchResult::PermanentError(
                             "Handshake channel unsupported".to_string(),
-                        ));
+                        ))
                     }
                 }
             };
