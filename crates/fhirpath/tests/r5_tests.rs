@@ -465,6 +465,7 @@ fn test_r5_test_suite() {
             let scope = TestScope {
                 context: &test.context,
                 context_type: &test.context_type,
+                unordered: test.unordered,
             };
             let test_run_result = run_fhir_test(
                 &test.expression,
