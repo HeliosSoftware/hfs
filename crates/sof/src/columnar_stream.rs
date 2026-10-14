@@ -403,6 +403,24 @@ mod tests {
     }
 
     #[test]
+    fn write_batch_matches_write_rows() {
+        let batch = to_batch(&schema(), &rows(0..10)).unwrap();
+        let opts = ParquetOptions::default();
+        let mut by_rows = ParquetStreamWriter::new(Vec::new(), schema(), &opts).unwrap();
+        by_rows.write_rows(&rows(0..10)).unwrap();
+        let mut by_batch = ParquetStreamWriter::new(Vec::new(), schema(), &opts).unwrap();
+        by_batch.write_batch(&batch).unwrap();
+        assert_eq!(by_batch.rows_written(), 10);
+        assert_eq!(by_rows.finish().unwrap(), by_batch.finish().unwrap());
+
+        let mut by_rows = ArrowIpcStreamWriter::new(Vec::new(), schema()).unwrap();
+        by_rows.write_rows(&rows(0..10)).unwrap();
+        let mut by_batch = ArrowIpcStreamWriter::new(Vec::new(), schema()).unwrap();
+        by_batch.write_batch(&batch).unwrap();
+        assert_eq!(by_rows.finish().unwrap(), by_batch.finish().unwrap());
+    }
+
+    #[test]
     fn write_batch_rejects_a_different_schema() {
         let other = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
         let bad = to_batch(&other, &rows(0..2)).unwrap();
