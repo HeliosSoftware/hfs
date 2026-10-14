@@ -47,7 +47,8 @@ use helios_persistence::tenant::TenantContext;
 
 /// Why a job failed and how its result endpoint reports it. Every worker
 /// error funnels through here: a failure that is the request's own keeps the
-/// 4xx and issue code `$sql-run` would have answered with, everything else
+/// 4xx and issue code `$sql-run` would have answered with, an unavailable
+/// store keeps its `503` and `transient` code (#2048), and everything else
 /// is a `500` whose text (backend or driver detail) goes to the job log only;
 /// the stored result is generic (see [`server_fault_message`]).
 #[derive(Debug)]
@@ -66,12 +67,30 @@ impl JobFailure {
         }
     }
 
+    /// The store was unavailable: transient and retryable, so the result
+    /// endpoint says `503` instead of blaming the server.
+    fn unavailable(message: String) -> Self {
+        Self {
+            message,
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "transient",
+        }
+    }
+
+    /// Whether the stored result shows `message` to the client: the wording of
+    /// a request's own failure or of an unavailable store carries no backend
+    /// detail, unlike a server fault's.
+    fn shows_message(&self) -> bool {
+        shows_failure_message(self.status)
+    }
+
     /// A client-attributable REST error becomes a client failure with its
-    /// own wording; a server error keeps `detail` (the REST wording hides
-    /// backend detail from clients, the job log wants it).
+    /// own wording, and an unavailable store a `503` with its own; a server
+    /// error keeps `detail` (the REST wording hides backend detail from
+    /// clients, the job log wants it).
     fn from_rest(prefix: &str, err: RestError, detail: String) -> Self {
         let (status, code, message) = err.client_response();
-        if status.is_client_error() {
+        if shows_failure_message(status) {
             Self {
                 message: format!("{prefix}: {message}"),
                 status,
@@ -98,9 +117,16 @@ impl JobFailure {
                 status,
                 code,
             },
+            ExportError::Unavailable(message) => Self::unavailable(format!("{prefix}: {message}")),
             other => Self::server(format!("{prefix}: {other}")),
         }
     }
+}
+
+/// Whether a failed job with `status` stores and returns its specific
+/// wording: the request's own failures (4xx) and an unavailable store (503).
+fn shows_failure_message(status: StatusCode) -> bool {
+    status.is_client_error() || status == StatusCode::SERVICE_UNAVAILABLE
 }
 
 impl From<String> for JobFailure {
@@ -499,9 +525,10 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                         status = %failure.status,
                         "export job failed"
                     );
-                    // The request's own failure keeps its wording; a server
-                    // fault's text stays in the log line above (#1703).
-                    let message = if failure.status.is_client_error() {
+                    // The request's own failure, or an unavailable store,
+                    // keeps its wording; a server fault's text stays in the
+                    // log line above (#1703).
+                    let message = if failure.shows_message() {
                         failure.message
                     } else {
                         server_fault_message(&jid)
@@ -1313,7 +1340,7 @@ async fn run_views_job<Sink: ExportSink>(
                     } else {
                         warn!(view = %named.name, error = %e, "export row stream failed");
                     }
-                    return Err(format!("view '{}': {e}", named.name).into());
+                    return Err(JobFailure::from_sof(&format!("view '{}'", named.name), e));
                 }
             }
         }
@@ -1485,6 +1512,10 @@ async fn execute_sql_query(
                 code,
                 message,
             }
+        } else if status == StatusCode::SERVICE_UNAVAILABLE {
+            // An unavailable store is retryable, and its REST wording carries
+            // no backend detail, so the job reports it as such (#2048).
+            ExportError::Unavailable(message)
         } else {
             ExportError::Runner(detail)
         }
@@ -2226,6 +2257,139 @@ mod tests {
                     Some("demo"),
                     "a server fault still names the subject that failed (#1800)"
                 );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A runner whose store becomes unavailable after one good row, the way an
+    /// S3 object read does once its retries are spent (#2048).
+    struct UnavailableStoreRunner;
+
+    const UNAVAILABLE_TEXT: &str =
+        "backend unavailable: s3: failed to read object body after 3 attempts";
+
+    #[async_trait]
+    impl SofRunner for UnavailableStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let rows = vec![
+                Ok(serde_json::json!({"id": "p0"})),
+                Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string())),
+            ];
+            Ok(Box::pin(futures::stream::iter(rows)))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "unavailable-store-test-runner"
+        }
+    }
+
+    /// #2048: a view whose store is unavailable partway through its rows fails
+    /// the job as a retryable 503 that keeps the reason, not as a 500.
+    #[tokio::test]
+    async fn an_unavailable_store_fails_a_view_job_as_a_503() {
+        let controller = InMemoryController::new(
+            Arc::new(UnavailableStoreRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let job_id = controller
+            .submit(view_task(&["patients"]))
+            .expect("job accepted");
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                subject,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{message}");
+                assert_eq!(code, "transient");
+                assert!(
+                    message.starts_with("view 'patients': "),
+                    "the subject is named: {message}"
+                );
+                assert!(
+                    message.contains("after 3 attempts"),
+                    "the reason is kept: {message}"
+                );
+                assert_ne!(message, server_fault_message(&job_id));
+                assert_eq!(subject.as_deref(), Some("patients"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// #2048: the same for a SQL Query subject, whose dependency is read through
+    /// the plan executor.
+    #[tokio::test]
+    async fn an_unavailable_store_fails_a_query_job_as_a_503() {
+        let controller = InMemoryController::new(
+            Arc::new(UnavailableStoreRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let query_plan = crate::handlers::sof::graph::GraphPlan {
+            nodes: vec![crate::handlers::sof::graph::PlanNode::Leaf {
+                internal_name: "vd_0".to_string(),
+                view: serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }),
+            }],
+            subject_edges: Vec::new(),
+        };
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![],
+                    queries: vec![NamedSqlQuery {
+                        name: "patient_ids".to_string(),
+                        sql: "SELECT * FROM vd_0".to_string(),
+                        plan: query_plan,
+                        bindings: Vec::new(),
+                    }],
+                    limits: SqlExportLimits {
+                        max_source_rows_per_vd: 10,
+                        max_rows: 10_000,
+                        timeout_secs: 5,
+                    },
+                },
+                tenant,
+                filters: ViewFilters::default(),
+                format: "csv".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                subject,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{message}");
+                assert_eq!(code, "transient");
+                assert!(
+                    message.starts_with("query 'patient_ids': "),
+                    "the subject is named: {message}"
+                );
+                assert!(
+                    message.contains("after 3 attempts"),
+                    "the reason is kept: {message}"
+                );
+                assert_eq!(subject.as_deref(), Some("patient_ids"));
             }
             other => panic!("expected Failed, got {other:?}"),
         }

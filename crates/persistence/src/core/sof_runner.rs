@@ -133,6 +133,12 @@ impl SofError {
     /// `PoolExhausted`) becomes [`SofError::Unavailable`], so the handler can
     /// answer `503` rather than `500`. Every other error becomes
     /// [`SofError::Storage`] with the error's text, as before.
+    ///
+    /// This is the same classification the CRUD path applies
+    /// (`BackendError::Unavailable` answers `503` there too), so it also covers
+    /// what a backend reports as unavailable besides an exhausted retry: a
+    /// dispatch failure or timeout, throttling, and an S3 misconfiguration
+    /// (access denied, a bucket that is missing or not accessible).
     pub fn from_storage(err: crate::error::StorageError) -> Self {
         use crate::error::{BackendError, StorageError};
         match &err {

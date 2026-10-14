@@ -55,9 +55,7 @@ where
             .storage()
             .read(tenant, resource_type, id)
             .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("failed to read {resource_type}: {e}"),
-            })?
+            .map_err(|e| storage_lookup_error(format!("failed to read {resource_type}: {e}"), &e))?
             .ok_or_else(|| RestError::NotFound {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
@@ -110,9 +108,10 @@ where
             return resolve_by_scan(state, tenant, resource_type, url).await;
         }
         Err(e) => {
-            return Err(RestError::InternalError {
-                message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-            });
+            return Err(storage_lookup_error(
+                format!("canonical lookup failed for {resource_type} url={url}: {e}"),
+                &e,
+            ));
         }
     };
 
@@ -172,18 +171,39 @@ where
     let resources = scan
         .scan_resources(tenant, resource_type)
         .await
-        .map_err(|e| RestError::InternalError {
-            message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-        })?;
+        .map_err(|e| canonical_scan_error(resource_type, url, e))?;
     newest_canonical_match(resources, url)
         .await
-        .map_err(|e| RestError::InternalError {
-            message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-        })?
+        .map_err(|e| canonical_scan_error(resource_type, url, e))?
         .ok_or_else(|| RestError::NotFound {
             resource_type: resource_type.to_string(),
             id: url.to_string(),
         })
+}
+
+/// The error for a failed storage read made while resolving a definition: a
+/// store that is unavailable (it could not be reached, was throttling, or could
+/// not read an object after retries) answers `503` (retryable), anything else
+/// `500` (#2048). `message` is shown to the client either way.
+fn storage_lookup_error(message: String, e: &StorageError) -> RestError {
+    match e {
+        StorageError::Backend(
+            BackendError::Unavailable { .. }
+            | BackendError::ConnectionFailed { .. }
+            | BackendError::PoolExhausted { .. },
+        ) => RestError::ServiceUnavailable { message },
+        _ => RestError::InternalError { message },
+    }
+}
+
+/// The error for a canonical lookup whose scan failed: a store that is
+/// unavailable answers `503` (retryable), anything else `500` (#2048).
+fn canonical_scan_error(resource_type: &str, url: &str, e: SofError) -> RestError {
+    let message = format!("canonical lookup failed for {resource_type} url={url}: {e}");
+    match e {
+        SofError::Unavailable(_) => RestError::ServiceUnavailable { message },
+        _ => RestError::InternalError { message },
+    }
 }
 
 /// Picks, among the scanned resources, the one [`canonical_matches`] selects
@@ -386,6 +406,8 @@ mod tests {
     enum Search {
         Unsupported,
         Broken,
+        /// The store is down: searches and reads both fail as unavailable.
+        Unavailable,
     }
 
     /// A storage that cannot search — the standalone S3 shape from #1228 —
@@ -400,6 +422,20 @@ mod tests {
     enum Scan {
         Of(Vec<Value>),
         Broken,
+        /// The store is unavailable when the scan starts.
+        Unavailable,
+        /// The store becomes unavailable partway through the scan's stream.
+        UnavailableInStream,
+    }
+
+    const UNAVAILABLE_TEXT: &str = "failed to read object body after 3 attempts";
+
+    /// What a store answers once it has run out of attempts at an object read.
+    fn unavailable_store() -> StorageError {
+        StorageError::Backend(BackendError::Unavailable {
+            backend_name: "scan-only".to_string(),
+            message: UNAVAILABLE_TEXT.to_string(),
+        })
     }
 
     #[async_trait]
@@ -435,7 +471,10 @@ mod tests {
             _resource_type: &str,
             _id: &str,
         ) -> StorageResult<Option<StoredResource>> {
-            unimplemented!()
+            match self.search {
+                Search::Unavailable => Err(unavailable_store()),
+                Search::Unsupported | Search::Broken => unimplemented!(),
+            }
         }
 
         async fn update(
@@ -478,17 +517,18 @@ mod tests {
             _tenant: &TenantContext,
             _query: &SearchQuery,
         ) -> StorageResult<SearchResult> {
-            Err(StorageError::Backend(match self.search {
-                Search::Unsupported => BackendError::UnsupportedCapability {
+            Err(match self.search {
+                Search::Unsupported => StorageError::Backend(BackendError::UnsupportedCapability {
                     backend_name: "scan-only".to_string(),
                     capability: "search".to_string(),
-                },
-                Search::Broken => BackendError::Internal {
+                }),
+                Search::Broken => StorageError::Backend(BackendError::Internal {
                     backend_name: "scan-only".to_string(),
                     message: "index offline".to_string(),
                     source: None,
-                },
-            }))
+                }),
+                Search::Unavailable => unavailable_store(),
+            })
         }
 
         async fn search_count(
@@ -526,6 +566,11 @@ mod tests {
                     Ok(Box::pin(futures::stream::iter(matched.into_iter().map(Ok))))
                 }
                 Scan::Broken => Err(SofError::Storage("bucket unreachable".to_string())),
+                Scan::Unavailable => Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string())),
+                Scan::UnavailableInStream => Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(json!({"resourceType": resource_type, "id": "first"})),
+                    Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string())),
+                ]))),
             }
         }
 
@@ -547,6 +592,9 @@ mod tests {
                     .cloned()
                     .collect()),
                 Scan::Broken => Err(SofError::Storage("bucket unreachable".to_string())),
+                Scan::Unavailable | Scan::UnavailableInStream => {
+                    Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string()))
+                }
             }
         }
     }
@@ -654,6 +702,47 @@ mod tests {
                 assert!(message.contains("url=http://example.org/vd"), "{message}");
             }
             other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    /// #2048: a scan whose store is unavailable, at its start or partway
+    /// through its stream, is a retryable 503 that names the canonical and
+    /// keeps the reason.
+    #[tokio::test]
+    async fn an_unavailable_scan_is_a_503() {
+        for scan in [Scan::Unavailable, Scan::UnavailableInStream] {
+            let storage = ScanOnly {
+                search: Search::Unsupported,
+                scan: Some(scan),
+            };
+            match resolve(storage, "ViewDefinition", "http://example.org/vd").await {
+                Err(RestError::ServiceUnavailable { message }) => {
+                    assert!(message.contains("after 3 attempts"), "{message}");
+                    assert!(message.contains("url=http://example.org/vd"), "{message}");
+                }
+                other => panic!("expected ServiceUnavailable, got {other:?}"),
+            }
+        }
+    }
+
+    /// #2048: a definition read, by id or by canonical, from a store that is
+    /// unavailable is a retryable 503 that keeps the reason, not a 500.
+    #[tokio::test]
+    async fn an_unavailable_store_is_a_503_for_a_definition_lookup() {
+        for reference in ["ViewDefinition/abc", "http://example.org/vd"] {
+            let storage = ScanOnly {
+                search: Search::Unavailable,
+                scan: None,
+            };
+            match resolve(storage, "ViewDefinition", reference).await {
+                Err(RestError::ServiceUnavailable { message }) => {
+                    assert!(
+                        message.contains("after 3 attempts"),
+                        "{reference}: {message}"
+                    );
+                }
+                other => panic!("{reference}: expected ServiceUnavailable, got {other:?}"),
+            }
         }
     }
 

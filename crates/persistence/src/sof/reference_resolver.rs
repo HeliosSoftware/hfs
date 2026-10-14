@@ -122,10 +122,16 @@ impl StorageReferenceResolver for StorageBackedResolver {
                         .read_batch(tenant, resource_type, &ids)
                         .await
                         .map_err(|e| {
-                            SofError::Storage(format!(
+                            let message = format!(
                                 "could not read {} referenced {resource_type} resources for resolve(): {e}",
                                 ids.len()
-                            ))
+                            );
+                            // Keep a transient failure transient, so the run
+                            // answers 503 rather than 500 (#2048).
+                            match SofError::from_storage(e) {
+                                SofError::Unavailable(_) => SofError::Unavailable(message),
+                                _ => SofError::Storage(message),
+                            }
                         })?
                 }
             };
@@ -246,6 +252,9 @@ fn parse_relative_type_id(reference: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{BackendError, StorageError, StorageResult};
+    use crate::tenant::{TenantId, TenantPermissions};
+    use crate::types::StoredResource;
     use serde_json::json;
 
     #[test]
@@ -321,5 +330,125 @@ mod tests {
             parse_relative_type_id("Patient/123/_history/2"),
             Some(("Patient".to_string(), "123".to_string()))
         );
+    }
+
+    /// A storage whose every `read` fails, either transiently (`Unavailable`,
+    /// as an S3 object read does once its retries are spent) or not.
+    struct FailingReads {
+        transient: bool,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for FailingReads {
+        fn backend_name(&self) -> &'static str {
+            "failing-reads"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!()
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Err(StorageError::Backend(if self.transient {
+                BackendError::Unavailable {
+                    backend_name: "s3".to_string(),
+                    message: "failed to read object body after 3 attempts".to_string(),
+                }
+            } else {
+                BackendError::Internal {
+                    backend_name: "s3".to_string(),
+                    message: "boom".to_string(),
+                    source: None,
+                }
+            }))
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            unimplemented!()
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            unimplemented!()
+        }
+    }
+
+    async fn resolve_over_failing_reads(transient: bool) -> SofError {
+        let resolver = StorageBackedResolver::new(Arc::new(FailingReads { transient }), 10);
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        resolver
+            .resolve(
+                &tenant,
+                FhirVersion::default(),
+                &[("Patient".to_string(), "p1".to_string())],
+            )
+            .await
+            .expect_err("the reads fail on both attempts")
+    }
+
+    /// #2048: a referenced-resource read that runs out of attempts on a
+    /// transient failure stays `Unavailable`, so the run answers 503.
+    #[tokio::test]
+    async fn a_resolve_read_that_stays_unavailable_is_unavailable() {
+        match resolve_over_failing_reads(true).await {
+            SofError::Unavailable(message) => {
+                assert!(
+                    message.starts_with(
+                        "could not read 1 referenced Patient resources for resolve(): "
+                    ),
+                    "{message}"
+                );
+                assert!(message.contains("after 3 attempts"), "{message}");
+            }
+            other => panic!("expected SofError::Unavailable, got {other:?}"),
+        }
+    }
+
+    /// Any other read failure is still a storage error (a server fault).
+    #[tokio::test]
+    async fn a_resolve_read_that_fails_internally_stays_a_storage_error() {
+        match resolve_over_failing_reads(false).await {
+            SofError::Storage(message) => assert!(message.contains("boom"), "{message}"),
+            other => panic!("expected SofError::Storage, got {other:?}"),
+        }
     }
 }
