@@ -496,6 +496,49 @@ async fn reconcile_sends_nothing_to_a_current_or_newer_index() {
     }
 }
 
+/// #1749: startup sets the configured refresh interval on an existing index
+/// that was created under another one, and a refusal does not fail startup.
+#[tokio::test]
+async fn initialize_sets_the_refresh_interval_on_existing_indices() {
+    for put_status in [200, 403] {
+        let server = cluster_with_index(
+            Some(json!({ SCHEMA_VERSION_META_KEY: SCHEMA_VERSION })),
+            acknowledged(),
+        )
+        .await;
+        // Mounted ahead of the stub's own empty `_settings` answer.
+        Mock::given(method("GET"))
+            .and(path_regex("^/hfs_\\*/_settings/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "hfs_read-stub_patient": { "settings": { "index.refresh_interval": "30s" } }
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex("^/[^/]+/_settings$"))
+            .respond_with(ResponseTemplate::new(put_status).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        backend(&server)
+            .initialize()
+            .await
+            .expect("a refresh-interval failure must not fail startup");
+
+        let puts: Vec<Request> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("/_settings"))
+            .collect();
+        assert_eq!(puts.len(), 1, "status {put_status}");
+        assert_eq!(puts[0].url.path(), "/hfs_read-stub_patient/_settings");
+        let body: Value = serde_json::from_slice(&puts[0].body).unwrap();
+        assert_eq!(body, json!({ "index.refresh_interval": "1s" }));
+    }
+}
+
 /// A refused or failing reconcile never blocks startup.
 #[tokio::test]
 async fn reconcile_failure_does_not_fail_startup() {

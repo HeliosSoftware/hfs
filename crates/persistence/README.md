@@ -1687,8 +1687,12 @@ resource is findable via search. Two independent delays contribute:
    puts the document in Elasticsearch before the write returns.
 2. **Elasticsearch refresh.** An indexed document only becomes searchable at the
    next index refresh. By default that happens on a timer
-   (`ElasticsearchConfig::refresh_interval`, applied when an index is created;
-   existing indices keep their setting). `ElasticsearchConfig::write_refresh`
+   (`ElasticsearchConfig::refresh_interval`, set when an index is created and
+   reconciled onto every existing `{index_prefix}_*` index at startup, which
+   overwrites a value set by hand with `PUT _settings`). With `WaitFor` the
+   interval is the price of every write: a long one makes each interactive
+   write wait for the next refresh (#1749).
+   `ElasticsearchConfig::write_refresh`
    sets the `refresh` parameter on each index/delete request instead:
    `WriteRefreshPolicy::False` (default) leaves it to the timer, `WaitFor`
    blocks the write until the affected shards refresh, and `True` forces a
