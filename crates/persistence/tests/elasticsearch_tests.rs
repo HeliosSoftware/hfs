@@ -2516,6 +2516,77 @@ mod es_integration {
         );
     }
 
+    /// #1749: an index created under a long refresh interval gets the configured
+    /// one when a backend with a different value starts, so a long interval
+    /// left over from a bulk import no longer makes interactive writes wait.
+    #[tokio::test]
+    async fn es_integration_startup_resets_refresh_interval_on_existing_index() {
+        use helios_persistence::search::ReindexTarget;
+
+        let es = shared_es().await;
+        let prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
+        let tenant = create_tenant("refresh-interval-existing");
+        let backend_with = |interval: &str| {
+            let config = ElasticsearchConfig {
+                nodes: vec![format!("http://{}:{}", es.host, es.port)],
+                index_prefix: prefix.clone(),
+                number_of_replicas: 0,
+                refresh_interval: interval.to_string(),
+                ..Default::default()
+            };
+            ElasticsearchBackend::with_shared_registry(config, build_search_registry())
+                .expect("Failed to create ElasticsearchBackend")
+        };
+        let interval_of = || async {
+            use elasticsearch::http::transport::Transport;
+            use elasticsearch::indices::IndicesGetSettingsParts;
+            let raw = elasticsearch::Elasticsearch::new(
+                Transport::single_node(&format!("http://{}:{}", es.host, es.port))
+                    .expect("transport"),
+            );
+            let pattern = format!("{prefix}_*");
+            let body: serde_json::Value = raw
+                .indices()
+                .get_settings(IndicesGetSettingsParts::IndexName(
+                    &[&pattern],
+                    &["index.refresh_interval"],
+                ))
+                .flat_settings(true)
+                .send()
+                .await
+                .expect("get settings")
+                .json()
+                .await
+                .expect("settings body");
+            body.as_object()
+                .expect("settings object")
+                .values()
+                .map(|v| {
+                    v["settings"]["index.refresh_interval"]
+                        .as_str()
+                        .expect("an interval")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The index is created under a long interval.
+        let slow = backend_with("30s");
+        slow.initialize().await.expect("initialize");
+        slow.write_search_entries_page(
+            &tenant,
+            std::slice::from_ref(&oversized_provenance(&tenant, "p1", 1)),
+        )
+        .await;
+        assert_eq!(interval_of().await, vec!["30s".to_string()]);
+
+        // A backend started with another value brings it in line.
+        let fast = backend_with("1s");
+        fast.initialize().await.expect("initialize");
+        assert_eq!(interval_of().await, vec!["1s".to_string()]);
+        assert_eq!(fast.apply_refresh_interval().await.unwrap(), 0);
+    }
+
     /// `$reindex` walks a page at a time and, before #1021, Elasticsearch used
     /// the default trait implementation: one HTTP round trip per resource. This
     /// pins the batched override — every resource of the page indexed, its own
@@ -8134,6 +8205,76 @@ mod es_integration {
         assert_eq!(backend.purge_all(&tenant, "Patient").await.unwrap(), 1);
         assert!(search_urls(containers_of("Acme")).await.is_empty());
         assert_eq!(backend.purge_all(&tenant, "Patient").await.unwrap(), 0);
+    }
+
+    /// #1749: under `write_refresh=wait_for` the `$reindex` page writer still
+    /// uses `reindex_refresh`. With `reindex_refresh=false` its documents are
+    /// acknowledged yet unsearchable until the next refresh tick, so
+    /// `ensure_writes_visible` must refresh them rather than return early.
+    /// Returns the count a search sees after the barrier.
+    async fn visible_after_barrier_for_bulk_write(refresh_interval: &str) -> u64 {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::SearchQuery;
+
+        let es = shared_es().await;
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+            number_of_replicas: 0,
+            refresh_interval: refresh_interval.to_string(),
+            write_refresh: WriteRefreshPolicy::WaitFor,
+            reindex_refresh: Some(WriteRefreshPolicy::False),
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::with_shared_registry(config, build_search_registry())
+            .expect("create backend");
+        backend.initialize().await.expect("initialize backend");
+        let tenant = create_tenant("barrier-bulk-write");
+
+        let resource = helios_persistence::types::StoredResource::from_storage(
+            "Patient",
+            "barrier-1".to_string(),
+            "1",
+            tenant.tenant_id().clone(),
+            json!({"resourceType": "Patient", "id": "barrier-1",
+                   "name": [{"family": "Barrier"}]}),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            None,
+            FhirVersion::default(),
+        );
+        let outcomes = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(&resource))
+            .await;
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+
+        backend
+            .ensure_writes_visible(&tenant, &["Patient"])
+            .await
+            .expect("ensure_writes_visible");
+        backend
+            .search_count(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .expect("count")
+    }
+
+    #[tokio::test]
+    async fn es_integration_barrier_refreshes_after_bulk_write_with_slow_interval() {
+        let visible = visible_after_barrier_for_bulk_write("30s").await;
+        assert_eq!(
+            visible, 1,
+            "bulk-written doc invisible after ensure_writes_visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn es_integration_barrier_refreshes_after_bulk_write_with_fast_interval() {
+        let visible = visible_after_barrier_for_bulk_write("1s").await;
+        assert_eq!(
+            visible, 1,
+            "bulk-written doc invisible after ensure_writes_visible"
+        );
     }
 }
 
