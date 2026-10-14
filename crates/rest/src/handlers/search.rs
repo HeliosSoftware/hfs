@@ -39,6 +39,7 @@ use crate::extractors::{
 };
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::subsetting::{SummaryMode, apply_elements, apply_summary};
 use crate::state::AppState;
@@ -59,6 +60,7 @@ pub async fn search_get_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
@@ -80,6 +82,7 @@ where
     execute_search(
         &state,
         tenant,
+        &compartment,
         &resource_type,
         pairs,
         negotiated.format,
@@ -101,6 +104,7 @@ pub async fn search_post_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawForm(form): RawForm,
 ) -> RestResult<Response>
@@ -122,6 +126,7 @@ where
     execute_search(
         &state,
         tenant,
+        &compartment,
         &resource_type,
         pairs,
         negotiated.format,
@@ -262,6 +267,7 @@ where
 async fn execute_search<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
+    compartment: &PatientCompartment,
     resource_type: &str,
     pairs: Vec<(String, String)>,
     format: FhirFormat,
@@ -270,7 +276,8 @@ async fn execute_search<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
-    let bundle_json = execute_search_bundle(state, &tenant, resource_type, pairs, strict).await?;
+    let bundle_json =
+        execute_search_bundle(state, &tenant, compartment, resource_type, pairs, strict).await?;
     format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format)
 }
 
@@ -279,9 +286,14 @@ where
 /// The HTTP search handlers wrap this in content negotiation; bundle
 /// processing (`GET [type]?params` entries in batch/transaction Bundles,
 /// #478) embeds the returned Bundle as an entry resource.
+///
+/// Under a compartment-confined grant (`patient/` scope, #1618) `compartment`
+/// filters the query to the launch patient's compartment and drops included
+/// resources outside it; see [`PatientCompartment`].
 pub(crate) async fn execute_search_bundle<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
     resource_type: &str,
     pairs: Vec<(String, String)>,
     strict: bool,
@@ -526,6 +538,11 @@ where
         built
     };
 
+    // A `patient/` scope sees the launch patient's compartment only (#1618):
+    // the filter is ANDed with everything the client asked for, before list,
+    // chain and `_has` resolution narrow the query further.
+    compartment.confine_query(fhir_version, &mut query)?;
+
     // `_contained=true|both` requires contained-resource indexing. Gate it on the
     // backend's capability so unsupported backends return a clear 501 rather than
     // silently ignoring the parameter and returning an unfiltered result.
@@ -702,6 +719,13 @@ where
             result.included.extend(continuation);
         }
     }
+
+    // An include follows references wherever they lead; under a compartment-
+    // confined grant only the launch patient's resources may come back (#1618).
+    compartment.retain_members(
+        || state.storage().search_param_registry(tenant.context()),
+        &mut result.included,
+    );
 
     // Drain any include-truncation marker(s) (#1061) out of `included` before
     // counting or building the bundle. The marker is control-plane
