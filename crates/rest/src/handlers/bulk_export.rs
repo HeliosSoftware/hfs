@@ -212,6 +212,11 @@ where
             )));
         }
         for (pk, _) in url::form_urlencoded::parse(query.as_bytes()) {
+            if pk.split(':').next() == Some("_in") {
+                return Err(bad_request(format!(
+                    "_typeFilter '{raw}': '_in' is not supported in a _typeFilter"
+                )));
+            }
             if FORBIDDEN_FILTER_PARAMS.contains(&pk.as_ref()) {
                 return Err(bad_request(format!(
                     "_typeFilter may not contain result-control param '{pk}'"
@@ -339,19 +344,73 @@ where
     }
 
     // Authorization — every requested type needs read scope; Group also needs Group read.
+    //
+    // A grant that rests on a `patient/` scope is confined to the launch
+    // patient's compartment (#1618). Only `Patient/$export` can honour that:
+    // the job is pinned to the launch patient, and any `patient` parameter the
+    // client sent must name that same patient. A system-level or Group export
+    // cannot be confined, so a `patient/`-granted type refuses the kick-off.
+    // Types the token does not cover at all keep today's behaviour: refused
+    // when named in `_type`, not judged when `_type` is absent (best effort).
+    let mut patient_refs = patient_refs;
     if let Some(p) = principal {
-        let types_to_check = if resource_types.is_empty() {
-            // Whole-scope export — require a wildcard read or accept (best effort).
-            vec![]
-        } else {
+        let explicit = !resource_types.is_empty();
+        let types_to_check: Vec<String> = if explicit {
             resource_types.clone()
+        } else {
+            crate::fhir_types::get_resource_type_names_for_version(fhir_version)
+                .iter()
+                .map(|t| t.to_string())
+                .collect()
         };
+        let mut confined_to: Option<String> = None;
         for t in &types_to_check {
-            helios_auth::SmartScopePolicy::check(p, t, helios_auth::FhirOperation::Read).map_err(
-                |e| RestError::Forbidden {
-                    message: e.to_string(),
-                },
-            )?;
+            match helios_auth::SmartScopePolicy::check(p, t, helios_auth::FhirOperation::Read) {
+                Ok(helios_auth::AccessScope::Unrestricted) => {}
+                Ok(helios_auth::AccessScope::PatientCompartment { patient_id }) => {
+                    if !matches!(level, ExportLevel::Patient) {
+                        return Err(RestError::Forbidden {
+                            message: format!(
+                                "export of {t} is granted only by a patient/ scope, which is confined to the launch patient's compartment; use Patient/$export"
+                            ),
+                        });
+                    }
+                    if helios_fhir::get_compartment_params(fhir_version, "Patient", t).is_empty()
+                        && t != "Patient"
+                    {
+                        return Err(RestError::Forbidden {
+                            message: format!(
+                                "export of {t} is not permitted under a patient/ scope: {t} is not a member of the Patient compartment"
+                            ),
+                        });
+                    }
+                    confined_to = Some(patient_id);
+                }
+                Err(e @ helios_auth::AuthError::PatientContextRequired { .. }) => {
+                    return Err(RestError::Forbidden {
+                        message: e.to_string(),
+                    });
+                }
+                Err(e) if explicit => {
+                    return Err(RestError::Forbidden {
+                        message: e.to_string(),
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(launch_patient) = confined_to {
+            let launch_ref = format!("Patient/{launch_patient}");
+            for pref in &patient_refs {
+                if pref.strip_prefix("Patient/").unwrap_or(pref) != launch_patient {
+                    return Err(RestError::Forbidden {
+                        message: format!(
+                            "patient '{pref}' is outside the launch patient's compartment the token's patient/ scope is confined to"
+                        ),
+                    });
+                }
+            }
+            patient_refs = vec![launch_ref];
         }
         if matches!(level, ExportLevel::Group { .. }) {
             helios_auth::SmartScopePolicy::check(p, "Group", helios_auth::FhirOperation::Read)
@@ -950,17 +1009,20 @@ async fn emit_export_audit<S>(
     .await;
 }
 
-/// Ownership check: the principal owns the job, holds a `system/*` scope, or
-/// auth is disabled (no principal).
+/// Ownership check: the principal owns the job, holds a wildcard scope in a
+/// context other than `patient/`, or auth is disabled (no principal).
+///
+/// A `patient/*` wildcard is as wide as one patient's compartment, not the
+/// tenant, so it does not override ownership (#1618).
 fn owns_job(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool {
     match principal {
         None => true, // auth disabled — no ownership enforcement
         Some(p) => {
             owner_subject == Some(p.subject.as_str())
-                || p.scopes
-                    .scopes()
-                    .iter()
-                    .any(|s| s.resource_type == helios_auth::scope::ResourceTypeSpec::Wildcard)
+                || p.scopes.scopes().iter().any(|s| {
+                    s.resource_type == helios_auth::scope::ResourceTypeSpec::Wildcard
+                        && s.context != helios_auth::scope::ScopeContext::Patient
+                })
         }
     }
 }

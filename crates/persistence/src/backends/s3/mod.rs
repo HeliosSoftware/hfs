@@ -23,6 +23,7 @@ mod user_settings;
 pub use backend::S3Backend;
 pub use client::{AwsS3Client, AwsS3ClientOptions, S3Api};
 pub use config::{S3BackendConfig, S3TenancyMode};
+pub use keyspace::KeyspaceLayout;
 pub use output_store::{AccessTokenMode, S3OutputStore};
 
 #[cfg(test)]

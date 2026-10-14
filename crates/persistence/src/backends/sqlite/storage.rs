@@ -2148,14 +2148,14 @@ impl SqliteBackend {
         };
 
         // The end of the value's range (#1391), read from the text as written.
-        let end = super::search::writer::stored_date_end(
-            &crate::search::converters::IndexValue::date(value),
-        );
+        let indexed = crate::search::converters::IndexValue::date(value);
+        let end = super::search::writer::stored_date_end(&indexed);
+        let start = super::search::writer::stored_date_start_text(&indexed);
 
         conn.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_date, value_date_end)
-             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5, ?6)",
-            params![tenant_id, resource_type, resource_id, param_name, normalized, end],
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_date, value_date_end, value_date_start)
+             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5, ?6, ?7)",
+            params![tenant_id, resource_type, resource_id, param_name, normalized, end, start],
         )
         .map_err(|e| internal_error(format!("Failed to insert date index: {}", e)))?;
         Ok(())

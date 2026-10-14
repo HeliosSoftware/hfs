@@ -1193,7 +1193,12 @@ impl ResourceStorage for PostgresBackend {
             }
 
             let extractor = self
-                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .write_extractor(
+                    &transaction,
+                    tenant_id,
+                    !self.is_search_offloaded(),
+                    resource_type == "SearchParameter",
+                )
                 .await?;
             self.index_resource_guarded(
                 &transaction,
@@ -1461,7 +1466,12 @@ impl ResourceStorage for PostgresBackend {
             // parameters. The `resource_fts` row stays either way:
             // `index_fts_content_guarded` upserts over it on the same connection.
             let extractor = self
-                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .write_extractor(
+                    &transaction,
+                    tenant_id,
+                    !self.is_search_offloaded(),
+                    resource_type == "SearchParameter",
+                )
                 .await?;
             self.index_resource_guarded(
                 &transaction,
@@ -2490,7 +2500,12 @@ impl PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to insert restore history: {e}")))?;
             let extractor = self
-                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .write_extractor(
+                    &transaction,
+                    tenant_id,
+                    !self.is_search_offloaded(),
+                    resource_type == "SearchParameter",
+                )
                 .await?;
             self.index_resource_guarded(
                 &transaction,

@@ -607,13 +607,19 @@ impl SearchProvider for ElasticsearchBackend {
     ///
     /// Under `write_refresh` `wait_for` or `true` an acknowledged write is
     /// searchable by the time the write returned, so there is nothing to do.
+    /// That holds only while the bulk paths (`$reindex`, the deferred rebuild,
+    /// indexing during ingest) refresh as well: with `reindex_refresh` `false`
+    /// they leave their documents unsearchable until the next
+    /// `refresh_interval` tick, so the refresh is still needed (#1749).
     /// A type whose index does not exist yet has had no writes to reveal.
     async fn ensure_writes_visible(
         &self,
         tenant: &TenantContext,
         resource_types: &[&str],
     ) -> StorageResult<()> {
-        if self.write_refresh_param().is_some() || resource_types.is_empty() {
+        let writes_already_visible =
+            self.write_refresh_param().is_some() && self.reindex_refresh_param().is_some();
+        if writes_already_visible || resource_types.is_empty() {
             return Ok(());
         }
         let tenant_id = tenant.tenant_id().as_str();

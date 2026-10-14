@@ -256,12 +256,14 @@ exactly as `Patient/<id>/$everything` does: a missing patient is 404, a deleted
 one 410, and next links stay on the type-level URL. Without the claim, or with a
 value of any other form (ignored, logged at debug), every patient the caller can
 see is walked. Narrowing applies whatever the token's scope context; the
-instance-level operation is unchanged. This narrowing is not an authorization
-boundary: a patient-context token can still read other patients through the
-instance-level operation or search until #1618, and an unusable `patient` value
-falls back to walking every patient rather than rejecting the request.
-`patient/` scope and compartment enforcement for search, read and `$export` is
-tracked in [#1618](https://github.com/HeliosSoftware/hfs/issues/1618).
+instance-level operation is unchanged.
+
+The authorization boundary is the scope context (#1618): when the token's
+grant rests on a `patient/` scope, `Patient/{id}/$everything` for any other
+patient is `403`, and a token whose `patient` claim is missing or unusable is
+refused rather than widened. A `user/` or `system/` grant is not confined, and
+for it an unusable `patient` value still falls back to walking every patient.
+See [Patient scopes in the auth README](../auth/README.md#patient-scopes).
 
 Supported on every backend that supports search (SQLite, PostgreSQL,
 MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
@@ -367,6 +369,12 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 A runnable multi-instance stack (HFS + PostgreSQL + MinIO + Keycloak) is provided
 as a compose example in [`docker/bulk-export/`](../../docker/bulk-export/README.md).
 
+Under a `patient/` scope (#1618) only `Patient/$export` is available, pinned to
+the token's launch patient: a `patient` parameter naming anyone else is `403`,
+as are system-level `/$export`, `Group/{id}/$export` and a `_type` outside the
+Patient compartment. See [Patient scopes in the auth
+README](../auth/README.md#patient-scopes).
+
 ### Bulk Data Submit
 
 HFS implements the HL7 FHIR Bulk Data Access **Submit** operation
@@ -471,7 +479,6 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 
 ```bash
 HFS_BULK_SUBMIT_DEFER_INDEXING=false       # index each committed batch during ingest
-HFS_ELASTICSEARCH_REFRESH_INTERVAL=30s     # the biggest lever: at 1s Elasticsearch spends its CPU refreshing
 HFS_ELASTICSEARCH_REINDEX_REFRESH=false
 HFS_ELASTICSEARCH_BULK_CONCURRENCY=4
 HFS_BULK_SUBMIT_BATCH_SIZE=1000
@@ -481,7 +488,7 @@ HFS_BULK_SUBMIT_INDEX_QUEUE=16             # bounds HFS memory
 HFS_PG_MAX_CONNECTIONS=32
 ```
 
-Leave `HFS_BULK_SUBMIT_INDEX_COALESCE`, `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` and `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` at their defaults. Plan for ~15 GB of HFS memory while a file of large resources (~100 KB each) is ingested. Resources the index rejects under load are marked unindexed and rebuilt one by one when the manifest completes. They are stored, so the completion manifest lists them in its `outcome` file as `warning`s (`incomplete`, "HFS starts a reindex that rebuilds its search index entries once the manifest completes; no manual $reindex is needed"), not as errors, and they are not counted in `failed_entries`; only a server without an automatic reindex reports them as `error`s asking for `POST /{type}/$reindex` (#1666). The warning points at `GET /$reindex-status/{job_id}` to follow that repair; the job id is in the `deferred reindex generation started` log line. Only if no such job started is a manual `POST /{type}/$reindex` needed. The log says `rebuilding search index entries for the resources the index rejected during ingest`, or `indexed every resource during ingest; no deferred reindex needed` when there were none.
+Leave `HFS_ELASTICSEARCH_REFRESH_INTERVAL` at its `1s` default. An earlier version of this block set it to `30s`, but the 1 h 45 min figure above came from a run that also carried other import fixes, so it was never isolated. Measured in isolation (#1749; `pg-es`, PostgreSQL 16, Elasticsearch 8.15.0, 8 CPU / 23 GB, 919,752 resources, 3 runs per value), the interval does not change the import time: `1s` 223 s, `5s` 220 s, `30s` 220 s on average (under 2 % apart, which is within run-to-run noise). It only lowers Elasticsearch's CPU (about 95 % at `1s`, about 40 % at `30s`). A long interval has a cost: with `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` every interactive write waits for the next refresh, and the server itself takes about 200 s to start on an empty cluster at `30s`, against 10 s at `1s`, because seeding the search parameters waits for refreshes too. `-1` together with `wait_for` never became ready in 10 minutes (three runs). The measurement at the full 18.96 M-resource scale is still open on #1749. Leave `HFS_BULK_SUBMIT_INDEX_COALESCE`, `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` and `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` at their defaults. Plan for ~15 GB of HFS memory while a file of large resources (~100 KB each) is ingested. Resources the index rejects under load are marked unindexed and rebuilt one by one when the manifest completes. They are stored, so the completion manifest lists them in its `outcome` file as `warning`s (`incomplete`, "HFS starts a reindex that rebuilds its search index entries once the manifest completes; no manual $reindex is needed"), not as errors, and they are not counted in `failed_entries`; only a server without an automatic reindex reports them as `error`s asking for `POST /{type}/$reindex` (#1666). The warning points at `GET /$reindex-status/{job_id}` to follow that repair; the job id is in the `deferred reindex generation started` log line. Only if no such job started is a manual `POST /{type}/$reindex` needed. The log says `rebuilding search index entries for the resources the index rejected during ingest`, or `indexed every resource during ingest; no deferred reindex needed` when there were none.
 
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when

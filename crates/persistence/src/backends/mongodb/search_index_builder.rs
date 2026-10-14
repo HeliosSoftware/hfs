@@ -121,7 +121,7 @@ pub enum BuildOutcome {
 
 /// How long to wait between `listIndexes` polls while another process's
 /// build of one of our names is in progress.
-const IN_PROGRESS_POLL: Duration = Duration::from_secs(30);
+pub(super) const IN_PROGRESS_POLL: Duration = Duration::from_secs(30);
 
 /// Bound on how long `run_inner` waits for a *foreign* build (another
 /// process's `createIndexes`, or a `buildUUID` that never clears) of one of
@@ -131,7 +131,7 @@ const IN_PROGRESS_POLL: Duration = Duration::from_secs(30);
 /// even a very large collection scan and still short enough that `inline`
 /// mode (which awaits this from `init_schema`) does not hang boot forever
 /// (I3).
-const IN_PROGRESS_MAX_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
+pub(super) const IN_PROGRESS_MAX_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Page size for [`SearchIndexBuilder::move_contained_rows`]. Small enough
 /// that a crash mid-move only replays one page's worth of work on the next
@@ -185,13 +185,13 @@ struct Inspection {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ListedIndex {
     pub(super) name: String,
-    key: Document,
-    partial: Option<Document>,
+    pub(super) key: Document,
+    pub(super) partial: Option<Document>,
     pub(super) in_progress: bool,
     /// Names of any [`EXTRA_OPTION_KEYS`] present on this entry (or its
     /// `spec`). Non-empty means a generation-2 name is conflicting even when
     /// its key and partial filter match the catalog (I2).
-    extra_options: Vec<String>,
+    pub(super) extra_options: Vec<String>,
 }
 
 impl ListedIndex {
@@ -720,7 +720,7 @@ pub(super) fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
 /// How one `listIndexes` entry compares to the generation-2 spec it is named
 /// for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpecStatus {
+pub(super) enum SpecStatus {
     /// Different key, different partial filter, or an [`EXTRA_OPTION_KEYS`]
     /// option present (I2) — a person built something under our name.
     Conflicting,
@@ -733,7 +733,7 @@ enum SpecStatus {
 /// Classifies one existing index against the catalog spec it is named for.
 /// Pure and side-effect-free so the conflict rule (I2, and the key/partial
 /// comparison it already had) is unit-testable without a live server.
-fn classify_spec(spec: &SearchIndexSpec, actual: &ListedIndex) -> SpecStatus {
+pub(super) fn classify_spec(spec: &SearchIndexSpec, actual: &ListedIndex) -> SpecStatus {
     // Numeric literals from mongosh land as doubles even when the catalog
     // spec's keys/partial filter are `1_i32`; normalise before comparing so
     // a pre-built database (e.g. from the shipped mongosh script) is never

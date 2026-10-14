@@ -33,13 +33,19 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_LOG_LEVEL` | `info` | Log level: error, warn, info, debug, trace |
-| `HFS_BASE_URL` | `http://localhost:8080` | Base URL for Location headers and Bundle links |
+| `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base for Location headers and Bundle links |
 | `HFS_DATA_DIR` | `./data` | FHIR data directory, including search parameters |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. `false` = headless (`/ui` returns 404 + OperationOutcome). Replaces the removed `headless` build feature (#975) |
 | `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes (`--dashboard-reconcile-interval-secs`). Whole seconds, `> 0`; `0` or non-numeric fails startup. Also spaces per-tenant full recounts (max(interval, 10 × last recount duration)) and failed-seed retries |
 | `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (`--dashboard-refresh-secs`). Whole seconds, `> 0`, `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise fails startup. In-memory counters only |
 | `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a settled Home dashboard (`--dashboard-idle-refresh-secs`). Whole seconds, `> 0`, `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise fails startup |
+
+Set `HFS_BASE_URL` explicitly for containers and reverse proxies. Include any
+published path prefix. HFS rejects non-HTTP(S) values, credentials, query
+strings, and fragments, and it never derives the public base from request
+forwarding headers. A loopback base that conflicts with the listener produces
+a startup warning.
 
 ## Limits
 
@@ -74,7 +80,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | Elasticsearch index prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | none | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | none | Elasticsearch basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
 | `HFS_ELASTICSEARCH_MAX_TERMS_COUNT` | `65536` | Index `max_terms_count`: most values one `terms` query carries; a chained or `_has` search that pins more ids is sent as several `terms` clauses of at most this many each (#1548). Set on new indices |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
@@ -127,6 +133,7 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Required by MinIO and most S3-compatible providers |
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure HTTP endpoint URLs when `HFS_S3_ENDPOINT` is set |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
 
 The standard AWS credential chain applies. For S3-compatible endpoints, set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`. One HFS process shares a single AWS credential chain, so a MinIO primary store and real-AWS bulk-export output store cannot be combined in the same process.
 
@@ -217,7 +224,7 @@ for the rest):
 
 | Prefix | Contents |
 |---|---|
-| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history |
+| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history (`history/_keyspace.json` is the per-tenant layout marker; the policy must allow `GetObject`/`PutObject` on it) |
 | `{tenant}/bulk/submit/` | Bulk-submit staging |
 | `tenants/` | Tenant registry |
 | `_system.user-settings/` | Per-user UI settings (`/_user/settings`) |

@@ -378,6 +378,10 @@ async fn mongodb_transaction_replay_keeps_forward_references_and_metadata_atomic
         let kind = row.get_str("resource_type").unwrap();
         let id = row.get_str("id").unwrap();
         committed.insert(format!("{kind}/{id}"));
+        assert!(
+            row.get_array("missing_params").is_ok(),
+            "{kind}/{id}: metadata must commit with the resource"
+        );
         if kind == "Observation" {
             assert_eq!(
                 row.get_document("data")

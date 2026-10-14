@@ -201,6 +201,35 @@ fn cases() -> Vec<Case> {
         },
         paged: false,
     });
+    let questionnaire = |name, select| Case {
+        name,
+        view: view("Questionnaire", select),
+        filters: ViewFilters::default(),
+        paged: false,
+    };
+    cases.push(questionnaire(
+        "repeat-in-foreach",
+        json!([{"column":[{"path":"id","name":"id"}]},
+        {"forEach":"item","select":[{"column":[{"path":"linkId","name":"top"}]},
+            {"repeat":["item"],"column":[{"path":"linkId","name":"child"}]}]}]),
+    ));
+    cases.push(questionnaire(
+        "repeat-nested",
+        json!([{"repeat":["item"],"select":[{"column":[{"path":"linkId","name":"parent"}]},
+            {"repeat":["item"],"column":[{"path":"linkId","name":"child"}]}]}]),
+    ));
+    cases.push(questionnaire(
+        "repeat-siblings",
+        json!([{"repeat":["item"],"column":[{"path":"linkId","name":"a"}]},
+        {"repeat":["item"],"column":[{"path":"linkId","name":"b"}]}]),
+    ));
+    cases.push(patient(
+        "union-in-foreach",
+        json!([{"column":[{"path":"id","name":"id"}]},
+        {"forEach":"contact","select":[{"unionAll":[
+            {"forEach":"telecom","column":[{"path":"value","name":"value"}]},
+            {"column":[{"path":"name.family","name":"value"}]}]}]}]),
+    ));
     cases.push(Case {
         name: "outside-compartment",
         view: view("Library", json!([{"column":[{"path":"id","name":"id"}]}])),
@@ -231,6 +260,13 @@ fn cases() -> Vec<Case> {
         ..Default::default()
     };
     cases.push(anchors);
+    let mut exists_multi_step = patient(
+        "exists-multi-step",
+        json!([{"column":[{"path":"id","name":"id"}]}]),
+    );
+    exists_multi_step.view["where"] =
+        json!([{"path":"contact.telecom.exists(system = 'phone' and value = '555')"}]);
+    cases.push(exists_multi_step);
     // Keyset pages of an export read: range slots come last, no SQL LIMIT.
     for (name, source) in [
         ("export-page-flat", "flat"),
@@ -278,7 +314,7 @@ async fn check(dialect: SqlDialect, name: &str) {
         std::fs::create_dir_all(&directory).unwrap();
     }
     let cases = cases();
-    assert_eq!(cases.len(), 28, "all golden cases must execute");
+    assert_eq!(cases.len(), 33, "all golden cases must execute");
     for case in cases {
         let groups = || {
             vec![

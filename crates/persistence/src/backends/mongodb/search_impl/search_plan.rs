@@ -5,6 +5,7 @@
 //! indexed matches without live-resource validation.
 
 use super::super::probe_cache::{OffsetPageDecision, ProbeCache, ProbeEstimate, ProbeKey};
+use super::super::search_deadline::{self, SearchCommand};
 use super::super::search_index_catalog::SEARCH_DATE_RANGE_INDEX;
 use super::collect_documents;
 use super::{
@@ -13,7 +14,7 @@ use super::{
 };
 use crate::error::{QueryErrorExt, StorageResult};
 use crate::types::{SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery};
-use futures::{TryStreamExt, stream::FuturesUnordered};
+use futures::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use mongodb::{
     bson::{Bson, Document, doc},
     options::Hint,
@@ -141,7 +142,9 @@ impl From<Document> for IndexPredicate {
 
 impl IndexPredicate {
     fn new(filter: Document, parameter: &SearchParameter) -> Self {
-        let access = if parameter.param_type != SearchParamType::Date {
+        let access = if parameter.param_type != SearchParamType::Date
+            || matches!(parameter.modifier, Some(SearchModifier::Missing))
+        {
             IndexAccess::Automatic
         } else if parameter.values.iter().any(|value| {
             matches!(
@@ -474,15 +477,24 @@ impl SearchFilterPlan {
         sort: Option<Document>,
         index_cursor_filter: Option<Document>,
     ) -> StorageResult<SearchPipeline> {
+        let missing_hint = super::missing_metadata_hint(&resource_filter);
+        let bounded_missing_page =
+            missing_hint.is_some() && sort.is_some() && matches!(&self, Self::CandidateIds(_));
         let id_ordered = sort
             .as_ref()
             .is_some_and(|sort| sort.len() == 1 && sort.contains_key("id"));
         let (collection, stages, mut hint) =
             self.pipeline_parts(resource_filter, sort, index_cursor_filter)?;
-        if hint.is_none() && collection == MongoBackend::RESOURCES_COLLECTION && id_ordered {
-            hint = Some(Hint::Name(
-                super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned(),
-            ));
+        if hint.is_none() && collection == MongoBackend::RESOURCES_COLLECTION {
+            if id_ordered || bounded_missing_page {
+                // Seek known IDs before a bounded sort; broad metadata scans
+                // retain their timestamp index order.
+                hint = Some(Hint::Name(
+                    super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned(),
+                ));
+            } else {
+                hint = missing_hint;
+            }
         }
         Ok(SearchPipeline {
             collection,
@@ -751,6 +763,7 @@ impl MongoBackend {
     /// share those batches; other complement paths retain existence checks.
     /// Composite pair matching and reference-identifier resolution still use the
     /// candidate-selection path, as do compartments and search-parameter sorts.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn resource_filter_plan(
         &self,
         db: &mongodb::Database,
@@ -758,6 +771,7 @@ impl MongoBackend {
         query: &SearchQuery,
         purpose: SearchFilterPurpose,
         page_policy: NoTotalPagePolicy,
+        index_cursor_filter: Option<&Document>,
         facts: &mut ProbeFacts,
     ) -> StorageResult<Option<SearchFilterPlan>> {
         // Upstream's candidate executor bounds all sibling predicates to a
@@ -776,6 +790,9 @@ impl MongoBackend {
         {
             return Ok(None);
         }
+        let missing_resource_filter = query.parameters.iter().any(|param| {
+            self.is_missing_resource_parameter(tenant_id, &query.resource_type, param)
+        });
         let indexed: Vec<_> = query
             .parameters
             .iter()
@@ -794,12 +811,17 @@ impl MongoBackend {
 
         // Positive searches share candidate selection for pages and totals.
         // Complements retain existence checks so absent values remain eligible.
-        let has_complement = indexed.iter().any(|param| {
-            matches!(
-                param.modifier,
-                Some(SearchModifier::Missing | SearchModifier::Not)
-            )
-        });
+        let has_complement = missing_resource_filter
+            || indexed.iter().any(|param| {
+                matches!(param.modifier, Some(SearchModifier::Not))
+                    || (matches!(param.modifier, Some(SearchModifier::Missing))
+                        && (param.param_type == SearchParamType::Composite
+                            || !self.supports_indexed_missing(
+                                tenant_id,
+                                &query.resource_type,
+                                param,
+                            )))
+            });
         if !has_complement {
             let probe_timeout = self.probe_timeout();
             let indexes_ready = self.search_indexes_ready();
@@ -847,21 +869,36 @@ impl MongoBackend {
                 return Ok(Some(SearchFilterPlan::ResourceBatches(ResourceBatchPlan {
                     filters,
                     exclusions: Vec::new(),
+                    missing: Vec::new(),
                 })));
             }
             return Ok(Some(SearchFilterPlan::IndexIntersection(filters)));
         }
 
-        let batch_page = matches!(purpose, SearchFilterPurpose::Page)
+        let timestamp_batch_page = matches!(purpose, SearchFilterPurpose::Page)
             && self.search_indexes_ready()
             && ResourceBatchPlan::supports_query(query);
+        let id_batch_page = matches!(purpose, SearchFilterPurpose::Page)
+            && self.search_indexes_ready()
+            && missing_resource_filter
+            && matches!(query.sort.as_slice(), [sort] if sort.parameter == "_id")
+            && indexed.iter().any(|param| {
+                !self.is_missing_resource_parameter(tenant_id, &query.resource_type, param)
+            });
+        let batch_page = timestamp_batch_page || id_batch_page;
         // Keep selective positive predicates on the index-first path. A
         // bounded count transfers only a scalar; broad searches never collect
         // their full candidate set just to choose a plan.
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let mut driver = None;
         for (position, param) in indexed.iter().enumerate() {
-            if matches!(param.modifier, Some(SearchModifier::Missing)) {
+            if self.is_missing_resource_parameter(tenant_id, &query.resource_type, param) {
+                continue;
+            }
+            if matches!(param.modifier, Some(SearchModifier::Missing))
+                && (param.param_type == SearchParamType::Composite
+                    || !self.supports_indexed_missing(tenant_id, &query.resource_type, param))
+            {
                 // Presence is a positive predicate: drive from its typed partial
                 // index, rather than enumerating resources with no value.
                 if !batch_page
@@ -890,6 +927,7 @@ impl MongoBackend {
                 facts.requests += 1;
                 let count = search_index
                     .count_documents(filter.clone())
+                    .search_deadline()?
                     .limit(SELECTIVE_SEARCH_ROW_LIMIT + 1)
                     .await
                     .or_query_error("Failed to probe resource-filtered search")?;
@@ -901,14 +939,25 @@ impl MongoBackend {
             if count <= SELECTIVE_SEARCH_ROW_LIMIT {
                 return Ok(None);
             }
-            if !batch_page && driver.is_none() {
+            if !missing_resource_filter && !batch_page && driver.is_none() {
                 driver = Some((position, filter));
             }
         }
         let mut filters = Vec::new();
         let mut exclusions = Vec::new();
+        let mut missing = Vec::new();
         let mut stages = Vec::new();
         for (position, param) in indexed.into_iter().enumerate() {
+            if self.is_missing_resource_parameter(tenant_id, &query.resource_type, param) {
+                let presence = missing_presence_filter(tenant_id, &query.resource_type, param);
+                if batch_page {
+                    missing.push(presence.clone());
+                }
+                if !batch_page {
+                    stages.extend(super::missing_fallback_stages(presence));
+                }
+                continue;
+            }
             let (filter, exclude) = if matches!(param.modifier, Some(SearchModifier::Missing)) {
                 (
                     missing_presence_filter(tenant_id, &query.resource_type, param),
@@ -932,20 +981,30 @@ impl MongoBackend {
             };
             if batch_page {
                 if exclude {
-                    exclusions.push(filter.into());
-                } else if matches!(param.modifier, Some(SearchModifier::Missing)) {
-                    // Typed presence is not a range predicate and must not inherit its hint.
-                    filters.push(filter.into());
+                    exclusions.push(filter.clone().into());
                 } else {
-                    filters.push(self.planning_predicate(
-                        db,
-                        tenant_id,
-                        &query.resource_type,
-                        param,
-                        filter,
-                        true,
-                    ));
+                    // Bound ID-page probes and reads together; the cache key
+                    // includes this boundary, while fallback and counts stay global.
+                    let bounded_filter = match index_cursor_filter.filter(|_| id_batch_page) {
+                        Some(boundary) => doc! { "$and": [filter.clone(), boundary.clone()] },
+                        None => filter.clone(),
+                    };
+                    if matches!(param.modifier, Some(SearchModifier::Missing)) {
+                        // Typed presence must not inherit a range predicate's hint.
+                        filters.push(bounded_filter.into());
+                    } else {
+                        filters.push(self.planning_predicate(
+                            db,
+                            tenant_id,
+                            &query.resource_type,
+                            param,
+                            bounded_filter,
+                            true,
+                        ));
+                    }
                 }
+            }
+            if batch_page {
                 continue;
             }
             if driver
@@ -982,13 +1041,17 @@ impl MongoBackend {
             {
                 let mut ids = ids.into_iter().collect();
                 exclude_candidates(db, &mut ids, &exclusions.iter().collect::<Vec<_>>()).await?;
+                filter_missing_candidates(db, &mut ids, &missing, false).await?;
                 return Ok(Some(SearchFilterPlan::CandidateIds(
                     ids.into_iter().collect(),
                 )));
             }
+        }
+        if batch_page {
             return Ok(Some(SearchFilterPlan::ResourceBatches(ResourceBatchPlan {
                 filters,
                 exclusions,
+                missing,
             })));
         }
         Ok(Some(SearchFilterPlan::ResourceLookups {
@@ -1046,6 +1109,7 @@ async fn count_capped_predicates(
     {
         return Ok(None);
     }
+    search_deadline::check()?;
     let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
     let budget = probe_timeout.saturating_mul(CAPPED_TIE_BREAK_BUDGETS);
     let started = tokio::time::Instant::now();
@@ -1080,7 +1144,7 @@ async fn count_capped_predicates(
                     return Ok(None);
                 }
                 facts.requests += 1;
-                let operation = with_hint_fallback(filter.hint(), |hint| {
+                let operation = |hint| {
                     let count = index
                         .count_documents(filter.filter.clone())
                         .max_time(remaining);
@@ -1088,10 +1152,28 @@ async fn count_capped_predicates(
                         Some(hint) => count.hint(hint),
                         None => count,
                     }
-                });
-                let count = match tokio::time::timeout(remaining, operation).await {
-                    Ok(result) => probe_count(result)?,
-                    Err(_) => None,
+                };
+                let count = if search_deadline::is_active() {
+                    // A configured soft deadline must not cancel a driver
+                    // future. Await it and distinguish expiry before caching.
+                    with_probe_hint_fallback(
+                        filter.hint(),
+                        || budget.saturating_sub(started.elapsed()),
+                        operation,
+                    )
+                    .await?
+                } else {
+                    // Preserve the original hard optional-probe timeout when
+                    // no whole-search deadline has been configured.
+                    match tokio::time::timeout(
+                        remaining,
+                        with_hint_fallback(filter.hint(), operation),
+                    )
+                    .await
+                    {
+                        Ok(result) => probe_count(result?)?,
+                        Err(_) => None,
+                    }
                 };
                 if let Some(cache_key) = cache_key {
                     cache.insert(
@@ -1144,6 +1226,7 @@ fn optional_probe_timed_out(error: &mongodb::error::Error) -> bool {
 }
 
 fn probe_count(result: mongodb::error::Result<u64>) -> StorageResult<Option<u64>> {
+    search_deadline::check()?;
     match result {
         Err(error) if optional_probe_timed_out(&error) => Ok(None),
         result => result
@@ -1158,22 +1241,63 @@ fn probe_count(result: mongodb::error::Result<u64>) -> StorageResult<Option<u64>
 /// (rolling upgrade), runs the operation once more without it. The identity
 /// index is required, so a rejection of that hint propagates.
 pub(super) async fn with_hint_fallback<T, F>(
-    hint: Option<Hint>,
+    mut hint: Option<Hint>,
     operation: impl Fn(Option<Hint>) -> F,
-) -> mongodb::error::Result<T>
+) -> StorageResult<mongodb::error::Result<T>>
 where
-    F: IntoFuture<Output = mongodb::error::Result<T>>,
+    F: SearchCommand + IntoFuture<Output = mongodb::error::Result<T>>,
 {
-    let Some(hint) = hint else {
-        return operation(None).await;
-    };
-    let may_be_missing = hint == Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned());
-    match operation(Some(hint.clone())).await {
-        Err(error) if may_be_missing && hint_rejected(&error) => {
+    loop {
+        // Build a fresh command budget for the unhinted retry as well.
+        let result = operation(hint.clone()).search_deadline()?.await;
+        if let Err(error) = &result
+            && hint == Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
+            && hint_rejected(error)
+        {
+            search_deadline::check()?;
             tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
-            operation(None).await
+            hint = None;
+            continue;
         }
-        result => result,
+        return Ok(result);
+    }
+}
+
+/// Optional probes retain their own budget, capped by the shared search
+/// deadline. The duration supplier also preserves a shared tie-break budget
+/// across a missing-index retry.
+async fn with_probe_hint_fallback<T, F>(
+    mut hint: Option<Hint>,
+    probe_timeout: impl Fn() -> Duration,
+    operation: impl Fn(Option<Hint>) -> F,
+) -> StorageResult<Option<T>>
+where
+    F: SearchCommand + IntoFuture<Output = mongodb::error::Result<T>>,
+{
+    loop {
+        search_deadline::check()?;
+        let remaining = probe_timeout();
+        if remaining < Duration::from_millis(1) {
+            return Ok(None);
+        }
+        let (command, budget) = operation(hint.clone()).search_probe_deadline(remaining)?;
+        let result = command.await;
+        budget.check_timeout(result.as_ref().is_err_and(optional_probe_timed_out))?;
+        match result {
+            Err(error)
+                if hint == Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
+                    && hint_rejected(&error) =>
+            {
+                tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
+                hint = None;
+            }
+            Err(error) if optional_probe_timed_out(&error) => return Ok(None),
+            result => {
+                return result
+                    .map(Some)
+                    .or_query_error("Failed to probe search candidates");
+            }
+        }
     }
 }
 
@@ -1221,17 +1345,20 @@ async fn probe_candidates(
             continue;
         }
         facts.requests += 1;
-        let probe = with_hint_fallback(filter.hint(), |hint| {
-            let probe = index
-                .count_documents(filter.filter.clone())
-                .limit(MAX_CANDIDATE_ROWS + 1)
-                .max_time(probe_timeout);
-            match hint {
-                Some(hint) => probe.hint(hint),
-                None => probe,
-            }
-        });
-        let count = probe_count(probe.await)?;
+        let count = with_probe_hint_fallback(
+            filter.hint(),
+            || probe_timeout,
+            |hint| {
+                let probe = index
+                    .count_documents(filter.filter.clone())
+                    .limit(MAX_CANDIDATE_ROWS + 1);
+                match hint {
+                    Some(hint) => probe.hint(hint),
+                    None => probe,
+                }
+            },
+        )
+        .await?;
         if let Some(key) = key {
             facts.remember(key, count);
         }
@@ -1296,7 +1423,7 @@ async fn bounded_candidates(
             None => seed,
         }
     })
-    .await
+    .await?
     .or_query_error("Failed to read search candidates")?;
     let mut candidates = CandidateIds::default();
     let mut rows = 0;
@@ -1384,6 +1511,7 @@ async fn matching_index_ids(
             doc! { "$match": filter },
             doc! { "$group": { "_id": "$resource_id" } },
         ])
+        .search_deadline()?
         .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
         .await
         .or_query_error("Failed to filter search candidates")?;
@@ -1406,11 +1534,76 @@ async fn matching_index_ids(
     Ok(matched)
 }
 
-/// Broad timestamp pages can stop after enough matches in resource-index order.
+async fn filter_missing_candidates(
+    db: &mongodb::Database,
+    candidates: &mut HashSet<String>,
+    missing: &[Document],
+    resource_scoped: bool,
+) -> StorageResult<()> {
+    let Some(first) = missing.first() else {
+        return Ok(());
+    };
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let tenant = first
+        .get_str("tenant_id")
+        .map_err(|_| internal_error("Missing predicate tenant".into()))?;
+    let resource_type = first
+        .get_str("resource_type")
+        .map_err(|_| internal_error("Missing predicate resource type".into()))?;
+    let scope = doc! {
+        "tenant_id": tenant, "resource_type": resource_type, "is_deleted": false,
+        "id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() },
+    };
+    let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+    // IDs already bound this work. The metadata index orders timestamps before
+    // IDs and can scan the whole missing population for this small batch.
+    let hint = Hint::Name(super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned());
+    if !resource_scoped {
+        let mut conditions = vec![scope.clone()];
+        for presence in missing {
+            let name = presence
+                .get_str("param_name")
+                .map_err(|_| internal_error("Missing predicate parameter name".into()))?;
+            conditions.push(super::missing_resource_condition(name));
+        }
+        let cursor = resources
+            .find(doc! { "$and": conditions })
+            .projection(doc! { "_id": 0, "id": 1 })
+            .hint(hint.clone())
+            .await
+            .or_query_error("Failed to select missing metadata candidates")?;
+        *candidates = super::collect_id_set(cursor, "id").await?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+    }
+    // Fetch only this batch's metadata; value-presence checks apply to older
+    // resources alone, never to resources whose missing metadata is known.
+    let cursor = resources
+        .find(doc! { "$and": [scope, { "missing_params": { "$exists": false } }] })
+        .projection(doc! { "_id": 0, "id": 1 })
+        .hint(hint)
+        .await
+        .or_query_error("Failed to select candidates without missing metadata")?;
+    let older = super::collect_id_set(cursor, "id").await?;
+    if older.is_empty() {
+        return Ok(());
+    }
+    let mut absent = older.clone();
+    let predicates: Vec<IndexPredicate> = missing.iter().cloned().map(Into::into).collect();
+    exclude_candidates(db, &mut absent, &predicates.iter().collect::<Vec<_>>()).await?;
+    candidates.retain(|id| !older.contains(id) || absent.contains(id));
+    Ok(())
+}
+
+/// Resource-order pages stop after enough matches in the requested index order.
 /// Every indexed condition is checked before a row contributes to the offset.
 pub(super) struct ResourceBatchPlan {
     filters: Vec<IndexPredicate>,
     exclusions: Vec<IndexPredicate>,
+    missing: Vec<Document>,
 }
 
 impl ResourceBatchPlan {
@@ -1463,7 +1656,13 @@ impl ResourceBatchPlan {
         };
         Ok(ResourcePageRun {
             cursor: ResourcePageCursor::new(resources, resource_filter, sort).await?,
-            scan: ResourcePageScan::new(&self.filters, &self.exclusions, offset, limit),
+            scan: ResourcePageScan::new(
+                &self.filters,
+                &self.exclusions,
+                &self.missing,
+                offset,
+                limit,
+            ),
             exhausted: false,
         })
     }
@@ -1535,6 +1734,7 @@ impl ResourcePageRun<'_> {
     /// Reads one batch of candidates and matches it. Returns true when the page
     /// is complete or the stream is exhausted.
     async fn step(&mut self, db: &mongodb::Database) -> StorageResult<bool> {
+        search_deadline::check()?;
         if self.exhausted {
             return Ok(true);
         }
@@ -1583,6 +1783,7 @@ pub(super) fn record_resource_page_fallback(live_matches: u64, id_set: usize) {
 struct ResourcePageScan<'a> {
     predicates: Vec<&'a IndexPredicate>,
     exclusions: Vec<&'a IndexPredicate>,
+    missing: &'a [Document],
     limit: usize,
     skip: u64,
     ids: Vec<String>,
@@ -1599,12 +1800,14 @@ impl<'a> ResourcePageScan<'a> {
     fn new(
         filters: &'a [IndexPredicate],
         exclusions: &'a [IndexPredicate],
+        missing: &'a [Document],
         offset: u32,
         limit: usize,
     ) -> Self {
         Self {
             predicates: filters.iter().collect(),
             exclusions: exclusions.iter().collect(),
+            missing,
             limit,
             skip: u64::from(offset),
             ids: Vec::new(),
@@ -1616,9 +1819,11 @@ impl<'a> ResourcePageScan<'a> {
     }
 
     async fn match_batch(&mut self, db: &mongodb::Database) -> StorageResult<()> {
+        search_deadline::check()?;
         let mut matched = self.batch.iter().cloned().collect();
         filter_candidates(db, &mut matched, &self.predicates).await?;
         exclude_candidates(db, &mut matched, &self.exclusions).await?;
+        filter_missing_candidates(db, &mut matched, self.missing, true).await?;
         for candidate in self.batch.drain(..) {
             if !matched.contains(&candidate) {
                 continue;
@@ -1682,6 +1887,9 @@ impl ResourcePageCursor {
         filter: Document,
         sort: Document,
     ) -> StorageResult<Self> {
+        if sort.len() == 1 && sort.get_i32("id").is_ok() {
+            return Ok(Self::Ordered(Self::open(&resources, filter, sort).await?));
+        }
         let timestamp_direction = sort
             .get_i32("last_updated")
             .map_err(|_| internal_error("Missing timestamp page order".to_owned()))?;
@@ -1702,8 +1910,10 @@ impl ResourcePageCursor {
         }
     }
 
-    fn hint() -> Hint {
-        Hint::Name(super::super::schema::RESOURCES_TYPE_SCAN_INDEX.to_owned())
+    fn hint(filter: &Document) -> Hint {
+        super::missing_metadata_hint(filter).unwrap_or_else(|| {
+            Hint::Name(super::super::schema::RESOURCES_TYPE_SCAN_INDEX.to_owned())
+        })
     }
 
     async fn open(
@@ -1711,11 +1921,17 @@ impl ResourcePageCursor {
         filter: Document,
         sort: Document,
     ) -> StorageResult<mongodb::Cursor<Document>> {
+        let hint = if sort.len() == 1 && sort.contains_key("id") {
+            Hint::Name(super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned())
+        } else {
+            Self::hint(&filter)
+        };
         resources
             .find(filter)
+            .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1, "last_updated": 1 })
             .sort(sort)
-            .hint(Self::hint())
+            .hint(hint)
             .batch_size(PAGE_CANDIDATE_BATCH_ROWS as u32)
             .await
             .or_query_error("Failed to stream resource page candidates")
@@ -1770,11 +1986,12 @@ impl TimestampGroupCursor {
             let next = self
                 .resources
                 .find_one(filter)
+                .search_deadline()?
                 .projection(doc! { "_id": 0, "last_updated": 1 })
                 .sort(doc! {
                     "last_updated": self.timestamp_direction, "id": self.timestamp_direction,
                 })
-                .hint(ResourcePageCursor::hint())
+                .hint(ResourcePageCursor::hint(&self.filter))
                 .await
                 .or_query_error("Failed to find next resource timestamp")?;
             let Some(next) = next else {
@@ -2003,7 +2220,7 @@ impl BatchedIndexPlan {
                 None => aggregate,
             }
         })
-        .await
+        .await?
         .or_query_error("Failed to count estimated index driver")?;
         let Some(document) = cursor
             .try_next()
@@ -2080,7 +2297,7 @@ impl BatchedIndexPlan {
                 None => aggregate,
             }
         })
-        .await
+        .await?
         .or_query_error("Failed to stream search candidates")?;
         self.consume_batches(db, &resource_filter, cursor, selection, Vec::new())
             .await
@@ -2132,26 +2349,51 @@ impl BatchedIndexPlan {
         let mut pending_counts = FuturesUnordered::new();
         let mut batch = Vec::with_capacity(batch_rows);
         let mut bytes = 0usize;
-        while cursor
-            .advance()
-            .await
-            .or_query_error("Failed to read candidate batch")?
-        {
-            let document = cursor
-                .deserialize_current()
-                .or_query_error("Invalid candidate row")?;
-            let id = document.get_str("_id").map_err(|_| {
-                internal_error("Search candidate is missing resource_id".to_owned())
-            })?;
-            let size = id.len().saturating_add(16);
-            if size > MAX_CANDIDATE_BYTES {
-                return Err(internal_error(
-                    "Search candidate exceeds the BSON batch budget".to_owned(),
-                ));
-            }
-            if !batch.is_empty()
-                && (batch.len() == batch_rows || bytes.saturating_add(size) > MAX_CANDIDATE_BYTES)
+        let outcome = async {
+            while cursor
+                .advance()
+                .await
+                .or_query_error("Failed to read candidate batch")?
             {
+                let document = cursor
+                    .deserialize_current()
+                    .or_query_error("Invalid candidate row")?;
+                let id = document.get_str("_id").map_err(|_| {
+                    internal_error("Search candidate is missing resource_id".to_owned())
+                })?;
+                let size = id.len().saturating_add(16);
+                if size > MAX_CANDIDATE_BYTES {
+                    return Err(internal_error(
+                        "Search candidate exceeds the BSON batch budget".to_owned(),
+                    ));
+                }
+                if !batch.is_empty()
+                    && (batch.len() == batch_rows
+                        || bytes.saturating_add(size) > MAX_CANDIDATE_BYTES)
+                {
+                    pending_counts.push(self.count_batch(
+                        db,
+                        resource_filter,
+                        match &page_ids {
+                            Some(page) => page.constrain(&selection)?,
+                            None => selection.clone(),
+                        },
+                        std::mem::replace(&mut batch, Vec::with_capacity(batch_rows)),
+                    ));
+                    if pending_counts.len() == COUNT_BATCH_CONCURRENCY
+                        && let Some(matches) = pending_counts.try_next().await?
+                    {
+                        result.count += matches.count;
+                        if let Some(page) = &mut page_ids {
+                            page.extend(matches.ids);
+                        }
+                    }
+                    bytes = 0;
+                }
+                batch.push(id.to_owned());
+                bytes += size;
+            }
+            if !batch.is_empty() {
                 pending_counts.push(self.count_batch(
                     db,
                     resource_filter,
@@ -2159,48 +2401,33 @@ impl BatchedIndexPlan {
                         Some(page) => page.constrain(&selection)?,
                         None => selection.clone(),
                     },
-                    std::mem::replace(&mut batch, Vec::with_capacity(batch_rows)),
+                    batch,
                 ));
-                if pending_counts.len() == COUNT_BATCH_CONCURRENCY
-                    && let Some(matches) = pending_counts.try_next().await?
-                {
-                    result.count += matches.count;
-                    if let Some(page) = &mut page_ids {
-                        page.extend(matches.ids);
-                    }
+            }
+            while let Some(matches) = pending_counts.try_next().await? {
+                result.count += matches.count;
+                if let Some(page) = &mut page_ids {
+                    page.extend(matches.ids);
                 }
-                bytes = 0;
             }
-            batch.push(id.to_owned());
-            bytes += size;
-        }
-        if !batch.is_empty() {
-            pending_counts.push(self.count_batch(
-                db,
-                resource_filter,
-                match &page_ids {
-                    Some(page) => page.constrain(&selection)?,
-                    None => selection.clone(),
-                },
-                batch,
-            ));
-        }
-        while let Some(matches) = pending_counts.try_next().await? {
-            result.count += matches.count;
-            if let Some(page) = &mut page_ids {
-                page.extend(matches.ids);
+            if let Some(page) = page_ids {
+                let offset = match selection {
+                    BatchSelection::PageAndCount { offset, .. }
+                    | BatchSelection::BoundedPage { offset, .. }
+                    | BatchSelection::EstimatedPageAndCount { offset, .. } => offset as usize,
+                    _ => 0,
+                };
+                result.ids = page.into_ids().into_iter().skip(offset).collect();
             }
+            Ok(result)
         }
-        if let Some(page) = page_ids {
-            let offset = match selection {
-                BatchSelection::PageAndCount { offset, .. }
-                | BatchSelection::BoundedPage { offset, .. }
-                | BatchSelection::EstimatedPageAndCount { offset, .. } => offset as usize,
-                _ => 0,
-            };
-            result.ids = page.into_ids().into_iter().skip(offset).collect();
+        .await;
+        if outcome.is_err() {
+            // Another batch may already be inside a driver call. Poll it to
+            // completion before releasing the search's admission permit.
+            while pending_counts.next().await.is_some() {}
         }
-        Ok(result)
+        outcome
     }
 
     fn record_page_decision(
@@ -2266,7 +2493,7 @@ impl BatchedIndexPlan {
                 None => aggregate,
             }
         })
-        .await
+        .await?
         .or_query_error("Failed to open adaptive page candidates")?;
         let mut batch = Vec::with_capacity(PAGE_CANDIDATE_BATCH_ROWS);
         let mut bytes = 0usize;
@@ -2413,7 +2640,7 @@ impl BatchedIndexPlan {
                     None => aggregate,
                 }
             })
-            .await
+            .await?
             .or_query_error("Failed to open candidate page window")?;
             let mut batch = Vec::with_capacity(PAGE_CANDIDATE_BATCH_ROWS);
             let mut bytes = 0usize;
@@ -2488,15 +2715,18 @@ impl BatchedIndexPlan {
             None => self.driver.filter.clone(),
         };
         let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let budget = search_deadline::ProbeBudget::new(self.probe_timeout)?;
         let opened = index
             .find(filter)
+            .search_deadline()?
             .projection(doc! { "_id": 0, "resource_id": 1 })
             .sort(doc! { "resource_id": direction })
             .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
             .limit(PAGE_CANDIDATE_BATCH_ROWS as i64)
             .batch_size(PAGE_CANDIDATE_BATCH_ROWS as u32)
-            .max_time(self.probe_timeout)
+            .max_time(budget.duration())
             .await;
+        budget.check_timeout(opened.as_ref().is_err_and(optional_probe_timed_out))?;
         let mut cursor = match opened {
             Err(error) if optional_probe_timed_out(&error) => {
                 return Ok(None);
@@ -2510,7 +2740,11 @@ impl BatchedIndexPlan {
         };
         let mut bytes = 0usize;
         loop {
-            let row = match cursor.try_next().await {
+            let read = cursor.try_next().await;
+            if let Err(error) = &read {
+                budget.check_timeout(optional_probe_timed_out(error))?;
+            }
+            let row = match read {
                 Err(error) if optional_probe_timed_out(&error) => {
                     return Ok(None);
                 }
@@ -2689,6 +2923,7 @@ impl BatchedIndexPlan {
         let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let mut cursor = index
             .aggregate(pipeline)
+            .search_deadline()?
             .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
             .await
             .or_query_error("Failed to count indexed candidate batch")?;
@@ -2733,6 +2968,7 @@ impl BatchedIndexPlan {
         let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let mut cursor = index
             .aggregate(pipeline)
+            .search_deadline()?
             .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
             .await
             .or_query_error("Failed to count and match indexed page candidates")?;
@@ -2784,6 +3020,7 @@ impl BatchedIndexPlan {
         collect_documents(
             resources
                 .find(doc! { "$and": filters })
+                .search_deadline()?
                 .projection(doc! { "_id": 0, "id": 1 })
                 .sort(doc! { "id": direction })
                 .limit(retained_page_limit(offset, limit)?)
@@ -2809,6 +3046,7 @@ impl BatchedIndexPlan {
         batch: &[String],
         result: &mut BatchMatches,
     ) -> StorageResult<bool> {
+        search_deadline::check()?;
         if batch.is_empty() {
             return Ok(false);
         }
@@ -2867,6 +3105,7 @@ impl BatchedIndexPlan {
             // timestamp partitions for an otherwise bounded ID lookup.
             result.count += resources
                 .count_documents(live_filter)
+                .search_deadline()?
                 .await
                 .or_query_error("Failed to count live candidates")?;
             return Ok(false);
@@ -2900,6 +3139,7 @@ impl BatchedIndexPlan {
                         "page": page_stages,
                     } },
                 ])
+                .search_deadline()?
                 .await
                 .or_query_error("Failed to count and select live candidates")?;
             let facet = cursor
@@ -2923,6 +3163,7 @@ impl BatchedIndexPlan {
         }
         let mut cursor = resources
             .find(live_filter)
+            .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
             .await
             .or_query_error("Failed to validate live candidates")?;
@@ -2959,6 +3200,68 @@ impl BatchedIndexPlan {
 #[cfg(test)]
 mod candidate_tests {
     use super::*;
+
+    #[test]
+    fn resource_pipeline_hints_preserve_id_order_with_missing_metadata() {
+        use super::super::super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_MISSING_INDEX};
+
+        let scope = doc! {
+            "tenant_id": "tenant", "resource_type": "Observation", "is_deleted": false,
+        };
+        for (name, condition, metadata_hint) in [
+            ("ordinary", doc! {}, false),
+            (
+                "recorded missing",
+                doc! { "missing_params": "method" },
+                true,
+            ),
+            (
+                "old resource",
+                doc! { "missing_params": { "$exists": false } },
+                true,
+            ),
+            (
+                "backward compatible missing",
+                doc! { "$or": [
+                    { "missing_params": "method" },
+                    { "missing_params": { "$exists": false } },
+                ] },
+                true,
+            ),
+        ] {
+            let filter = doc! { "$and": [scope.clone(), condition] };
+            for (sort, expected_hint) in [
+                (Some(doc! { "id": 1 }), Some(RESOURCES_IDENTITY_INDEX)),
+                (Some(doc! { "id": -1 }), Some(RESOURCES_IDENTITY_INDEX)),
+                (
+                    Some(doc! { "last_updated": 1, "id": 1 }),
+                    metadata_hint.then_some(RESOURCES_MISSING_INDEX),
+                ),
+                (
+                    Some(doc! { "last_updated": -1, "id": -1 }),
+                    metadata_hint.then_some(RESOURCES_MISSING_INDEX),
+                ),
+                (None, metadata_hint.then_some(RESOURCES_MISSING_INDEX)),
+            ] {
+                let pipeline = SearchFilterPlan::ResourceLookups {
+                    index_filter: None,
+                    stages: Vec::new(),
+                }
+                .pipeline(filter.clone(), sort.clone(), None)
+                .unwrap();
+                assert_eq!(pipeline.collection, MongoBackend::RESOURCES_COLLECTION);
+                assert_eq!(
+                    pipeline.hint,
+                    expected_hint.map(|name| Hint::Name(name.to_owned())),
+                    "{name}, sort={sort:?}",
+                );
+                assert_eq!(pipeline.stages[0], doc! { "$match": filter.clone() });
+                if let Some(sort) = sort {
+                    assert_eq!(pipeline.stages[1], doc! { "$sort": sort });
+                }
+            }
+        }
+    }
 
     #[test]
     fn totals_accept_nonnegative_bson_integers_and_reject_malformed_results() {
@@ -4186,24 +4489,33 @@ mod index_intersection_tests {
     fn resource_lookup_keeps_its_date_hint_and_cursor_bound() {
         let predicate = date_predicate("ge2024-11-01");
         let boundary = doc! { "resource_id": { "$lt": "next" } };
-        let plan = SearchFilterPlan::ResourceLookups {
-            index_filter: Some(predicate.clone()),
-            stages: Vec::new(),
-        }
-        .pipeline(
+        for resource_filter in [
             doc! { "is_deleted": false },
-            Some(doc! { "id": -1 }),
-            Some(boundary.clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            plan.hint,
-            Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
-        );
-        assert_eq!(
-            plan.stages[0],
-            doc! { "$match": { "$and": [predicate.filter, boundary] } }
-        );
+            doc! { "is_deleted": false, "$or": [
+                { "missing_params": "method" },
+                { "missing_params": { "$exists": false } },
+            ] },
+        ] {
+            let plan = SearchFilterPlan::ResourceLookups {
+                index_filter: Some(predicate.clone()),
+                stages: Vec::new(),
+            }
+            .pipeline(
+                resource_filter,
+                Some(doc! { "id": -1 }),
+                Some(boundary.clone()),
+            )
+            .unwrap();
+            assert_eq!(plan.collection, MongoBackend::SEARCH_INDEX_COLLECTION);
+            assert_eq!(
+                plan.hint,
+                Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
+            );
+            assert_eq!(
+                plan.stages[0],
+                doc! { "$match": { "$and": [predicate.filter.clone(), boundary.clone()] } }
+            );
+        }
     }
 
     #[test]

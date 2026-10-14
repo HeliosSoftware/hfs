@@ -53,7 +53,9 @@ pub(super) const BULK_INGEST_RETRY: RetryPolicy = RetryPolicy {
 /// ([`next_attempt_delay`]). The server aborts a transaction that loses a race
 /// with concurrent writers (`WriteConflict`, or an eviction under cache
 /// pressure) and labels the error `TransientTransactionError`; the losers of a
-/// burst retrying in lockstep would only collide again (#1586).
+/// burst retrying in lockstep would only collide again (#1586). An eviction
+/// rollback of a Bundle that held the whole admission room is not run again
+/// (#1895): it ran alone, so a replay meets the same cache.
 pub(super) const BUNDLE_TRANSACTION_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 3,
     base: Duration::from_millis(200),

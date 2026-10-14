@@ -20,6 +20,7 @@ use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_subscriptions::manager::SubscriptionStatusCode;
 use helios_subscriptions::{
     RehydrationConfig, ResourceEvent, ResourceEventType, SubscriptionConfig, SubscriptionEngine,
+    SubscriptionError,
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -34,17 +35,30 @@ fn current_fhir_version() -> FhirVersion {
     FhirVersion::default()
 }
 
-fn uses_backport_ig() -> bool {
-    current_fhir_version() == FhirVersion::R4
+fn enabled_versions() -> Vec<FhirVersion> {
+    vec![
+        #[cfg(feature = "R4")]
+        FhirVersion::R4,
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B,
+        #[cfg(feature = "R5")]
+        FhirVersion::R5,
+        #[cfg(feature = "R6")]
+        FhirVersion::R6,
+    ]
 }
 
 /// A topic in whichever shape the compiled default version stores: an R4
 /// backport `Basic`, or a native `SubscriptionTopic`.
 fn topic_resource() -> Value {
-    if uses_backport_ig() {
+    topic_resource_for(current_fhir_version(), "topic-1", TOPIC_URL, "Encounter")
+}
+
+fn topic_resource_for(version: FhirVersion, id: &str, url: &str, trigger: &str) -> Value {
+    if version.as_str() == "R4" {
         json!({
             "resourceType": "Basic",
-            "id": "topic-1",
+            "id": id,
             "code": {
                 "coding": [{
                     "system": "http://hl7.org/fhir/fhir-types",
@@ -53,12 +67,12 @@ fn topic_resource() -> Value {
             },
             "extension": [{
                 "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
-                "valueUri": TOPIC_URL
+                "valueUri": url
             }, {
                 "url": "http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger",
                 "extension": [{
                     "url": "resource",
-                    "valueUri": "http://hl7.org/fhir/StructureDefinition/Encounter"
+                    "valueUri": format!("http://hl7.org/fhir/StructureDefinition/{trigger}")
                 }, {
                     "url": "supportedInteraction",
                     "valueCode": "create"
@@ -68,11 +82,11 @@ fn topic_resource() -> Value {
     } else {
         json!({
             "resourceType": "SubscriptionTopic",
-            "id": "topic-1",
-            "url": TOPIC_URL,
+            "id": id,
+            "url": url,
             "status": "active",
             "resourceTrigger": [{
-                "resource": "Encounter",
+                "resource": trigger,
                 "supportedInteraction": ["create"]
             }]
         })
@@ -80,7 +94,11 @@ fn topic_resource() -> Value {
 }
 
 fn topic_resource_type() -> &'static str {
-    if uses_backport_ig() {
+    topic_resource_type_for(current_fhir_version())
+}
+
+fn topic_resource_type_for(version: FhirVersion) -> &'static str {
+    if version.as_str() == "R4" {
         "Basic"
     } else {
         "SubscriptionTopic"
@@ -89,12 +107,22 @@ fn topic_resource_type() -> &'static str {
 
 /// A subscription in the compiled default version's shape.
 fn subscription_resource(id: &str, status: &str, endpoint: &str) -> Value {
-    if uses_backport_ig() {
+    subscription_resource_for(current_fhir_version(), id, status, TOPIC_URL, endpoint)
+}
+
+fn subscription_resource_for(
+    version: FhirVersion,
+    id: &str,
+    status: &str,
+    url: &str,
+    endpoint: &str,
+) -> Value {
+    if version.as_str() == "R4" {
         json!({
             "resourceType": "Subscription",
             "id": id,
             "status": status,
-            "criteria": TOPIC_URL,
+            "criteria": url,
             "channel": {
                 "type": "rest-hook",
                 "endpoint": endpoint,
@@ -106,7 +134,7 @@ fn subscription_resource(id: &str, status: &str, endpoint: &str) -> Value {
             "resourceType": "Subscription",
             "id": id,
             "status": status,
-            "topic": TOPIC_URL,
+            "topic": url,
             "channelType": { "code": "rest-hook" },
             "endpoint": endpoint,
             "contentType": "application/fhir+json"
@@ -172,15 +200,432 @@ fn encounter_created_event(tenant_id: &str) -> ResourceEvent {
 }
 
 async fn seed(backend: &SqliteBackend, tenant_id: &str, resource_type: &str, resource: Value) {
+    seed_for(
+        backend,
+        current_fhir_version(),
+        tenant_id,
+        resource_type,
+        resource,
+    )
+    .await;
+}
+
+async fn seed_for(
+    backend: &SqliteBackend,
+    version: FhirVersion,
+    tenant_id: &str,
+    resource_type: &str,
+    resource: Value,
+) {
     backend
-        .create(
-            &tenant_context(tenant_id),
-            resource_type,
-            resource,
-            current_fhir_version(),
-        )
+        .create(&tenant_context(tenant_id), resource_type, resource, version)
         .await
         .expect("seed resource");
+}
+
+fn notification_type(body: &Value) -> &str {
+    let status = &body["entry"][0]["resource"];
+    if status["resourceType"] == "Parameters" {
+        status["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "type")
+            .unwrap()["valueCode"]
+            .as_str()
+            .unwrap()
+    } else {
+        status["type"].as_str().unwrap()
+    }
+}
+
+async fn event_notifications(server: &MockServer, endpoint_path: Option<&str>) -> usize {
+    let requests = server.received_requests().await.unwrap();
+    requests
+        .iter()
+        .filter(|request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                notification_type(&body),
+                "event-notification",
+                "active subscriptions must not send handshakes"
+            );
+            endpoint_path.is_none_or(|path| request.url.path() == path)
+        })
+        .count()
+}
+
+async fn assert_event_delivery(
+    engine: &SubscriptionEngine,
+    server: &MockServer,
+    version: FhirVersion,
+    tenant: &str,
+    resource_type: &str,
+    endpoint_path: &str,
+    expected: usize,
+) {
+    let total_before = event_notifications(server, None).await;
+    let own_before = event_notifications(server, Some(endpoint_path)).await;
+    let mut event = encounter_created_event(tenant);
+    event.fhir_version = version;
+    event.resource_type = resource_type.to_string();
+    event.resource = Some(json!({"resourceType": resource_type, "id": "enc-1"}));
+    tokio::time::timeout(Duration::from_secs(5), engine.on_resource_event(event))
+        .await
+        .expect("bounded event delivery");
+    assert_eq!(
+        event_notifications(server, None).await - total_before,
+        expected,
+        "{version:?} {tenant} {resource_type}: total delivery"
+    );
+    assert_eq!(
+        event_notifications(server, Some(endpoint_path)).await - own_before,
+        expected,
+        "{version:?} {tenant} {resource_type}: owning tenant's endpoint"
+    );
+}
+
+fn topic_lifecycle_event(
+    version: FhirVersion,
+    tenant: &str,
+    id: &str,
+    interaction: ResourceEventType,
+    resource: Option<Value>,
+) -> ResourceEvent {
+    ResourceEvent {
+        tenant_id: TenantId::new(tenant),
+        fhir_version: version,
+        resource_type: topic_resource_type_for(version).to_string(),
+        resource_id: id.to_string(),
+        version_id: "2".to_string(),
+        event_type: interaction,
+        resource,
+        previous_resource: None,
+        timestamp: Utc::now(),
+    }
+}
+
+/// Each version executes real storage/export, topic parsing, registration,
+/// evaluation and successful delivery. The second topic in tenant-b is restored
+/// with a one-resource page size, then renamed or deleted without old payload.
+#[tokio::test]
+async fn shared_topics_and_their_lifecycle_survive_a_paginated_restart() {
+    const RENAMED_URL: &str = "http://example.org/topic/renamed";
+    const FIRST_URL: &str = "http://example.org/topic/first";
+    for version in enabled_versions() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let backend = storage();
+        for tenant in [TENANT_ID, OTHER_TENANT_ID] {
+            backend.register_tenant(tenant, None).await.unwrap();
+        }
+        let resource_type = topic_resource_type_for(version);
+        seed_for(
+            &backend,
+            version,
+            TENANT_ID,
+            resource_type,
+            topic_resource_for(version, "topic-2", TOPIC_URL, "Encounter"),
+        )
+        .await;
+        seed_for(
+            &backend,
+            version,
+            OTHER_TENANT_ID,
+            resource_type,
+            topic_resource_for(version, "topic-1", FIRST_URL, "Patient"),
+        )
+        .await;
+        seed_for(
+            &backend,
+            version,
+            OTHER_TENANT_ID,
+            resource_type,
+            topic_resource_for(version, "topic-2", TOPIC_URL, "Observation"),
+        )
+        .await;
+        for (tenant, endpoint) in [(TENANT_ID, "/a"), (OTHER_TENANT_ID, "/b")] {
+            seed_for(
+                &backend,
+                version,
+                tenant,
+                "Subscription",
+                subscription_resource_for(
+                    version,
+                    "same-sub-id",
+                    "active",
+                    TOPIC_URL,
+                    &format!("{}{endpoint}", server.uri()),
+                ),
+            )
+            .await;
+        }
+        let config = RehydrationConfig {
+            batch_size: 1,
+            handshake_requested: false,
+            ..RehydrationConfig::default()
+        };
+        let engine = fresh_engine();
+        assert!(engine.topic_registry().list_topics(TENANT_ID).is_empty());
+        assert!(
+            engine
+                .manager()
+                .get_subscription(TENANT_ID, "same-sub-id")
+                .is_none()
+        );
+        let report = engine
+            .rehydrate(&backend, TENANT_ID, version, &config)
+            .await;
+        assert!(report.is_complete(), "{version:?}: {report:?}");
+        assert_eq!(report.tenants, 2);
+        assert_eq!(report.topics_registered, 3);
+        assert_eq!(report.topics_failed, 0);
+        assert_eq!(report.subscriptions_registered, 2);
+        assert_eq!(report.subscriptions_failed, 0);
+        assert_eq!(report.handshakes_started, 0);
+        assert_eq!(
+            engine
+                .topic_registry()
+                .get_topic(TENANT_ID, TOPIC_URL)
+                .unwrap()
+                .resource_triggers[0]
+                .resource_type,
+            "Encounter"
+        );
+        assert_eq!(
+            engine
+                .topic_registry()
+                .get_topic(OTHER_TENANT_ID, TOPIC_URL)
+                .unwrap()
+                .resource_triggers[0]
+                .resource_type,
+            "Observation"
+        );
+        assert_event_delivery(&engine, &server, version, TENANT_ID, "Encounter", "/a", 1).await;
+        assert_event_delivery(&engine, &server, version, TENANT_ID, "Observation", "/a", 0).await;
+        assert_event_delivery(
+            &engine,
+            &server,
+            version,
+            OTHER_TENANT_ID,
+            "Observation",
+            "/b",
+            1,
+        )
+        .await;
+        assert_event_delivery(
+            &engine,
+            &server,
+            version,
+            OTHER_TENANT_ID,
+            "Encounter",
+            "/b",
+            0,
+        )
+        .await;
+
+        // No previous_resource: removing the old URL must use the restored index.
+        engine
+            .on_resource_event(topic_lifecycle_event(
+                version,
+                OTHER_TENANT_ID,
+                "topic-2",
+                ResourceEventType::Update,
+                Some(topic_resource_for(
+                    version,
+                    "topic-2",
+                    RENAMED_URL,
+                    "Observation",
+                )),
+            ))
+            .await;
+        assert!(
+            engine
+                .topic_registry()
+                .get_topic(OTHER_TENANT_ID, TOPIC_URL)
+                .is_none()
+        );
+        assert!(
+            engine
+                .topic_registry()
+                .get_topic(OTHER_TENANT_ID, FIRST_URL)
+                .is_some()
+        );
+        assert_event_delivery(&engine, &server, version, TENANT_ID, "Encounter", "/a", 1).await;
+        assert_event_delivery(
+            &engine,
+            &server,
+            version,
+            OTHER_TENANT_ID,
+            "Observation",
+            "/b",
+            0,
+        )
+        .await;
+        engine
+            .manager()
+            .register(
+                OTHER_TENANT_ID,
+                "renamed-sub",
+                &subscription_resource_for(
+                    version,
+                    "renamed-sub",
+                    "active",
+                    RENAMED_URL,
+                    &format!("{}/b", server.uri()),
+                ),
+                version,
+            )
+            .unwrap();
+        assert_event_delivery(
+            &engine,
+            &server,
+            version,
+            OTHER_TENANT_ID,
+            "Observation",
+            "/b",
+            1,
+        )
+        .await;
+
+        // A second fresh engine proves payload-free DELETE works directly from
+        // the restart index, without relying on the live rename above.
+        let restarted = fresh_engine();
+        let report = restarted
+            .rehydrate(&backend, TENANT_ID, version, &config)
+            .await;
+        assert_eq!(report.topics_registered, 3);
+        assert_eq!(report.subscriptions_registered, 2);
+        restarted
+            .on_resource_event(topic_lifecycle_event(
+                version,
+                OTHER_TENANT_ID,
+                "topic-2",
+                ResourceEventType::Delete,
+                None,
+            ))
+            .await;
+        assert!(
+            restarted
+                .topic_registry()
+                .get_topic(OTHER_TENANT_ID, TOPIC_URL)
+                .is_none()
+        );
+        assert!(
+            restarted
+                .topic_registry()
+                .get_topic(OTHER_TENANT_ID, FIRST_URL)
+                .is_some()
+        );
+        assert_event_delivery(
+            &restarted,
+            &server,
+            version,
+            OTHER_TENANT_ID,
+            "Observation",
+            "/b",
+            0,
+        )
+        .await;
+        assert_event_delivery(
+            &restarted,
+            &server,
+            version,
+            TENANT_ID,
+            "Encounter",
+            "/a",
+            1,
+        )
+        .await;
+        println!(
+            "{version:?}: paginated tenant-scoped restart, rename and payload-free delete delivered only to owning endpoints"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rehydration_rejects_a_stored_subscription_to_another_tenants_topic() {
+    for version in enabled_versions() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let backend = storage();
+        for tenant in [TENANT_ID, OTHER_TENANT_ID] {
+            backend.register_tenant(tenant, None).await.unwrap();
+        }
+        seed_for(
+            &backend,
+            version,
+            TENANT_ID,
+            topic_resource_type_for(version),
+            topic_resource_for(version, "topic-1", TOPIC_URL, "Encounter"),
+        )
+        .await;
+        for (tenant, endpoint) in [(TENANT_ID, "/a"), (OTHER_TENANT_ID, "/b")] {
+            seed_for(
+                &backend,
+                version,
+                tenant,
+                "Subscription",
+                subscription_resource_for(
+                    version,
+                    "sub-1",
+                    "active",
+                    TOPIC_URL,
+                    &format!("{}{endpoint}", server.uri()),
+                ),
+            )
+            .await;
+        }
+        let engine = fresh_engine();
+        let report = engine
+            .rehydrate(&backend, TENANT_ID, version, &no_handshake_config())
+            .await;
+        assert!(report.is_complete(), "{version:?}: {report:?}");
+        assert_eq!(report.topics_registered, 1);
+        assert_eq!(report.subscriptions_registered, 1);
+        assert_eq!(report.subscriptions_failed, 1);
+        assert!(
+            engine
+                .manager()
+                .get_subscription(OTHER_TENANT_ID, "sub-1")
+                .is_none()
+        );
+        assert!(matches!(
+            engine.manager().register(
+                OTHER_TENANT_ID,
+                "sub-1",
+                &subscription_resource_for(
+                    version,
+                    "sub-1",
+                    "active",
+                    TOPIC_URL,
+                    &format!("{}/b", server.uri())
+                ),
+                version
+            ),
+            Err(SubscriptionError::TopicNotFound { .. })
+        ));
+        assert_event_delivery(
+            &engine,
+            &server,
+            version,
+            OTHER_TENANT_ID,
+            "Encounter",
+            "/b",
+            0,
+        )
+        .await;
+        assert_event_delivery(&engine, &server, version, TENANT_ID, "Encounter", "/a", 1).await;
+        println!(
+            "{version:?}: foreign stored subscription rejected; failure report counted once; no foreign notification"
+        );
+    }
 }
 
 /// The core regression: an `active` subscription stored before a restart must
@@ -280,7 +725,10 @@ async fn topic_is_registered_before_subscriptions() {
     );
     assert_eq!(report.subscriptions_registered, 1, "report: {report:?}");
     assert!(
-        engine.topic_registry().get_topic(TOPIC_URL).is_some(),
+        engine
+            .topic_registry()
+            .get_topic(TENANT_ID, TOPIC_URL)
+            .is_some(),
         "topic must be in the registry"
     );
 }

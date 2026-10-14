@@ -135,6 +135,7 @@ verbatim and not misread as the `ap` prefix (regression-tested in the REST extra
 | `_has` (reverse chaining) | REST + backend | ✓ | ✓ | ✗ | ✗ |
 | `_type` (system search) | — (REST refuses system-level search with `501`, #1338) | ✗ | ✗ | ✗ | ✗ |
 | `_list` | passthrough param | ○ | ○ | ○ | ○ |
+| `_in` (R5/R6 only) | resolved application-side to an `_id` filter (List `entry.item`, enumerated Group `member.entity`); no per-backend support needed, so ○ here means "nothing to implement in the backend", not "unsupported" | ○ | ○ | ○ | ○ |
 | `_query` | — | ✗ | ✗ | ✗ | ✗ |
 | `_contained` / `_containedType` | REST capability gate + backend entity matching | ✓ | ✓ | ✓ | ✓ |
 
@@ -149,6 +150,12 @@ wildcard page does not acquire a total from searches that never ran.
 `backends/sqlite/search/filter_parser.rs`). Note the REST layer does not give `_filter` special
 handling; SQLite picks it up as a recognized parameter name. On other backends `_filter` is
 effectively a no-op.
+
+Inside `_filter`, the `ap` operator follows the `ap` search prefix: on a date it uses the shared
+date window, and on a quantity column (`value-quantity`, `dose-quantity`, `age`) it is the closed
+range `[v - m, v + m]` with `m = max(0.1 * |v|, implicit_precision / 2)` (`approx_range`), emitted as
+`BETWEEN`. `ap` has no defined meaning on string, token, reference or URI columns, so it matches
+nothing there (a logged warning, never a substring match), as does a non-numeric quantity literal.
 
 ## 5. Chaining, reverse chaining, include/revinclude
 

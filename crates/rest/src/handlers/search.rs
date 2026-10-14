@@ -39,6 +39,7 @@ use crate::extractors::{
 };
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::subsetting::{SummaryMode, apply_elements, apply_summary};
 use crate::state::AppState;
@@ -59,6 +60,7 @@ pub async fn search_get_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
@@ -80,6 +82,7 @@ where
     execute_search(
         &state,
         tenant,
+        &compartment,
         &resource_type,
         pairs,
         negotiated.format,
@@ -101,6 +104,7 @@ pub async fn search_post_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawForm(form): RawForm,
 ) -> RestResult<Response>
@@ -122,6 +126,7 @@ where
     execute_search(
         &state,
         tenant,
+        &compartment,
         &resource_type,
         pairs,
         negotiated.format,
@@ -194,10 +199,75 @@ where
     execute_system_search(&state, tenant, pairs, negotiated.format).await
 }
 
+/// Whether `_in` (List/Group membership) exists in `version`: R5 and R6 only.
+pub(crate) fn membership_supported(version: helios_fhir::FhirVersion) -> bool {
+    matches!(version.as_mime_param(), "5.0" | "6.0")
+}
+
+/// Refuses the `_in` forms this server does not resolve, from the raw query
+/// pairs: a chained (`patient._in`) or reverse-chained (`_has:…:_in`) `_in` is
+/// never answered, and a `CareTeam` container (`_in=CareTeam/1`, `_in:CareTeam`)
+/// is valid in the spec but not implemented. Without this a chained `_in` would
+/// slip past the unknown-parameter check (it is judged by its first segment) and
+/// reach a backend unresolved.
+pub(crate) fn validate_membership_params(
+    pairs: &[(String, String)],
+    version: helios_fhir::FhirVersion,
+) -> RestResult<()> {
+    for (key, value) in pairs {
+        let base = |name: &str| name.split(':').next().unwrap_or(name).to_string();
+        let chained = key.contains('.') && base(key.rsplit('.').next().unwrap_or(key)) == "_in";
+        let reverse =
+            key.starts_with("_has:") && base(key.rsplit(':').next().unwrap_or(key)) == "_in";
+        if chained || reverse {
+            return Err(RestError::InvalidParameter {
+                param: key.clone(),
+                message: format!(
+                    "'_in' cannot be used in a chained or reverse-chained search ('{key}')"
+                ),
+            });
+        }
+        if membership_supported(version) && base(key) == "_in" {
+            let care_team = key.split_once(':').is_some_and(|(_, m)| m == "CareTeam")
+                || value.split(',').any(|v| v.contains("CareTeam/"));
+            if care_team {
+                return Err(RestError::NotImplemented {
+                    feature: "'_in' with a CareTeam is not supported; use a List or Group"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves `_in` filters into an `_id` filter on R5/R6; otherwise returns the
+/// query unchanged.
+pub(crate) async fn resolve_membership<S>(
+    storage: &S,
+    tenant: &helios_persistence::tenant::TenantContext,
+    query: helios_persistence::types::SearchQuery,
+    version: helios_fhir::FhirVersion,
+) -> RestResult<helios_persistence::types::SearchQuery>
+where
+    S: ResourceStorage + ?Sized,
+{
+    if !membership_supported(version) || !helios_persistence::search::query_has_in(&query) {
+        return Ok(query);
+    }
+    helios_persistence::search::resolve_in(storage, tenant, &query)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Membership (_in) resolution failed");
+            RestError::from(e)
+        })
+}
+
 /// Executes a type-level search and returns a Bundle response.
 async fn execute_search<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
+    compartment: &PatientCompartment,
     resource_type: &str,
     pairs: Vec<(String, String)>,
     format: FhirFormat,
@@ -206,7 +276,8 @@ async fn execute_search<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
-    let bundle_json = execute_search_bundle(state, &tenant, resource_type, pairs, strict).await?;
+    let bundle_json =
+        execute_search_bundle(state, &tenant, compartment, resource_type, pairs, strict).await?;
     format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format)
 }
 
@@ -215,9 +286,14 @@ where
 /// The HTTP search handlers wrap this in content negotiation; bundle
 /// processing (`GET [type]?params` entries in batch/transaction Bundles,
 /// #478) embeds the returned Bundle as an entry resource.
+///
+/// Under a compartment-confined grant (`patient/` scope, #1618) `compartment`
+/// filters the query to the launch patient's compartment and drops included
+/// resources outside it; see [`PatientCompartment`].
 pub(crate) async fn execute_search_bundle<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
     resource_type: &str,
     pairs: Vec<(String, String)>,
     strict: bool,
@@ -245,19 +321,14 @@ where
     // via list resolution; `_score` as an output/`_sort` concept; `_contained` /
     // `_containedType` are parsed below and gated per backend capability.)
     //
-    // `_in` (R5/R6) asks whether a resource is a member of a referenced List or
-    // Group; resolving that is not implemented (#638). It cannot be left to fall
-    // through, because it *is* a registered parameter of type `reference` on
-    // those versions — so `Prefer: handling=lenient` would not drop it, and the
-    // backends would answer it with whatever their reference path makes of the
-    // spec's placeholder `Resource.id` expression: an identity test on
-    // PostgreSQL, an unfiltered result set on SQLite. Use `_list` for List
-    // membership.
+    // `_in` (R5/R6) is not rejected here: it is resolved application-side into an
+    // `_id` filter below (#638). On R4/R4B it is not a search parameter at all
+    // and takes the unknown-parameter path.
     // A parameter with no value (`family=`) is ignored, per FHIR; from here on
     // it is as if the client had not sent it (#1380).
     let pairs = crate::extractors::drop_empty_parameters(pairs);
 
-    const UNSUPPORTED_PARAMS: [&str; 2] = ["_query", "_in"];
+    const UNSUPPORTED_PARAMS: [&str; 1] = ["_query"];
     if let Some((key, _)) = pairs
         .iter()
         .find(|(k, _)| UNSUPPORTED_PARAMS.contains(&k.as_str()))
@@ -267,6 +338,8 @@ where
             message: format!("search parameter '{key}' is not supported by this server"),
         });
     }
+
+    validate_membership_params(&pairs, fhir_version)?;
 
     // A terminology-backed modifier (`:in` / `:not-in` / `:above` / `:below`)
     // the parameter's type does not define is a client error — `name:in`,
@@ -465,6 +538,11 @@ where
         built
     };
 
+    // A `patient/` scope sees the launch patient's compartment only (#1618):
+    // the filter is ANDed with everything the client asked for, before list,
+    // chain and `_has` resolution narrow the query further.
+    compartment.confine_query(fhir_version, &mut query)?;
+
     // `_contained=true|both` requires contained-resource indexing. Gate it on the
     // backend's capability so unsupported backends return a clear 501 rather than
     // silently ignoring the parameter and returning an unfiltered result.
@@ -486,6 +564,8 @@ where
         let chained = query.parameters.iter().find(|p| !p.chain.is_empty());
         let refused = if !query.list.is_empty() {
             Some("_list".to_string())
+        } else if helios_persistence::search::query_has_in(&query) {
+            Some("_in".to_string())
         } else if !query.reverse_chains.is_empty() {
             Some("_has".to_string())
         } else {
@@ -536,6 +616,10 @@ where
     } else {
         query
     };
+
+    // Resolve `_in` (R5/R6 List/Group membership) into an `_id` filter, the same
+    // way.
+    let query = resolve_membership(state.storage(), tenant.context(), query, fhir_version).await?;
 
     // Resolve chained / reverse-chained (`_has`) parameters into an `_id` filter
     // via application-side joins, so any backend's `search()` can execute them.
@@ -635,6 +719,13 @@ where
             result.included.extend(continuation);
         }
     }
+
+    // An include follows references wherever they lead; under a compartment-
+    // confined grant only the launch patient's resources may come back (#1618).
+    compartment.retain_members(
+        || state.storage().search_param_registry(tenant.context()),
+        &mut result.included,
+    );
 
     // Drain any include-truncation marker(s) (#1061) out of `included` before
     // counting or building the bundle. The marker is control-plane
@@ -852,7 +943,20 @@ where
     S: ResourceStorage + MultiTypeSearchProvider + Send + Sync,
 {
     // A parameter with no value is ignored, as in a type-level search (#1380).
-    let search_params = SearchParams::from_pairs(crate::extractors::drop_empty_parameters(pairs));
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
+    // `_in` is resolved against one searched type; the multi-type path has no
+    // resolver, and strict validation is skipped here, so it must not reach a
+    // backend unresolved.
+    if let Some((key, _)) = pairs
+        .iter()
+        .find(|(k, _)| k.split(['.', ':']).any(|seg| seg == "_in"))
+    {
+        return Err(RestError::InvalidParameter {
+            param: key.clone(),
+            message: format!("'_in' is not supported in a system-level search ('{key}')"),
+        });
+    }
+    let search_params = SearchParams::from_pairs(pairs);
 
     // Get resource types from _type parameter (if specified)
     let type_param = search_params.get("_type").cloned();
