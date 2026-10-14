@@ -101,7 +101,7 @@ helios-persistence/
 │   │   │   ├── backend.rs      # SqliteBackend with connection pooling
 │   │   │   ├── storage.rs      # ResourceStorage implementation
 │   │   │   ├── transaction.rs  # TransactionProvider implementation
-│   │   │   ├── schema.rs       # Schema migrations (v1-v6)
+│   │   │   ├── schema.rs       # Schema migrations (v1 to current)
 │   │   │   ├── search_impl.rs  # SearchProvider implementation
 │   │   │   ├── bulk_export.rs  # BulkExportStorage implementation
 │   │   │   ├── bulk_submit.rs  # BulkSubmitProvider implementation
@@ -601,7 +601,8 @@ Full-featured relational backend for production deployments with JSONB storage a
 - `_include` and `_revinclude` resolution
 - Multi-tenant support (shared schema via a `tenant_id` discriminator column)
 
-**Prerequisites:** A running PostgreSQL instance (14+).
+**Prerequisites:** A running PostgreSQL instance (14+; startup refuses an older server before
+changing the schema).
 
 ```bash
 # Build with PostgreSQL support
@@ -1422,13 +1423,19 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   1 day, 10 minutes, or 10 seconds for year, month, day, minute and
   second-or-finer values.
 - Descending `_sort` on a date parameter orders by the largest range end.
-- SQLite keeps an index on the range end and start (`idx_search_date_end`, created by the
-  v35 migration) and adds the implied `end > start-bound` term to every group
-  that bounds the start, so `eq`, `gt` and `sa` seek instead of scanning the
-  parameter's rows (2M date rows: `eq` 0.9 s -> 0.1 s). Conditions that bound
-  only the start (`lt`, `ge`, `ne`, `ap`) still evaluate a normalizing
-  expression per row and are slower than before on very large
-  date slices (measured 1.3x-2.5x).
+- SQLite stores the range as two normalized text columns, `value_date_start`
+  (added by the v39 migration) and `value_date_end`, in the same
+  `YYYY-MM-DD HH:MM:SS.SSS` UTC form, and compares both as plain `TEXT` with no
+  SQL function per row. Two partial indexes cover them:
+  `idx_search_date_start (…, value_date_start, value_date_end, resource_key)`
+  and `idx_search_date_end (…, value_date_end, value_date_start, resource_key)`,
+  both covering for the `resource_key IN (…)` subquery. The query still
+  adds the implied `end > start-bound` term to every group that bounds the
+  start, so `eq`, `gt` and `sa` seek. Before v39 the start was normalized with
+  `strftime` on every row, which made `lt`, `ge`, `le`, `ne`, `eb` and `ap`
+  slower than before #1391 on very large date slices (#1506). The v39 backfill
+  runs in batches of 10 000 rows, one transaction per batch, and resumes after
+  a crash.
 - `_lastUpdated` and the date components of composite parameters are still
   compared as points.
 - SQLite rows indexed before `value_date_precision` existed (or by the fallback
@@ -1436,12 +1443,58 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   say whether it was a year, month, day or second. The v35 backfill does not
   guess: such a row gets a one-second range, the migration logs how many it
   filled, and `ne`/`ap` on them can differ until `$reindex`.
-- **After upgrading, run `$reindex`.** The SQLite (v35) and PostgreSQL (v43)
-  migrations fill in the range end of existing rows, so point values keep
-  working, but a Period indexed before the upgrade is still two point rows
-  until the resource is reindexed. MongoDB and Elasticsearch documents
-  indexed before the upgrade have no range end at all, so they fail every
-  condition on it (`eq`, `ne`, `gt`, `ge`, `le`, `eb`, `ap`) until reindexed.
+- **After upgrading, run `$reindex`.** The SQLite (v35, v39) and PostgreSQL (v43)
+  migrations fill in the range end (and, on SQLite, the start) of existing
+  rows, so point values keep working, but a Period indexed before the upgrade
+  is still two point rows until the resource is reindexed. MongoDB and
+  Elasticsearch documents indexed before the upgrade have no range end at all,
+  so they fail every condition on it (`eq`, `ne`, `gt`, `ge`, `le`, `eb`,
+  `ap`) until reindexed. Reindexing can also change which resources match: the
+  two point rows of an old Period matched on either end, while the single range
+  row follows the range-target rules (a Period starting before `2000` and
+  ending inside it no longer matches `eq2000`).
+- On a very large date slice `le` and `ne` match most rows of the parameter,
+  so their cost follows the size of the result, and they return more rows than
+  before #1391 for the same data (a year-precision value now covers the whole
+  year). They still run faster than before #1391 (#1506):
+  - the two ranges of `ne`, `le` and `ge` are one `SELECT` each, joined by
+    `UNION ALL`, so each reads its covering index alone; joined by `OR`,
+    SQLite de-duplicated every row by rowid and, for `ne`, read each row from
+    the table;
+  - a search on one parameter uses that parameter's `search_index` subquery as
+    the whole filter, without the `SELECT DISTINCT` wrapper that probed
+    `idx_search_composite` once per matching key;
+  - a filtered one-row page (`_count=0` or `1`) reads its matches by rowid
+    instead of probing `idx_resources_live_type` first.
+
+  On 2M date rows (debug build) `le2000` takes 2.3 s against 4.6 s before
+  #1391 and `ne2000` 2.7 s against 5.4 s with `_count=1`; with `_count=100`,
+  1.2 s against 2.6 s and 1.6 s against 3.1 s.
+- **PostgreSQL v43 does not hold a long lock.** It adds `value_date_end` and
+  the statistics object in short transactions (2 s `lock_timeout`, retried),
+  backfills in committed batches of 2,000 heap blocks selected by `ctid` range
+  (resumable: only rows with a `NULL` end are touched), builds each index with
+  `CREATE INDEX CONCURRENTLY` under a temporary name and swaps it in with a
+  short `DROP`/`RENAME`, so date searches always have an index. The schema
+  version is written only after the last step, and every step is idempotent, so
+  a crash resumes on the next startup. Like v49, the concurrent builds wait for
+  older transactions (a long export delays startup) and block other DDL and
+  `VACUUM` while they run. The closing `ANALYZE` is best-effort and bounded
+  (30 s): if it fails or times out, v43 is still recorded, a warning says
+  autovacuum will fill in the statistics, and the session keeps its own
+  `statement_timeout`. Each batch is a TID range scan, which needs PostgreSQL
+  14 — on 13 every batch reads the whole table, so the backfill grows with the
+  square of its size — and 13 cannot run v42's reference index either, so
+  startup refuses servers older than 14 before changing anything.
+- **Elasticsearch mappings are reconciled at startup.** `hfs` runs the
+  backend's initialization (index template, nested-object limit, mapping
+  reconcile) once before serving in every `*-elasticsearch` mode, so a
+  version-1 index is brought up to date, and the "reindex needed" warning is
+  logged once per startup pass. If Elasticsearch is unreachable at startup the
+  failure is logged and the server still starts; indices are then reconciled on
+  their first write, with one warning per index. If the cluster answers but one
+  startup step fails (for example the index template), that step is logged on
+  its own and the other two still run.
 
 **Full-Text Search (FTS5):**
 
@@ -1687,8 +1740,12 @@ resource is findable via search. Two independent delays contribute:
    puts the document in Elasticsearch before the write returns.
 2. **Elasticsearch refresh.** An indexed document only becomes searchable at the
    next index refresh. By default that happens on a timer
-   (`ElasticsearchConfig::refresh_interval`, applied when an index is created;
-   existing indices keep their setting). `ElasticsearchConfig::write_refresh`
+   (`ElasticsearchConfig::refresh_interval`, set when an index is created and
+   reconciled onto every existing `{index_prefix}_*` index at startup, which
+   overwrites a value set by hand with `PUT _settings`). With `WaitFor` the
+   interval is the price of every write: a long one makes each interactive
+   write wait for the next refresh (#1749).
+   `ElasticsearchConfig::write_refresh`
    sets the `refresh` parameter on each index/delete request instead:
    `WriteRefreshPolicy::False` (default) leaves it to the timer, `WaitFor`
    blocks the write until the affected shards refresh, and `True` forces a

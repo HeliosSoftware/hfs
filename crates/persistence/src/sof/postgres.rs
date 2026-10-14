@@ -20,11 +20,13 @@ use std::sync::Arc;
 use deadpool_postgres::Pool;
 use futures::StreamExt as _;
 use helios_fhir::FhirVersion;
-use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnKind, ColumnarBatchBuilder};
+use helios_sof::columnar::ColumnarBatchBuilder;
+use helios_sof::columnar_stream::STREAM_BATCH_ROWS;
 use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace};
 
+use helios_sof::arrow::datatypes::DataType;
 use helios_sof::arrow::record_batch::RecordBatch;
 
 use crate::core::sof_runner::{
@@ -230,6 +232,10 @@ impl SofRunner for PgInDbRunner {
             .into_iter()
             .map(PgParam::from_runtime)
             .collect();
+        let declared = helios_sof::parquet_schema::declared_arrow_types(
+            &compiled.columns,
+            &helios_sof::sqlquery::engine::declared_columns(&view_definition),
+        );
         let pool = self.pool.clone();
         let (tx, rx) =
             tokio::sync::mpsc::channel::<Result<RecordBatch, SofError>>(BATCH_CHANNEL_BUFFER);
@@ -241,6 +247,7 @@ impl SofRunner for PgInDbRunner {
                 params,
                 compiled.columns,
                 compiled.column_decodes,
+                declared,
                 prepared.client_limit,
                 tx,
             )
@@ -640,26 +647,32 @@ async fn stream_pg_pages_inner(
 // Columnar fetch loop
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_pg_batches(
     pool: Pool,
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
     decodes: Vec<ColumnDecode>,
+    declared: Vec<Option<DataType>>,
     limit: Option<usize>,
     tx: BatchSender,
 ) {
-    if let Err(e) = stream_pg_batches_inner(pool, sql, params, columns, decodes, limit, &tx).await {
+    if let Err(e) =
+        stream_pg_batches_inner(pool, sql, params, columns, decodes, declared, limit, &tx).await
+    {
         let _ = tx.send(Err(e)).await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_pg_batches_inner(
     pool: Pool,
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
     decodes: Vec<ColumnDecode>,
+    declared: Vec<Option<DataType>>,
     limit: Option<usize>,
     tx: &BatchSender,
 ) -> Result<(), SofError> {
@@ -687,8 +700,9 @@ async fn stream_pg_batches_inner(
     let kinds = (0..columns.len())
         .map(|i| decodes.get(i).copied().unwrap_or_default().column_kind())
         .collect();
-    let mut builder = ColumnarBatchBuilder::new(columns.clone(), kinds, COLUMNAR_BATCH_ROWS)
-        .map_err(|e| SofError::Backend(format!("columnar builder: {e}")))?;
+    let mut builder =
+        ColumnarBatchBuilder::new(columns.clone(), kinds, declared, STREAM_BATCH_ROWS)
+            .map_err(|e| SofError::Backend(format!("columnar builder: {e}")))?;
 
     let mut count = 0usize;
     // False once the stream ended on an error or a closed receiver: the
@@ -760,8 +774,8 @@ async fn stream_pg_batches_inner(
 /// Appends one `tokio_postgres::Row` to the builder.
 ///
 /// Every projected column is text, so each cell is borrowed as `&str`. Typed
-/// columns parse it in the builder; `Deferred` ones decode it to JSON exactly
-/// as [`row_to_json`] does.
+/// columns parse it in the builder; columns still buffered as JSON get the
+/// value [`row_to_json`] would build.
 fn append_pg_row(
     builder: &mut ColumnarBatchBuilder,
     pg_row: &tokio_postgres::Row,
@@ -772,15 +786,13 @@ fn append_pg_row(
         let val: Option<&str> = pg_row
             .try_get(i)
             .map_err(|e| SofError::Backend(format!("failed to read column '{name}': {e}")))?;
-        let decode = decodes.get(i).copied().unwrap_or_default();
         match val {
             None => builder.append_null(i),
-            Some(s) => match decode.column_kind() {
-                ColumnKind::Deferred => {
-                    builder.append_deferred(i, decode_text(decode, s.to_owned()))
-                }
-                _ => builder.append_str(i, s),
-            },
+            Some(s) if builder.needs_value(i) => {
+                let decode = decodes.get(i).copied().unwrap_or_default();
+                builder.append_deferred(i, decode_text(decode, s.to_owned()));
+            }
+            Some(s) => builder.append_str(i, s),
         }
     }
     Ok(())

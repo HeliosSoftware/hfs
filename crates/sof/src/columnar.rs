@@ -1,131 +1,318 @@
-//! Typed columnar batch builder.
+//! Columnar batch builder for the in-DB runners.
 //!
-//! The in-DB runners know every output column's type up front. Instead of
-//! building a `serde_json::Value` per cell and re-inferring types from the
-//! first rows, they append database values straight to Arrow builders through
+//! The in-DB runners know how each output column is decoded from the database
+//! ([`ColumnKind`]). Instead of building a `serde_json::Value` per cell, they
+//! append database values straight to Arrow builders through
 //! [`ColumnarBatchBuilder`] and receive finished [`RecordBatch`]es.
 //!
-//! The type mapping matches what [`parquet_schema`](crate::parquet_schema)
-//! produces today:
+//! The result is identical to the row path: the schema is what
+//! [`resolve_arrow_schema`](crate::parquet_schema::resolve_arrow_schema)
+//! decides (declared types win; every other column is inferred from the first
+//! [`SCHEMA_SAMPLE_ROWS`] values) and every array equals
+//! `build_array_from_values` over the JSON values the row path would build.
 //!
-//! | [`ColumnKind`] | Arrow     |
-//! |----------------|-----------|
-//! | `Text`         | `Utf8`    |
-//! | `Boolean`      | `Boolean` |
-//! | `Integer`      | `Int32`   |
-//! | `Decimal`      | `Float64` |
-//! | `Deferred`     | inferred from the first flush |
+//! * A column whose target type is declared and compatible with its kind is
+//!   *typed* from the start: the caller appends natively (`append_str`,
+//!   `append_i64`, ...) and no JSON is built.
+//! * Every other column is *buffered* as JSON for the first batch
+//!   ([`needs_value`](ColumnarBatchBuilder::needs_value) is `true`; the caller
+//!   supplies the cell through [`append_deferred`](ColumnarBatchBuilder::append_deferred)).
+//!   The first flush fixes the schema; afterwards an undeclared column whose
+//!   inferred type is compatible with its kind is promoted to a typed builder.
 //!
-//! A value that does not fit its column (unparseable text, an integer outside
-//! `i32`, a non-finite float) is written as null and logged once per column.
-//! `Deferred` columns buffer JSON values and fix their Arrow type on the first
-//! flush with the same inference [`create_arrow_schema`] uses (the first 100
-//! values), so later batches keep that type.
+//! Because the first flush samples the buffered rows, `batch_rows` should be at
+//! least [`SCHEMA_SAMPLE_ROWS`] for the same inference as the row path.
 //!
-//! [`create_arrow_schema`]: crate::parquet_schema::create_arrow_schema
+//! A value that does not fit its typed column (unparseable text, an integer
+//! outside `i32`, a non-finite float, a JSON array) is written as null and
+//! logged once per column.
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, StringBuilder};
+use arrow::array::{
+    ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{Number, Value};
 use tracing::warn;
 
 use crate::SofError;
-use crate::parquet_schema::{build_array_from_values, infer_arrow_type};
+use crate::parquet_schema::{
+    SCHEMA_SAMPLE_ROWS, build_array_from_values, infer_arrow_type, parse_bool_text, parse_f64_text,
+    parse_i64_text,
+};
 
-/// Rows per batch used by the in-DB runners.
+/// How the runner decodes one output column from the database.
 ///
-/// This is the minimum of the row-based estimator in the buffered formatters,
-/// and it guarantees the first flush sees at least the 100 rows that type
-/// inference samples.
-pub const COLUMNAR_BATCH_ROWS: usize = 100_000;
-
-/// Number of leading values of a `Deferred` column used to infer its type.
-const INFER_SAMPLE: usize = 100;
-
-/// The declared kind of one output column.
+/// This is the *decode category*; it does not decide the Arrow schema (see the
+/// module docs), only which columns can use a typed builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnKind {
-    /// String-like column, written as `Utf8`.
+    /// String-like column (database text).
     Text,
-    /// `boolean` column, written as `Boolean`.
+    /// Native boolean column.
     Boolean,
-    /// Integer column, written as `Int32`.
+    /// Native integer column.
     Integer,
-    /// Decimal column, written as `Float64`.
+    /// Native floating point column.
     Decimal,
-    /// Collection, complex or untyped column: values are buffered as JSON and
-    /// the Arrow type is inferred on the first flush.
+    /// Collection, complex or untyped column: always buffered as JSON.
     Deferred,
 }
 
-enum ColumnBuf {
-    Text(StringBuilder),
-    Boolean(BooleanBuilder),
-    Integer(Int32Builder),
-    Decimal(Float64Builder),
-    Deferred {
-        values: Vec<Option<Value>>,
-        data_type: Option<DataType>,
-    },
+/// Whether a column of `kind` can feed a typed builder for `target`.
+fn eligible(kind: ColumnKind, target: &DataType) -> bool {
+    use ColumnKind::*;
+    match target {
+        DataType::Utf8 => kind == Text,
+        DataType::Boolean => matches!(kind, Text | Boolean),
+        DataType::Int32 | DataType::Int64 => matches!(kind, Text | Integer),
+        DataType::Float64 => matches!(kind, Text | Decimal | Integer),
+        _ => false,
+    }
 }
 
-impl ColumnBuf {
-    fn new(kind: ColumnKind) -> Self {
-        match kind {
-            ColumnKind::Text => Self::Text(StringBuilder::new()),
-            ColumnKind::Boolean => Self::Boolean(BooleanBuilder::new()),
-            ColumnKind::Integer => Self::Integer(Int32Builder::new()),
-            ColumnKind::Decimal => Self::Decimal(Float64Builder::new()),
-            ColumnKind::Deferred => Self::Deferred {
-                values: Vec::new(),
-                data_type: None,
-            },
+/// A typed Arrow builder. Every append returns `true` when the value fit and
+/// `false` when it was written as null because it did not.
+enum Typed {
+    Utf8(StringBuilder),
+    Bool(BooleanBuilder),
+    I32(Int32Builder),
+    I64(Int64Builder),
+    F64(Float64Builder),
+}
+
+impl Typed {
+    fn new(target: &DataType) -> Option<Self> {
+        Some(match target {
+            DataType::Utf8 => Self::Utf8(StringBuilder::new()),
+            DataType::Boolean => Self::Bool(BooleanBuilder::new()),
+            DataType::Int32 => Self::I32(Int32Builder::new()),
+            DataType::Int64 => Self::I64(Int64Builder::new()),
+            DataType::Float64 => Self::F64(Float64Builder::new()),
+            _ => return None,
+        })
+    }
+
+    fn append_null(&mut self) {
+        match self {
+            Self::Utf8(b) => b.append_null(),
+            Self::Bool(b) => b.append_null(),
+            Self::I32(b) => b.append_null(),
+            Self::I64(b) => b.append_null(),
+            Self::F64(b) => b.append_null(),
+        }
+    }
+
+    /// Same as `build_array_from_values` over `Value::String(s)`.
+    fn append_str(&mut self, s: &str) -> bool {
+        match self {
+            Self::Utf8(b) => {
+                b.append_value(s);
+                true
+            }
+            Self::Bool(b) => {
+                let v = parse_bool_text(s);
+                b.append_option(v);
+                v.is_some()
+            }
+            Self::I32(b) => {
+                let v = parse_i64_text(s).and_then(|i| i32::try_from(i).ok());
+                b.append_option(v);
+                v.is_some()
+            }
+            Self::I64(b) => {
+                let v = parse_i64_text(s);
+                b.append_option(v);
+                v.is_some()
+            }
+            Self::F64(b) => {
+                let v = parse_f64_text(s);
+                b.append_option(v);
+                v.is_some()
+            }
+        }
+    }
+
+    /// Same as `build_array_from_values` over a JSON integer.
+    fn append_i64(&mut self, n: i64) -> bool {
+        match self {
+            Self::Utf8(b) => {
+                b.append_value(n.to_string());
+                true
+            }
+            Self::Bool(b) => {
+                b.append_null();
+                false
+            }
+            Self::I32(b) => {
+                let v = i32::try_from(n).ok();
+                b.append_option(v);
+                v.is_some()
+            }
+            Self::I64(b) => {
+                b.append_value(n);
+                true
+            }
+            Self::F64(b) => {
+                b.append_value(n as f64);
+                true
+            }
+        }
+    }
+
+    /// Same as `build_array_from_values` over `Number::from_f64(f)`.
+    fn append_f64(&mut self, f: f64) -> bool {
+        match self {
+            Self::Utf8(b) => {
+                let n = Number::from_f64(f);
+                b.append_option(n.as_ref().map(Number::to_string));
+                n.is_some()
+            }
+            Self::F64(b) => {
+                let v = f.is_finite().then_some(f);
+                b.append_option(v);
+                v.is_some()
+            }
+            Self::Bool(b) => {
+                b.append_null();
+                false
+            }
+            Self::I32(b) => {
+                b.append_null();
+                false
+            }
+            Self::I64(b) => {
+                b.append_null();
+                false
+            }
+        }
+    }
+
+    /// Same as `build_array_from_values` over `Value::Bool(v)`.
+    fn append_bool(&mut self, v: bool) -> bool {
+        match self {
+            Self::Utf8(b) => {
+                b.append_value(v.to_string());
+                true
+            }
+            Self::Bool(b) => {
+                b.append_value(v);
+                true
+            }
+            Self::I32(b) => {
+                b.append_null();
+                false
+            }
+            Self::I64(b) => {
+                b.append_null();
+                false
+            }
+            Self::F64(b) => {
+                b.append_null();
+                false
+            }
+        }
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        match self {
+            Self::Utf8(b) => Arc::new(b.finish()),
+            Self::Bool(b) => Arc::new(b.finish()),
+            Self::I32(b) => Arc::new(b.finish()),
+            Self::I64(b) => Arc::new(b.finish()),
+            Self::F64(b) => Arc::new(b.finish()),
         }
     }
 }
 
-/// Appends database values to typed Arrow builders, one cell at a time.
+enum Buf {
+    Typed(Typed),
+    Values(Vec<Option<Value>>),
+}
+
+struct Column {
+    name: String,
+    kind: ColumnKind,
+    /// The fixed Arrow type: the declared one, else set at the first flush.
+    target: Option<DataType>,
+    buf: Buf,
+    warned: bool,
+}
+
+impl Column {
+    fn warn_once(&mut self, got: &str) {
+        if !self.warned {
+            self.warned = true;
+            warn!(
+                column = %self.name,
+                kind = ?self.kind,
+                target = ?self.target,
+                got,
+                "columnar output: value does not fit the column type; written as null"
+            );
+        }
+    }
+}
+
+/// Appends database values to Arrow builders, one cell at a time.
 ///
 /// Per row, call exactly one `append_*` method for each column index in
-/// `0..columns`, then [`end_row`](Self::end_row). When `end_row` returns
-/// `true` the batch is full: call [`flush`](Self::flush). Call `flush` once
-/// more after the last row to emit the remainder.
+/// `0..column_count()`, then [`end_row`](Self::end_row). When `end_row`
+/// returns `true` the batch is full: call [`flush`](Self::flush). Call `flush`
+/// once more after the last row to emit the remainder.
 pub struct ColumnarBatchBuilder {
-    names: Vec<String>,
-    kinds: Vec<ColumnKind>,
-    cols: Vec<ColumnBuf>,
-    warned: Vec<bool>,
+    cols: Vec<Column>,
     batch_rows: usize,
     rows: usize,
     schema: Option<Arc<Schema>>,
 }
 
 impl ColumnarBatchBuilder {
-    /// Creates a builder. `columns` and `kinds` are parallel and keep the
-    /// SELECT-list order; duplicate names are kept as separate columns.
-    /// `batch_rows` is clamped to at least 1.
+    /// Creates a builder. `columns`, `kinds` and `declared` are parallel and
+    /// keep the SELECT-list order (duplicate names stay separate columns).
+    /// `declared[i]` is the Arrow type fixed by the declaration (see
+    /// [`declared_arrow_types`](crate::parquet_schema::declared_arrow_types)),
+    /// or `None` to infer it at the first flush. `batch_rows` is clamped to at
+    /// least 1.
     pub fn new(
         columns: Vec<String>,
         kinds: Vec<ColumnKind>,
+        declared: Vec<Option<DataType>>,
         batch_rows: usize,
     ) -> Result<Self, SofError> {
-        if columns.len() != kinds.len() {
+        if columns.len() != kinds.len() || columns.len() != declared.len() {
             return Err(SofError::ArrowConversionError(format!(
-                "column count ({}) does not match kind count ({})",
+                "column count ({}) does not match kind count ({}) / declared count ({})",
                 columns.len(),
-                kinds.len()
+                kinds.len(),
+                declared.len()
             )));
         }
-        let cols = kinds.iter().map(|k| ColumnBuf::new(*k)).collect();
-        let warned = vec![false; columns.len()];
+        let cols = columns
+            .into_iter()
+            .zip(kinds)
+            .zip(declared)
+            .map(|((name, kind), target)| {
+                let typed = target
+                    .as_ref()
+                    .filter(|t| eligible(kind, t))
+                    .and_then(Typed::new);
+                Column {
+                    name,
+                    kind,
+                    buf: match typed {
+                        Some(t) => Buf::Typed(t),
+                        None => Buf::Values(Vec::new()),
+                    },
+                    target,
+                    warned: false,
+                }
+            })
+            .collect();
         Ok(Self {
-            names: columns,
-            kinds,
             cols,
-            warned,
             batch_rows: batch_rows.max(1),
             rows: 0,
             schema: None,
@@ -134,7 +321,7 @@ impl ColumnarBatchBuilder {
 
     /// Number of columns.
     pub fn column_count(&self) -> usize {
-        self.names.len()
+        self.cols.len()
     }
 
     /// Rows appended since the last flush.
@@ -142,183 +329,95 @@ impl ColumnarBatchBuilder {
         self.rows
     }
 
-    /// The schema shared by every batch, once known: immediately when no
-    /// column is `Deferred`, otherwise after the first non-empty flush.
+    /// The schema shared by every batch: `Some` after the first flush.
     pub fn schema(&self) -> Option<Arc<Schema>> {
         self.schema.clone()
     }
 
+    /// `true` while column `col` is buffered as JSON: the caller must supply
+    /// its cell as a `serde_json::Value` through
+    /// [`append_deferred`](Self::append_deferred), built as the row path builds
+    /// it. `false` when the column has a typed builder and the caller may use
+    /// `append_str` / `append_i64` / `append_f64` / `append_bool`.
+    pub fn needs_value(&self, col: usize) -> bool {
+        matches!(self.cols[col].buf, Buf::Values(_))
+    }
+
     /// Appends SQL NULL to column `col`.
     pub fn append_null(&mut self, col: usize) {
-        match &mut self.cols[col] {
-            ColumnBuf::Text(b) => b.append_null(),
-            ColumnBuf::Boolean(b) => b.append_null(),
-            ColumnBuf::Integer(b) => b.append_null(),
-            ColumnBuf::Decimal(b) => b.append_null(),
-            ColumnBuf::Deferred { values, .. } => values.push(None),
+        match &mut self.cols[col].buf {
+            Buf::Typed(t) => t.append_null(),
+            Buf::Values(v) => v.push(None),
         }
     }
 
-    /// Appends database text to column `col`.
-    ///
-    /// `Text` takes the string as is. `Boolean` accepts `true` / `false`.
-    /// `Integer` and `Decimal` parse JSON number syntax. A `Deferred` column
-    /// stores a JSON string; use [`append_deferred`](Self::append_deferred)
-    /// to store a decoded value instead.
+    /// Appends database text, equal to appending `Value::String(s)`.
     pub fn append_str(&mut self, col: usize, s: &str) {
-        let ok = match &mut self.cols[col] {
-            ColumnBuf::Text(b) => {
-                b.append_value(s);
-                true
-            }
-            ColumnBuf::Boolean(b) => match s {
-                "true" => {
-                    b.append_value(true);
-                    true
-                }
-                "false" => {
-                    b.append_value(false);
-                    true
-                }
-                _ => {
-                    b.append_null();
-                    false
-                }
-            },
-            ColumnBuf::Integer(b) => {
-                let parsed = parse_number(s)
-                    .and_then(|n| n.as_i64())
-                    .and_then(|i| i32::try_from(i).ok());
-                b.append_option(parsed);
-                parsed.is_some()
-            }
-            ColumnBuf::Decimal(b) => {
-                let parsed = parse_number(s).and_then(|n| n.as_f64());
-                b.append_option(parsed);
-                parsed.is_some()
-            }
-            ColumnBuf::Deferred { values, .. } => {
-                values.push(Some(Value::String(s.to_owned())));
+        let c = &mut self.cols[col];
+        let ok = match &mut c.buf {
+            Buf::Typed(t) => t.append_str(s),
+            Buf::Values(v) => {
+                v.push(Some(Value::String(s.to_owned())));
                 true
             }
         };
         if !ok {
-            self.warn_once(col, "text");
+            c.warn_once("text");
         }
     }
 
-    /// Appends a native integer to column `col`.
-    ///
-    /// `Text` writes its decimal text, `Boolean` accepts 0 and 1, `Integer`
-    /// accepts the `i32` range, `Decimal` converts to `f64`.
+    /// Appends a native integer, equal to appending a JSON integer.
     pub fn append_i64(&mut self, col: usize, n: i64) {
-        let ok = match &mut self.cols[col] {
-            ColumnBuf::Text(b) => {
-                b.append_value(n.to_string());
-                true
-            }
-            ColumnBuf::Boolean(b) => match n {
-                0 | 1 => {
-                    b.append_value(n == 1);
-                    true
-                }
-                _ => {
-                    b.append_null();
-                    false
-                }
-            },
-            ColumnBuf::Integer(b) => {
-                let v = i32::try_from(n).ok();
-                b.append_option(v);
-                v.is_some()
-            }
-            ColumnBuf::Decimal(b) => {
-                b.append_value(n as f64);
-                true
-            }
-            ColumnBuf::Deferred { values, .. } => {
-                values.push(Some(Value::from(n)));
+        let c = &mut self.cols[col];
+        let ok = match &mut c.buf {
+            Buf::Typed(t) => t.append_i64(n),
+            Buf::Values(v) => {
+                v.push(Some(Value::from(n)));
                 true
             }
         };
         if !ok {
-            self.warn_once(col, "integer");
+            c.warn_once("integer");
         }
     }
 
-    /// Appends a native float to column `col`.
-    ///
-    /// `Text` writes the JSON number text, `Decimal` stores it. A non-finite
-    /// value, or any float in a `Boolean` or `Integer` column, is written as
-    /// null.
+    /// Appends a native float, equal to appending `Number::from_f64(f)` (a
+    /// non-finite value is null).
     pub fn append_f64(&mut self, col: usize, f: f64) {
-        let ok = match &mut self.cols[col] {
-            ColumnBuf::Text(b) => {
-                let n = Number::from_f64(f);
-                b.append_option(n.as_ref().map(Number::to_string));
-                n.is_some()
-            }
-            ColumnBuf::Boolean(b) => {
-                b.append_null();
-                false
-            }
-            ColumnBuf::Integer(b) => {
-                b.append_null();
-                false
-            }
-            ColumnBuf::Decimal(b) => {
-                let v = f.is_finite().then_some(f);
-                b.append_option(v);
-                v.is_some()
-            }
-            ColumnBuf::Deferred { values, .. } => {
-                values.push(Number::from_f64(f).map(Value::Number));
+        let c = &mut self.cols[col];
+        let ok = match &mut c.buf {
+            Buf::Typed(t) => t.append_f64(f),
+            Buf::Values(v) => {
+                v.push(Number::from_f64(f).map(Value::Number));
                 true
             }
         };
         if !ok {
-            self.warn_once(col, "float");
+            c.warn_once("float");
         }
     }
 
-    /// Appends a boolean to column `col`.
-    ///
-    /// `Text` writes `true` / `false`; `Integer` and `Decimal` write null.
+    /// Appends a native boolean, equal to appending `Value::Bool(v)`.
     pub fn append_bool(&mut self, col: usize, v: bool) {
-        let ok = match &mut self.cols[col] {
-            ColumnBuf::Text(b) => {
-                b.append_value(if v { "true" } else { "false" });
-                true
-            }
-            ColumnBuf::Boolean(b) => {
-                b.append_value(v);
-                true
-            }
-            ColumnBuf::Integer(b) => {
-                b.append_null();
-                false
-            }
-            ColumnBuf::Decimal(b) => {
-                b.append_null();
-                false
-            }
-            ColumnBuf::Deferred { values, .. } => {
+        let c = &mut self.cols[col];
+        let ok = match &mut c.buf {
+            Buf::Typed(t) => t.append_bool(v),
+            Buf::Values(values) => {
                 values.push(Some(Value::Bool(v)));
                 true
             }
         };
         if !ok {
-            self.warn_once(col, "boolean");
+            c.warn_once("boolean");
         }
     }
 
-    /// Appends an already decoded JSON value, for `Deferred` columns.
+    /// Appends an already decoded JSON value to any column.
     ///
-    /// On a typed column this dispatches to the matching `append_*` method
-    /// (arrays and objects become null there), so callers never need to
-    /// branch on the column kind.
+    /// A buffered column stores it. A typed column dispatches to the matching
+    /// typed append; arrays and objects become null there (with a warning).
     pub fn append_deferred(&mut self, col: usize, value: Value) {
-        if let ColumnBuf::Deferred { values, .. } = &mut self.cols[col] {
+        if let Buf::Values(values) = &mut self.cols[col].buf {
             values.push(match value {
                 Value::Null => None,
                 v => Some(v),
@@ -332,6 +431,11 @@ impl ColumnarBatchBuilder {
             Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     self.append_i64(col, i);
+                } else if matches!(self.cols[col].buf, Buf::Typed(Typed::Utf8(_))) {
+                    // u64 above i64::MAX keeps its exact digits.
+                    if let Buf::Typed(Typed::Utf8(b)) = &mut self.cols[col].buf {
+                        b.append_value(n.to_string());
+                    }
                 } else if let Some(f) = n.as_f64() {
                     self.append_f64(col, f);
                 } else {
@@ -340,7 +444,7 @@ impl ColumnarBatchBuilder {
             }
             Value::Array(_) | Value::Object(_) => {
                 self.append_null(col);
-                self.warn_once(col, "json");
+                self.cols[col].warn_once("json");
             }
         }
     }
@@ -354,33 +458,43 @@ impl ColumnarBatchBuilder {
 
     /// Emits the pending rows as a [`RecordBatch`], or `None` when there are
     /// none. Builders are reset for the next batch.
+    ///
+    /// The first flush fixes the schema (inferring every undeclared column from
+    /// its first [`SCHEMA_SAMPLE_ROWS`] values) and promotes eligible
+    /// undeclared columns to typed builders for the following batches.
     pub fn flush(&mut self) -> Result<Option<RecordBatch>, SofError> {
         if self.rows == 0 {
             return Ok(None);
         }
         let mut fields = Vec::with_capacity(self.cols.len());
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.cols.len());
-        for (name, buf) in self.names.iter().zip(self.cols.iter_mut()) {
-            let (data_type, array): (DataType, ArrayRef) = match buf {
-                ColumnBuf::Text(b) => (DataType::Utf8, Arc::new(b.finish())),
-                ColumnBuf::Boolean(b) => (DataType::Boolean, Arc::new(b.finish())),
-                ColumnBuf::Integer(b) => (DataType::Int32, Arc::new(b.finish())),
-                ColumnBuf::Decimal(b) => (DataType::Float64, Arc::new(b.finish())),
-                ColumnBuf::Deferred { values, data_type } => {
+        for c in &mut self.cols {
+            let array = match &mut c.buf {
+                Buf::Typed(t) => t.finish(),
+                Buf::Values(values) => {
                     let values = std::mem::take(values);
-                    let dt = data_type
-                        .get_or_insert_with(|| {
-                            infer_arrow_type(&values[..values.len().min(INFER_SAMPLE)])
-                        })
-                        .clone();
-                    let array = build_array_from_values(values, &dt)?;
-                    (dt, array)
+                    if c.target.is_none() {
+                        let sample = values.len().min(SCHEMA_SAMPLE_ROWS);
+                        c.target = Some(infer_arrow_type(&values[..sample]));
+                    }
+                    let target = c.target.as_ref().expect("target fixed above");
+                    build_array_from_values(values, target)?
                 }
             };
-            fields.push(Field::new(name, data_type, true));
+            fields.push(Field::new(&c.name, array.data_type().clone(), true));
             arrays.push(array);
         }
         self.rows = 0;
+
+        // Later batches keep the types fixed now; promote what can go typed.
+        for c in &mut self.cols {
+            if let (Buf::Values(_), Some(t)) = (&c.buf, &c.target)
+                && eligible(c.kind, t)
+                && let Some(typed) = Typed::new(t)
+            {
+                c.buf = Buf::Typed(typed);
+            }
+        }
 
         let schema = self
             .schema
@@ -390,184 +504,501 @@ impl ColumnarBatchBuilder {
             .map(Some)
             .map_err(|e| SofError::ArrowConversionError(e.to_string()))
     }
-
-    fn warn_once(&mut self, col: usize, got: &str) {
-        if !self.warned[col] {
-            self.warned[col] = true;
-            warn!(
-                column = %self.names[col],
-                kind = ?self.kinds[col],
-                got,
-                "columnar output: value does not fit the declared column type; written as null"
-            );
-        }
-    }
-}
-
-fn parse_number(s: &str) -> Option<Number> {
-    serde_json::from_str::<Number>(s).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProcessedRow;
+    use crate::parquet_schema::{declared_arrow_types, resolve_arrow_schema};
+    use crate::sqlquery::ColumnFhirType;
+    use crate::sqlquery::engine::DeclaredColumn;
     use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, ListArray, StringArray};
     use serde_json::json;
 
-    fn builder(kinds: &[ColumnKind], batch_rows: usize) -> ColumnarBatchBuilder {
-        let names = (0..kinds.len()).map(|i| format!("c{i}")).collect();
-        ColumnarBatchBuilder::new(names, kinds.to_vec(), batch_rows).unwrap()
+    const ALL_KINDS: [ColumnKind; 5] = [
+        ColumnKind::Text,
+        ColumnKind::Boolean,
+        ColumnKind::Integer,
+        ColumnKind::Decimal,
+        ColumnKind::Deferred,
+    ];
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("c{i}")).collect()
+    }
+
+    fn builder(
+        kinds: &[ColumnKind],
+        declared: &[Option<DataType>],
+        batch_rows: usize,
+    ) -> ColumnarBatchBuilder {
+        ColumnarBatchBuilder::new(
+            names(kinds.len()),
+            kinds.to_vec(),
+            declared.to_vec(),
+            batch_rows,
+        )
+        .unwrap()
+    }
+
+    fn undeclared(kinds: &[ColumnKind], batch_rows: usize) -> ColumnarBatchBuilder {
+        builder(kinds, &vec![None; kinds.len()], batch_rows)
+    }
+
+    fn target_types() -> Vec<DataType> {
+        vec![
+            DataType::Utf8,
+            DataType::Boolean,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float64,
+        ]
+    }
+
+    const TRICKY: &[&str] = &[
+        "",
+        " 5 ",
+        "1e3",
+        "007",
+        "5.0",
+        "-5",
+        "true",
+        "T",
+        " False ",
+        "f",
+        "yes",
+        "NaN",
+        "inf",
+        "9223372036854775808",
+        "9223372036854775807",
+        "2147483648",
+        "2147483647",
+        "-2147483649",
+        "-0",
+        "0.1",
+        "1e999",
+        "+5",
+        "héllo ✓ 日本",
+    ];
+
+    fn assert_same(got: &ArrayRef, expected: &ArrayRef, what: &str) {
+        assert_eq!(got.data_type(), expected.data_type(), "{what}: type");
+        assert_eq!(got.to_data(), expected.to_data(), "{what}: values");
     }
 
     #[test]
     fn mismatched_lengths_are_rejected() {
-        assert!(ColumnarBatchBuilder::new(vec!["a".into()], vec![], 10).is_err());
+        assert!(ColumnarBatchBuilder::new(vec!["a".into()], vec![], vec![None], 10).is_err());
+        assert!(
+            ColumnarBatchBuilder::new(vec!["a".into()], vec![ColumnKind::Text], vec![], 10)
+                .is_err()
+        );
     }
 
     #[test]
-    fn text_column_keeps_database_string() {
-        let mut b = builder(&[ColumnKind::Text], 10);
-        for s in ["44054006", "null", "true", ""] {
-            b.append_str(0, s);
-            b.end_row();
-        }
-        b.append_null(0);
-        b.end_row();
-        b.append_i64(0, 7);
-        b.end_row();
-        let batch = b.flush().unwrap().unwrap();
-        let a = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
+    fn declared_eligible_columns_are_typed_from_the_start() {
+        let b = builder(
+            &[ColumnKind::Text, ColumnKind::Integer, ColumnKind::Deferred],
+            &[
+                Some(DataType::Utf8),
+                Some(DataType::Int64),
+                Some(DataType::Utf8),
+            ],
+            10,
+        );
+        assert!(!b.needs_value(0));
+        assert!(!b.needs_value(1));
+        assert!(b.needs_value(2)); // Deferred kind is always buffered
+        let b = builder(
+            &[ColumnKind::Integer, ColumnKind::Text],
+            &[Some(DataType::Utf8), None],
+            10,
+        );
+        assert!(b.needs_value(0)); // Integer kind cannot feed Utf8
+        assert!(b.needs_value(1)); // undeclared: buffered until the first flush
+    }
+
+    #[test]
+    fn typed_text_matches_buffered_for_every_target() {
+        for target in target_types() {
+            let mut b = builder(&[ColumnKind::Text], &[Some(target.clone())], 1000);
+            assert!(!b.needs_value(0), "{target:?}");
+            for s in TRICKY {
+                b.append_str(0, s);
+                b.end_row();
+            }
+            let batch = b.flush().unwrap().unwrap();
+            let expected = build_array_from_values(
+                TRICKY
+                    .iter()
+                    .map(|s| Some(Value::String((*s).to_owned())))
+                    .collect(),
+                &target,
+            )
             .unwrap();
-        assert_eq!(a.value(0), "44054006");
-        assert_eq!(a.value(1), "null");
-        assert_eq!(a.value(2), "true");
-        assert_eq!(a.value(3), "");
-        assert!(a.is_null(4));
-        assert_eq!(a.value(5), "7");
+            assert_same(batch.column(0), &expected, &format!("{target:?}"));
+            assert_eq!(batch.schema().field(0).data_type(), &target);
+        }
     }
 
     #[test]
-    fn boolean_column_accepts_text_and_zero_one() {
-        let mut b = builder(&[ColumnKind::Boolean], 10);
-        b.append_str(0, "true");
+    fn typed_native_values_match_buffered_for_every_target() {
+        let values: Vec<Option<Value>> = vec![
+            None,
+            Some(json!(0)),
+            Some(json!(-7)),
+            Some(json!(2147483648i64)),
+            Some(json!(i64::MAX)),
+            Some(json!(u64::MAX)),
+            Some(json!(1.5)),
+            Some(json!(-0.0)),
+            Some(json!(2.0)),
+            Some(json!(true)),
+            Some(json!(false)),
+            Some(json!("12")),
+            Some(json!("t")),
+            Some(json!("x")),
+            Some(json!("")),
+        ];
+        for target in target_types() {
+            let mut specific = builder(&[ColumnKind::Text], &[Some(target.clone())], 1000);
+            let mut deferred = builder(&[ColumnKind::Text], &[Some(target.clone())], 1000);
+            for v in &values {
+                match v {
+                    None => specific.append_null(0),
+                    Some(Value::Bool(x)) => specific.append_bool(0, *x),
+                    Some(Value::String(s)) => specific.append_str(0, s),
+                    Some(Value::Number(n)) => match (n.as_i64(), n.as_f64()) {
+                        (Some(i), _) => specific.append_i64(0, i),
+                        (None, Some(f)) => specific.append_f64(0, f),
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                }
+                specific.end_row();
+                deferred.append_deferred(0, v.clone().unwrap_or(Value::Null));
+                deferred.end_row();
+            }
+            let expected = build_array_from_values(values.clone(), &target).unwrap();
+            let a = specific.flush().unwrap().unwrap();
+            let d = deferred.flush().unwrap().unwrap();
+            // u64::MAX through the native f64 path loses digits for Utf8
+            // only; the deferred path must be exact everywhere.
+            assert_same(d.column(0), &expected, &format!("deferred {target:?}"));
+            if target != DataType::Utf8 {
+                assert_same(a.column(0), &expected, &format!("native {target:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_floats_are_null() {
+        for target in [DataType::Utf8, DataType::Float64] {
+            let mut b = builder(&[ColumnKind::Decimal], &[Some(target.clone())], 10);
+            if target == DataType::Utf8 {
+                b = builder(&[ColumnKind::Text], &[Some(target.clone())], 10);
+            }
+            b.append_f64(0, f64::NAN);
+            b.end_row();
+            b.append_f64(0, f64::INFINITY);
+            b.end_row();
+            b.append_f64(0, 0.5);
+            b.end_row();
+            let batch = b.flush().unwrap().unwrap();
+            assert_eq!(batch.column(0).null_count(), 2, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn kinds_feed_their_declared_targets() {
+        let mut b = builder(
+            &[
+                ColumnKind::Boolean,
+                ColumnKind::Integer,
+                ColumnKind::Integer,
+                ColumnKind::Decimal,
+            ],
+            &[
+                Some(DataType::Boolean),
+                Some(DataType::Int32),
+                Some(DataType::Float64),
+                Some(DataType::Float64),
+            ],
+            10,
+        );
+        for c in 0..4 {
+            assert!(!b.needs_value(c));
+        }
+        b.append_bool(0, true);
+        b.append_i64(1, 5);
+        b.append_i64(2, 5);
+        b.append_f64(3, 2.5);
         b.end_row();
-        b.append_str(0, "false");
-        b.end_row();
-        b.append_i64(0, 1);
-        b.end_row();
-        b.append_i64(0, 0);
-        b.end_row();
-        b.append_i64(0, 2);
-        b.end_row();
-        b.append_str(0, "yes");
-        b.end_row();
-        b.append_null(0);
+        b.append_i64(0, 1); // an integer is not a boolean: null
+        b.append_i64(1, i64::from(i32::MAX) + 1);
+        b.append_null(2);
+        b.append_i64(3, 3);
         b.end_row();
         let batch = b.flush().unwrap().unwrap();
-        let a = batch
+        let bools = batch
             .column(0)
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        let got: Vec<Option<bool>> = a.iter().collect();
-        assert_eq!(
-            got,
-            vec![
-                Some(true),
-                Some(false),
-                Some(true),
-                Some(false),
-                None,
-                None,
-                None
-            ]
-        );
+        assert_eq!(bools.iter().collect::<Vec<_>>(), vec![Some(true), None]);
+        let ints = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ints.iter().collect::<Vec<_>>(), vec![Some(5), None]);
+        let f = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(f.iter().collect::<Vec<_>>(), vec![Some(5.0), None]);
+        let d = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(d.iter().collect::<Vec<_>>(), vec![Some(2.5), Some(3.0)]);
     }
 
     #[test]
-    fn integer_column_parses_and_rejects_out_of_range() {
-        let mut b = builder(&[ColumnKind::Integer], 10);
-        b.append_str(0, "42");
+    fn schema_equals_resolve_arrow_schema() {
+        let columns = names(7);
+        let declared_cols = vec![
+            DeclaredColumn {
+                name: "c0".into(),
+                fhir_type: Some(ColumnFhirType::Boolean),
+                collection: false,
+            },
+            DeclaredColumn {
+                name: "c1".into(),
+                fhir_type: Some(ColumnFhirType::Integer64),
+                collection: false,
+            },
+            DeclaredColumn {
+                name: "c2".into(),
+                fhir_type: Some(ColumnFhirType::Decimal),
+                collection: false,
+            },
+            DeclaredColumn {
+                name: "c3".into(),
+                fhir_type: Some(ColumnFhirType::String("code".into())),
+                collection: true,
+            },
+            DeclaredColumn {
+                name: "c4".into(),
+                fhir_type: None,
+                collection: false,
+            },
+        ];
+        let kinds = vec![
+            ColumnKind::Boolean,
+            ColumnKind::Integer,
+            ColumnKind::Decimal,
+            ColumnKind::Deferred,
+            ColumnKind::Text,
+            ColumnKind::Integer,
+            ColumnKind::Deferred,
+        ];
+        // c4: strings; c5: ints; c6: arrays; first 100 votes decide, later
+        // rows must not.
+        let rows: Vec<ProcessedRow> = (0..130)
+            .map(|i| ProcessedRow {
+                values: vec![
+                    Some(json!(true)),
+                    Some(json!(i)),
+                    Some(json!(i as f64 + 0.5)),
+                    Some(json!(["a"])),
+                    Some(json!(format!("s{i}"))),
+                    if i < 100 {
+                        Some(json!(i))
+                    } else {
+                        Some(json!("x"))
+                    },
+                    Some(json!(["x", "y"])),
+                ],
+            })
+            .collect();
+        let expected = resolve_arrow_schema(&columns, &declared_cols, &rows).unwrap();
+
+        let declared = declared_arrow_types(&columns, &declared_cols);
+        let mut b = ColumnarBatchBuilder::new(columns.clone(), kinds, declared, 130).unwrap();
+        assert!(b.schema().is_none());
+        for row in &rows {
+            for (c, v) in row.values.iter().enumerate() {
+                let v = v.clone().unwrap();
+                if b.needs_value(c) {
+                    b.append_deferred(c, v);
+                } else {
+                    match v {
+                        Value::Bool(x) => b.append_bool(c, x),
+                        Value::Number(n) => match n.as_i64() {
+                            Some(i) => b.append_i64(c, i),
+                            None => b.append_f64(c, n.as_f64().unwrap()),
+                        },
+                        other => b.append_deferred(c, other),
+                    }
+                }
+            }
+            b.end_row();
+        }
+        let batch = b.flush().unwrap().unwrap();
+        assert_eq!(batch.schema().as_ref(), &expected);
+        assert_eq!(b.schema().unwrap().as_ref(), &expected);
+
+        // Arrays equal the row path's, too.
+        let arrays =
+            crate::parquet_schema::process_to_arrow_arrays(&expected, &columns, &rows).unwrap();
+        for (i, a) in arrays.iter().enumerate() {
+            assert_same(batch.column(i), a, &format!("column {i}"));
+        }
+    }
+
+    #[test]
+    fn promotion_after_first_flush_matches_a_buffered_build() {
+        // (kind, first-batch value that makes inference pick the type, type)
+        let cases = [
+            (ColumnKind::Text, json!(5), DataType::Int32),
+            (ColumnKind::Text, json!(1.5), DataType::Float64),
+            (ColumnKind::Text, json!(true), DataType::Boolean),
+            (ColumnKind::Text, json!("s"), DataType::Utf8),
+            (ColumnKind::Integer, json!(5), DataType::Int32),
+            (ColumnKind::Decimal, json!(1.5), DataType::Float64),
+            (ColumnKind::Boolean, json!(true), DataType::Boolean),
+        ];
+        for (kind, first, target) in cases {
+            let mut b = undeclared(&[kind], 2);
+            assert!(b.needs_value(0));
+            b.append_deferred(0, first.clone());
+            b.end_row();
+            b.append_deferred(0, first);
+            assert!(b.end_row());
+            let first_batch = b.flush().unwrap().unwrap();
+            assert_eq!(first_batch.schema().field(0).data_type(), &target);
+            assert!(!b.needs_value(0), "{kind:?}/{target:?} should be promoted");
+
+            let mut feed: Vec<Option<Value>> = TRICKY
+                .iter()
+                .map(|s| Some(Value::String((*s).to_owned())))
+                .collect();
+            feed.push(None);
+            feed.push(Some(json!(3)));
+            feed.push(Some(json!(2.5)));
+            feed.push(Some(json!(false)));
+            for v in &feed {
+                b.append_deferred(0, v.clone().unwrap_or(Value::Null));
+                b.end_row();
+                // end_row flags a full batch but flush is deferred below
+            }
+            let second = b.flush().unwrap().unwrap();
+            assert_eq!(second.schema(), first_batch.schema());
+            let expected = build_array_from_values(feed, &target).unwrap();
+            assert_same(second.column(0), &expected, &format!("{kind:?}/{target:?}"));
+        }
+    }
+
+    #[test]
+    fn ineligible_pairs_stay_buffered_and_match_the_row_path() {
+        // Integer kind inferred Utf8 (strings), Deferred kind inferred Int32,
+        // Text kind inferred List<Utf8>.
+        let mut b = undeclared(
+            &[ColumnKind::Integer, ColumnKind::Deferred, ColumnKind::Text],
+            2,
+        );
+        for _ in 0..2 {
+            b.append_deferred(0, json!("a"));
+            b.append_deferred(1, json!(1));
+            b.append_deferred(2, json!(["x"]));
+            b.end_row();
+        }
+        let first = b.flush().unwrap().unwrap();
+        assert_eq!(first.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(first.schema().field(1).data_type(), &DataType::Int32);
+        assert!(matches!(
+            first.schema().field(2).data_type(),
+            DataType::List(_)
+        ));
+        for c in 0..3 {
+            assert!(b.needs_value(c), "column {c}");
+        }
+        b.append_deferred(0, json!(9));
+        b.append_deferred(1, json!("77"));
+        b.append_deferred(2, json!(["p", 1]));
         b.end_row();
-        b.append_str(0, "-7");
+        let second = b.flush().unwrap().unwrap();
+        assert_eq!(second.schema(), first.schema());
+        let a = second
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(a.value(0), "9");
+        let i = second
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(i.value(0), 77);
+        let l = second
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let inner = l.value(0);
+        let inner = inner.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(inner.iter().collect::<Vec<_>>(), vec![Some("p"), Some("1")]);
+    }
+
+    #[test]
+    fn typed_column_turns_json_containers_into_null() {
+        let mut b = builder(
+            &[ColumnKind::Integer, ColumnKind::Text],
+            &[Some(DataType::Int32), Some(DataType::Utf8)],
+            10,
+        );
+        b.append_deferred(0, json!(5));
+        b.append_deferred(1, json!(true));
         b.end_row();
-        b.append_str(0, "1.5");
+        b.append_deferred(0, json!([1]));
+        b.append_deferred(1, json!({"a": 1}));
         b.end_row();
-        b.append_str(0, "abc");
-        b.end_row();
-        b.append_str(0, "NaN");
-        b.end_row();
-        b.append_i64(0, i64::from(i32::MAX) + 1);
-        b.end_row();
-        b.append_i64(0, 9);
-        b.end_row();
-        b.append_f64(0, 2.0);
+        b.append_deferred(0, Value::Null);
+        b.append_deferred(1, json!(u64::MAX));
         b.end_row();
         let batch = b.flush().unwrap().unwrap();
-        let a = batch
+        let i = batch
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let got: Vec<Option<i32>> = a.iter().collect();
-        assert_eq!(
-            got,
-            vec![Some(42), Some(-7), None, None, None, None, Some(9), None]
-        );
-    }
-
-    #[test]
-    fn decimal_column_parses_json_numbers_only() {
-        let mut b = builder(&[ColumnKind::Decimal], 10);
-        b.append_str(0, "1.25");
-        b.end_row();
-        b.append_str(0, "3");
-        b.end_row();
-        b.append_str(0, "NaN");
-        b.end_row();
-        b.append_str(0, "inf");
-        b.end_row();
-        b.append_i64(0, 5);
-        b.end_row();
-        b.append_f64(0, 0.5);
-        b.end_row();
-        b.append_f64(0, f64::NAN);
-        b.end_row();
-        let batch = b.flush().unwrap().unwrap();
-        let a = batch
-            .column(0)
+        assert_eq!(i.iter().collect::<Vec<_>>(), vec![Some(5), None, None]);
+        let t = batch
+            .column(1)
             .as_any()
-            .downcast_ref::<Float64Array>()
+            .downcast_ref::<StringArray>()
             .unwrap();
-        let got: Vec<Option<f64>> = a.iter().collect();
         assert_eq!(
-            got,
-            vec![
-                Some(1.25),
-                Some(3.0),
-                None,
-                None,
-                Some(5.0),
-                Some(0.5),
-                None
-            ]
+            t.iter().collect::<Vec<_>>(),
+            vec![Some("true"), None, Some("18446744073709551615")]
         );
     }
 
     #[test]
-    fn deferred_type_is_fixed_on_first_flush() {
-        let mut b = builder(&[ColumnKind::Deferred], 2);
+    fn inferred_type_is_fixed_on_first_flush() {
+        let mut b = undeclared(&[ColumnKind::Deferred], 2);
         b.append_deferred(0, json!(1));
         assert!(!b.end_row());
         b.append_deferred(0, json!(2));
         assert!(b.end_row());
         let first = b.flush().unwrap().unwrap();
         assert_eq!(first.schema().field(0).data_type(), &DataType::Int32);
-
-        // A string now would vote Utf8 on its own, but the type is locked.
+        // A string would vote Utf8 on its own, but the type is locked.
         b.append_deferred(0, json!("x"));
         b.end_row();
         b.append_deferred(0, json!(3));
@@ -583,8 +1014,23 @@ mod tests {
     }
 
     #[test]
+    fn inference_samples_only_the_first_hundred_values() {
+        let mut b = undeclared(&[ColumnKind::Deferred], 1000);
+        for _ in 0..100 {
+            b.append_deferred(0, json!(1));
+            b.end_row();
+        }
+        for _ in 0..200 {
+            b.append_deferred(0, json!("s"));
+            b.end_row();
+        }
+        let batch = b.flush().unwrap().unwrap();
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
+    }
+
+    #[test]
     fn deferred_column_serialises_objects_and_string_lists() {
-        let mut b = builder(&[ColumnKind::Deferred, ColumnKind::Deferred], 10);
+        let mut b = undeclared(&[ColumnKind::Deferred, ColumnKind::Deferred], 10);
         b.append_deferred(0, json!({"a": 1}));
         b.append_deferred(1, json!(["x", "y"]));
         b.end_row();
@@ -606,52 +1052,46 @@ mod tests {
             .unwrap();
         assert!(list.is_valid(0));
         assert!(list.is_null(1));
-        let inner = list.value(0);
-        let inner = inner.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(inner.iter().collect::<Vec<_>>(), vec![Some("x"), Some("y")]);
     }
 
-    /// Pins an inherited limitation: inference can yield `List<Int32>` but the
-    /// list builder always writes `List<Utf8>`, so the batch cannot be built.
     #[test]
-    fn deferred_non_string_list_is_an_error_as_in_the_row_path() {
-        let mut b = builder(&[ColumnKind::Deferred], 10);
+    fn declared_collection_is_buffered_as_utf8_list() {
+        let cols = names(1);
+        let declared = declared_arrow_types(
+            &cols,
+            &[DeclaredColumn {
+                name: "c0".into(),
+                fhir_type: Some(ColumnFhirType::Integer),
+                collection: true,
+            }],
+        );
+        let mut b =
+            ColumnarBatchBuilder::new(cols, vec![ColumnKind::Deferred], declared, 10).unwrap();
+        assert!(b.needs_value(0));
         b.append_deferred(0, json!([1, 2]));
         b.end_row();
-        assert!(b.flush().is_err());
-    }
-
-    #[test]
-    fn typed_column_dispatches_deferred_values() {
-        let mut b = builder(&[ColumnKind::Integer, ColumnKind::Text], 10);
-        b.append_deferred(0, json!(5));
-        b.append_deferred(1, json!(true));
-        b.end_row();
-        b.append_deferred(0, json!([1]));
-        b.append_deferred(1, Value::Null);
-        b.end_row();
         let batch = b.flush().unwrap().unwrap();
-        let i = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(i.iter().collect::<Vec<_>>(), vec![Some(5), None]);
-        let t = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(t.iter().collect::<Vec<_>>(), vec![Some("true"), None]);
+        assert!(matches!(
+            batch.schema().field(0).data_type(),
+            DataType::List(_)
+        ));
     }
 
     #[test]
     fn batches_split_at_batch_rows_and_share_a_schema() {
-        let mut b = builder(&[ColumnKind::Text, ColumnKind::Integer], 3);
+        let mut b = builder(
+            &[ColumnKind::Text, ColumnKind::Integer],
+            &[Some(DataType::Utf8), None],
+            3,
+        );
         let mut batches = Vec::new();
         for i in 0..7 {
             b.append_str(0, &i.to_string());
-            b.append_i64(1, i);
+            if b.needs_value(1) {
+                b.append_deferred(1, json!(i));
+            } else {
+                b.append_i64(1, i);
+            }
             if b.end_row() {
                 batches.push(b.flush().unwrap().unwrap());
             }
@@ -661,6 +1101,8 @@ mod tests {
         assert_eq!(sizes, vec![3, 3, 1]);
         assert!(batches.windows(2).all(|w| w[0].schema() == w[1].schema()));
         assert_eq!(b.schema().unwrap(), batches[0].schema());
+        assert_eq!(batches[0].schema().field(1).data_type(), &DataType::Int32);
+        assert!(!b.needs_value(1));
         assert!(b.flush().unwrap().is_none());
     }
 
@@ -669,34 +1111,26 @@ mod tests {
         let mut b = ColumnarBatchBuilder::new(
             vec!["x".into(), "x".into()],
             vec![ColumnKind::Text, ColumnKind::Integer],
+            vec![Some(DataType::Utf8), Some(DataType::Int32)],
             10,
         )
         .unwrap();
         b.append_str(0, "a");
         b.append_i64(1, 1);
         b.end_row();
-        let batch = b.flush().unwrap().unwrap();
-        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(b.flush().unwrap().unwrap().num_columns(), 2);
     }
 
     #[test]
     fn empty_builder_flushes_nothing() {
-        let mut b = builder(&[ColumnKind::Text], 10);
+        let mut b = undeclared(&[ColumnKind::Text], 10);
         assert!(b.flush().unwrap().is_none());
         assert!(b.schema().is_none());
     }
 
-    const ALL_KINDS: [ColumnKind; 5] = [
-        ColumnKind::Text,
-        ColumnKind::Boolean,
-        ColumnKind::Integer,
-        ColumnKind::Decimal,
-        ColumnKind::Deferred,
-    ];
-
     #[test]
     fn counters_track_columns_and_pending_rows() {
-        let mut b = builder(&ALL_KINDS, 10);
+        let mut b = undeclared(&ALL_KINDS, 10);
         assert_eq!(b.column_count(), 5);
         assert_eq!(b.pending_rows(), 0);
         for c in 0..5 {
@@ -704,80 +1138,60 @@ mod tests {
         }
         assert!(!b.end_row());
         assert_eq!(b.pending_rows(), 1);
+        b.flush().unwrap();
+        assert_eq!(b.pending_rows(), 0);
     }
 
     #[test]
-    fn every_value_kind_is_accepted_by_every_column_kind() {
-        // One row per value kind, each appended to all five column kinds. A
-        // value that does not fit a typed column becomes null; none may panic
+    fn every_value_kind_is_accepted_by_every_column() {
+        // Declared and undeclared builders over all kinds; no value may panic
         // and every row must flush.
-        let mut b = builder(&ALL_KINDS, 100);
-        for c in 0..5 {
-            b.append_str(c, "7");
+        for declared in [
+            vec![
+                Some(DataType::Utf8),
+                Some(DataType::Boolean),
+                Some(DataType::Int32),
+                Some(DataType::Float64),
+                None,
+            ],
+            vec![None; 5],
+        ] {
+            let mut b = builder(&ALL_KINDS, &declared, 100);
+            for c in 0..5 {
+                b.append_str(c, "7");
+            }
+            b.end_row();
+            for c in 0..5 {
+                b.append_i64(c, 7);
+            }
+            b.end_row();
+            for c in 0..5 {
+                b.append_f64(c, 1.5);
+            }
+            b.end_row();
+            for c in 0..5 {
+                b.append_f64(c, f64::NAN);
+            }
+            b.end_row();
+            for c in 0..5 {
+                b.append_bool(c, true);
+            }
+            b.end_row();
+            for v in [
+                json!("x"),
+                json!(3),
+                json!(2.5),
+                json!({"a": 1}),
+                Value::Null,
+            ] {
+                for c in 0..5 {
+                    b.append_deferred(c, v.clone());
+                }
+                b.end_row();
+            }
+            let batch = b.flush().unwrap().unwrap();
+            assert_eq!(batch.num_rows(), 10);
+            assert_eq!(batch.num_columns(), 5);
         }
-        b.end_row();
-        for c in 0..5 {
-            b.append_i64(c, 7);
-        }
-        b.end_row();
-        for c in 0..5 {
-            b.append_f64(c, 1.5);
-        }
-        b.end_row();
-        for c in 0..5 {
-            b.append_f64(c, f64::NAN);
-        }
-        b.end_row();
-        for c in 0..5 {
-            b.append_bool(c, true);
-        }
-        b.end_row();
-        for c in 0..5 {
-            b.append_deferred(c, json!("x"));
-        }
-        b.end_row();
-        for c in 0..5 {
-            b.append_deferred(c, json!(3));
-        }
-        b.end_row();
-        for c in 0..5 {
-            b.append_deferred(c, json!(2.5));
-        }
-        b.end_row();
-        for c in 0..5 {
-            b.append_deferred(c, json!({"a": 1}));
-        }
-        b.end_row();
-        for c in 0..5 {
-            b.append_deferred(c, Value::Null);
-        }
-        b.end_row();
-        let batch = b.flush().unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 10);
-        assert_eq!(batch.num_columns(), 5);
-    }
-
-    #[test]
-    fn decimal_text_and_boolean_columns_map_numbers_and_bools() {
-        let mut b = builder(&[ColumnKind::Decimal, ColumnKind::Boolean], 10);
-        b.append_f64(0, 2.5);
-        b.append_bool(1, true);
-        b.end_row();
-        b.append_i64(0, 3);
-        b.append_i64(1, 0);
-        b.end_row();
-        let batch = b.flush().unwrap().unwrap();
-        let d = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        assert_eq!((d.value(0), d.value(1)), (2.5, 3.0));
-        let t = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
-        assert_eq!((t.value(0), t.value(1)), (true, false));
     }
 }

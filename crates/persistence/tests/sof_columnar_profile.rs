@@ -273,14 +273,19 @@ async fn run_stages(
         .await
         .expect("run_view_columnar")
         .expect("runner supports columnar");
-    let mut writer: Option<helios_sof::ColumnarWriter> = None;
+    let options = helios_sof::ParquetOptions::default();
+    let mut writer: Option<helios_sof::columnar_stream::ParquetStreamWriter<Vec<u8>>> = None;
     while let Some(batch) = stream.next().await {
         let batch = batch.expect("batch");
         let w = writer.get_or_insert_with(|| {
-            helios_sof::ColumnarWriter::new(helios_sof::ContentType::Parquet, batch.schema(), None)
-                .expect("writer")
+            helios_sof::columnar_stream::ParquetStreamWriter::new(
+                Vec::new(),
+                batch.schema(),
+                &options,
+            )
+            .expect("writer")
         });
-        w.write(&batch).expect("write");
+        w.write_batch(&batch).expect("write");
     }
     let columnar_bytes = writer
         .expect("at least one batch")

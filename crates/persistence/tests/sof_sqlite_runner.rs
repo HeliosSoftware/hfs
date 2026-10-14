@@ -5,6 +5,7 @@
 //! 2. The in-DB runner produces the same rows as the in-process runner for
 //!    spec ViewDefinition fixtures (byte-identical column sets).
 //! 3. `SofError::Uncompilable` is returned for unsupported ViewDefinitions.
+//! 4. The columnar path yields the same Arrow schema and values as the row path.
 
 #[cfg(all(feature = "sqlite", feature = "R4"))]
 #[path = "common/sof_prefix_matrix.rs"]
@@ -1235,6 +1236,18 @@ mod sqlite_runner_tests {
     #[tokio::test]
     async fn test_pr410_exists_with_criteria() {
         assert_pr410_cases(&["UsCoreBloodPressures"]).await;
+    }
+
+    /// `exists(criteria)` over a path with more than one repeating step
+    /// (`component` and `coding`) sees every element (#1946).
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_exists_over_repeating_steps() {
+        assert_pr410_cases(&[
+            "ExistsAcrossRepeatingStepsWhere",
+            "ExistsAcrossRepeatingStepsColumns",
+        ])
+        .await;
     }
 
     /// `forEach: "name.where(use = 'official').first()"` — the criterion's own
@@ -2634,40 +2647,30 @@ mod total_order_acceptance {
     }
 }
 
-/// The columnar path (`run_view_columnar`) must return the same columns, rows
-/// and values as `run_view`, for the same views, filters and limits.
+/// The columnar path (`run_view_columnar`) must return the same schema (Arrow
+/// types included) and values as the row path: `run_view` rows through
+/// `rows_to_processed_result`, `resolve_arrow_schema` and
+/// `process_to_arrow_arrays`.
 #[cfg(all(feature = "sqlite", feature = "R4"))]
 mod columnar_parity {
-    use super::sof_columnar::{assert_columnar_parity, column_types, row_path_cells};
+    use super::sof_columnar::columnar_batches;
     use super::sof_pr410_views as pr410;
     use super::sof_prefix_matrix as matrix;
+    use futures::StreamExt;
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::sqlite::SqliteBackend;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-    use helios_sof::arrow::array::Array;
+    use helios_sof::arrow::array::{Array, ArrayRef};
+    use helios_sof::arrow::compute::concat;
     use helios_sof::arrow::datatypes::DataType;
     use helios_sof::arrow::record_batch::RecordBatch;
     use helios_sof::arrow::util::display::array_value_to_string;
-    use serde_json::json;
+    use helios_sof::parquet_schema::{process_to_arrow_arrays, resolve_arrow_schema};
+    use helios_sof::sqlquery::engine::declared_columns;
+    use serde_json::{Value, json};
     use std::sync::Arc;
-
-    fn cells_of_batches(batches: &[RecordBatch]) -> Vec<Vec<Option<String>>> {
-        let mut out = Vec::new();
-        for batch in batches {
-            for r in 0..batch.num_rows() {
-                out.push(
-                    batch
-                        .columns()
-                        .iter()
-                        .map(|c| (!c.is_null(r)).then(|| array_value_to_string(c, r).unwrap()))
-                        .collect(),
-                );
-            }
-        }
-        out
-    }
 
     fn tenant() -> TenantContext {
         TenantContext::new(TenantId::new("columnar"), TenantPermissions::full_access())
@@ -2678,6 +2681,75 @@ mod columnar_parity {
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
         Arc::new(backend)
+    }
+
+    fn cells(array: &ArrayRef) -> Vec<Option<String>> {
+        (0..array.len())
+            .map(|r| (!array.is_null(r)).then(|| array_value_to_string(array, r).unwrap()))
+            .collect()
+    }
+
+    /// Runs `view` through the row path and the columnar path and asserts the
+    /// schema (names, order, Arrow types), every cell and the batch schemas
+    /// are identical. Returns the columnar batches.
+    async fn strict_parity(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        view: &Value,
+        filters: &ViewFilters,
+        ctx: &str,
+    ) -> Vec<RecordBatch> {
+        let mut stream = runner
+            .run_view(tenant, view.clone(), filters.clone())
+            .await
+            .expect("run_view");
+        let mut rows = Vec::new();
+        while let Some(item) = stream.next().await {
+            rows.push(item.expect("row"));
+        }
+        let batches = columnar_batches(runner, tenant, view, filters).await;
+        let result = helios_sof::rows_to_processed_result(rows);
+        if result.rows.is_empty() {
+            let n: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(n, 0, "{ctx}: row path is empty, columnar has {n} rows");
+            return batches;
+        }
+        let schema = resolve_arrow_schema(&result.columns, &declared_columns(view), &result.rows)
+            .expect("row schema");
+        let arrays =
+            process_to_arrow_arrays(&schema, &result.columns, &result.rows).expect("row arrays");
+        let first = batches.first().expect("columnar batches");
+        let actual_schema = first.schema();
+        assert_eq!(
+            actual_schema.fields(),
+            schema.fields(),
+            "{ctx}: schema differs from the row path"
+        );
+        assert!(
+            batches.iter().all(|b| b.schema() == actual_schema),
+            "{ctx}: batches do not share one schema"
+        );
+        for (c, expected) in arrays.iter().enumerate() {
+            let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
+            let actual = concat(&parts).expect("concat column");
+            assert_eq!(actual.data_type(), expected.data_type(), "{ctx}: col {c}");
+            assert_eq!(
+                cells(&actual),
+                cells(expected),
+                "{ctx}: column {} differs",
+                schema.field(c).name()
+            );
+        }
+        batches
+    }
+
+    fn types(batches: &[RecordBatch]) -> Vec<(String, DataType)> {
+        batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+            .collect()
     }
 
     #[tokio::test]
@@ -2692,14 +2764,7 @@ mod columnar_parity {
         }
         let runner = backend.sof_runner().expect("in-DB runner");
         for case in pr410::pr410_cases().into_iter().chain(pr410::extra_cases()) {
-            if case.name == "UsCoreBloodPressures" {
-                // Declared `decimal` columns are `Float64` on the columnar
-                // path (`120.0`) but vote to `Int32` on the row path (`120`):
-                // compare those cells numerically instead of as text.
-                numeric_parity(runner.as_ref(), &tenant, &case.view, case.name).await;
-                continue;
-            }
-            assert_columnar_parity(
+            strict_parity(
                 runner.as_ref(),
                 &tenant,
                 &case.view,
@@ -2707,33 +2772,6 @@ mod columnar_parity {
                 case.name,
             )
             .await;
-        }
-    }
-
-    async fn numeric_parity(
-        runner: &dyn SofRunner,
-        tenant: &TenantContext,
-        view: &serde_json::Value,
-        ctx: &str,
-    ) {
-        let (columns, expected) =
-            row_path_cells(runner, tenant, view, &ViewFilters::default()).await;
-        let batches =
-            super::sof_columnar::columnar_batches(runner, tenant, view, &ViewFilters::default())
-                .await;
-        let actual = cells_of_batches(&batches);
-        assert_eq!(actual.len(), expected.len(), "{ctx}: row count differs");
-        assert!(!columns.is_empty());
-        for (a_row, e_row) in actual.iter().zip(&expected) {
-            for (a, e) in a_row.iter().zip(e_row) {
-                match (a, e) {
-                    (Some(a), Some(e)) => match (a.parse::<f64>(), e.parse::<f64>()) {
-                        (Ok(a), Ok(e)) => assert_eq!(a, e, "{ctx}"),
-                        _ => assert_eq!(a, e, "{ctx}"),
-                    },
-                    _ => assert_eq!(a, e, "{ctx}"),
-                }
-            }
         }
     }
 
@@ -2752,7 +2790,7 @@ mod columnar_parity {
             for limit in [None, Some(0), Some(1), Some(50), Some(usize::MAX)] {
                 let mut filters = case.filters.clone();
                 filters.limit = limit;
-                assert_columnar_parity(
+                strict_parity(
                     runner.as_ref(),
                     &tenant,
                     &case.view,
@@ -2774,7 +2812,7 @@ mod columnar_parity {
             group: vec!["Group/does-not-exist".to_string()],
             ..Default::default()
         };
-        let batches = assert_columnar_parity(
+        let batches = strict_parity(
             runner.as_ref(),
             &tenant,
             &case.view,
@@ -2785,20 +2823,29 @@ mod columnar_parity {
         assert!(batches.is_empty());
     }
 
+    async fn seed_patients(backend: &SqliteBackend, tenant: &TenantContext, n: usize) {
+        for i in 0..n {
+            let mut patient = json!({"resourceType": "Patient", "id": format!("p{i:05}")});
+            match i % 3 {
+                0 => patient["active"] = json!(true),
+                1 => patient["active"] = json!(false),
+                _ => {}
+            }
+            if i % 2 == 0 {
+                patient["multipleBirthInteger"] = json!(i as i64);
+            }
+            backend
+                .create(tenant, "Patient", patient, FhirVersion::R4)
+                .await
+                .expect("seed patient");
+        }
+    }
+
     #[tokio::test]
     async fn columnar_types_columns_from_the_view_and_keeps_nulls() {
         let backend = backend().await;
         let tenant = tenant();
-        for (id, active) in [("a", Some(true)), ("b", Some(false)), ("c", None)] {
-            let mut patient = json!({"resourceType": "Patient", "id": id});
-            if let Some(active) = active {
-                patient["active"] = json!(active);
-            }
-            backend
-                .create(&tenant, "Patient", patient, FhirVersion::R4)
-                .await
-                .expect("seed patient");
-        }
+        seed_patients(&backend, &tenant, 3).await;
         let runner = backend.sof_runner().expect("in-DB runner");
         let view = json!({
             "resourceType": "ViewDefinition",
@@ -2810,7 +2857,7 @@ mod columnar_parity {
                 {"name": "birth", "path": "birthDate", "type": "date"}
             ]}]
         });
-        let batches = assert_columnar_parity(
+        let batches = strict_parity(
             runner.as_ref(),
             &tenant,
             &view,
@@ -2818,14 +2865,118 @@ mod columnar_parity {
             "typed columns",
         )
         .await;
-        let types = column_types(&batches);
         assert_eq!(
-            types,
+            types(&batches),
             vec![
                 ("id".to_string(), DataType::Utf8),
                 ("active".to_string(), DataType::Boolean),
                 ("birth".to_string(), DataType::Utf8),
             ]
         );
+    }
+
+    /// More rows than one batch: undeclared columns are inferred from the
+    /// first batch and promoted to typed builders afterwards; the schema and
+    /// values must still equal the row path's.
+    #[tokio::test]
+    async fn columnar_undeclared_columns_across_batches() {
+        let backend = backend().await;
+        let tenant = tenant();
+        seed_patients(&backend, &tenant, 8300).await;
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id"},
+                {"name": "active", "path": "active"},
+                {"name": "multi", "path": "multipleBirthInteger"},
+                {"name": "declared_int", "path": "multipleBirthInteger", "type": "integer"}
+            ]}]
+        });
+        let batches = strict_parity(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+            "undeclared across batches",
+        )
+        .await;
+        assert!(batches.len() >= 2, "expected several batches");
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            8300
+        );
+    }
+
+    #[tokio::test]
+    async fn columnar_declared_integer64_and_all_null_integer() {
+        let backend = backend().await;
+        let tenant = tenant();
+        seed_patients(&backend, &tenant, 20).await;
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "big", "path": "multipleBirthInteger", "type": "integer64"},
+                {"name": "nothing", "path": "birthDate", "type": "integer"}
+            ]}]
+        });
+        let batches = strict_parity(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+            "integer64 and all-null integer",
+        )
+        .await;
+        let t = types(&batches);
+        assert_eq!(t[2].1, DataType::Int32, "all-null declared integer");
+    }
+
+    #[tokio::test]
+    async fn columnar_limit_and_booleans_stored_as_integers() {
+        let backend = backend().await;
+        let tenant = tenant();
+        seed_patients(&backend, &tenant, 30).await;
+        let runner = backend.sof_runner().expect("in-DB runner");
+        // `active` is a JSON boolean, which SQLite's json_extract returns as
+        // INTEGER 0/1: the Boolean decode must turn it back into a boolean,
+        // both in a declared and in an undeclared column.
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "active", "path": "active", "type": "boolean"},
+                {"name": "active_untyped", "path": "active"}
+            ]}]
+        });
+        for limit in [None, Some(0), Some(7), Some(1000)] {
+            let filters = ViewFilters {
+                limit,
+                ..Default::default()
+            };
+            let batches = strict_parity(
+                runner.as_ref(),
+                &tenant,
+                &view,
+                &filters,
+                &format!("booleans limit={limit:?}"),
+            )
+            .await;
+            if let Some(n) = limit.filter(|n| *n > 0) {
+                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(rows, n.min(30));
+                let t = types(&batches);
+                assert_eq!(t[1].1, DataType::Boolean);
+                assert_eq!(t[2].1, DataType::Boolean);
+            }
+        }
     }
 }

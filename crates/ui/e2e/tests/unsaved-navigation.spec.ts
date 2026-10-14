@@ -76,6 +76,7 @@ for (const action of ["rail", "create", "filter"] as const) {
       const editor = new VdEditor(page);
       await editor.setDoc(JSON.stringify({ ...JSON.parse(await editor.doc()), name: "unsaved_navigation" }));
       let destinations = 0;
+      const navigated = page.waitForRequest(r => r.isNavigationRequest() && r.method() === "GET");
       page.on("request", r => { if (r.isNavigationRequest() && r.method() === "GET") destinations++; });
       if (action === "rail") await page.locator(`#vd-rail-list a[data-type='${second}']`).click();
       else if (action === "create") await page.locator(".page-head__actions a[data-editor-link]").click();
@@ -85,6 +86,9 @@ for (const action of ["rail", "create", "filter"] as const) {
         await filter.press("Enter");
       }
       await acceptConfirm(page, MESSAGE);
+      // The typed filter also arms the live htmx request, whose replaced URL
+      // would satisfy waitForURL without any navigation: wait for the GET.
+      await navigated;
       await page.waitForURL(url => action === "rail" ? url.searchParams.get("vd") === second : action === "create" ? url.searchParams.get("vd") === "new" : url.searchParams.get("filter") === "issue1880");
       expect(destinations).toBe(1);
       expect(dialogsSeen(page)).toEqual([]);

@@ -23,7 +23,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace};
 
 use helios_sof::arrow::record_batch::RecordBatch;
-use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnarBatchBuilder};
+use helios_sof::columnar::ColumnarBatchBuilder;
+use helios_sof::columnar_stream::STREAM_BATCH_ROWS;
+use helios_sof::parquet_schema::declared_arrow_types;
+use helios_sof::sqlquery::engine::declared_columns;
 
 use crate::core::sof_runner::{
     BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
@@ -38,7 +41,7 @@ use super::runtime::{RuntimeParam, prepare_sql_run};
 const CHANNEL_BUFFER: usize = 256;
 
 /// Channel buffer depth of the columnar path, in batches. A batch holds up to
-/// [`COLUMNAR_BATCH_ROWS`] rows, so a couple of them is plenty of read-ahead.
+/// [`STREAM_BATCH_ROWS`] rows, so a couple of them is plenty of read-ahead.
 const BATCH_CHANNEL_BUFFER: usize = 2;
 
 /// SQL-on-FHIR runner that compiles ViewDefinitions to SQLite SQL.
@@ -155,8 +158,9 @@ impl SofRunner for SqliteInDbRunner {
             .iter()
             .map(|d| d.column_kind())
             .collect();
+        let declared = declared_arrow_types(&compiled.columns, &declared_columns(&view_definition));
         let builder =
-            ColumnarBatchBuilder::new(compiled.columns.clone(), kinds, COLUMNAR_BATCH_ROWS)
+            ColumnarBatchBuilder::new(compiled.columns.clone(), kinds, declared, STREAM_BATCH_ROWS)
                 .map_err(|e| SofError::Backend(format!("columnar builder: {e}")))?;
         debug!(runner = "sqlite-indb", tenant = %tenant_id, "executing compiled ViewDefinition (columnar)");
         let params = prepared
@@ -495,28 +499,36 @@ fn send_batch(
     }
 }
 
-/// Appends one result row to the builder, cell by cell, like
-/// [`map_sqlite_row`] but without the intermediate JSON object.
+/// Appends one result row to the builder, cell by cell, with exactly the value
+/// [`map_sqlite_row`] would build for it (no intermediate JSON object).
+///
+/// Text is appended natively (`append_str`) only for a `Text` decode, where the
+/// row path yields `Value::String`. Every other decode can produce a boolean,
+/// number, array or object from text, so the decoded value goes through
+/// `append_deferred`, which a typed builder dispatches to its typed append.
 fn append_sqlite_row(
     row: &rusqlite::Row<'_>,
     decodes: &[ColumnDecode],
     builder: &mut ColumnarBatchBuilder,
 ) -> rusqlite::Result<()> {
     for i in 0..builder.column_count() {
+        let decode = decodes.get(i).copied().unwrap_or_default();
         match row.get_ref(i)? {
             ValueRef::Null => builder.append_null(i),
+            // SQLite has no boolean type: 0/1 in a boolean column is a boolean.
+            ValueRef::Integer(n @ (0 | 1)) if decode == ColumnDecode::Boolean => {
+                builder.append_bool(i, n == 1)
+            }
             ValueRef::Integer(n) => builder.append_i64(i, n),
             ValueRef::Real(f) if f.is_finite() => builder.append_f64(i, f),
             // Matches the row path: NaN and +/-Inf are reported as 0.
             ValueRef::Real(_) => builder.append_i64(i, 0),
             ValueRef::Text(b) | ValueRef::Blob(b) => {
                 let text = String::from_utf8_lossy(b);
-                let decode = decodes.get(i).copied().unwrap_or_default();
-                match decode {
-                    ColumnDecode::Json | ColumnDecode::Auto => {
-                        builder.append_deferred(i, decode_text(decode, text.into_owned()));
-                    }
-                    _ => builder.append_str(i, &text),
+                if decode == ColumnDecode::Text {
+                    builder.append_str(i, &text);
+                } else {
+                    builder.append_deferred(i, decode_text(decode, text.into_owned()));
                 }
             }
         }

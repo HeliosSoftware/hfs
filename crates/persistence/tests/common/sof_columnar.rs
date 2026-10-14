@@ -5,10 +5,9 @@
 //! [`SofRunner::run_view`] (rows, then the buffered Arrow formatter) and
 //! [`SofRunner::run_view_columnar`], and compares what comes out.
 //!
-//! Values are compared by their rendered text, not by Arrow type: the
-//! columnar path types columns from the view, while the row path votes on the
-//! first 100 values, so e.g. an all-null `integer` column is `Int32` on one
-//! side and `Utf8` on the other. Use [`column_types`] to pin types explicitly.
+//! The row path is rendered exactly as the REST handler does on main: the
+//! schema comes from `resolve_arrow_schema` with the view's declared columns,
+//! so the columnar path must match it in Arrow types as well as in values.
 
 #![allow(dead_code)]
 
@@ -40,13 +39,48 @@ pub async fn row_path_cells(
     while let Some(item) = stream.next().await {
         rows.push(item.expect("row"));
     }
+    let (schema, columns, cells) = render_row_path(rows, view);
+    drop(schema);
+    (columns, cells)
+}
+
+/// Row-path schema and cells for `rows`, as the REST handler builds them.
+fn render_row_path(
+    rows: Vec<Value>,
+    view: &Value,
+) -> (
+    helios_sof::arrow::datatypes::Schema,
+    Vec<String>,
+    Vec<Vec<Cell>>,
+) {
     let result = helios_sof::rows_to_processed_result(rows);
-    let schema = helios_sof::parquet_schema::create_arrow_schema(&result.columns, &result.rows)
-        .expect("schema");
+    let declared = helios_sof::sqlquery::engine::declared_columns(view);
+    let schema =
+        helios_sof::parquet_schema::resolve_arrow_schema(&result.columns, &declared, &result.rows)
+            .expect("schema");
     let arrays =
         helios_sof::parquet_schema::process_to_arrow_arrays(&schema, &result.columns, &result.rows)
             .expect("arrays");
-    (result.columns.clone(), cells_of(&arrays, result.rows.len()))
+    let cells = cells_of(&arrays, result.rows.len());
+    (schema, result.columns.clone(), cells)
+}
+
+/// The Arrow schema the row path produces for `view`.
+pub async fn row_path_schema(
+    runner: &dyn SofRunner,
+    tenant: &TenantContext,
+    view: &Value,
+    filters: &ViewFilters,
+) -> helios_sof::arrow::datatypes::Schema {
+    let mut stream = runner
+        .run_view(tenant, view.clone(), filters.clone())
+        .await
+        .expect("run_view");
+    let mut rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        rows.push(item.expect("row"));
+    }
+    render_row_path(rows, view).0
 }
 
 /// Batches produced by the columnar path. Panics if the runner has no
@@ -69,8 +103,8 @@ pub async fn columnar_batches(
     batches
 }
 
-/// Asserts the columnar path yields the same column names, row count, row
-/// order and cell values as the row path.
+/// Asserts the columnar path yields the same column names, Arrow types, row
+/// count, row order and cell values as the row path.
 ///
 /// Returns the batches so callers can add type assertions.
 pub async fn assert_columnar_parity(
@@ -81,8 +115,16 @@ pub async fn assert_columnar_parity(
     ctx: &str,
 ) -> Vec<RecordBatch> {
     let (expected_columns, expected) = row_path_cells(runner, tenant, view, filters).await;
+    let expected_schema = row_path_schema(runner, tenant, view, filters).await;
     let batches = columnar_batches(runner, tenant, view, filters).await;
 
+    if let Some(first) = batches.first() {
+        assert_eq!(
+            first.schema().fields(),
+            expected_schema.fields(),
+            "{ctx}: Arrow schema differs from the row path"
+        );
+    }
     if expected.is_empty() {
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(

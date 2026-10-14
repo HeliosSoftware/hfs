@@ -1638,6 +1638,18 @@ mod sof_pg_runner_tests {
         assert_pr410_cases(&["UsCoreBloodPressures"]).await;
     }
 
+    /// `exists(criteria)` over a path with more than one repeating step
+    /// (`component` and `coding`) sees every element (#1946).
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_exists_over_repeating_steps() {
+        assert_pr410_cases(&[
+            "ExistsAcrossRepeatingStepsWhere",
+            "ExistsAcrossRepeatingStepsColumns",
+        ])
+        .await;
+    }
+
     /// `forEach: "name.where(use = 'official').first()"`.
     #[cfg(feature = "R4")]
     #[tokio::test]
@@ -2028,8 +2040,8 @@ mod sof_pg_runner_tests {
     // Columnar path parity (run_view_columnar vs run_view)
     // =========================================================================
 
-    /// Every PR #410 and extra case yields the same names, rows and cells on
-    /// the columnar path as on the row path.
+    /// Every PR #410 and extra case yields the same schema names, rows and
+    /// cells on the columnar path as on the row path.
     #[cfg(feature = "R4")]
     #[tokio::test]
     async fn test_pg_columnar_parity_pr410_cases() {
@@ -2057,25 +2069,6 @@ mod sof_pg_runner_tests {
             else {
                 continue;
             };
-            if case.name == "UsCoreBloodPressures" {
-                // Declared-type change: the row path votes `120` as Int32,
-                // the columnar path types the untyped Quantity.value from the
-                // view as Float64 and renders `120.0`. Pin that instead.
-                let batches = super::sof_columnar::columnar_batches(
-                    runner.as_ref(),
-                    &tenant,
-                    &case.view,
-                    &ViewFilters::default(),
-                )
-                .await;
-                let types = super::sof_columnar::column_types(&batches);
-                let (_, ty) = types
-                    .iter()
-                    .find(|(n, _)| n == "sbp_quantity_value")
-                    .expect("sbp_quantity_value column");
-                assert_eq!(*ty, helios_sof::arrow::datatypes::DataType::Float64);
-                continue;
-            }
             assert_columnar_parity(
                 runner.as_ref(),
                 &tenant,
@@ -2150,6 +2143,69 @@ mod sof_pg_runner_tests {
         let batches =
             assert_columnar_parity(runner.as_ref(), &tenant, &view, &limited, "limit").await;
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// Declared `integer`/`boolean` columns, all-NULL columns, an undeclared
+    /// column that becomes typed after the first batch, and `_limit` all match
+    /// the row path in schema and values.
+    #[tokio::test]
+    async fn test_pg_columnar_typing_edge_cases() {
+        use super::sof_columnar::{assert_columnar_parity, column_types};
+        use helios_sof::arrow::datatypes::DataType;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        // Past one 8192-row batch so later batches reuse the first one's types.
+        let pairs: Vec<(String, String)> = (0..8300)
+            .map(|i| {
+                (
+                    format!("e{i:05}"),
+                    if i % 2 == 0 { "male" } else { "female" }.into(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = pairs
+            .iter()
+            .map(|(i, g)| (i.as_str(), g.as_str(), "1990-01-01"))
+            .collect();
+        seed_patients(&backend, &tenant, &refs).await;
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "id"},
+                {"path": "name.count()", "name": "names_undeclared"},
+                {"path": "name.count()", "name": "names_i64", "type": "integer64"},
+                {"path": "active", "name": "active", "type": "boolean"},
+                {"path": "active", "name": "active_undeclared"},
+                {"path": "deceasedBoolean", "name": "never_set", "type": "integer"},
+                {"path": "deceasedBoolean", "name": "never_set_undeclared"}
+            ]}]
+        });
+        let batches = assert_columnar_parity(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+            "typing",
+        )
+        .await;
+        assert!(batches.len() >= 2, "expected more than one batch");
+        let types = column_types(&batches);
+        let ty = |n: &str| types.iter().find(|(c, _)| c == n).unwrap().1.clone();
+        assert_eq!(ty("names_i64"), DataType::Int64);
+        assert_eq!(ty("active"), DataType::Boolean);
+        assert_eq!(ty("never_set"), DataType::Int32);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 8300);
+
+        let limited = ViewFilters {
+            limit: Some(8200),
+            ..Default::default()
+        };
+        let batches =
+            assert_columnar_parity(runner.as_ref(), &tenant, &view, &limited, "limit-2batch").await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 8200);
     }
 
     /// A view that matches no rows ends the stream without a batch.

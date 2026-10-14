@@ -275,7 +275,15 @@ the full semantics. The server renders each rail's "Recently used" group
 from `recent`; Compartments is the one exception — it remembers only `last`,
 no group, since its 4-5 definitions would make one noise. With no settings
 store configured there is nothing to render or restore, and every rail opens
-on its page default. `resource-filter.js` now only owns a rail's tooltip and
+on its page default. A rail's filter box applies to the "Recently used" group
+as well as the list (a term matching nothing hides the group and its divider):
+the SQL and Search Parameters rails filter server-side and swap the list and
+group via htmx as you type (View Definitions also swaps its pagination, and the
+SQL rails their "not in the filtered list" notice; Enter still submits the GET
+form). The SQL rails send `X-Rail-Filter` while typing so the echoed selection
+is never recorded as a pick, and replace the URL so reload keeps the filter,
+while the Resources/Search type rail filters client-side in `search-builder.js`.
+`resource-filter.js` now only owns a rail's tooltip and
 scroll-to-selection on arrival — recents are server-rendered, not client-side.
 
 ### i18n

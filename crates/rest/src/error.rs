@@ -811,6 +811,16 @@ impl From<helios_auth::AuthError> for RestError {
             } => RestError::Forbidden {
                 message: format!("Insufficient scope for {} on {}", operation, resource_type),
             },
+            // A patient/ scope with nothing to confine it to is a 403, not a
+            // 401: the token is valid, the grant just cannot be honoured (#1618).
+            helios_auth::AuthError::PatientContextRequired {
+                resource_type,
+                operation,
+            } => RestError::Forbidden {
+                message: format!(
+                    "{operation} on {resource_type} is granted only by a patient/ scope, and the token carries no usable patient launch context to confine it to"
+                ),
+            },
             helios_auth::AuthError::InternalError(msg) => RestError::InternalError { message: msg },
             other => RestError::Unauthorized {
                 message: other.to_string(),
