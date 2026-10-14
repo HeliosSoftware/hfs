@@ -300,7 +300,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | ES index name prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | *(none)* | ES basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | ES basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | ES request timeout in milliseconds, including `_bulk`. A `_bulk` request that times out is split in half and resent |
@@ -363,6 +363,9 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing (required by MinIO and most S3-compatible providers) |
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure `http://` endpoint URLs (only relevant when `HFS_S3_ENDPOINT` is set) |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+
+**S3 keyspace layout (`HFS_S3_KEYSPACE_LAYOUT`).** Each tenant has one layout, `v1` or `v2`, recorded in a marker object `history/_keyspace.json` (`{"layout":2}`). The variable only decides the layout of a tenant that has no marker and no data yet; a tenant that already holds objects without a marker is always `v1`, and a stamped marker always wins, so changing the variable never moves existing data. `v2` stores `resources/{type}/{h2}/{id}/…` and `history/type/{type}/{h2}/…` with `h2 = hex(sha256(id))[0..2]` (256 sub-prefixes) and drops the tenant-wide `history/system/` index (system history is served from `history/type/`), so each write does 3 PUTs instead of 4. The layout of a tenant is immutable: there is no migration, and `purge_tenant_data` keeps the marker. To change it, stop every instance and delete the tenant's prefix by hand. `v2` requires every instance that writes the bucket to run a build that reads the marker and to use the same setting; an older binary ignores the marker and would write `v1` keys into a `v2` tenant, leaving them unreachable. Opt-in: the default is `v1`.
 
 **SQL-on-FHIR async export**
 

@@ -80,7 +80,7 @@ a startup warning.
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | Elasticsearch index prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | none | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | none | Elasticsearch basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
 | `HFS_ELASTICSEARCH_MAX_TERMS_COUNT` | `65536` | Index `max_terms_count`: most values one `terms` query carries; a chained or `_has` search that pins more ids is sent as several `terms` clauses of at most this many each (#1548). Set on new indices |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
@@ -133,6 +133,7 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Required by MinIO and most S3-compatible providers |
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure HTTP endpoint URLs when `HFS_S3_ENDPOINT` is set |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
 
 The standard AWS credential chain applies. For S3-compatible endpoints, set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`. One HFS process shares a single AWS credential chain, so a MinIO primary store and real-AWS bulk-export output store cannot be combined in the same process.
 
@@ -223,7 +224,7 @@ for the rest):
 
 | Prefix | Contents |
 |---|---|
-| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history |
+| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history (`history/_keyspace.json` is the per-tenant layout marker; the policy must allow `GetObject`/`PutObject` on it) |
 | `{tenant}/bulk/submit/` | Bulk-submit staging |
 | `tenants/` | Tenant registry |
 | `_system.user-settings/` | Per-user UI settings (`/_user/settings`) |

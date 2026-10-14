@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::SYSTEM_TENANT;
 
+use super::keyspace::KeyspaceLayout;
+
 /// Tenant-to-bucket resolution for S3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -66,6 +68,19 @@ pub struct S3BackendConfig {
 
     /// Default ingestion batch size for bulk submit processing.
     pub bulk_submit_batch_size: u32,
+
+    /// Layout stamped on tenants that have no keyspace marker and no data yet.
+    ///
+    /// A tenant that already holds objects without a marker is always `V1`, and
+    /// a stamped marker always wins, so this only decides how *new* tenants are
+    /// laid out. Defaults to `V1`; `V2` requires every instance that writes the
+    /// bucket to run a build that reads the marker.
+    #[serde(default = "default_keyspace_layout")]
+    pub default_keyspace_layout: KeyspaceLayout,
+}
+
+fn default_keyspace_layout() -> KeyspaceLayout {
+    KeyspaceLayout::V1
 }
 
 impl Default for S3BackendConfig {
@@ -82,6 +97,7 @@ impl Default for S3BackendConfig {
             validate_buckets_on_startup: true,
             bulk_export_part_size: 10_000,
             bulk_submit_batch_size: 100,
+            default_keyspace_layout: KeyspaceLayout::V1,
         }
     }
 }

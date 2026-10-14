@@ -28,8 +28,8 @@ use super::backend::ElasticsearchBackend;
 /// of `create_index_mapping`. Without the bump, existing indices never see
 /// the change (#1335: `ignore_malformed` from #1314 reached new indices only).
 /// Edits to the `settings` half do not need a bump: settings are not part of
-/// `PUT _mapping`, and the dynamic ones have their own pass
-/// (`raise_nested_objects_limit`).
+/// `PUT _mapping`, and the dynamic ones have their own passes
+/// (`raise_nested_objects_limit`, `apply_refresh_interval`).
 ///
 /// # What a bump can and cannot deliver
 ///
@@ -453,6 +453,116 @@ fn indices_below_nested_limit(body: &serde_json::Value, target: u64) -> Vec<Stri
         .collect();
     below.sort();
     below
+}
+
+/// The index setting `refresh_interval` is reported under with `flat_settings`.
+const REFRESH_INTERVAL_SETTING: &str = "index.refresh_interval";
+
+/// Sets the configured `refresh_interval` on every existing index under the
+/// configured prefix that has a different one, and returns how many indices
+/// were changed (#1749).
+///
+/// The interval goes into the settings an index is created with, so an index
+/// made under an earlier value keeps it. Under `wait_for` writes that value is
+/// what every interactive write waits for. The setting is dynamic, so it
+/// changes on a live index.
+///
+/// Unlike [`raise_nested_objects_limit`] this sets the value rather than only
+/// raising it, so it overwrites one an operator set by hand on any index
+/// matching `{prefix}_*`.
+pub async fn apply_refresh_interval(backend: &ElasticsearchBackend) -> StorageResult<usize> {
+    /// Index names per update request, keeping the request URL short.
+    const INDICES_PER_REQUEST: usize = 50;
+
+    let target = backend.config().refresh_interval.as_str();
+    let pattern = format!("{}_*", backend.config().index_prefix);
+
+    let response = backend
+        .client()
+        .indices()
+        .get_settings(IndicesGetSettingsParts::IndexName(
+            &[&pattern],
+            &[REFRESH_INTERVAL_SETTING],
+        ))
+        .include_defaults(true)
+        .flat_settings(true)
+        .allow_no_indices(true)
+        .ignore_unavailable(true)
+        .send()
+        .await
+        .map_err(|e| settings_error(format!("Failed to read index settings: {e}")))?;
+    let status = response.status_code();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| settings_error(format!("Failed to parse index settings: {e}")))?;
+    if !status.is_success() {
+        return Err(settings_error(format!(
+            "Reading index settings failed (status {status}): {body}"
+        )));
+    }
+
+    let differing = indices_with_other_refresh_interval(&body, target);
+    for chunk in differing.chunks(INDICES_PER_REQUEST) {
+        let names: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        let mut settings = serde_json::Map::new();
+        settings.insert(REFRESH_INTERVAL_SETTING.to_string(), json!(target));
+        let response = backend
+            .client()
+            .indices()
+            .put_settings(IndicesPutSettingsParts::Index(&names))
+            .body(serde_json::Value::Object(settings))
+            .send()
+            .await
+            .map_err(|e| {
+                settings_error(format!("Failed to set {REFRESH_INTERVAL_SETTING}: {e}"))
+            })?;
+        let status = response.status_code();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(settings_error(format!(
+                "Setting {REFRESH_INTERVAL_SETTING} failed (status {status}): {text}"
+            )));
+        }
+    }
+    Ok(differing.len())
+}
+
+/// The indices in a `GET _settings?include_defaults=true&flat_settings=true`
+/// response whose refresh interval is not `target`, sorted by name.
+///
+/// Intervals are compared as durations, so `1000ms` matches `1s`; a value
+/// either side that is not a time value this crate reads is compared as text.
+/// An explicit per-index value wins over the cluster default. An index that
+/// reports the setting in neither place is left alone rather than guessed at.
+fn indices_with_other_refresh_interval(body: &serde_json::Value, target: &str) -> Vec<String> {
+    use super::backend::parse_refresh_interval;
+
+    let Some(indices) = body.as_object() else {
+        return Vec::new();
+    };
+    let wanted = parse_refresh_interval(target);
+    let mut differing: Vec<String> = indices
+        .iter()
+        .filter_map(|(name, entry)| {
+            let current = entry
+                .get("settings")
+                .and_then(|s| s.get(REFRESH_INTERVAL_SETTING))
+                .or_else(|| {
+                    entry
+                        .get("defaults")
+                        .and_then(|d| d.get(REFRESH_INTERVAL_SETTING))
+                })?
+                .as_str()?;
+            let same = match (wanted, parse_refresh_interval(current)) {
+                (Some(wanted), Some(current)) => wanted == current,
+                _ => current.trim() == target.trim(),
+            };
+            (!same).then(|| name.clone())
+        })
+        .collect();
+    differing.sort();
+    differing
 }
 
 fn settings_error(message: String) -> crate::error::StorageError {
@@ -1147,6 +1257,16 @@ mod tests {
             mapping["settings"]["index.mapping.nested_objects.limit"],
             50_000
         );
+        // #1749: the configured interval is part of an index's own settings.
+        assert_eq!(mapping["settings"]["refresh_interval"], "1s");
+        let slow = ElasticsearchConfig {
+            refresh_interval: "30s".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            create_index_mapping(&slow)["settings"]["refresh_interval"],
+            "30s"
+        );
 
         // Verify mappings exist
         let props = &mapping["mappings"]["properties"];
@@ -1543,6 +1663,35 @@ mod tests {
         });
     }
 
+    /// #1506: an index the startup pass already brought up to date is not read
+    /// or warned about again by the write path on the same backend.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_write_path_skips_an_index_the_startup_pass_reconciled() {
+        let server = stub_cluster(
+            &[("hfs_t_patient", v(1))],
+            200,
+            Some(&[("hfs_t_patient", 4)]),
+        )
+        .await;
+        let backend = backend_on(&server);
+        reconcile_index_mappings(&backend).await;
+        reconcile_index(&backend, "hfs_t_patient").await;
+
+        let single_reads = server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .into_iter()
+            .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/hfs_t_patient/_mapping")
+            .count();
+        assert_eq!(single_reads, 0);
+        logs_assert(|lines: &[&str]| {
+            assert_eq!(reindex_warnings(lines).len(), 1, "{lines:?}");
+            Ok(())
+        });
+    }
+
     /// #1391: the write path reconciles an index the startup pass did not see;
     /// the same rule applies there, once per index.
     #[tokio::test]
@@ -1630,5 +1779,166 @@ mod tests {
         );
         assert!(indices_below_nested_limit(&json!({}), 50_000).is_empty());
         assert!(indices_below_nested_limit(&json!("not an object"), 50_000).is_empty());
+    }
+
+    /// #1749: which existing indices get the configured interval. Durations are
+    /// compared, an explicit value beats the cluster default, and an index that
+    /// reports no value is not guessed at.
+    #[test]
+    fn test_indices_with_other_refresh_interval() {
+        let body = json!({
+            "hfs_t_slow": { "settings": { "index.refresh_interval": "30s" }, "defaults": {} },
+            "hfs_t_same": { "settings": { "index.refresh_interval": "1s" } },
+            "hfs_t_same_in_ms": { "settings": { "index.refresh_interval": "1000ms" } },
+            "hfs_t_off": { "settings": { "index.refresh_interval": "-1" } },
+            "hfs_t_default": { "settings": {}, "defaults": { "index.refresh_interval": "1s" } },
+            "hfs_t_explicit_over_default": {
+                "settings": { "index.refresh_interval": "5s" },
+                "defaults": { "index.refresh_interval": "1s" }
+            },
+            "hfs_t_unknown": { "settings": {}, "defaults": {} }
+        });
+
+        assert_eq!(
+            indices_with_other_refresh_interval(&body, "1s"),
+            vec![
+                "hfs_t_explicit_over_default".to_string(),
+                "hfs_t_off".to_string(),
+                "hfs_t_slow".to_string()
+            ]
+        );
+        assert_eq!(
+            indices_with_other_refresh_interval(&body, "-1"),
+            vec![
+                "hfs_t_default".to_string(),
+                "hfs_t_explicit_over_default".to_string(),
+                "hfs_t_same".to_string(),
+                "hfs_t_same_in_ms".to_string(),
+                "hfs_t_slow".to_string()
+            ]
+        );
+        // A target this crate cannot read falls back to comparing text.
+        assert_eq!(
+            indices_with_other_refresh_interval(&body, "1.5s").len(),
+            6,
+            "every index with a value differs from an unreadable target"
+        );
+        assert!(indices_with_other_refresh_interval(&json!({}), "1s").is_empty());
+        assert!(indices_with_other_refresh_interval(&json!("nope"), "1s").is_empty());
+    }
+
+    /// A stub cluster answering `GET _settings` with `listing` and every
+    /// `PUT _settings` with `put_status`.
+    async fn settings_cluster(listing: Value, put_status: u16) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/hfs_\\*/_settings/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(listing))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex("^/.+/_settings$"))
+            .respond_with(
+                ResponseTemplate::new(put_status).set_body_json(json!({ "acknowledged": true })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn settings_puts(server: &MockServer) -> Vec<wiremock::Request> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("/_settings"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn apply_refresh_interval_sets_only_the_indices_that_differ() {
+        let server = settings_cluster(
+            json!({
+                "hfs_t_patient": { "settings": { "index.refresh_interval": "30s" } },
+                "hfs_t_encounter": { "settings": { "index.refresh_interval": "1000ms" } },
+                "hfs_t_basic": { "settings": {}, "defaults": { "index.refresh_interval": "1s" } },
+                "hfs_t_group": { "settings": { "index.refresh_interval": "-1" } }
+            }),
+            200,
+        )
+        .await;
+
+        let changed = apply_refresh_interval(&backend_on(&server))
+            .await
+            .expect("apply");
+        assert_eq!(changed, 2);
+
+        let puts = settings_puts(&server).await;
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].url.path(), "/hfs_t_group,hfs_t_patient/_settings");
+        let body: Value = serde_json::from_slice(&puts[0].body).unwrap();
+        assert_eq!(body, json!({ "index.refresh_interval": "1s" }));
+    }
+
+    #[tokio::test]
+    async fn apply_refresh_interval_is_a_no_op_when_every_index_matches() {
+        let server = settings_cluster(
+            json!({ "hfs_t_patient": { "settings": { "index.refresh_interval": "1s" } } }),
+            200,
+        )
+        .await;
+        assert_eq!(
+            apply_refresh_interval(&backend_on(&server)).await.unwrap(),
+            0
+        );
+        assert!(settings_puts(&server).await.is_empty());
+
+        // No indices at all.
+        let server = settings_cluster(json!({}), 200).await;
+        assert_eq!(
+            apply_refresh_interval(&backend_on(&server)).await.unwrap(),
+            0
+        );
+        assert!(settings_puts(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_refresh_interval_reports_a_failed_read_or_write() {
+        let server = settings_cluster(
+            json!({ "hfs_t_patient": { "settings": { "index.refresh_interval": "30s" } } }),
+            403,
+        )
+        .await;
+        let error = apply_refresh_interval(&backend_on(&server))
+            .await
+            .expect_err("a refused update is an error");
+        assert!(error.to_string().contains("403"), "{error}");
+
+        // The listing itself failing.
+        let server = MockServer::start().await;
+        let error = apply_refresh_interval(&backend_on(&server))
+            .await
+            .expect_err("an unanswered read is an error");
+        assert!(error.to_string().contains("settings"), "{error}");
+    }
+
+    /// Many indices go in chunks, so the request URL stays short.
+    #[tokio::test]
+    async fn apply_refresh_interval_chunks_large_clusters() {
+        let listing: serde_json::Map<String, Value> = (0..120)
+            .map(|i| {
+                (
+                    format!("hfs_t_type{i:03}"),
+                    json!({ "settings": { "index.refresh_interval": "30s" } }),
+                )
+            })
+            .collect();
+        let server = settings_cluster(Value::Object(listing), 200).await;
+        assert_eq!(
+            apply_refresh_interval(&backend_on(&server)).await.unwrap(),
+            120
+        );
+        assert_eq!(settings_puts(&server).await.len(), 3);
     }
 }

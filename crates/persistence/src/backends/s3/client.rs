@@ -162,6 +162,41 @@ pub trait S3Api: Send + Sync {
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError>;
 
+    /// Like [`Self::list_objects`], but starting after the key `start_after`
+    /// (S3 `StartAfter`; ignored by S3 once a `continuation` token is given).
+    ///
+    /// The default walks the whole listing and filters, which is correct but
+    /// not cheaper; the AWS client overrides it with a real `StartAfter`.
+    async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: &str,
+        continuation: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
+        let mut items = Vec::new();
+        let mut token = continuation.map(str::to_string);
+        loop {
+            let page = self
+                .list_objects(bucket, prefix, token.as_deref(), max_keys)
+                .await?;
+            items.extend(
+                page.items
+                    .into_iter()
+                    .filter(|i| i.key.as_str() > start_after),
+            );
+            token = page.next_continuation_token;
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(ListObjectsResult {
+            items,
+            next_continuation_token: None,
+        })
+    }
+
     /// Lists the distinct key groups directly under `prefix` (S3
     /// `CommonPrefixes` with `delimiter`), following continuation tokens to
     /// exhaustion. Each returned string is the full common prefix — `prefix`,
@@ -532,8 +567,23 @@ impl S3Api for AwsS3Client {
         continuation: Option<&str>,
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError> {
+        self.list_objects_after(bucket, prefix, "", continuation, max_keys)
+            .await
+    }
+
+    async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: &str,
+        continuation: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
         let mut req = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
 
+        if !start_after.is_empty() {
+            req = req.start_after(start_after);
+        }
         if let Some(token) = continuation {
             req = req.continuation_token(token);
         }
