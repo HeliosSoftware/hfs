@@ -182,6 +182,7 @@
 
 pub mod app;
 pub mod canonical;
+pub mod columnar;
 pub mod columnar_stream;
 pub mod compartment;
 pub mod constants;
@@ -234,7 +235,11 @@ use thiserror::Error;
 use traits::*;
 
 // Re-export commonly used types and traits for easier access
+/// Arrow and Parquet as built against by this crate, so dependents that
+/// handle record batches need no matching dependency of their own.
+pub use arrow;
 pub use helios_fhir::FhirVersion;
+pub use parquet;
 pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 
 /// Multi-version ViewDefinition container supporting version-agnostic operations.

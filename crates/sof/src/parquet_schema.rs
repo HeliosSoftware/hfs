@@ -172,7 +172,7 @@ fn cell_as_i64(value: Option<Value>) -> Option<i64> {
     }
 }
 
-fn build_array_from_values(
+pub(crate) fn build_array_from_values(
     values: Vec<Option<Value>>,
     data_type: &DataType,
 ) -> Result<ArrayRef, SofError> {
