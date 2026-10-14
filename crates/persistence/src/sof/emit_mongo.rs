@@ -781,7 +781,7 @@ fn lower_where_exists(
     negate: bool,
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
-    let filtered = lower_where_filter(focus, iter_alias, predicate, ctx)?;
+    let filtered = lower_where_filter(focus, iter_alias, predicate, true, ctx)?;
     let exists: Bson = doc! { "$gt": [doc! { "$size": filtered }, 0i64] }.into();
     if negate {
         Ok(doc! { "$not": [exists] }.into())
@@ -799,7 +799,7 @@ fn lower_where_scalar(
     projection: &SqlExpr,
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
-    let filtered = lower_where_filter(focus, iter_alias, predicate, ctx)?;
+    let filtered = lower_where_filter(focus, iter_alias, predicate, false, ctx)?;
     let var = scope_var(iter_alias);
     let child = ctx.child(format!("{iter_alias}.value"), var.clone());
     let projection = lower_expr(projection, &child)?;
@@ -814,13 +814,31 @@ fn lower_where_scalar(
 
 /// Shared `$filter` for the `where()` constructs: iterate `focus` (coerced to an
 /// array), binding each element to the alias variable, keeping the truthy ones.
+///
+/// With `flatten`, a `JsonPath` focus crossing more than one field step is
+/// flattened across every repeating step (`$reduce`/`$concatArrays`) instead of
+/// following only the first element of each intermediate array.
 fn lower_where_filter(
     focus: &SqlExpr,
     iter_alias: &str,
     predicate: &SqlExpr,
+    flatten: bool,
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
-    let arr = ensure_array(lower_expr(focus, ctx)?);
+    let arr = match focus {
+        SqlExpr::JsonPath { root, path }
+            if flatten
+                && path
+                    .0
+                    .iter()
+                    .filter(|s| matches!(s, PathStep::Field(_)))
+                    .count()
+                    > 1 =>
+        {
+            lower_collection_agg(root, path, ctx)?
+        }
+        _ => ensure_array(lower_expr(focus, ctx)?),
+    };
     let var = scope_var(iter_alias);
     let child = ctx.child(format!("{iter_alias}.value"), var.clone());
     let cond = truthy(lower_expr(predicate, &child)?);
@@ -1253,6 +1271,38 @@ mod tests {
             "expected first-element flattening"
         );
         assert!(rendered.contains("$isArray"), "expected array guard");
+    }
+
+    fn exists_where_pipeline(path: &str) -> String {
+        let pipeline = compile(json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }],
+            "where": [{ "path": path }],
+        }));
+        format!("{pipeline:?}")
+    }
+
+    #[test]
+    fn exists_over_multi_step_focus_flattens_every_repeating_step() {
+        let rendered = exists_where_pipeline(
+            "component.code.coding.exists(system = 'http://loinc.org' and code = '8480-6')",
+        );
+        assert!(rendered.contains("$filter"), "expected a $filter");
+        assert!(
+            rendered.contains("$reduce") && rendered.contains("$concatArrays"),
+            "expected $reduce/$concatArrays flattening: {rendered}"
+        );
+
+        let negated = exists_where_pipeline("component.code.coding.where(code = '8480-6').empty()");
+        assert!(negated.contains("$reduce"), "empty() must flatten too");
+    }
+
+    #[test]
+    fn exists_over_single_repeating_step_keeps_plain_lowering() {
+        let rendered = exists_where_pipeline("category.exists(text = 'vital-signs')");
+        assert!(rendered.contains("$filter"), "expected a $filter");
+        assert!(!rendered.contains("$reduce"), "single-step focus unchanged");
     }
 
     #[test]

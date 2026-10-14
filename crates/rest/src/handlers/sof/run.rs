@@ -465,16 +465,47 @@ where
         "dispatching $viewdefinition-run"
     );
 
+    let runner_label = state
+        .config()
+        .sof_runner_header
+        .then(|| runner.runner_name());
+
+    let parquet_options = parquet_options_from_params(&body_params)?;
+
+    // Parquet and Arrow IPC: let the runner append database values straight
+    // to Arrow builders. A runner without a columnar path answers `None` and
+    // the row path below serves the request.
+    if let Some(columnar_type @ (ContentType::Parquet | ContentType::ArrowIpc)) = content_type
+        && let Some(batches) =
+            open_columnar(runner.as_ref(), &effective_tenant, &view_json, &filters).await?
+    {
+        let options = parquet_options.unwrap_or_default();
+        // The envelope needs the whole payload, as on the row path.
+        if wants_envelope {
+            let body = encode_batches(batches, columnar_type, &options).await?;
+            return buffered_response(
+                content_type_headers(columnar_type).0,
+                body,
+                wants_envelope,
+                runner_label,
+                &format,
+            );
+        }
+        return Ok(streaming_batch_response(
+            batches,
+            columnar_type,
+            options,
+            runner_label,
+            &format,
+        ));
+    }
+
     // Probe the runner — surfaces synchronous Uncompilable errors as 422
     // before we start streaming bytes to the client.
     let stream = runner
         .run_view(&effective_tenant, view_json.clone(), filters.clone())
         .await
         .map_err(map_sof_error_to_rest)?;
-    let runner_label = state
-        .config()
-        .sof_runner_header
-        .then(|| runner.runner_name());
 
     // `_format=fhir`: buffer the rows and render the typed `Parameters`
     // resource, using the ViewDefinition's declared column types.
@@ -499,8 +530,6 @@ where
         return Ok(streaming_ndjson_response(stream, runner_label));
     }
 
-    let parquet_options = parquet_options_from_params(&body_params)?;
-
     // Streaming path for parquet and arrow: the schema is fixed from the
     // ViewDefinition's declared types (plus a bounded row prefix) and rows are
     // encoded as they arrive. The envelope forfeits streaming for the same
@@ -520,6 +549,18 @@ where
     // Buffered paths (csv, json array, enveloped parquet/arrow) — collect the stream first.
     let (ct, body) =
         format_stream(stream, content_type, &view_json, parquet_options.as_ref()).await?;
+    buffered_response(ct, body, wants_envelope, runner_label, &format)
+}
+
+/// Wraps a fully buffered body in the optional base64 `Binary` envelope and
+/// builds the `200` response.
+fn buffered_response(
+    ct: &'static str,
+    body: Vec<u8>,
+    wants_envelope: bool,
+    runner_label: Option<&str>,
+    format: &str,
+) -> Result<Response, RestError> {
     let (ct, body) = if wants_envelope {
         let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
         (FHIR_JSON_MIME, wrapped)
@@ -531,8 +572,138 @@ where
         ct,
         body,
         runner_label,
-        &format,
+        format,
     ))
+}
+
+/// Record batches from a runner's columnar path, with the first one already
+/// read so a failure before any output still gets a real error status.
+struct ColumnarBatches {
+    schema: std::sync::Arc<helios_sof::arrow::datatypes::Schema>,
+    first: Option<helios_sof::arrow::record_batch::RecordBatch>,
+    rest: helios_persistence::core::sof_runner::BatchStream,
+}
+
+/// Opens the runner's columnar path for Parquet / Arrow IPC output.
+///
+/// Returns `Ok(None)` when the runner has no columnar path for this view, so
+/// the caller falls back to the row path. `Uncompilable` and the like, and an
+/// error producing the first batch, surface here before any bytes are sent.
+/// A stream that ends without a batch means the view returned no rows; the
+/// schema is then the one the row path uses for an empty result (the declared
+/// columns), without running the query again.
+async fn open_columnar(
+    runner: &dyn helios_persistence::core::sof_runner::SofRunner,
+    tenant: &helios_persistence::tenant::TenantContext,
+    view_json: &Value,
+    filters: &helios_persistence::core::sof_runner::ViewFilters,
+) -> Result<Option<ColumnarBatches>, RestError> {
+    let Some(mut rest) = runner
+        .run_view_columnar(tenant, view_json.clone(), filters.clone())
+        .await
+        .map_err(map_sof_error_to_rest)?
+    else {
+        return Ok(None);
+    };
+    let first = match rest.next().await {
+        Some(Ok(batch)) => Some(batch),
+        Some(Err(e)) => {
+            warn!(error = %e, "batch error before the columnar response started");
+            return Err(map_sof_error_to_rest(e));
+        }
+        None => None,
+    };
+    let schema = match &first {
+        Some(batch) => batch.schema(),
+        None => {
+            let declared = declared_columns(view_json);
+            let columns: Vec<String> = declared.iter().map(|d| d.name.clone()).collect();
+            std::sync::Arc::new(
+                resolve_arrow_schema(&columns, &declared, &[])
+                    .map_err(map_sof_lib_error_to_rest)?,
+            )
+        }
+    };
+    Ok(Some(ColumnarBatches {
+        schema,
+        first,
+        rest,
+    }))
+}
+
+/// Encodes every batch into one buffer (the `Binary` envelope needs the whole
+/// payload). A batch error returns an error status, never a truncated body.
+async fn encode_batches(
+    batches: ColumnarBatches,
+    content_type: ContentType,
+    options: &ParquetOptions,
+) -> Result<Vec<u8>, RestError> {
+    let ColumnarBatches {
+        schema,
+        first,
+        mut rest,
+    } = batches;
+    let mut enc = ColumnarEncoder::new(content_type, Vec::new(), schema, options)
+        .map_err(map_sof_lib_error_to_rest)?;
+    if let Some(batch) = first {
+        enc.write_batch(&batch).map_err(map_sof_lib_error_to_rest)?;
+    }
+    while let Some(item) = rest.next().await {
+        let batch = item.map_err(|e| {
+            warn!(error = %e, "batch error while collecting columnar stream");
+            map_sof_error_to_rest(e)
+        })?;
+        enc.write_batch(&batch).map_err(map_sof_lib_error_to_rest)?;
+    }
+    enc.finish().map_err(map_sof_lib_error_to_rest)
+}
+
+/// Streams the runner's record batches as Parquet or Arrow IPC through the
+/// same blocking encoder as [`streaming_columnar_response`]: past the first
+/// batch the `200` is committed, so a batch error aborts the chunked body.
+fn streaming_batch_response(
+    batches: ColumnarBatches,
+    content_type: ContentType,
+    options: ParquetOptions,
+    runner_label: Option<&str>,
+    format: &str,
+) -> Response {
+    let ColumnarBatches {
+        schema,
+        first,
+        mut rest,
+    } = batches;
+    let (msg_tx, body_rx) = spawn_columnar_encoder(content_type, schema, options);
+
+    tokio::spawn(async move {
+        if let Some(batch) = first
+            && msg_tx.send(EncodeMsg::Batch(batch)).await.is_err()
+        {
+            return;
+        }
+        loop {
+            let item = tokio::select! {
+                _ = msg_tx.closed() => return,
+                item = rest.next() => item,
+            };
+            let Some(item) = item else { break };
+            match item {
+                Ok(batch) => {
+                    if msg_tx.send(EncodeMsg::Batch(batch)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "batch error while streaming columnar output");
+                    let _ = msg_tx.send(EncodeMsg::Fail(e.to_string())).await;
+                    return;
+                }
+            }
+        }
+        let _ = msg_tx.send(EncodeMsg::End).await;
+    });
+
+    columnar_body_response(body_rx, content_type, runner_label, format)
 }
 
 /// Runs the view against inline `resource:` parameters using the in-process
@@ -939,6 +1110,8 @@ impl std::io::Write for ChannelWriter {
 /// Message from the async row reader to the blocking encoder.
 enum EncodeMsg {
     Rows(Vec<ProcessedRow>),
+    /// A batch already built by the runner's columnar path.
+    Batch(helios_sof::arrow::record_batch::RecordBatch),
     /// The stream ended cleanly.
     End,
     /// The stream failed; the encoder must abort without writing a footer.
@@ -1056,58 +1229,8 @@ async fn streaming_columnar_response(
     );
     drop(prefix);
 
-    let options = parquet_options.unwrap_or_default();
-    let (row_tx, mut row_rx) = tokio::sync::mpsc::channel::<EncodeMsg>(2);
-    let (body_tx, body_rx) =
-        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
-
-    // Blocking encoder: rows in, encoded chunks out.
-    let abort_tx = body_tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let sink = ChannelWriter {
-            tx: body_tx,
-            buf: Vec::new(),
-        };
-        let outcome = (|| -> Result<(), String> {
-            enum Enc {
-                Parquet(ParquetStreamWriter<ChannelWriter>),
-                Arrow(ArrowIpcStreamWriter<ChannelWriter>),
-            }
-            let mut enc = match content_type {
-                ContentType::ArrowIpc => {
-                    Enc::Arrow(ArrowIpcStreamWriter::new(sink, schema).map_err(|e| e.to_string())?)
-                }
-                _ => Enc::Parquet(
-                    ParquetStreamWriter::new(sink, schema, &options).map_err(|e| e.to_string())?,
-                ),
-            };
-            loop {
-                match row_rx.blocking_recv() {
-                    Some(EncodeMsg::Rows(rows)) => match &mut enc {
-                        Enc::Parquet(w) => w.write_rows(&rows),
-                        Enc::Arrow(w) => w.write_rows(&rows),
-                    }
-                    .map_err(|e| e.to_string())?,
-                    Some(EncodeMsg::End) => break,
-                    Some(EncodeMsg::Fail(m)) => return Err(m),
-                    None => return Err("row reader stopped unexpectedly".to_string()),
-                }
-            }
-            let mut sink = match enc {
-                Enc::Parquet(w) => w.finish(),
-                Enc::Arrow(w) => w.finish(),
-            }
-            .map_err(|e| e.to_string())?;
-            std::io::Write::flush(&mut sink).map_err(|e| e.to_string())
-        })();
-        if let Err(message) = outcome {
-            warn!(error = %message, "columnar encoding aborted");
-            let _ = abort_tx.blocking_send(Err(std::io::Error::other(format!(
-                "row error while streaming {}: {message}",
-                content_type_headers(content_type).1
-            ))));
-        }
-    });
+    let (row_tx, body_rx) =
+        spawn_columnar_encoder(content_type, schema, parquet_options.unwrap_or_default());
 
     // Async reader: forwards the prefix, then the rest of the stream in batches.
     tokio::spawn(async move {
@@ -1152,6 +1275,118 @@ async fn streaming_columnar_response(
         let _ = row_tx.send(EncodeMsg::End).await;
     });
 
+    Ok(columnar_body_response(
+        body_rx,
+        content_type,
+        runner_label,
+        format,
+    ))
+}
+
+/// The Parquet or Arrow IPC encoder behind the columnar outputs.
+enum ColumnarEncoder<W: std::io::Write + Send> {
+    Parquet(ParquetStreamWriter<W>),
+    Arrow(ArrowIpcStreamWriter<W>),
+}
+
+impl<W: std::io::Write + Send> ColumnarEncoder<W> {
+    /// `content_type` is Parquet or Arrow IPC; `options` only apply to Parquet.
+    fn new(
+        content_type: ContentType,
+        sink: W,
+        schema: std::sync::Arc<helios_sof::arrow::datatypes::Schema>,
+        options: &ParquetOptions,
+    ) -> Result<Self, helios_sof::SofError> {
+        Ok(match content_type {
+            ContentType::ArrowIpc => Self::Arrow(ArrowIpcStreamWriter::new(sink, schema)?),
+            _ => Self::Parquet(ParquetStreamWriter::new(sink, schema, options)?),
+        })
+    }
+
+    fn write_rows(&mut self, rows: &[ProcessedRow]) -> Result<(), helios_sof::SofError> {
+        match self {
+            Self::Parquet(w) => w.write_rows(rows),
+            Self::Arrow(w) => w.write_rows(rows),
+        }
+    }
+
+    fn write_batch(
+        &mut self,
+        batch: &helios_sof::arrow::record_batch::RecordBatch,
+    ) -> Result<(), helios_sof::SofError> {
+        match self {
+            Self::Parquet(w) => w.write_batch(batch),
+            Self::Arrow(w) => w.write_batch(batch),
+        }
+    }
+
+    fn finish(self) -> Result<W, helios_sof::SofError> {
+        match self {
+            Self::Parquet(w) => w.finish(),
+            Self::Arrow(w) => w.finish(),
+        }
+    }
+}
+
+/// Starts the blocking encoder: [`EncodeMsg`]s in, encoded body chunks out.
+/// A failure (row error, encoder error, client gone) aborts the body without
+/// writing a footer.
+fn spawn_columnar_encoder(
+    content_type: ContentType,
+    schema: std::sync::Arc<helios_sof::arrow::datatypes::Schema>,
+    options: ParquetOptions,
+) -> (
+    tokio::sync::mpsc::Sender<EncodeMsg>,
+    tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::io::Error>>,
+) {
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<EncodeMsg>(2);
+    let (body_tx, body_rx) =
+        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+
+    let abort_tx = body_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let sink = ChannelWriter {
+            tx: body_tx,
+            buf: Vec::new(),
+        };
+        let outcome = (|| -> Result<(), String> {
+            let mut enc = ColumnarEncoder::new(content_type, sink, schema, &options)
+                .map_err(|e| e.to_string())?;
+            loop {
+                match msg_rx.blocking_recv() {
+                    Some(EncodeMsg::Rows(rows)) => {
+                        enc.write_rows(&rows).map_err(|e| e.to_string())?
+                    }
+                    Some(EncodeMsg::Batch(batch)) => {
+                        enc.write_batch(&batch).map_err(|e| e.to_string())?
+                    }
+                    Some(EncodeMsg::End) => break,
+                    Some(EncodeMsg::Fail(m)) => return Err(m),
+                    None => return Err("row reader stopped unexpectedly".to_string()),
+                }
+            }
+            let mut sink = enc.finish().map_err(|e| e.to_string())?;
+            std::io::Write::flush(&mut sink).map_err(|e| e.to_string())
+        })();
+        if let Err(message) = outcome {
+            warn!(error = %message, "columnar encoding aborted");
+            let _ = abort_tx.blocking_send(Err(std::io::Error::other(format!(
+                "row error while streaming {}: {message}",
+                content_type_headers(content_type).1
+            ))));
+        }
+    });
+    (msg_tx, body_rx)
+}
+
+/// The streamed `200` for a columnar body, with the parquet attachment header
+/// when `format` asks for it.
+fn columnar_body_response(
+    body_rx: tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::io::Error>>,
+    content_type: ContentType,
+    runner_label: Option<&str>,
+    format: &str,
+) -> Response {
     let mut response =
         channel_body_response(body_rx, content_type_headers(content_type).0, runner_label);
     if wants_parquet_attachment(format, content_type_headers(content_type).0) {
@@ -1160,7 +1395,7 @@ async fn streaming_columnar_response(
             HeaderValue::from_static("attachment; filename=\"output.parquet\""),
         );
     }
-    Ok(response)
+    response
 }
 
 /// Whether a response in `format` carries the parquet `Content-Disposition`.
@@ -1604,6 +1839,224 @@ mod tests {
         assert!(
             drain_stream(stream).await.is_err(),
             "a mid-stream row error must propagate instead of truncating"
+        );
+    }
+
+    /// A runner with no columnar path: only the defaulted
+    /// `run_view_columnar`, which answers `None`.
+    struct RowOnlyRunner;
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::sof_runner::SofRunner for RowOnlyRunner {
+        async fn run_view(
+            &self,
+            _tenant: &helios_persistence::tenant::TenantContext,
+            _view_definition: Value,
+            _filters: helios_persistence::core::sof_runner::ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Ok(row_stream(vec![Ok(json!({ "a": 1 }))]))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "row-only-test-runner"
+        }
+    }
+
+    /// A runner whose columnar path yields `batches` (possibly none), then an
+    /// error when `fail` is set.
+    struct BatchRunner {
+        batches: usize,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::sof_runner::SofRunner for BatchRunner {
+        async fn run_view(
+            &self,
+            _tenant: &helios_persistence::tenant::TenantContext,
+            _view_definition: Value,
+            _filters: helios_persistence::core::sof_runner::ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            panic!("the columnar path must not fall back to run_view");
+        }
+
+        async fn run_view_columnar(
+            &self,
+            _tenant: &helios_persistence::tenant::TenantContext,
+            _view_definition: Value,
+            _filters: helios_persistence::core::sof_runner::ViewFilters,
+        ) -> Result<Option<helios_persistence::core::sof_runner::BatchStream>, SofError> {
+            use helios_sof::arrow::array::{ArrayRef, Int32Array};
+            use helios_sof::arrow::datatypes::{DataType, Field, Schema};
+            use helios_sof::arrow::record_batch::RecordBatch;
+
+            let schema =
+                std::sync::Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+            let column: ArrayRef = std::sync::Arc::new(Int32Array::from(vec![1, 2, 3]));
+            let batch = RecordBatch::try_new(schema, vec![column]).expect("batch");
+            let mut items: Vec<_> = (0..self.batches).map(|_| Ok(batch.clone())).collect();
+            if self.fail {
+                items.push(Err(SofError::Backend("boom".to_string())));
+            }
+            Ok(Some(Box::pin(futures::stream::iter(items))))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "batch-test-runner"
+        }
+    }
+
+    fn test_tenant() -> helios_persistence::tenant::TenantContext {
+        use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+        TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    /// A view declaring one `integer` column `n`.
+    fn int_view() -> Value {
+        json!({ "select": [{ "column": [{ "name": "n", "path": "x", "type": "integer" }] }] })
+    }
+
+    async fn open(
+        runner: &dyn helios_persistence::core::sof_runner::SofRunner,
+    ) -> Result<Option<ColumnarBatches>, RestError> {
+        open_columnar(runner, &test_tenant(), &int_view(), &Default::default()).await
+    }
+
+    /// The streamed and the buffered (envelope) bodies of the columnar path.
+    async fn columnar_bodies(
+        runner: &dyn helios_persistence::core::sof_runner::SofRunner,
+        content_type: ContentType,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let batches = open(runner).await.expect("open_columnar")?;
+        let response = streaming_batch_response(
+            batches,
+            content_type,
+            ParquetOptions::default(),
+            None,
+            "parquet",
+        );
+        let streamed = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("streamed body")
+            .to_vec();
+        let batches = open(runner).await.expect("open_columnar")?;
+        let buffered = encode_batches(batches, content_type, &ParquetOptions::default())
+            .await
+            .expect("buffered body");
+        Some((streamed, buffered))
+    }
+
+    #[tokio::test]
+    async fn columnar_falls_back_when_runner_has_no_columnar_path() {
+        assert!(open(&RowOnlyRunner).await.expect("open").is_none());
+        // The row path the caller then takes still produces Parquet.
+        let (mime, body) = format_stream(
+            row_stream(vec![Ok(json!({ "a": 1 }))]),
+            ContentType::Parquet,
+            &json!({}),
+            None,
+        )
+        .await
+        .expect("row path");
+        assert_eq!(mime, "application/vnd.apache.parquet");
+        assert!(body.starts_with(b"PAR1"));
+    }
+
+    #[tokio::test]
+    async fn columnar_batches_are_encoded_without_the_row_path() {
+        let runner = BatchRunner {
+            batches: 2,
+            fail: false,
+        };
+
+        let (streamed, buffered) = columnar_bodies(&runner, ContentType::Parquet)
+            .await
+            .expect("columnar output");
+        for body in [&streamed, &buffered] {
+            assert!(body.starts_with(b"PAR1"));
+            let reader =
+                helios_sof::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                    bytes::Bytes::from(body.clone()),
+                )
+                .expect("parquet reader")
+                .build()
+                .expect("reader");
+            let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+            assert_eq!(rows, 6);
+        }
+
+        let (streamed, buffered) = columnar_bodies(&runner, ContentType::ArrowIpc)
+            .await
+            .expect("columnar output");
+        assert_eq!(streamed, buffered);
+        let reader = helios_sof::arrow::ipc::reader::StreamReader::try_new(
+            std::io::Cursor::new(streamed),
+            None,
+        )
+        .expect("ipc reader");
+        let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+        assert_eq!(rows, 6);
+    }
+
+    #[tokio::test]
+    async fn columnar_zero_batches_match_the_empty_row_output() {
+        let runner = BatchRunner {
+            batches: 0,
+            fail: false,
+        };
+        for ct in [ContentType::Parquet, ContentType::ArrowIpc] {
+            let (streamed, buffered) = columnar_bodies(&runner, ct).await.expect("columnar output");
+            let response = streaming_columnar_response(
+                row_stream(vec![]),
+                ct,
+                &int_view(),
+                None,
+                None,
+                "parquet",
+            )
+            .await
+            .expect("row path");
+            let expected = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("row body");
+            assert_eq!(streamed, expected.to_vec(), "{ct:?}");
+            assert_eq!(buffered, expected.to_vec(), "{ct:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn columnar_error_before_the_first_batch_is_an_error_status() {
+        let runner = BatchRunner {
+            batches: 0,
+            fail: true,
+        };
+        assert!(open(&runner).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn columnar_error_after_the_first_batch_aborts_the_body() {
+        let runner = BatchRunner {
+            batches: 1,
+            fail: true,
+        };
+        let batches = open(&runner).await.expect("first batch").expect("columnar");
+        let response = streaming_batch_response(
+            batches,
+            ContentType::Parquet,
+            ParquetOptions::default(),
+            None,
+            "parquet",
+        );
+        assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .is_err()
+        );
+        let batches = open(&runner).await.expect("first batch").expect("columnar");
+        assert!(
+            encode_batches(batches, ContentType::Parquet, &ParquetOptions::default())
+                .await
+                .is_err()
         );
     }
 

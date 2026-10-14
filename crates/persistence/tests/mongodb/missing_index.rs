@@ -1000,6 +1000,18 @@ async fn mongodb_missing_metadata_composite_and_derived_definitions_preserve_pre
     db.drop().await.unwrap();
 }
 
+/// Empties the profiler so the next capture holds only the next search's
+/// operations. Profiling must be off. A `ts` window against the client clock
+/// does not isolate searches: mongod's clock and timestamp semantics differ
+/// from the runner's by milliseconds, which let the previous search's work in
+/// or dropped the next search's first reads.
+async fn clear_profile(db: &mongodb::Database) {
+    db.collection::<Document>("system.profile")
+        .drop()
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages() {
     use futures::TryStreamExt;
@@ -1138,9 +1150,9 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             eprintln!("Dense ID page compatibility work: {field}={examined}");
         }
     }
-    let since = mongodb::bson::DateTime::now();
     let mut ordered = query.clone();
     ordered.sort.clear();
+    clear_profile(&db).await;
     db.run_command(doc! {"profile": 2}).await.unwrap();
     let result = backend.search(&tenant, &ordered).await;
     db.run_command(doc! {"profile": 0}).await.unwrap();
@@ -1155,7 +1167,6 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
         ["row-1199", "row-1198"]
     );
     let ordered_operations: Vec<Document> = db.collection("system.profile").find(doc! {
-        "ts": {"$gte": since},
         "ns": {"$in": [format!("{}.resources", db.name()), format!("{}.search_index", db.name())]},
         "op": {"$in": ["query", "command", "getmore"]}, "nreturned": {"$exists": true},
     }).await.unwrap().try_collect().await.unwrap();
@@ -1214,7 +1225,7 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             chain: vec![],
             components: vec![],
         });
-        let since = mongodb::bson::DateTime::now();
+        clear_profile(&db).await;
         db.run_command(doc! {"profile": 2}).await.unwrap();
         let result = backend.search(&tenant, &selective).await;
         db.run_command(doc! {"profile": 0}).await.unwrap();
@@ -1229,7 +1240,6 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             expected
         );
         let operations: Vec<Document> = db.collection("system.profile").find(doc! {
-            "ts": {"$gte": since},
             "ns": {"$in": [format!("{}.resources", db.name()), format!("{}.search_index", db.name())]},
             "op": {"$in": ["query", "command", "getmore"]},
             "nreturned": {"$exists": true},
