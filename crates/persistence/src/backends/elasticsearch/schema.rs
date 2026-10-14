@@ -1663,6 +1663,35 @@ mod tests {
         });
     }
 
+    /// #1506: an index the startup pass already brought up to date is not read
+    /// or warned about again by the write path on the same backend.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_write_path_skips_an_index_the_startup_pass_reconciled() {
+        let server = stub_cluster(
+            &[("hfs_t_patient", v(1))],
+            200,
+            Some(&[("hfs_t_patient", 4)]),
+        )
+        .await;
+        let backend = backend_on(&server);
+        reconcile_index_mappings(&backend).await;
+        reconcile_index(&backend, "hfs_t_patient").await;
+
+        let single_reads = server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .into_iter()
+            .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/hfs_t_patient/_mapping")
+            .count();
+        assert_eq!(single_reads, 0);
+        logs_assert(|lines: &[&str]| {
+            assert_eq!(reindex_warnings(lines).len(), 1, "{lines:?}");
+            Ok(())
+        });
+    }
+
     /// #1391: the write path reconciles an index the startup pass did not see;
     /// the same rule applies there, once per index.
     #[tokio::test]
