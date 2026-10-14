@@ -11,6 +11,8 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::{DateTime, Utc};
 
+use super::get_retry::{GET_OBJECT_RETRY, GetAttemptError, get_with_body_retry};
+
 /// Metadata returned from S3 object head and put operations.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -475,43 +477,48 @@ impl S3Api for AwsS3Client {
         bucket: &str,
         key: &str,
     ) -> Result<Option<ObjectData>, S3ClientError> {
-        match self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(out) => {
-                let etag = out.e_tag().map(|s| s.to_string());
-                let bytes = out
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|e| {
-                        S3ClientError::Internal(format!("failed to collect object body: {e}"))
-                    })?
-                    .into_bytes()
-                    .to_vec();
-                Ok(Some(ObjectData {
-                    metadata: ObjectMetadata {
-                        etag,
-                        last_modified: None,
-                        size: bytes.len() as i64,
-                    },
-                    bytes,
-                }))
-            }
-            Err(err) => {
-                let mapped = map_sdk_error(err);
-                if matches!(mapped, S3ClientError::NotFound) {
-                    Ok(None)
-                } else {
-                    Err(mapped)
+        // The SDK retries a request only until the response headers arrive, and
+        // `GetObject` hands the body back unread, so a failure while the body is
+        // read is never retried by the SDK (#2048). A GET is idempotent: re-issue
+        // the whole request. Each attempt is send plus collect, so the ETag and
+        // the bytes always come from one response.
+        get_with_body_retry(&GET_OBJECT_RETRY, bucket, key, || async move {
+            let out = match self
+                .client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+            {
+                Ok(out) => out,
+                Err(err) => {
+                    let mapped = map_sdk_error(err);
+                    return if matches!(mapped, S3ClientError::NotFound) {
+                        Ok(None)
+                    } else {
+                        Err(GetAttemptError::Request(mapped))
+                    };
                 }
-            }
-        }
+            };
+            let etag = out.e_tag().map(|s| s.to_string());
+            let bytes = out
+                .body
+                .collect()
+                .await
+                .map_err(|e| GetAttemptError::body(&e))?
+                .into_bytes()
+                .to_vec();
+            Ok(Some(ObjectData {
+                metadata: ObjectMetadata {
+                    etag,
+                    last_modified: None,
+                    size: bytes.len() as i64,
+                },
+                bytes,
+            }))
+        })
+        .await
     }
 
     async fn put_object(

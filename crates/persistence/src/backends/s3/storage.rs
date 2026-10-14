@@ -2664,7 +2664,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         let location = self
             .resource_location(tenant)
             .await
-            .map_err(|e| SofError::Storage(e.to_string()))?;
+            .map_err(SofError::from_storage)?;
 
         // The type is listed one LIST page at a time as the stream is read, so
         // the first rows come after the first page, memory holds one page of
@@ -2688,7 +2688,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                     .client
                     .list_objects(&bucket, &prefix, token.as_deref(), Some(1000))
                     .await
-                    .map_err(|e| SofError::Storage(backend.map_client_error(e).to_string()));
+                    .map_err(|e| SofError::from_storage(backend.map_client_error(e)));
                 Some(match page {
                     Ok(page) => {
                         let keys: Vec<(Result<String, SofError>, Option<String>)> = page
@@ -2727,7 +2727,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                     let read = backend
                         .get_json_object::<StoredResource>(&bucket, &key)
                         .await
-                        .map_err(|e| SofError::Storage(e.to_string()))?;
+                        .map_err(SofError::from_storage)?;
                     Ok(read.map(|(resource, meta)| {
                         // Remember the tombstone under the ETag the GET saw; the
                         // LIST's ETag matches it when nothing was rewritten.
@@ -2782,7 +2782,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                                     .map(|c| c.resource)
                                     .filter(|resource| !resource.is_deleted())
                             })
-                            .map_err(|e| SofError::Storage(e.to_string()))
+                            .map_err(SofError::from_storage)
                     }
                 })
                 .buffer_unordered(self.bulk_write_concurrency())

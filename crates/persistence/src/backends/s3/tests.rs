@@ -111,6 +111,10 @@ struct MockState {
     /// LIST calls on exactly these prefixes fail with the given error, simulating
     /// a permission or transport failure on one listing.
     failing_list_prefixes: HashMap<String, S3ClientError>,
+    /// `get_object` calls on exactly these keys fail with the given error,
+    /// simulating a GET whose body could not be read (#2048). Opt-in: a key not
+    /// listed here reads as before.
+    failing_get_keys: HashMap<String, S3ClientError>,
     /// `list_objects` on exactly these prefixes first returns this many empty
     /// pages that are still truncated, as S3 can over a run of delete markers
     /// on a versioned bucket, before the real listing.
@@ -220,6 +224,16 @@ impl MockS3Client {
             .unwrap()
             .failing_list_prefixes
             .insert(prefix.to_string(), error);
+    }
+
+    /// Makes every subsequent `get_object` call on exactly `key` fail with
+    /// `error`.
+    fn fail_gets_at(&self, key: &str, error: S3ClientError) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_get_keys
+            .insert(key.to_string(), error);
     }
 
     /// Makes every subsequent `list_objects` call on exactly `prefix` return
@@ -354,6 +368,9 @@ impl S3Api for MockS3Client {
         state.get_count += 1;
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
+        if let Some(error) = state.failing_get_keys.get(key).cloned() {
+            return Err(error);
         }
         Ok(state
             .objects
@@ -3662,6 +3679,118 @@ async fn the_resource_scan_lists_one_page_at_a_time() {
     assert!(
         mock.list_count() - lists_before > 1,
         "the type spans several LIST pages"
+    );
+}
+
+/// Creates Patients `p1` and `p2` and returns the backend, the mock, the tenant
+/// and the S3 key of `p1`'s `current.json`, for the object-read failure tests.
+async fn two_patients_for_scan() -> (S3Backend, Arc<MockS3Client>, TenantContext, String) {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    for id in ["p1", "p2"] {
+        backend
+            .create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Patient");
+    }
+    let p1_key = mock
+        .keys("test-bucket")
+        .into_iter()
+        .find(|key| key.ends_with("/Patient/p1/current.json"))
+        .expect("p1's current.json key");
+    (backend, mock, t, p1_key)
+}
+
+/// #2048: an object whose read is unavailable (the S3 client has already retried
+/// a failed body read) ends the scan with an `Unavailable` error, so the REST
+/// layer answers 503 rather than 500.
+#[tokio::test]
+async fn a_scan_whose_object_read_is_unavailable_fails_as_unavailable() {
+    use crate::core::sof_runner::SofError;
+
+    let (backend, mock, t, p1_key) = two_patients_for_scan().await;
+    mock.fail_gets_at(
+        &p1_key,
+        S3ClientError::Unavailable(
+            "failed to read object body after 3 attempts: streaming error".to_string(),
+        ),
+    );
+
+    let results: Vec<Result<Value, SofError>> = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan")
+        .scan_resources(&t, "Patient")
+        .await
+        .expect("scan")
+        .collect()
+        .await;
+
+    let error = results
+        .into_iter()
+        .find_map(Result::err)
+        .expect("the unreadable object fails the scan");
+    match error {
+        SofError::Unavailable(message) => {
+            assert!(message.contains("after 3 attempts"), "message: {message}")
+        }
+        other => panic!("expected SofError::Unavailable, got {other:?}"),
+    }
+}
+
+/// #2048: an object read that fails for any other reason is still a server fault
+/// (500), not a retryable 503.
+#[tokio::test]
+async fn a_scan_whose_object_read_fails_internally_stays_a_storage_error() {
+    use crate::core::sof_runner::SofError;
+
+    let (backend, mock, t, p1_key) = two_patients_for_scan().await;
+    mock.fail_gets_at(&p1_key, S3ClientError::Internal("boom".to_string()));
+
+    let results: Vec<Result<Value, SofError>> = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan")
+        .scan_resources(&t, "Patient")
+        .await
+        .expect("scan")
+        .collect()
+        .await;
+
+    let error = results
+        .into_iter()
+        .find_map(Result::err)
+        .expect("the failing object fails the scan");
+    assert!(
+        matches!(error, SofError::Storage(_)),
+        "expected SofError::Storage, got {error:?}"
+    );
+}
+
+/// #2048: the by-id read reports an unavailable object as unavailable too.
+#[tokio::test]
+async fn read_resources_reports_an_unavailable_object_as_unavailable() {
+    use crate::core::sof_runner::SofError;
+
+    let (backend, mock, t, p1_key) = two_patients_for_scan().await;
+    mock.fail_gets_at(
+        &p1_key,
+        S3ClientError::Unavailable("failed to read object body".to_string()),
+    );
+
+    let error = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan")
+        .read_resources(&t, "Patient", &["p1".to_string()])
+        .await
+        .expect_err("the unreadable object fails the read");
+    assert!(
+        matches!(error, SofError::Unavailable(_)),
+        "expected SofError::Unavailable, got {error:?}"
     );
 }
 
