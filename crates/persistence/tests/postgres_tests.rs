@@ -27290,6 +27290,286 @@ mod postgres_integration {
         assert_eq!(timeout, "300ms");
     }
 
+    fn custom_given_search_parameter(id: &str, code: &str) -> serde_json::Value {
+        json!({
+            "resourceType": "SearchParameter",
+            "id": id,
+            "url": format!("http://example.org/fhir/SearchParameter/{id}"),
+            "name": code,
+            "status": "active",
+            "code": code,
+            "base": ["Patient"],
+            "type": "string",
+            "expression": "Patient.name.given"
+        })
+    }
+
+    fn patient_ids_matching(result: &helios_persistence::core::SearchResult) -> Vec<String> {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect()
+    }
+
+    async fn search_patients_by(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        code: &str,
+        value: &str,
+    ) -> Vec<String> {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: code.to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        });
+        patient_ids_matching(
+            &SearchProvider::search(backend, tenant, &query)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// #1897: a write validates its cached overlay with one fingerprint probe
+    /// instead of re-reading every stored SearchParameter. A SearchParameter
+    /// committed by another HFS process moves that fingerprint, so the next
+    /// write here indexes with it — without this process's cache having been
+    /// reloaded and without waiting for the TTL refresh.
+    #[tokio::test]
+    async fn postgres_write_indexes_with_cluster_mates_search_parameter_without_refresh() {
+        let (writer, _dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("sp-fingerprint-mate");
+        // Warm the writer's cached overlay with an ordinary write.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"warm","name":[{"given":["Warm"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Another process: a second backend over the same database, with its
+        // own cache, stores a custom parameter on `Patient.name.given`.
+        let mate = PostgresBackend::new(writer.config().clone()).await.unwrap();
+        mate.create(
+            &tenant,
+            "SearchParameter",
+            custom_given_search_parameter("givenfp", "givenfp"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        // The writer's next write indexes the new parameter.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"after","name":[{"given":["Fingerprinted"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            search_patients_by(&mate, &tenant, "givenfp", "Fingerprinted").await,
+            vec!["after".to_string()],
+            "the write after the cluster-mate's SearchParameter is indexed with it"
+        );
+        assert!(
+            search_patients_by(&mate, &tenant, "givenfp", "Warm")
+                .await
+                .is_empty(),
+            "the write before it is not (nothing reindexed)"
+        );
+    }
+
+    /// #1897: the fingerprint is what a write trusts. A change to a stored
+    /// SearchParameter's body that leaves the tenant's live count and newest
+    /// `last_updated` untouched — only raw SQL can do that; every HFS write
+    /// path bumps `last_updated` — is served from the cache, which is the
+    /// proof that the full read no longer runs on every write. The TTL
+    /// refresh then picks it up, as on every other backend.
+    #[tokio::test]
+    async fn postgres_write_serves_an_unchanged_fingerprint_from_the_cache() {
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("sp-fingerprint-cache");
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                custom_given_search_parameter("givenfp", "givenfp"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // The first write after the SearchParameter reads and fingerprints the overlay.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"warm","name":[{"given":["Warm"],"family":"Warm"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_patients_by(&backend, &tenant, "givenfp", "Warm").await,
+            vec!["warm".to_string()]
+        );
+
+        // Repoint the parameter at `Patient.name.family` behind the cache's back.
+        let client = reindex_test_client_for(&dbname).await;
+        let rewritten = client
+            .execute(
+                "UPDATE resources SET data = jsonb_set(data, '{expression}', '\"Patient.name.family\"')
+                 WHERE tenant_id = $1 AND resource_type = 'SearchParameter' AND id = 'givenfp'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rewritten, 1);
+
+        // Same fingerprint: the write extracts with the cached expression.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"cached","name":[{"given":["Cached"],"family":"Sigma"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_patients_by(&backend, &tenant, "givenfp", "Cached").await,
+            vec!["cached".to_string()],
+            "an unchanged fingerprint is served from the cache"
+        );
+        assert!(
+            search_patients_by(&backend, &tenant, "givenfp", "Sigma")
+                .await
+                .is_empty()
+        );
+
+        // The refresh re-reads storage; the next write re-fingerprints from it.
+        backend.refresh_stored_search_parameters().await.unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"refreshed","name":[{"given":["Refreshed"],"family":"Omega"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_patients_by(&backend, &tenant, "givenfp", "Omega").await,
+            vec!["refreshed".to_string()],
+            "after the refresh the write extracts with the rewritten expression"
+        );
+        assert!(
+            search_patients_by(&backend, &tenant, "givenfp", "Refreshed")
+                .await
+                .is_empty()
+        );
+    }
+
+    /// #1897: the fingerprint probe is an index-only scan of
+    /// `idx_resources_search`, seeking on tenant and resource type. It never
+    /// fetches the rows' JSONB, which is what made the read it replaces cost
+    /// 24.8 ms a call.
+    #[tokio::test]
+    async fn postgres_overlay_fingerprint_is_an_index_only_scan() {
+        fn scans_on_resources<'a>(
+            plan: &'a serde_json::Value,
+            out: &mut Vec<&'a serde_json::Value>,
+        ) {
+            match plan {
+                serde_json::Value::Object(fields) => {
+                    let on_resources = fields
+                        .get("Relation Name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("resources")
+                        || fields
+                            .get("Index Name")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|name| {
+                                name == "resources_pkey" || name.starts_with("idx_resources_")
+                            });
+                    if on_resources {
+                        out.push(plan);
+                    }
+                    for value in fields.values() {
+                        scans_on_resources(value, out);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        scans_on_resources(value, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenants = [create_tenant("fingerprint-plan")];
+        seed_startup_search_parameters(&backend, &tenants).await;
+
+        let client = reindex_test_client_for(&dbname).await;
+        // Set the visibility map so the planner can price an index-only scan.
+        client
+            .batch_execute("VACUUM ANALYZE resources")
+            .await
+            .unwrap();
+        client
+            .batch_execute("BEGIN; SET LOCAL enable_seqscan = off")
+            .await
+            .unwrap();
+        let plan: serde_json::Value = client
+            .query_one(
+                &format!(
+                    "EXPLAIN (FORMAT JSON) {}",
+                    PostgresBackend::OVERLAY_FINGERPRINT_SQL
+                ),
+                &[&tenants[0].tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        client.batch_execute("ROLLBACK").await.unwrap();
+
+        let mut scans = Vec::new();
+        scans_on_resources(&plan, &mut scans);
+        assert_eq!(scans.len(), 1, "one scan of resources: {plan}");
+        let scan = scans[0];
+        assert_eq!(
+            scan["Node Type"].as_str(),
+            Some("Index Only Scan"),
+            "the fingerprint must not fetch heap rows: {plan}"
+        );
+        assert_eq!(
+            scan["Index Name"].as_str(),
+            Some("idx_resources_search"),
+            "{plan}"
+        );
+        let cond = scan["Index Cond"].as_str().unwrap_or_default();
+        assert!(
+            cond.contains("tenant_id") && cond.contains("resource_type"),
+            "the probe must seek on tenant and type, got {cond}: {plan}"
+        );
+    }
+
     /// Seeds the stored SearchParameter fixtures for the #1664 startup tests:
     /// per tenant a Patient, an active SearchParameter whose code names the
     /// tenant, a retired one, and an active one that is then deleted.

@@ -25,6 +25,9 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
 use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
+use helios_sof::columnar_stream::{ParquetStreamWriter, STREAM_BATCH_ROWS};
+use helios_sof::parquet_schema::{SCHEMA_SAMPLE_ROWS, resolve_arrow_schema};
+use helios_sof::sqlquery::engine::declared_columns;
 use helios_sof::sqlquery::{InMemorySqlEngine, QueryResult};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -994,6 +997,31 @@ fn write_view_shard<Sink: ExportSink>(
     ensure_running(jobs, jid)?;
 
     let data = format_rows(rows, format, header).map_err(|e| format!("view '{name}': {e}"))?;
+    store_view_shard(
+        jobs,
+        jid,
+        sink,
+        name,
+        data,
+        rows.len(),
+        ext,
+        completed_files,
+    )
+}
+
+/// Hands one encoded shard to the sink and records it in `completed_files`.
+#[allow(clippy::too_many_arguments)]
+fn store_view_shard<Sink: ExportSink>(
+    jobs: &DashMap<String, JobStatus>,
+    jid: &str,
+    sink: &Sink,
+    name: &str,
+    data: Vec<u8>,
+    row_count: usize,
+    ext: &str,
+    completed_files: &mut Vec<CompletedFile>,
+) -> Result<(), JobFailure> {
+    ensure_running(jobs, jid)?;
 
     // Shard files are numbered by a running index across the whole
     // job so every shard gets a unique filename; for the
@@ -1004,13 +1032,177 @@ fn write_view_shard<Sink: ExportSink>(
         .write_shard(jid, shard_key, data, ext)
         .map_err(|e| format!("view '{name}': {e}"))?;
 
-    debug!(job_id = %jid, view = %name, shard = shard_key, rows = rows.len(), file = %filename, "shard written");
+    debug!(job_id = %jid, view = %name, shard = shard_key, rows = row_count, file = %filename, "shard written");
     completed_files.push(CompletedFile {
         view_name: name.to_string(),
         filename,
-        row_count: rows.len(),
+        row_count,
     });
     Ok(())
+}
+
+/// Encodes one view's Parquet shards incrementally: rows go straight into an
+/// open Parquet writer in batches, so a subject holds at most one batch of
+/// rows plus the encoded bytes of the shard being built (#1812).
+///
+/// The Arrow schema is fixed once per view, before the first shard is
+/// written, from the view's declared column types and the first
+/// [`helios_sof::parquet_schema::SCHEMA_SAMPLE_ROWS`] rows of the whole view
+/// (not of each shard), so every shard of a view has the same schema. Columns
+/// and their order come from the first row's keys.
+struct ParquetShardEncoder {
+    view: serde_json::Value,
+    shard_rows: usize,
+    /// Rows held back until enough have arrived to fix the schema.
+    head: Vec<serde_json::Value>,
+    state: Option<ParquetShardState>,
+}
+
+/// An encoded shard and its row count.
+type EncodedShard = (Vec<u8>, usize);
+
+struct ParquetShardState {
+    columns: Vec<String>,
+    new_writer: Box<dyn Fn() -> Result<ParquetStreamWriter<Vec<u8>>, ExportError> + Send>,
+    writer: Option<ParquetStreamWriter<Vec<u8>>>,
+    pending: Vec<helios_sof::ProcessedRow>,
+    rows_in_shard: usize,
+}
+
+impl ParquetShardState {
+    fn new(
+        view: &serde_json::Value,
+        first_rows: &[serde_json::Value],
+    ) -> Result<Self, ExportError> {
+        let columns: Vec<String> = first_rows
+            .first()
+            .and_then(|r| r.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        let sample: Vec<helios_sof::ProcessedRow> = first_rows
+            .iter()
+            .map(|r| to_processed_row(&columns, r))
+            .collect();
+        let declared = declared_columns(view);
+        let schema = Arc::new(
+            resolve_arrow_schema(&columns, &declared, &sample)
+                .map_err(|e| ExportError::Serialization(e.to_string()))?,
+        );
+        let options = helios_sof::ParquetOptions::default();
+        Ok(Self {
+            columns,
+            new_writer: Box::new(move || {
+                ParquetStreamWriter::new(Vec::new(), schema.clone(), &options)
+                    .map_err(|e| ExportError::Serialization(e.to_string()))
+            }),
+            writer: None,
+            pending: Vec::new(),
+            rows_in_shard: 0,
+        })
+    }
+
+    fn flush_pending(&mut self) -> Result<(), ExportError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        if self.writer.is_none() {
+            self.writer = Some((self.new_writer)()?);
+        }
+        if let Some(w) = self.writer.as_mut() {
+            w.write_rows(&self.pending)
+                .map_err(|e| ExportError::Serialization(e.to_string()))?;
+        }
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn finish_shard(&mut self) -> Result<Option<EncodedShard>, ExportError> {
+        if self.rows_in_shard == 0 {
+            return Ok(None);
+        }
+        self.flush_pending()?;
+        let rows = std::mem::take(&mut self.rows_in_shard);
+        let Some(w) = self.writer.take() else {
+            return Ok(None);
+        };
+        let data = w
+            .finish()
+            .map_err(|e| ExportError::Serialization(e.to_string()))?;
+        Ok(Some((data, rows)))
+    }
+
+    fn push(
+        &mut self,
+        row: &serde_json::Value,
+        shard_rows: usize,
+        out: &mut Vec<EncodedShard>,
+    ) -> Result<(), ExportError> {
+        self.pending.push(to_processed_row(&self.columns, row));
+        self.rows_in_shard += 1;
+        if self.pending.len() == STREAM_BATCH_ROWS {
+            self.flush_pending()?;
+        }
+        if self.rows_in_shard == shard_rows {
+            out.extend(self.finish_shard()?);
+        }
+        Ok(())
+    }
+}
+
+fn to_processed_row(columns: &[String], row: &serde_json::Value) -> helios_sof::ProcessedRow {
+    let values = columns
+        .iter()
+        .map(|col| row.as_object().and_then(|o| o.get(col)).cloned())
+        .collect();
+    helios_sof::ProcessedRow { values }
+}
+
+impl ParquetShardEncoder {
+    fn new(view: &serde_json::Value, shard_rows: usize) -> Self {
+        Self {
+            view: view.clone(),
+            shard_rows,
+            head: Vec::new(),
+            state: None,
+        }
+    }
+
+    /// Adds one row; returns the shards completed by it (usually none).
+    fn push(&mut self, row: serde_json::Value) -> Result<Vec<EncodedShard>, ExportError> {
+        let mut out = Vec::new();
+        if let Some(state) = self.state.as_mut() {
+            state.push(&row, self.shard_rows, &mut out)?;
+            return Ok(out);
+        }
+        self.head.push(row);
+        if self.head.len() == SCHEMA_SAMPLE_ROWS {
+            self.resolve(&mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Fixes the schema from the rows held so far and replays them.
+    fn resolve(&mut self, out: &mut Vec<EncodedShard>) -> Result<(), ExportError> {
+        let head = std::mem::take(&mut self.head);
+        let mut state = ParquetShardState::new(&self.view, &head)?;
+        for row in &head {
+            state.push(row, self.shard_rows, out)?;
+        }
+        self.state = Some(state);
+        Ok(())
+    }
+
+    /// Ends the view: returns the remaining shard, if any rows are left.
+    fn finish(mut self) -> Result<Vec<EncodedShard>, ExportError> {
+        let mut out = Vec::new();
+        if self.state.is_none() && !self.head.is_empty() {
+            self.resolve(&mut out)?;
+        }
+        if let Some(state) = self.state.as_mut() {
+            out.extend(state.finish_shard()?);
+        }
+        Ok(out)
+    }
 }
 
 /// The ViewDefinition half of an export job: run each named view through the
@@ -1071,10 +1263,33 @@ async fn run_views_job<Sink: ExportSink>(
         // bytes are unchanged. A stream error after some shards were written
         // still fails the job, and the worker deletes them.
         let mut shard: Vec<serde_json::Value> = Vec::new();
+        // Parquet shards are encoded as rows arrive instead of being buffered
+        // as JSON values first (#1812).
+        let mut parquet =
+            (format == "parquet").then(|| ParquetShardEncoder::new(&named.view, shard_rows));
         let mut stream = stream;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(v) => {
+                    if let Some(enc) = parquet.as_mut() {
+                        let done = enc
+                            .push(v)
+                            .map_err(|e| format!("view '{}': {e}", named.name))?;
+                        for (data, rows) in done {
+                            store_view_shard(
+                                jobs,
+                                jid,
+                                sink,
+                                &named.name,
+                                data,
+                                rows,
+                                ext,
+                                &mut completed_files,
+                            )?;
+                            total_rows += rows;
+                        }
+                        continue;
+                    }
                     shard.push(v);
                     if shard.len() == shard_rows {
                         write_view_shard(
@@ -1100,6 +1315,25 @@ async fn run_views_job<Sink: ExportSink>(
                     }
                     return Err(format!("view '{}': {e}", named.name).into());
                 }
+            }
+        }
+
+        if let Some(enc) = parquet {
+            let done = enc
+                .finish()
+                .map_err(|e| format!("view '{}': {e}", named.name))?;
+            for (data, rows) in done {
+                store_view_shard(
+                    jobs,
+                    jid,
+                    sink,
+                    &named.name,
+                    data,
+                    rows,
+                    ext,
+                    &mut completed_files,
+                )?;
+                total_rows += rows;
             }
         }
 
@@ -1271,7 +1505,10 @@ fn format_rows(
 ) -> Result<Vec<u8>, ExportError> {
     match format {
         "csv" => format_csv(rows, include_csv_header),
-        "parquet" => format_parquet(rows),
+        // Parquet shards are encoded incrementally by `ParquetShardEncoder`.
+        "parquet" => Err(ExportError::Serialization(
+            "parquet shards are encoded incrementally".to_string(),
+        )),
         "json" => format_json_array(rows),
         _ => format_ndjson(rows),
     }
@@ -1309,44 +1546,19 @@ fn format_query_rows(
             .map(|r| helios_sof::ProcessedRow { values: r.clone() })
             .collect(),
     };
-    helios_sof::format_output(processed, ct, None)
+    // Parquet takes its column types from the query result so every shard of
+    // a query has the same schema.
+    let declared = helios_sof::sqlquery::engine::declared_from_query_types(
+        &result.columns,
+        &result.column_types,
+    );
+    helios_sof::format_output_with_schema(processed, ct, None, &declared)
         .map_err(|e| ExportError::Serialization(e.to_string()))
 }
 
 /// Serialises rows as a single JSON array (`_format=json`).
 fn format_json_array(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
     serde_json::to_vec(rows).map_err(|e| ExportError::Serialization(e.to_string()))
-}
-
-fn format_parquet(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let columns: Vec<String> = rows[0]
-        .as_object()
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
-
-    let processed_rows: Vec<helios_sof::ProcessedRow> = rows
-        .iter()
-        .map(|row| {
-            let values = columns
-                .iter()
-                .map(|col| row.as_object().and_then(|o| o.get(col)).cloned())
-                .collect();
-            helios_sof::ProcessedRow { values }
-        })
-        .collect();
-
-    let result = helios_sof::ProcessedResult {
-        columns,
-        rows: processed_rows,
-    };
-
-    helios_sof::format_parquet_multi_file(result, None, usize::MAX)
-        .map_err(|e| ExportError::Serialization(e.to_string()))
-        .map(|files| files.into_iter().next().unwrap_or_default())
 }
 
 fn format_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
@@ -3052,6 +3264,34 @@ mod tests {
         })
     }
 
+    /// The bytes a shard of `rows[range]` must have. Parquet shards share one
+    /// schema per view, fixed from the whole view's first rows, and are
+    /// written in `STREAM_BATCH_ROWS` batches from the start of the shard.
+    fn oracle_shard_bytes(
+        name: &str,
+        rows: &[serde_json::Value],
+        range: std::ops::Range<usize>,
+        fmt: &str,
+    ) -> Vec<u8> {
+        if fmt != "parquet" {
+            return format_rows(&rows[range], fmt, true).unwrap();
+        }
+        let state = ParquetShardState::new(
+            &named_view_json(name),
+            &rows[..rows.len().min(SCHEMA_SAMPLE_ROWS)],
+        )
+        .unwrap();
+        let mut writer = (state.new_writer)().unwrap();
+        for chunk in rows[range].chunks(STREAM_BATCH_ROWS) {
+            let batch: Vec<_> = chunk
+                .iter()
+                .map(|r| to_processed_row(&state.columns, r))
+                .collect();
+            writer.write_rows(&batch).unwrap();
+        }
+        writer.finish().unwrap()
+    }
+
     /// An ndjson export for tenant `t1` with one view subject per name.
     fn view_task(names: &[&str]) -> ExportTask {
         ExportTask {
@@ -3583,7 +3823,7 @@ mod tests {
                             name.to_string(),
                             format!("shard-{k}.{}", ext_for(fmt)),
                             range.len(),
-                            format_rows(&rows[range], fmt, true).unwrap(),
+                            oracle_shard_bytes(name, rows, range, fmt),
                         ));
                     }
                 }

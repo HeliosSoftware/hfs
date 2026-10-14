@@ -77,7 +77,9 @@ Since #1391 an `Encounter.period` is no longer such a case: it indexes as one
 row holding the range `[value_date, value_date_end)`, and each arm is the FHIR
 range-target rule on that row (`ge` is `te > e ∨ eq`, `le` is `ts < s ∨ eq`).
 Schema v43 adds `value_date_end` to the `INCLUDE` list of `idx_search_date`
-and `idx_search_date_recent`, so the arms stay index-only.
+and `idx_search_date_recent`, so the arms stay index-only. The v43 migration
+builds these indexes with `CREATE INDEX CONCURRENTLY` and a short swap, so
+they are never missing while it runs (#1506).
 
 `crates/persistence/tests/postgres_tests.rs` pins the end-to-end semantics: an
 Encounter from 2019-01-01 to 2021-06-01 is returned for
