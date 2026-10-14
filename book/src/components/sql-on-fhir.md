@@ -76,9 +76,10 @@ Parameter precedence: request body > query params > `Accept` header.
 |-----------|----------------------|
 | boolean | BOOLEAN |
 | string, code, uri | UTF8 |
-| integer | INT32 |
+| integer, positiveInt, unsignedInt | INT32 |
+| integer64 | INT64 |
 | decimal | FLOAT64 |
 | dateTime, date | UTF8 |
-| arrays | Arrow List |
+| `collection: true` columns, arrays | List<UTF8> |
 
-All fields are OPTIONAL.
+All fields are OPTIONAL. Parquet and Arrow IPC are encoded incrementally with the schema fixed from the declared column types before the first row, so memory stays bounded rather than growing with the result.

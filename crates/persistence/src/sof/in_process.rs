@@ -248,6 +248,9 @@ fn map_engine_error(e: helios_sof::SofError) -> SofError {
     match e {
         E::InvalidViewDefinition(m) => SofError::InvalidViewDefinition(m),
         E::ReferencedResourceNotFound(m) => SofError::InvalidViewDefinition(m),
+        // A path the view's author wrote that FHIRPath rejects is a problem with
+        // the ViewDefinition, not a backend failure.
+        E::FhirPathError(m) => SofError::InvalidViewDefinition(m),
         other => SofError::Backend(other.to_string()),
     }
 }
@@ -688,6 +691,34 @@ mod tests {
         assert_eq!(rows, 0, "no row may be emitted for an unresolved batch");
         assert!(
             matches!(error, Some(SofError::ResolutionLimit(_))),
+            "got {error:?}"
+        );
+    }
+
+    /// #640: a leading identifier that is neither a type nor an element fails
+    /// the run as an invalid ViewDefinition (4xx), not a backend error (500).
+    #[tokio::test]
+    async fn unresolvable_leading_identifier_is_an_invalid_view_definition() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![patient()]), FhirVersion::R4, "test");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"name": "x", "path": "Bogus.name.family"}]}]
+        });
+        let mut stream = runner
+            .run_view(&tenant(), view, ViewFilters::default())
+            .await
+            .expect("run_view");
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                error = Some(e);
+            }
+        }
+        assert!(
+            matches!(error, Some(SofError::InvalidViewDefinition(ref m)) if m.contains("Bogus")),
             "got {error:?}"
         );
     }

@@ -1182,6 +1182,49 @@ async fn test_invalid_view_definition_returns_422() {
     assert_eq!(json["resourceType"], "OperationOutcome");
 }
 
+/// #640: a column path whose leading identifier is neither a type nor an
+/// element of the resource is a 422 naming the identifier, not a silently
+/// empty column.
+#[tokio::test]
+async fn test_unresolvable_leading_identifier_returns_422() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": "ndjson"},
+            {
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"name": "x", "path": "Bogus.name.family"}]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {"resourceType": "Patient", "id": "p1", "name": [{"family": "Smith"}]}
+            }
+        ]
+    });
+
+    let response = server
+        .post("/$sql-run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "got {} with body: {}",
+        response.status_code(),
+        response.text()
+    );
+    assert!(response.text().contains("Bogus"), "{}", response.text());
+}
+
 /// A `ViewDefinition` with more than one structural problem gets one
 /// `OperationOutcome.issue` per lint error (#821), in the same order
 /// `helios_sof::lint::lint_view_definition` itself reports them (document

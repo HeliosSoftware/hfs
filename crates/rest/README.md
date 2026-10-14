@@ -256,12 +256,14 @@ exactly as `Patient/<id>/$everything` does: a missing patient is 404, a deleted
 one 410, and next links stay on the type-level URL. Without the claim, or with a
 value of any other form (ignored, logged at debug), every patient the caller can
 see is walked. Narrowing applies whatever the token's scope context; the
-instance-level operation is unchanged. This narrowing is not an authorization
-boundary: a patient-context token can still read other patients through the
-instance-level operation or search until #1618, and an unusable `patient` value
-falls back to walking every patient rather than rejecting the request.
-`patient/` scope and compartment enforcement for search, read and `$export` is
-tracked in [#1618](https://github.com/HeliosSoftware/hfs/issues/1618).
+instance-level operation is unchanged.
+
+The authorization boundary is the scope context (#1618): when the token's
+grant rests on a `patient/` scope, `Patient/{id}/$everything` for any other
+patient is `403`, and a token whose `patient` claim is missing or unusable is
+refused rather than widened. A `user/` or `system/` grant is not confined, and
+for it an unusable `patient` value still falls back to walking every patient.
+See [Patient scopes in the auth README](../auth/README.md#patient-scopes).
 
 Supported on every backend that supports search (SQLite, PostgreSQL,
 MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
@@ -366,6 +368,12 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 
 A runnable multi-instance stack (HFS + PostgreSQL + MinIO + Keycloak) is provided
 as a compose example in [`docker/bulk-export/`](../../docker/bulk-export/README.md).
+
+Under a `patient/` scope (#1618) only `Patient/$export` is available, pinned to
+the token's launch patient: a `patient` parameter naming anyone else is `403`,
+as are system-level `/$export`, `Group/{id}/$export` and a `_type` outside the
+Patient compartment. See [Patient scopes in the auth
+README](../auth/README.md#patient-scopes).
 
 ### Bulk Data Submit
 
