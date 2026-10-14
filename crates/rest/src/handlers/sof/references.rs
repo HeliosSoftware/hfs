@@ -186,13 +186,10 @@ where
 /// not read an object after retries) answers `503` (retryable), anything else
 /// `500` (#2048). `message` is shown to the client either way.
 fn storage_lookup_error(message: String, e: &StorageError) -> RestError {
-    match e {
-        StorageError::Backend(
-            BackendError::Unavailable { .. }
-            | BackendError::ConnectionFailed { .. }
-            | BackendError::PoolExhausted { .. },
-        ) => RestError::ServiceUnavailable { message },
-        _ => RestError::InternalError { message },
+    if e.is_unavailable() {
+        RestError::ServiceUnavailable { message }
+    } else {
+        RestError::InternalError { message }
     }
 }
 

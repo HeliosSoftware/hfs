@@ -67,11 +67,13 @@ impl JobFailure {
         }
     }
 
-    /// The store was unavailable: transient and retryable, so the result
-    /// endpoint says `503` instead of blaming the server.
+    /// The store was unavailable: transient, so the result endpoint says `503`
+    /// instead of blaming the server. The failure is terminal for this job
+    /// though, and the result URL keeps answering it, so the stored wording
+    /// tells the client to submit the export again rather than poll on.
     fn unavailable(message: String) -> Self {
         Self {
-            message,
+            message: with_resubmit_hint(message),
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "transient",
         }
@@ -91,8 +93,13 @@ impl JobFailure {
     fn from_rest(prefix: &str, err: RestError, detail: String) -> Self {
         let (status, code, message) = err.client_response();
         if shows_failure_message(status) {
+            let message = format!("{prefix}: {message}");
             Self {
-                message: format!("{prefix}: {message}"),
+                message: if status == StatusCode::SERVICE_UNAVAILABLE {
+                    with_resubmit_hint(message)
+                } else {
+                    message
+                },
                 status,
                 code,
             }
@@ -121,6 +128,17 @@ impl JobFailure {
             other => Self::server(format!("{prefix}: {other}")),
         }
     }
+}
+
+/// Appended to the stored wording of a job that failed on an unavailable
+/// store. A `503` with the `transient` issue code usually means "retry this
+/// request later", but the failed job stays failed: re-reading its result URL
+/// returns the same `503` for as long as the job is kept, and only a new
+/// kick-off can succeed (#2048).
+const RESUBMIT_HINT: &str = "the export did not complete, submit it again";
+
+fn with_resubmit_hint(message: String) -> String {
+    format!("{message}; {RESUBMIT_HINT}")
 }
 
 /// Whether a failed job with `status` stores and returns its specific
@@ -2319,6 +2337,10 @@ mod tests {
                     message.contains("after 3 attempts"),
                     "the reason is kept: {message}"
                 );
+                assert!(
+                    message.ends_with("the export did not complete, submit it again"),
+                    "the remedy is stated: {message}"
+                );
                 assert_ne!(message, server_fault_message(&job_id));
                 assert_eq!(subject.as_deref(), Some("patients"));
             }
@@ -2388,6 +2410,10 @@ mod tests {
                 assert!(
                     message.contains("after 3 attempts"),
                     "the reason is kept: {message}"
+                );
+                assert!(
+                    message.ends_with("the export did not complete, submit it again"),
+                    "the remedy is stated: {message}"
                 );
                 assert_eq!(subject.as_deref(), Some("patient_ids"));
             }

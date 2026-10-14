@@ -170,7 +170,10 @@ pub enum JobStatus {
         /// What the result endpoint answers: the 4xx `$sql-run` gives the
         /// same failure when it is the request's own (a documented limit, a
         /// subject the runner refuses), `503` when the store was unavailable
-        /// (#2048), `500` for a fault of the server.
+        /// (#2048), `500` for a fault of the server. A `503` here is terminal
+        /// for this job, unlike a `503` on a status poll: the result URL keeps
+        /// answering it, and the stored `message` tells the client to submit
+        /// the export again.
         status: StatusCode,
         /// The `OperationOutcome.issue.code` that goes with `status`.
         code: &'static str,
@@ -257,7 +260,9 @@ pub enum ExportError {
     /// The store a subject reads from was unavailable (it could not be
     /// reached, was throttling, or could not read an object after retries).
     /// Transient rather than the request's fault: the result endpoint answers
-    /// `503`, the status `$sql-run` gives the same failure (#2048).
+    /// `503`, the status `$sql-run` gives the same failure (#2048). The job
+    /// itself still fails for good, so its stored wording asks the client to
+    /// submit the export again.
     #[error("{0}")]
     Unavailable(String),
 }

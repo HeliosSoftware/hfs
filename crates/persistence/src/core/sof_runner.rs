@@ -140,14 +140,10 @@ impl SofError {
     /// dispatch failure or timeout, throttling, and an S3 misconfiguration
     /// (access denied, a bucket that is missing or not accessible).
     pub fn from_storage(err: crate::error::StorageError) -> Self {
-        use crate::error::{BackendError, StorageError};
-        match &err {
-            StorageError::Backend(
-                BackendError::Unavailable { .. }
-                | BackendError::ConnectionFailed { .. }
-                | BackendError::PoolExhausted { .. },
-            ) => SofError::Unavailable(err.to_string()),
-            _ => SofError::Storage(err.to_string()),
+        if err.is_unavailable() {
+            SofError::Unavailable(err.to_string())
+        } else {
+            SofError::Storage(err.to_string())
         }
     }
 }
