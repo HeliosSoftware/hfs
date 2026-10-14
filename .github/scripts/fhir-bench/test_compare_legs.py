@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -342,7 +343,11 @@ class CompareLegsTest(unittest.TestCase):
         md = render(self.root, ["sqlite", "postgres"], tests="prewarm,import,crud,search")
         self.assertNotIn("| reindex", md)  # not requested, nothing written (older runs)
         self.assertNotIn(cl.REINDEX_NOTE, md)
-        md = render(self.root, ["sqlite", "postgres", "mongodb"])  # tests=all includes indexing
+        md = render(self.root, ["sqlite", "postgres", "mongodb"])  # tests=all: indexing is opt-in
+        self.assertNotIn("| reindex", md)
+        self.assertNotIn(cl.REINDEX_NOTE, md)
+        md = render(self.root, ["sqlite", "postgres", "mongodb"],
+                    tests="prewarm,import,crud,search,indexing,insert,bulk-import")  # named
         for heading, name in (("Throughput", REINDEX_ROW), ("p95", REINDEX), ("Errors", REINDEX)):
             name = name.replace(" Encounter", "")  # no leg reindexed anything
             self.assertEqual(row(md, heading, name),
@@ -360,6 +365,23 @@ class CompareLegsTest(unittest.TestCase):
         md = render(unasked, ["sqlite"], tests="prewarm,import,crud,search")
         self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 |")
         self.assertIn(cl.REINDEX_NOTE, md)
+
+    def test_indexing_not_in_default_suites(self):
+        self.assertNotIn("indexing", cl.CANONICAL_SUITES)
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
+        md = render(self.root, ["sqlite"])  # tests=all, but the leg wrote indexing.txt
+        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 |")
+        self.assertIn(cl.REINDEX_NOTE, md)
+
+    def test_canonical_matches_workflow(self):
+        # the suites tests=all runs are listed in two places; keep them in step
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "..", "..", "workflows", "fhir-benchmark.yml")
+        with open(path, encoding="utf-8") as fh:
+            m = re.search(r'CANONICAL="([^"]+)"', fh.read())
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), " ".join(cl.CANONICAL_SUITES))
+        self.assertNotIn("indexing", m.group(1).split())
 
     def test_reindex_label_names_one_type_only(self):
         put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))

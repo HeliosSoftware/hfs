@@ -205,7 +205,7 @@ if drain:
           f"es_live={drain.get('es_live', '?')} missing={d_missing} "
           f"needs_reindex={drain.get('needs_reindex_after', '?')}.{d_warn}")
 
-# Indexing suite: one timed `POST /<type>/$reindex` after search
+# Indexing suite (opt-in: only when tests names it): one timed `POST /<type>/$reindex` after search
 # (run_indexing_suite in suite-lib.sh documents what it measures and why it
 # is comparable across legs). indexing-hfs-log.txt holds the job's own
 # `reindex job finished` line from the HFS log: where the time went.

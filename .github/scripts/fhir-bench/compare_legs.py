@@ -6,8 +6,8 @@
 # stacked per-leg summaries. The three rows that load the corpus sit together (LOADING_ROWS)
 # and name the operation each one times (ROW_LABELS): import is k6 POSTing
 # transaction Bundles to the base URL (HFS has no `$import`), bulk-import is
-# `$bulk-submit` into a fresh database, reindex is the `indexing` suite's one
-# timed `$reindex`. The import row is not k6's request figures: its throughput
+# `$bulk-submit` into a fresh database, reindex is the opt-in `indexing` suite's
+# one timed `$reindex` (only when `tests` names it). The import row is not k6's request figures: its throughput
 # is resources/s and its p95 is per Bundle (IMPORT_NOTE, _import_row_values).
 # The `insert` row is HFS's own suite (k6/insert.js, not upstream): its
 # throughput row is labelled creates/s and it never carries the corpus marker
@@ -80,14 +80,17 @@ KNOWN_LEGS = [
     "postgres-elasticsearch",
     "mongodb-elasticsearch",
 ]
-# "Run benchmark suites" CANONICAL: the order the suites run in.
-CANONICAL_SUITES = ["prewarm", "import", "crud", "search", "indexing", "insert", "bulk-import"]
+# "Run benchmark suites" CANONICAL: what tests=all runs, in run order. `indexing`
+# is opt-in and not in it; its row still shows when `tests` names it or a leg
+# wrote indexing.txt (_render's extras).
+CANONICAL_SUITES = ["prewarm", "import", "crud", "search", "insert", "bulk-import"]
 # bulk-import is not a k6 suite: bulk-import.sh writes bulk-import.txt (key=value),
 # and it runs after search against its own fresh database.
 BULK_SUITE = "bulk-import"
 BULK_FILE = "bulk-import.txt"
-# Nor is indexing: "Run benchmark suites" runs it after search, before insert,
-# in the suite loop (run_indexing_suite in suite-lib.sh) and it writes
+# Nor is indexing: it is opt-in (never in tests=all), and "Run benchmark suites"
+# runs it where `tests` lists it (after search), always before insert and
+# bulk-import, in the suite loop (run_indexing_suite in suite-lib.sh); it writes
 # indexing.txt (key=value). Its row is labelled reindex, the operation it times;
 # its seconds and resource counts are in the leg's job summary (REINDEX_NOTE).
 INDEXING_SUITE = "indexing"
@@ -162,15 +165,19 @@ INSERT_NOTE = (
     "resources are in neither, and it never carries `†` because it does not read the corpus."
 )
 REINDEX_NOTE = (
-    "Reindex row: one timed `POST /<type>/$reindex` per leg (the `indexing` suite, after search "
-    "and before `insert`): HFS re-reads every stored resource of that type, re-extracts its "
-    "search parameters and rewrites the index that serves search (the primary's own index on "
+    "Reindex row (the opt-in `indexing` suite: it runs only when `tests` names it and is not "
+    "part of `all`): one timed `POST /<type>/$reindex` per leg, after search and before "
+    "`insert`: HFS re-reads every stored resource of that type, re-extracts its search "
+    "parameters and rewrites the index that serves search (the primary's own index on "
     "sqlite/postgres/mongodb, Elasticsearch on the +ES legs). **resources/s** = processed ÷ "
     "(completedAt − startedAt) from `$reindex-status`. This is not the index cost paid inside "
-    "import, which stays in the import row. A job still running at the budget (`budget_s` in "
-    "indexing.txt) is cancelled and its rate covers the part that ran (`(partial)`). Its "
-    "seconds, resources reindexed, index entries per resource and phase split are in each "
-    "leg's job summary (writer-reported, so not comparable across backends)."
+    "import, which stays in the import row, nor the initial index time of freshly loaded "
+    "data, which is the bulk-import initial index row; it rewrites the index right before "
+    "`insert` and `bulk-import`, so a run that includes it may skew both. A job still running "
+    "at the budget (`budget_s` in indexing.txt) is cancelled and its rate covers the part that "
+    "ran (`(partial)`). Its seconds, resources reindexed, index entries per resource and phase "
+    "split are in each leg's job summary (writer-reported, so not comparable across "
+    "backends)."
 )
 
 
