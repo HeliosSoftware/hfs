@@ -1138,7 +1138,12 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             eprintln!("Dense ID page compatibility work: {field}={examined}");
         }
     }
-    let since = mongodb::bson::DateTime::now();
+    // Capture each search separately without comparing the runner's clock to
+    // MongoDB's profiler timestamps. Profiling is already off at this point.
+    db.collection::<Document>("system.profile")
+        .drop()
+        .await
+        .unwrap();
     let mut ordered = query.clone();
     ordered.sort.clear();
     db.run_command(doc! {"profile": 2}).await.unwrap();
@@ -1155,7 +1160,6 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
         ["row-1199", "row-1198"]
     );
     let ordered_operations: Vec<Document> = db.collection("system.profile").find(doc! {
-        "ts": {"$gte": since},
         "ns": {"$in": [format!("{}.resources", db.name()), format!("{}.search_index", db.name())]},
         "op": {"$in": ["query", "command", "getmore"]}, "nreturned": {"$exists": true},
     }).await.unwrap().try_collect().await.unwrap();
@@ -1214,7 +1218,10 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             chain: vec![],
             components: vec![],
         });
-        let since = mongodb::bson::DateTime::now();
+        db.collection::<Document>("system.profile")
+            .drop()
+            .await
+            .unwrap();
         db.run_command(doc! {"profile": 2}).await.unwrap();
         let result = backend.search(&tenant, &selective).await;
         db.run_command(doc! {"profile": 0}).await.unwrap();
@@ -1229,7 +1236,6 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             expected
         );
         let operations: Vec<Document> = db.collection("system.profile").find(doc! {
-            "ts": {"$gte": since},
             "ns": {"$in": [format!("{}.resources", db.name()), format!("{}.search_index", db.name())]},
             "op": {"$in": ["query", "command", "getmore"]},
             "nreturned": {"$exists": true},
