@@ -304,21 +304,21 @@ impl Drop for BusyTimeoutGuard<'_> {
 
 /// What one file-boundary WAL checkpoint did (#1127).
 #[derive(Debug, Clone, Copy)]
-struct CheckpointReport {
+pub(super) struct CheckpointReport {
     /// Frames in the WAL when the checkpoint started.
-    wal_frames: i64,
+    pub(super) wal_frames: i64,
     /// Frames the `PASSIVE` pass copied into the database.
-    passive_checkpointed: i64,
+    pub(super) passive_checkpointed: i64,
     /// Whether the `TRUNCATE` pass gave up on a reader or writer.
-    truncate_busy: bool,
+    pub(super) truncate_busy: bool,
     /// Frames left in the WAL after the `TRUNCATE` pass (0 once truncated).
-    truncate_frames: i64,
-    page_size: i64,
-    duration: StdDuration,
+    pub(super) truncate_frames: i64,
+    pub(super) page_size: i64,
+    pub(super) duration: StdDuration,
 }
 
 impl CheckpointReport {
-    fn wal_bytes(&self) -> i64 {
+    pub(super) fn wal_bytes(&self) -> i64 {
         self.wal_frames.max(0).saturating_mul(self.page_size.max(0))
     }
 
@@ -365,7 +365,7 @@ fn wal_checkpoint(conn: &rusqlite::Connection, mode: &str) -> rusqlite::Result<(
 /// what it can without blocking anyone; `TRUNCATE` then has little left to copy
 /// and waits at most [`CHECKPOINT_TRUNCATE_BUSY_TIMEOUT`] for readers and
 /// writers before leaving the WAL for the next file boundary.
-fn checkpoint_wal(conn: &rusqlite::Connection) -> rusqlite::Result<CheckpointReport> {
+pub(super) fn checkpoint_wal(conn: &rusqlite::Connection) -> rusqlite::Result<CheckpointReport> {
     let started = std::time::Instant::now();
     let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
     let (_, wal_frames, passive_checkpointed) = wal_checkpoint(conn, "PASSIVE")?;

@@ -374,6 +374,11 @@ impl SqliteBackend {
             // never fsyncs anyway.
             if enable_wal && !is_memory {
                 conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+                // Without a limit the -wal file keeps its high-water size
+                // after every reset: once concurrent writes had grown it to
+                // 36 GB it stayed there, and every start rebuilt its index
+                // (#2025). With it, SQLite truncates the file at each reset.
+                conn.execute_batch("PRAGMA journal_size_limit = 268435456;")?;
             }
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(

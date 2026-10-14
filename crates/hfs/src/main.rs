@@ -2153,6 +2153,31 @@ where
 /// (#235). `HFS_SEARCH_PARAM_CACHE_TTL=0` disables it. A failed pass keeps
 /// serving the stale cache; the next tick retries.
 #[cfg(feature = "sqlite")]
+/// Keeps the SQLite WAL bounded on every write path, not only `$bulk-submit`
+/// (#2025): every 30 s a WAL file past the threshold is folded back into the
+/// database and truncated. A pass that finds readers or writers in the way
+/// gives up after a second and the next one retries.
+fn spawn_sqlite_wal_maintenance(backend: Arc<SqliteBackend>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(e) = backend.maintain_wal().await {
+                tracing::warn!("SQLite WAL maintenance failed; the next pass retries: {e}");
+            }
+        }
+    });
+}
+
+/// Folds the SQLite WAL back and truncates it after the server drained, so a
+/// restart does not inherit it (#2025).
+async fn checkpoint_sqlite_wal_at_shutdown(backend: &SqliteBackend) {
+    if let Err(e) = backend.checkpoint_wal_at_shutdown().await {
+        warn!("SQLite WAL checkpoint at shutdown failed: {e}");
+    }
+}
+
 fn spawn_sqlite_search_param_refresh(backend: Arc<SqliteBackend>, config: &ServerConfig) {
     let ttl = config.search_param_cache_ttl;
     if ttl == 0 {
@@ -2355,6 +2380,8 @@ async fn start_sqlite(
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_sqlite_search_param_refresh(backend.clone(), &config);
+    spawn_sqlite_wal_maintenance(backend.clone());
+    let wal_backend = backend.clone();
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own). Cheap: the SQLite backend
     // shares one connection pool behind the Arc.
@@ -2395,7 +2422,7 @@ async fn start_sqlite(
         settings_store,
         ops,
     );
-    serve(
+    let served = serve(
         app,
         &config,
         serve_audit_state,
@@ -2404,7 +2431,9 @@ async fn start_sqlite(
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
-    .await
+    .await;
+    checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
+    served
 }
 
 /// Constructs an embedded SQLite job store for backends that can't host job
@@ -3272,6 +3301,8 @@ async fn start_sqlite_elasticsearch(
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
     spawn_sqlite_search_param_refresh(sqlite.clone(), &config);
+    spawn_sqlite_wal_maintenance(sqlite.clone());
+    let wal_backend = sqlite.clone();
 
     // Build Elasticsearch configuration from server config
     let es_nodes: Vec<String> = config
@@ -3453,7 +3484,7 @@ async fn start_sqlite_elasticsearch(
     );
     // The UI's tenant-maintenance path goes through the composite (not the
     // bare primary) so a purge also clears the offloaded search documents.
-    serve(
+    let served = serve(
         app,
         &config,
         serve_audit_state,
@@ -3462,7 +3493,9 @@ async fn start_sqlite_elasticsearch(
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
-    .await
+    .await;
+    checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
+    served
 }
 
 /// Fallback when elasticsearch feature is not enabled.
