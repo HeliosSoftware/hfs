@@ -594,6 +594,33 @@ The context includes:
 - **Resources**: Available FHIR resources for evaluation
 - **Variables**: Environment variables (including `$this`, `$index`, `$total`)
 - **Configuration**: Strict mode, ordered function checking, etc.
+- **Unresolved-identifier policy**: What to do with a leading identifier that is neither a known type nor an element of the context resource
+
+#### Leading type identifiers
+
+A path such as `Patient.name` starts with a type identifier. The evaluator resolves it as follows:
+
+| Leading identifier | Result |
+|---|---|
+| The context resource's own type (`Patient` on a Patient) | Resolves |
+| An abstract base the resource conforms to (`Resource`, `DomainResource`) | Resolves |
+| A known type that is not the context type (`Patient` on an Observation) | Empty, silently (required for union type-dispatch such as `Patient.name.family \| Observation.code.text`) |
+| Neither a known type nor an element of the context (`Bogus`) | Diagnosed according to the policy |
+
+The diagnosis is controlled by `EvaluationContext::set_unresolved_identifier_policy`:
+
+```rust
+use helios_fhirpath::{EvaluationContext, evaluator::UnresolvedIdentifierPolicy};
+
+let mut context = EvaluationContext::new(fhir_resources);
+context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
+```
+
+- `Ignore`: evaluate to an empty collection, as before.
+- `Warn` (default): evaluate to an empty collection and log a `tracing::warn!`, once per identifier and context type.
+- `Error`: return an `EvaluationError::SemanticError` naming the identifier and the context type.
+
+`fhirpath-cli` and `fhirpath-server` use `Error`, so a typo fails instead of printing an empty result (exit code 1, HTTP 422 with an OperationOutcome). Search-parameter indexing, validator constraints and compartment filtering keep the default `Warn`, because a single malformed expression must not discard the rest of a union.
 - **Variable Scoping**: Parent context support for proper variable scoping in functions like `select()` and `where()`
 
 ### Type System and Namespace Resolution

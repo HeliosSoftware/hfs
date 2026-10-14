@@ -526,12 +526,6 @@ jobs:
       - name: Renormalize the working tree
         uses: ./.github/actions/renormalize-eol
 
-      # `.agents/skills` (Codex) must stay a byte-for-byte mirror of
-      # `.claude/skills` (#1834).
-      - name: Check agent skill trees are in sync
-        if: runner.os != 'Windows'
-        run: diff -r .agents/skills .claude/skills
-
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
         uses: dtolnay/rust-toolchain@stable

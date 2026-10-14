@@ -42,6 +42,22 @@ pub enum AuthError {
         operation: String,
     },
 
+    /// The operation is granted only by a `patient/` scope, but the token
+    /// carries no usable patient launch context to confine it to.
+    ///
+    /// A `patient/` scope is access to one patient's compartment; without a
+    /// `patient` claim naming that patient there is nothing to confine to, so
+    /// the scope is refused rather than widened to `user/` (#1618).
+    #[error(
+        "Forbidden: {operation} on {resource_type} is granted only by a patient/ scope and the token has no usable patient launch context"
+    )]
+    PatientContextRequired {
+        /// The FHIR resource type.
+        resource_type: String,
+        /// The operation that was attempted.
+        operation: String,
+    },
+
     /// Failed to fetch JWKS from the endpoint.
     #[error("JWKS fetch error: {0}")]
     JwksFetchError(String),

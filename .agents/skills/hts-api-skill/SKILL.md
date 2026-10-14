@@ -91,7 +91,7 @@ actually reads are in `crates/hts/src/operations/`.
 | CodeSystem `$lookup` | `GET/POST /CodeSystem/$lookup`, `/{id}/$lookup` | Concept inspector: display, definition, designations, properties, parent/child |
 | CodeSystem `$validate-code` | `GET/POST /CodeSystem/$validate-code` | Single-code validator with display / active / abstract / supplement toggles |
 | CodeSystem `$subsumes` | `GET/POST /CodeSystem/$subsumes` | Two-code relationship viewer (`equivalent`, `subsumes`, `subsumed-by`, `not-subsumed`) |
-| ValueSet `$expand` | `GET/POST /ValueSet/$expand`, `/{id}/$expand` | Expansion browser with filter, flat/tree, pagination, language, designations, supplements, `tx-resource`; 422 `too-costly` needs an `X-TOO-COSTLY-THRESHOLD` escape hatch |
+| ValueSet `$expand` | `GET/POST /ValueSet/$expand`, `/{id}/$expand` | Expansion browser with filter, flat/tree, pagination, language, designations, supplements, `tx-resource`; 422 `too-costly` needs an `X-TOO-COSTLY-THRESHOLD` escape hatch. `url=http://fhir.org/VCL?v1=<percent-encoded VCL>` expands a VCL expression (see `work-with-hts`); VCL is not advertised in `/metadata` and the UI has no VCL input yet |
 | ValueSet `$validate-code` | `GET/POST /ValueSet/$validate-code`, `/{id}/$validate-code` | Membership validator with `tx-resource`, version pins, language |
 | ValueSet `$batch-validate-code` | `POST /ValueSet/$batch-validate-code` | Bulk validation grid with inherited defaults + per-row overrides |
 | ConceptMap `$translate` | `GET/POST /ConceptMap/$translate`, `/{id}/$translate` | Forward/reverse translation with match grid, equivalence/relationship column |

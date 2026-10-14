@@ -462,8 +462,13 @@ fn test_r5_test_suite() {
 
             // Run the test
             let is_predicate_test = test.predicate == "true";
+            let scope = TestScope {
+                context: &test.context,
+                context_type: &test.context_type,
+            };
             let test_run_result = run_fhir_test(
                 &test.expression,
+                &scope,
                 &context,
                 &expected_results,
                 is_predicate_test,
@@ -501,7 +506,7 @@ fn test_r5_test_suite() {
                 // correct behaviour. That was the single largest under-report in
                 // issue #307, and it is why a "zero failures" result could not be
                 // taken at face value.
-                match helios_fhirpath::evaluate_expression(&test.expression, &context) {
+                match evaluate_test_expression(&test.expression, &scope, &context) {
                     Ok(EvaluationResult::Empty) => {
                         println!("  PASS: {} - '{}'", test.name, test.expression);
                         Ok(())
