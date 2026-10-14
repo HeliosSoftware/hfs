@@ -59,6 +59,13 @@ name: FHIR Server Benchmark
 #     file concurrency 1); the clock runs from kick-off until the deferred
 #     search-index rebuild has finished, capped by BULK_IMPORT_TIMEOUT_S and by
 #     what is left of the leg budget; the bulk database is dropped afterwards.
+#     The comparison reports the one load as three Throughput rows:
+#     `bulk-import` (resources/s over both phases), `bulk-import ingest`
+#     (resources/s and the seconds from kick-off until the status manifest is
+#     final: how long loading the corpus takes) and `bulk-import initial
+#     index` (seconds of the deferred search-index rebuild that follows: how
+#     long until that freshly loaded data is indexed; `inline (during ingest)`
+#     when HFS indexed while ingesting, HFS_BULK_SUBMIT_DEFER_INDEXING=false).
 #     It starts no containers, so the capacity gate is unchanged. Logic in
 #     .github/scripts/fhir-bench/bulk-import.sh and bulk_import.py.
 #   • Every named volume this workflow creates is
@@ -132,7 +139,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' = prewarm,import,crud,search,insert,bulk-import | comma-separated from those plus indexing (a timed $reindex; opt-in only, never part of 'all', list it after search; it rewrites the index before insert and bulk-import and may skew both). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,insert' skips it"
+        description: "Suites to run: 'all' = prewarm,import,crud,search,insert,bulk-import | comma-separated from those plus indexing (a timed $reindex; opt-in only, never part of 'all', list it after search; it rewrites the index before insert and bulk-import and may skew both). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and initial-index rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,insert' skips it"
         required: false
         default: "all"
       vus:
@@ -2171,9 +2178,10 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
   # errors; the import, bulk-import and reindex rows name the operation each
-  # times and sit together; the reindex row appears only when a leg ran the
-  # opt-in indexing suite) and a leg-health table, so a reader does not
-  # have to scroll six stacked per-leg summaries.
+  # times and sit together; the Throughput table also splits bulk-import into
+  # its ingest and initial-index rows right under it; the reindex row appears
+  # only when a leg ran the opt-in indexing suite) and a leg-health table, so
+  # a reader does not have to scroll six stacked per-leg summaries.
   # Display only: the job is continue-on-error and
   # compare_legs.py always exits 0, so it can never change the run's
   # conclusion, and it adds nothing to the per-leg jobs.

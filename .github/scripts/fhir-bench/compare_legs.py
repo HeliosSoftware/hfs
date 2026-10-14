@@ -13,8 +13,12 @@
 # throughput row is labelled creates/s and it never carries the corpus marker
 # `†` (see INSERT_NOTE). bulk-import and reindex are read from bulk-import.txt
 # and indexing.txt instead of a k6 summary; bulk-import also adds a bulk
-# detail table after the leg-health table. Display only: it never decides
-# anything, it always exits 0 and every problem goes out as a `::warning`
+# detail table after the leg-health table. The Throughput table also splits the
+# bulk-import row into its two phases, directly under it: ingest (resources/s and
+# seconds, how long loading the corpus takes) and initial index (seconds of the
+# deferred search-index rebuild after it, `inline (during ingest)` when the
+# backend indexed while ingesting; BULK_PHASES_NOTE). Display only: it never
+# decides anything, it always exits 0 and every problem goes out as a `::warning`
 # instead.
 #
 # Called from: the `compare` job's "Write comparison summary" step
@@ -113,13 +117,17 @@ TITLE = "Leg comparison"
 
 LEGEND = (
     "`†` crud/search/reindex ran on an incomplete corpus (import below 1000/1000 bundles or not "
-    "run before it, or the ES index not drained); on bulk-import, search did not return every "
-    "resource it ingested · `‡` more than 1% errors or failed checks in "
-    "that suite (on bulk-import, any resource not ingested; on reindex, any reindex error or a "
-    "failed job) · `⚠` contended host (postgres crud above 3 ms/call) or a backend container "
-    "died · **bold** = best in its row, shown only when no leg in that row carries a marker or "
-    "`(partial)` · bulk-import is resources/s through `$bulk-submit` into a fresh database, "
-    "kick-off until the search index covers it; reindex is resources/s of one `$reindex` of the "
+    "run before it, or the ES index not drained); on bulk-import and its initial index, search "
+    "did not return every resource it ingested · `‡` more than 1% errors or failed checks in "
+    "that suite (on bulk-import and its ingest, any resource not ingested; on its initial "
+    "index, a rebuild that did not complete or reported errors; on reindex, any reindex error "
+    "or a failed job) · `⚠` contended host (postgres crud above 3 ms/call) or a backend "
+    "container died · **bold** = best in its row, shown only when no leg in that row carries a "
+    "marker or `(partial)` (on the bulk-import ingest and initial index rows, also only when "
+    "every leg indexed the same way) · bulk-import is resources/s through `$bulk-submit` into a "
+    "fresh database, kick-off until the search index covers it, and its ingest and initial "
+    "index rows split that time (see the note below the tables); reindex is resources/s of one "
+    "`$reindex` of the "
     "type its row names, in the corpus import loaded, `(partial)` when it did not finish (the "
     "reason is in that leg's job summary); each is one asynchronous job, so its p95 is n/a · "
     "n/a = no result (reason in brackets)"
@@ -149,6 +157,14 @@ ROW_LABELS = {
     ("indexing", "p95"): "reindex, `$reindex`%s",
     ("indexing", "err"): "reindex, `$reindex`%s",
 }
+# The two phases of the bulk-import job, as Throughput rows right under the
+# combined bulk-import row (_bulk_phase_lines).
+BULK_INGEST_LABEL = "bulk-import ingest (resources/s, seconds)"
+BULK_INDEX_LABEL = "bulk-import initial index (seconds)"
+# index_seconds is 0 when HFS indexed while ingesting; that is not a free index.
+INLINE_INDEX = "inline (during ingest)"
+# bulk_import.py index_status values that mean the deferred rebuild did not finish cleanly.
+_BULK_INDEX_BAD = ("failed", "permanent-errors", "cancelled")
 IMPORT_NOTE = (
     "Import row: **resources/s** = entries of the transaction Bundles that committed (k6 "
     "`bundle_size`) per second of the import scenario's own clock, which starts after k6 "
@@ -156,6 +172,20 @@ IMPORT_NOTE = (
     "upstream's report uses. Its p95 is **per Bundle**: one k6 iteration, the corpus fetch "
     "plus the transaction POST. k6's `http_reqs` is not used for import: it counts a corpus "
     "GET beside every Bundle POST. Bundles/s is in Leg health."
+)
+BULK_PHASES_NOTE = (
+    "Bulk-import ingest and initial index rows: the same `$bulk-submit` load as the "
+    "`bulk-import` row, split into the two times a user waits for. **Ingest** = resources "
+    "ingested ÷ seconds from kick-off until the status manifest is final, those seconds in "
+    "brackets: how long loading the corpus takes. **Initial index** = seconds from then until "
+    "HFS's deferred search-index rebuild of that freshly loaded data has finished "
+    "(HFS_BULK_SUBMIT_DEFER_INDEXING, the default); the Search check in the Bulk import table "
+    "then confirms it is searchable. `inline (during ingest)` = the backend indexed each batch "
+    "while ingesting (DEFER_INDEXING=false), so its indexing time is inside its ingest seconds "
+    "— it is not a zero-second index; `+ N s rebuild` is a follow-up rebuild of the types the "
+    "index rejected. No best is marked on either row when legs indexed differently. Both rows "
+    "are in the Throughput table only (one asynchronous job: no p95; failed resources are in "
+    "the bulk-import Errors row)."
 )
 INSERT_NOTE = (
     "`insert` is HFS's own suite (`.github/scripts/fhir-bench/k6/insert.js`, load shape "
@@ -853,6 +883,8 @@ def _metric_table(title, kind, datas, loaded, rows, nocrown):
             crown = _crowned(loaded, suite, "p95", min, _fmt_p95, rows, nocrown)
         cells = [_metric_cell(d, suite, kind, crown, rows) for d in datas]
         lines.append("| " + _row_label(suite, kind, rtype) + " | " + " | ".join(cells) + " |")
+        if suite == BULK_SUITE and kind == "rps":
+            lines += _bulk_phase_lines(datas, loaded, nocrown)
     lines.append("")
     return lines
 
@@ -990,7 +1022,10 @@ BULK_CAPTION = (
     "after the search suite. **Ingest** is kick-off until the status manifest is final; **Index** "
     "is the deferred search-index rebuild that follows (followed in the second HFS's log); "
     "**Total** is both, and is what the `bulk-import` row above divides the ingested resources "
-    "by. **Search check** compares Patient and Observation totals and two indexed queries with the "
+    "by; the ingest and initial index rows above show **Ingest** and **Index** on their own. "
+    "**Index** reads `inline (during ingest)` when HFS indexed while ingesting, so that time is "
+    "inside **Ingest**. **Search check** compares Patient and Observation totals and two "
+    "indexed queries with the "
     "converted corpus. It counts the 3,349 seed resources the `import` row's entries do not."
 )
 
@@ -1001,6 +1036,119 @@ _BULK_CHECKS = (("patient", "Patient"), ("observation", "Observation"),
 def _bulk_secs(kv, key):
     v = _fnum(kv.get(key))
     return "{:,.0f} s".format(v) if v is not None else "n/a"
+
+
+def _bulk_inline(kv):
+    """True when HFS indexed while ingesting (HFS_BULK_SUBMIT_DEFER_INDEXING=false):
+    bulk_import.py records index_status=inline (index_seconds=0) when no deferred
+    rebuild ran; with the setting off, an ES composite can still rebuild the types its
+    batch sink rejected. A missing defer_indexing means deferred."""
+    return kv.get("index_status") == "inline" or kv.get("defer_indexing") == "false"
+
+
+def _bulk_index_text(kv):
+    """The initial-index time of a complete bulk-import run as text, or None when the
+    run recorded no index_status (an older artifact; the caller decides). Inline
+    indexing is named, never shown as a zero-second index."""
+    istatus = kv.get("index_status")
+    if not istatus:
+        return None
+    if istatus == "inline":
+        return INLINE_INDEX
+    secs = _fnum(kv.get("index_seconds"))
+    if secs is None or secs < 0:
+        return "n/a (no data)"
+    text = "{:,.0f} s".format(secs)
+    if _bulk_inline(kv):
+        text = "%s + %s rebuild" % (INLINE_INDEX, text)
+    if istatus != "completed":
+        text += " (%s)" % md_cell(istatus)
+    return text
+
+
+def _phase_cell(head, tail="", mk="", val=None):
+    """One bulk-phase cell: text (head is what bold wraps), markers, and the number a
+    best can be picked from (None when the cell is n/a or not comparable)."""
+    return {"head": head, "tail": tail, "mk": mk, "val": val}
+
+
+def _bulk_phase(d):
+    """(ingest cell, index cell) of one leg for the two bulk-import phase rows."""
+    if d["status"] in _LEG_NA:
+        na = _phase_cell("n/a (%s)" % _LEG_NA[d["status"]])
+        return na, na
+    s = d["suites"].get(BULK_SUITE) or {}
+    kv = s.get("bulk")
+    if kv is None:
+        na = _phase_cell("n/a (%s)" % md_cell(s.get("reason") or "not run"))
+        return na, na
+    reason = s.get("reason")  # set when the job did not finish (status != complete)
+    secs, rate = _seconds(kv.get("ingest_seconds")), _fnum(kv.get("ingest_resources_per_s"))
+    if secs is not None and rate is not None:
+        # recorded as soon as the final manifest is in, so it shows even when the
+        # later index phase timed out or errored
+        mk = ""
+        failed = _int(kv.get("resources_failed"))
+        if failed is not None and failed > 0:
+            mk += "‡"
+        if d["died"]:
+            mk += "⚠"
+        ingest = _phase_cell(_fmt_rps(rate), " ({:,.0f} s)".format(secs), mk, rate)
+    else:
+        ingest = _phase_cell("n/a (%s)" % md_cell(reason or "no ingest timing"))
+    if reason:
+        return ingest, _phase_cell("n/a (%s)" % md_cell(reason))
+    istatus = kv.get("index_status")
+    if not istatus:
+        return ingest, _phase_cell("n/a (no index timing)")
+    mk = ""
+    if s.get("unsearchable"):
+        mk += "†"
+    errors = _int(kv.get("index_errors"))
+    if istatus in _BULK_INDEX_BAD or (errors is not None and errors > 0):
+        mk += "‡"
+    if d["died"]:
+        mk += "⚠"
+    secs = _fnum(kv.get("index_seconds"))
+    comparable = (istatus == "completed" and not _bulk_inline(kv)
+                  and secs is not None and secs >= 0)
+    return ingest, _phase_cell(_bulk_index_text(kv), "", mk, secs if comparable else None)
+
+
+def _fmt_secs(v):
+    return "{:,.0f}".format(v)
+
+
+def _bulk_phase_lines(datas, loaded, nocrown):
+    """The ingest and initial-index rows (BULK_INGEST_LABEL, BULK_INDEX_LABEL) that sit
+    under the combined bulk-import row in the Throughput table. Bold follows the other
+    rows (no best across a marker, a hardware mismatch or fewer than two legs), and also
+    when legs mixed inline and deferred indexing: their times measure different things."""
+    phases = dict((d["leg"], _bulk_phase(d)) for d in datas)
+    kinds = set()
+    for d in loaded:
+        kv = (d["suites"].get(BULK_SUITE) or {}).get("bulk")
+        if kv and (kv.get("defer_indexing") or kv.get("index_status")):
+            kinds.add(_bulk_inline(kv))
+    mixed = len(kinds) > 1
+    out = []
+    for text, which, pick, fmt in ((BULK_INGEST_LABEL, 0, max, _fmt_rps),
+                                   (BULK_INDEX_LABEL, 1, min, _fmt_secs)):
+        cells = dict((d["leg"], phases[d["leg"]][which]) for d in datas)
+        crown = set()
+        cand = [d["leg"] for d in loaded if cells[d["leg"]]["val"] is not None]
+        marked = any(cells[d["leg"]]["mk"] for d in loaded)
+        if not (nocrown or mixed or marked or len(cand) < 2):
+            best = fmt(pick(cells[leg]["val"] for leg in cand))
+            crown = set(leg for leg in cand if fmt(cells[leg]["val"]) == best)
+        shown = []
+        for d in datas:
+            c = cells[d["leg"]]
+            head = "**%s**" % c["head"] if d["leg"] in crown else c["head"]
+            cell = head + c["tail"]
+            shown.append(cell + " " + c["mk"] if c["mk"] else cell)
+        out.append("| " + md_cell(text) + " | " + " | ".join(shown) + " |")
+    return out
 
 
 def _bulk_search_cell(kv):
@@ -1046,15 +1194,9 @@ def _bulk_row(d):
     ingest = _bulk_secs(kv, "ingest_seconds") if kv.get("ingest_seconds") else "n/a"
     if ingest != "n/a" and rate is not None:
         ingest += " · {:,.0f}/s".format(rate)
-    istatus = kv.get("index_status")
-    if status != "complete" or not istatus:
+    index = _bulk_index_text(kv) if status == "complete" else None
+    if index is None:
         index = "n/a"
-    elif istatus == "inline":
-        index = "inline"
-    else:
-        index = _bulk_secs(kv, "index_seconds")
-        if istatus != "completed":
-            index += " (%s)" % md_cell(istatus)
     total = _bulk_secs(kv, "total_seconds") if kv.get("total_seconds") else "n/a"
     search = _bulk_search_cell(kv) if status == "complete" else "n/a"
     return "| " + " | ".join([leg, result, ingested, ingest, index, total, search]) + " |"
@@ -1188,7 +1330,10 @@ def _render(root, env, warn, zips):
                            datas, loaded, rows, nocrown)
     lines += _metric_table("p95 latency (ms)", "p95", datas, loaded, rows, nocrown)
     lines += _metric_table("Errors (Err% · failed checks)", "err", datas, loaded, rows, nocrown)
-    lines += [LEGEND, "", IMPORT_NOTE, "", "### Leg health", "",
+    lines += [LEGEND, "", IMPORT_NOTE, ""]
+    if BULK_SUITE in rows:
+        lines += [BULK_PHASES_NOTE, ""]
+    lines += ["### Leg health", "",
               "| Leg | Results | Runner | Import | Result sizes | ES drain | Host at crud start |",
               "|---|---|---|---|---|---|---|"]
     lines += [_health_row(d, rows) for d in datas]
