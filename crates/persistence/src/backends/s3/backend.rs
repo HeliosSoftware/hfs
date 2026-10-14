@@ -669,6 +669,18 @@ impl S3Backend {
             S3ClientError::PreconditionFailed => StorageError::Backend(BackendError::QueryError {
                 message: "S3 precondition failed".to_string(),
             }),
+            // Transient (#2047): S3 had a conflicting conditional write in flight
+            // and wrote nothing. Deliberately NOT `QueryError`, which the
+            // resource paths read as a lost precondition (AlreadyExists /
+            // VersionConflict). `Unavailable` is served as 503 with Retry-After.
+            S3ClientError::ConditionalConflict(message) => {
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "s3".to_string(),
+                    message: format!(
+                        "S3 reported a conflicting concurrent write (HTTP 409); retry: {message}"
+                    ),
+                })
+            }
             S3ClientError::Throttled(message) => StorageError::Backend(BackendError::Unavailable {
                 backend_name: "s3".to_string(),
                 message,

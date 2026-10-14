@@ -120,6 +120,10 @@ struct MockState {
     /// When true, every `put_object` fails its precondition, simulating a writer
     /// that loses the compare-and-swap race on every attempt.
     fail_all_puts_with_precondition: bool,
+    /// Conditional `put_object` calls on exactly these keys fail with
+    /// `ConditionalConflict` (AWS 409) this many more times, without writing
+    /// (#2047).
+    conflicting_puts: HashMap<String, usize>,
     /// Preconditions carried by each `put_object` call, in order.
     recorded_puts: Vec<RecordedPut>,
     /// A [`StealHook`] to run before the next `put_object` evaluates its
@@ -277,6 +281,19 @@ impl MockS3Client {
         self.state.lock().unwrap().fail_all_puts_with_precondition = true;
     }
 
+    /// Makes the next `times` *conditional* `put_object` calls on exactly `key`
+    /// fail with `ConditionalConflict` (AWS `409 ConditionalRequestConflict`)
+    /// without writing; `usize::MAX` means always (#2047). Unconditional puts
+    /// never consume the count. The conflicting calls are still counted and
+    /// recorded.
+    fn conflict_puts_at(&self, key: &str, times: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .conflicting_puts
+            .insert(key.to_string(), times);
+    }
+
     /// Arranges for a concurrent writer to overwrite `key` with `body` exactly
     /// once, immediately before the next `put_object` call evaluates its
     /// preconditions.
@@ -396,6 +413,21 @@ impl S3Api for MockS3Client {
         // ETag is now stale correctly sees `PreconditionFailed`.
         if let Some(steal) = state.steal_hook.take() {
             steal(&mut state);
+        }
+
+        // A conflicting conditional write in flight on this key (#2047): S3
+        // answers 409 and writes nothing. Only conditional puts are refused.
+        let conditional = if_match.is_some() || if_none_match.is_some();
+        if conditional
+            && let Some(remaining) = state.conflicting_puts.get_mut(key)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Err(S3ClientError::ConditionalConflict(
+                "A conflicting conditional operation is currently in progress against this \
+                 resource. Try again."
+                    .to_string(),
+            ));
         }
 
         let entry_key = (bucket.to_string(), key.to_string());
@@ -6646,6 +6678,85 @@ async fn transaction_bundle_is_refused_without_writing_anything() {
 }
 
 // ===========================================================================
+// HTTP 409 ConditionalRequestConflict (#2047)
+//
+// AWS answers a conditional write that collides with another conditional write
+// in flight on the same key with a 409, not a 412. It is transient and says
+// nothing about the stored state, so it must never be reported as a lost
+// precondition (AlreadyExists / VersionConflict).
+// ===========================================================================
+
+#[test]
+fn conditional_conflict_maps_to_unavailable_not_query_error() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    match backend.map_client_error(S3ClientError::ConditionalConflict("busy".to_string())) {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            assert!(message.contains("409"), "message was: {message}");
+            assert!(message.contains("busy"), "message was: {message}");
+        }
+        other => panic!("expected Unavailable (503), got {other:?}"),
+    }
+}
+
+/// A 409 on a resource write is a retryable 503, not a conflict: the resource
+/// paths turn `PreconditionFailed` into `AlreadyExists`/`VersionConflict`, and
+/// a 409 must never be reported as one (nothing is known about stored state).
+#[tokio::test]
+async fn a_409_on_a_resource_write_is_unavailable_not_a_conflict() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    create_patient(&backend, "tenant-a", "p1").await;
+
+    // The current pointer, whichever key layout the backend writes.
+    let current_keys: Vec<String> = mock
+        .keys("test-bucket")
+        .into_iter()
+        .filter(|k| k.contains("/resources/Patient/") && k.ends_with("/p1/current.json"))
+        .collect();
+    assert_eq!(current_keys.len(), 1, "keys were: {current_keys:?}");
+    let current_key = &current_keys[0];
+
+    let read = backend
+        .read(&t, "Patient", "p1")
+        .await
+        .expect("read")
+        .expect("p1 exists");
+
+    mock.conflict_puts_at(current_key, 1);
+    let err = backend
+        .update(
+            &t,
+            &read,
+            json!({"resourceType":"Patient","id":"p1","active":false}),
+        )
+        .await
+        .expect_err("a 409 must fail the update");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "an update meeting a 409 must be Unavailable, not a version conflict: {err:?}"
+    );
+
+    mock.conflict_puts_at(current_key, 1);
+    let err = backend
+        .delete(&t, "Patient", "p1")
+        .await
+        .expect_err("a 409 must fail the delete");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "a delete meeting a 409 must be Unavailable, not an optimistic-lock failure: {err:?}"
+    );
+
+    // Neither refused write landed.
+    let after = backend
+        .read(&t, "Patient", "p1")
+        .await
+        .expect("read")
+        .expect("p1 still exists");
+    assert_eq!(after.version_id(), "1");
+}
+
+// ===========================================================================
 // $bulk-submit job store
 //
 // S3 hosts the REST worker's job state itself — leases compare-and-swapped
@@ -7773,6 +7884,407 @@ mod bulk_submit_worker {
         assert!(
             artifacts.iter().any(|f| f.file_type == "error"),
             "the malformed line must surface in the error artifact, got {artifacts:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP 409 ConditionalRequestConflict on the compare-and-swap writes (#2047)
+    //
+    // AWS refuses a conditional PUT that collides with another write in flight
+    // on the same key with a 409. Nothing was written, so every loop below must
+    // re-read and retry it exactly as it does a lost race (412).
+    // -----------------------------------------------------------------------
+
+    /// How many puts the mock has received for exactly `key` so far.
+    fn puts_on(mock: &MockS3Client, key: &str) -> usize {
+        mock.recorded_puts()
+            .iter()
+            .filter(|put| put.key == key)
+            .count()
+    }
+
+    /// A seeded submission with one manifest, the mock behind it, and the S3
+    /// key of that manifest's state object.
+    struct Seeded {
+        mock: Arc<MockS3Client>,
+        backend: S3Backend,
+        id: SubmissionId,
+        manifest_id: String,
+        manifest_key: String,
+        location: crate::backends::s3::backend::TenantLocation,
+    }
+
+    async fn seeded_with_manifest_key(t: &TenantContext) -> Seeded {
+        let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+        let backend = make_prefix_backend(mock.clone());
+        let (id, manifest_id) = seed(&backend, t).await;
+        let location = backend.tenant_location(t).expect("location");
+        let manifest_key =
+            location
+                .keyspace
+                .submit_manifest_key(&id.submitter, &id.submission_id, &manifest_id);
+        Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key,
+            location,
+        }
+    }
+
+    #[tokio::test]
+    async fn mutate_manifest_state_retries_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+        let before = puts_on(&mock, &key);
+
+        mock.conflict_puts_at(&key, 2);
+        backend
+            .mutate_manifest_state(&location, &id, &manifest_id, |state| {
+                state.manifest.processed_entries += 1;
+            })
+            .await
+            .expect("two 409s are retried and the third attempt lands");
+
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(
+            manifest.processed_entries, 1,
+            "the change must be applied exactly once"
+        );
+        let attempts: Vec<_> = mock
+            .recorded_puts()
+            .into_iter()
+            .filter(|put| put.key == key)
+            .skip(before)
+            .collect();
+        assert_eq!(attempts.len(), 3, "two conflicts and the write that landed");
+        assert!(
+            attempts.iter().all(|put| put.if_match.is_some()),
+            "every attempt is a compare-and-swap: {attempts:?}"
+        );
+    }
+
+    /// The #2047 scenario: a leased manifest ingesting a batch while AWS answers
+    /// 409 to the status write that opens the batch and to the counter write
+    /// that closes it. Before the fix the first 409 failed the whole batch.
+    #[tokio::test]
+    async fn process_entries_completes_through_409s_on_the_manifest_state() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+        let before = puts_on(&mock, &key);
+
+        // The pre-batch status write meets one 409 ...
+        mock.conflict_puts_at(&key, 1);
+        // ... and so does the post-batch counter write, armed once the batch's
+        // entries are stored.
+        let arming = Arc::clone(&mock);
+        let armed_key = key.clone();
+        let options =
+            BulkProcessingOptions::new().with_batch_observer(Arc::new(MidBatch(move || {
+                arming.conflict_puts_at(&armed_key, 1);
+                Box::pin(async {}) as futures::future::BoxFuture<'static, ()>
+            })));
+
+        let results = backend
+            .process_entries(&t, &id, &manifest_id, one_patient(1, "p1"), &options)
+            .await
+            .expect("ingest must ride out the 409s");
+        assert!(results[0].is_success());
+
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.total_entries, 1);
+        assert_eq!(
+            manifest.processed_entries, 1,
+            "the retried counter write must not double-count"
+        );
+        assert_eq!(
+            manifest.status,
+            ManifestStatus::Processing,
+            "a leased manifest's terminal status belongs to the worker"
+        );
+        assert_eq!(
+            puts_on(&mock, &key) - before,
+            4,
+            "status write + its 409, counter write + its 409"
+        );
+        // The holder still holds the lease.
+        backend.heartbeat(&lease).await.expect("lease intact");
+    }
+
+    #[tokio::test]
+    async fn fenced_writes_retry_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .heartbeat(&lease)
+            .await
+            .expect("heartbeat rides out a 409");
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .add_manifest_progress(&lease, 3, 1, 4)
+            .await
+            .expect("progress rides out a 409");
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.processed_entries, 3);
+        assert_eq!(manifest.failed_entries, 1);
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .finish_manifest(&lease)
+            .await
+            .expect("finish rides out a 409");
+        assert_eq!(
+            backend.list_manifests(&t, &id).await.expect("manifests")[0].status,
+            ManifestStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_cas_retries_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            location,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+        let state_key = location
+            .keyspace
+            .submit_state_key(&id.submitter, &id.submission_id);
+        let before = puts_on(&mock, &state_key);
+
+        mock.conflict_puts_at(&state_key, 1);
+        backend
+            .set_submission_kickoff_meta(
+                &t,
+                &id,
+                Some("client-subject"),
+                "https://hfs.example/$bulk-submit",
+                true,
+            )
+            .await
+            .expect("kickoff meta rides out a 409");
+
+        let attempts: Vec<_> = mock
+            .recorded_puts()
+            .into_iter()
+            .filter(|put| put.key == state_key)
+            .skip(before)
+            .collect();
+        assert_eq!(attempts.len(), 2, "one conflict and the write that landed");
+        assert!(
+            attempts.iter().all(|put| put.if_match.is_some()),
+            "every attempt is a compare-and-swap: {attempts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_params_retry_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .set_manifest_fetch_params(
+                &t,
+                &id,
+                &manifest_id,
+                ManifestFetchParams {
+                    fhir_base_url: Some("https://provider.example/fhir"),
+                    output_format: None,
+                    file_request_headers: &[],
+                    oauth_metadata_urls: &[],
+                    file_encryption_key: None,
+                    import_directives: &[],
+                    metadata: &[],
+                },
+            )
+            .await
+            .expect("fetch params ride out a 409");
+
+        let (state, _) = backend
+            .load_manifest_for_cas(&location, &id, &manifest_id)
+            .await
+            .expect("load")
+            .expect("manifest exists");
+        assert_eq!(
+            state.fhir_base_url.as_deref(),
+            Some("https://provider.example/fhir")
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_manifest_by_url_retries_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+        backend
+            .set_manifest_fetch_params(
+                &t,
+                &id,
+                &manifest_id,
+                ManifestFetchParams {
+                    fhir_base_url: Some("https://provider.example/fhir"),
+                    output_format: None,
+                    file_request_headers: &[],
+                    oauth_metadata_urls: &[],
+                    file_encryption_key: None,
+                    import_directives: &[],
+                    metadata: &[],
+                },
+            )
+            .await
+            .expect("fetch params");
+
+        mock.conflict_puts_at(&key, 1);
+        let superseded = backend
+            .replace_manifest_by_url(&t, &id, "https://provider.example/manifest.json")
+            .await
+            .expect("replace rides out a 409");
+        assert_eq!(superseded, vec![manifest_id.clone()]);
+
+        assert_eq!(
+            backend.list_manifests(&t, &id).await.expect("manifests")[0].status,
+            ManifestStatus::Replaced,
+            "the Replaced write must land, not be silently dropped"
+        );
+        let (state, _) = backend
+            .load_manifest_for_cas(&location, &id, &manifest_id)
+            .await
+            .expect("load")
+            .expect("manifest exists");
+        assert_eq!(
+            state.fhir_base_url.as_deref(),
+            Some("https://provider.example/fhir"),
+            "the retry re-reads, so it keeps what the manifest already carried"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_moves_past_a_409_on_its_claim_write() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            manifest_key: key,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+
+        mock.conflict_puts_at(&key, 1);
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+                .await
+                .expect("a 409 on the claim write is a lost claim, not an error")
+                .is_none()
+        );
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("the manifest stayed queued and is claimable on the next poll");
+        assert_eq!(lease.fencing_token, 1);
+    }
+
+    /// A conflict that never clears gives up after a bounded number of attempts
+    /// with the usual diagnosable error. Time is paused so the backoffs
+    /// auto-advance instead of really sleeping.
+    #[tokio::test(start_paused = true)]
+    async fn a_persistent_409_gives_up_after_bounded_attempts() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+        let before = puts_on(&mock, &key);
+
+        mock.conflict_puts_at(&key, usize::MAX);
+        let err = backend
+            .mutate_manifest_state(&location, &id, &manifest_id, |state| {
+                state.manifest.processed_entries += 1;
+            })
+            .await
+            .expect_err("a conflict that never clears must fail");
+        match err {
+            StorageError::Backend(BackendError::Internal { message, .. }) => {
+                assert!(
+                    message.contains("compare-and-swap attempts"),
+                    "message was: {message}"
+                );
+            }
+            other => panic!("expected the exhaustion error, got {other:?}"),
+        }
+        assert_eq!(
+            puts_on(&mock, &key) - before,
+            crate::backends::s3::submit_worker::CAS_ATTEMPTS,
+            "the loop must be bounded"
         );
     }
 }
