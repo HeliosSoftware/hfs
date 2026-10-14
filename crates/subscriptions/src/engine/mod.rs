@@ -29,7 +29,7 @@ use crate::manager::{
     ActiveSubscription, ChannelType, SubscriptionManager, SubscriptionStatusCode,
 };
 use crate::notification::{self, NotificationEventData};
-use crate::topics::InMemoryTopicRegistry;
+use crate::topics::{InMemoryTopicRegistry, TopicDefinition};
 use helios_auth::{NoOpOutboundAuthProvider, OutboundAuthProvider};
 
 /// The subscription engine orchestrates the entire subscription pipeline.
@@ -385,6 +385,39 @@ impl SubscriptionEngine {
         }
     }
 
+    /// Registers a parsed topic and its resource-to-canonical association.
+    ///
+    /// Shared by live writes and startup rehydration so rename and payload-free
+    /// deletion have the same tenant-scoped index after a restart. Exported
+    /// resources without a usable string ID still register their definition.
+    pub(crate) fn register_topic(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: Option<&str>,
+        topic: TopicDefinition,
+    ) {
+        let canonical_url = topic.canonical_url.clone();
+        if let Some(resource_id) = resource_id.filter(|id| !id.is_empty()) {
+            let key = (
+                tenant_id.to_string(),
+                resource_type.to_string(),
+                resource_id.to_string(),
+            );
+            if let Some(previous_url) = self
+                .topic_resource_index
+                .insert(key, canonical_url.clone())
+                .filter(|previous_url| previous_url != &canonical_url)
+            {
+                self.topic_registry.remove_topic(tenant_id, &previous_url);
+            }
+        } else {
+            warn!(tenant_id, resource_type, topic_url = %canonical_url,
+                "Registering topic without a resource ID; lifecycle index unavailable");
+        }
+        self.topic_registry.add_topic(tenant_id, topic);
+    }
+
     /// Handle a SubscriptionTopic resource event.
     async fn handle_topic_event(&self, event: &ResourceEvent) {
         let topic_key = (
@@ -439,7 +472,9 @@ impl SubscriptionEngine {
                 }
 
                 for canonical_url in candidate_urls {
-                    let removed = self.topic_registry.remove_topic(&canonical_url);
+                    let removed = self
+                        .topic_registry
+                        .remove_topic(event.tenant_id.as_ref(), &canonical_url);
                     info!(
                         resource_id = %event.resource_id,
                         topic_url = %canonical_url,
@@ -453,18 +488,16 @@ impl SubscriptionEngine {
                     match InMemoryTopicRegistry::parse_topic_resource(resource) {
                         Ok(topic) => {
                             let canonical_url = topic.canonical_url.clone();
-                            if let Some(previous_url) = self
-                                .topic_resource_index
-                                .insert(topic_key, canonical_url.clone())
-                                .filter(|previous_url| previous_url != &canonical_url)
-                            {
-                                let _ = self.topic_registry.remove_topic(&previous_url);
-                            }
                             info!(
                                 topic_url = %canonical_url,
                                 "Registered SubscriptionTopic"
                             );
-                            self.topic_registry.add_topic(topic);
+                            self.register_topic(
+                                event.tenant_id.as_ref(),
+                                &event.resource_type,
+                                Some(&event.resource_id),
+                                topic,
+                            );
                         }
                         Err(e) => {
                             warn!(
@@ -546,7 +579,9 @@ impl SubscriptionEngine {
                 candidate_urls.dedup();
 
                 for canonical_url in candidate_urls {
-                    let removed = self.topic_registry.remove_topic(&canonical_url);
+                    let removed = self
+                        .topic_registry
+                        .remove_topic(event.tenant_id.as_ref(), &canonical_url);
                     info!(
                         resource_id = %event.resource_id,
                         topic_url = %canonical_url,
@@ -562,18 +597,16 @@ impl SubscriptionEngine {
                     match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource) {
                         Ok(Some(topic)) => {
                             let canonical_url = topic.canonical_url.clone();
-                            if let Some(previous_url) = self
-                                .topic_resource_index
-                                .insert(topic_key, canonical_url.clone())
-                                .filter(|previous_url| previous_url != &canonical_url)
-                            {
-                                let _ = self.topic_registry.remove_topic(&previous_url);
-                            }
                             info!(
                                 topic_url = %canonical_url,
                                 "Registered R4 Basic SubscriptionTopic"
                             );
-                            self.topic_registry.add_topic(topic);
+                            self.register_topic(
+                                event.tenant_id.as_ref(),
+                                &event.resource_type,
+                                Some(&event.resource_id),
+                                topic,
+                            );
                             true
                         }
                         Ok(None) => false,
@@ -1290,13 +1323,178 @@ mod tests {
     async fn test_topic_event_registers_topic() {
         let engine = make_engine("http://localhost:8080");
 
-        assert!(engine.topic_registry().list_topics().is_empty());
+        assert!(engine.topic_registry().list_topics("t1").is_empty());
 
         engine.on_resource_event(topic_event()).await;
 
-        let topics = engine.topic_registry().list_topics();
+        let topics = engine.topic_registry().list_topics("t1");
         assert_eq!(topics.len(), 1);
         assert!(topics.contains(&"http://example.org/topic/encounter-start".to_string()));
+    }
+
+    fn enabled_versions() -> Vec<FhirVersion> {
+        vec![
+            #[cfg(feature = "R4")]
+            FhirVersion::R4,
+            #[cfg(feature = "R4B")]
+            FhirVersion::R4B,
+            #[cfg(feature = "R5")]
+            FhirVersion::R5,
+            #[cfg(feature = "R6")]
+            FhirVersion::R6,
+        ]
+    }
+
+    fn tenant_topic_event(
+        version: FhirVersion,
+        tenant: &str,
+        url: &str,
+        trigger: &str,
+    ) -> ResourceEvent {
+        let mut event = topic_event();
+        #[cfg(feature = "R4")]
+        if version == FhirVersion::R4 {
+            event = r4_basic_topic_event();
+        }
+        event.tenant_id = TenantId::new(tenant);
+        event.fhir_version = version;
+        event.resource_id = "shared-id".to_string();
+        let resource = event.resource.as_mut().unwrap();
+        resource["id"] = json!(event.resource_id);
+        if version.as_str() == "R4" {
+            resource["extension"][0]["valueUri"] = json!(url);
+            resource["extension"][1]["extension"][0]["valueUri"] =
+                json!(format!("http://hl7.org/fhir/StructureDefinition/{trigger}"));
+        } else {
+            resource["url"] = json!(url);
+            resource["resourceTrigger"][0]["resource"] = json!(trigger);
+        }
+        event
+    }
+
+    #[tokio::test]
+    async fn shared_canonical_topic_lifecycle_is_tenant_scoped() {
+        let url = "http://example.org/topic/shared";
+        let renamed = "http://example.org/topic/renamed";
+        for version in enabled_versions() {
+            let engine = make_engine("http://example.org/fhir");
+            engine
+                .on_resource_event(tenant_topic_event(version, "tenant-a", url, "Encounter"))
+                .await;
+            engine
+                .on_resource_event(tenant_topic_event(version, "tenant-b", url, "Observation"))
+                .await;
+            assert_eq!(
+                engine
+                    .topic_registry()
+                    .get_topic("tenant-a", url)
+                    .unwrap()
+                    .resource_triggers[0]
+                    .resource_type,
+                "Encounter",
+                "{version:?}"
+            );
+            assert_eq!(
+                engine
+                    .topic_registry()
+                    .get_topic("tenant-b", url)
+                    .unwrap()
+                    .resource_triggers[0]
+                    .resource_type,
+                "Observation",
+                "{version:?}"
+            );
+
+            let mut update = tenant_topic_event(version, "tenant-b", url, "Patient");
+            update.event_type = ResourceEventType::Update;
+            engine.on_resource_event(update).await;
+            assert_eq!(
+                engine
+                    .topic_registry()
+                    .get_topic("tenant-b", url)
+                    .unwrap()
+                    .resource_triggers[0]
+                    .resource_type,
+                "Patient"
+            );
+
+            let mut rename = tenant_topic_event(version, "tenant-b", renamed, "Patient");
+            rename.event_type = ResourceEventType::Update;
+            engine.on_resource_event(rename).await;
+            assert!(engine.topic_registry().get_topic("tenant-b", url).is_none());
+            assert!(
+                engine
+                    .topic_registry()
+                    .get_topic("tenant-b", renamed)
+                    .is_some()
+            );
+            let mut delete = tenant_topic_event(version, "tenant-b", renamed, "Patient");
+            delete.event_type = ResourceEventType::Delete;
+            delete.resource = None;
+            engine.on_resource_event(delete).await;
+            assert!(engine.topic_registry().list_topics("tenant-b").is_empty());
+            assert_eq!(
+                engine
+                    .topic_registry()
+                    .get_topic("tenant-a", url)
+                    .unwrap()
+                    .resource_triggers[0]
+                    .resource_type,
+                "Encounter"
+            );
+
+            // Resolve deletion from the current payload, previous payload, or
+            // resource index; none may remove another tenant's shared URL.
+            for payload in 0..3 {
+                let create = tenant_topic_event(version, "tenant-b", url, "Observation");
+                engine.on_resource_event(create.clone()).await;
+                if payload < 2 {
+                    engine.topic_resource_index.remove(&(
+                        "tenant-b".to_string(),
+                        create.resource_type.clone(),
+                        create.resource_id.clone(),
+                    ));
+                }
+                let mut delete = create;
+                delete.event_type = ResourceEventType::Delete;
+                match payload {
+                    0 => {}
+                    1 => {
+                        delete.previous_resource = delete.resource.take();
+                    }
+                    _ => {
+                        delete.resource = None;
+                    }
+                }
+                engine.on_resource_event(delete).await;
+                assert!(engine.topic_registry().get_topic("tenant-b", url).is_none());
+                assert!(
+                    engine.topic_registry().get_topic("tenant-a", url).is_some(),
+                    "{version:?}, payload {payload}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn topics_without_a_resource_id_keep_their_definition() {
+        let engine = make_engine("http://example.org/fhir");
+        for resource_id in [None, Some("")] {
+            engine.register_topic(
+                "tenant-a",
+                "SubscriptionTopic",
+                resource_id,
+                encounter_topic(),
+            );
+            assert!(
+                engine
+                    .topic_registry()
+                    .get_topic("tenant-a", "http://example.org/topic/encounter-start")
+                    .is_some()
+            );
+            assert!(engine.topic_resource_index.is_empty());
+        }
+        assert!(engine.topic_registry().list_topics("tenant-b").is_empty());
     }
 
     #[tokio::test]
@@ -1318,7 +1516,7 @@ mod tests {
 
         engine.on_resource_event(delete_event).await;
 
-        let topics = engine.topic_registry().list_topics();
+        let topics = engine.topic_registry().list_topics("t1");
         assert!(topics.is_empty());
     }
 
@@ -1327,11 +1525,11 @@ mod tests {
     async fn test_r4_basic_topic_event_registers_topic() {
         let engine = make_engine("http://localhost:8080");
 
-        assert!(engine.topic_registry().list_topics().is_empty());
+        assert!(engine.topic_registry().list_topics("t1").is_empty());
 
         engine.on_resource_event(r4_basic_topic_event()).await;
 
-        let topics = engine.topic_registry().list_topics();
+        let topics = engine.topic_registry().list_topics("t1");
         assert_eq!(topics.len(), 1);
         assert!(topics.contains(&"http://example.org/topic/encounter-start-basic".to_string()));
     }
@@ -1345,7 +1543,7 @@ mod tests {
             .await;
 
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Create a subscription event.
         let sub_resource = crate::manager::tests::build_subscription_json(
@@ -1392,7 +1590,7 @@ mod tests {
             ..Default::default()
         };
         let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         let sub_resource = crate::manager::tests::build_subscription_json(
             "http://example.org/topic/encounter-start",
@@ -1429,7 +1627,7 @@ mod tests {
             .await;
 
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Register and activate a subscription.
         let sub_resource = crate::manager::tests::build_subscription_json(
@@ -1462,7 +1660,7 @@ mod tests {
     #[tokio::test]
     async fn test_no_dispatch_when_no_matching_subscriptions() {
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Fire an event with no subscriptions registered.
         engine.on_resource_event(encounter_event()).await;
@@ -1479,7 +1677,7 @@ mod tests {
             .await;
 
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Register subscription for Encounter topic.
         let sub_resource = crate::manager::tests::build_subscription_json(
@@ -1542,7 +1740,7 @@ mod tests {
             ..Default::default()
         };
         let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Register subscription.
         let sub_resource = crate::manager::tests::build_subscription_json(
@@ -1576,7 +1774,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_delete_event() {
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Register directly.
         let resource = crate::manager::tests::default_subscription_json();
@@ -1615,7 +1813,9 @@ mod tests {
             .await;
 
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine
+            .topic_registry()
+            .add_topic("tenant-a", encounter_topic());
 
         // Register subscription for tenant-a.
         let sub_resource = crate::manager::tests::build_subscription_json(

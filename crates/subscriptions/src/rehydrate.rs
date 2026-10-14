@@ -330,8 +330,9 @@ impl SubscriptionEngine {
     /// Repopulates the engine from stored resources, for every tenant.
     ///
     /// This is the startup mirror of the write-handler path: for each tenant it
-    /// registers stored topics and then stored subscriptions, so subscriptions
-    /// that were active before a restart resume matching and delivering.
+    /// registers stored topics and their resource associations in that tenant,
+    /// then stored subscriptions, so active subscriptions resume matching and
+    /// topic rename/deletion still resolve their canonical URL after a restart.
     ///
     /// Errors are absorbed, never propagated: a storage failure on one tenant
     /// must not prevent the others from rehydrating, and one malformed resource
@@ -517,7 +518,12 @@ impl SubscriptionEngine {
                             topic_url = %topic.canonical_url,
                             "Rehydrated SubscriptionTopic"
                         );
-                        self.topic_registry().add_topic(topic);
+                        self.register_topic(
+                            tenant.tenant_id().as_str(),
+                            resource_type,
+                            resource.get("id").and_then(Value::as_str),
+                            topic,
+                        );
                         report.topics_registered += 1;
                     }
                     Err(e) => {
