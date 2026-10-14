@@ -8,7 +8,7 @@ pub mod filter_match;
 use std::sync::Arc;
 
 use crate::event::ResourceEvent;
-use crate::manager::{ActiveSubscription, SubscriptionManager};
+use crate::manager::{ActiveSubscription, SubscriptionManager, SubscriptionSnapshot};
 use crate::topics::{InMemoryTopicRegistry, TopicMatch};
 
 /// Evaluates which subscriptions should receive notifications for a resource event.
@@ -21,6 +21,11 @@ pub struct EventEvaluator {
 #[derive(Debug)]
 pub struct EvaluationMatch {
     pub subscription: ActiveSubscription,
+    pub topic_match: TopicMatch,
+}
+
+pub(crate) struct SnapshotMatch {
+    pub snapshot: SubscriptionSnapshot,
     pub topic_match: TopicMatch,
 }
 
@@ -43,38 +48,40 @@ impl EventEvaluator {
     /// 3. For each subscription, evaluate filter criteria against the resource.
     /// 4. Return subscriptions that pass all filters.
     pub fn evaluate(&self, event: &ResourceEvent) -> Vec<EvaluationMatch> {
-        let topic_matches = self
-            .topic_registry
-            .matching_topics(&event.resource_type, event.event_type);
+        self.evaluate_snapshots(event)
+            .into_iter()
+            .map(|matched| EvaluationMatch {
+                subscription: matched.snapshot.subscription,
+                topic_match: matched.topic_match,
+            })
+            .collect()
+    }
 
+    pub(crate) fn evaluate_snapshots(&self, event: &ResourceEvent) -> Vec<SnapshotMatch> {
         let mut results = Vec::new();
-
-        for topic_match in topic_matches {
-            let subscriptions = self
+        for topic_match in self
+            .topic_registry
+            .matching_topics(&event.resource_type, event.event_type)
+        {
+            for snapshot in self
                 .subscription_manager
-                .active_subscriptions_for_topic(event.tenant_id.as_ref(), &topic_match.topic_url);
-
-            for sub in subscriptions {
-                // Evaluate filter criteria against the resource.
-                let resource_matches = match &event.resource {
+                .active_snapshots_for_topic(event.tenant_id.as_ref(), &topic_match.topic_url)
+            {
+                let sub = &snapshot.subscription;
+                let matches = match &event.resource {
                     Some(resource) => {
                         filter_match::matches_filters(resource, &event.resource_type, &sub.filters)
                     }
-                    None => {
-                        // Delete events with no resource content: match if no filters.
-                        sub.filters.is_empty()
-                    }
+                    None => sub.filters.is_empty(),
                 };
-
-                if resource_matches {
-                    results.push(EvaluationMatch {
-                        subscription: sub,
+                if matches {
+                    results.push(SnapshotMatch {
+                        snapshot,
                         topic_match: topic_match.clone(),
                     });
                 }
             }
         }
-
         results
     }
 }
