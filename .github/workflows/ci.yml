@@ -829,6 +829,23 @@ jobs:
         # reaching the bug would require AWS itself to send the hostile frame
         # stream. Remove this once the AWS SDK drops its hyper 0.14 fallback
         # client.
+        #
+        # rustls 0.21.12 (RUSTSEC-2026-0346, RUSTSEC-2026-0349). The copy we
+        # build ourselves is on the patched 0.23.46; this is the same legacy
+        # AWS fallback copy (rustls 0.21 <- aws-smithy-http-client 1.1.10
+        # `legacy-rustls-ring`), only linked under `--all-features`. The
+        # advisories' fix lands in >= 0.23.46 only, so no 0.21.x upgrade
+        # exists. Neither is reachable through that path:
+        #   - RUSTSEC-2026-0346 (derived `Debug` on client session values
+        #     prints the master secret / resumption PSK): only affects custom
+        #     `ClientSessionStore` impls that Debug-format those values; the
+        #     AWS SDK uses rustls's built-in, redacted session cache.
+        #   - RUSTSEC-2026-0349 (unauthenticated ServerHello downgrades later
+        #     handshakes from X25519MLKEM768 to classical X25519): rustls 0.21
+        #     has no post-quantum hybrid group, so its key exchange is already
+        #     classical-only and there is nothing to downgrade.
+        # Remove these with the h2 entry above, once the AWS SDK drops its
+        # hyper 0.14 fallback client.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0098
@@ -838,6 +855,8 @@ jobs:
           --ignore RUSTSEC-2026-0195
           --ignore RUSTSEC-2026-0235
           --ignore RUSTSEC-2026-0258
+          --ignore RUSTSEC-2026-0346
+          --ignore RUSTSEC-2026-0349
 
       # See the note in `test-rust`.
       - name: Cap target dir size
