@@ -40,6 +40,18 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
+  # No incremental compilation in CI. Its caches under target/<profile>/incremental
+  # are invisible to cargo-sweep (it neither tracks nor removes them, by design),
+  # so on the `clean: false` runners every crate/test-target hash that stops
+  # being built, and every rustc session a cancelled run kills mid-compile,
+  # stays on disk forever. Worse, cargo-sweep still counts them toward
+  # `maxsize`, so they crowd the warm dependency artifacts out of the cap -- the
+  # leading suspect for the Windows agents' disk creeping back up until a build
+  # died mid-link (run 38627332199). The warm
+  # cache that keeps `test-rust` in budget is the dependency graph, which is
+  # never built incrementally anyway. cargo-target-gc purges leftover
+  # incremental dirs while this is 0. See .github/actions/cargo-target-gc.
+  CARGO_INCREMENTAL: 0
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
 
 jobs:
@@ -190,6 +202,18 @@ jobs:
             exit 1
           fi
           echo "All test subdirectories are wired into a top-level test binary."
+
+      # Make room before the build, not after it fails. On the Windows agents
+      # this build grows target/ by 130-150GB, and the end-of-job sweep below
+      # only caps what is left between jobs; a run that started with ~150GB
+      # free ran out mid-link (run 38627332199). 175 covers the largest growth
+      # seen plus margin, and is a no-op on the Linux agents (~230GB free, ~30GB
+      # growth). See "Pre-build headroom" in .github/actions/cargo-target-gc.
+      - name: Ensure build headroom
+        uses: ./.github/actions/cargo-target-gc
+        with:
+          mode: preflight
+          min-free-gb: "175"
 
       # `--all-features` enables R5, so this is the one job where the R5 FHIRPath
       # conformance suite is live rather than compiled to its `#[cfg(not(R5))]`
