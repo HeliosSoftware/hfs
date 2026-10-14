@@ -858,4 +858,62 @@ mod sof_export_s3_restart_tests {
             "loading must never delete an in-flight job's objects"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn from_config_with_endpoint_reaches_minio_path_style() {
+        let shared = shared_minio().await;
+        let client = sdk_client().await;
+        let bucket = fresh_bucket(&client).await;
+
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", MINIO_ROOT_USER);
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", MINIO_ROOT_PASSWORD);
+        }
+
+        let sink = S3Sink::from_config(
+            bucket.clone(),
+            None,
+            Some(shared.endpoint_url.clone()),
+            false,
+            String::new(),
+            86_400,
+        )
+        .await
+        .expect("from_config with an endpoint must build a sink");
+
+        let filename = sink
+            .write_shard(
+                "job-1214",
+                0,
+                b"{\"patient_id\":\"p1\"}\n".to_vec(),
+                "ndjson",
+            )
+            .expect("write_shard through the endpoint-configured sink failed");
+        assert_eq!(filename, "shard-0.ndjson");
+
+        let read = sink
+            .read_shard("job-1214", &filename)
+            .expect("read_shard must find the shard just written");
+        assert_eq!(read, b"{\"patient_id\":\"p1\"}\n".to_vec());
+
+        let url = sink
+            .download_url("http://localhost:8080", "job-1214", &filename)
+            .expect("presigning must succeed");
+        let parsed = url::Url::parse(&url).expect("presigned URL must parse");
+        assert!(
+            url.starts_with(&shared.endpoint_url),
+            "presigned URL must target the configured endpoint: {url}"
+        );
+        assert!(
+            parsed.path().starts_with(&format!("/{bucket}/")),
+            "presigned URL must be path-style (bucket in path): {url}"
+        );
+        let fetched = reqwest::get(&url)
+            .await
+            .expect("fetching the presigned URL failed")
+            .bytes()
+            .await
+            .expect("reading the presigned body failed");
+        assert_eq!(fetched.as_ref(), b"{\"patient_id\":\"p1\"}\n");
+    }
 }

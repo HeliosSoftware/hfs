@@ -755,55 +755,52 @@ where
                 ),
             });
 
+            let export_sink = config.export_sink.trim().to_lowercase();
+            match export_sink.as_str() {
+                "fs" | "s3" => {}
+                other => panic!("HFS_EXPORT_SINK must be 'fs' or 's3', got '{other}'"),
+            }
+
             #[cfg(feature = "s3")]
-            if config.export_sink.to_lowercase() == "s3" {
+            if export_sink == "s3" {
                 use crate::export::S3Sink;
                 let bucket = config
                     .export_s3_bucket
-                    .clone()
-                    .unwrap_or_else(|| "hfs-exports".to_string());
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        panic!("HFS_EXPORT_S3_BUCKET is required when HFS_EXPORT_SINK=s3")
+                    });
                 let region = config.export_s3_region.clone();
+                let endpoint = config.export_s3_endpoint.clone();
+                let force_path_style = config.export_s3_force_path_style;
                 let ttl = config.export_presign_ttl_secs;
 
                 info!(bucket = %bucket, "Export controller: InMemory + S3Sink");
 
-                match tokio::task::block_in_place(|| {
+                let sink = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(S3Sink::from_config(
                         bucket.clone(),
                         region,
+                        endpoint,
+                        force_path_style,
                         String::new(),
                         ttl,
                     ))
-                }) {
-                    Ok(sink) => Arc::new(
-                        InMemoryController::with_options(
-                            runner_for_export,
-                            sink,
-                            max_concurrency,
-                            shard_rows,
-                            cleanup,
-                        )
-                        .with_max_jobs_per_tenant(max_jobs_per_tenant),
-                    ),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            dir = %config.export_dir,
-                            "S3 export sink init failed — falling back to FilesystemSink"
-                        );
-                        let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                        Arc::new(
-                            InMemoryController::with_options(
-                                runner_for_export,
-                                sink,
-                                max_concurrency,
-                                shard_rows,
-                                cleanup,
-                            )
-                            .with_max_jobs_per_tenant(max_jobs_per_tenant),
-                        )
-                    }
-                }
+                })
+                .unwrap_or_else(|e| panic!("S3 export sink init failed: {e}"));
+                Arc::new(
+                    InMemoryController::with_options(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                        cleanup,
+                    )
+                    .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                )
             } else {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
@@ -821,6 +818,12 @@ where
 
             #[cfg(not(feature = "s3"))]
             {
+                if export_sink == "s3" {
+                    panic!(
+                        "HFS_EXPORT_SINK=s3 requires the 's3' feature. \
+                         Build with: cargo build -p helios-hfs --features s3"
+                    );
+                }
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
                 Arc::new(
@@ -1464,6 +1467,42 @@ mod builder_tests {
         let mut config = ServerConfig::default();
         config.sof_enabled = false;
         config
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "HFS_EXPORT_SINK must be 'fs' or 's3'")]
+    async fn unrecognised_export_sink_panics() {
+        let mut config = ServerConfig::default();
+        config.sof_enabled = true;
+        config.export_sink = "aws".to_string();
+        let _app: Router = create_app_with_auth_and_bulk(
+            backend(),
+            config,
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[tokio::test]
+    #[should_panic(expected = "requires the 's3' feature")]
+    async fn export_sink_s3_without_feature_panics() {
+        let mut config = ServerConfig::default();
+        config.sof_enabled = true;
+        config.export_sink = "s3".to_string();
+        config.export_s3_bucket = Some("hfs-sql-export".to_string());
+        let _app: Router = create_app_with_auth_and_bulk(
+            backend(),
+            config,
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
     }
 
     /// The generic bulk builder wires a router with no bundles (bulk export and
