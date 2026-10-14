@@ -523,9 +523,12 @@ impl<'a> EsQueryBuilder<'a> {
                     });
                     // `search_params.date.end` exists only in indices at schema
                     // version 2 (#1391). An index that has not been reconciled
-                    // yet (the mapping is brought up to date on the first write
-                    // to it) lacks the field, and Elasticsearch refuses to sort
-                    // on an unmapped one with a 400 unless told its type.
+                    // yet lacks the field (the startup pass may have failed or
+                    // missed it, e.g. Elasticsearch was down at boot or an older
+                    // instance created the index during a rolling upgrade; the
+                    // first write then reconciles it), and Elasticsearch
+                    // refuses to sort on an unmapped one with a 400 unless told
+                    // its type.
                     if field == "search_params.date.end" {
                         clause["unmapped_type"] = json!("date");
                     }

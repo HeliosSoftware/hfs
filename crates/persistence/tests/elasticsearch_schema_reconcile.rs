@@ -20,7 +20,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use elasticsearch::http::transport::Transport;
-use elasticsearch::indices::{IndicesGetMappingParts, IndicesPutMappingParts};
+use elasticsearch::indices::{
+    IndicesDeleteTemplateParts, IndicesExistsTemplateParts, IndicesGetMappingParts,
+    IndicesGetSettingsParts, IndicesPutMappingParts, IndicesPutSettingsParts,
+};
 use elasticsearch::{Elasticsearch, IndexParts, SearchParts};
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::elasticsearch::{
@@ -394,8 +397,9 @@ async fn startup_adds_the_date_range_end_to_a_version_1_index() {
     assert!(found_ids(&backend, &date_query("2020-03")).await.is_empty());
 }
 
-/// #1391: `hfs` does not run `initialize` at startup, so an index at schema
-/// version 1 keeps its mapping until its first write. A descending date sort
+/// #1391: an index at schema version 1 that the startup pass has not reached
+/// (Elasticsearch down at boot, or created by an older instance) keeps its
+/// mapping until its first write. A descending date sort
 /// reads `search_params.date.end`, which such an index lacks: the search must
 /// still work (it used to be a 400, "No mapping found ... in order to sort").
 #[tokio::test]
@@ -408,7 +412,7 @@ async fn a_descending_date_sort_works_on_an_index_not_yet_reconciled() {
     mapping["_meta"] = json!({ SCHEMA_VERSION_META_KEY: 1 });
 
     let prefix = new_prefix();
-    // Not initialized, as `hfs` builds it.
+    // Not initialized: models an index the startup pass did not reconcile.
     let backend = backend_on(&prefix).await;
     let index = backend.index_name("reconcile", "Encounter");
     let response = raw_client()
@@ -596,6 +600,88 @@ impl WarningLog {
     }
 }
 
+/// `index.mapping.nested_objects.limit` of `index`: its own value, else the
+/// cluster default.
+async fn nested_objects_limit(index: &str) -> u64 {
+    const SETTING: &str = "index.mapping.nested_objects.limit";
+    let body: Value = raw_client()
+        .await
+        .indices()
+        .get_settings(IndicesGetSettingsParts::IndexName(&[index], &[SETTING]))
+        .include_defaults(true)
+        .flat_settings(true)
+        .send()
+        .await
+        .expect("get settings")
+        .json()
+        .await
+        .expect("settings json");
+    body[index]["settings"][SETTING]
+        .as_str()
+        .or_else(|| body[index]["defaults"][SETTING].as_str())
+        .and_then(|limit| limit.parse().ok())
+        .unwrap_or_else(|| panic!("no nested-object limit for {index}: {body}"))
+}
+
+/// #1506: a template the cluster refuses does not skip the rest of the startup
+/// initialization. Elasticsearch validates a template's settings, so a refresh
+/// interval it cannot parse gets the template refused; the nested-object limit
+/// and the mapping reconcile carry no such setting and still go through. They
+/// used to be skipped, leaving a version-1 index stale until its first write.
+#[tokio::test]
+async fn a_refused_template_does_not_skip_the_rest_of_the_startup() {
+    let log = WarningLog::install();
+    let prefix = new_prefix();
+    let first = started_backend_on(&prefix).await;
+    create_patient(&first, "seed", "Refusedseed").await;
+    let index = first.index_name("reconcile", "Patient");
+    downgrade_to_pre_1335_mapping(&index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+    let client = raw_client().await;
+    let lowered = client
+        .indices()
+        .put_settings(IndicesPutSettingsParts::Index(&[&index]))
+        .body(json!({ "index.mapping.nested_objects.limit": 10_000 }))
+        .send()
+        .await
+        .expect("lower the nested-object limit");
+    assert!(lowered.status_code().is_success(), "lowering failed");
+    // The template the first start wrote: the next start must write its own.
+    let template = format!("{prefix}_template");
+    client
+        .indices()
+        .delete_template(IndicesDeleteTemplateParts::Name(&template))
+        .send()
+        .await
+        .expect("delete template");
+
+    let config = ElasticsearchConfig {
+        nodes: vec![es_url().await.to_string()],
+        index_prefix: prefix.clone(),
+        number_of_replicas: 0,
+        refresh_interval: "not-an-interval".to_string(),
+        ..Default::default()
+    };
+    ElasticsearchBackend::start_with_shared_registry(config, search_registry())
+        .await
+        .expect("a refused template must not fail the start");
+
+    let template_status = client
+        .indices()
+        .exists_template(IndicesExistsTemplateParts::Name(&[&template]))
+        .send()
+        .await
+        .expect("template exists?")
+        .status_code();
+    assert_eq!(
+        template_status.as_u16(),
+        404,
+        "the cluster was expected to refuse the template"
+    );
+    assert_reconciled(&mapping_of(&index).await);
+    assert_eq!(nested_objects_limit(&index).await, 50_000);
+    assert_eq!(log.reindex_warnings_for(&index).len(), 1);
+}
+
 /// #1391: upgrading an index below schema version 2 that holds documents warns,
 /// once, that they have no `search_params.date.end` until `$reindex`; an empty
 /// index and one already at version 2 do not. Run on the real cluster so the
@@ -672,6 +758,36 @@ async fn upgrading_an_old_index_with_documents_warns_that_reindex_is_needed() {
     downgrade_to_pre_1335_mapping(&rolling_index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
     create_patient(&newer, "second", "Rollingwarn").await;
     assert_eq!(log.reindex_warnings_for(&rolling_index).len(), 1);
+}
+
+/// The `hfs` startup path: `start_with_shared_registry` reconciles a version-1
+/// index holding documents before the first request, with one warning, and the
+/// first write afterwards neither reconciles again nor warns again.
+#[tokio::test]
+async fn the_startup_constructor_reconciles_a_version_1_index_before_the_first_request() {
+    let log = WarningLog::install();
+    let prefix = new_prefix();
+    let first = started_backend_on(&prefix).await;
+    create_patient(&first, "seed", "Startupseed").await;
+    let index = first.index_name("reconcile", "Patient");
+    downgrade_to_pre_1335_mapping(&index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+
+    let config = ElasticsearchConfig {
+        nodes: vec![es_url().await.to_string()],
+        index_prefix: prefix.clone(),
+        number_of_replicas: 0,
+        refresh_interval: "1ms".to_string(),
+        write_refresh: WriteRefreshPolicy::WaitFor,
+        ..Default::default()
+    };
+    let backend = ElasticsearchBackend::start_with_shared_registry(config, search_registry())
+        .await
+        .expect("start");
+    assert_reconciled(&mapping_of(&index).await);
+    assert_eq!(log.reindex_warnings_for(&index).len(), 1);
+
+    create_patient(&backend, "second", "Startupseed").await;
+    assert_eq!(log.reindex_warnings_for(&index).len(), 1);
 }
 
 /// An index a newer build has already taken past this version is left alone:
