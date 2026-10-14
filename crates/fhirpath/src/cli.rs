@@ -162,6 +162,7 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
 
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
 
     // Load variables if provided
     if let Some(vars_path) = &args.variables {
@@ -193,6 +194,7 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
 
         // Create a new context with the context result
         let mut scoped_context = EvaluationContext::new(vec![]);
+        scoped_context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
         // Set the context result as the root
         let context_items = match context_result {
             EvaluationResult::Collection { items, .. } => items,

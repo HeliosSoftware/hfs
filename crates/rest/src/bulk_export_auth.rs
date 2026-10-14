@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use helios_auth::Principal;
-use helios_auth::scope::{ResourceTypeSpec, SmartPermissions};
+use helios_auth::scope::{ResourceTypeSpec, ScopeContext, SmartPermissions};
 use helios_persistence::core::ExportFileMetadata;
 use helios_persistence::tenant::TenantContext;
 
@@ -125,6 +125,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patient_wildcard_does_not_override_ownership() {
+        let auth = BearerScopeAuth;
+        let p = make_principal("other", "patient/*.rs");
+        let result = auth
+            .authorize_download(
+                Some(&p),
+                &test_tenant(),
+                Some("owner"),
+                &make_file_meta("Patient", Some("owner")),
+            )
+            .await;
+        assert!(matches!(result, Err(ExportAuthError::Forbidden(_))));
+        // The owner of the job may still download it.
+        let owner = make_principal("owner", "patient/*.rs");
+        let result = auth
+            .authorize_download(
+                Some(&owner),
+                &test_tenant(),
+                Some("owner"),
+                &make_file_meta("Patient", Some("owner")),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn owner_missing_read_scope_is_forbidden() {
         let auth = BearerScopeAuth;
         // No SMART read scope — empty scope string → ScopeSet::empty()
@@ -155,13 +181,15 @@ pub trait ExportFileAuth: Send + Sync {
     ) -> Result<(), ExportAuthError>;
 }
 
-/// Returns true if the principal holds any `system/*` (wildcard) scope.
+/// Returns true if the principal holds a wildcard scope (`system/*`, `user/*`)
+/// in a context other than `patient/`.
+///
+/// A `patient/*` wildcard spans one patient's compartment, not the tenant, so
+/// it does not override job ownership (#1618).
 fn has_wildcard_scope(principal: &Principal) -> bool {
-    principal
-        .scopes
-        .scopes()
-        .iter()
-        .any(|s| s.resource_type == ResourceTypeSpec::Wildcard)
+    principal.scopes.scopes().iter().any(|s| {
+        s.resource_type == ResourceTypeSpec::Wildcard && s.context != ScopeContext::Patient
+    })
 }
 
 /// The default [`ExportFileAuth`]: requires the kickoff Bearer token, the

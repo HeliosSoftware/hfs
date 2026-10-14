@@ -1000,6 +1000,16 @@ async fn mongodb_missing_metadata_composite_and_derived_definitions_preserve_pre
     db.drop().await.unwrap();
 }
 
+/// mongod's clock, for `system.profile` `ts` filters. The client clock can run
+/// ahead of a mongod in a VM or container, which filters out every entry.
+async fn server_now(db: &mongodb::Database) -> mongodb::bson::DateTime {
+    *db.run_command(doc! {"hello": 1})
+        .await
+        .unwrap()
+        .get_datetime("localTime")
+        .unwrap()
+}
+
 #[tokio::test]
 async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages() {
     use futures::TryStreamExt;
@@ -1138,7 +1148,7 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             eprintln!("Dense ID page compatibility work: {field}={examined}");
         }
     }
-    let since = mongodb::bson::DateTime::now();
+    let since = server_now(&db).await;
     let mut ordered = query.clone();
     ordered.sort.clear();
     db.run_command(doc! {"profile": 2}).await.unwrap();
@@ -1214,7 +1224,7 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             chain: vec![],
             components: vec![],
         });
-        let since = mongodb::bson::DateTime::now();
+        let since = server_now(&db).await;
         db.run_command(doc! {"profile": 2}).await.unwrap();
         let result = backend.search(&tenant, &selective).await;
         db.run_command(doc! {"profile": 0}).await.unwrap();

@@ -76,11 +76,14 @@ fn launch_patient_id(principal: Option<&Principal>) -> Option<String> {
 /// 404 for a missing patient and 410 for a deleted one. Bare `<id>` and
 /// `Patient/<id>` are accepted; any other value is ignored (logged at debug)
 /// and every patient is walked. Narrowing applies whatever the token's scope
-/// context; enforcing `patient/` scopes and compartments elsewhere is #1618.
+/// context.
 ///
-/// This narrowing scopes the type-level operation only. It is not an authorization
-/// boundary: the same token can still call `Patient/<other>/$everything` and search
-/// other patients until compartment enforcement lands in #1618.
+/// The authorization boundary is elsewhere (#1618): when the grant rests on a
+/// `patient/` scope, the authorization middleware has already refused every
+/// `Patient/<other>/$everything`, and the policy has already refused the token
+/// if its `patient` claim was missing or unusable — so under such a grant the
+/// launch patient is always usable here and the fallback to every patient is
+/// only ever taken by a `user/` or `system/` grant.
 pub async fn patient_everything_type_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
