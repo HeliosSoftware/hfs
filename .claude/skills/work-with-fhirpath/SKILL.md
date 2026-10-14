@@ -63,6 +63,13 @@ FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 cargo run --bin fhirpath-
 
 Request bodies with gzip, deflate, br, or zstd `Content-Encoding` are decompressed before parsing. Unsupported encodings return `415`. Responses are compressed when the client sends `Accept-Encoding`.
 
+## Unresolved leading identifiers
+
+- `Resource.`/`DomainResource.` prefixes resolve against any conforming resource; a known type that is not the context type (`Patient.name` on an Observation) stays silently empty (union dispatch relies on it).
+- A leading identifier that is neither a known type (in any enabled FHIR version) nor an element of the context is governed by `EvaluationContext::set_unresolved_identifier_policy` (`Ignore` | `Warn` default | `Error`).
+- `fhirpath-cli` and `fhirpath-server` set `Error` (exit 1 / 422); the search extractor, validator and compartments stay on `Warn`.
+- The search extractor still strips `Resource.`/`DomainResource.` prefixes: that is union-member selection, not an evaluator workaround.
+
 ## Tests
 
 - FHIRPath test cases live under `crates/fhirpath/tests/`.

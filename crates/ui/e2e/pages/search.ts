@@ -37,6 +37,9 @@ export class SearchPage {
   railItem(type: string): Locator {
     return this.page.locator(`#type-rail-list > [data-type='${type}']`);
   }
+  get railFilter(): Locator {
+    return this.page.locator("#type-rail-filter");
+  }
   /** The "Recently used" group (#754/#755, server-rendered per page): hidden
    * until this page's own `rails.search.recent` has at least one entry. */
   get recentGroup(): Locator {

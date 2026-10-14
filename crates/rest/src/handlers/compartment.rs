@@ -99,6 +99,7 @@ where
 
     // A parameter with no value is ignored, as in a type-level search (#1380).
     let pairs = crate::extractors::drop_empty_parameters(pairs);
+    crate::handlers::search::validate_membership_params(&pairs, fhir_version)?;
     let mut search_params = SearchParams::from_pairs(pairs);
 
     // Unknown search parameters. Per FHIR search error handling these may be
@@ -151,7 +152,7 @@ where
         .min(state.max_page_size());
     query.count = Some(count as u32);
 
-    let query = resolve_out_of_band(&state, &tenant, query).await?;
+    let query = resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
 
     // Execute the search
     let result = state
@@ -234,6 +235,7 @@ where
     let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
     // A parameter with no value is ignored, as in a type-level search (#1380).
     let pairs = crate::extractors::drop_empty_parameters(pairs);
+    crate::handlers::search::validate_membership_params(&pairs, fhir_version)?;
     let mut search_params = SearchParams::from_pairs(pairs);
 
     // Member types of this compartment, resolved once: they decide both which
@@ -359,7 +361,7 @@ where
         if collected.len() >= count {
             break;
         }
-        let query = &resolve_out_of_band(&state, &tenant, query).await?;
+        let query = &resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
         match state.storage().search(tenant.context(), query).await {
             Ok(result) => collected.extend(result.resources.items),
             Err(e) => {
@@ -425,6 +427,7 @@ async fn resolve_out_of_band<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     query: helios_persistence::types::SearchQuery,
+    fhir_version: helios_fhir::FhirVersion,
 ) -> RestResult<helios_persistence::types::SearchQuery>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
@@ -441,6 +444,13 @@ where
     let query = helios_persistence::search::resolve_list(state.storage(), tenant.context(), &query)
         .await
         .map_err(RestError::from)?;
+    let query = crate::handlers::search::resolve_membership(
+        state.storage(),
+        tenant.context(),
+        query,
+        fhir_version,
+    )
+    .await?;
     helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
         .await
         .map_err(RestError::from)
@@ -461,6 +471,8 @@ fn validate_out_of_band(
         let chained = query.parameters.iter().find(|p| !p.chain.is_empty());
         let refused = if !query.list.is_empty() {
             Some("_list".to_string())
+        } else if helios_persistence::search::query_has_in(query) {
+            Some("_in".to_string())
         } else if !query.reverse_chains.is_empty() {
             Some("_has".to_string())
         } else {

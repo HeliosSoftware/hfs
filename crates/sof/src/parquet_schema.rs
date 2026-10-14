@@ -29,12 +29,14 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::sqlquery::ColumnFhirType;
+use crate::sqlquery::engine::DeclaredColumn;
 use crate::{ProcessedRow, SofError};
 
 /// Returns `true` when `n` is an integer that does not fit in an Arrow `Int32`.
 ///
 /// A `u64` above `i64::MAX` also counts as wide: it cannot be an `Int32`
-/// either, and the builder reports it instead of writing a null.
+/// either.
 fn exceeds_i32(n: &serde_json::Number) -> bool {
     match n.as_i64() {
         Some(i) => i32::try_from(i).is_err(),
@@ -42,17 +44,96 @@ fn exceeds_i32(n: &serde_json::Number) -> bool {
     }
 }
 
-/// Infers the Arrow type of one column from a sample of its values.
+/// Returns `true` when any row holds an integer outside the `Int32` range in
+/// column `col_idx`.
+fn column_has_wide_integer(rows: &[ProcessedRow], col_idx: usize) -> bool {
+    rows.iter().any(|row| {
+        matches!(
+            row.values.get(col_idx),
+            Some(Some(Value::Number(n))) if exceeds_i32(n)
+        )
+    })
+}
+
+fn utf8_list_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+}
+
+/// Arrow type for a ViewDefinition column with a declared FHIR type.
 ///
-/// Integers map to `Int32` only when every sampled integer fits in 32 bits;
-/// otherwise the column is `Int64`. Because the sample may miss a wide value
-/// further down the column, [`create_arrow_schema`] re-checks every row of an
-/// `Int32` column before the schema is final.
+/// `boolean`→Boolean, `integer`/`positiveInt`/`unsignedInt`→Int32,
+/// `integer64`→Int64, `decimal`→Float64, everything else→Utf8. A
+/// `collection: true` column is `List<Utf8>` whatever its type.
+pub fn arrow_type_for_declared(fhir_type: &ColumnFhirType, collection: bool) -> DataType {
+    if collection {
+        return utf8_list_type();
+    }
+    match fhir_type {
+        ColumnFhirType::Boolean => DataType::Boolean,
+        ColumnFhirType::Integer => DataType::Int32,
+        ColumnFhirType::Integer64 => DataType::Int64,
+        ColumnFhirType::Decimal => DataType::Float64,
+        _ => DataType::Utf8,
+    }
+}
+
+/// Number of leading rows sampled to infer the type of undeclared columns.
+pub const SCHEMA_SAMPLE_ROWS: usize = 100;
+
+/// Decides the Arrow schema for `columns`.
+///
+/// A column found (by name) in `declared` with a `type` or `collection: true`
+/// gets its declared mapping; every other column is inferred from at most
+/// [`SCHEMA_SAMPLE_ROWS`] rows of `sample`. An inferred `Int32` column is then
+/// widened to `Int64` when any row of `sample` (not only the first
+/// [`SCHEMA_SAMPLE_ROWS`]) holds an integer outside the 32-bit range, so a
+/// large value past the inference window is not written as null. Column order
+/// and names come from `columns`. Shared by the buffered and the incremental
+/// writers so both agree.
+pub fn resolve_arrow_schema(
+    columns: &[String],
+    declared: &[DeclaredColumn],
+    sample: &[ProcessedRow],
+) -> Result<Schema, SofError> {
+    let rows = sample;
+    let sample = &sample[..sample.len().min(SCHEMA_SAMPLE_ROWS)];
+    let fields = columns
+        .iter()
+        .enumerate()
+        .map(|(col_idx, column_name)| {
+            let decl = declared.iter().find(|d| &d.name == column_name);
+            let data_type = match decl {
+                Some(DeclaredColumn {
+                    fhir_type: Some(t),
+                    collection,
+                    ..
+                }) => arrow_type_for_declared(t, *collection),
+                Some(DeclaredColumn {
+                    collection: true, ..
+                }) => utf8_list_type(),
+                _ => {
+                    let values: Vec<Option<Value>> = sample
+                        .iter()
+                        .map(|row| row.values.get(col_idx).cloned().flatten())
+                        .collect();
+                    match infer_arrow_type(&values) {
+                        DataType::Int32 if column_has_wide_integer(rows, col_idx) => {
+                            DataType::Int64
+                        }
+                        inferred => inferred,
+                    }
+                }
+            };
+            Field::new(column_name, data_type, true)
+        })
+        .collect::<Vec<_>>();
+    Ok(Schema::new(fields))
+}
+
 pub fn infer_arrow_type(values: &[Option<Value>]) -> DataType {
     let mut type_counts: HashMap<String, usize> = HashMap::new();
     let mut has_array = false;
     let mut has_object = false;
-    let mut array_element_type = None;
     let mut integer_exceeds_i32 = false;
 
     for value in values.iter().flatten() {
@@ -71,13 +152,8 @@ pub fn infer_arrow_type(values: &[Option<Value>]) -> DataType {
             Value::String(_) => {
                 *type_counts.entry("string".to_string()).or_insert(0) += 1;
             }
-            Value::Array(arr) => {
+            Value::Array(_) => {
                 has_array = true;
-                if !arr.is_empty() && array_element_type.is_none() {
-                    let element_values: Vec<Option<Value>> =
-                        arr.iter().map(|v| Some(v.clone())).collect();
-                    array_element_type = Some(infer_arrow_type(&element_values));
-                }
             }
             Value::Object(_) => {
                 has_object = true;
@@ -86,12 +162,10 @@ pub fn infer_arrow_type(values: &[Option<Value>]) -> DataType {
         }
     }
 
+    // Collections are always `List<Utf8>`: the array builder stringifies
+    // elements, so any other element type would not match the built arrays.
     if has_array {
-        if let Some(element_type) = array_element_type {
-            return DataType::List(Arc::new(Field::new("item", element_type, true)));
-        } else {
-            return DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-        }
+        return utf8_list_type();
     }
 
     if has_object {
@@ -113,54 +187,28 @@ pub fn infer_arrow_type(values: &[Option<Value>]) -> DataType {
     }
 }
 
-/// Builds the Arrow schema for `columns` from the values in `rows`.
-///
-/// The kind of each column (boolean, integer, decimal, string, list) is
-/// inferred from the first 100 rows. The width of an integer column is then
-/// decided from every row: a column inferred as `Int32` is widened to `Int64`
-/// when any value anywhere in the column lies outside the 32-bit range, so a
-/// large value past the sample never has to wrap or fail at write time.
+/// Infers the schema purely from a sample of `rows` (no declared types).
 pub fn create_arrow_schema(columns: &[String], rows: &[ProcessedRow]) -> Result<Schema, SofError> {
-    let sample_size = std::cmp::min(100, rows.len());
-    let mut fields = Vec::new();
+    resolve_arrow_schema(columns, &[], rows)
+}
 
-    for (col_idx, column_name) in columns.iter().enumerate() {
-        let sample_values: Vec<Option<Value>> = rows
-            .iter()
-            .take(sample_size)
-            .map(|row| row.values.get(col_idx).cloned().flatten())
-            .collect();
+/// Parses a string cell the way a typed column expects (Postgres runners
+/// return text for several columns).
+fn parse_str_number(s: &str) -> Option<serde_json::Number> {
+    s.trim().parse::<serde_json::Number>().ok()
+}
 
-        let mut data_type = infer_arrow_type(&sample_values);
-        if data_type == DataType::Int32 && column_has_wide_integer(rows, col_idx) {
-            data_type = DataType::Int64;
-        }
-        let field = Field::new(column_name, data_type, true);
-        fields.push(field);
+/// An integer cell: a JSON integer or a string holding one. Anything else
+/// (floats, out-of-range u64, non-numeric text) is `None`, i.e. null.
+fn cell_as_i64(value: Option<Value>) -> Option<i64> {
+    match value {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => parse_str_number(&s).and_then(|n| n.as_i64()),
+        _ => None,
     }
-
-    Ok(Schema::new(fields))
 }
 
-/// Returns `true` when any row holds an integer outside the `Int32` range in
-/// column `col_idx`.
-fn column_has_wide_integer(rows: &[ProcessedRow], col_idx: usize) -> bool {
-    rows.iter().any(|row| {
-        matches!(
-            row.values.get(col_idx),
-            Some(Some(Value::Number(n))) if exceeds_i32(n)
-        )
-    })
-}
-
-fn integer_out_of_range(column: &str, n: &serde_json::Number, target: &str) -> SofError {
-    SofError::ArrowConversionError(format!(
-        "integer value {n} in column '{column}' does not fit the column's {target} type"
-    ))
-}
-
-fn build_array_from_values(
-    column: &str,
+pub(crate) fn build_array_from_values(
     values: Vec<Option<Value>>,
     data_type: &DataType,
 ) -> Result<ArrayRef, SofError> {
@@ -170,6 +218,12 @@ fn build_array_from_values(
             for value in values {
                 match value {
                     Some(Value::Bool(b)) => builder.append_value(b),
+                    Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                        // Postgres text renders booleans as `t` / `f`.
+                        "true" | "t" => builder.append_value(true),
+                        "false" | "f" => builder.append_value(false),
+                        _ => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -178,15 +232,9 @@ fn build_array_from_values(
         DataType::Int32 => {
             let mut builder = Int32Builder::new();
             for value in values {
-                match value {
-                    Some(Value::Number(n)) if n.is_i64() || n.is_u64() => {
-                        let i = n
-                            .as_i64()
-                            .and_then(|i| i32::try_from(i).ok())
-                            .ok_or_else(|| integer_out_of_range(column, &n, "Int32"))?;
-                        builder.append_value(i);
-                    }
-                    _ => builder.append_null(),
+                match cell_as_i64(value).and_then(|i| i32::try_from(i).ok()) {
+                    Some(i) => builder.append_value(i),
+                    None => builder.append_null(),
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -194,14 +242,9 @@ fn build_array_from_values(
         DataType::Int64 => {
             let mut builder = Int64Builder::new();
             for value in values {
-                match value {
-                    Some(Value::Number(n)) if n.is_i64() || n.is_u64() => {
-                        let i = n
-                            .as_i64()
-                            .ok_or_else(|| integer_out_of_range(column, &n, "Int64"))?;
-                        builder.append_value(i);
-                    }
-                    _ => builder.append_null(),
+                match cell_as_i64(value) {
+                    Some(i) => builder.append_value(i),
+                    None => builder.append_null(),
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -209,15 +252,14 @@ fn build_array_from_values(
         DataType::Float64 => {
             let mut builder = Float64Builder::new();
             for value in values {
-                match value {
-                    Some(Value::Number(n)) => {
-                        if let Some(f) = n.as_f64() {
-                            builder.append_value(f);
-                        } else {
-                            builder.append_null();
-                        }
-                    }
-                    _ => builder.append_null(),
+                let number = match value {
+                    Some(Value::Number(n)) => Some(n),
+                    Some(Value::String(s)) => parse_str_number(&s),
+                    _ => None,
+                };
+                match number.and_then(|n| n.as_f64()) {
+                    Some(f) => builder.append_value(f),
+                    None => builder.append_null(),
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -298,7 +340,7 @@ pub fn process_to_arrow_arrays(
             .map(|row| row.values.get(col_idx).cloned().flatten())
             .collect();
 
-        let array = build_array_from_values(field.name(), values, field.data_type())?;
+        let array = build_array_from_values(values, field.data_type())?;
         arrays.push(array);
     }
 
@@ -417,7 +459,7 @@ mod tests {
             Some(json!(false)),
             Some(json!(true)),
         ];
-        let array = build_array_from_values("b", values, &DataType::Boolean).unwrap();
+        let array = build_array_from_values(values, &DataType::Boolean).unwrap();
         let bool_array = array
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
@@ -431,6 +473,23 @@ mod tests {
     }
 
     #[test]
+    fn test_boolean_array_accepts_postgres_text() {
+        let values = vec![
+            Some(json!("t")),
+            Some(json!("F")),
+            Some(json!("TRUE")),
+            Some(json!("maybe")),
+        ];
+        let array = build_array_from_values(values, &DataType::Boolean).unwrap();
+        let b = array
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert!(b.value(0) && !b.value(1) && b.value(2));
+        assert!(array.is_null(3));
+    }
+
+    #[test]
     fn test_build_string_array_with_mixed_types() {
         let values = vec![
             Some(json!("text")),
@@ -439,7 +498,7 @@ mod tests {
             Some(json!({"key": "value"})),
             None,
         ];
-        let array = build_array_from_values("s", values, &DataType::Utf8).unwrap();
+        let array = build_array_from_values(values, &DataType::Utf8).unwrap();
         let string_array = array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
@@ -488,19 +547,23 @@ mod tests {
     }
 
     #[test]
-    fn test_build_int32_array_rejects_out_of_range_instead_of_wrapping() {
-        let values = vec![Some(json!(1)), Some(json!(3_000_000_000_i64))];
-        let err = build_array_from_values("n", values, &DataType::Int32).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("3000000000"), "{msg}");
-        assert!(msg.contains("'n'"), "{msg}");
-        assert!(msg.contains("Int32"), "{msg}");
-
-        let values = vec![Some(json!(-3_000_000_000_i64))];
-        assert!(build_array_from_values("n", values, &DataType::Int32).is_err());
+    fn test_build_int32_array_nulls_out_of_range_instead_of_wrapping() {
+        let values = vec![
+            Some(json!(1)),
+            Some(json!(3_000_000_000_i64)),
+            Some(json!(-3_000_000_000_i64)),
+        ];
+        let array = build_array_from_values(values, &DataType::Int32).unwrap();
+        let ints = array
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert_eq!(ints.value(0), 1);
+        assert!(array.is_null(1));
+        assert!(array.is_null(2));
 
         let values = vec![Some(json!(i32::MAX)), Some(json!(i32::MIN)), None];
-        let array = build_array_from_values("n", values, &DataType::Int32).unwrap();
+        let array = build_array_from_values(values, &DataType::Int32).unwrap();
         let ints = array
             .as_any()
             .downcast_ref::<arrow::array::Int32Array>()
@@ -520,7 +583,7 @@ mod tests {
             Some(json!(i64::MIN)),
             Some(json!("not a number")),
         ];
-        let array = build_array_from_values("n", values, &DataType::Int64).unwrap();
+        let array = build_array_from_values(values, &DataType::Int64).unwrap();
         let ints = array
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
@@ -535,9 +598,71 @@ mod tests {
     }
 
     #[test]
-    fn test_build_int64_array_rejects_u64_above_i64_max_instead_of_nulling() {
+    fn test_build_int64_array_nulls_u64_above_i64_max() {
         let values = vec![Some(json!(u64::MAX))];
-        let err = build_array_from_values("n", values, &DataType::Int64).unwrap_err();
-        assert!(err.to_string().contains("Int64"), "{err}");
+        let array = build_array_from_values(values, &DataType::Int64).unwrap();
+        assert!(array.is_null(0));
+    }
+
+    #[test]
+    fn test_resolve_schema_declared_inferred_and_collection() {
+        use crate::sqlquery::engine::declared_columns;
+        let view = json!({"select": [{"column": [
+            {"name": "n", "type": "integer"},
+            {"name": "big", "type": "integer64"},
+            {"name": "d", "type": "decimal"},
+            {"name": "b", "type": "boolean"},
+            {"name": "tags", "type": "string", "collection": true},
+            {"name": "untyped", "path": "x"},
+        ]}]});
+        let declared = declared_columns(&view);
+        assert_eq!(declared.len(), 6);
+        assert!(declared[5].fhir_type.is_none());
+        let columns: Vec<String> = declared.iter().map(|d| d.name.clone()).collect();
+        let rows = vec![ProcessedRow {
+            values: vec![
+                Some(json!(1)),
+                Some(json!(1)),
+                Some(json!(1)), // integer-looking value, declared decimal
+                Some(json!(true)),
+                Some(json!(["a"])),
+                Some(json!(7)),
+            ],
+        }];
+        let schema = resolve_arrow_schema(&columns, &declared, &rows).unwrap();
+        let types: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        assert_eq!(types[0], DataType::Int32);
+        assert_eq!(types[1], DataType::Int64);
+        assert_eq!(types[2], DataType::Float64);
+        assert_eq!(types[3], DataType::Boolean);
+        assert_eq!(types[4], utf8_list_type());
+        assert_eq!(types[5], DataType::Int32); // inferred
+    }
+
+    #[test]
+    fn test_inferred_lists_are_always_utf8() {
+        let values = vec![Some(json!([1, 2, 3]))];
+        assert_eq!(infer_arrow_type(&values), utf8_list_type());
+    }
+
+    #[test]
+    fn test_typed_builders_accept_numeric_strings_and_null_overflow() {
+        let ints = build_array_from_values(
+            vec![
+                Some(json!("42")),
+                Some(json!(5_000_000_000i64)),
+                Some(json!("x")),
+            ],
+            &DataType::Int32,
+        )
+        .unwrap();
+        assert_eq!(ints.null_count(), 2);
+        let longs =
+            build_array_from_values(vec![Some(json!(5_000_000_000i64))], &DataType::Int64).unwrap();
+        assert_eq!(longs.null_count(), 0);
     }
 }

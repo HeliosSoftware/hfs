@@ -529,6 +529,115 @@ fn es_reindex_refresh_from_config(
     }
 }
 
+/// Subscription status-write budget in milliseconds, as the subscriptions
+/// engine reads it (`HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS`, default 5 s).
+#[cfg(feature = "elasticsearch")]
+fn subscription_status_write_timeout_ms() -> u64 {
+    std::env::var("HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(5_000)
+}
+
+/// Why `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` with this refresh interval
+/// would stall interactive writes, or `None` when it would not.
+///
+/// With `wait_for` every write blocks until the next refresh, so the interval
+/// is the price of each write: a disabled interval (`-1`) blocks until
+/// something else refreshes the index, and one at or above the Elasticsearch
+/// request timeout turns into a failed attempt and a retry (#1749). An
+/// interval at or above the subscriptions status-write budget makes every
+/// status transition time out when writes are synchronous. That is legal
+/// configuration, so it is a warning, not a startup failure.
+#[cfg(feature = "elasticsearch")]
+fn es_refresh_wait_warning(
+    write_refresh: helios_persistence::backends::elasticsearch::WriteRefreshPolicy,
+    refresh_interval: &str,
+    request_timeout_ms: u64,
+    status_write_timeout_ms: u64,
+    sync_mode: helios_persistence::composite::SyncMode,
+) -> Option<String> {
+    use helios_persistence::backends::elasticsearch::{
+        RefreshInterval, WriteRefreshPolicy, parse_refresh_interval,
+    };
+    use helios_persistence::composite::SyncMode;
+
+    if write_refresh != WriteRefreshPolicy::WaitFor {
+        return None;
+    }
+    let ms_of = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let reason = match parse_refresh_interval(refresh_interval)? {
+        RefreshInterval::Disabled => "periodic refresh is disabled (-1), so a wait_for write \
+             blocks until something else refreshes the index"
+            .to_string(),
+        RefreshInterval::Every(interval) => {
+            let interval_ms = ms_of(interval);
+            if interval_ms >= request_timeout_ms {
+                format!(
+                    "the interval ({interval_ms} ms) is not below \
+                     HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS ({request_timeout_ms} ms), so a write \
+                     can time out waiting for the refresh and be retried"
+                )
+            } else if interval_ms >= status_write_timeout_ms
+                && matches!(
+                    sync_mode,
+                    SyncMode::Synchronous
+                        | SyncMode::Hybrid {
+                            sync_for_search: true
+                        }
+                )
+            {
+                format!(
+                    "the interval ({interval_ms} ms) is not below \
+                     HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS ({status_write_timeout_ms} ms), so \
+                     a subscription status transition can time out and not be persisted"
+                )
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(format!(
+        "HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for with HFS_ELASTICSEARCH_REFRESH_INTERVAL=\
+         {refresh_interval}: {reason}. Use a short interval (the default is 1s) or \
+         HFS_ELASTICSEARCH_WRITE_REFRESH=false"
+    ))
+}
+
+/// Startup work on a freshly built Elasticsearch backend: warns about a refresh
+/// configuration that stalls writes, then applies the configured
+/// `refresh_interval` to indices that already exist (they are otherwise only
+/// given it when created). Never fails startup.
+#[cfg(feature = "elasticsearch")]
+async fn es_startup_refresh_setup(
+    es: &helios_persistence::backends::elasticsearch::ElasticsearchBackend,
+    config: &ServerConfig,
+) {
+    let es_config = es.config();
+    if let Some(message) = es_refresh_wait_warning(
+        es_config.write_refresh,
+        &es_config.refresh_interval,
+        es_config.request_timeout_ms,
+        subscription_status_write_timeout_ms(),
+        composite_sync_mode_from_env(),
+    ) {
+        warn!("{message}");
+    }
+    match es.apply_refresh_interval().await {
+        Ok(0) => {}
+        Ok(changed) => info!(
+            indices = changed,
+            refresh_interval = %config.elasticsearch_refresh_interval,
+            "applied the Elasticsearch refresh interval to existing indices"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            refresh_interval = %config.elasticsearch_refresh_interval,
+            "could not apply the Elasticsearch refresh interval to existing indices"
+        ),
+    }
+}
+
 /// The indexes `$reindex` rebuilds on `sqlite-elasticsearch`.
 ///
 /// Elasticsearch always, because it serves every search here. The SQLite
@@ -1383,6 +1492,11 @@ async fn serve(
     Ok(())
 }
 
+/// Whether this binary can serve the requested web UI and its dashboard.
+fn effective_ui_enabled(requested: bool) -> bool {
+    requested && cfg!(feature = "ui")
+}
+
 /// Attaches the web UI surface to the FHIR router.
 ///
 /// The UI is served when it is compiled in (the `ui` feature) **and** enabled at
@@ -1803,7 +1917,10 @@ async fn main() -> anyhow::Result<()> {
     // Keep the skipped sub-configs populated while surfacing invalid CLI and
     // environment values instead of silently replacing the whole config with
     // defaults.
-    let config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
+    let mut config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
+    // The REST builder uses this same flag to start the dashboard's background
+    // work. A binary without the UI must not seed or reconcile unseen figures.
+    config.ui_enabled = effective_ui_enabled(config.ui_enabled);
     helios_observability::uptime::init();
     helios_observability::telemetry::init("hfs", &config.log_level);
     helios_observability::metrics::init("hfs");
@@ -3181,10 +3298,14 @@ async fn start_sqlite_elasticsearch(
     );
 
     // Create ES backend sharing SQLite's search parameter registry
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        sqlite.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(
+            es_config,
+            sqlite.tenant_registries().clone(),
+        )
+        .await?,
+    );
+    es_startup_refresh_setup(&es, &config).await;
 
     // Build composite configuration
     let composite_config = CompositeConfig::builder()
@@ -3528,10 +3649,11 @@ async fn start_postgres_elasticsearch(
     );
 
     // Create ES backend sharing PostgreSQL's search parameter registry
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        pg.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(es_config, pg.tenant_registries().clone())
+            .await?,
+    );
+    es_startup_refresh_setup(&es, &config).await;
 
     // Build composite configuration
     let composite_config = CompositeConfig::builder()
@@ -3761,10 +3883,14 @@ async fn start_mongodb_elasticsearch(
     );
 
     // Create ES backend sharing MongoDB's search parameter registry
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        mongo.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(
+            es_config,
+            mongo.tenant_registries().clone(),
+        )
+        .await?,
+    );
+    es_startup_refresh_setup(&es, &config).await;
 
     // Build composite configuration
     let composite_config = CompositeConfig::builder()
@@ -4143,6 +4269,12 @@ async fn start_s3_elasticsearch(
         .filter(|s| !s.is_empty())
         .collect();
 
+    if es_nodes.is_empty() {
+        anyhow::bail!(
+            "s3-elasticsearch mode requires at least one Elasticsearch node in HFS_ELASTICSEARCH_NODES"
+        );
+    }
+
     let es_auth = match (
         &config.elasticsearch_username,
         &config.elasticsearch_password,
@@ -4199,10 +4331,11 @@ async fn start_s3_elasticsearch(
             &data_dir,
         );
     }
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        s3.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(es_config, s3.tenant_registries().clone())
+            .await?,
+    );
+    es_startup_refresh_setup(&es, &config).await;
 
     // --- Composite wiring ---
     let composite_config = CompositeConfig::builder()
@@ -4625,6 +4758,53 @@ mod tests {
     }
 
     // ── Elasticsearch rebuild wiring (#1125) ──────────────────────
+
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    fn test_es_refresh_wait_warning() {
+        use helios_persistence::backends::elasticsearch::WriteRefreshPolicy::{False, WaitFor};
+        use helios_persistence::composite::SyncMode::{Asynchronous, Synchronous};
+
+        // Defaults, and anything that is not wait_for, are quiet.
+        assert_eq!(
+            es_refresh_wait_warning(WaitFor, "1s", 30_000, 5_000, Synchronous),
+            None
+        );
+        assert_eq!(
+            es_refresh_wait_warning(False, "-1", 30_000, 5_000, Synchronous),
+            None
+        );
+        assert_eq!(
+            es_refresh_wait_warning(WaitFor, "bogus", 30_000, 5_000, Synchronous),
+            None
+        );
+
+        let disabled = es_refresh_wait_warning(WaitFor, "-1", 30_000, 5_000, Synchronous)
+            .expect("a disabled interval stalls wait_for writes");
+        assert!(
+            disabled.contains("HFS_ELASTICSEARCH_REFRESH_INTERVAL"),
+            "{disabled}"
+        );
+
+        let timeout = es_refresh_wait_warning(WaitFor, "30s", 30_000, 5_000, Asynchronous)
+            .expect("an interval at the request timeout");
+        assert!(
+            timeout.contains("HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS"),
+            "{timeout}"
+        );
+
+        let status = es_refresh_wait_warning(WaitFor, "10s", 30_000, 5_000, Synchronous)
+            .expect("an interval above the subscription status budget");
+        assert!(
+            status.contains("HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS"),
+            "{status}"
+        );
+        // Asynchronous writes do not hold up status transitions.
+        assert_eq!(
+            es_refresh_wait_warning(WaitFor, "10s", 30_000, 5_000, Asynchronous),
+            None
+        );
+    }
 
     #[cfg(feature = "elasticsearch")]
     #[test]
@@ -5435,6 +5615,27 @@ mod tests {
             shared_file.is_ok(),
             "shared SQLite file path must be accepted"
         );
+    }
+
+    #[test]
+    fn dashboard_ui_disabled_request_stays_disabled() {
+        assert!(!effective_ui_enabled(false));
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn dashboard_ui_enabled_request_stays_enabled_when_compiled_in() {
+        assert!(effective_ui_enabled(true));
+    }
+
+    #[cfg(not(feature = "ui"))]
+    #[test]
+    fn dashboard_ui_enabled_request_is_disabled_when_compiled_out() {
+        // The shared REST configuration keeps its default; only the binary
+        // accounts for whether it can mount the UI.
+        let config = ServerConfig::default();
+        assert!(config.ui_enabled);
+        assert!(!effective_ui_enabled(config.ui_enabled));
     }
 
     /// The regression guard for #975: whatever feature selection this test

@@ -1,5 +1,6 @@
 //! Regression tests for issue #1811: integer values outside the `Int32` range
-//! must reach Parquet and Arrow IPC output unchanged, never wrapped or nulled.
+//! must reach Parquet and Arrow IPC output unchanged, never wrapped or nulled
+//! (a u64 above `i64::MAX` fits no Arrow integer type and is written as null).
 
 use arrow::array::{Array, Int32Array, Int64Array};
 use arrow::datatypes::DataType;
@@ -101,12 +102,15 @@ fn parquet_integer_column_that_fits_i32_stays_int32() {
 }
 
 #[test]
-fn parquet_integer_above_i64_max_is_an_error_not_a_null() {
+fn parquet_integer_above_i64_max_is_null_not_wrapped() {
+    // No Arrow integer type holds a u64 above i64::MAX; like any value that
+    // does not fit its column type it is written as null.
     let values = vec![Some(json!(u64::MAX)), Some(json!(1))];
-    let err = format_parquet(result_with("n", values), None).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("18446744073709551615"), "{msg}");
-    assert!(msg.contains("'n'"), "{msg}");
+    let bytes = format_parquet(result_with("n", values), None).expect("parquet");
+
+    let batches = read_parquet(bytes);
+    assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Int64);
+    assert_eq!(int64_values(&batches), vec![None, Some(1)]);
 }
 
 #[test]

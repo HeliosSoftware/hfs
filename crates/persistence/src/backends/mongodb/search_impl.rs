@@ -8,6 +8,7 @@ use helios_fhir::FhirVersion;
 use mongodb::{
     Cursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
+    options::Hint,
 };
 use regex::escape as regex_escape;
 use serde_json::Value;
@@ -627,6 +628,82 @@ pub(super) fn missing_presence_filter(
     filter
 }
 
+/// Metadata predicates stay on resources, alongside tenant and deletion scope.
+fn missing_metadata_hint(filter: &Document) -> Option<Hint> {
+    let has_missing = filter.contains_key("missing_params")
+        || filter.get_array("$and").is_ok_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition
+                    .as_document()
+                    .is_some_and(|condition| missing_metadata_hint(condition).is_some())
+            })
+        })
+        || filter.get_array("$or").is_ok_and(|conditions| {
+            !conditions.is_empty()
+                && conditions.iter().all(|condition| {
+                    condition
+                        .as_document()
+                        .is_some_and(|condition| missing_metadata_hint(condition).is_some())
+                })
+        });
+    has_missing.then(|| Hint::Name(super::schema::RESOURCES_MISSING_INDEX.to_owned()))
+}
+
+fn missing_resource_condition(name: &str) -> Document {
+    doc! { "$or": [
+        { "missing_params": name },
+        { "missing_params": { "$exists": false } },
+    ] }
+}
+
+/// Resources without metadata consult the existing value index.
+fn missing_fallback_stages(presence: Document) -> Vec<Document> {
+    vec![
+        doc! { "$lookup": {
+            "from": MongoBackend::SEARCH_INDEX_COLLECTION,
+            "let": {
+                // Indexed resource IDs are strings; false cannot match one and keeps an equality seek.
+                "candidate_id": { "$cond": [
+                    { "$eq": [{ "$type": "$missing_params" }, "missing"] },
+                    "$id",
+                    false,
+                ] },
+            },
+            "pipeline": [
+                { "$match": { "$and": [presence, {
+                    "$expr": { "$eq": ["$resource_id", "$$candidate_id"] },
+                }] } },
+                { "$limit": 1 },
+                { "$project": { "_id": 1 } },
+            ],
+            "as": "_hfs_missing_present",
+        } },
+        doc! { "$match": { "_hfs_missing_present.0": { "$exists": false } } },
+        doc! { "$unset": "_hfs_missing_present" },
+    ]
+}
+
+#[cfg(test)]
+mod missing_metadata_hint_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_hint_requires_absence_in_every_cursor_alternative() {
+        let absent = doc! { "missing_params": "status" };
+        let scope = doc! { "tenant_id": "a", "resource_type": "Observation", "is_deleted": false };
+        assert!(missing_metadata_hint(&scope).is_none());
+        assert!(missing_metadata_hint(&doc! { "$and": [scope.clone(), absent.clone()] }).is_some());
+        assert!(
+            missing_metadata_hint(&doc! { "$or": [
+                { "$and": [absent.clone(), { "id": { "$gt": "a" } }] },
+                { "$and": [absent.clone(), { "id": { "$lt": "b" } }] },
+            ] })
+            .is_some()
+        );
+        assert!(missing_metadata_hint(&doc! { "$or": [absent, scope] }).is_none());
+    }
+}
+
 /// A positive `_id` filter's implied resource-id universe (#1528): every
 /// `_id` search value is itself an id, so a query carrying one already names
 /// a finite set to check everything else against — no `search_index` scan
@@ -956,6 +1033,8 @@ impl SearchProvider for MongoBackend {
         }
 
         let combine_total = execution.combines_total();
+        let index_cursor_filter =
+            self.build_index_cursor_filter(cursor.as_ref().zip(keyset.as_ref()))?;
         let filter_plan = self
             .resource_filter_plan(
                 &db,
@@ -963,6 +1042,7 @@ impl SearchProvider for MongoBackend {
                 query,
                 execution.filter_purpose,
                 execution.page_policy,
+                index_cursor_filter.as_ref(),
                 &mut probe_facts,
             )
             .await?;
@@ -1070,8 +1150,6 @@ impl SearchProvider for MongoBackend {
             let direction = sort.get_i32("id").map_err(|_| {
                 internal_error("Batched page requires an ID sort direction".to_owned())
             })?;
-            let index_cursor_filter =
-                self.build_index_cursor_filter(cursor.as_ref().zip(keyset.as_ref()))?;
             let match_filter = if combine_total {
                 self.build_resource_filter(tenant_id, &query.resource_type, query, None, None)?
             } else {
@@ -1119,8 +1197,6 @@ impl SearchProvider for MongoBackend {
             }
         } else if let Some(plan) = filter_plan {
             let fetch_page = matches!(&plan, SearchFilterPlan::IndexIntersection(_));
-            let index_cursor_filter =
-                self.build_index_cursor_filter(cursor.as_ref().zip(keyset.as_ref()))?;
             let SearchPipeline {
                 collection,
                 stages: mut pipeline,
@@ -1511,6 +1587,51 @@ fn contained_composite_value_stages(
 }
 
 impl MongoBackend {
+    fn supports_indexed_missing(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+    ) -> bool {
+        // Until `idx_resources_missing_params` is built (#2001) every
+        // parameter takes the value-index route, as an unsupported one does:
+        // same results, no full `resources` scan, and no hint naming an
+        // index that does not exist yet.
+        if !self.missing_params_index_ready() {
+            return false;
+        }
+        let registry = self.tenant_registry(tenant_id);
+        let definition = {
+            let registry = registry.read();
+            registry.get_param(resource_type, &param.name).or_else(|| {
+                helios_fhir::search::ABSTRACT_BASE_TYPES
+                    .iter()
+                    .find_map(|base| registry.get_param(base, &param.name))
+            })
+        };
+        definition.is_some_and(|definition| {
+            definition.param_type == param.param_type
+                && self
+                    .tenant_extractor(tenant_id)
+                    .supports_missing(resource_type, &definition)
+        })
+    }
+
+    fn is_missing_resource_parameter(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+    ) -> bool {
+        !matches!(param.name.as_str(), "_id" | "_lastUpdated")
+            && matches!(param.modifier, Some(SearchModifier::Missing))
+            && param
+                .values
+                .first()
+                .is_some_and(|value| value.value == "true")
+            && self.supports_indexed_missing(tenant_id, resource_type, param)
+    }
+
     /// Chooses between `plan` and the candidate id set. `IndexIntersection`
     /// and `ResourceLookups` read every live resource of the type, or run one
     /// `$lookup` per driver row, so their cost follows the size of the type
@@ -1524,7 +1645,17 @@ impl MongoBackend {
         plan: Option<SearchFilterPlan>,
     ) -> StorageResult<(Option<SearchFilterPlan>, Option<HashSet<String>>)> {
         match plan {
-            Some(plan) if !plan.scans_type() => Ok((Some(plan), None)),
+            // Metadata-supported absence predicates already bound the resource
+            // executor. Preserve that plan rather than materializing its full
+            // ID set; ordinary type scans retain the upstream selection below.
+            Some(plan)
+                if !plan.scans_type()
+                    || query.parameters.iter().any(|param| {
+                        self.is_missing_resource_parameter(tenant_id, &query.resource_type, param)
+                    }) =>
+            {
+                Ok((Some(plan), None))
+            }
             plan => match self
                 .matching_resource_ids(db, tenant_id, &query.resource_type, query)
                 .await
@@ -1710,6 +1841,7 @@ impl MongoBackend {
                 query,
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
+                None,
                 facts,
             )
             .await?;
@@ -2516,7 +2648,7 @@ impl MongoBackend {
                 self.resource_level_ids(db, tenant_id, &query.resource_type, query, Some(&set))
                     .await?,
             ),
-            None if Self::has_resource_level_params(query) => Some(
+            None if self.has_resource_level_params(tenant_id, query) => Some(
                 self.resource_level_ids(db, tenant_id, &query.resource_type, query, None)
                     .await?,
             ),
@@ -2631,11 +2763,11 @@ impl MongoBackend {
 
     /// True when the query carries a predicate that lives on the resource
     /// document rather than in the search index.
-    fn has_resource_level_params(query: &SearchQuery) -> bool {
-        query
-            .parameters
-            .iter()
-            .any(|p| matches!(p.name.as_str(), "_id" | "_lastUpdated"))
+    fn has_resource_level_params(&self, tenant_id: &str, query: &SearchQuery) -> bool {
+        query.parameters.iter().any(|p| {
+            matches!(p.name.as_str(), "_id" | "_lastUpdated")
+                || self.is_missing_resource_parameter(tenant_id, &query.resource_type, p)
+        })
     }
 
     /// Ids of the live resources that satisfy the resource-level predicates
@@ -3405,6 +3537,13 @@ impl MongoBackend {
             if candidates.is_empty() {
                 break;
             }
+            if self.is_missing_resource_parameter(tenant_id, resource_type, param) {
+                let db = self.get_database().await?;
+                candidates = self
+                    .metadata_missing_ids(&db, tenant_id, resource_type, param, Some(&candidates))
+                    .await?;
+                continue;
+            }
             let wants_missing = param
                 .values
                 .first()
@@ -3439,7 +3578,7 @@ impl MongoBackend {
                             "tenant_id": tenant_id,
                             "resource_type": resource_type,
                             "resource_id": { "$in": candidate_ids },
-                            "param_name": &param.name,
+                            "$and": [missing_presence_filter(tenant_id, resource_type, param)],
                         },
                     )
                     .await
@@ -3640,6 +3779,13 @@ impl MongoBackend {
         let mut matched: Option<HashSet<String>> = None;
 
         for param in missing {
+            if self.is_missing_resource_parameter(tenant_id, resource_type, param) {
+                let ids = self
+                    .metadata_missing_ids(db, tenant_id, resource_type, param, matched.as_ref())
+                    .await?;
+                matched = Some(ids);
+                continue;
+            }
             let wants_missing = param
                 .values
                 .first()
@@ -3733,6 +3879,38 @@ impl MongoBackend {
         ))
     }
 
+    async fn metadata_missing_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+        candidates: Option<&HashSet<String>>,
+    ) -> StorageResult<HashSet<String>> {
+        let mut scope =
+            doc! { "tenant_id": tenant_id, "resource_type": resource_type, "is_deleted": false };
+        if let Some(ids) = candidates {
+            scope.insert(
+                "id",
+                doc! { "$in": ids.iter().cloned().collect::<Vec<_>>() },
+            );
+        }
+        let mut stages =
+            vec![doc! { "$match": { "$and": [scope, missing_resource_condition(&param.name)] } }];
+        stages.extend(missing_fallback_stages(missing_presence_filter(
+            tenant_id,
+            resource_type,
+            param,
+        )));
+        stages.push(doc! { "$project": { "_id": 0, "id": 1 } });
+        let cursor = db
+            .collection::<Document>(Self::RESOURCES_COLLECTION)
+            .aggregate(stages)
+            .await
+            .or_query_error("Failed to check missing resource metadata")?;
+        collect_id_set(cursor, "id").await
+    }
+
     pub(super) fn build_search_index_filter(
         &self,
         tenant_id: &str,
@@ -3752,6 +3930,22 @@ impl MongoBackend {
             return Err(StorageError::Search(SearchError::QueryParseError {
                 message: format!("Search parameter '{}' has no values", param.name),
             }));
+        }
+
+        if matches!(param.modifier, Some(SearchModifier::Missing)) {
+            if param
+                .values
+                .first()
+                .is_some_and(|value| value.value == "true")
+            {
+                // Absence cannot drive a positive value-index scan. Search
+                // handles it against resources; transactional callers must not invert it.
+                return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: "missing=true".to_owned(),
+                    param_type: param.param_type.to_string(),
+                }));
+            }
+            return Ok(missing_presence_filter(tenant_id, resource_type, param));
         }
 
         let mut filter = doc! {
@@ -5002,6 +5196,10 @@ impl MongoBackend {
         }
 
         for param in &query.parameters {
+            if self.is_missing_resource_parameter(tenant_id, resource_type, param) {
+                conditions.push(missing_resource_condition(&param.name));
+                continue;
+            }
             match param.name.as_str() {
                 "_id" => {
                     conditions.push(self.build_resource_id_condition(param)?);
