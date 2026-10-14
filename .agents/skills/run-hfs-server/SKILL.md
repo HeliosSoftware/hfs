@@ -133,6 +133,9 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Required by MinIO and most S3-compatible providers |
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure HTTP endpoint URLs when `HFS_S3_ENDPOINT` is set |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+
+`HFS_S3_KEYSPACE_LAYOUT=v2` only affects new, empty tenants: each tenant's layout is stamped in `history/_keyspace.json` and is immutable; `v2` needs every writing instance on a build that reads the marker.
 
 The standard AWS credential chain applies. For S3-compatible endpoints, set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`. One HFS process shares a single AWS credential chain, so a MinIO primary store and real-AWS bulk-export output store cannot be combined in the same process.
 

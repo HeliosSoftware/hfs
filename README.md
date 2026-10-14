@@ -361,6 +361,9 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing (required by MinIO and most S3-compatible providers) |
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure `http://` endpoint URLs (only relevant when `HFS_S3_ENDPOINT` is set) |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+
+**S3 keyspace layout (`HFS_S3_KEYSPACE_LAYOUT`).** Each tenant has one layout, `v1` or `v2`, recorded in a marker object `history/_keyspace.json` (`{"layout":2}`). The variable only decides the layout of a tenant that has no marker and no data yet; a tenant that already holds objects without a marker is always `v1`, and a stamped marker always wins, so changing the variable never moves existing data. `v2` stores `resources/{type}/{h2}/{id}/…` and `history/type/{type}/{h2}/…` with `h2 = hex(sha256(id))[0..2]` (256 sub-prefixes) and drops the tenant-wide `history/system/` index (system history is served from `history/type/`), so each write does 3 PUTs instead of 4. The layout of a tenant is immutable: there is no migration, and `purge_tenant_data` keeps the marker. To change it, stop every instance and delete the tenant's prefix by hand. `v2` requires every instance that writes the bucket to run a build that reads the marker and to use the same setting; an older binary ignores the marker and would write `v1` keys into a `v2` tenant, leaving them unreachable. Opt-in: the default is `v1`.
 
 **SQL-on-FHIR async export**
 
