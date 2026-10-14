@@ -137,6 +137,57 @@ pub fn split_csv_refs(value: Option<&str>) -> Vec<String> {
     }
 }
 
+/// The id a `patient`/`group` value names when a runner can act on it: a
+/// relative `{resource_type}/{id}` reference or a bare `{id}`. `None` for
+/// anything else: an absolute URL, a `urn:uuid:`, a reference to the other
+/// type, a versioned or contained reference, an empty id.
+///
+/// The check is structural, not the FHIR id grammar: the server does not
+/// enforce that grammar on create/PUT, so an id such as `p_1` can exist and
+/// a runner can act on it. The id must be non-empty and free of `/`, `:`,
+/// `#`, `?`, whitespace and control characters.
+///
+/// This is the one shape rule for `patient`/`group` values, shared by HFS
+/// (`$sql-run` on every path and the `$sql-export` kick-off) and sof-server's
+/// `$sql-run`.
+pub fn compartment_ref_id<'a>(reference: &'a str, resource_type: &str) -> Option<&'a str> {
+    let id = reference
+        .strip_prefix(resource_type)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(reference);
+    let valid = !id.is_empty()
+        && !id.chars().any(|c| {
+            matches!(c, '/' | ':' | '#' | '?') || c.is_ascii_whitespace() || c.is_ascii_control()
+        });
+    valid.then_some(id)
+}
+
+/// Checks the shape of every `patient` and `group` value with
+/// [`compartment_ref_id`], before anything reads one. The first value a
+/// runner cannot act on is the error, naming its parameter; existence is
+/// checked only after every shape passed (by the caller, against storage or
+/// the supplied resources).
+pub fn check_patient_group_shapes(
+    patient: &[String],
+    group: &[String],
+) -> Result<(), ReferenceParameterError> {
+    for (param, resource_type, refs) in [("patient", "Patient", patient), ("group", "Group", group)]
+    {
+        for reference in refs {
+            if compartment_ref_id(reference, resource_type).is_none() {
+                return Err(ReferenceParameterError {
+                    param: param.to_string(),
+                    message: format!(
+                        "`{param}` value '{reference}' is not a reference this server can \
+                         resolve; use a relative `{resource_type}/{{id}}` reference"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Returns `true` when `body` names a subject the caller can run — either a
 /// bare `ViewDefinition` resource or a `Parameters` body carrying one of the
 /// three subject parameters.
@@ -668,6 +719,76 @@ mod tests {
                 .patient
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn compartment_ref_id_accepts_relative_and_bare_ids() {
+        assert_eq!(compartment_ref_id("Patient/p1", "Patient"), Some("p1"));
+        assert_eq!(compartment_ref_id("p1", "Patient"), Some("p1"));
+        assert_eq!(compartment_ref_id("Group/g-1.a", "Group"), Some("g-1.a"));
+        assert_eq!(compartment_ref_id("Patient/p_1", "Patient"), Some("p_1"));
+        let long = "a".repeat(65);
+        assert_eq!(
+            compartment_ref_id(long.as_str(), "Patient"),
+            Some(long.as_str())
+        );
+    }
+
+    #[test]
+    fn compartment_ref_id_rejects_unusable_references() {
+        for (reference, resource_type) in [
+            ("http://example.org/fhir/Patient/p1", "Patient"),
+            ("urn:uuid:0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60", "Patient"),
+            ("Group/g1", "Patient"),
+            ("Patient/p1", "Group"),
+            ("Patient/p1/_history/2", "Patient"),
+            ("Patient/", "Patient"),
+            ("", "Patient"),
+            ("#p1", "Patient"),
+            (" Patient/p1", "Patient"),
+        ] {
+            assert_eq!(
+                compartment_ref_id(reference, resource_type),
+                None,
+                "{reference:?} must be rejected for {resource_type}"
+            );
+        }
+    }
+
+    /// #1864: every value's shape is checked, and the first unusable one is
+    /// the error, naming its parameter.
+    #[test]
+    fn check_patient_group_shapes_names_the_first_unusable_parameter() {
+        let ok = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(check_patient_group_shapes(&ok(&["Patient/p1", "p2"]), &ok(&["Group/g1"])).is_ok());
+        assert!(check_patient_group_shapes(&[], &[]).is_ok());
+        for (patient, group, param, value) in [
+            (
+                ok(&["Patient/p1", "Patient/p1/_history/2"]),
+                ok(&[]),
+                "patient",
+                "Patient/p1/_history/2",
+            ),
+            (ok(&["Group/g1"]), ok(&[]), "patient", "Group/g1"),
+            (
+                ok(&["p1"]),
+                ok(&["urn:uuid:0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60"]),
+                "group",
+                "urn:uuid:0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60",
+            ),
+            (
+                ok(&[]),
+                ok(&["http://example.org/fhir/Group/g1"]),
+                "group",
+                "http://example.org/fhir/Group/g1",
+            ),
+            (ok(&["#contained"]), ok(&[]), "patient", "#contained"),
+        ] {
+            let error = check_patient_group_shapes(&patient, &group).unwrap_err();
+            assert_eq!(error.param, param, "{value}");
+            assert!(error.message.contains(value), "{error}");
+            assert!(error.message.contains(&format!("`{param}`")), "{error}");
+        }
     }
 
     #[test]

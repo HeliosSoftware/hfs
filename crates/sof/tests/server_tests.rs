@@ -1591,6 +1591,94 @@ async fn reference_parameters_server_rejects_unusable_body_entries() {
     }
 }
 
+/// #1864 (A19): every value sof-server cannot act on (an absolute URL,
+/// `urn:uuid:`, the other type, a versioned or contained reference, an empty
+/// id) is a 400 `invalid` naming its parameter, from the body or the query
+/// string, before any filter runs. On the base commit an absolute or other-type
+/// value fell through to the filter and answered `not-found`, and a versioned
+/// one ran.
+#[tokio::test]
+async fn reference_parameters_server_rejects_unusable_shapes() {
+    let server = common::test_server().await;
+    for (name, ty) in [("patient", "Patient"), ("group", "Group")] {
+        let other = if name == "patient" {
+            "Group"
+        } else {
+            "Patient"
+        };
+        for value in [
+            format!("http://example.org/fhir/{ty}/p1"),
+            "urn:uuid:0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60".to_string(),
+            format!("{other}/p1"),
+            format!("{ty}/p1/_history/1"),
+            "#p1".to_string(),
+            format!("{ty}/"),
+        ] {
+            let mut body = reference_parameters_request();
+            body["parameter"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name": name, "valueReference": {"reference": value}}));
+            for response in [
+                server.post("/$sql-run").json(&body).await,
+                server
+                    .post(&format!(
+                        "/$sql-run?{name}={}",
+                        url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>()
+                    ))
+                    .json(&reference_parameters_request())
+                    .await,
+            ] {
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::BAD_REQUEST,
+                    "{name}={value}: {}",
+                    response.text()
+                );
+                let outcome: serde_json::Value = response.json();
+                assert_eq!(outcome["resourceType"], "OperationOutcome", "{outcome}");
+                assert_eq!(
+                    outcome["issue"][0]["code"], "invalid",
+                    "{name}={value}: {outcome}"
+                );
+                let text = outcome["issue"][0]["details"]["text"]
+                    .as_str()
+                    .unwrap_or_default();
+                assert!(text.contains(&format!("`{name}`")), "{outcome}");
+                assert!(text.contains(&value), "{outcome}");
+            }
+        }
+    }
+}
+
+/// #1864 (A19): a usable reference that the supplied resources do not carry
+/// keeps sof-server's 400 `not-found`, for a relative and a bare id.
+#[tokio::test]
+async fn reference_parameters_server_absent_target_stays_400_not_found() {
+    let server = common::test_server().await;
+    for (name, value, named) in [
+        ("patient", "Patient/absent", "Patient/absent"),
+        ("patient", "absent", "Patient/absent"),
+        ("group", "Group/absent", "Group/absent"),
+    ] {
+        let mut body = reference_parameters_request();
+        body["parameter"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": name, "valueReference": {"reference": value}}));
+        let response = server.post("/$sql-run").json(&body).await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{name}={value}: {}",
+            response.text()
+        );
+        let outcome: serde_json::Value = response.json();
+        assert_eq!(outcome["issue"][0]["code"], "not-found", "{outcome}");
+        assert!(outcome.to_string().contains(named), "{outcome}");
+    }
+}
+
 #[tokio::test]
 async fn reference_parameters_server_normalizes_repeated_patient_and_group_entries() {
     let server = common::test_server().await;

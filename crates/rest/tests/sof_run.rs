@@ -346,6 +346,74 @@ mod sof_run_tests {
         assert_eq!(rows[0]["family"], "Green");
     }
 
+    /// A stored ViewDefinition is not re-linted, so it can name two columns
+    /// alike. Such a run still answers `200`: NDJSON carries one `x` key per
+    /// row (first position, last column's value), and Parquet, which has no
+    /// columnar path for the view, falls back to the row path.
+    #[tokio::test]
+    async fn test_run_stored_view_with_duplicate_column_names_falls_back_to_rows() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-dup-1", "Green").await;
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "id": "dup-view",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "x"},
+                {"path": "name.family", "name": "x"},
+                {"path": "id", "name": "patient_id"}
+            ]}]
+        });
+        backend
+            .create(&test_tenant(), "ViewDefinition", view, FhirVersion::R4)
+            .await
+            .expect("failed to seed ViewDefinition");
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "subjectReference",
+                "valueReference": {"reference": "ViewDefinition/dup-view"}
+            }]
+        });
+        let run = |format: &'static str| {
+            server
+                .post(&format!("/$sql-run?_format={format}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&body)
+        };
+
+        let response = run("ndjson").await;
+        response.assert_status(StatusCode::OK);
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows, [json!({"x": "Green", "patient_id": "pt-dup-1"})]);
+        let keys: Vec<&String> = rows[0].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["x", "patient_id"]);
+
+        let response = run("parquet").await;
+        response.assert_status(StatusCode::OK);
+        let bytes = response.as_bytes().clone();
+        assert!(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"));
+        let total: usize = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("valid parquet")
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(total, 1);
+    }
+
     /// Supplying two subject parameters is rejected: the spec is explicit that
     /// exactly one of the three is supplied, and the error names both so the
     /// client can see what it sent.
@@ -484,11 +552,18 @@ mod sof_run_tests {
                 {"actor": {"reference": "Patient/bob"}, "status": "accepted"}
             ]
         });
-        for (rt, res) in [("Appointment", appt_in), ("Appointment", appt_out)] {
+        // The filtered Patient must exist: a `patient` reference to a
+        // resource that is not stored is a 400 `not-found` (#1864).
+        let alice = json!({"resourceType": "Patient", "id": "alice"});
+        for (rt, res) in [
+            ("Patient", alice),
+            ("Appointment", appt_in),
+            ("Appointment", appt_out),
+        ] {
             backend
                 .create(&tenant, rt, res, FhirVersion::R4)
                 .await
-                .expect("failed to seed appointment");
+                .expect("failed to seed resource");
         }
 
         let view = json!({
@@ -1364,6 +1439,17 @@ mod sof_run_tests {
         let (server, backend) = create_test_server_with_indb().await;
 
         let tenant = test_tenant();
+        // The filtered Patient must exist: a `patient` reference to a resource
+        // that is not stored is a 400 `not-found` (#1864).
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("failed to seed patient");
         // Seed two Observations, one per patient
         for (id, patient_ref) in [("obs-1", "Patient/p1"), ("obs-2", "Patient/p2")] {
             let obs = json!({
@@ -1484,8 +1570,9 @@ mod sof_run_tests {
     }
 
     /// #1701: a `group` that resolves to no Patient refs (empty group,
-    /// Device-only group, missing group) selects nothing; it must not fall
-    /// back to an unfiltered run.
+    /// Device-only group) selects nothing; it must not fall back to an
+    /// unfiltered run. A group that does not exist is not an empty group: it
+    /// is a 400 `not-found` naming it (#1864; it used to select nothing too).
     #[tokio::test]
     async fn test_run_view_definition_group_without_patient_members_returns_no_rows() {
         let (server, backend) = create_test_server_with_indb().await;
@@ -1511,7 +1598,7 @@ mod sof_run_tests {
                 .expect("failed to seed resource");
         }
 
-        for group in ["Group/g-empty", "Group/g-devices", "Group/missing"] {
+        for group in ["Group/g-empty", "Group/g-devices"] {
             let response = server
                 .post(&format!("/$sql-run?_format=ndjson&group={group}"))
                 .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
@@ -1526,6 +1613,20 @@ mod sof_run_tests {
             let rows = text.lines().filter(|l| !l.trim().is_empty()).count();
             assert_eq!(rows, 0, "group={group} must select nothing: {text}");
         }
+
+        let response = server
+            .post("/$sql-run?_format=ndjson&group=Group/missing")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let outcome: Value = response.json();
+        assert_eq!(outcome["issue"][0]["code"], "not-found", "{outcome}");
+        assert!(outcome.to_string().contains("Group/missing"), "{outcome}");
     }
 
     // =========================================================================
@@ -2744,5 +2845,294 @@ mod sof_run_tests {
         .expect("valid arrow stream");
         let total: usize = reader.map(|b| b.unwrap().num_rows()).sum();
         assert_eq!(total, 120);
+    }
+
+    // =========================================================================
+    // #1864 (A19): one reference rule on every run path. A usable `patient` /
+    // `group` reference to a resource the server does not hold is a 400
+    // OperationOutcome with code `not-found` that names the reference.
+    // =========================================================================
+
+    /// The OperationOutcome text of the first issue (`diagnostics` or
+    /// `details.text`).
+    fn first_issue_text(outcome: &Value) -> String {
+        outcome["issue"][0]["diagnostics"]
+            .as_str()
+            .or_else(|| outcome["issue"][0]["details"]["text"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Asserts a 400 `not-found` OperationOutcome naming `reference`.
+    fn assert_not_found_400(response: &axum_test::TestResponse, reference: &str, path: &str) {
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{path}: a missing {reference} must be a 400; got {}: {}",
+            response.status_code(),
+            response.text()
+        );
+        let outcome: Value = response.json();
+        assert_eq!(
+            outcome["resourceType"], "OperationOutcome",
+            "{path}: {outcome}"
+        );
+        assert_eq!(
+            outcome["issue"][0]["code"], "not-found",
+            "{path}: a missing {reference} must answer code `not-found`: {outcome}"
+        );
+        assert!(
+            first_issue_text(&outcome).contains(reference),
+            "{path}: the OperationOutcome must name {reference}: {outcome}"
+        );
+    }
+
+    /// Stored ViewDefinition on the SQLite in-DB runner: `group=Group/missing`
+    /// answers 200 with no rows on the base commit.
+    #[tokio::test]
+    async fn test_run_stored_view_missing_group_ref_returns_400_not_found() {
+        let (server, backend) = create_test_server_with_indb().await;
+        seed_patient(&backend, "p1", "One").await;
+        seed_view_definition(&backend, "stored-refs-view", None, None).await;
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "subjectReference",
+                "valueReference": {"reference": "ViewDefinition/stored-refs-view"}
+            }]
+        });
+        let response = server
+            .post("/$sql-run?_format=ndjson&group=Group/missing")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        assert_not_found_400(&response, "Group/missing", "stored view, SQLite in-DB");
+    }
+
+    /// A `ResourceScan` over a fixed set of resources, for the in-process
+    /// runner.
+    struct FixedScan(Vec<Value>);
+
+    #[async_trait::async_trait]
+    impl helios_persistence::sof::in_process::ResourceScan for FixedScan {
+        async fn scan_resources(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+        ) -> Result<
+            helios_persistence::sof::in_process::ResourceStream,
+            helios_persistence::core::sof_runner::SofError,
+        > {
+            let items: Vec<_> = self
+                .0
+                .iter()
+                .filter(|r| r["resourceType"] == resource_type)
+                .cloned()
+                .map(Ok)
+                .collect();
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+
+        async fn read_resources(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            ids: &[String],
+        ) -> Result<Vec<Value>, helios_persistence::core::sof_runner::SofError> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|r| {
+                    r["resourceType"] == resource_type
+                        && r["id"]
+                            .as_str()
+                            .is_some_and(|id| ids.iter().any(|w| w == id))
+                })
+                .cloned()
+                .collect())
+        }
+    }
+
+    /// The in-process runner (S3 and S3-primary composites) with
+    /// `group=Group/missing`: 422 on the base commit.
+    #[tokio::test]
+    async fn test_run_in_process_missing_group_ref_returns_400_not_found() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+        let runner = helios_persistence::sof::in_process::InProcessSofRunner::new(
+            Arc::new(FixedScan(vec![json!({
+                "resourceType": "Patient", "id": "p1", "name": [{"family": "One"}]
+            })])),
+            FhirVersion::R4,
+            "test-in-process",
+        );
+        let state = helios_rest::AppState::new(Arc::clone(&backend), ServerConfig::for_testing())
+            .with_sof_runner(Arc::new(runner));
+        let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
+            .expect("failed to create test server");
+
+        let response = server
+            .post("/$sql-run?_format=ndjson&group=Group/missing")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        assert_not_found_400(&response, "Group/missing", "in-process runner");
+    }
+
+    /// #1864 (A19): an inline `subjectResource` ViewDefinition runs against
+    /// storage, so its targets are checked there too: a deleted Patient or
+    /// Group is missing (400 `not-found`, never a 500 or an empty 200), on the
+    /// SQLite in-DB runner, from the body or the query string.
+    #[tokio::test]
+    async fn test_run_inline_view_deleted_patient_or_group_ref_returns_400_not_found() {
+        let (server, backend) = create_test_server_with_indb().await;
+        let tenant = test_tenant();
+        seed_patient(&backend, "p1", "One").await;
+        seed_patient(&backend, "p-gone", "Gone").await;
+        backend
+            .create(
+                &tenant,
+                "Group",
+                json!({"resourceType": "Group", "id": "g-gone", "type": "person",
+                    "actual": true, "member": [{"entity": {"reference": "Patient/p1"}}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed group");
+        backend
+            .delete(&tenant, "Patient", "p-gone")
+            .await
+            .expect("delete patient");
+        backend
+            .delete(&tenant, "Group", "g-gone")
+            .await
+            .expect("delete group");
+
+        for (query, entry, reference) in [
+            ("patient=Patient/p-gone", None, "Patient/p-gone"),
+            ("group=Group/g-gone", None, "Group/g-gone"),
+            ("", Some(("patient", "Patient/p-gone")), "Patient/p-gone"),
+            ("", Some(("group", "g-gone")), "g-gone"),
+            ("patient=Patient/never", None, "Patient/never"),
+        ] {
+            let mut parameters = vec![json!({
+                "name": "subjectResource", "resource": patient_view_definition()
+            })];
+            if let Some((name, value)) = entry {
+                parameters.push(json!({"name": name, "valueReference": {"reference": value}}));
+            }
+            let response = server
+                .post(&format!("/$sql-run?_format=ndjson&{query}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&json!({"resourceType": "Parameters", "parameter": parameters}))
+                .await;
+            assert_not_found_400(&response, reference, "inline view, SQLite in-DB");
+        }
+
+        // A live target still runs.
+        let response = server
+            .post("/$sql-run?_format=ndjson&patient=Patient/p1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        response.assert_status(StatusCode::OK);
+    }
+
+    /// #1864 (A19): every value no runner can act on is a 400 `invalid` naming
+    /// its parameter on every `$sql-run` path (stored data and inline
+    /// resources), checked before existence, so a missing target in the same
+    /// request does not turn it into a `not-found`.
+    #[tokio::test]
+    async fn test_run_unusable_patient_or_group_shapes_return_400_invalid() {
+        let (server, _backend) = create_test_server_with_indb().await;
+        let inline_resource = json!({
+            "resourceType": "Patient", "id": "p1", "name": [{"family": "One"}]
+        });
+        for (name, value) in [
+            ("patient", "http://example.org/fhir/Patient/p1"),
+            ("patient", "urn:uuid:0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60"),
+            ("patient", "Group/g1"),
+            ("group", "Patient/p1"),
+            ("patient", "Patient/p1/_history/1"),
+            ("group", "#g1"),
+            ("patient", "Patient/"),
+        ] {
+            for inline in [false, true] {
+                let mut parameters = vec![
+                    json!({"name": "subjectResource", "resource": patient_view_definition()}),
+                    json!({"name": name, "valueReference": {"reference": value}}),
+                    json!({"name": "patient", "valueReference": {"reference": "Patient/never"}}),
+                ];
+                if inline {
+                    parameters.push(json!({"name": "resource", "resource": inline_resource}));
+                }
+                let response = server
+                    .post("/$sql-run?_format=ndjson")
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/fhir+json"),
+                    )
+                    .json(&json!({"resourceType": "Parameters", "parameter": parameters}))
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::BAD_REQUEST,
+                    "{name}={value} (inline resources: {inline}): {}",
+                    response.text()
+                );
+                let outcome: Value = response.json();
+                assert_eq!(outcome["issue"][0]["code"], "invalid", "{outcome}");
+                let text = first_issue_text(&outcome);
+                assert!(text.contains(&format!("'{name}'")), "{outcome}");
+                assert!(text.contains(value), "{outcome}");
+            }
+        }
+    }
+
+    /// Inline `resource` entries: a `patient` the request does not carry is a
+    /// 400 with code `invalid` on the base commit, not `not-found`.
+    #[tokio::test]
+    async fn test_run_inline_resources_missing_patient_ref_returns_400_not_found() {
+        let (server, _backend) = create_test_server().await;
+        let parameters_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": patient_view_definition()},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "bob", "name": [{"family": "Bob"}]
+                }},
+                {"name": "patient", "valueReference": {"reference": "Patient/alice"}}
+            ]
+        });
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&parameters_body)
+            .await;
+        assert_not_found_400(&response, "Patient/alice", "inline resources");
     }
 }

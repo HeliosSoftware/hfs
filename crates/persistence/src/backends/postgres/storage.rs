@@ -1109,6 +1109,44 @@ impl ResourceStorage for PostgresBackend {
         ))
     }
 
+    /// The same in-DB runner as [`sof_runner`](Self::sof_runner), over a
+    /// separate export pool ([`PostgresBackend::create_export_pool`]):
+    /// `application_name = hfs-export`, `options.max_connections` connections
+    /// on top of the main pool's, no wait timeout, and the export job budget
+    /// as the session `statement_timeout` backstop. Export reads therefore
+    /// never occupy request connections; the compiled SQL, and so every
+    /// result, is the same. The runner keeps the configured FHIR version, as
+    /// `sof_runner` does. A pool that cannot be built is logged and the main
+    /// runner returned.
+    fn export_sof_runner(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
+        use crate::sof::postgres::PgInDbRunner;
+        let fhir_version = self.config().fhir_version;
+        match self.create_export_pool(options) {
+            Ok(pool) => {
+                tracing::info!(
+                    runner = "postgres-indb",
+                    ?fhir_version,
+                    max_connections = options.max_connections.max(1),
+                    statement_timeout_ms = options.statement_timeout_ms,
+                    "Creating export SofRunner on the hfs-export pool"
+                );
+                Some(std::sync::Arc::new(
+                    PgInDbRunner::new(pool).with_fhir_version(fhir_version),
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Could not build the PostgreSQL export pool; exports use the main pool"
+                );
+                self.sof_runner()
+            }
+        }
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,

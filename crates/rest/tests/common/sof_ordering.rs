@@ -14,7 +14,9 @@ use axum_test::TestServer;
 use futures::TryStreamExt;
 use helios_fhir::FhirVersion;
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
+use helios_persistence::core::sof_runner::{
+    RunContext, RunKind, RunOutput, RunRequest, SofError, SofRunner, ViewFilters,
+};
 use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -190,8 +192,13 @@ pub async fn unlimited(
     let mut filters = filters.clone();
     filters.limit = None;
     runner
-        .run_view(tenant, view.clone(), filters)
+        .run_view(
+            tenant,
+            RunRequest::new(view.clone(), filters),
+            RunContext::detached(RunKind::UnlimitedRun),
+        )
         .await
+        .map(|output| output.rows)
         .expect("unlimited runner")
         .try_collect()
         .await
@@ -286,14 +293,47 @@ pub async fn preview_acceptance(
         }
         let all = unlimited(runner, tenant, &case.view, &case.filters).await;
         assert_ordered(&all, &expected, case.name);
+        // #1864: `$sql-run` checks the `patient`/`group` targets before it runs.
+        // A case naming a target the fixture does not hold (absent, or deleted)
+        // answers 400 `not-found` listing exactly those references; the runner
+        // above still saw the full filters. The REST prefixes are then checked
+        // with the resolvable references only, when any remain (an empty list
+        // would widen the run, so such a case stops here).
+        let missing = unresolvable_references(&case.filters, resources);
+        let (filters, expected, all) = if missing.is_empty() {
+            (case.filters.clone(), expected, all)
+        } else {
+            assert_rest_not_found(
+                server,
+                tenant_id,
+                &case.view,
+                &case.filters,
+                &missing,
+                case.name,
+            )
+            .await;
+            let filters = without_references(&case.filters, &missing);
+            if filters.patient.is_empty() && filters.group.is_empty() {
+                eprintln!(
+                    "REST prefix case={} resources={} missing={missing:?}: 400 not-found only",
+                    case.name,
+                    resources.len()
+                );
+                continue;
+            }
+            let expected = evaluator_oracle(&case.view, resources, &filters);
+            let all = unlimited(runner, tenant, &case.view, &filters).await;
+            assert_ordered(&all, &expected, case.name);
+            (filters, expected, all)
+        };
         eprintln!(
-            "REST prefix case={} resources={} unlimited_rows={} limits=1,50,10000",
+            "REST prefix case={} resources={} unlimited_rows={} limits=1,50,10000 missing={missing:?}",
             case.name,
             resources.len(),
             expected.len()
         );
         for limit in [1, 50, 10_000] {
-            let actual = http_rows(server, tenant_id, &case.view, &case.filters, limit).await;
+            let actual = http_rows(server, tenant_id, &case.view, &filters, limit).await;
             let difference = compare_rows(Comparison::Prefix(limit), &actual, &expected);
             assert!(
                 difference.is_none(),
@@ -302,6 +342,83 @@ pub async fn preview_acceptance(
             );
             assert_prefix(&actual, &all, limit, case.name);
         }
+    }
+}
+
+/// The `patient`/`group` references of `filters` (as written) whose target
+/// is not a live resource of the fixture: absent, or deleted. A reference names
+/// `{Type}/{id}` or a bare id.
+pub fn unresolvable_references(
+    filters: &ViewFilters,
+    resources: &[FixtureResource],
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for (refs, resource_type) in [(&filters.patient, "Patient"), (&filters.group, "Group")] {
+        for reference in refs {
+            let id = reference
+                .strip_prefix(resource_type)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .unwrap_or(reference);
+            let live = resources
+                .iter()
+                .any(|r| r.resource_type == resource_type && r.id == id && !r.deleted);
+            if !live {
+                missing.push(reference.clone());
+            }
+        }
+    }
+    missing
+}
+
+/// `filters` without the `missing` references.
+fn without_references(filters: &ViewFilters, missing: &[String]) -> ViewFilters {
+    let keep = |refs: &[String]| {
+        refs.iter()
+            .filter(|r| !missing.contains(r))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    ViewFilters {
+        patient: keep(&filters.patient),
+        group: keep(&filters.group),
+        ..filters.clone()
+    }
+}
+
+/// Asserts that `$sql-run` answers `filters` with 400 `not-found` naming every
+/// reference in `missing` (#1864).
+async fn assert_rest_not_found(
+    server: &TestServer,
+    tenant_id: &str,
+    view: &Value,
+    filters: &ViewFilters,
+    missing: &[String],
+    case: &str,
+) {
+    let response = server
+        .post("/$sql-run")
+        .add_header("x-tenant-id", tenant_id)
+        .json(&run_parameters(view, filters, Some(1)))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::BAD_REQUEST,
+        "{case}: a missing or deleted target is a 400: {}",
+        response.text()
+    );
+    let outcome: Value = response.json();
+    assert_eq!(
+        outcome["issue"][0]["code"], "not-found",
+        "{case}: {outcome}"
+    );
+    let text = outcome["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap_or_default();
+    for reference in missing {
+        assert!(
+            text.contains(reference.as_str()),
+            "{case}: must name {reference}: {outcome}"
+        );
     }
 }
 
@@ -553,11 +670,11 @@ impl SofRunner for RecordingRunner {
     async fn run_view(
         &self,
         tenant: &TenantContext,
-        view: Value,
-        filters: ViewFilters,
-    ) -> Result<RowStream, SofError> {
-        self.limits.lock().unwrap().push(filters.limit);
-        self.inner.run_view(tenant, view, filters).await
+        request: RunRequest,
+        ctx: RunContext,
+    ) -> Result<RunOutput, SofError> {
+        self.limits.lock().unwrap().push(request.filters.limit);
+        self.inner.run_view(tenant, request, ctx).await
     }
     fn runner_name(&self) -> &'static str {
         self.inner.runner_name()

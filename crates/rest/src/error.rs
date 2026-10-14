@@ -69,6 +69,14 @@ use std::fmt;
 /// recovers within seconds; shared with the readiness handler for consistency.
 pub(crate) const SERVICE_UNAVAILABLE_RETRY_AFTER_SECS: &str = "5";
 
+/// The client text of a SQL-on-FHIR run stopped at its time limit
+/// ([`RestError::SofTimeout`]). It names what a caller can change about a
+/// view run; the limit and the backend detail stay in the server log.
+pub(crate) const SOF_TIMEOUT_CLIENT_MESSAGE: &str = "The SQL-on-FHIR run exceeded its time limit \
+     and was stopped. Narrow it (filter by patient, group or _since, set _limit, or add a where \
+     clause to the ViewDefinition or the query) and try again, or run it as an asynchronous \
+     $sql-export.";
+
 /// The client message for a transaction the backend gave up re-running after
 /// transient aborts (#1586): `503 transient`, nothing applied, safe to resubmit.
 ///
@@ -288,6 +296,32 @@ pub enum RestError {
         message: String,
     },
 
+    /// A SQL-on-FHIR run (`$sql-run` with a ViewDefinition or Library
+    /// subject, or an export subject) exceeded its time limit and was stopped
+    /// (HTTP 504 + `timeout`). The status and the reasons to keep it apart from
+    /// a 503 are those of [`RestError::GatewayTimeout`]; only the client text
+    /// differs, because the search advice there (`_count`, date ranges) means
+    /// nothing to a view run (#1864).
+    SofTimeout {
+        /// Error message. Internal only — logged, never sent to the client.
+        message: String,
+    },
+
+    /// A SQL-on-FHIR run was cancelled before it finished (HTTP 408 +
+    /// `timeout`). On `$sql-run` this follows only a client that went away or
+    /// a request that already timed out, so the answer is rarely seen; it is
+    /// never a 500 (#1864). An export job reports its own status instead.
+    SofCancelled,
+
+    /// A `patient` or `group` reference names a resource that does not exist
+    /// or was deleted (HTTP 400 + `not-found`): the request names something
+    /// that is not there, unlike [`RestError::NotFound`] (404), which is for
+    /// the addressed resource itself (#1864).
+    ReferenceNotFound {
+        /// Client-facing message naming the references.
+        message: String,
+    },
+
     /// Not implemented (HTTP 501).
     NotImplemented {
         /// Description of what's not implemented.
@@ -433,6 +467,13 @@ impl fmt::Display for RestError {
             }
             RestError::GatewayTimeout { message } => {
                 write!(f, "Backend timeout: {}", message)
+            }
+            RestError::SofTimeout { message } => {
+                write!(f, "SQL-on-FHIR run timed out: {}", message)
+            }
+            RestError::SofCancelled => write!(f, "SQL-on-FHIR run cancelled"),
+            RestError::ReferenceNotFound { message } => {
+                write!(f, "Reference not found: {}", message)
             }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
@@ -609,6 +650,29 @@ impl RestError {
                      or request a smaller date range — and try again."
                         .to_string(),
                 )
+            }
+            RestError::SofTimeout { message } => {
+                // As for `GatewayTimeout`: the detail (SQLSTATE, driver text,
+                // which limit fired) stays in the server log.
+                tracing::warn!(
+                    error.detail = %message,
+                    "SQL-on-FHIR run stopped at its time limit"
+                );
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    SOF_TIMEOUT_CLIENT_MESSAGE.to_string(),
+                )
+            }
+            RestError::SofCancelled => (
+                StatusCode::REQUEST_TIMEOUT,
+                "timeout",
+                "The SQL-on-FHIR run was stopped before it finished because the request was \
+                 cancelled or timed out."
+                    .to_string(),
+            ),
+            RestError::ReferenceNotFound { message } => {
+                (StatusCode::BAD_REQUEST, "not-found", message.clone())
             }
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,

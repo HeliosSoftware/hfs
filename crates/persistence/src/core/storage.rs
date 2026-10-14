@@ -708,6 +708,29 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the SQL-on-FHIR runner `$sql-export` jobs read through.
+    ///
+    /// An export job reads whole results (every subject row and every SQL
+    /// Query dependency), so a backend may give it connections of its own:
+    /// the PostgreSQL backend returns a runner over a separate `hfs-export`
+    /// pool built from `options` (see
+    /// [`ExportRunnerOptions`](crate::core::ExportRunnerOptions)). Each call
+    /// may build a new pool, so call it once, at startup. The controller then
+    /// takes [`SofRunner::for_export_job`] from it per job.
+    ///
+    /// The default implementation ignores `options` and returns
+    /// [`sof_runner`](Self::sof_runner): SQLite, MongoDB and S3 export through
+    /// their ordinary runner. Results never depend on which runner is used.
+    /// A wrapper that delegates `sof_runner` must delegate this as well, or
+    /// its exports silently fall back to the inner store's request runner.
+    fn export_sof_runner(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> Option<Arc<dyn SofRunner>> {
+        let _ = options;
+        self.sof_runner()
+    }
+
     /// Returns a whole-type scan for backends that have no search index.
     ///
     /// A backend without search cannot answer `url=` lookups, yet the
@@ -1643,6 +1666,98 @@ pub trait ConditionalStorage: ResourceStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store that only overrides `sof_runner` exports through it: the
+    /// default `export_sof_runner` ignores the options (#1864).
+    #[test]
+    fn export_sof_runner_defaults_to_sof_runner() {
+        use crate::core::export_runner::test_support::{MAIN_RUNNER, NamedRunner};
+
+        struct OnlySofRunner;
+
+        #[async_trait]
+        impl ResourceStorage for OnlySofRunner {
+            fn backend_name(&self) -> &'static str {
+                "only-sof-runner"
+            }
+
+            fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+                Some(Arc::new(NamedRunner(MAIN_RUNNER)))
+            }
+
+            async fn create(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _resource: Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<StoredResource> {
+                unimplemented!("not used by this test")
+            }
+
+            async fn create_or_update(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+                _resource: Value,
+                _fhir_version: FhirVersion,
+            ) -> StorageResult<(StoredResource, bool)> {
+                unimplemented!("not used by this test")
+            }
+
+            async fn read(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+            ) -> StorageResult<Option<StoredResource>> {
+                Ok(None)
+            }
+
+            async fn update(
+                &self,
+                _tenant: &TenantContext,
+                _current: &StoredResource,
+                _resource: Value,
+            ) -> StorageResult<StoredResource> {
+                unimplemented!("not used by this test")
+            }
+
+            async fn delete(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: &str,
+                _id: &str,
+            ) -> StorageResult<()> {
+                Ok(())
+            }
+
+            async fn count(
+                &self,
+                _tenant: &TenantContext,
+                _resource_type: Option<&str>,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+        }
+
+        let options = crate::core::ExportRunnerOptions {
+            max_connections: 1,
+            statement_timeout_ms: 1_000,
+        };
+        let runner = OnlySofRunner
+            .export_sof_runner(&options)
+            .expect("the default returns sof_runner");
+        assert_eq!(runner.runner_name(), MAIN_RUNNER);
+
+        // A store without a runner has no export runner either.
+        assert!(
+            PerTypeDeltasOnly::default()
+                .export_sof_runner(&options)
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_conditional_create_result_debug() {

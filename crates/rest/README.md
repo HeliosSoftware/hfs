@@ -544,7 +544,14 @@ rather than PHI and providers commonly leave them unencrypted.
 or display-only references, empty values, and unsupported value fields return
 `400` with an OperationOutcome naming the parameter. This applies to inline
 resources, stored ViewDefinitions and Library subjects, and is shared with
-`$sql-export`.
+`$sql-export`. Each value must be a relative `Patient/{id}` or `Group/{id}`
+reference of its parameter's type, or a bare id; an absolute URL, `urn:uuid:`,
+the other type, a versioned or a contained reference is a `400` (`invalid`)
+naming the parameter. Before the run starts, every referenced Patient or Group
+must exist, a deleted one counting as missing: a missing target is `400`
+(`not-found`) on every `$sql-run` path and `404` (`not-found`) at the
+`$sql-export` kick-off. An existence check that fails answers with the storage
+error's status (`503` with `Retry-After`, or `504`), not `500`.
 
 SQLite, PostgreSQL and S3 stored-data SOF runners use `HFS_DEFAULT_FHIR_VERSION`
 for cardinality and compartment metadata. Results on a server configured for
@@ -553,7 +560,8 @@ SQLite and PostgreSQL refuse computed iteration sources they cannot lower:
 a direct ViewDefinition `$sql-run` returns `422` for a NUL literal in a nested
 focus rather than executing an empty source. Non-path `forEach` sources remain
 unsupported. A dependency compilation error in a SQL Query or SQL View subject
-still surfaces as `500`, pending [#1864](https://github.com/HeliosSoftware/hfs/issues/1864).
+keeps its `422`, on `$sql-run` and in a failed export job's result, and every
+other dependency error keeps its kind the same way.
 
 A SQL Query or SQL View can depend on a `unionAll` ViewDefinition. Its dependency
 table keeps one column per distinct name, using the first declaration's position
@@ -572,8 +580,11 @@ enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 
 A failed job's result URL (`GET [base]/export/{id}/result`) answers with the
 failure's own status, the `4xx` that `$sql-run` gives for the request's own
-fault (a documented limit, a subject the runner refuses) or `500` for a server
-fault, and an `OperationOutcome`. A `4xx` keeps its specific `diagnostics`. A
+fault (a documented limit, a subject the runner refuses), `503` (`transient`,
+with `Retry-After`) when the database was unavailable, `504` (`timeout`) when
+the job ran past `HFS_EXPORT_JOB_TIMEOUT_SECS`, or `500` for a server fault,
+and an `OperationOutcome`. A `4xx` keeps its specific `diagnostics`; a `503`
+or `504` has the generic wording `$sql-run` gives it. A
 `500`'s `diagnostics` are generic and name the job, whose underlying error is
 in the server log. Either way, `issue[0].expression` carries the output name of
 the subject that failed (for example `["patients_flat"]`), so a client can tell
@@ -585,14 +596,17 @@ which subject failed without parsing the message.
 | `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`). Rows beyond it are silently dropped, not an error. |
 | `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View) by `$sql-run` and `$sql-export`. A dependency that produces more fails the request with a `422` naming it. Each dependency is materialized in full before the query's `WHERE` runs, so narrow it with a ViewDefinition `where`, or raise this limit. |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. Resolution stops with a `422` at the first node past this limit, before any further dependency is fetched. A Library may also declare at most 4 × this many `depends-on` entries (64 by default). |
-| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs (the subject's SQL and each SQL View's SQL). It does not cover materializing a dependency. |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs (the subject's SQL and each SQL View's SQL), capped by what is left of the run's budget. It does not cover materializing a dependency, which the run's budget bounds. A statement past it ends the run with `504` (`timeout`); it was a `422`. |
+| `HFS_SOF_RUN_TIMEOUT_SECS` | `600` | Time budget, seconds, of a `$sql-run` that streams its rows (`_format=ndjson`, `parquet` or `arrow` without `_limit` and without the `Binary` envelope). Every other `$sql-run` (a `_limit` preview, a buffered format, a SQL Query) is bounded by `HFS_REQUEST_TIMEOUT` minus 2 s (at least 1 s), or by this if smaller, so it answers `504` (`timeout`) before the request timeout answers `408`. 1 to 2147483; any other value fails startup. |
 | `HFS_SOF_RUNNER_HEADER` | `false` | Add an `X-HFS-Runner` response header naming the runner that served a `$sql-run` ViewDefinition request (`sqlite-indb`, `postgres-indb`, `in-process`). Off by default: it discloses the storage backend; turn it on for debugging. |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. Job directories and output files are created owner-only (`0700` / `0600`) on Unix. |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
 | `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. |
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). Each URL is capped at the job's remaining `HFS_EXPORT_OUTPUT_TTL` retention (never below 60 s), so a late poll does not hand out a URL that outlives the object. |
-| `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
+| `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. On PostgreSQL it is also the default size of the export connection pool (`HFS_EXPORT_PG_MAX_CONNECTIONS`). |
+| `HFS_EXPORT_JOB_TIMEOUT_SECS` | `3600` | Time budget, seconds, of one export job, counted from when it starts running (time queued for a slot does not count) and never renewed per subject or page. A job still running at the end of it fails, and its result answers `504` (`timeout`). On PostgreSQL it is also the export connections' session `statement_timeout`, as a backstop. 1 to 2147483; any other value fails startup. |
+| `HFS_EXPORT_PG_MAX_CONNECTIONS` | `HFS_EXPORT_MAX_CONCURRENCY` (at least 1) | Connections in the PostgreSQL pool export jobs read through (`application_name` `hfs-export`), in addition to `HFS_PG_MAX_CONNECTIONS`. A job runs one statement at a time; with fewer connections than running jobs, jobs wait for one (no wait timeout) and stay cancellable and bounded by their budget. Must be greater than 0. Other backends ignore it. |
 | `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum export jobs one tenant may have queued or running at once (must be ≥ 1). A job counts from kick-off until its worker ends, so a job cancelled while it waits for an `HFS_EXPORT_MAX_CONCURRENCY` slot counts until its turn comes. Beyond it `$sql-export` answers `429 Too Many Requests` with `Retry-After: 5`. |
 | `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. A ViewDefinition subject's rows are written as each shard fills, so it holds at most one shard in memory. A running view job keeps its row stream, and the storage connection or cursor behind it, open while it writes each shard, so keep `HFS_EXPORT_MAX_CONCURRENCY` below the storage connection pool size. |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
@@ -621,11 +635,38 @@ Each is a `400` that names the limit. It is returned before the work it bounds
 
 Cancelling a job (`DELETE` on the status URL) deletes its already-written
 partial shards immediately and stops the job. A job still waiting for an
-`HFS_EXPORT_MAX_CONCURRENCY` slot never starts. A running job stops at its next
-checkpoint (before each subject, before each shard, and every 4096 rows it
-reads) and frees its slot. A SQL statement that is already executing is not
-interrupted; `HFS_SOF_SQLQUERY_TIMEOUT_SECS` bounds it. A mid-run failure also
+`HFS_EXPORT_MAX_CONCURRENCY` slot never starts. A running job stops at once:
+the cancel stops the database work of the run in progress (the statement,
+aggregation or scan, and a SQL Query subject's own SQL), and the job frees its
+slot when that run has ended. A mid-run failure also
 deletes the partial shards.
+
+Every SQL-on-FHIR run has a budget and stops at its end: a streamed `$sql-run`
+after `HFS_SOF_RUN_TIMEOUT_SECS`, every other `$sql-run` just under
+`HFS_REQUEST_TIMEOUT`, an export job after `HFS_EXPORT_JOB_TIMEOUT_SECS`. A run
+past its budget answers `504` (`timeout`). A run also stops when its client goes
+away, and an export job's run when the job is cancelled. The database work
+stops within about one second; the stated exceptions are an in-process (S3)
+FHIRPath terminology call already in flight (bounded by
+`FHIRPATH_TERMINOLOGY_TIMEOUT`), a MongoDB deployment that refuses both killing
+a user's own operation and killing a disconnected client's read (bounded by the
+aggregation's `maxTimeMS`, the run's budget), and a PostgreSQL cancel request
+that cannot reach the server (bounded by `SET LOCAL statement_timeout`, the
+run's budget). An in-process run checks the stop once per resource, so it
+finishes the CPU work of a resource it is already evaluating, such as a
+`forEach` cross product of millions of rows, while its S3 reads stop at once.
+On PostgreSQL every SQL-on-FHIR statement runs in a
+`BEGIN READ ONLY` transaction under `SET LOCAL statement_timeout` from what is
+left of its run's budget, so `HFS_PG_STATEMENT_TIMEOUT_MS` no longer bounds
+SQL-on-FHIR statements. Export jobs read through their own `hfs-export` pool of
+`HFS_EXPORT_PG_MAX_CONNECTIONS` connections, in addition to
+`HFS_PG_MAX_CONNECTIONS`: plan PostgreSQL's `max_connections` for both. Behind
+a transaction-mode pooler such as PgBouncer a cancel request may reach a
+different backend; connect HFS to PostgreSQL directly or use session pooling.
+The standalone sof-server checks the same reference shape: an absolute or
+other-type `patient`/`group` reference is a `400` with code `invalid` (it was
+`not-found`), and so is a versioned one, which it used to accept. See
+[run budgets, cancellation and errors](../../book/src/ch06-sql-on-fhir.md#run-budgets-cancellation-and-errors).
 
 The reaper reclaims every finished job (completed, failed or cancelled) once it
 ages past `HFS_EXPORT_OUTPUT_TTL`. If deleting a job's output fails, the job

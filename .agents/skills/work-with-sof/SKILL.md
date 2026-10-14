@@ -137,24 +137,32 @@ in-process fallback.
 | `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`); rows beyond it are silently dropped, not an error |
 | `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized in full before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. Narrow it with a ViewDefinition `where`, or raise this limit |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
-| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's); does not cover materializing a dependency |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's), capped by the run's remaining budget; does not cover materializing a dependency (the run's budget does). Past it: `504` `timeout` |
+| `HFS_SOF_RUN_TIMEOUT_SECS` | `600` | Budget, seconds, of a streamed `$sql-run` (`_format=ndjson`, `parquet` or `arrow`, no `_limit`, no `Binary` envelope); every other `$sql-run` gets `HFS_REQUEST_TIMEOUT` − 2 s (min 1 s) or this if smaller. Past it: `504` `timeout`. 1 to 2147483 |
 | `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3` |
 | `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink |
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for `s3`, seconds (spec requires ≥ 24h) |
-| `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs |
+| `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs; default size of the PostgreSQL export pool |
+| `HFS_EXPORT_JOB_TIMEOUT_SECS` | `3600` | Budget, seconds, of one export job, from when it starts running, never renewed; past it the job fails with result `504` `timeout`. 1 to 2147483 |
+| `HFS_EXPORT_PG_MAX_CONNECTIONS` | `HFS_EXPORT_MAX_CONCURRENCY` (min 1) | Connections of the PostgreSQL `hfs-export` pool export jobs read through, on top of `HFS_PG_MAX_CONNECTIONS`; must be > 0 |
 | `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum queued + running export jobs per tenant; beyond it `$sql-export` returns `429` with `Retry-After: 5` |
 | `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger results split across files |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory` in-process; `kafka`/`sqs` reserved) |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`) |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval, seconds (clamped to ≥ 1) |
 
-Cancelling a job (`DELETE` on the status URL) deletes its partial shards
-immediately and stops it: a queued job never starts, a running one stops at its
-next checkpoint (before each subject and shard, every 4096 rows) and frees its
-slot. A SQL statement already executing is not interrupted;
-`HFS_SOF_SQLQUERY_TIMEOUT_SECS` bounds it. A mid-run failure also deletes the
+Cancelling a job (`DELETE` on the status URL) stops it at once: a queued job
+never starts, and a running one stops the database work of its current run
+(statement, aggregation or scan, a SQL Query's own SQL included) and frees its
+slot. Every run has a budget (table above) and ends with `504` `timeout` past
+it; on PostgreSQL each SoF statement runs under `SET LOCAL statement_timeout`
+from what is left, so `HFS_PG_STATEMENT_TIMEOUT_MS` no longer bounds it. The
+stop bound (about 1 s) and its three exceptions are in the
+[book](../../../book/src/ch06-sql-on-fhir.md#run-budgets-cancellation-and-errors).
+
+Cancelling a job also deletes its partial shards immediately. A mid-run failure also deletes the
 partial shards. The reaper reclaims every finished job (completed, failed or
 cancelled) once it ages past `HFS_EXPORT_OUTPUT_TTL`; a failed delete leaves the
 job unreachable (404) and is retried, with a warning, on every sweep. Request

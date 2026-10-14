@@ -76,7 +76,9 @@ tempfile = "3"
 form_urlencoded = "1"
 
 # SQLite backend
-rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"], optional = true }
+# `hooks`: the SoF runner's progress handler stops a statement on a cancel or a
+# deadline (#1864). helios-sof already enables it on the same rusqlite.
+rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions", "hooks"], optional = true }
 r2d2 = { version = "0.8", optional = true }
 r2d2_sqlite = { version = "0.26", optional = true }
 

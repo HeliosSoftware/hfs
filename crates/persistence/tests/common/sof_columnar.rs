@@ -13,13 +13,23 @@
 #![allow(dead_code)]
 
 use futures::StreamExt;
-use helios_persistence::core::{SofRunner, ViewFilters};
+use helios_persistence::core::{RunContext, RunKind, RunRequest, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::arrow::array::{Array, ArrayRef};
 use helios_sof::arrow::datatypes::DataType;
 use helios_sof::arrow::record_batch::RecordBatch;
 use helios_sof::arrow::util::display::array_value_to_string;
 use serde_json::Value;
+
+/// The context of a parity run: detached (no deadline, nothing cancels it),
+/// with the kind a `$sql-run` with these filters would have.
+fn ctx(filters: &ViewFilters) -> RunContext {
+    RunContext::detached(if filters.limit.is_some() {
+        RunKind::Preview
+    } else {
+        RunKind::UnlimitedRun
+    })
+}
 
 /// One result cell rendered as text; `None` is null.
 pub type Cell = Option<String>;
@@ -33,8 +43,13 @@ pub async fn row_path_cells(
     filters: &ViewFilters,
 ) -> (Vec<String>, Vec<Vec<Cell>>) {
     let mut stream = runner
-        .run_view(tenant, view.clone(), filters.clone())
+        .run_view(
+            tenant,
+            RunRequest::new(view.clone(), filters.clone()),
+            ctx(filters),
+        )
         .await
+        .map(|output| output.rows)
         .expect("run_view");
     let mut rows = Vec::new();
     while let Some(item) = stream.next().await {
@@ -58,7 +73,11 @@ pub async fn columnar_batches(
     filters: &ViewFilters,
 ) -> Vec<RecordBatch> {
     let mut stream = runner
-        .run_view_columnar(tenant, view.clone(), filters.clone())
+        .run_view_columnar(
+            tenant,
+            RunRequest::new(view.clone(), filters.clone()),
+            ctx(filters),
+        )
         .await
         .expect("run_view_columnar")
         .expect("runner has no columnar path for this view");

@@ -11,6 +11,7 @@ use helios_fhir::FhirVersion;
 use serde_json::Value;
 
 use crate::core::sof_runner::{SofError, ViewFilters};
+use crate::core::sof_schema::ViewSchema;
 
 use super::compile_view::build_plan;
 use super::compiler::{CompileTarget, CompiledQuery, OutputLimitStrategy, SqlDialect, dialect_for};
@@ -32,6 +33,35 @@ pub(super) struct PreparedSqlRun {
     pub query: CompiledQuery,
     pub params: Vec<RuntimeParam>,
     pub client_limit: Option<usize>,
+    /// The view's declared columns in document order, with the compiler's
+    /// decode for each. `query.columns` may list them in another order.
+    pub schema: ViewSchema,
+    /// The statement returns its rows in a total order; see [`total_order`].
+    /// The runners copy it into `RunCapabilities::total_order`.
+    pub total_order: bool,
+}
+
+/// What the shared preamble decided for one run.
+pub(super) enum SqlPrepared {
+    /// Run this statement.
+    Run(PreparedSqlRun),
+    /// The empty-group short-circuit: no statement runs and the run has no
+    /// rows, but it still has the view's schema.
+    Empty {
+        schema: ViewSchema,
+        total_order: bool,
+    },
+}
+
+impl SqlPrepared {
+    /// The statement to run, or `None` for the empty-group short-circuit.
+    #[cfg_attr(not(test), allow(dead_code))] // golden_tests.rs reads runs through this
+    pub(super) fn into_run(self) -> Option<PreparedSqlRun> {
+        match self {
+            Self::Run(prepared) => Some(prepared),
+            Self::Empty { .. } => None,
+        }
+    }
 }
 
 /// A validated view retained as IR until group membership has been resolved.
@@ -42,6 +72,8 @@ pub(super) struct SqlRunPlan {
     dialect: SqlDialect,
     fhir_version: FhirVersion,
     limit_strategy: OutputLimitStrategy,
+    total_order: bool,
+    schema: ViewSchema,
 }
 
 impl SqlRunPlan {
@@ -58,12 +90,15 @@ impl SqlRunPlan {
         let (plan, constants) = build_plan(view, dial.as_ref(), target, fhir_version)?;
         // Emission can reject a computed source (#1862). Check before any
         // group I/O and before an empty-group result could bypass that error.
-        emit_plan(&plan, dial.as_ref())?;
+        let emitted = emit_plan(&plan, dial.as_ref())?;
         let resource_type = view["resource"]
             .as_str()
             .expect("build_plan checked ViewDefinition.resource")
             .to_string();
         let limit_strategy = OutputLimitStrategy::for_plan(&plan);
+        let total_order = total_order(&plan);
+        let schema = ViewSchema::from_view_definition(view)
+            .with_decodes(&emitted.columns, &emitted.column_decodes);
         Ok(Self {
             plan,
             constants,
@@ -71,7 +106,17 @@ impl SqlRunPlan {
             dialect,
             fhir_version,
             limit_strategy,
+            total_order,
+            schema,
         })
+    }
+
+    /// The empty-group short-circuit for this view.
+    fn empty(self) -> SqlPrepared {
+        SqlPrepared::Empty {
+            schema: self.schema,
+            total_order: self.total_order,
+        }
     }
 
     /// Finish a view whose group references have already been folded into
@@ -91,7 +136,6 @@ impl SqlRunPlan {
     /// two entries of `params` (`after`, then `through`), holding empty
     /// placeholders the caller overwrites per page. No SQL `LIMIT` is emitted:
     /// it would apply per page, so `filters.limit` stays a client-side cap.
-    #[allow(dead_code)] // consumed by the paged PostgreSQL export reader
     pub(super) fn finish_paged(
         self,
         tenant_id: &str,
@@ -140,57 +184,105 @@ impl SqlRunPlan {
             query,
             params,
             client_limit,
+            schema: self.schema,
+            total_order: self.total_order,
         })
     }
 }
 
-/// One run preamble for both SQL backends. `None` is the existing empty-group
-/// short-circuit, reached only after full compilation and emission validation.
+/// Whether the statement compiled from `plan` returns its rows in a total
+/// order: true for flat and `forEach` views, false for `unionAll` and
+/// `repeat`, whether the run is paged or not. The key is `(last_updated, id)`
+/// for one statement and the resource id for export pages; a union or repeat
+/// statement sorts by its first column only, so no total order is claimed.
+fn total_order(plan: &PlanNode) -> bool {
+    OutputLimitStrategy::for_plan(plan) == OutputLimitStrategy::Direct
+}
+
+/// One run preamble for both SQL backends: compile, resolve groups, bind.
+/// `paged` binds one page of an id-ordered export read; see
+/// [`SqlRunPlan::finish_paged`] for the range slots and limit handling.
+/// [`SqlPrepared::Empty`] is the existing empty-group short-circuit, reached
+/// only after full compilation and emission validation.
+pub(super) async fn prepare_sql<F, Fut>(
+    view: &Value,
+    dialect: SqlDialect,
+    fhir_version: FhirVersion,
+    tenant_id: &str,
+    mut filters: ViewFilters,
+    paged: bool,
+    load_groups: F,
+) -> Result<SqlPrepared, SofError>
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<Vec<Value>, SofError>>,
+{
+    let plan = SqlRunPlan::compile(view, dialect, fhir_version)?;
+    if !filters.group.is_empty() {
+        let documents = load_groups(filters.group.clone()).await?;
+        if !resolve_group_filter(&mut filters, &documents) {
+            return Ok(plan.empty());
+        }
+    }
+    if paged {
+        plan.finish_paged(tenant_id, &filters).map(SqlPrepared::Run)
+    } else {
+        plan.finish(tenant_id, &filters).map(SqlPrepared::Run)
+    }
+}
+
+/// [`prepare_sql`] for one statement. `None` is the empty-group short-circuit.
+#[cfg_attr(not(test), allow(dead_code))] // the runners call `prepare_sql`
 pub(super) async fn prepare_sql_run<F, Fut>(
     view: &Value,
     dialect: SqlDialect,
     fhir_version: FhirVersion,
     tenant_id: &str,
-    mut filters: ViewFilters,
+    filters: ViewFilters,
     load_groups: F,
 ) -> Result<Option<PreparedSqlRun>, SofError>
 where
     F: FnOnce(Vec<String>) -> Fut,
     Fut: Future<Output = Result<Vec<Value>, SofError>>,
 {
-    let plan = SqlRunPlan::compile(view, dialect, fhir_version)?;
-    if !filters.group.is_empty() {
-        let documents = load_groups(filters.group.clone()).await?;
-        if !resolve_group_filter(&mut filters, &documents) {
-            return Ok(None);
-        }
-    }
-    plan.finish(tenant_id, &filters).map(Some)
+    prepare_sql(
+        view,
+        dialect,
+        fhir_version,
+        tenant_id,
+        filters,
+        false,
+        load_groups,
+    )
+    .await
+    .map(SqlPrepared::into_run)
 }
 
-/// [`prepare_sql_run`] for one page of an id-ordered export read; see
-/// [`SqlRunPlan::finish_paged`] for the range slots and limit handling.
-#[allow(dead_code)] // consumed by the paged PostgreSQL export reader
+/// [`prepare_sql`] for one page of an id-ordered export read.
+#[cfg_attr(not(test), allow(dead_code))] // the runners call `prepare_sql`
 pub(super) async fn prepare_sql_export_page<F, Fut>(
     view: &Value,
     dialect: SqlDialect,
     fhir_version: FhirVersion,
     tenant_id: &str,
-    mut filters: ViewFilters,
+    filters: ViewFilters,
     load_groups: F,
 ) -> Result<Option<PreparedSqlRun>, SofError>
 where
     F: FnOnce(Vec<String>) -> Fut,
     Fut: Future<Output = Result<Vec<Value>, SofError>>,
 {
-    let plan = SqlRunPlan::compile(view, dialect, fhir_version)?;
-    if !filters.group.is_empty() {
-        let documents = load_groups(filters.group.clone()).await?;
-        if !resolve_group_filter(&mut filters, &documents) {
-            return Ok(None);
-        }
-    }
-    plan.finish_paged(tenant_id, &filters).map(Some)
+    prepare_sql(
+        view,
+        dialect,
+        fhir_version,
+        tenant_id,
+        filters,
+        true,
+        load_groups,
+    )
+    .await
+    .map(SqlPrepared::into_run)
 }
 
 /// Resolve only Patient member references, preserving bare/unknown Group
@@ -592,6 +684,115 @@ mod tests {
             assert_eq!(plain.client_limit, None);
             assert!(!plain.query.sql.contains("r.id COLLATE BINARY >"));
             assert!(!plain.query.sql.contains("r.id COLLATE \"C\" >"));
+        }
+    }
+
+    /// A `unionAll` before a sibling column: document order lists `tail`
+    /// last. The compiler distributes the `unionAll` in place
+    /// (`normalize_union`), so it projects the same order.
+    fn union_first_view() -> Value {
+        json!({"resource":"Patient", "select":[
+            {"unionAll":[
+                {"forEach":"name", "column":[{"name":"family","path":"family","type":"string"}]},
+                {"forEach":"contact.name", "column":[{"name":"family","path":"family","type":"string"}]}
+            ]},
+            {"column":[{"name":"tail","path":"id","type":"id"}]}
+        ]})
+    }
+
+    #[test]
+    fn the_schema_is_in_document_order_with_the_compiled_decodes() {
+        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            for paged in [false, true] {
+                let plan = SqlRunPlan::compile(
+                    &union_first_view(),
+                    dialect,
+                    FhirVersion::default_enabled(),
+                )
+                .unwrap();
+                let run = if paged {
+                    plan.finish_paged("tenant", &ViewFilters::default())
+                } else {
+                    plan.finish("tenant", &ViewFilters::default())
+                }
+                .unwrap();
+                assert_eq!(run.schema.names().collect::<Vec<_>>(), ["family", "tail"]);
+                assert_eq!(run.query.columns, ["family", "tail"], "compiled order");
+                for column in &run.schema.columns {
+                    let at = run.query.columns.iter().position(|c| *c == column.name);
+                    assert_eq!(Some(column.decode), at.map(|i| run.query.column_decodes[i]));
+                }
+                let permutation = run.schema.permutation_from(&run.query.columns).unwrap();
+                assert!(permutation.is_identity());
+
+                let flat =
+                    SqlRunPlan::compile(&flat_view(), dialect, FhirVersion::default_enabled())
+                        .unwrap()
+                        .finish("tenant", &ViewFilters::default())
+                        .unwrap();
+                assert!(
+                    flat.schema
+                        .permutation_from(&flat.query.columns)
+                        .unwrap()
+                        .is_identity()
+                );
+            }
+        }
+    }
+
+    /// The predicate the runners copy into `RunCapabilities::total_order`.
+    #[test]
+    fn total_order_holds_for_flat_and_foreach_only_paged_or_not() {
+        let foreach = json!({"resource":"Patient", "select":[{"forEach":"name",
+            "column":[{"name":"family","path":"family"}]}]});
+        let repeat = json!({"resource":"QuestionnaireResponse", "select":[{"repeat":["item"],
+            "column":[{"name":"link","path":"linkId"}]}]});
+        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            for (view, expected) in [
+                (flat_view(), true),
+                (foreach.clone(), true),
+                (union_first_view(), false),
+                (repeat.clone(), false),
+            ] {
+                let compile =
+                    || SqlRunPlan::compile(&view, dialect, FhirVersion::default_enabled()).unwrap();
+                let run = compile().finish("tenant", &ViewFilters::default()).unwrap();
+                let page = compile()
+                    .finish_paged("tenant", &ViewFilters::default())
+                    .unwrap();
+                assert_eq!(run.total_order, expected, "{dialect:?} {view}");
+                assert_eq!(page.total_order, expected, "{dialect:?} paged {view}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_empty_group_short_circuit_keeps_the_schema() {
+        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let prepared = prepare_sql(
+                &union_first_view(),
+                dialect,
+                FhirVersion::default_enabled(),
+                "tenant",
+                ViewFilters {
+                    group: vec!["Group/empty".into()],
+                    ..Default::default()
+                },
+                false,
+                |_| async { Ok(vec![json!({"resourceType":"Group","id":"empty"})]) },
+            )
+            .await
+            .unwrap();
+            match prepared {
+                SqlPrepared::Empty {
+                    schema,
+                    total_order,
+                } => {
+                    assert_eq!(schema.names().collect::<Vec<_>>(), ["family", "tail"]);
+                    assert!(!total_order);
+                }
+                SqlPrepared::Run(_) => panic!("an empty group runs no statement"),
+            }
         }
     }
 }

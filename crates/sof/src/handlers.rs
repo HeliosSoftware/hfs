@@ -331,6 +331,13 @@ pub async fn sql_run_handler(
     } else {
         crate::split_csv_refs(validated_params.group.as_deref())
     };
+    // Every value's shape is checked before any source is loaded or filtered
+    // (#1864): an absolute URL, `urn:uuid:`, the other type, a versioned or
+    // contained reference, or an empty id is a 400 naming the parameter. Only
+    // a usable reference reaches the filter, whose absent target stays a 400
+    // `not-found` (the SoF v2 error table).
+    crate::params::check_patient_group_shapes(&patient_filter, &group_filter)
+        .map_err(|error| ServerError::BadRequest(error.message))?;
     let source_param = extracted_params.source.or(validated_params.source.clone());
 
     // Merge limit parameter - body takes precedence over query

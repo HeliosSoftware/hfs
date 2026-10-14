@@ -34,7 +34,9 @@ mod sof_pg_runner_tests {
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
     use helios_persistence::core::ResourceStorage;
-    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{
+        RunContext, RunKind, RunRequest, SofRunner, ViewFilters,
+    };
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -176,10 +178,8 @@ mod sof_pg_runner_tests {
             let runner = backend.sof_runner().expect("runner");
             // Composition.subject is a singleton Reference in R4 and a
             // collection of References in R5. The same path is valid in both.
-            let cardinality = runner.run_view(&tenant,
-                json!({"resourceType":"ViewDefinition", "resource":"Composition",
-                    "select":[{"column":[{"name":"subject", "path":"subject.reference", "collection":false}]}]}),
-                ViewFilters::default()).await;
+            let cardinality = runner.run_view(&tenant, RunRequest::new(json!({"resourceType":"ViewDefinition", "resource":"Composition",
+                    "select":[{"column":[{"name":"subject", "path":"subject.reference", "collection":false}]}]}), ViewFilters::default()), RunContext::detached(RunKind::Preview)).await.map(|output| output.rows);
             if version == FhirVersion::R5 {
                 assert!(matches!(
                     cardinality,
@@ -312,8 +312,13 @@ mod sof_pg_runner_tests {
         view: Value,
     ) -> Vec<BTreeMap<String, Value>> {
         let mut stream = runner
-            .run_view(tenant, view, ViewFilters::default())
+            .run_view(
+                tenant,
+                RunRequest::new(view, ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view must succeed");
 
         let mut rows: Vec<BTreeMap<String, Value>> = Vec::new();
@@ -493,13 +498,17 @@ mod sof_pg_runner_tests {
         let mut stream = runner
             .run_view(
                 &tenant,
-                view,
-                ViewFilters {
-                    limit: Some(2),
-                    ..Default::default()
-                },
+                RunRequest::new(
+                    view,
+                    ViewFilters {
+                        limit: Some(2),
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::Preview),
             )
             .await
+            .map(|output| output.rows)
             .expect("run_view must succeed");
 
         let mut count = 0;
@@ -554,13 +563,17 @@ mod sof_pg_runner_tests {
         let mut stream = runner
             .run_view(
                 &tenant,
-                view,
-                ViewFilters {
-                    patient: vec!["Patient/alice".to_string()],
-                    ..Default::default()
-                },
+                RunRequest::new(
+                    view,
+                    ViewFilters {
+                        patient: vec!["Patient/alice".to_string()],
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::Preview),
             )
             .await
+            .map(|output| output.rows)
             .expect("run_view must succeed");
 
         let mut ids = Vec::new();
@@ -794,8 +807,13 @@ mod sof_pg_runner_tests {
         filters: ViewFilters,
     ) -> Vec<Value> {
         let mut stream = runner
-            .run_view(tenant, view, filters)
+            .run_view(
+                tenant,
+                RunRequest::new(view, filters),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run view");
         let mut rows = Vec::new();
         while let Some(row) = stream.next().await {
@@ -807,6 +825,40 @@ mod sof_pg_runner_tests {
     fn preview_flat_view(resource: &str, alias: &str) -> Value {
         json!({"resourceType":"ViewDefinition", "resource":resource,
             "select":[{"column":[{"path":"id","name":alias}]}]})
+    }
+
+    /// Two output columns with the same name (a stored view is not
+    /// re-linted): the columnar path declines the view, and the row path it
+    /// falls back to answers with one `x` key per row (first position, last
+    /// column's value), as main's runner did.
+    #[tokio::test]
+    async fn test_pg_duplicate_column_names_fall_back_to_rows_with_one_key() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(&backend, &tenant, &[("p1", "male", "1990-01-01")]).await;
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient", "status":"active",
+        "select":[{"column":[
+            {"path":"id","name":"x"},
+            {"path":"gender","name":"x"},
+            {"path":"birthDate","name":"dob"}
+        ]}]});
+
+        let columnar = runner
+            .run_view_columnar(
+                &tenant,
+                RunRequest::new(view.clone(), ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
+            .await
+            .expect("run_view_columnar");
+        assert!(columnar.is_none(), "duplicate names have no columnar path");
+
+        let rows =
+            collect_rows_in_order(runner.as_ref(), &tenant, view, ViewFilters::default()).await;
+        assert_eq!(rows, [json!({"x": "male", "dob": "1990-01-01"})]);
+        let keys: Vec<&String> = rows[0].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["x", "dob"]);
     }
 
     #[tokio::test]
@@ -2063,7 +2115,11 @@ mod sof_pg_runner_tests {
         for case in cases {
             // Views with duplicate column names have no columnar path.
             let Some(_) = runner
-                .run_view_columnar(&tenant, case.view.clone(), ViewFilters::default())
+                .run_view_columnar(
+                    &tenant,
+                    RunRequest::new(case.view.clone(), ViewFilters::default()),
+                    RunContext::detached(RunKind::Preview),
+                )
                 .await
                 .expect("run_view_columnar")
             else {
@@ -2195,8 +2251,8 @@ mod sof_pg_runner_tests {
         let result = runner
             .run_view_columnar(
                 &tenant,
-                json!({"resourceType": "Nope"}),
-                ViewFilters::default(),
+                RunRequest::new(json!({"resourceType": "Nope"}), ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
             )
             .await;
         assert!(result.is_err(), "invalid view must be rejected up front");
@@ -2214,7 +2270,9 @@ mod export_paging {
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
     use helios_persistence::core::ResourceStorage;
-    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{
+        RunContext, RunKind, RunRequest, SofRunner, ViewFilters,
+    };
     use helios_persistence::sof::postgres::PgInDbRunner;
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use serde_json::{Value, json};
@@ -2343,8 +2401,13 @@ mod export_paging {
 
     async fn run(runner: &dyn SofRunner, tenant: &TenantContext, view: &Value) -> Vec<Value> {
         let mut stream = runner
-            .run_view(tenant, view.clone(), ViewFilters::default())
+            .run_view(
+                tenant,
+                RunRequest::new(view.clone(), ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view");
         let mut rows = Vec::new();
         while let Some(row) = stream.next().await {
@@ -2477,8 +2540,13 @@ mod export_paging {
         // Before the fix: one statement ordered by (last_updated, id).
         let unpaged = PgInDbRunner::new(fx.pool.clone());
         let mut stream = unpaged
-            .run_view(&tenant, view.clone(), ViewFilters::default())
+            .run_view(
+                &tenant,
+                RunRequest::new(view.clone(), ViewFilters::default()),
+                RunContext::detached(RunKind::ExportJob),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view starts");
         let mut failure = None;
         while let Some(row) = stream.next().await {
@@ -2498,8 +2566,13 @@ mod export_paging {
             .for_export_job()
             .expect("PostgreSQL provides a paged export runner");
         let mut stream = paged
-            .run_view(&tenant, view, ViewFilters::default())
+            .run_view(
+                &tenant,
+                RunRequest::new(view, ViewFilters::default()),
+                RunContext::detached(RunKind::ExportJob),
+            )
             .await
+            .map(|output| output.rows)
             .expect("paged run_view starts");
         let mut count = 0usize;
         while let Some(row) = stream.next().await {
@@ -2520,13 +2593,17 @@ mod export_paging {
         let mut stream = paged
             .run_view(
                 &tenant,
-                view,
-                ViewFilters {
-                    limit: Some(7),
-                    ..Default::default()
-                },
+                RunRequest::new(
+                    view,
+                    ViewFilters {
+                        limit: Some(7),
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::ExportJob),
             )
             .await
+            .map(|output| output.rows)
             .unwrap();
         let mut limited = Vec::new();
         while let Some(row) = stream.next().await {
@@ -2596,8 +2673,13 @@ mod export_paging {
         let view2 = json!({"resourceType":"ViewDefinition","resource":"Patient",
             "select":[{"column":[{"path":"id","name":alias2}]}]});
         let mut stream = paged
-            .run_view(&tenant, view2, ViewFilters::default())
+            .run_view(
+                &tenant,
+                RunRequest::new(view2, ViewFilters::default()),
+                RunContext::detached(RunKind::ExportJob),
+            )
             .await
+            .map(|output| output.rows)
             .unwrap();
         stream.next().await.expect("first row").expect("row ok");
         drop(stream);
@@ -2640,7 +2722,9 @@ mod total_order_acceptance {
     use futures::StreamExt;
     use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
     use helios_persistence::core::ResourceStorage;
-    use helios_persistence::core::sof_runner::{SofError, SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{
+        RunContext, RunKind, RunRequest, SofError, SofRunner, ViewFilters,
+    };
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -2715,8 +2799,13 @@ mod total_order_acceptance {
 
     async fn rows(runner: &dyn SofRunner, view: Value, filters: ViewFilters) -> Vec<Value> {
         let mut stream = runner
-            .run_view(&tenant(), view, filters)
+            .run_view(
+                &tenant(),
+                RunRequest::new(view, filters),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run view");
         let mut rows = Vec::new();
         while let Some(row) = stream.next().await {
@@ -3067,13 +3156,17 @@ mod total_order_acceptance {
         let result = runner
             .run_view(
                 &tenant(),
-                invalid,
-                ViewFilters {
-                    group: vec!["Group/g-empty".into()],
-                    ..Default::default()
-                },
+                RunRequest::new(
+                    invalid,
+                    ViewFilters {
+                        group: vec!["Group/g-empty".into()],
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::Preview),
             )
-            .await;
+            .await
+            .map(|output| output.rows);
         assert!(
             matches!(result, Err(SofError::Uncompilable { .. })),
             "NUL emission must fail before empty Group short circuit"

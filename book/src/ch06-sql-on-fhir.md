@@ -398,6 +398,16 @@ in a different sequence. The additional sort keys can increase query cost,
 especially for unlimited output; a preview limit does not guarantee that
 the database reads only N source rows.
 
+Output columns follow ViewDefinition document order on every HFS runner
+(SQLite, PostgreSQL, MongoDB and the in-process runner used for S3): each row
+has exactly the view's columns, in the order the ViewDefinition declares
+them, with an explicit `null` for an empty column, and the formatted output
+follows the same order. This matters for a `select` declared after a
+`unionAll`, whose columns the SQLite, PostgreSQL and MongoDB runners used to
+place before the `unionAll` branch columns. Each run now reorders its columns
+once, at the runner boundary, so the emitted query, the rows and the row
+order are unchanged.
+
 ---
 
 ## SQL Query and SQL View Subjects
@@ -406,11 +416,11 @@ The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or S
 
 A `unionAll` ViewDefinition can be a dependency of either Library type. Its dependency table has one column per distinct name, retaining the first declaration's position and type; every branch contributes its rows, including duplicates. The SQL emitters still require the branches to declare the same columns in the same order.
 
-For `$sql-run` on HFS and sof-server, a `patient` or `group` body parameter must contain a nonblank `valueReference.reference` or `valueString`. The value is trimmed. Identifier-only or display-only references, unsupported value fields, and empty values return a `400` OperationOutcome naming the parameter. HFS applies this rule to inline resources, stored ViewDefinitions and Library subjects; `$sql-export` uses the same rule.
+For `$sql-run` on HFS and sof-server, a `patient` or `group` body parameter must contain a nonblank `valueReference.reference` or `valueString`. The value is trimmed. Identifier-only or display-only references, unsupported value fields, and empty values return a `400` OperationOutcome naming the parameter. HFS applies this rule to inline resources, stored ViewDefinitions and Library subjects; `$sql-export` uses the same rule. Each value must then be a relative `Patient/{id}` or `Group/{id}` reference of its parameter's type, or a bare id: an absolute URL, a `urn:uuid:`, a reference to the other type, a versioned (`Patient/p1/_history/2`) or contained reference is a `400` with code `invalid` naming the parameter, on HFS and sof-server alike. HFS then checks, before the run starts, that every referenced Patient or Group exists; a deleted one counts as missing. A missing target is a `400` with code `not-found` listing it on every `$sql-run` path (stored or inline ViewDefinition, Library subject, inline resources), and a `404` with code `not-found` at the `$sql-export` kick-off. If the existence check itself fails, the request gets the storage error's status (`503` with `Retry-After` when the database is unavailable, `504` when it timed out), not a `500`. A target deleted after the check and before the run reads it gives an empty result on SQLite, PostgreSQL and MongoDB, and a `400` `not-found` from the in-process runner (an export job fails with it).
 
 Stored-data runners on SQLite, PostgreSQL and S3 use `HFS_DEFAULT_FHIR_VERSION` for FHIR metadata. A server configured for R5 therefore uses R5 cardinality and compartment rules; correcting an earlier R4 default can change stored-data results on such a server.
 
-When SQLite or PostgreSQL cannot lower a computed iteration source, a direct ViewDefinition `$sql-run` returns `422`, including a NUL string literal inside a nested `extension()` or `where()` focus. It no longer substitutes an empty source. A non-path `forEach` source remains unsupported. A compilation failure inside a SQL Query or SQL View dependency currently surfaces as `500`; preserving its `422` through dependency execution is tracked in [#1864](https://github.com/HeliosSoftware/hfs/issues/1864).
+When SQLite or PostgreSQL cannot lower a computed iteration source, a direct ViewDefinition `$sql-run` returns `422`, including a NUL string literal inside a nested `extension()` or `where()` focus. It no longer substitutes an empty source. A non-path `forEach` source remains unsupported. A compilation failure inside a SQL Query or SQL View dependency keeps its `422`, on `$sql-run` and in the result of a failed `$sql-export` job, and so does every other dependency error kind: a dependency that fails mid-stream answers as the same failure would on a `$sql-run` of that ViewDefinition.
 
 These limits apply to SQL Query and SQL View subjects of `$sql-run` and `$sql-export`:
 
@@ -419,7 +429,89 @@ These limits apply to SQL Query and SQL View subjects of `$sql-run` and `$sql-ex
 | `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result. Rows beyond it are silently dropped, not an error. |
 | `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per dependency (a `depends-on` ViewDefinition or SQL View). A dependency that produces more fails the request with a `422` naming it. |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in the resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries. |
-| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, in seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's). It does not cover materializing a dependency. |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, in seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's), capped by what is left of the run's budget. It does not cover materializing a dependency, which the run's budget bounds instead (see [Run budgets, cancellation and errors](#run-budgets-cancellation-and-errors)). A statement that exceeds it ends the run with `504` and code `timeout` (it was a `422`). |
+
+---
+
+## Run budgets, cancellation and errors
+
+Every SQL-on-FHIR run on the HFS server has a time budget, counted from the
+start of the request or job and never renewed per statement or page:
+
+| Run | Budget |
+|-----|--------|
+| `$sql-run` that streams its rows (`_format=ndjson`, `parquet` or `arrow` without `_limit` and without the `Binary` envelope) | `HFS_SOF_RUN_TIMEOUT_SECS` (default `600`) |
+| Every other `$sql-run` (a `_limit` preview, a buffered format such as CSV, JSON or an enveloped Parquet, a SQL Query or SQL View subject and its dependencies) | `HFS_REQUEST_TIMEOUT` minus 2 seconds (at least 1 second), or `HFS_SOF_RUN_TIMEOUT_SECS` if smaller, so the run answers `504` before the request timeout answers `408` |
+| `$sql-export` job | `HFS_EXPORT_JOB_TIMEOUT_SECS` (default `3600`) for the whole job, every subject and SQL Query dependency included, counted from when the job starts running (time spent queued for an `HFS_EXPORT_MAX_CONCURRENCY` slot does not count) |
+
+`HFS_SOF_RUN_TIMEOUT_SECS` and `HFS_EXPORT_JOB_TIMEOUT_SECS` must be between 1
+and 2147483 (PostgreSQL's `statement_timeout` limit in milliseconds); any
+other value fails startup.
+
+A run stops when its budget runs out, when the client goes away (it closes
+the connection, or `HFS_REQUEST_TIMEOUT` answers `408`), and when its export
+job is cancelled (`DELETE` on the status URL), fails or completes. The stop
+reaches the database, not only the server's side of the run:
+
+- PostgreSQL runs every statement of a run inside a `BEGIN READ ONLY`
+  transaction that starts with `SET LOCAL statement_timeout` set to what is
+  left of the budget, so `HFS_PG_STATEMENT_TIMEOUT_MS` no longer bounds
+  SQL-on-FHIR statements. On a stop, HFS sends a PostgreSQL cancel request
+  for the running statement while it still holds the statement's
+  connection; the connection is reused only when the statement is known to
+  have ended, otherwise it is closed.
+- SQLite interrupts the statement, and a progress handler aborts it at the
+  deadline.
+- MongoDB gives every aggregation a `maxTimeMS` from the time left and kills
+  the run's own operation on a stop.
+- The in-process runner (S3) stops its scan and stops evaluating after the
+  resource each worker is evaluating.
+- A SQL Query or SQL View subject stops the SQL it is running in its
+  embedded database, and the dependency it is materializing.
+
+The target is that the database work stops within about one second of the
+stop. Three cases are bounded by something else instead:
+
+- in-process runs: a FHIRPath terminology call already in flight is bounded
+  by `FHIRPATH_TERMINOLOGY_TIMEOUT` (default 30 seconds, `0` for none);
+- MongoDB deployments that refuse both killing a user's own operation and
+  killing the read of a disconnected client: the aggregation's `maxTimeMS`,
+  that is the run's budget;
+- PostgreSQL, when the cancel request cannot reach the server (a network
+  fault): the statement's `SET LOCAL statement_timeout`, that is the run's
+  budget. HFS still closes the connection and ends the run within one
+  second.
+
+In-process runs check the stop once per resource, so a worker finishes the
+CPU work of the resource it is evaluating: one resource whose `forEach`
+clauses multiply into millions of rows runs to the end of its evaluation,
+while the S3 reads stop at once.
+
+On PostgreSQL, `$sql-export` jobs read through their own connection pool,
+named `hfs-export` in `pg_stat_activity`, so a long export never holds a
+request-serving connection. It has `HFS_EXPORT_PG_MAX_CONNECTIONS`
+connections (default `HFS_EXPORT_MAX_CONCURRENCY`, at least 1), in addition
+to `HFS_PG_MAX_CONNECTIONS`; plan PostgreSQL's `max_connections` for both.
+A running job waits for a free export connection rather than failing, and
+stays cancellable and bounded by its budget while it waits. Behind a
+transaction-mode connection pooler such as PgBouncer, a cancel request may
+reach a different backend than the statement it was meant for; point HFS at
+PostgreSQL directly, or use session pooling.
+
+Errors keep their kind, so each answers with one status:
+
+| Failure | `$sql-run` | Failed `$sql-export` job result |
+|---------|------------|----------------------------------|
+| An invalid or uncompilable ViewDefinition or dependency, or a documented limit it exceeds | `422` | `422` |
+| A `patient` or `group` target that does not exist | `400`, code `not-found` | `404`, code `not-found`, at kick-off (no job starts) |
+| The database is unavailable (no connection could be obtained) | `503`, code `transient`, with `Retry-After` | `503`, code `transient`, with `Retry-After` |
+| The run exceeded its budget, or a SQL Query statement exceeded `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `504`, code `timeout` | `504`, code `timeout` |
+| A database or driver fault | `500` | `500` |
+
+A streamed `$sql-run` starts its response once its first rows are in (NDJSON
+as soon as the run has started, Parquet and Arrow after their first batch or
+the rows that fix their schema), so a later error cannot change its status:
+the response body is cut off instead.
 
 ---
 

@@ -231,6 +231,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use traits::*;
 
@@ -1854,6 +1855,38 @@ impl PreparedViewDefinition {
         chunk: ResourceChunk,
         external: Vec<helios_fhir::FhirResource>,
     ) -> Result<ChunkedResult, SofError> {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        Ok(self
+            .process_chunk_with_external_until(chunk, external, &NEVER)?
+            .expect("a stop flag that is never set cannot stop the chunk"))
+    }
+
+    /// Like [`Self::process_chunk_with_external`], but stops early once `stop`
+    /// is set.
+    ///
+    /// The flag is read before each resource is parsed into the resolution
+    /// pool and before each resource is evaluated, so after `stop` is set
+    /// every Rayon worker finishes at most the resource it is evaluating and
+    /// takes no other. A stopped chunk returns `Ok(None)` and no rows: its
+    /// rows would be a partial set. A chunk that finished before the flag was
+    /// seen returns all its rows, as `Ok(Some(..))`.
+    ///
+    /// An evaluation that is already running is not interrupted: a slow
+    /// FHIRPath call inside it (for example a terminology request, bounded by
+    /// its own timeout) still runs to its end.
+    pub fn process_chunk_with_external_until(
+        &self,
+        chunk: ResourceChunk,
+        external: Vec<helios_fhir::FhirResource>,
+        stop: &AtomicBool,
+    ) -> Result<Option<ChunkedResult>, SofError> {
+        /// Why the parallel evaluation ended before its last resource.
+        enum Interrupted {
+            Stopped,
+            Failed(SofError),
+        }
+        let stopped = || stop.load(Ordering::Relaxed);
+
         // Build the resolution pool for `resolve()` from the resources in this chunk
         // plus any remotely-prefetched `external` resources.
         //
@@ -1864,17 +1897,22 @@ impl PreparedViewDefinition {
         // `external` resources prefetched per chunk with a cross-chunk cache. The
         // non-streaming Bundle path resolves across the entire bundle.
         let version = self.view_definition.version();
-        let mut pool: Vec<helios_fhir::FhirResource> = chunk
-            .resources
-            .iter()
-            .filter_map(|json| parse_json_to_fhir_resource(json.clone(), version).ok())
-            .collect();
+        let mut pool: Vec<helios_fhir::FhirResource> = Vec::with_capacity(chunk.resources.len());
+        for json in &chunk.resources {
+            if stopped() {
+                return Ok(None);
+            }
+            if let Ok(resource) = parse_json_to_fhir_resource(json.clone(), version) {
+                pool.push(resource);
+            }
+        }
         pool.extend(external);
         let resolution_scope: std::sync::Arc<Vec<helios_fhir::FhirResource>> =
             std::sync::Arc::new(pool);
 
-        // Process resources in parallel using rayon
-        let results: Result<Vec<Vec<ProcessedRow>>, SofError> = chunk
+        // Process resources in parallel using rayon. An `Err` ends the
+        // collection early: the workers take no further resource.
+        let results: Result<Vec<Vec<ProcessedRow>>, Interrupted> = chunk
             .resources
             .par_iter()
             .filter_map(|resource_json| {
@@ -1886,23 +1924,33 @@ impl PreparedViewDefinition {
 
                 if resource_type != self.target_resource_type {
                     None
+                } else if stopped() {
+                    Some(Err(Interrupted::Stopped))
                 } else {
                     // Process single resource based on version
-                    Some(self.process_single_resource(resource_json, &resolution_scope))
+                    Some(
+                        self.process_single_resource(resource_json, &resolution_scope)
+                            .map_err(Interrupted::Failed),
+                    )
                 }
             })
             .collect();
 
         // Flatten results from all resources
-        let all_rows: Vec<ProcessedRow> = results?.into_iter().flatten().collect();
+        let all_rows: Vec<ProcessedRow> = match results {
+            Ok(rows) => rows.into_iter().flatten().collect(),
+            Err(Interrupted::Stopped) => return Ok(None),
+            Err(Interrupted::Failed(_)) if stopped() => return Ok(None),
+            Err(Interrupted::Failed(e)) => return Err(e),
+        };
 
-        Ok(ChunkedResult {
+        Ok(Some(ChunkedResult {
             columns: self.column_names.clone(),
             rows: all_rows,
             chunk_index: chunk.chunk_index,
             is_last: chunk.is_last,
             resources_in_chunk: chunk.resources.len(),
-        })
+        }))
     }
 
     /// Process a single resource JSON value through the ViewDefinition.
@@ -4853,5 +4901,118 @@ mod tests {
         let mut out = Vec::new();
         write_csv_chunk(&chunk, &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "'=1+2,-5\n");
+    }
+    /// A prepared view over Patient with one row per `name` entry.
+    #[cfg(feature = "R4")]
+    fn names_view() -> PreparedViewDefinition {
+        let vd = view_definition_from_json(serde_json::json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [
+                {"column": [{"name": "id", "path": "id"}]},
+                {"forEach": "name", "column": [{"name": "family", "path": "family"}]}
+            ]
+        }));
+        PreparedViewDefinition::new(SofViewDefinition::R4(vd)).expect("valid view")
+    }
+
+    /// `count` Patients with `names` names each.
+    #[cfg(feature = "R4")]
+    fn patients_with_names(count: usize, names: usize) -> Vec<serde_json::Value> {
+        (0..count)
+            .map(|i| {
+                let names: Vec<_> = (0..names)
+                    .map(|n| serde_json::json!({"family": format!("f{i}-{n}")}))
+                    .collect();
+                serde_json::json!({"resourceType": "Patient", "id": format!("p{i}"), "name": names})
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "R4")]
+    fn chunk_of(resources: Vec<serde_json::Value>) -> ResourceChunk {
+        ResourceChunk {
+            resources,
+            chunk_index: 0,
+            is_last: true,
+        }
+    }
+
+    /// #1864: with the flag never set, the stoppable form returns exactly the
+    /// rows of `process_chunk`.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn process_chunk_until_a_clear_flag_returns_every_row() {
+        let prepared = names_view();
+        let resources = patients_with_names(40, 3);
+        let flag = AtomicBool::new(false);
+        let stoppable = prepared
+            .process_chunk_with_external_until(chunk_of(resources.clone()), Vec::new(), &flag)
+            .expect("no error")
+            .expect("not stopped");
+        let plain = prepared
+            .process_chunk(chunk_of(resources))
+            .expect("no error");
+        assert_eq!(stoppable.rows.len(), 120);
+        let values = |r: &ChunkedResult| -> Vec<Vec<Option<serde_json::Value>>> {
+            let mut v: Vec<_> = r.rows.iter().map(|row| row.values.clone()).collect();
+            v.sort_by_key(|values| format!("{values:?}"));
+            v
+        };
+        assert_eq!(values(&stoppable), values(&plain));
+        assert_eq!(stoppable.columns, plain.columns);
+        assert!(stoppable.is_last);
+        assert_eq!(stoppable.resources_in_chunk, 40);
+    }
+
+    /// #1864: a flag set before the call stops the chunk before any
+    /// evaluation; no partial rows come back.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn process_chunk_until_a_set_flag_returns_no_rows() {
+        let flag = AtomicBool::new(true);
+        let result = names_view()
+            .process_chunk_with_external_until(
+                chunk_of(patients_with_names(40, 3)),
+                Vec::new(),
+                &flag,
+            )
+            .expect("a stop is not an error");
+        assert!(result.is_none());
+    }
+
+    /// #1864 (council S4): a flag set while a large chunk is being evaluated
+    /// stops it after the resource each worker is on, well before the chunk
+    /// would have finished.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn process_chunk_until_stops_a_running_chunk_promptly() {
+        let prepared = names_view();
+        let resources = patients_with_names(1024, 400);
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let setter = {
+            let flag = std::sync::Arc::clone(&flag);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                flag.store(true, Ordering::Relaxed);
+                std::time::Instant::now()
+            })
+        };
+        let result = prepared
+            .process_chunk_with_external_until(chunk_of(resources), Vec::new(), &flag)
+            .expect("a stop is not an error");
+        let returned = std::time::Instant::now();
+        let set_at = setter.join().expect("setter");
+        let after_flag = returned.saturating_duration_since(set_at);
+        eprintln!("process_chunk_until: returned {after_flag:?} after the flag was set");
+        assert!(
+            result.is_none(),
+            "the chunk finished before the flag was set"
+        );
+        assert!(
+            after_flag < std::time::Duration::from_secs(1),
+            "returned {after_flag:?} after the flag was set"
+        );
     }
 }

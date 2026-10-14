@@ -1,11 +1,17 @@
 //! `ExportJobController` trait and associated types.
 
+use std::sync::Arc;
+
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_persistence::tenant::TenantContext;
 use serde_json::Value;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+
+use super::in_memory::JobFailure;
 
 /// Opaque identifier for an export job.
 pub type JobId = String;
@@ -230,6 +236,168 @@ impl JobStatus {
     }
 }
 
+/// One export job's status and its cancellation token, as the job's worker and
+/// the controller see them (#1864).
+///
+/// **Contract:** every transition out of [`JobStatus::Running`] (a cancel, a
+/// failure, a completion) goes through this handle and fires
+/// [`token`](Self::token), so whatever the job is running stops at once
+/// instead of noticing the new status at its next checkpoint. The worker also
+/// holds a drop guard of the token, so the token fires when the worker ends
+/// for any reason (an early return or a panic included), and removing the job
+/// fires it again, which is idempotent. Each run the job starts gets a child
+/// token of it in its [`RunContext`](helios_persistence::core::sof_runner::RunContext),
+/// so one run's stop never stops the job.
+///
+/// A worker receives its handle from the controller's `submit`; any other
+/// caller obtains one through [`ExportJobController::job_handle`], which is
+/// tenant-checked.
+#[derive(Clone)]
+pub struct JobHandle {
+    jobs: Arc<DashMap<JobId, JobStatus>>,
+    job_id: JobId,
+    token: CancellationToken,
+}
+
+impl std::fmt::Debug for JobHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobHandle")
+            .field("job_id", &self.job_id)
+            .field("cancelled", &self.token.is_cancelled())
+            .finish()
+    }
+}
+
+impl JobHandle {
+    /// The handle of `job_id`, whose status lives in `jobs`.
+    pub(crate) fn new(
+        jobs: Arc<DashMap<JobId, JobStatus>>,
+        job_id: JobId,
+        token: CancellationToken,
+    ) -> Self {
+        Self {
+            jobs,
+            job_id,
+            token,
+        }
+    }
+
+    /// The job's id.
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    /// The job's cancellation token. It fires on every transition out of
+    /// `Running`, when the worker ends, and when the job is removed.
+    pub fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    /// Whether the job is still `Running`. A cancelled, finished or removed
+    /// job is not.
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.jobs.get(&self.job_id).as_deref(),
+            Some(JobStatus::Running { .. })
+        )
+    }
+
+    /// The job's current status, or `None` once it was removed.
+    pub fn status(&self) -> Option<JobStatus> {
+        self.jobs.get(&self.job_id).map(|entry| entry.clone())
+    }
+
+    /// Cancels the job: a `Running` job becomes [`JobStatus::Cancelled`] and
+    /// its token fires. Returns whether this call moved the job; a job that
+    /// already finished (or was removed) is left untouched.
+    pub fn cancel(&self) -> bool {
+        self.transition_if_running(|_| JobStatus::Cancelled {
+            cancelled_at: Utc::now(),
+        })
+    }
+
+    /// Records the job's failure: a `Running` job becomes
+    /// [`JobStatus::Failed`] with the subject it was writing, and its token
+    /// fires. Returns whether this call moved the job.
+    pub(crate) fn fail(&self, failure: JobFailure) -> bool {
+        self.transition_if_running(|running| failure.into_status(&self.job_id, running))
+    }
+
+    /// Records the job's completion with `files`: a `Running` job becomes
+    /// [`JobStatus::Completed`] and its token fires. Returns whether this call
+    /// moved the job; a job cancelled in the meantime stays cancelled.
+    pub(crate) fn complete(
+        &self,
+        files: Vec<CompletedFile>,
+        completed_at: DateTime<Utc>,
+        format: String,
+        client_tracking_id: Option<String>,
+    ) -> bool {
+        self.transition_if_running(|running| JobStatus::Completed {
+            files,
+            submitted_at: running_submitted_at(running),
+            completed_at,
+            format,
+            client_tracking_id,
+        })
+    }
+
+    /// Records progress of a `Running` job (the job stays `Running`, its token
+    /// does not fire). A job that is no longer `Running` is left untouched.
+    pub(crate) fn record_progress(
+        &self,
+        subjects_done: u32,
+        subjects_total: u32,
+        current_subject: Option<&str>,
+    ) {
+        if let Some(mut entry) = self.jobs.get_mut(&self.job_id) {
+            if let JobStatus::Running { submitted_at, .. } = &*entry {
+                let submitted_at = *submitted_at;
+                *entry = JobStatus::Running {
+                    subjects_done,
+                    subjects_total,
+                    current_subject: current_subject.map(str::to_string),
+                    submitted_at,
+                };
+            }
+        }
+    }
+
+    /// The single transition out of `Running`: replaces a `Running` status
+    /// with `next(&running)` and fires the token. A job that is no longer
+    /// `Running` keeps its status (a cancelled job is never resurrected), and
+    /// the call returns `false`.
+    fn transition_if_running(&self, next: impl FnOnce(&JobStatus) -> JobStatus) -> bool {
+        let moved = match self.jobs.get_mut(&self.job_id) {
+            Some(mut entry) if matches!(&*entry, JobStatus::Running { .. }) => {
+                let status = next(&entry);
+                debug_assert!(
+                    !matches!(status, JobStatus::Running { .. }),
+                    "a transition leaves Running"
+                );
+                *entry = status;
+                true
+            }
+            _ => false,
+        };
+        // Fired after the map entry is released: whatever wakes on the token
+        // may read the status.
+        if moved {
+            self.token.cancel();
+        }
+        moved
+    }
+}
+
+/// The submission time a `Running` status carries (`Utc::now()` for any other
+/// status, which a transition never sees).
+fn running_submitted_at(status: &JobStatus) -> DateTime<Utc> {
+    match status {
+        JobStatus::Running { submitted_at, .. } => *submitted_at,
+        _ => Utc::now(),
+    }
+}
+
 /// Errors returned by export operations.
 #[derive(Debug, Error)]
 pub enum ExportError {
@@ -330,4 +498,17 @@ pub trait ExportJobController: Send + Sync + 'static {
         job_id: &str,
         filename: &str,
     ) -> Option<String>;
+
+    /// Returns the [`JobHandle`] of the given job (its status and its
+    /// cancellation token), or `None` if the job ID is unknown OR if
+    /// `tenant_id` does not match the tenant that submitted the job.
+    ///
+    /// The default returns `None`: a controller that does not run its jobs
+    /// through handles exposes none. A controller that does MUST fire the
+    /// handle's token on every transition of the job out of `Running` (see
+    /// [`JobHandle`]).
+    fn job_handle(&self, tenant_id: &str, job_id: &str) -> Option<JobHandle> {
+        let _ = (tenant_id, job_id);
+        None
+    }
 }

@@ -980,11 +980,14 @@ where
             .into_response()),
 
         // Failed export → the failure's own status (the 4xx `$sql-run` gives
-        // a request's fault such as a row limit, 500 for a server fault) with
-        // an OperationOutcome body explaining it. `issue[0].expression` names
-        // the subject that failed by its output name (#1800); that is the
-        // client's own input, so it is there even when a server fault's
-        // `diagnostics` are generic.
+        // a request's fault such as a row limit, 503 for an unavailable
+        // backend, 504 for a job past its budget, 500 for a server fault)
+        // with an OperationOutcome body explaining it. `issue[0].expression`
+        // names the subject that failed by its output name (#1800); that is
+        // the client's own input, so it is there even when a server fault's
+        // `diagnostics` are generic. A 503 carries the same `Retry-After`
+        // every other 503 does (#1864), since a transient failure is worth
+        // retrying.
         Some(JobStatus::Failed {
             message,
             status,
@@ -1000,11 +1003,18 @@ where
             if let Some(name) = subject {
                 issue["expression"] = json!([name]);
             }
-            Ok((
+            let mut response = (
                 status,
                 axum::Json(json!({"resourceType": "OperationOutcome", "issue": [issue]})),
             )
-                .into_response())
+                .into_response();
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                response.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from_static(crate::error::SERVICE_UNAVAILABLE_RETRY_AFTER_SECS),
+                );
+            }
+            Ok(response)
         }
 
         // Successful export → `200 OK` with the manifest `Parameters` resource.
@@ -1404,12 +1414,17 @@ fn collect_body_refs(params: Option<&Vec<Value>>, name: &str) -> Result<Vec<Stri
     Ok(refs)
 }
 
-/// Validates the `patient` and `group` inputs. A value the runner cannot act
-/// on (an absolute URL, `urn:uuid:`, a reference to the other type, a
-/// versioned or contained reference, an empty id) is a 400 OperationOutcome
-/// naming the parameter (#1701). Shapes are checked for every value first;
-/// only then is existence checked, and a usable reference to a resource the
-/// server cannot find is a 404 listing the missing references.
+/// Validates the `patient` and `group` inputs with the shared rule
+/// ([`super::patient_group_refs`]); the values were already bounded by
+/// [`merge_export_inputs`]. A value the runner cannot act on (an absolute URL,
+/// `urn:uuid:`, a reference to the other type, a versioned or contained
+/// reference, an empty id) is a 400 OperationOutcome naming the parameter
+/// (#1701). Shapes are checked for every value first; only then is existence
+/// checked, and a usable reference to a resource that does not exist, or was
+/// deleted, is a 404 `not-found` listing the missing references (#1864: a
+/// deleted target used to be a 500). An existence read that fails for another
+/// reason maps through `RestError::from(StorageError)` (503 with
+/// `Retry-After`, 504), never a blanket 500.
 async fn validate_patient_group_refs<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -1418,55 +1433,34 @@ async fn validate_patient_group_refs<S>(
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
-    let params: [(&str, &str, &Vec<String>); 2] = [
-        ("patient", "Patient", &inputs.patient),
-        ("group", "Group", &inputs.group),
-    ];
-
-    for (param, resource_type, refs) in params {
-        for reference in refs {
-            if compartment_ref_id(reference, resource_type).is_none() {
-                return Ok(Some(
-                    (
-                        StatusCode::BAD_REQUEST,
-                        axum::Json(json!({
-                            "resourceType": "OperationOutcome",
-                            "issue": [{
-                                "severity": "error",
-                                "code": "invalid",
-                                "diagnostics": format!(
-                                    "`{param}` value '{reference}' is not a reference this \
-                                     server can resolve; use a relative `{resource_type}/{{id}}` reference"
-                                ),
-                                "expression": [param]
-                            }]
-                        })),
-                    )
-                        .into_response(),
-                ));
-            }
-        }
+    if let Err(error) =
+        helios_sof::params::check_patient_group_shapes(&inputs.patient, &inputs.group)
+    {
+        let param = error.param;
+        return Ok(Some(
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "severity": "error",
+                        "code": "invalid",
+                        "diagnostics": error.message,
+                        "expression": [param]
+                    }]
+                })),
+            )
+                .into_response(),
+        ));
     }
 
-    let mut missing: Vec<String> = Vec::new();
-    for (_, resource_type, refs) in params {
-        for reference in refs {
-            let Some(id) = compartment_ref_id(reference, resource_type) else {
-                continue;
-            };
-            let exists = state
-                .storage()
-                .read(tenant.context(), resource_type, id)
-                .await
-                .map_err(|e| RestError::InternalError {
-                    message: format!("failed to check {resource_type}/{id}: {e}"),
-                })?
-                .is_some();
-            if !exists {
-                missing.push(reference.clone());
-            }
-        }
-    }
+    let missing = super::patient_group_refs::missing_stored_targets(
+        state.storage(),
+        tenant.context(),
+        &inputs.patient,
+        &inputs.group,
+    )
+    .await?;
     if missing.is_empty() {
         return Ok(None);
     }
@@ -1478,36 +1472,12 @@ where
                 "issue": [{
                     "severity": "error",
                     "code": "not-found",
-                    "diagnostics": format!(
-                        "one or more patient/group references could not be resolved: {}",
-                        missing.join(", ")
-                    )
+                    "diagnostics": super::patient_group_refs::missing_references_message(&missing)
                 }]
             })),
         )
             .into_response(),
     ))
-}
-
-/// The id a `patient`/`group` value names when the runner can act on it, i.e.
-/// a relative `{resource_type}/{id}` reference or a bare `{id}`. `None` for
-/// anything else: an absolute URL, a `urn:uuid:`, a reference to another
-/// type, a versioned or contained reference, an empty id.
-///
-/// The check is structural, not the FHIR id grammar: the server does not
-/// enforce that grammar on create/PUT, so an id such as `p_1` can exist and
-/// the runner can act on it. The id must be non-empty and free of `/`, `:`,
-/// `#`, `?`, whitespace and control characters.
-fn compartment_ref_id<'a>(reference: &'a str, resource_type: &str) -> Option<&'a str> {
-    let id = reference
-        .strip_prefix(resource_type)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .unwrap_or(reference);
-    let valid = !id.is_empty()
-        && !id.chars().any(|c| {
-            matches!(c, '/' | ':' | '#' | '?') || c.is_ascii_whitespace() || c.is_ascii_control()
-        });
-    valid.then_some(id)
 }
 
 /// Splits a comma-separated query value into trimmed, non-empty refs.
@@ -1524,20 +1494,168 @@ fn split_refs(v: Option<&str>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_body_refs, compartment_ref_id};
+    use super::collect_body_refs;
     use serde_json::json;
 
-    #[test]
-    fn compartment_ref_id_accepts_relative_and_bare_ids() {
-        assert_eq!(compartment_ref_id("Patient/p1", "Patient"), Some("p1"));
-        assert_eq!(compartment_ref_id("p1", "Patient"), Some("p1"));
-        assert_eq!(compartment_ref_id("Group/g-1.a", "Group"), Some("g-1.a"));
-        assert_eq!(compartment_ref_id("Patient/p_1", "Patient"), Some("p_1"));
-        let long = "a".repeat(65);
-        assert_eq!(
-            compartment_ref_id(long.as_str(), "Patient"),
-            Some(long.as_str())
+    /// #1864 (R-k, council S10): a job that failed because the backend was
+    /// unavailable, at the start of its run or mid-stream, is answered at its
+    /// result URL with `503`, code `transient`, generic diagnostics, and the
+    /// `Retry-After` every other `503` carries.
+    #[tokio::test]
+    async fn a_failed_export_with_unavailable_answers_503_with_retry_after() {
+        use crate::export::{InMemoryController, InMemorySink};
+        use async_trait::async_trait;
+        use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::core::sof_runner::{
+            RunContext, RunOutput, RunRequest, SofError, SofRunner,
+        };
+        use helios_persistence::tenant::TenantContext;
+        use std::sync::Arc;
+
+        /// The backend is unavailable: at the start of every run, or after
+        /// one row.
+        struct UnavailableRunner {
+            at_start: bool,
+        }
+
+        #[async_trait]
+        impl SofRunner for UnavailableRunner {
+            async fn run_view(
+                &self,
+                _tenant: &TenantContext,
+                _request: RunRequest,
+                _ctx: RunContext,
+            ) -> Result<RunOutput, SofError> {
+                let unavailable = || SofError::Unavailable {
+                    message: "connection pool exhausted on db-7".to_string(),
+                };
+                if self.at_start {
+                    return Err(unavailable());
+                }
+                let rows = vec![Ok(json!({"id": "p1"})), Err(unavailable())];
+                Ok(RunOutput::from_rows(Box::pin(futures::stream::iter(rows))))
+            }
+
+            fn runner_name(&self) -> &'static str {
+                "unavailable-test-runner"
+            }
+        }
+
+        let tenant = (
+            HeaderName::from_static("x-tenant-id"),
+            HeaderValue::from_static("t1"),
         );
+        for (cell, at_start) in [("startup", true), ("mid-stream", false)] {
+            let backend = SqliteBackend::with_config(":memory:", Default::default()).unwrap();
+            backend.init_schema().unwrap();
+            let controller = InMemoryController::with_shard_rows(
+                Arc::new(UnavailableRunner { at_start }),
+                InMemorySink::new("http://localhost"),
+                None,
+                Some(1),
+            );
+            let config = crate::config::ServerConfig {
+                base_url: "http://localhost".to_string(),
+                ..crate::config::ServerConfig::for_testing()
+            };
+            let state = crate::state::AppState::new(Arc::new(backend), config)
+                .with_export_controller(Arc::new(controller));
+            let server =
+                axum_test::TestServer::new(crate::routing::fhir_routes::create_routes(state))
+                    .unwrap();
+
+            let kickoff = server
+                .post("/$sql-export?_format=ndjson")
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("respond-async"),
+                )
+                .add_header(tenant.0.clone(), tenant.1.clone())
+                .json(&json!({
+                    "resourceType": "ViewDefinition",
+                    "name": "patients",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }))
+                .await;
+            assert_eq!(
+                kickoff.status_code(),
+                StatusCode::ACCEPTED,
+                "{cell}: {}",
+                kickoff.text()
+            );
+            let status_url = kickoff
+                .headers()
+                .get(header::CONTENT_LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("content-location")
+                .to_string();
+            let status_path = status_url
+                .strip_prefix("http://localhost")
+                .unwrap_or(&status_url)
+                .to_string();
+
+            let mut result_path = None;
+            for _ in 0..300 {
+                let poll = server
+                    .get(&status_path)
+                    .add_header(tenant.0.clone(), tenant.1.clone())
+                    .await;
+                if poll.status_code() == StatusCode::SEE_OTHER {
+                    let location = poll.headers()[header::LOCATION]
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    result_path = Some(
+                        location
+                            .strip_prefix("http://localhost")
+                            .unwrap_or(&location)
+                            .to_string(),
+                    );
+                    break;
+                }
+                assert_eq!(
+                    poll.status_code(),
+                    StatusCode::ACCEPTED,
+                    "{cell}: {}",
+                    poll.text()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let result_path = result_path.expect("the job must finish");
+            let result = server
+                .get(&result_path)
+                .add_header(tenant.0.clone(), tenant.1.clone())
+                .await;
+            assert_eq!(
+                result.status_code(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{cell}: {}",
+                result.text()
+            );
+            assert_eq!(
+                result
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                Some(crate::error::SERVICE_UNAVAILABLE_RETRY_AFTER_SECS),
+                "{cell}"
+            );
+            let outcome: serde_json::Value = result.json();
+            assert_eq!(outcome["issue"][0]["code"], "transient", "{cell}");
+            let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap();
+            assert!(
+                !diagnostics.contains("db-7") && !diagnostics.contains("pool exhausted"),
+                "{cell}: the backend detail stays in the log: {diagnostics}"
+            );
+            assert_eq!(
+                outcome["issue"][0]["expression"],
+                json!(["patients"]),
+                "{cell}"
+            );
+        }
     }
 
     #[test]
@@ -1561,26 +1679,5 @@ mod tests {
             vec!["Patient/p1".to_string()]
         );
         assert!(collect_body_refs(None, "patient").unwrap().is_empty());
-    }
-
-    #[test]
-    fn compartment_ref_id_rejects_unusable_references() {
-        for (reference, resource_type) in [
-            ("http://example.org/fhir/Patient/p1", "Patient"),
-            ("urn:uuid:0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60", "Patient"),
-            ("Group/g1", "Patient"),
-            ("Patient/p1", "Group"),
-            ("Patient/p1/_history/2", "Patient"),
-            ("Patient/", "Patient"),
-            ("", "Patient"),
-            ("#p1", "Patient"),
-            (" Patient/p1", "Patient"),
-        ] {
-            assert_eq!(
-                compartment_ref_id(reference, resource_type),
-                None,
-                "{reference:?} must be rejected for {resource_type}"
-            );
-        }
     }
 }

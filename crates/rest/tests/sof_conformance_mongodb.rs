@@ -21,6 +21,10 @@
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
+/// The shared column-order fixtures and runner checkers (#1864 A2/A3).
+#[path = "../../persistence/tests/common/sof_prefix_matrix.rs"]
+mod sof_prefix_matrix;
+
 mod sof_conformance_mongodb_tests {
     use axum::http::{HeaderName, HeaderValue};
     use axum_test::TestServer;
@@ -116,6 +120,8 @@ mod sof_conformance_mongodb_tests {
         view: Value,
         expect: Option<Vec<Value>>,
         expect_error: bool,
+        /// The fixture's `expectColumns`: every row's keys, in this order.
+        expect_columns: Option<Vec<String>>,
     }
 
     #[derive(Debug)]
@@ -157,6 +163,11 @@ mod sof_conformance_mongodb_tests {
                     view: t["view"].clone(),
                     expect: t.get("expect").and_then(|e| e.as_array()).cloned(),
                     expect_error: t["expectError"].as_bool().unwrap_or(false),
+                    expect_columns: t.get("expectColumns").and_then(|c| c.as_array()).map(|c| {
+                        c.iter()
+                            .filter_map(|n| n.as_str().map(str::to_string))
+                            .collect()
+                    }),
                 })
                 .collect();
             fixtures.push(Fixture {
@@ -325,15 +336,16 @@ mod sof_conformance_mongodb_tests {
         Fail(String),
     }
 
-    /// Runs one fixture test against the server and classifies the result.
-    /// Panics from `axum-test` (mid-stream runtime errors) propagate to the
-    /// caller's `catch_unwind`.
+    /// Runs one fixture test against the server and classifies the result,
+    /// plus an `expectColumns` key-order mismatch, if any (#1864). Panics from
+    /// `axum-test` (mid-stream runtime errors) propagate to the caller's
+    /// `catch_unwind`.
     async fn evaluate_test(
         server: &TestServer,
         tenant_id: &str,
         view_body: &Value,
         test: &TestCase,
-    ) -> Outcome {
+    ) -> (Outcome, Option<String>) {
         let resp = server
             .post("/$sql-run?_format=ndjson")
             .add_header(X_TENANT_ID, HeaderValue::from_str(tenant_id).unwrap())
@@ -347,19 +359,34 @@ mod sof_conformance_mongodb_tests {
         let status = resp.status_code();
 
         if test.expect_error {
-            return if status.is_success() {
+            let outcome = if status.is_success() {
                 Outcome::Fail(format!("expected error but got {status}"))
             } else {
                 Outcome::Pass(format!(" (expected error, got {status})"))
             };
+            return (outcome, None);
         }
 
         if !status.is_success() {
-            return Outcome::Fail(format!("unexpected HTTP {status}: {}", resp.text()));
+            return (
+                Outcome::Fail(format!("unexpected HTTP {status}: {}", resp.text())),
+                None,
+            );
         }
 
-        let actual = parse_ndjson(&resp.text());
-        match &test.expect {
+        let body = resp.text();
+        let actual = parse_ndjson(&body);
+        // Key order needs the rows as parsed (`serde_json` keeps insertion
+        // order), not the `BTreeMap`s the row comparison uses.
+        let column_order = test.expect_columns.as_ref().and_then(|columns| {
+            let rows: Vec<Value> = body
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).expect("valid NDJSON row"))
+                .collect();
+            column_order_mismatch(&rows, columns)
+        });
+        let outcome = match &test.expect {
             Some(expected) => match compare_rows(&actual, expected) {
                 None => Outcome::Pass(String::new()),
                 Some(mismatch) => Outcome::Fail(format!(
@@ -367,7 +394,20 @@ mod sof_conformance_mongodb_tests {
                 )),
             },
             None => Outcome::Pass(" (no assertion)".to_string()),
-        }
+        };
+        (outcome, column_order)
+    }
+
+    /// The first row whose keys are not exactly `columns`, in that order.
+    fn column_order_mismatch(rows: &[Value], columns: &[String]) -> Option<String> {
+        rows.iter().find_map(|row| {
+            let keys: Vec<&str> = row
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            (keys != columns.iter().map(String::as_str).collect::<Vec<_>>())
+                .then(|| format!("row keys {keys:?}, expected {columns:?}"))
+        })
     }
 
     // =========================================================================
@@ -384,6 +424,7 @@ mod sof_conformance_mongodb_tests {
         let mut failed = 0usize;
         let mut skipped = 0usize;
         let mut failure_msgs: Vec<String> = Vec::new();
+        let mut column_order_failures: Vec<String> = Vec::new();
 
         for fixture in &fixtures {
             let (tenant, tenant_id) = unique_tenant();
@@ -405,13 +446,22 @@ mod sof_conformance_mongodb_tests {
                 // request is evaluated under `catch_unwind` and a panic is
                 // recorded as a failure rather than aborting the whole suite.
                 let view_body = normalise_view(&test.view);
-                let outcome =
+                let (outcome, column_order) =
                     AssertUnwindSafe(evaluate_test(&server, &tenant_id, &view_body, test))
                         .catch_unwind()
                         .await
                         .unwrap_or_else(|_| {
-                            Outcome::Fail("request panicked (mid-stream runtime error)".to_string())
+                            (
+                                Outcome::Fail(
+                                    "request panicked (mid-stream runtime error)".to_string(),
+                                ),
+                                None,
+                            )
                         });
+                if let Some(mismatch) = column_order {
+                    eprintln!("  COLUMN-ORDER  {key}: {mismatch}");
+                    column_order_failures.push(format!("{key}: {mismatch}"));
+                }
 
                 match outcome {
                     Outcome::Pass(note) => {
@@ -442,5 +492,39 @@ mod sof_conformance_mongodb_tests {
              Failures:\n  {}",
             failure_msgs.join("\n  "),
         );
+
+        // `expectColumns` (#1864): every row's keys follow ViewDefinition
+        // document order, which puts a `select` after a `unionAll` after the
+        // `unionAll` columns. Checked apart from the pass floor so a key-order
+        // regression fails even while the rows themselves still match.
+        assert!(
+            column_order_failures.is_empty(),
+            "expectColumns key order differs from ViewDefinition document order:\n  {}",
+            column_order_failures.join("\n  "),
+        );
+    }
+
+    /// #1864 A2, MongoDB cell: the declared schema is ViewDefinition document
+    /// order and every row's keys follow it, including a `select` after a
+    /// `unionAll` (`sof_prefix_matrix::schema_order_views`). The pipeline has
+    /// no total row order, so the A3 row-sequence cell is SQLite/PostgreSQL
+    /// only; MongoDB's key order is also pinned by `expectColumns` above.
+    #[tokio::test]
+    async fn view_schema_matches_row_keys_in_document_order() {
+        use super::sof_prefix_matrix as matrix;
+        let backend = create_backend().await;
+        let (tenant, _id) = unique_tenant();
+        seed_resources(
+            &backend,
+            &tenant,
+            &matrix::union_first_sibling_after_resources(),
+        )
+        .await;
+        matrix::assert_view_schema_matches_row_keys(
+            backend.sof_runner().unwrap().as_ref(),
+            &tenant,
+            "mongodb",
+        )
+        .await;
     }
 }

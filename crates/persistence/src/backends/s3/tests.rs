@@ -670,7 +670,7 @@ fn configured_fhir_version_controls_sof_compartment() {
         .build()
         .expect("test runtime")
         .block_on(async {
-            use crate::core::sof_runner::ViewFilters;
+            use crate::core::sof_runner::{RunContext, RunKind, RunRequest, ViewFilters};
 
             for version in [FhirVersion::R4, FhirVersion::R5] {
                 let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])))
@@ -696,8 +696,8 @@ fn configured_fhir_version_controls_sof_compartment() {
                 let view = json!({"resourceType":"ViewDefinition", "resource":"Task", "status":"active",
                     "select":[{"column":[{"path":"id", "name":"task_id"}]}]});
                 let unfiltered = runner
-                    .run_view(&tenant, view.clone(), ViewFilters::default())
-                    .await
+                    .run_view(&tenant, RunRequest::new(view.clone(), ViewFilters::default()), RunContext::detached(RunKind::Preview))
+                    .await.map(|output| output.rows)
                     .expect("run unfiltered view")
                     .collect::<Vec<_>>()
                     .await;
@@ -706,15 +706,11 @@ fn configured_fhir_version_controls_sof_compartment() {
                     row.expect("unfiltered row");
                 }
                 let mut stream = runner
-                    .run_view(
-                        &tenant,
-                        view,
-                        ViewFilters {
+                    .run_view(&tenant, RunRequest::new(view, ViewFilters {
                             patient: vec!["Patient/p1".into()],
                             ..Default::default()
-                        },
-                    )
-                    .await
+                        }), RunContext::detached(RunKind::Preview))
+                    .await.map(|output| output.rows)
                     .expect("run filtered view");
                 let mut ids = Vec::new();
                 while let Some(row) = stream.next().await {
@@ -732,6 +728,201 @@ fn configured_fhir_version_controls_sof_compartment() {
                 }
             }
         });
+}
+
+/// Patients written through the backend for the in-process cancellation
+/// tests: well over what the run reads ahead (the resource channel, the
+/// engine's batch and its lookahead), so a stopped scan visibly leaves most
+/// of the type unread.
+#[cfg(feature = "R4")]
+const SOF_CANCEL_PATIENTS: usize = 10_000;
+
+/// Seeds [`SOF_CANCEL_PATIENTS`] Patients and returns the backend, its mock
+/// and the tenant.
+#[cfg(feature = "R4")]
+async fn sof_cancel_fixture() -> (Arc<MockS3Client>, S3Backend, TenantContext) {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("sof-cancel");
+    for i in 0..SOF_CANCEL_PATIENTS {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}"), "gender": "female"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed patient");
+    }
+    (mock, backend, tenant)
+}
+
+/// Waits until the scan stops reading (no GET for 100 ms, or `wait` passed)
+/// and returns the GETs counted then.
+#[cfg(feature = "R4")]
+async fn settled_get_count(mock: &MockS3Client, wait: std::time::Duration) -> u64 {
+    let started = std::time::Instant::now();
+    let mut last = mock.get_count();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let now = mock.get_count();
+        if now == last || started.elapsed() >= wait {
+            return now;
+        }
+        last = now;
+    }
+}
+
+/// #1864 (A7, in-process column on the CI-safe mock): a cancelled run over
+/// S3 ends `Cancelled` within the bound and stops reading objects; it never
+/// reads the rest of the type.
+#[cfg(feature = "R4")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_in_process_run_stops_reading_s3_once_cancelled() {
+    use crate::core::sof_runner::{RunContext, RunKind, RunRequest, SofError, ViewFilters};
+
+    let (mock, backend, tenant) = sof_cancel_fixture().await;
+    let runner = backend.sof_runner().expect("runner");
+    let view = json!({"resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+        "select": [{"column": [{"name": "id", "path": "id"}]}]});
+    let gets_before = mock.get_count();
+    let ctx = RunContext::detached(RunKind::Preview);
+    let cancel = ctx.cancel.clone();
+    let mut rows = runner
+        .run_view(&tenant, RunRequest::new(view, ViewFilters::default()), ctx)
+        .await
+        .expect("run_view")
+        .rows;
+    rows.next().await.expect("a row").expect("a row");
+    cancel.cancel();
+    let cancelled_at = std::time::Instant::now();
+    let last = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while let Some(item) = rows.next().await {
+            if let Err(e) = item {
+                return Some(e);
+            }
+        }
+        None
+    })
+    .await
+    .expect("the run ends within the bound after the cancel");
+    assert!(
+        matches!(last, Some(SofError::Cancelled)),
+        "expected a Cancelled item, got {last:?}"
+    );
+    let at_end = mock.get_count();
+    let settled = settled_get_count(&mock, std::time::Duration::from_secs(1)).await;
+    eprintln!(
+        "SOF-CANCEL s3 in-process: ended {:?} after the cancel; {} GETs before the end, {} after",
+        cancelled_at.elapsed(),
+        at_end - gets_before,
+        settled - at_end
+    );
+    assert_eq!(settled, at_end, "the scan read objects after the run ended");
+    assert!(
+        settled - gets_before < SOF_CANCEL_PATIENTS as u64,
+        "the stopped run read the whole type"
+    );
+}
+
+/// #1864: dropping the row stream of an in-process run over S3 stops the
+/// scan's reads within the bound.
+#[cfg(feature = "R4")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_an_in_process_run_over_s3_stops_its_reads() {
+    use crate::core::sof_runner::{RunContext, RunKind, RunRequest, ViewFilters};
+
+    let (mock, backend, tenant) = sof_cancel_fixture().await;
+    let runner = backend.sof_runner().expect("runner");
+    let view = json!({"resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+        "select": [{"column": [{"name": "id", "path": "id"}]}]});
+    let gets_before = mock.get_count();
+    let mut rows = runner
+        .run_view(
+            &tenant,
+            RunRequest::new(view, ViewFilters::default()),
+            RunContext::detached(RunKind::Preview),
+        )
+        .await
+        .expect("run_view")
+        .rows;
+    rows.next().await.expect("a row").expect("a row");
+    drop(rows);
+    let settled = settled_get_count(&mock, std::time::Duration::from_secs(1)).await;
+    let after = settled_get_count(&mock, std::time::Duration::from_secs(1)).await;
+    eprintln!(
+        "SOF-CANCEL s3 in-process drop: {} GETs in all",
+        after - gets_before
+    );
+    assert_eq!(after, settled, "the scan kept reading after the drop");
+    assert!(
+        after - gets_before < SOF_CANCEL_PATIENTS as u64,
+        "the dropped run read the whole type"
+    );
+}
+
+/// #1864 N11 (L2-F3): an S3 scan whose LIST is throttled or whose endpoint
+/// is unavailable ends an in-process run with the retryable
+/// `SofError::Unavailable` (503 with `Retry-After`), not a storage fault, and
+/// the run's stream says so in an error item.
+#[cfg(feature = "R4")]
+#[tokio::test]
+async fn an_unavailable_s3_scan_ends_the_run_unavailable() {
+    use crate::core::sof_runner::{RunContext, RunKind, RunRequest, SofError, ViewFilters};
+
+    for (name, failure) in [
+        (
+            "throttled",
+            S3ClientError::Throttled("SlowDown".to_string()),
+        ),
+        (
+            "unavailable",
+            S3ClientError::Unavailable("connection refused".to_string()),
+        ),
+    ] {
+        let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+        let backend = make_prefix_backend(mock.clone());
+        let tenant = tenant("sof-unavailable");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed patient");
+        let prefix = backend
+            .resource_location(&tenant)
+            .await
+            .expect("resource location")
+            .keyspace
+            .resource_type_prefix("Patient");
+        mock.fail_lists_at(&prefix, failure);
+        let runner = backend.sof_runner().expect("runner");
+        let view = json!({"resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"column": [{"name": "id", "path": "id"}]}]});
+        let items = match runner
+            .run_view(
+                &tenant,
+                RunRequest::new(view, ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
+            .await
+        {
+            Ok(output) => output.rows.collect::<Vec<_>>().await,
+            Err(e) => vec![Err(e)],
+        };
+        assert!(
+            matches!(items.last(), Some(Err(SofError::Unavailable { .. }))),
+            "{name}: {items:?}"
+        );
+        assert!(
+            items.iter().all(|item| item.is_err()),
+            "{name}: no row comes from a failed listing: {items:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -8333,5 +8524,248 @@ mod keyspace_layouts {
         let mut expected = ids.clone();
         expected.sort_by_key(|id| (shard_segment(id), id.clone()));
         assert_eq!(seen, expected);
+    }
+}
+
+/// #1864 (A18): `_since` on the S3 (in-process) runner compares the instant S3
+/// stored for the resource, which has nanosecond precision, and is inclusive:
+/// a cutoff equal to that instant keeps the resource. The JSON
+/// `meta.lastUpdated` the scan yields is truncated to milliseconds, so it is
+/// not the instant to compare.
+#[tokio::test]
+async fn since_boundary_table_compares_the_stored_instant() {
+    use crate::core::sof_runner::{RunContext, RunKind, RunRequest, ViewFilters};
+    use chrono::Duration;
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let tenant = tenant("sof-since");
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({"resourceType": "Observation", "id": "o1", "status": "final",
+                "code": {"text": "since"}}),
+            FhirVersion::R4,
+        )
+        .await
+        .expect("seed observation");
+    let s = backend
+        .read(&tenant, "Observation", "o1")
+        .await
+        .expect("read")
+        .expect("stored")
+        .last_modified();
+    assert_ne!(
+        s.timestamp_subsec_nanos() % 1_000_000,
+        0,
+        "the stored instant must be finer than the JSON stamp for this table to mean anything"
+    );
+
+    let runner = backend.clone().sof_runner().expect("runner");
+    let view = json!({"resourceType": "ViewDefinition", "resource": "Observation",
+        "status": "active", "select": [{"column": [{"name": "id", "path": "id"}]}]});
+    let rows: [(&str, DateTime<Utc>, bool); 4] = [
+        ("cutoff equal to the stored instant: kept", s, true),
+        (
+            "cutoff one tick (1 ns) after: dropped",
+            s + Duration::nanoseconds(1),
+            false,
+        ),
+        (
+            "cutoff one tick (1 ns) before: kept",
+            s - Duration::nanoseconds(1),
+            true,
+        ),
+        ("cutoff in the future: empty", s + Duration::days(1), false),
+    ];
+    let mut wrong = Vec::new();
+    for (name, cutoff, expected) in rows {
+        let mut stream = runner
+            .run_view(
+                &tenant,
+                RunRequest::new(
+                    view.clone(),
+                    ViewFilters {
+                        since: Some(cutoff),
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::Preview),
+            )
+            .await
+            .map(|output| output.rows)
+            .expect("run_view");
+        let mut kept = false;
+        while let Some(row) = stream.next().await {
+            kept |= row.expect("row")["id"] == "o1";
+        }
+        eprintln!(
+            "SOF-SINCE s3: stored {} cutoff {} -> kept={kept} (expected {expected}) [{name}]",
+            s.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            cutoff.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        );
+        if kept != expected {
+            wrong.push(format!(
+                "{name}: cutoff {} kept={kept}, expected {expected}",
+                cutoff.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "s3 `_since` boundary table, stored instant {}:\n  {}",
+        s.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        wrong.join("\n  ")
+    );
+}
+
+/// #1864 (A18, R-l; council C1/S7): the export path keeps S3's stored-instant
+/// `_since`. An export job reads through `export_sof_runner(..)` (S3 keeps the
+/// default, its ordinary runner) and `for_export_job()`, whose per-job scan
+/// cache must forward the cutoff to S3's `scan_resources_since` and keep what
+/// it read under that cutoff. A resource whose nanosecond stamp equals the
+/// cutoff is kept on the cache miss and on the cache hit; a later cutoff in the
+/// same job drops it (never a replay of the first cutoff's resources), and a
+/// replay reads no object from S3.
+#[tokio::test]
+async fn export_path_since_keeps_a_resource_at_its_nanosecond_stamp() {
+    use crate::core::ExportRunnerOptions;
+    use crate::core::sof_runner::{RunContext, RunKind, RunRequest, SofRunner, ViewFilters};
+    use chrono::Duration;
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(Arc::clone(&mock));
+    let tenant = tenant("sof-since-export");
+    for id in ["o1", "o2"] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"resourceType": "Observation", "id": id, "status": "final",
+                    "code": {"text": "since"}}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed observation");
+    }
+    let stored = |id: &'static str| {
+        let backend = backend.clone();
+        let tenant = tenant.clone();
+        async move {
+            backend
+                .read(&tenant, "Observation", id)
+                .await
+                .expect("read")
+                .expect("stored")
+                .last_modified()
+        }
+    };
+    let (s1, s2) = (stored("o1").await, stored("o2").await);
+    assert_ne!(
+        s1.timestamp_subsec_nanos() % 1_000_000,
+        0,
+        "the stored instant must be finer than the JSON stamp for this case to mean anything"
+    );
+    assert!(s1 < s2, "o2 is stored after o1");
+
+    let runner = backend
+        .export_sof_runner(&ExportRunnerOptions::default())
+        .expect("S3 keeps the default export runner");
+    let job = runner
+        .for_export_job()
+        .expect("the in-process export job runner");
+    let view = json!({"resourceType": "ViewDefinition", "resource": "Observation",
+        "status": "active", "select": [{"column": [{"name": "id", "path": "id"}]}]});
+    let ids = |job: Arc<dyn SofRunner>, cutoff: DateTime<Utc>| {
+        let view = view.clone();
+        let tenant = tenant.clone();
+        async move {
+            let mut stream = job
+                .run_view(
+                    &tenant,
+                    RunRequest::new(
+                        view,
+                        ViewFilters {
+                            since: Some(cutoff),
+                            ..Default::default()
+                        },
+                    ),
+                    RunContext::detached(RunKind::ExportJob),
+                )
+                .await
+                .map(|output| output.rows)
+                .expect("run_view");
+            let mut ids = Vec::new();
+            while let Some(row) = stream.next().await {
+                ids.push(row.expect("row")["id"].as_str().unwrap().to_string());
+            }
+            ids.sort();
+            ids
+        }
+    };
+
+    // Cache miss: the cutoff equal to o1's nanosecond stamp keeps o1.
+    assert_eq!(ids(Arc::clone(&job), s1).await, ["o1", "o2"]);
+    // Cache hit: the same answer, and no object read from S3.
+    let gets_before = mock.get_count();
+    assert_eq!(ids(Arc::clone(&job), s1).await, ["o1", "o2"]);
+    assert_eq!(mock.get_count(), gets_before, "a replay reads no object");
+    // A second view of the job with another cutoff: its own scan.
+    assert_eq!(
+        ids(Arc::clone(&job), s1 + Duration::nanoseconds(1)).await,
+        ["o2"]
+    );
+    assert_eq!(ids(Arc::clone(&job), s2).await, ["o2"]);
+    assert!(
+        ids(Arc::clone(&job), s2 + Duration::nanoseconds(1))
+            .await
+            .is_empty()
+    );
+    // And the first cutoff still replays its own resources.
+    assert_eq!(ids(job, s1).await, ["o1", "o2"]);
+}
+
+/// #1864 (A19; council C10): on S3 `exists()` treats a deleted resource as
+/// absent (the default maps `read`'s `Gone` to `false`), so the reference
+/// check answers a deleted `patient`/`group` target like a missing one
+/// instead of failing. CI-safe twin of the MinIO reference cells.
+#[tokio::test]
+async fn exists_is_false_for_a_deleted_resource() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let tenant = tenant("sof-refs");
+    for (resource_type, id) in [("Patient", "p1"), ("Group", "g1"), ("Patient", "p2")] {
+        backend
+            .create(
+                &tenant,
+                resource_type,
+                json!({"resourceType": resource_type, "id": id}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+    }
+    backend
+        .delete(&tenant, "Patient", "p1")
+        .await
+        .expect("delete patient");
+    backend
+        .delete(&tenant, "Group", "g1")
+        .await
+        .expect("delete group");
+
+    for (resource_type, id, exists) in [
+        ("Patient", "p1", false),
+        ("Group", "g1", false),
+        ("Patient", "p2", true),
+        ("Patient", "never", false),
+    ] {
+        assert_eq!(
+            backend
+                .exists(&tenant, resource_type, id)
+                .await
+                .expect("exists() never fails for a deleted resource"),
+            exists,
+            "{resource_type}/{id}"
+        );
     }
 }

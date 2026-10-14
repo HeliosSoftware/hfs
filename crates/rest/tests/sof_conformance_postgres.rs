@@ -21,6 +21,13 @@ mod container_cleanup;
 #[path = "common/sof_ordering.rs"]
 mod sof_ordering;
 
+/// The shared column-order fixtures and runner checkers (#1864 A2/A3). Included
+/// directly because `sof_ordering` keeps its own copy of the module private;
+/// the second load of the file is intended.
+#[allow(clippy::duplicate_mod)]
+#[path = "../../persistence/tests/common/sof_prefix_matrix.rs"]
+mod sof_prefix_matrix;
+
 mod sof_conformance_postgres_tests {
     use super::sof_ordering::{self, Comparison, compare_rows, parse_ndjson};
     use axum::http::{HeaderName, HeaderValue};
@@ -166,6 +173,8 @@ mod sof_conformance_postgres_tests {
         view: Value,
         expect: Option<Vec<Value>>,
         expect_error: bool,
+        /// The fixture's `expectColumns`: every row's keys, in this order.
+        expect_columns: Option<Vec<String>>,
     }
 
     #[derive(Debug)]
@@ -207,6 +216,11 @@ mod sof_conformance_postgres_tests {
                     view: t["view"].clone(),
                     expect: t.get("expect").and_then(|e| e.as_array()).cloned(),
                     expect_error: t["expectError"].as_bool().unwrap_or(false),
+                    expect_columns: t.get("expectColumns").and_then(|c| c.as_array()).map(|c| {
+                        c.iter()
+                            .filter_map(|n| n.as_str().map(str::to_string))
+                            .collect()
+                    }),
                 })
                 .collect();
             fixtures.push(Fixture {
@@ -310,6 +324,7 @@ mod sof_conformance_postgres_tests {
         let mut failed = 0usize;
         let mut skipped = 0usize;
         let mut failure_msgs: Vec<String> = Vec::new();
+        let mut column_order_failures: Vec<String> = Vec::new();
 
         for fixture in &fixtures {
             let (tenant, tenant_id) = unique_tenant();
@@ -361,6 +376,12 @@ mod sof_conformance_postgres_tests {
 
                 let body = resp.text();
                 let actual = parse_ndjson(&body);
+                if let Some(columns) = &test.expect_columns
+                    && let Some(mismatch) = column_order_mismatch(&actual, columns)
+                {
+                    eprintln!("  COLUMN-ORDER  {key}: {mismatch}");
+                    column_order_failures.push(format!("{key}: {mismatch}"));
+                }
 
                 if let Some(expected) = &test.expect {
                     match compare_rows(Comparison::Official, &actual, expected) {
@@ -411,6 +432,28 @@ mod sof_conformance_postgres_tests {
              Failures:\n  {}",
             failure_msgs.join("\n  "),
         );
+
+        // `expectColumns` (#1864): every row's keys follow ViewDefinition
+        // document order, which puts a `select` after a `unionAll` after the
+        // `unionAll` columns. Checked apart from the pass floor so a key-order
+        // regression fails even while the rows themselves still match.
+        assert!(
+            column_order_failures.is_empty(),
+            "expectColumns key order differs from ViewDefinition document order:\n  {}",
+            column_order_failures.join("\n  "),
+        );
+    }
+
+    /// The first row whose keys are not exactly `columns`, in that order.
+    fn column_order_mismatch(rows: &[Value], columns: &[String]) -> Option<String> {
+        rows.iter().find_map(|row| {
+            let keys: Vec<&str> = row
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            (keys != columns.iter().map(String::as_str).collect::<Vec<_>>())
+                .then(|| format!("row keys {keys:?}, expected {columns:?}"))
+        })
     }
 
     #[tokio::test]
@@ -501,5 +544,82 @@ mod sof_conformance_postgres_tests {
             sof_ordering::ExportOrder::IdBytes,
         )
         .await;
+    }
+
+    // =========================================================================
+    // Column order (#1864 A2/A3), PostgreSQL cells
+    // =========================================================================
+
+    /// A2: the declared schema is ViewDefinition document order and every
+    /// row's keys follow it (`sof_prefix_matrix::schema_order_views`).
+    #[tokio::test]
+    async fn view_schema_matches_row_keys_in_document_order() {
+        use super::sof_prefix_matrix as matrix;
+        let backend = create_backend().await;
+        let (tenant, _id) = unique_tenant();
+        seed_resources(
+            &backend,
+            &tenant,
+            &matrix::union_first_sibling_after_resources(),
+        )
+        .await;
+        matrix::assert_view_schema_matches_row_keys(
+            backend.sof_runner().unwrap().as_ref(),
+            &tenant,
+            "postgres",
+        )
+        .await;
+    }
+
+    /// A3: a `unionAll` before a sibling `select` keeps the base row sequence
+    /// (the statement's `ORDER BY 1` key, the first branch column) while every
+    /// row's keys are in document order: runner preview and unlimited (one
+    /// statement), the export runner (`for_export_job()`, keyset pages), and
+    /// `$sql-run`.
+    #[tokio::test]
+    async fn union_first_sibling_after_keeps_row_order() {
+        use super::sof_prefix_matrix as matrix;
+        let backend = create_backend().await;
+        let (tenant, id) = unique_tenant();
+        let server = create_test_server(backend.clone()).await;
+        seed_resources(
+            &backend,
+            &tenant,
+            &matrix::union_first_sibling_after_resources(),
+        )
+        .await;
+        let runner = backend.sof_runner().unwrap();
+        assert!(
+            runner.for_export_job().is_some(),
+            "PostgreSQL exports through its keyset-paged runner"
+        );
+        matrix::assert_union_first_sibling_after_keeps_row_order(
+            runner.as_ref(),
+            &tenant,
+            "postgres",
+        )
+        .await;
+        // The same sequence and key order through `$sql-run` (NDJSON).
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_str(&id).unwrap())
+            .add_header(
+                axum::http::HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&matrix::union_first_sibling_after_view())
+            .await;
+        assert!(response.status_code().is_success(), "{}", response.text());
+        let rows = parse_ndjson(&response.text());
+        matrix::assert_ordered(
+            &rows,
+            &matrix::union_first_sibling_after_base_sequence(),
+            "postgres/$sql-run: base row sequence",
+        );
+        matrix::assert_row_keys(
+            &rows,
+            &matrix::UNION_FIRST_DOCUMENT_ORDER,
+            "postgres/$sql-run",
+        );
     }
 }

@@ -496,6 +496,31 @@ fn startup_options(config: &PostgresConfig) -> String {
     )
 }
 
+/// `application_name` of the request-serving pool's connections.
+const APPLICATION_NAME: &str = "hfs";
+
+/// `application_name` of the export pool's connections, so an export
+/// statement is told apart from request traffic in `pg_stat_activity`.
+pub(crate) const EXPORT_APPLICATION_NAME: &str = "hfs-export";
+
+/// The `options` startup parameter every export connection is opened with:
+/// the main pool's [`startup_options`] with the export job budget as the
+/// session `statement_timeout` (capped at PostgreSQL's maximum, `i32::MAX`
+/// ms). It is a backstop: each export statement runs under `SET LOCAL
+/// statement_timeout` from what is left of its job's deadline, so the session
+/// value only applies to a statement sent without one. It still bounds
+/// exports when `HFS_PG_STATEMENT_TIMEOUT_MS=0` turns the main pool's limit
+/// off.
+fn export_startup_options(
+    config: &PostgresConfig,
+    options: &crate::core::ExportRunnerOptions,
+) -> String {
+    startup_options(&PostgresConfig {
+        statement_timeout_ms: options.statement_timeout_ms.min(i32::MAX as u64),
+        ..config.clone()
+    })
+}
+
 impl PostgresBackend {
     /// The capabilities this backend declares.
     ///
@@ -707,7 +732,63 @@ impl PostgresBackend {
         config
     }
 
+    /// Builds the export-only connection pool `$sql-export` jobs read through
+    /// (#1864).
+    ///
+    /// Same server, credentials, TLS mode, `plan_cache_mode` and connect
+    /// timeouts as the main pool, with `options.max_connections` connections
+    /// (at least one), the `hfs-export` application name, and the export job
+    /// budget as the session `statement_timeout` (see
+    /// [`export_startup_options`]). The pool is lazy: building it opens no
+    /// connection, so it costs nothing on a server that never runs an export.
+    /// Its connections come on top of `HFS_PG_MAX_CONNECTIONS`.
+    ///
+    /// Unlike the main pool, a borrower waits for a free connection without a
+    /// time limit (`HFS_PG_POOL_WAIT_TIMEOUT_SECS` does not apply): export
+    /// jobs are background work already bounded by the export concurrency, so
+    /// a job that finds every connection busy (a pool smaller than the job
+    /// concurrency, or a stopped job's connection still being cleaned up)
+    /// queues instead of failing. The SoF runner races that wait against the
+    /// run's cancel token and deadline, so a queued job stays cancellable and
+    /// bounded.
+    ///
+    /// Each call builds a new, independent pool;
+    /// [`ResourceStorage::export_sof_runner`] calls it once per runner.
+    ///
+    /// [`ResourceStorage::export_sof_runner`]: crate::core::ResourceStorage::export_sof_runner
+    pub fn create_export_pool(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> StorageResult<Pool> {
+        Self::build_pool(
+            &self.config,
+            options.max_connections.max(1),
+            None,
+            export_startup_options(&self.config, options),
+            EXPORT_APPLICATION_NAME,
+        )
+    }
+
     fn create_pool(config: &PostgresConfig) -> StorageResult<Pool> {
+        Self::build_pool(
+            config,
+            config.max_connections,
+            Some(Duration::from_secs(config.pool_wait_timeout_secs)),
+            startup_options(config),
+            APPLICATION_NAME,
+        )
+    }
+
+    /// Builds a pool on `config`'s server with `max_connections` connections,
+    /// the startup `options` and `application_name`. `wait` bounds how long a
+    /// borrower waits for a free connection; `None` waits until one is free.
+    fn build_pool(
+        config: &PostgresConfig,
+        max_connections: usize,
+        wait: Option<Duration>,
+        options: String,
+        application_name: &str,
+    ) -> StorageResult<Pool> {
         let mut cfg = Config::new();
         cfg.host = Some(config.host.clone());
         cfg.port = Some(config.port);
@@ -740,9 +821,12 @@ impl PostgresBackend {
         // per-connection and a statement prepared before a `SET` would keep
         // whichever policy was in force when it was first planned. See
         // [`PostgresPlanCacheMode`] for what the default protects.
-        cfg.options = Some(startup_options(config));
+        //
+        // `options` is [`startup_options`] for the main pool and
+        // [`export_startup_options`] for the export pool.
+        cfg.options = Some(options);
         // Makes HFS connections identifiable in pg_stat_activity.
-        cfg.application_name = Some("hfs".to_string());
+        cfg.application_name = Some(application_name.to_string());
 
         let pool = cfg
             .builder(NoTls)
@@ -753,11 +837,13 @@ impl PostgresBackend {
                     source: None,
                 })
             })?
-            .max_size(config.max_connections)
+            .max_size(max_connections)
             // deadpool waits forever by default, so a saturated pool — or a database
             // that accepts TCP but stalls the startup handshake — becomes an
-            // unbounded latency tail. Bound the wait and surface exhaustion as a
-            // fast `Unavailable` (503) instead of a request that hangs for a minute.
+            // unbounded latency tail. The main pool bounds the wait and surfaces
+            // exhaustion as a fast `Unavailable` (503) instead of a request that
+            // hangs for a minute; the export pool passes `None` (see
+            // `create_export_pool`).
             //
             // `create` also bounds the whole of `Manager::create` (DNS + TCP + TLS +
             // auth). Without it, a peer that completes the TCP handshake and then
@@ -765,9 +851,7 @@ impl PostgresBackend {
             // blackhole — hangs the caller forever, since the kernel's SYN-retry only
             // covers failures that never complete the handshake.
             .timeouts(deadpool_postgres::Timeouts {
-                wait: Some(std::time::Duration::from_secs(
-                    config.pool_wait_timeout_secs,
-                )),
+                wait,
                 create: Some(connect_timeout),
                 recycle: Some(connect_timeout),
             })
@@ -1303,12 +1387,24 @@ impl PostgresBackend {
     /// advisory locks, and current-row checks.
     #[doc(hidden)]
     pub async fn get_client(&self) -> StorageResult<deadpool_postgres::Client> {
+        Self::checkout(&self.pool).await
+    }
+
+    /// Checks a connection out of `pool` the way every PostgreSQL caller
+    /// should: a connect that failed before reaching the server is retried
+    /// ([`CONNECT_ATTEMPTS`]), an exhausted pool (the wait timeout elapsed)
+    /// is [`BackendError::Unavailable`], any other failure
+    /// [`BackendError::ConnectionFailed`]; both are retryable (`503`).
+    ///
+    /// Shared by [`Self::get_client`] and the SQL-on-FHIR runner (#1864),
+    /// whose pool is not always the backend's own.
+    pub(crate) async fn checkout(pool: &Pool) -> StorageResult<deadpool_postgres::Client> {
         use deadpool_postgres::{PoolError, TimeoutType};
 
         let _checkout = crate::perf::span(crate::perf::Phase::PostgresPoolCheckout);
         let mut attempt = 1;
         let checked_out = loop {
-            match self.pool.get().await {
+            match pool.get().await {
                 Err(e) if attempt < CONNECT_ATTEMPTS && is_transient_connect_failure(&e) => {
                     tracing::warn!(attempt, error = %e, "retrying a failed PostgreSQL connect");
                     tokio::time::sleep(connect_retry_delay(attempt)).await;
@@ -1963,6 +2059,46 @@ mod tests {
         );
     }
 
+    /// #1864: export connections carry the export job budget as their
+    /// session `statement_timeout` (capped at PostgreSQL's maximum) and keep
+    /// every other main-pool setting; the main pool's packet is untouched.
+    #[test]
+    fn export_connections_carry_the_job_budget_as_their_session_timeout() {
+        let cfg = PostgresConfig {
+            statement_timeout_ms: 45_000,
+            plan_cache_mode: PostgresPlanCacheMode::Auto,
+            ..Default::default()
+        };
+        let options = crate::core::ExportRunnerOptions {
+            max_connections: 2,
+            statement_timeout_ms: 3_600_000,
+        };
+        assert_eq!(
+            export_startup_options(&cfg, &options),
+            "-c statement_timeout=3600000 -c plan_cache_mode=auto"
+        );
+        assert_eq!(
+            startup_options(&cfg),
+            "-c statement_timeout=45000 -c plan_cache_mode=auto"
+        );
+        // The main pool without a limit (`HFS_PG_STATEMENT_TIMEOUT_MS=0`)
+        // leaves exports bounded by their budget.
+        let unlimited = PostgresConfig {
+            statement_timeout_ms: 0,
+            ..cfg.clone()
+        };
+        assert!(export_startup_options(&unlimited, &options).contains("statement_timeout=3600000"));
+        // PostgreSQL rejects a statement_timeout above INT_MAX ms.
+        let huge = crate::core::ExportRunnerOptions {
+            statement_timeout_ms: u64::MAX,
+            ..options
+        };
+        assert!(
+            export_startup_options(&cfg, &huge)
+                .starts_with(&format!("-c statement_timeout={} ", i32::MAX))
+        );
+    }
+
     #[test]
     fn both_settings_ride_in_the_startup_packet() {
         let cfg = PostgresConfig::default();
@@ -2016,5 +2152,103 @@ mod tests {
         unsafe {
             std::env::remove_var("HFS_PG_PLAN_CACHE_MODE");
         }
+    }
+}
+
+/// The export pool against a real PostgreSQL 16 (testcontainers, Docker
+/// required): its connections carry the export settings and do not time out
+/// waiting for a connection, and the main pool's connections keep their own
+/// (#1864).
+#[cfg(test)]
+mod export_pool_integration {
+    use super::*;
+    use crate::core::ExportRunnerOptions;
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    async fn show(client: &deadpool_postgres::Client, guc: &str) -> String {
+        client
+            .query_one(&format!("SHOW {guc}"), &[])
+            .await
+            .unwrap_or_else(|e| panic!("SHOW {guc}: {e}"))
+            .get(0)
+    }
+
+    #[tokio::test]
+    async fn export_pool_connections_carry_the_export_settings() {
+        let container = crate::container_cleanup::with_cleanup_label(
+            Postgres::default().with_tag("16-alpine").with_label(
+                "github.run_id",
+                std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+            ),
+        )
+        .start()
+        .await
+        .expect("start PostgreSQL 16 testcontainer");
+        let config = PostgresConfig {
+            host: container.get_host().await.expect("host").to_string(),
+            port: container.get_host_port_ipv4(5432).await.expect("port"),
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 3,
+            statement_timeout_ms: 45_000,
+            pool_wait_timeout_secs: 1,
+            ..Default::default()
+        };
+        let backend = PostgresBackend::new(config).await.expect("PostgresBackend");
+
+        let options = ExportRunnerOptions {
+            max_connections: 2,
+            statement_timeout_ms: 123_456,
+        };
+        let export_pool = backend.create_export_pool(&options).expect("export pool");
+        assert_eq!(export_pool.status().max_size, 2);
+        // Lazy: building the pool opened no connection.
+        assert_eq!(export_pool.status().size, 0);
+        let client = export_pool.get().await.expect("export connection");
+        assert_eq!(show(&client, "application_name").await, "hfs-export");
+        assert_eq!(show(&client, "statement_timeout").await, "123456ms");
+        assert_eq!(show(&client, "plan_cache_mode").await, "force_custom_plan");
+        drop(client);
+
+        // Every main-pool connection, not only the first, keeps its own
+        // name and timeout while export connections are open.
+        let main_pool = backend.pool();
+        let mut held = Vec::new();
+        for _ in 0..backend.config().max_connections {
+            held.push(main_pool.get().await.expect("main connection"));
+        }
+        for client in &held {
+            assert_eq!(show(client, "application_name").await, "hfs");
+            assert_eq!(show(client, "statement_timeout").await, "45s");
+        }
+        // The main pool, saturated, gives up after its wait timeout.
+        assert!(main_pool.get().await.is_err());
+        drop(held);
+
+        // The export pool does not: with every export connection busy, a
+        // borrower waits past `pool_wait_timeout_secs` (1 s here) and gets
+        // the connection once it is returned.
+        let single = backend
+            .create_export_pool(&ExportRunnerOptions {
+                max_connections: 1,
+                ..ExportRunnerOptions::default()
+            })
+            .expect("export pool");
+        let busy = single.get().await.expect("export connection");
+        let waiter = tokio::spawn({
+            let single = single.clone();
+            async move { single.get().await.map(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(!waiter.is_finished(), "export borrower gave up waiting");
+        drop(busy);
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("export borrower gets the returned connection")
+            .expect("waiter task")
+            .expect("export connection after waiting");
     }
 }

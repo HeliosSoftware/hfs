@@ -46,6 +46,8 @@
 //! - `X-HFS-Runner` — the runner that served a ViewDefinition request (`sqlite-indb`,
 //!   `postgres-indb`, `in-process`). Only sent when `HFS_SOF_RUNNER_HEADER` is on.
 //! - `400 Bad Request` — unsupported `_format`, no subject or more than one, an unparsable `_since`, or a parameter the subject kind does not accept
+//! - `400 Bad Request` with OperationOutcome code `invalid` — a `patient`/`group` value no runner can act on (absolute, `urn:uuid:`, the other type, versioned, contained, empty id), naming the parameter
+//! - `400 Bad Request` with OperationOutcome code `not-found` — a `patient`/`group` reference to a resource that does not exist or was deleted (in storage, or among the supplied `resource` entries); see [`super::patient_group_refs`]
 //! - `404 Not Found` — the subject could not be resolved
 //! - `422 Unprocessable Entity` — the subject could not be compiled or executed. An
 //!   inline `subjectResource` ViewDefinition is linted structurally first (#821):
@@ -65,7 +67,9 @@ use axum::{
 };
 use futures::StreamExt;
 use helios_persistence::core::search::SearchProvider;
-use helios_persistence::core::sof_runner::{SofError, ViewFilters};
+use helios_persistence::core::sof_runner::{
+    RunContext, RunKind, RunRequest, SofError, ViewFilters,
+};
 use helios_sof::columnar_stream::{ArrowIpcStreamWriter, ParquetStreamWriter, STREAM_BATCH_ROWS};
 use helios_sof::fhir_format::{
     FHIR_JSON_MIME, accept_has_mime, accept_requires_unsupported_fhir_xml,
@@ -83,6 +87,9 @@ use helios_sof::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use std::time::Duration;
+use tokio::time::Instant;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, warn};
 
 use super::sqlquery::{SqlQueryRunQuery, run_library_subject};
@@ -93,6 +100,125 @@ use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::handlers::bulk_common::parse_instant_param;
 use crate::state::AppState;
+
+/// The stop of one `$sql-run` request (#1864).
+///
+/// Every run the request starts gets a child of the request's token in its
+/// [`RunContext`]. The guard fires the token when the request is abandoned:
+/// it lives in the handler future, so a client that closes its connection
+/// before the response (the server drops the handler future) or a `408` from
+/// the `TimeoutLayer` fires it; a streamed response (NDJSON, Parquet, Arrow
+/// IPC) moves it into the body ([`channel_body_response`]), so a client that
+/// goes away mid-stream fires it too. The runners then stop their database work (a PostgreSQL cancel
+/// request, a SQLite interrupt, a MongoDB `killOp`, the in-process stop flag)
+/// instead of waiting until they next try to hand over a row.
+///
+/// A request that ends normally fires the token as well, once its runs have
+/// ended, which stops nothing.
+///
+/// It also carries the request's deadlines ([`RunBudgets`]), counted from the
+/// moment the request was taken: every run of the request gets an absolute
+/// deadline in its [`RunContext`], so a run that cannot finish in time ends
+/// as a timeout (`504`) instead of running on after the response is lost.
+pub(crate) struct RequestStop {
+    token: CancellationToken,
+    guard: DropGuard,
+    started: Instant,
+    budgets: RunBudgets,
+}
+
+/// The time budgets of the runs of one `$sql-run` request (#1864, D-1b, D-5).
+///
+/// - a response the server sends only once it has every row (a preview with
+///   `_limit`, any buffered format, a SQL Query and its dependencies) must be
+///   ready before the request timeout answers `408`: `buffered` is
+///   `HFS_REQUEST_TIMEOUT` minus a margin
+///   ([`ServerConfig::sof_buffered_budget`]), capped by `run`;
+/// - a streamed run without `_limit` (NDJSON, Parquet or Arrow IPC without the
+///   `Binary` envelope) sends its head as soon as its first rows are in (NDJSON
+///   at once, Parquet/Arrow after the first batch or the schema-sampling
+///   prefix), so the request timeout no longer applies once the body is
+///   streaming: `run` (`HFS_SOF_RUN_TIMEOUT_SECS`).
+///
+/// A SQL Query's dependency runs share the request's deadline (D-5); the
+/// per-statement `HFS_SOF_SQLQUERY_TIMEOUT_SECS` is capped by it in the
+/// engine supervisor.
+///
+/// [`ServerConfig::sof_buffered_budget`]: crate::config::ServerConfig::sof_buffered_budget
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunBudgets {
+    /// The bound of a response sent only once every row is in.
+    pub(crate) buffered: Duration,
+    /// The budget of a streamed run.
+    pub(crate) run: Duration,
+}
+
+impl RunBudgets {
+    /// The budgets `config` sets.
+    pub(crate) fn from_config(config: &crate::config::ServerConfig) -> Self {
+        Self {
+            buffered: config.sof_buffered_budget(),
+            run: config.sof_run_budget(),
+        }
+    }
+
+    /// The budget of one run of `kind`; `streamed` says whether its response
+    /// is sent as the rows arrive.
+    pub(crate) fn for_run(&self, kind: RunKind, streamed: bool) -> Duration {
+        match kind {
+            RunKind::UnlimitedRun if streamed => self.run,
+            // A preview, a buffered unlimited run, and a SQL Query's own
+            // dependencies (its result is sent once complete). An export job
+            // has its own budget and never reaches a request's runs.
+            RunKind::Preview
+            | RunKind::UnlimitedRun
+            | RunKind::SqlQueryDependency
+            | RunKind::ExportJob => self.buffered.min(self.run),
+        }
+    }
+}
+
+impl RequestStop {
+    /// A fresh stop for one request, its budgets counted from now.
+    pub(crate) fn new(budgets: RunBudgets) -> Self {
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+        Self {
+            token,
+            guard,
+            started: Instant::now(),
+            budgets,
+        }
+    }
+
+    /// The context of one run of this request whose response is buffered: a
+    /// child of the request's token, so one run's stop never stops the
+    /// request, and the deadline of its kind ([`RunBudgets::for_run`]).
+    pub(crate) fn run_context(&self, kind: RunKind) -> RunContext {
+        self.context(kind, false)
+    }
+
+    /// [`Self::run_context`] for a run whose response is streamed as the rows
+    /// arrive (NDJSON).
+    pub(crate) fn streamed_run_context(&self, kind: RunKind) -> RunContext {
+        self.context(kind, true)
+    }
+
+    fn context(&self, kind: RunKind, streamed: bool) -> RunContext {
+        RunContext {
+            cancel: self.token.child_token(),
+            deadline: self
+                .started
+                .checked_add(self.budgets.for_run(kind, streamed)),
+            kind,
+        }
+    }
+
+    /// The guard, for a streamed body to hold from now on.
+    fn into_guard(self) -> DropGuard {
+        self.guard
+    }
+}
 
 /// Query-string parameters for `$sql-run`.
 ///
@@ -167,6 +293,9 @@ where
     S: SearchProvider + Send + Sync + 'static,
 {
     let body_value = body.map(|j| j.0);
+    // Lives in this handler future (and moves into a streamed body): dropping
+    // it stops every run this request started.
+    let request_stop = RequestStop::new(RunBudgets::from_config(state.config()));
 
     // Unknown parameter names are deliberately ignored: this handler does
     // not introduce general strict validation. `view` is the pre-ballot
@@ -247,6 +376,7 @@ where
                 tenant,
                 subject.resource,
                 &headers,
+                request_stop,
             )
             .await
         }
@@ -271,6 +401,7 @@ where
                 &headers,
                 subject.resource,
                 filters,
+                request_stop,
             )
             .await
         }
@@ -365,6 +496,7 @@ async fn execute_view<S>(
     tenant: TenantExtractor,
     view_json: Value,
     headers: &HeaderMap,
+    request_stop: RequestStop,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -431,10 +563,13 @@ where
     // safety cap.
     validate_limit(params.limit)?;
 
-    // Bound the effective `patient` plus `group` values (same precedence as
-    // `build_filters`) before they reach the runner or the inline path.
+    // The `patient`/`group` rule (#1864, `patient_group_refs`): bound the
+    // effective values (same precedence as `build_filters`), then check every
+    // value's shape, before they reach the runner or the inline path.
+    // Existence follows per path: among the supplied resources inline, in
+    // storage otherwise.
     let (patient, group) = effective_patient_group(&params, &body_params);
-    super::input_limits::check_patient_group_values(patient.len() + group.len())?;
+    super::patient_group_refs::check_values(&patient, &group)?;
 
     if !body_params.inline_resources.is_empty() {
         return execute_view_inline(
@@ -457,6 +592,16 @@ where
         .clone();
     let effective_tenant = tenant.context().clone();
     let filters = build_filters(&params, &body_params)?;
+    // A stored-data run (a stored or inline ViewDefinition): every target
+    // must exist in storage; a missing or deleted one is a 400 `not-found`,
+    // never an empty 200 (SQL runners) or a 422 (in-process).
+    super::patient_group_refs::check_stored_targets(
+        state.storage(),
+        &effective_tenant,
+        &filters.patient,
+        &filters.group,
+    )
+    .await?;
 
     debug!(
         runner = runner.runner_name(),
@@ -472,12 +617,39 @@ where
 
     let parquet_options = parquet_options_from_params(&body_params)?;
 
+    let kind = if filters.limit.is_some() {
+        RunKind::Preview
+    } else {
+        RunKind::UnlimitedRun
+    };
+    // NDJSON, Parquet and Arrow IPC are streamed (below) unless they must be
+    // wrapped in a `Binary` envelope; every other format is sent once
+    // complete. The run's deadline follows (`RunBudgets`): a streamed body is
+    // sent as the rows arrive, so the request timeout no longer bounds it.
+    let streamed = matches!(
+        content_type,
+        Some(ContentType::NdJson | ContentType::Parquet | ContentType::ArrowIpc)
+    ) && !wants_envelope;
+    let run_context = |request_stop: &RequestStop| {
+        if streamed {
+            request_stop.streamed_run_context(kind)
+        } else {
+            request_stop.run_context(kind)
+        }
+    };
+
     // Parquet and Arrow IPC: let the runner append database values straight
     // to Arrow builders. A runner without a columnar path answers `None` and
     // the row path below serves the request.
     if let Some(columnar_type @ (ContentType::Parquet | ContentType::ArrowIpc)) = content_type
-        && let Some(batches) =
-            open_columnar(runner.as_ref(), &effective_tenant, &view_json, &filters).await?
+        && let Some(batches) = open_columnar(
+            runner.as_ref(),
+            &effective_tenant,
+            &view_json,
+            &filters,
+            run_context(&request_stop),
+        )
+        .await?
     {
         let options = parquet_options.unwrap_or_default();
         // The envelope needs the whole payload, as on the row path.
@@ -497,14 +669,21 @@ where
             options,
             runner_label,
             &format,
+            request_stop.into_guard(),
         ));
     }
 
     // Probe the runner — surfaces synchronous Uncompilable errors as 422
     // before we start streaming bytes to the client.
+    let ctx = run_context(&request_stop);
     let stream = runner
-        .run_view(&effective_tenant, view_json.clone(), filters.clone())
+        .run_view(
+            &effective_tenant,
+            RunRequest::new(view_json.clone(), filters.clone()),
+            ctx,
+        )
         .await
+        .map(|output| output.rows)
         .map_err(map_sof_error_to_rest)?;
 
     // `_format=fhir`: buffer the rows and render the typed `Parameters`
@@ -526,15 +705,19 @@ where
     // Streaming path for ndjson: forward rows incrementally. An envelope
     // request forfeits streaming — the base64 `Binary` wrapper needs the
     // whole payload — so it falls through to the buffered path.
-    if matches!(content_type, ContentType::NdJson) && !wants_envelope {
-        return Ok(streaming_ndjson_response(stream, runner_label));
+    if streamed && content_type == ContentType::NdJson {
+        return Ok(streaming_ndjson_response(
+            stream,
+            runner_label,
+            request_stop.into_guard(),
+        ));
     }
 
     // Streaming path for parquet and arrow: the schema is fixed from the
     // ViewDefinition's declared types (plus a bounded row prefix) and rows are
     // encoded as they arrive. The envelope forfeits streaming for the same
     // reason as above.
-    if matches!(content_type, ContentType::Parquet | ContentType::ArrowIpc) && !wants_envelope {
+    if streamed {
         return streaming_columnar_response(
             stream,
             content_type,
@@ -542,6 +725,7 @@ where
             parquet_options,
             runner_label,
             &format,
+            request_stop.into_guard(),
         )
         .await;
     }
@@ -584,7 +768,9 @@ struct ColumnarBatches {
     rest: helios_persistence::core::sof_runner::BatchStream,
 }
 
-/// Opens the runner's columnar path for Parquet / Arrow IPC output.
+/// Opens the runner's columnar path for Parquet / Arrow IPC output, under the
+/// request's run context `ctx` (#1864: its cancel token and deadline stop the
+/// run's database work as on the row path).
 ///
 /// Returns `Ok(None)` when the runner has no columnar path for this view, so
 /// the caller falls back to the row path. `Uncompilable` and the like, and an
@@ -597,9 +783,14 @@ async fn open_columnar(
     tenant: &helios_persistence::tenant::TenantContext,
     view_json: &Value,
     filters: &helios_persistence::core::sof_runner::ViewFilters,
+    ctx: RunContext,
 ) -> Result<Option<ColumnarBatches>, RestError> {
     let Some(mut rest) = runner
-        .run_view_columnar(tenant, view_json.clone(), filters.clone())
+        .run_view_columnar(
+            tenant,
+            RunRequest::new(view_json.clone(), filters.clone()),
+            ctx,
+        )
         .await
         .map_err(map_sof_error_to_rest)?
     else {
@@ -667,6 +858,7 @@ fn streaming_batch_response(
     options: ParquetOptions,
     runner_label: Option<&str>,
     format: &str,
+    guard: DropGuard,
 ) -> Response {
     let ColumnarBatches {
         schema,
@@ -703,7 +895,7 @@ fn streaming_batch_response(
         let _ = msg_tx.send(EncodeMsg::End).await;
     });
 
-    columnar_body_response(body_rx, content_type, runner_label, format)
+    columnar_body_response(body_rx, content_type, runner_label, format, guard)
 }
 
 /// Runs the view against inline `resource:` parameters using the in-process
@@ -734,9 +926,9 @@ where
 
     // Patient/group filtering: prefer the multi-valued body entries; fall
     // back to comma-split query values. Spec is `patient` 0..1, `group`
-    // 0..* — pass all references through so the shared filter can union
-    // multiple group memberships once that path is implemented (today the
-    // filter still errors when group_refs is non-empty).
+    // 0..*; every reference is passed through and the shared filter unions
+    // them (a Group contributes its Patient members). Shapes were checked by
+    // the caller (`execute_view`).
     let patient_refs = if !body_params.patient.is_empty() {
         body_params.patient.clone()
     } else {
@@ -748,9 +940,10 @@ where
         split_csv_refs(params.group.as_deref())
     };
 
-    // Per SoF v2 spec: absent `patient` / `group` targets are a hard 400
-    // (mapped from `SofError::ReferencedResourceNotFound` by
-    // `map_sof_lib_error_to_rest`), not a "200 + Warning: 199" path.
+    // Per SoF v2 spec: a target absent from the supplied resources is a hard
+    // 400 with code `not-found` (mapped from
+    // `SofError::ReferencedResourceNotFound` by `map_sof_lib_error_to_rest`),
+    // as sof-server answers, not a "200 + Warning: 199" path.
     if !patient_refs.is_empty() || !group_refs.is_empty() {
         resources = filter_resources_by_patient_and_group(
             resources,
@@ -981,11 +1174,10 @@ fn map_sof_lib_error_to_rest(e: helios_sof::SofError) -> RestError {
         }
         LibErr::UnsupportedContentType(msg) => RestError::BadRequest { message: msg },
         // Per SoF v2 spec error table: a `patient` / `group` reference that
-        // doesn't resolve against the supplied / queryable resources is a
-        // `400 Bad Request`. (No `RestError::NotFound`-with-400 variant
-        // exists, so the OperationOutcome's `code = invalid`; the
-        // 400/spec-status is what matters.)
-        LibErr::ReferencedResourceNotFound(msg) => RestError::BadRequest { message: msg },
+        // doesn't resolve against the supplied resources is a `400 Bad
+        // Request` with OperationOutcome code `not-found` (#1864; it used to
+        // be `invalid`), as sof-server answers.
+        LibErr::ReferencedResourceNotFound(msg) => RestError::ReferenceNotFound { message: msg },
         other => {
             warn!(error = %other, "in-process SOF evaluator error");
             RestError::InternalError {
@@ -999,14 +1191,28 @@ fn map_sof_lib_error_to_rest(e: helios_sof::SofError) -> RestError {
 /// they arrive from the runner. Each row is serialised once and pushed
 /// through an mpsc channel into the response body, so the full result set
 /// never has to be buffered server-side.
+///
+/// The body holds the request's `guard` ([`RequestStop`]): when the server
+/// drops the body (the client went away, or the response ended), the request's
+/// token fires and the run stops its database work at once, even while it has
+/// no row to send. The task that reads the run also stops reading, and drops
+/// the run's stream, as soon as the body is gone.
 fn streaming_ndjson_response(
     mut stream: helios_persistence::core::sof_runner::RowStream,
     runner_label: Option<&str>,
+    guard: DropGuard,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
 
     tokio::spawn(async move {
-        while let Some(row) = futures::StreamExt::next(&mut stream).await {
+        loop {
+            let row = tokio::select! {
+                biased;
+                // Nobody reads the body any more: stop reading the run.
+                () = tx.closed() => break,
+                row = futures::StreamExt::next(&mut stream) => row,
+            };
+            let Some(row) = row else { break };
             let mut buf = match row {
                 Ok(r) => match serde_json::to_vec(&r) {
                     Ok(v) => v,
@@ -1027,7 +1233,18 @@ fn streaming_ndjson_response(
                     // Yield an error into the body so hyper aborts the
                     // chunked transfer (no terminating chunk). Without this
                     // the client sees a cleanly-ended, silently-truncated 200.
-                    warn!(error = %e, "row error while streaming ndjson");
+                    match &e {
+                        SofError::Cancelled => {
+                            debug!("SoF run cancelled while streaming ndjson")
+                        }
+                        SofError::Backend {
+                            sqlstate: Some(code),
+                            ..
+                        } => {
+                            warn!(sqlstate = %code, error = %e, "row error while streaming ndjson")
+                        }
+                        _ => warn!(error = %e, "row error while streaming ndjson"),
+                    }
                     let _ = tx
                         .send(Err(std::io::Error::other(format!(
                             "row error while streaming ndjson: {e}"
@@ -1043,19 +1260,25 @@ fn streaming_ndjson_response(
         }
     });
 
-    channel_body_response(rx, "application/x-ndjson", runner_label)
+    channel_body_response(rx, "application/x-ndjson", runner_label, guard)
 }
 
 /// Wraps a channel of body chunks into a `200` response. An `Err` item aborts
 /// the chunked transfer (no terminating chunk), so the client sees a failed
 /// body instead of a clean but truncated one.
+///
+/// The body holds the request's `guard` ([`RequestStop`]) for as long as it is
+/// sent: when the server drops the body (the client went away, or the
+/// response ended), the request's token fires and the run stops its database
+/// work at once (#1864).
 fn channel_body_response(
     rx: tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::io::Error>>,
     content_type: &'static str,
     runner_label: Option<&str>,
+    guard: DropGuard,
 ) -> Response {
-    let body_stream = futures::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|chunk| (chunk, rx))
+    let body_stream = futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+        rx.recv().await.map(|chunk| (chunk, (rx, guard)))
     });
     let body = axum::body::Body::from_stream(body_stream);
 
@@ -1186,6 +1409,7 @@ async fn streaming_columnar_response(
     parquet_options: Option<ParquetOptions>,
     runner_label: Option<&str>,
     format: &str,
+    guard: DropGuard,
 ) -> Result<Response, RestError> {
     let mut prefix: Vec<Value> = Vec::new();
     let mut ended = false;
@@ -1280,6 +1504,7 @@ async fn streaming_columnar_response(
         content_type,
         runner_label,
         format,
+        guard,
     ))
 }
 
@@ -1386,9 +1611,14 @@ fn columnar_body_response(
     content_type: ContentType,
     runner_label: Option<&str>,
     format: &str,
+    guard: DropGuard,
 ) -> Response {
-    let mut response =
-        channel_body_response(body_rx, content_type_headers(content_type).0, runner_label);
+    let mut response = channel_body_response(
+        body_rx,
+        content_type_headers(content_type).0,
+        runner_label,
+        guard,
+    );
     if wants_parquet_attachment(format, content_type_headers(content_type).0) {
         response.headers_mut().insert(
             header::CONTENT_DISPOSITION,
@@ -1442,7 +1672,9 @@ async fn drain_stream(
         match result {
             Ok(row) => rows.push(row),
             Err(e) => {
-                warn!(error = %e, "row error while collecting stream");
+                // `map_sof_error_to_rest` logs server-side faults at `warn`
+                // (with the SQLSTATE); a client-attributable kind is not one.
+                debug!(error = %e, "row error while collecting stream");
                 return Err(map_sof_error_to_rest(e));
             }
         }
@@ -1520,17 +1752,79 @@ fn build_filters(
     })
 }
 
-/// Maps a `SofError` to a `RestError`, returning 422 for uncompilable views.
+/// Maps a `SofError` to a `RestError`. This is the only mapping of a run
+/// error: `$sql-run` (ViewDefinition and Library subjects, at the start of the
+/// run and mid-stream) and the export job status all go through it, so one
+/// kind always gets one answer (#1864):
+///
+/// | Kind | Answer |
+/// |---|---|
+/// | `Uncompilable`, `InvalidViewDefinition`, `ResolutionLimit` | 422 `processing` |
+/// | `ClientInput { status: 422 }` | 422 `processing` |
+/// | `ClientInput { .. }`, any other status | 400 `invalid` |
+/// | `NotFound` | 400 `not-found` |
+/// | `Unavailable` | 503 `transient` with `Retry-After` |
+/// | `Timeout` | 504 `timeout` |
+/// | `Cancelled` | 408 `timeout` (the client has gone or the request timed out; an export job reports its own status) |
+/// | `Storage`, `Backend` | 500 `exception` |
+///
+/// One row sits outside this mapping because it fails before any run starts:
+/// the `patient`/`group` existence check ([`super::patient_group_refs`]). A
+/// missing or deleted target there is the same 400 `not-found` as `NotFound`;
+/// an existence read that fails maps through `RestError::from(StorageError)`
+/// (503 `transient` with `Retry-After` when the backend is unavailable, 504
+/// `timeout` when it timed out), never a 500 for a transient fault.
+///
+/// Server-side detail is logged here (a `Backend` error with its SQLSTATE)
+/// and never sent to the client.
 pub(crate) fn map_sof_error_to_rest(e: SofError) -> RestError {
     match e {
         SofError::Uncompilable { reason }
         | SofError::InvalidViewDefinition(reason)
         | SofError::ResolutionLimit(reason) => RestError::UnprocessableEntity { message: reason },
-        SofError::Cancelled => RestError::InternalError {
-            message: "View execution was cancelled".to_string(),
+        SofError::ClientInput { status, message } => {
+            if status == StatusCode::UNPROCESSABLE_ENTITY.as_u16() {
+                RestError::UnprocessableEntity { message }
+            } else {
+                RestError::BadRequest { message }
+            }
+        }
+        SofError::NotFound { references } => RestError::ReferenceNotFound {
+            message: format!("Referenced resource not found: {}", references.join(", ")),
         },
-        other => {
-            warn!(error = %other, "SofRunner error");
+        SofError::Unavailable { message } => {
+            warn!(error.detail = %message, "SoF run: backend unavailable");
+            RestError::ServiceUnavailable {
+                message: "The database could not serve the SQL-on-FHIR run right now. Retry \
+                          the request later."
+                    .to_string(),
+            }
+        }
+        SofError::Timeout { budget, message } => RestError::SofTimeout {
+            message: match budget {
+                Some(budget) => format!("{message} (run budget {budget:?})"),
+                None => message,
+            },
+        },
+        SofError::Cancelled => {
+            debug!("SoF run cancelled");
+            RestError::SofCancelled
+        }
+        SofError::Backend { sqlstate, message } => {
+            warn!(
+                sqlstate = sqlstate.as_deref().unwrap_or("none"),
+                error.detail = %message,
+                "SofRunner backend error"
+            );
+            RestError::InternalError {
+                message: match sqlstate {
+                    Some(code) => format!("backend error (SQLSTATE {code}): {message}"),
+                    None => format!("backend error: {message}"),
+                },
+            }
+        }
+        other @ SofError::Storage(_) => {
+            warn!(error = %other, "SofRunner storage error");
             RestError::InternalError {
                 message: other.to_string(),
             }
@@ -1548,10 +1842,174 @@ mod tests {
         Box::pin(futures::stream::iter(rows))
     }
 
+    /// Budgets far beyond any test's run.
+    fn test_budgets() -> RunBudgets {
+        RunBudgets {
+            buffered: Duration::from_secs(3_600),
+            run: Duration::from_secs(3_600),
+        }
+    }
+
+    /// #1864 (A17, request half): every run kind gets its deadline, counted
+    /// from the request's start and never renewed: a preview, a buffered
+    /// unlimited run and a SQL Query's dependencies get the buffered bound
+    /// (capped by the run budget), a streamed unlimited run the run budget.
+    #[tokio::test(start_paused = true)]
+    async fn each_run_kind_gets_its_deadline() {
+        let budgets = RunBudgets {
+            buffered: Duration::from_secs(28),
+            run: Duration::from_secs(600),
+        };
+        let start = Instant::now();
+        let stop = RequestStop::new(budgets);
+        // Later runs of the same request share its deadlines.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let cases = [
+            (stop.run_context(RunKind::Preview), 28),
+            (stop.streamed_run_context(RunKind::Preview), 28),
+            (stop.run_context(RunKind::UnlimitedRun), 28),
+            (stop.streamed_run_context(RunKind::UnlimitedRun), 600),
+            (stop.run_context(RunKind::SqlQueryDependency), 28),
+        ];
+        for (ctx, secs) in cases {
+            assert_eq!(
+                ctx.deadline,
+                Some(start + Duration::from_secs(secs)),
+                "{:?}",
+                ctx.kind
+            );
+        }
+
+        // A run budget smaller than the buffered bound caps it.
+        let small = RequestStop::new(RunBudgets {
+            buffered: Duration::from_secs(28),
+            run: Duration::from_secs(10),
+        });
+        assert_eq!(
+            small.run_context(RunKind::UnlimitedRun).deadline,
+            Some(Instant::now() + Duration::from_secs(10))
+        );
+
+        // From the configuration: HFS_REQUEST_TIMEOUT minus 2 s, and
+        // HFS_SOF_RUN_TIMEOUT_SECS.
+        let config = crate::config::ServerConfig {
+            request_timeout: 30,
+            sof_run_timeout_secs: 600,
+            ..Default::default()
+        };
+        assert_eq!(RunBudgets::from_config(&config), budgets);
+    }
+
+    /// #1864 (A17, request half, through the handler): a context-capturing
+    /// runner sees the deadline of each `$sql-run` shape. A preview and every
+    /// buffered format get `HFS_REQUEST_TIMEOUT - 2 s`; NDJSON streamed without
+    /// `_limit` gets `HFS_SOF_RUN_TIMEOUT_SECS`; NDJSON wrapped in a `Binary`
+    /// envelope is buffered.
+    #[tokio::test]
+    async fn each_run_kind_gets_its_deadline_through_the_handler() {
+        use axum::http::{HeaderName, HeaderValue};
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::core::sof_runner::{RunOutput, SofRunner};
+        use helios_persistence::tenant::TenantContext;
+        use std::sync::{Arc, Mutex};
+
+        /// Records the kind and the time left until the deadline of every run.
+        #[derive(Default)]
+        struct CapturingRunner {
+            seen: Mutex<Vec<(RunKind, Option<Duration>)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl SofRunner for CapturingRunner {
+            async fn run_view(
+                &self,
+                _tenant: &TenantContext,
+                _request: RunRequest,
+                ctx: RunContext,
+            ) -> Result<RunOutput, SofError> {
+                let left = ctx
+                    .deadline
+                    .map(|d| d.saturating_duration_since(Instant::now()));
+                self.seen.lock().unwrap().push((ctx.kind, left));
+                Ok(RunOutput::from_rows(Box::pin(futures::stream::empty())))
+            }
+
+            fn runner_name(&self) -> &'static str {
+                "capturing-runner"
+            }
+        }
+
+        let backend = SqliteBackend::with_config(":memory:", Default::default()).unwrap();
+        backend.init_schema().unwrap();
+        let runner = Arc::new(CapturingRunner::default());
+        let config = crate::config::ServerConfig {
+            request_timeout: 30,
+            sof_run_timeout_secs: 600,
+            ..crate::config::ServerConfig::for_testing()
+        };
+        let state = AppState::new(Arc::new(backend), config).with_sof_runner(runner.clone());
+        let server =
+            axum_test::TestServer::new(crate::routing::fhir_routes::create_routes(state)).unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"name": "id", "path": "id"}]}]
+        });
+        let cases = [
+            (
+                "/$sql-run?_format=ndjson&_limit=5",
+                None,
+                RunKind::Preview,
+                28,
+            ),
+            ("/$sql-run?_format=csv", None, RunKind::UnlimitedRun, 28),
+            ("/$sql-run?_format=json", None, RunKind::UnlimitedRun, 28),
+            ("/$sql-run?_format=ndjson", None, RunKind::UnlimitedRun, 600),
+            (
+                "/$sql-run?_format=ndjson",
+                Some("application/fhir+json"),
+                RunKind::UnlimitedRun,
+                28,
+            ),
+        ];
+        for (path, accept, kind, secs) in cases {
+            let mut request = server
+                .post(path)
+                .add_header(
+                    HeaderName::from_static("x-tenant-id"),
+                    HeaderValue::from_static("t1"),
+                )
+                .json(&view);
+            if let Some(accept) = accept {
+                request = request.add_header(header::ACCEPT, HeaderValue::from_static(accept));
+            }
+            let response = request.await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::OK,
+                "{path}: {}",
+                response.text()
+            );
+            let (seen_kind, left) = runner.seen.lock().unwrap().pop().expect("a run");
+            assert_eq!(seen_kind, kind, "{path} {accept:?}");
+            let left = left.expect("every run has a deadline");
+            let budget = Duration::from_secs(secs);
+            assert!(
+                left <= budget && left > budget - Duration::from_secs(5),
+                "{path} {accept:?}: {left:?} left, budget {budget:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn streaming_ndjson_aborts_on_row_error() {
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
-        let response = streaming_ndjson_response(stream, Some("test-runner"));
+        let response = streaming_ndjson_response(
+            stream,
+            Some("test-runner"),
+            RequestStop::new(test_budgets()).into_guard(),
+        );
         assert_eq!(response.status(), StatusCode::OK);
         // A mid-stream error must abort the chunked body, not end it cleanly:
         // collecting an aborted body fails.
@@ -1592,6 +2050,7 @@ mod tests {
             options,
             None,
             "parquet",
+            RequestStop::new(test_budgets()).into_guard(),
         )
         .await
     }
@@ -1647,6 +2106,7 @@ mod tests {
             Some(options),
             None,
             "parquet",
+            RequestStop::new(test_budgets()).into_guard(),
         )
         .await
         .unwrap();
@@ -1825,12 +2285,186 @@ mod tests {
     #[tokio::test]
     async fn streaming_ndjson_completes_on_clean_stream() {
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Ok(json!({ "a": 2 }))]);
-        let response = streaming_ndjson_response(stream, Some("test-runner"));
+        let response = streaming_ndjson_response(
+            stream,
+            Some("test-runner"),
+            RequestStop::new(test_budgets()).into_guard(),
+        );
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("a clean stream should produce a collectable body");
         let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
         assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n");
+    }
+
+    /// Sets its flag when dropped; moved into a row stream, it shows that the
+    /// stream itself (and with it a runner's channel) was dropped.
+    struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A run that never yields a row (a statement still sorting), with a flag
+    /// that is set once its stream is dropped.
+    fn quiet_run() -> (RowStream, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(std::sync::Arc::clone(&dropped));
+        let rows = futures::stream::pending().map(move |row: Result<Value, SofError>| {
+            let _ = &flag;
+            row
+        });
+        (Box::pin(rows), dropped)
+    }
+
+    /// #1864 (A15, `DropGuard` mechanics): dropping a streamed body (the
+    /// client went away mid-stream) fires the request's token, so the run is
+    /// cancelled while it has no row to send, and the task reading the run
+    /// drops its stream.
+    #[tokio::test]
+    async fn dropping_the_streamed_body_stops_the_run() {
+        let stop = RequestStop::new(test_budgets());
+        let ctx = stop.run_context(RunKind::UnlimitedRun);
+        let (rows, dropped) = quiet_run();
+        let response = streaming_ndjson_response(rows, None, stop.into_guard());
+        tokio::task::yield_now().await;
+        assert!(!ctx.cancel.is_cancelled(), "the body is still being read");
+
+        drop(response);
+        assert!(
+            ctx.cancel.is_cancelled(),
+            "dropping the body fires the run's cancel"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the task reading the run drops its stream");
+    }
+
+    /// #1864 (A15, `DropGuard` mechanics) on main's streamed Parquet / Arrow
+    /// bodies (#1812, #1813): the request's guard moves into the body, so
+    /// returning the response does not stop the run (its rows are still being
+    /// sent), and dropping the body (the client went away) does.
+    #[tokio::test]
+    async fn the_streamed_columnar_bodies_hold_the_request_guard() {
+        for ct in [ContentType::Parquet, ContentType::ArrowIpc] {
+            // Row path: the prefix is read, then the rest is streamed.
+            let stop = RequestStop::new(test_budgets());
+            let ctx = stop.streamed_run_context(RunKind::UnlimitedRun);
+            let rows = row_stream(numbered_rows(3)).chain(quiet_run().0).boxed();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                streaming_columnar_response(
+                    rows,
+                    ct,
+                    &typed_view(),
+                    None,
+                    None,
+                    "parquet",
+                    stop.into_guard(),
+                ),
+            )
+            .await;
+            // The quiet run never ends the prefix, so the response is not
+            // ready; dropping the handler's future fires the guard.
+            assert!(response.is_err(), "{ct:?}: the prefix waits on the run");
+            assert!(
+                ctx.cancel.is_cancelled(),
+                "{ct:?}: a dropped handler future fires the run's cancel"
+            );
+
+            let stop = RequestStop::new(test_budgets());
+            let ctx = stop.streamed_run_context(RunKind::UnlimitedRun);
+            let rows = row_stream(numbered_rows(SCHEMA_SAMPLE_ROWS + 1))
+                .chain(quiet_run().0)
+                .boxed();
+            let response = streaming_columnar_response(
+                rows,
+                ct,
+                &typed_view(),
+                None,
+                None,
+                "parquet",
+                stop.into_guard(),
+            )
+            .await
+            .expect("the prefix is in");
+            tokio::task::yield_now().await;
+            assert!(
+                !ctx.cancel.is_cancelled(),
+                "{ct:?}: the body is still being sent"
+            );
+            drop(response);
+            assert!(
+                ctx.cancel.is_cancelled(),
+                "{ct:?}: dropping the body fires the run's cancel"
+            );
+
+            // Columnar path: the runner's record batches are streamed.
+            let stop = RequestStop::new(test_budgets());
+            let ctx = stop.streamed_run_context(RunKind::UnlimitedRun);
+            let runner = BatchRunner {
+                batches: 1,
+                fail: false,
+            };
+            let batches = open(&runner).await.expect("open").expect("columnar");
+            let response = streaming_batch_response(
+                batches,
+                ct,
+                ParquetOptions::default(),
+                None,
+                "parquet",
+                stop.into_guard(),
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                !ctx.cancel.is_cancelled(),
+                "{ct:?}: the body is still being sent"
+            );
+            drop(response);
+            assert!(
+                ctx.cancel.is_cancelled(),
+                "{ct:?}: dropping the body fires the run's cancel"
+            );
+        }
+    }
+
+    /// #1864 (A15, `DropGuard` mechanics): a handler future dropped before it
+    /// answered (the client closed its connection, or `TimeoutLayer` answered
+    /// 408) fires the request's token; each run's token is a child of it.
+    #[tokio::test]
+    async fn dropping_the_handler_future_stops_its_runs() {
+        let (ctx_tx, ctx_rx) = tokio::sync::oneshot::channel();
+        let handler = async move {
+            let stop = RequestStop::new(test_budgets());
+            let _ = ctx_tx.send((
+                stop.run_context(RunKind::Preview),
+                stop.run_context(RunKind::Preview),
+            ));
+            std::future::pending::<()>().await;
+            drop(stop);
+        };
+        let mut handler = Box::pin(handler);
+        assert!(
+            futures::poll!(handler.as_mut()).is_pending(),
+            "the handler waits on its run"
+        );
+        let (first, second) = ctx_rx.await.expect("the handler started its runs");
+        first.cancel.cancel();
+        assert!(
+            !second.cancel.is_cancelled(),
+            "one run's cancel never stops another run of the request"
+        );
+        drop(handler);
+        assert!(
+            second.cancel.is_cancelled(),
+            "dropping the handler future fires every run's cancel"
+        );
     }
 
     #[tokio::test]
@@ -1851,10 +2485,12 @@ mod tests {
         async fn run_view(
             &self,
             _tenant: &helios_persistence::tenant::TenantContext,
-            _view_definition: Value,
-            _filters: helios_persistence::core::sof_runner::ViewFilters,
-        ) -> Result<RowStream, SofError> {
-            Ok(row_stream(vec![Ok(json!({ "a": 1 }))]))
+            _request: RunRequest,
+            _ctx: RunContext,
+        ) -> Result<helios_persistence::core::sof_runner::RunOutput, SofError> {
+            Ok(helios_persistence::core::sof_runner::RunOutput::from_rows(
+                row_stream(vec![Ok(json!({ "a": 1 }))]),
+            ))
         }
 
         fn runner_name(&self) -> &'static str {
@@ -1874,17 +2510,17 @@ mod tests {
         async fn run_view(
             &self,
             _tenant: &helios_persistence::tenant::TenantContext,
-            _view_definition: Value,
-            _filters: helios_persistence::core::sof_runner::ViewFilters,
-        ) -> Result<RowStream, SofError> {
+            _request: RunRequest,
+            _ctx: RunContext,
+        ) -> Result<helios_persistence::core::sof_runner::RunOutput, SofError> {
             panic!("the columnar path must not fall back to run_view");
         }
 
         async fn run_view_columnar(
             &self,
             _tenant: &helios_persistence::tenant::TenantContext,
-            _view_definition: Value,
-            _filters: helios_persistence::core::sof_runner::ViewFilters,
+            _request: RunRequest,
+            _ctx: RunContext,
         ) -> Result<Option<helios_persistence::core::sof_runner::BatchStream>, SofError> {
             use helios_sof::arrow::array::{ArrayRef, Int32Array};
             use helios_sof::arrow::datatypes::{DataType, Field, Schema};
@@ -1896,7 +2532,7 @@ mod tests {
             let batch = RecordBatch::try_new(schema, vec![column]).expect("batch");
             let mut items: Vec<_> = (0..self.batches).map(|_| Ok(batch.clone())).collect();
             if self.fail {
-                items.push(Err(SofError::Backend("boom".to_string())));
+                items.push(Err(SofError::backend("boom")));
             }
             Ok(Some(Box::pin(futures::stream::iter(items))))
         }
@@ -1919,7 +2555,14 @@ mod tests {
     async fn open(
         runner: &dyn helios_persistence::core::sof_runner::SofRunner,
     ) -> Result<Option<ColumnarBatches>, RestError> {
-        open_columnar(runner, &test_tenant(), &int_view(), &Default::default()).await
+        open_columnar(
+            runner,
+            &test_tenant(),
+            &int_view(),
+            &Default::default(),
+            RunContext::detached(RunKind::UnlimitedRun),
+        )
+        .await
     }
 
     /// The streamed and the buffered (envelope) bodies of the columnar path.
@@ -1934,6 +2577,7 @@ mod tests {
             ParquetOptions::default(),
             None,
             "parquet",
+            RequestStop::new(test_budgets()).into_guard(),
         );
         let streamed = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -2013,6 +2657,7 @@ mod tests {
                 None,
                 None,
                 "parquet",
+                RequestStop::new(test_budgets()).into_guard(),
             )
             .await
             .expect("row path");
@@ -2046,6 +2691,7 @@ mod tests {
             ParquetOptions::default(),
             None,
             "parquet",
+            RequestStop::new(test_budgets()).into_guard(),
         );
         assert!(
             axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -2067,5 +2713,155 @@ mod tests {
             .await
             .expect("clean stream should drain");
         assert_eq!(rows.len(), 2);
+    }
+
+    /// #1864 (A4): every run error kind maps to exactly one status and
+    /// OperationOutcome code, through the one mapping. Only server faults
+    /// (`Storage`, `Backend`) answer 500; `Unavailable` carries `Retry-After`
+    /// and nothing else does; no server-side detail reaches the client.
+    #[test]
+    fn every_sof_error_kind_maps_to_one_status() {
+        let secret = "db.internal:5432 relation \"resources\"";
+        let cases: Vec<(SofError, StatusCode, &str)> = vec![
+            (
+                SofError::Uncompilable {
+                    reason: "two unionAll".into(),
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "processing",
+            ),
+            (
+                SofError::InvalidViewDefinition("no resource".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "processing",
+            ),
+            (
+                SofError::ResolutionLimit("over the cap".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "processing",
+            ),
+            (
+                SofError::ClientInput {
+                    status: 422,
+                    message: "dependency refused".into(),
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "processing",
+            ),
+            (
+                SofError::ClientInput {
+                    status: 400,
+                    message: "unusable value".into(),
+                },
+                StatusCode::BAD_REQUEST,
+                "invalid",
+            ),
+            (
+                SofError::NotFound {
+                    references: vec!["Group/missing".into()],
+                },
+                StatusCode::BAD_REQUEST,
+                "not-found",
+            ),
+            (
+                SofError::Unavailable {
+                    message: secret.into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient",
+            ),
+            (
+                SofError::Timeout {
+                    budget: None,
+                    message: secret.into(),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+            ),
+            (
+                SofError::Timeout {
+                    budget: Some(std::time::Duration::from_secs(30)),
+                    message: secret.into(),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+            ),
+            (SofError::Cancelled, StatusCode::REQUEST_TIMEOUT, "timeout"),
+            (
+                SofError::Storage(secret.into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+            ),
+            (
+                SofError::backend(secret),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+            ),
+            (
+                SofError::backend_with_sqlstate("42P01", secret),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+            ),
+        ];
+        for (error, status, code) in cases {
+            let label = format!("{error:?}");
+            let rest = map_sof_error_to_rest(error);
+            let (got_status, got_code, diagnostics) = rest.client_response();
+            assert_eq!((got_status, got_code), (status, code), "{label}");
+            assert!(!diagnostics.contains(secret), "{label}: {diagnostics}");
+            if status == StatusCode::GATEWAY_TIMEOUT {
+                assert_eq!(
+                    diagnostics,
+                    crate::error::SOF_TIMEOUT_CLIENT_MESSAGE,
+                    "{label}: the SoF text, not the search advice"
+                );
+            }
+            let response = rest.into_response();
+            assert_eq!(response.status(), status, "{label}");
+            assert_eq!(
+                response.headers().contains_key(header::RETRY_AFTER),
+                status == StatusCode::SERVICE_UNAVAILABLE,
+                "{label}: Retry-After goes with 503 only"
+            );
+        }
+    }
+
+    /// #1864 (A5): a backend error's SQLSTATE is logged by the mapping.
+    #[test]
+    fn a_backend_error_logs_its_sqlstate() {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let rest = map_sof_error_to_rest(SofError::backend_with_sqlstate(
+                "42P01",
+                "failed to prepare SQL: ERROR (SQLSTATE 42P01): relation does not exist",
+            ));
+            assert!(matches!(rest, RestError::InternalError { .. }));
+        });
+        let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("sqlstate") && logged.contains("42P01"),
+            "the SQLSTATE must be logged: {logged}"
+        );
     }
 }

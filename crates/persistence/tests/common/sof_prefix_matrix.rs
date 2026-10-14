@@ -2,15 +2,22 @@
 //!
 //! Included by persistence and REST tests. Storage adapters seed the records
 //! and may replace `last_updated` with the timestamp returned by a write.
-//! No SQL, pools, or backend-specific dependencies belong in this module.
+//! No SQL, pools, or backend-specific dependencies belong in this module: the
+//! runner-level checkers below take any `&dyn SofRunner`, and each backend's
+//! test file seeds the records and calls them.
 
 #![allow(dead_code)]
 
 use std::collections::HashSet;
 
 use chrono::{DateTime, TimeZone, Utc};
+use futures::StreamExt as _;
 use helios_fhir::FhirVersion;
-use helios_persistence::core::sof_runner::ViewFilters;
+use helios_persistence::core::sof_runner::{
+    RunContext, RunKind, RunOutput, RunRequest, SofRunner, ViewFilters,
+};
+use helios_persistence::core::sof_schema::ViewSchema;
+use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug)]
@@ -573,6 +580,302 @@ mod oracle_tests {
             {"forEach":"given","column":[{"path":"$this","name":"given","type":"string"}]},
             {"forEach":"prefix","column":[{"path":"$this","name":"prefix","type":"string"}]}]}]));
         assert!(std::panic::catch_unwind(|| root_factor_rows(&unsupported, &[])).is_err());
+    }
+}
+
+// ===========================================================================
+// Column order (#1864 A2, A3): rows follow ViewDefinition document order
+// ===========================================================================
+
+/// A `unionAll` before a sibling `select`. Document order lists the branch
+/// columns first (`family`, `source`, then `born`). The union statement sorts
+/// by its first projected column (`ORDER BY 1`). The SQL compilers distribute
+/// the `unionAll` in place (`normalize_union`) and project document order, so
+/// its rows come out by `family`; before that (X `cf1af0544`) they projected
+/// the sibling first and the rows came out by `born`.
+pub fn union_first_sibling_after_view() -> Value {
+    patient_view(json!([
+        {"unionAll":[
+            {"forEach":"name","column":[
+                {"path":"family","name":"family","type":"string"},
+                {"path":"'name'","name":"source","type":"string"}]},
+            {"forEach":"contact.name","column":[
+                {"path":"family","name":"family","type":"string"},
+                {"path":"'contact'","name":"source","type":"string"}]}
+        ]},
+        {"column":[{"path":"birthDate","name":"born","type":"date"}]}
+    ]))
+}
+
+/// The view's columns in document order.
+pub const UNION_FIRST_DOCUMENT_ORDER: [&str; 3] = ["family", "source", "born"];
+
+/// The records for [`union_first_sibling_after_view`], in seed order (which is
+/// also id order, so seed order = `(last_updated, id)` order). Each patient
+/// yields at most one union row and `family` and `born` are both unique, so
+/// `ORDER BY 1` is a total order. The data separates three candidate
+/// sequences: by `family` (the first branch column, the statement's sort key
+/// now that the compiler projects document order), by `born` (the sort key on
+/// X, where the compiler projected the sibling first) and by resource. `uf-e`
+/// has neither a name nor a contact and yields no row.
+pub fn union_first_sibling_after_resources() -> Vec<Value> {
+    vec![
+        json!({"resourceType":"Patient","id":"uf-a","birthDate":"1990-01-01",
+            "name":[{"family":"Delta"}]}),
+        json!({"resourceType":"Patient","id":"uf-b","birthDate":"1970-01-01",
+            "contact":[{"name":{"family":"Alpha"}}]}),
+        json!({"resourceType":"Patient","id":"uf-c","birthDate":"2000-01-01",
+            "name":[{"family":"Charlie"}]}),
+        json!({"resourceType":"Patient","id":"uf-d","birthDate":"1980-01-01",
+            "name":[{"family":"Bravo"}]}),
+        json!({"resourceType":"Patient","id":"uf-e","birthDate":"1960-01-01"}),
+    ]
+}
+
+/// The row sequence the SQL runners return on `main` before #1864: sorted by
+/// `family`, the union statement's `ORDER BY 1` key over the document-order
+/// projection. #1864 normalizes only the keys of each row, never the row
+/// order, so this stays the expected sequence until #1867 replaces the union
+/// order with its own explicit keys and its own expected-order fixture.
+pub fn union_first_sibling_after_base_sequence() -> Vec<Value> {
+    vec![
+        json!({"family":"Alpha","source":"contact","born":"1970-01-01"}),
+        json!({"family":"Bravo","source":"name","born":"1980-01-01"}),
+        json!({"family":"Charlie","source":"name","born":"2000-01-01"}),
+        json!({"family":"Delta","source":"name","born":"1990-01-01"}),
+    ]
+}
+
+/// Views whose declared schema the A2 check compares with every row's keys:
+/// flat, `forEachOrNull` (explicit nulls), a `select` after a `unionAll`, and
+/// the official `basic.json` "column ordering" shape (columns, a nested
+/// `select`, a `unionAll`, then a sibling `select`). Seed
+/// [`union_first_sibling_after_resources`] before running them.
+pub fn schema_order_views() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "flat",
+            patient_view(json!([{"column":[{"path":"id","name":"id"},
+                {"path":"birthDate","name":"born","type":"date"}]}])),
+        ),
+        (
+            "for-each-or-null",
+            patient_view(json!([{"column":[{"path":"id","name":"id"}]},
+                {"forEachOrNull":"name","column":[{"path":"family","name":"family","type":"string"}]}])),
+        ),
+        (
+            "union-first-sibling-after",
+            union_first_sibling_after_view(),
+        ),
+        (
+            "basic-column-ordering",
+            patient_view(json!([
+                {"column":[{"path":"'A'","name":"a","type":"string"},{"path":"id","name":"b"}],
+                 "select":[{"forEach":"name","column":[{"path":"family","name":"c","type":"string"}]}],
+                 "unionAll":[
+                    {"column":[{"path":"'E1'","name":"e","type":"string"}]},
+                    {"column":[{"path":"'E2'","name":"e","type":"string"}]}]},
+                {"column":[{"path":"birthDate","name":"g","type":"date"}]}
+            ])),
+        ),
+    ]
+}
+
+/// The evaluator's own column list for `view` (the reference order).
+pub fn evaluator_columns(view: &Value) -> Vec<String> {
+    prepare_evaluator(view).columns().to_vec()
+}
+
+/// Every row is an object whose keys are exactly `columns`, in that order.
+/// `Value` equality ignores key order, so this is checked on its own.
+pub fn assert_row_keys(rows: &[Value], columns: &[&str], context: &str) {
+    for (index, row) in rows.iter().enumerate() {
+        let keys: Vec<&str> = row
+            .as_object()
+            .unwrap_or_else(|| panic!("{context}: row {index} is not an object: {row}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, columns, "{context}: keys of row {index}: {row}");
+    }
+}
+
+async fn collect_output(output: RunOutput, context: &str) -> (Vec<String>, Vec<Value>) {
+    let schema = output.schema.names().map(str::to_string).collect();
+    assert!(
+        output.capabilities.declared_schema,
+        "{context}: the runner declares its schema"
+    );
+    let rows = output
+        .rows
+        .map(|row| row.unwrap_or_else(|e| panic!("{context}: row error {e}")))
+        .collect()
+        .await;
+    (schema, rows)
+}
+
+async fn run_output(
+    runner: &dyn SofRunner,
+    tenant: &TenantContext,
+    view: &Value,
+    kind: RunKind,
+    context: &str,
+) -> (Vec<String>, Vec<Value>) {
+    let output = runner
+        .run_view(
+            tenant,
+            RunRequest::new(view.clone(), ViewFilters::default()),
+            RunContext::detached(kind),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{context}: run_view failed: {e}"));
+    collect_output(output, context).await
+}
+
+/// A2 (`view_schema_matches_row_keys_in_document_order`): for each of
+/// [`schema_order_views`], the runner's declared schema is the walker's
+/// document order, which is the evaluator's column order, and every row's
+/// keys are that schema, in order (empty cells as explicit nulls). The caller
+/// seeds [`union_first_sibling_after_resources`] for `tenant` first.
+pub async fn assert_view_schema_matches_row_keys(
+    runner: &dyn SofRunner,
+    tenant: &TenantContext,
+    backend: &str,
+) {
+    for (name, view) in schema_order_views() {
+        let context = format!("{backend}/{name}");
+        let walker: Vec<String> = ViewSchema::from_view_definition(&view)
+            .names()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            walker,
+            evaluator_columns(&view),
+            "{context}: walker = evaluator"
+        );
+        let (schema, rows) = run_output(runner, tenant, &view, RunKind::Preview, &context).await;
+        assert_eq!(schema, walker, "{context}: declared schema");
+        assert!(!rows.is_empty(), "{context}: rows");
+        let columns: Vec<&str> = schema.iter().map(String::as_str).collect();
+        assert_row_keys(&rows, &columns, &context);
+    }
+}
+
+/// A3 (`union_first_sibling_after_keeps_row_order`): the runner returns
+/// [`union_first_sibling_after_base_sequence`] exactly (rows, cells and their
+/// order) with every row's keys in document order, both from a plain run and
+/// from its export runner (`for_export_job()`, the PostgreSQL keyset-paged
+/// reader; a runner without one exports through itself). The caller seeds
+/// [`union_first_sibling_after_resources`] for `tenant` first.
+pub async fn assert_union_first_sibling_after_keeps_row_order(
+    runner: &dyn SofRunner,
+    tenant: &TenantContext,
+    backend: &str,
+) {
+    let view = union_first_sibling_after_view();
+    let expected = union_first_sibling_after_base_sequence();
+    let export = runner.for_export_job();
+    let cells: [(&str, &dyn SofRunner, RunKind); 3] = [
+        ("preview", runner, RunKind::Preview),
+        ("unlimited", runner, RunKind::UnlimitedRun),
+        (
+            "export",
+            export.as_deref().unwrap_or(runner),
+            RunKind::ExportJob,
+        ),
+    ];
+    for (cell, runner, kind) in cells {
+        let context = format!("{backend}/{cell}");
+        let (schema, rows) = run_output(runner, tenant, &view, kind, &context).await;
+        assert_eq!(
+            schema, UNION_FIRST_DOCUMENT_ORDER,
+            "{context}: declared schema"
+        );
+        assert_ordered(&rows, &expected, &format!("{context}: base row sequence"));
+        assert_row_keys(&rows, &UNION_FIRST_DOCUMENT_ORDER, &context);
+    }
+}
+
+#[cfg(test)]
+mod column_order_tests {
+    use super::*;
+
+    /// The official `basic.json` "column ordering" view, verbatim.
+    fn official_column_ordering_view() -> Value {
+        patient_view(json!([
+            {"column":[{"path":"'A'","name":"a","type":"string"},{"path":"'B'","name":"b","type":"string"}],
+             "select":[{"forEach":"name","column":[{"path":"'C'","name":"c","type":"string"},
+                {"path":"'D'","name":"d","type":"string"}]}],
+             "unionAll":[
+                {"column":[{"path":"'E1'","name":"e","type":"string"},{"path":"'F1'","name":"f","type":"string"}]},
+                {"column":[{"path":"'E2'","name":"e","type":"string"},{"path":"'F2'","name":"f","type":"string"}]}]},
+            {"column":[{"path":"'G'","name":"g","type":"string"},{"path":"'H'","name":"h","type":"string"}]}
+        ]))
+    }
+
+    /// Oracle case (#1864 A3): for a `select` after a `unionAll`, the core
+    /// walker (every runner's declared schema) and the evaluator agree on
+    /// document order, and the evaluator's rows carry their keys in it.
+    #[test]
+    fn select_after_union_all_keeps_document_order() {
+        let resources = union_first_sibling_after_resources();
+        for (view, expected) in [
+            (
+                official_column_ordering_view(),
+                vec!["a", "b", "c", "d", "e", "f", "g", "h"],
+            ),
+            (
+                union_first_sibling_after_view(),
+                UNION_FIRST_DOCUMENT_ORDER.to_vec(),
+            ),
+        ] {
+            let walker: Vec<String> = ViewSchema::from_view_definition(&view)
+                .names()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(walker, expected, "walker: {view}");
+            assert_eq!(evaluator_columns(&view), expected, "evaluator: {view}");
+            let rows = evaluator_rows(&view, &resources);
+            assert!(!rows.is_empty(), "{view}");
+            assert_row_keys(&rows, &expected, "evaluator rows");
+        }
+        for (name, view) in schema_order_views() {
+            assert_eq!(
+                ViewSchema::from_view_definition(&view)
+                    .names()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                evaluator_columns(&view),
+                "{name}"
+            );
+        }
+    }
+
+    /// The union-first fixture discriminates (council S1): its base sequence
+    /// is the evaluator's rows (same complete rows and multiplicity, keys in
+    /// document order), sorted by the first branch column `family`; sorting by
+    /// the sibling `born` (X's key) or keeping resource order would give
+    /// another sequence.
+    #[test]
+    fn union_first_sibling_after_keeps_row_order() {
+        let resources = union_first_sibling_after_resources();
+        let view = union_first_sibling_after_view();
+        let base = union_first_sibling_after_base_sequence();
+        let evaluated = evaluator_rows(&view, &resources);
+        assert_multiset_strict(&base, &evaluated, "base sequence = evaluator rows");
+        assert_row_keys(&base, &UNION_FIRST_DOCUMENT_ORDER, "base sequence");
+        let sorted_by = |key: &str| {
+            let mut rows = base.clone();
+            rows.sort_by(|a, b| a[key].as_str().cmp(&b[key].as_str()));
+            rows
+        };
+        assert_eq!(
+            sorted_by("family"),
+            base,
+            "base sorts by the first branch column (ORDER BY 1)"
+        );
+        assert_ne!(sorted_by("born"), base, "the sibling gives another order");
+        assert_ne!(evaluated, base, "resource order gives another order");
     }
 }
 

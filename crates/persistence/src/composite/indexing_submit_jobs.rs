@@ -332,6 +332,13 @@ impl ResourceStorage for IndexingSubmitJobs {
         self.inner.sof_runner()
     }
 
+    fn export_sof_runner(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> Option<Arc<dyn SofRunner>> {
+        self.inner.export_sof_runner(options)
+    }
+
     async fn count_by_types(
         &self,
         tenant: &TenantContext,
@@ -1054,6 +1061,30 @@ mod tests {
             h.jobs.complete_submission(&tenant(), &h.sub).await.is_err(),
             "completing twice must surface the store's rejection"
         );
+    }
+
+    /// #1864: `export_sof_runner` is the inner store's. Wired as in
+    /// production (`IndexingSubmitJobs(CompositeSubmitJobs(..))`), an export
+    /// reaches the composite primary's export runner.
+    #[tokio::test]
+    async fn export_sof_runner_is_forwarded_to_the_inner_store() {
+        use crate::composite::bulk_submit::CompositeSubmitJobs;
+        use crate::core::export_runner::test_support::{
+            ExportMarkerStorage, assert_export_runner_is_forwarded, composite_over,
+        };
+        let h = harness(SpyTarget::default()).await;
+        let marker = Arc::new(ExportMarkerStorage::default());
+        let inner = CompositeSubmitJobs::new(
+            h.sqlite.clone() as Arc<dyn BulkSubmitJobStore>,
+            Arc::new(composite_over(marker.clone())),
+        );
+        let sink = Arc::new(IngestIndexSink::new(
+            h.sqlite.clone() as Arc<dyn ResourceStorage>,
+            vec![h.target.clone() as Arc<dyn ReindexTarget>],
+            IngestIndexSinkConfig::default(),
+        ));
+        let jobs = IndexingSubmitJobs::new(Arc::new(inner) as Arc<dyn BulkSubmitJobStore>, sink);
+        assert_export_runner_is_forwarded(&jobs, &marker);
     }
 
     /// #1912: the tenant existence probe is the inner store's, so ingested

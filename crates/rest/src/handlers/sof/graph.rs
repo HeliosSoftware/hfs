@@ -39,20 +39,24 @@
 //! see the `#[cfg(test)]` module below.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use helios_persistence::core::search::SearchProvider;
-use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
+use helios_persistence::core::sof_runner::{
+    RowStream, RunContext, RunKind, RunRequest, SofError, SofRunner, ViewFilters,
+};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
-    BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
-    TableSchema,
+    BoundParam, DependencyKind, DependsOnView, EngineStop, InMemorySqlEngine, QueryResult,
+    SourceError, SourceFailure, SqlQueryError, StopCause, TableSchema,
 };
 use serde_json::{Value, json};
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::references::{canonical_matches, resolve_resource_canonical_or_relative};
@@ -675,7 +679,9 @@ pub(crate) struct ExecLimits {
     /// v2 PR #353.
     pub max_rows: usize,
     /// SQL execution timeout in seconds, applied per statement (each
-    /// interior SQLView's own SQL, and the subject's).
+    /// interior SQLView's own SQL, and the subject's). The plan's own
+    /// deadline (`ctx.deadline`: the request's, or the export job's budget)
+    /// caps it: whichever comes first stops the statement (D-5).
     pub timeout_secs: u64,
 }
 
@@ -687,9 +693,28 @@ pub(crate) struct ExecLimits {
 ///
 /// Leaves are materialized via `runner.run_view` (async I/O against
 /// storage). Interior SQLView nodes and the subject's own SQL run on a
-/// blocking thread under the same watchdog-timeout/interrupt mechanism, one
-/// statement at a time — `limits.timeout_secs` bounds each of them
-/// individually, not the whole call.
+/// blocking thread, one statement at a time — `limits.timeout_secs` bounds
+/// each of them individually, not the whole call.
+///
+/// ## Stopping (`ctx`)
+///
+/// `ctx` is the caller's run context (an export job's, or a `$sql-run`
+/// request's): firing `ctx.cancel` or passing `ctx.deadline` stops the whole
+/// plan within the stop bound, wherever it is.
+/// - Each leaf runs with a child token of `ctx.cancel` and `ctx.deadline`
+///   (kind [`RunKind::SqlQueryDependency`]); its `run_view` and every `next()`
+///   of its rows are raced against the stop, so a leaf whose runner is quiet
+///   still ends at once.
+/// - Every engine operation (DDL, row insertion, a SQLView node, the subject's
+///   SELECT) runs on a blocking worker under a supervisor that maps the stop,
+///   and `limits.timeout_secs` for a SELECT, onto the engine's latched
+///   [`EngineStop`]: the reason is set first, then the statement is
+///   interrupted, and the interrupt is repeated every [`ENGINE_REFIRE`] until
+///   the worker returns. The supervisor always waits for the worker to finish;
+///   it never just drops it.
+/// - A stopped plan ends with [`SqlQueryError::Stopped`] carrying its
+///   [`StopCause`]: `Cancelled`, `DeadlineExceeded`, or
+///   `StatementTimeout { secs }` for the per-statement limit (D-5).
 ///
 /// A node referenced by more than one label (a diamond, or simply two
 /// consumers using different names for the same dependency) is computed
@@ -698,11 +723,11 @@ pub(crate) struct ExecLimits {
 /// 1 guarantees every label maps to exactly one node.
 ///
 /// Returns a typed [`SqlQueryError`]. In particular, a
-/// [`SqlQueryError::SourceStream`] means the *source* failed — a storage
-/// error, a backend statement timeout, or a lost connection while streaming
-/// a leaf ViewDefinition's rows — never that the Library or its
-/// ViewDefinitions were malformed; callers must not treat it as a client
-/// error.
+/// [`SqlQueryError::SourceStream`] means a leaf ViewDefinition's run failed,
+/// at its start or after some of its rows; its [`SourceError`] keeps the
+/// run error's kind ([`source_error_from_sof`]), so a leaf the runner refuses
+/// (422), an unavailable backend (503) and a timeout (504) keep their
+/// answers instead of becoming a 500.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan(
     mut engine: InMemorySqlEngine,
@@ -712,6 +737,7 @@ pub(crate) async fn execute_plan(
     plan: &GraphPlan,
     subject_sql: &str,
     subject_bindings: &[BoundParam],
+    ctx: &RunContext,
     limits: ExecLimits,
 ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
     let labels_by_target = labels_by_target(plan);
@@ -727,9 +753,28 @@ pub(crate) async fn execute_plan(
                 engine.create_table(internal_name, &schema)?;
                 let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();
-                let row_stream = match runner.run_view(tenant, view.clone(), filters.clone()).await
-                {
+                let leaf_ctx = RunContext {
+                    cancel: ctx.cancel.child_token(),
+                    deadline: ctx.deadline,
+                    kind: RunKind::SqlQueryDependency,
+                };
+                let started = tokio::select! {
+                    biased;
+                    cause = stopped(ctx) => return Err(SqlQueryError::Stopped(cause)),
+                    started = runner.run_view(
+                        tenant,
+                        RunRequest::new(view.clone(), filters.clone()),
+                        leaf_ctx,
+                    ) => started,
+                };
+                let row_stream = match started.map(|output| output.rows) {
                     Ok(s) => s,
+                    // The leaf's runner ended with the plan's own stop.
+                    Err(_) if cause_now(ctx).is_some() => {
+                        let cause = cause_now(ctx).unwrap_or(StopCause::Cancelled);
+                        debug!(table = %internal_name, view = %view_label, %cause, "SQL query dependency stopped");
+                        return Err(SqlQueryError::Stopped(cause));
+                    }
                     Err(e) => {
                         warn!(
                             table = %internal_name,
@@ -737,19 +782,21 @@ pub(crate) async fn execute_plan(
                             error = %e,
                             "SQL query dependency failed to materialize"
                         );
-                        return Err(SqlQueryError::SourceStream(format!(
-                            "dependency failed to materialize: {e}"
+                        return Err(SqlQueryError::SourceStream(source_error_from_sof(
+                            Some("dependency failed to materialize"),
+                            e,
                         )));
                     }
                 };
-                let row_stream = adapt_row_stream(row_stream);
-                let (returned_engine, inserted) = match engine
-                    .insert_rows(
-                        internal_name,
-                        &schema,
-                        Box::pin(row_stream),
-                        limits.max_source_rows_per_vd,
-                    )
+                let row_stream = adapt_row_stream(until_stopped(row_stream, ctx));
+                let engine_stop = engine.stop_handle();
+                let insert = engine.insert_rows(
+                    internal_name,
+                    &schema,
+                    Box::pin(row_stream),
+                    limits.max_source_rows_per_vd,
+                );
+                let (returned_engine, inserted) = match supervise(engine_stop, ctx, None, insert)
                     .await
                 {
                     Ok(v) => v,
@@ -772,12 +819,16 @@ pub(crate) async fn execute_plan(
                             }
                             other => other,
                         };
-                        warn!(
-                            table = %internal_name,
-                            view = %view_label,
-                            error = %e,
-                            "SQL query dependency failed to materialize"
-                        );
+                        if matches!(e, SqlQueryError::Stopped(_)) {
+                            debug!(table = %internal_name, view = %view_label, error = %e, "SQL query dependency stopped");
+                        } else {
+                            warn!(
+                                table = %internal_name,
+                                view = %view_label,
+                                error = %e,
+                                "SQL query dependency failed to materialize"
+                            );
+                        }
                         return Err(e);
                     }
                 };
@@ -791,7 +842,7 @@ pub(crate) async fn execute_plan(
                     "materialized SQL query dependency"
                 );
                 leaf_schemas.push(schema);
-                engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
+                engine = materialize_labels(engine, internal_name, &labels_by_target, ctx).await?;
             }
             PlanNode::SqlView {
                 internal_name,
@@ -800,11 +851,12 @@ pub(crate) async fn execute_plan(
                 ..
             } => {
                 let start = std::time::Instant::now();
-                let (returned_engine, result) = run_select_with_timeout(
+                let (returned_engine, result) = run_select(
                     engine,
                     sql.clone(),
                     Vec::new(),
                     limits.max_source_rows_per_vd.saturating_add(1),
+                    ctx,
                     limits.timeout_secs,
                 )
                 .await?;
@@ -818,7 +870,7 @@ pub(crate) async fn execute_plan(
                     });
                 }
                 let rows = result.rows.len();
-                engine = materialize_query_result(engine, internal_name, &result).await?;
+                engine = materialize_query_result(engine, internal_name, &result, ctx).await?;
                 let elapsed_ms = start.elapsed().as_millis();
                 debug!(
                     table = %internal_name,
@@ -826,16 +878,17 @@ pub(crate) async fn execute_plan(
                     elapsed_ms,
                     "materialized SQL view node"
                 );
-                engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
+                engine = materialize_labels(engine, internal_name, &labels_by_target, ctx).await?;
             }
         }
     }
 
-    let (_, result) = run_select_with_timeout(
+    let (_, result) = run_select(
         engine,
         subject_sql.to_string(),
         subject_bindings.to_vec(),
         limits.max_rows,
+        ctx,
         limits.timeout_secs,
     )
     .await?;
@@ -915,20 +968,21 @@ async fn materialize_labels(
     engine: InMemorySqlEngine,
     internal_name: &str,
     labels_by_target: &HashMap<String, Vec<String>>,
+    ctx: &RunContext,
 ) -> Result<InMemorySqlEngine, SqlQueryError> {
     let Some(labels) = labels_by_target.get(internal_name) else {
         return Ok(engine);
     };
     let internal_name = internal_name.to_string();
     let labels = labels.clone();
-    tokio::task::spawn_blocking(move || {
+    let (engine, ()) = on_engine(engine, ctx, None, move |engine| {
         for label in &labels {
             engine.create_view(label, &internal_name)?;
         }
-        Ok(engine)
+        Ok(())
     })
-    .await
-    .map_err(|e| SqlQueryError::Internal(format!("sqlquery worker panicked: {e}")))?
+    .await?;
+    Ok(engine)
 }
 
 /// Builds a [`TableSchema`] from a [`QueryResult`]'s columns and inferred
@@ -954,10 +1008,11 @@ async fn materialize_query_result(
     engine: InMemorySqlEngine,
     table_name: &str,
     result: &QueryResult,
+    ctx: &RunContext,
 ) -> Result<InMemorySqlEngine, SqlQueryError> {
     let schema = schema_from_query_result(result);
     engine.create_table(table_name, &schema)?;
-    let rows: Vec<Result<Value, String>> = result
+    let rows: Vec<Result<Value, SourceError>> = result
         .rows
         .iter()
         .map(|row| {
@@ -971,50 +1026,226 @@ async fn materialize_query_result(
         .collect();
     let cap = result.rows.len();
     let stream = futures::stream::iter(rows);
-    let (returned_engine, _inserted) = engine
-        .insert_rows(table_name, &schema, Box::pin(stream), cap)
-        .await?;
+    let engine_stop = engine.stop_handle();
+    let insert = engine.insert_rows(table_name, &schema, Box::pin(stream), cap);
+    let (returned_engine, _inserted) = supervise(engine_stop, ctx, None, insert).await?;
     Ok(returned_engine)
 }
 
-/// Runs one SELECT statement on a blocking thread under a watchdog timeout
-/// (mirrors the exact mechanism `$sql-run` has always used for the
-/// subject's own query), returning ownership of `engine` alongside the
-/// result so the caller can keep using it for the next node.
-async fn run_select_with_timeout(
+/// Runs one SELECT statement on a blocking worker under the plan's stop and
+/// the per-statement limit `timeout_secs` (D-5: one more stop reason, ended as
+/// [`StopCause::StatementTimeout`]), returning ownership of `engine`
+/// alongside the result so the caller can keep using it for the next node.
+async fn run_select(
     engine: InMemorySqlEngine,
     sql: String,
     bindings: Vec<BoundParam>,
     max_rows: usize,
+    ctx: &RunContext,
     timeout_secs: u64,
 ) -> Result<(InMemorySqlEngine, QueryResult), SqlQueryError> {
-    let interrupt = engine.interrupt_handle();
-    let watchdog = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
-        interrupt.interrupt();
-    });
-    let (engine, exec_result) = tokio::task::spawn_blocking(move || {
-        let r = engine.execute_select(&sql, &bindings, max_rows);
-        (engine, r)
+    on_engine(engine, ctx, Some(timeout_secs), move |engine| {
+        engine.execute_select(&sql, &bindings, max_rows)
     })
     .await
-    .map_err(|e| SqlQueryError::Internal(format!("sqlquery worker panicked: {e}")))?;
-    watchdog.abort();
-    match exec_result {
-        Ok(r) => Ok((engine, r)),
-        Err(e) if e.to_string().contains("interrupted") => {
-            Err(SqlQueryError::Timeout { secs: timeout_secs })
+}
+
+/// How often a supervisor repeats the interrupt of a stopped engine until its
+/// blocking worker returns. `sqlite3_interrupt` only reaches a statement that
+/// is running when it is called; the latched reason and the engine's progress
+/// handler catch the rest, and this keeps the interrupt itself from being lost.
+const ENGINE_REFIRE: Duration = Duration::from_millis(20);
+
+/// Runs `work` on `engine` on a blocking worker under [`supervise`], and hands
+/// the engine back with the result.
+async fn on_engine<T, F>(
+    engine: InMemorySqlEngine,
+    ctx: &RunContext,
+    statement_timeout_secs: Option<u64>,
+    work: F,
+) -> Result<(InMemorySqlEngine, T), SqlQueryError>
+where
+    T: Send + 'static,
+    F: FnOnce(&InMemorySqlEngine) -> Result<T, SqlQueryError> + Send + 'static,
+{
+    let engine_stop = engine.stop_handle();
+    let worker = tokio::task::spawn_blocking(move || work(&engine).map(|t| (engine, t)));
+    supervise(engine_stop, ctx, statement_timeout_secs, async move {
+        worker
+            .await
+            .map_err(|e| SqlQueryError::Internal(format!("sqlquery worker panicked: {e}")))?
+    })
+    .await
+}
+
+/// Awaits `work` (an engine operation on a blocking worker) to completion while
+/// mapping the plan's stop onto `engine_stop`: a fired `ctx.cancel`
+/// ([`StopCause::Cancelled`]), a passed `ctx.deadline`
+/// ([`StopCause::DeadlineExceeded`]), or `statement_timeout_secs` elapsed
+/// ([`StopCause::StatementTimeout`]). The first reason is latched on the engine
+/// before its statement is interrupted, and the interrupt is repeated every
+/// [`ENGINE_REFIRE`] until `work` returns. A reason already in effect when the
+/// operation starts is latched before it runs, so it runs nothing.
+///
+/// A failed operation whose engine was stopped, or whose plan is stopped by
+/// then, ends with [`SqlQueryError::Stopped`]: its error is the effect of the
+/// stop (an interrupt, or a leaf stream ended by [`until_stopped`]).
+///
+/// The blocking worker does not belong to this future: if the future is
+/// dropped before `work` returns (the request was abandoned: a client
+/// disconnect, a `408`, a plan dropped by its caller), its drop guard latches
+/// [`StopCause::Cancelled`] on the engine and interrupts it, so the worker's
+/// statement is aborted by the interrupt or by the engine's progress handler
+/// and any later operation on the engine runs nothing.
+async fn supervise<T>(
+    engine_stop: EngineStop,
+    ctx: &RunContext,
+    statement_timeout_secs: Option<u64>,
+    work: impl Future<Output = Result<T, SqlQueryError>>,
+) -> Result<T, SqlQueryError> {
+    let abandoned = StopEngineOnDrop(Some(engine_stop.clone()));
+    if let Some(cause) = cause_now(ctx) {
+        engine_stop.stop(cause);
+    }
+    let statement_deadline =
+        statement_timeout_secs.map(|secs| (Instant::now() + Duration::from_secs(secs), secs));
+    tokio::pin!(work);
+    let result = loop {
+        let latched = engine_stop.cause().is_some();
+        tokio::select! {
+            biased;
+            result = &mut work => break result,
+            () = ctx.cancel.cancelled(), if !latched => {
+                engine_stop.stop(StopCause::Cancelled);
+            }
+            () = sleep_until_or_never(ctx.deadline), if !latched => {
+                engine_stop.stop(StopCause::DeadlineExceeded);
+            }
+            () = sleep_until_or_never(statement_deadline.map(|(at, _)| at)), if !latched => {
+                let secs = statement_deadline.map_or(0, |(_, secs)| secs);
+                engine_stop.stop(StopCause::StatementTimeout { secs });
+            }
+            () = tokio::time::sleep(ENGINE_REFIRE), if latched => engine_stop.interrupt(),
         }
-        Err(e) => Err(e),
+    };
+    abandoned.disarm();
+    result.map_err(|e| match engine_stop.cause().or_else(|| cause_now(ctx)) {
+        Some(cause) => SqlQueryError::Stopped(cause),
+        None => e,
+    })
+}
+
+/// Stops an engine whose supervisor was dropped before its operation
+/// returned (see [`supervise`]); disarmed once the operation returned.
+struct StopEngineOnDrop(Option<EngineStop>);
+
+impl StopEngineOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
     }
 }
 
+impl Drop for StopEngineOnDrop {
+    fn drop(&mut self) {
+        if let Some(engine_stop) = self.0.take() {
+            engine_stop.stop(StopCause::Cancelled);
+        }
+    }
+}
+
+/// The plan's stop reason in effect now: a fired cancel, or a passed deadline.
+fn cause_now(ctx: &RunContext) -> Option<StopCause> {
+    if ctx.cancel.is_cancelled() {
+        Some(StopCause::Cancelled)
+    } else if ctx.deadline.is_some_and(|d| Instant::now() >= d) {
+        Some(StopCause::DeadlineExceeded)
+    } else {
+        None
+    }
+}
+
+/// Resolves once the plan is stopped (its cancel fires or its deadline
+/// passes), with the reason.
+async fn stopped(ctx: &RunContext) -> StopCause {
+    tokio::select! {
+        biased;
+        () = ctx.cancel.cancelled() => StopCause::Cancelled,
+        () = sleep_until_or_never(ctx.deadline) => StopCause::DeadlineExceeded,
+    }
+}
+
+/// Sleeps until `at`, or forever without one.
+async fn sleep_until_or_never(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A leaf's rows, each `next()` raced against the plan's stop: once the plan
+/// is stopped the stream yields one [`SofError::Cancelled`] (or a
+/// [`SofError::Timeout`] for the deadline) and ends, dropping the leaf's own
+/// stream, so a leaf whose runner is quiet (still sorting, still listing a
+/// type) cannot hold the plan. The leaf's runner sees the same stop through
+/// its child token and deadline.
+fn until_stopped(rows: RowStream, ctx: &RunContext) -> RowStream {
+    let cancel = ctx.cancel.clone();
+    let deadline = ctx.deadline;
+    Box::pin(futures::stream::unfold(Some(rows), move |rows| {
+        let cancel = cancel.clone();
+        async move {
+            let mut rows = rows?;
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Some((Err(SofError::Cancelled), None)),
+                () = sleep_until_or_never(deadline) => Some((
+                    Err(SofError::Timeout {
+                        budget: None,
+                        message: "the SQL query's deadline passed".to_string(),
+                    }),
+                    None,
+                )),
+                item = rows.next() => item.map(|item| (item, Some(rows))),
+            }
+        }
+    }))
+}
+
 /// Converts a `RowStream<Result<Value, SofError>>` into a
-/// `Stream<Item = Result<Value, String>>` for the engine (it doesn't know the
-/// persistence crate's error type).
-fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, String>> + Send {
-    use futures::StreamExt;
-    stream.map(|r| r.map_err(|e| e.to_string()))
+/// `Stream<Item = Result<Value, SourceError>>` for the engine (it doesn't
+/// know the persistence crate's error type). Each error keeps its kind
+/// ([`source_error_from_sof`]), so a leaf that fails after emitting rows is
+/// answered like one that fails at its start (council S2).
+fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, SourceError>> + Send {
+    stream.map(|r| r.map_err(|e| source_error_from_sof(None, e)))
+}
+
+/// The engine-side [`SourceError`] of a leaf's run error: the kind the REST
+/// mapping needs, and a message (prefixed with `context` when given).
+/// [`super::sqlquery::sof_error_from_source`] is its inverse, so a
+/// `SourceStream` error is answered by the one run-error mapping
+/// (`map_sof_error_to_rest`).
+///
+/// A `NotFound` keeps only its references, joined, as the message: the
+/// inverse turns them back into one `NotFound` with the same text.
+pub(crate) fn source_error_from_sof(context: Option<&str>, e: SofError) -> SourceError {
+    let kind = match &e {
+        SofError::Uncompilable { .. }
+        | SofError::InvalidViewDefinition(_)
+        | SofError::ResolutionLimit(_) => SourceFailure::ClientInput(422),
+        SofError::ClientInput { status, .. } => SourceFailure::ClientInput(*status),
+        SofError::NotFound { .. } => SourceFailure::NotFound,
+        SofError::Unavailable { .. } => SourceFailure::Unavailable,
+        SofError::Timeout { .. } => SourceFailure::Timeout,
+        SofError::Cancelled => SourceFailure::Cancelled,
+        SofError::Storage(_) | SofError::Backend { .. } => SourceFailure::Backend,
+    };
+    let message = match (e, context) {
+        (SofError::NotFound { references }, _) => references.join(", "),
+        (other, Some(context)) => format!("{context}: {other}"),
+        (other, None) => other.to_string(),
+    };
+    SourceError::new(kind, message)
 }
 
 // ============================================================================
@@ -1023,7 +1254,7 @@ fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, Strin
 
 #[cfg(test)]
 mod tests {
-    use helios_persistence::core::sof_runner::SofError;
+    use helios_persistence::core::sof_runner::{RunOutput, SofError};
     use helios_persistence::tenant::{TenantId, TenantPermissions};
 
     use super::*;
@@ -1725,11 +1956,11 @@ mod tests {
         async fn run_view(
             &self,
             _tenant: &TenantContext,
-            _view_definition: Value,
-            _filters: ViewFilters,
-        ) -> Result<RowStream, SofError> {
+            _request: RunRequest,
+            _ctx: RunContext,
+        ) -> Result<RunOutput, SofError> {
             let rows = (0..self.rows).map(|i| Ok(json!({"id": format!("p{i}")})));
-            Ok(Box::pin(futures::stream::iter(rows)))
+            Ok(RunOutput::from_rows(Box::pin(futures::stream::iter(rows))))
         }
 
         fn runner_name(&self) -> &'static str {
@@ -1766,6 +1997,7 @@ mod tests {
             plan,
             subject_sql,
             &[],
+            &RunContext::detached(RunKind::SqlQueryDependency),
             limits,
         )
         .await
@@ -2018,6 +2250,257 @@ mod tests {
         assert_eq!(
             message,
             "only SELECT queries are allowed; INSERT statements are not permitted"
+        );
+    }
+
+    /// A `SofRunner` that yields two rows, then the error `fail` builds.
+    struct FailingRunner {
+        fail: fn() -> SofError,
+    }
+
+    #[async_trait]
+    impl SofRunner for FailingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _request: RunRequest,
+            _ctx: RunContext,
+        ) -> Result<RunOutput, SofError> {
+            let rows = vec![
+                Ok(json!({"id": "p0"})),
+                Ok(json!({"id": "p1"})),
+                Err((self.fail)()),
+            ];
+            Ok(RunOutput::from_rows(Box::pin(futures::stream::iter(rows))))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "failing-test-runner"
+        }
+    }
+
+    /// #1864 (A6): a leaf that times out and a leaf that is cancelled after
+    /// emitting rows are told apart by their kind, not by message text: the
+    /// kind crosses the engine's row-stream boundary, and the one run-error
+    /// mapping answers 504 `timeout` for one and 408 for the other. The other
+    /// kinds keep their status the same way.
+    #[tokio::test]
+    async fn timeout_and_cancel_are_told_apart_by_kind() {
+        /// The leaf's error, the kind it keeps, and the `(status, code)` answered.
+        type Case = (fn() -> SofError, SourceFailure, u16, &'static str);
+        let cases: [Case; 5] = [
+            (
+                || SofError::Timeout {
+                    budget: None,
+                    message: "interrupted by the run deadline".into(),
+                },
+                SourceFailure::Timeout,
+                504,
+                "timeout",
+            ),
+            (
+                || SofError::Cancelled,
+                SourceFailure::Cancelled,
+                408,
+                "timeout",
+            ),
+            (
+                || SofError::Uncompilable {
+                    reason: "interrupted".into(),
+                },
+                SourceFailure::ClientInput(422),
+                422,
+                "processing",
+            ),
+            (
+                || SofError::Unavailable {
+                    message: "pool exhausted".into(),
+                },
+                SourceFailure::Unavailable,
+                503,
+                "transient",
+            ),
+            (
+                || SofError::backend_with_sqlstate("XX000", "interrupted"),
+                SourceFailure::Backend,
+                500,
+                "exception",
+            ),
+        ];
+        for (fail, kind, status, code) in cases {
+            let runner: Arc<dyn SofRunner> = Arc::new(FailingRunner { fail });
+            let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+            let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+            let err = execute_plan(
+                InMemorySqlEngine::open().expect("open engine"),
+                &runner,
+                &tenant,
+                &ViewFilters::default(),
+                &plan,
+                "SELECT id FROM obs",
+                &[],
+                &RunContext::detached(RunKind::SqlQueryDependency),
+                limits(100, 100),
+            )
+            .await
+            .err()
+            .expect("the leaf fails mid-stream");
+            match &err {
+                SqlQueryError::SourceStream(source) => assert_eq!(source.kind, kind, "{err:?}"),
+                other => panic!("{kind:?}: expected SourceStream, got {other:?}"),
+            }
+            let (got_status, got_code, _) = sqlquery_err_to_rest(err).client_response();
+            assert_eq!((got_status.as_u16(), got_code), (status, code), "{kind:?}");
+        }
+    }
+
+    /// #1864 (A14, D-5): a subject statement that is still running is stopped
+    /// by each of the plan's stop reasons within the stop bound, and the error
+    /// carries that reason (not SQLite's "interrupted" text): a cancel is a
+    /// cancel, the run's deadline and the per-statement limit are 504
+    /// `timeout`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_subject_statement_stops_for_each_reason() {
+        const ENDLESS: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+                               WHERE x < 4000000000) SELECT count(*) AS n FROM c, obs";
+        let after = Duration::from_millis(300);
+        let bound = Duration::from_secs(1);
+        let cases: [(&str, u64, StopCause, u16); 3] = [
+            ("cancel", 30, StopCause::Cancelled, 408),
+            ("deadline", 30, StopCause::DeadlineExceeded, 504),
+            (
+                "statement limit",
+                1,
+                StopCause::StatementTimeout { secs: 1 },
+                504,
+            ),
+        ];
+        for (name, timeout_secs, cause, status) in cases {
+            // Built at the cell's own start, so its deadline is `after` away.
+            let mut ctx = RunContext::detached(RunKind::SqlQueryDependency);
+            if name == "deadline" {
+                ctx.deadline = Some(Instant::now() + after);
+            }
+            let cancel = ctx.cancel.clone();
+            let runner: Arc<dyn SofRunner> = Arc::new(RowsRunner { rows: 1 });
+            let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+            let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+            let limits = ExecLimits {
+                max_source_rows_per_vd: 10,
+                max_rows: 10,
+                timeout_secs,
+            };
+            let canceller = {
+                let cancel = cancel.clone();
+                let fire = name == "cancel";
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    if fire {
+                        cancel.cancel();
+                    }
+                })
+            };
+            let started = std::time::Instant::now();
+            let err = execute_plan(
+                InMemorySqlEngine::open().expect("open engine"),
+                &runner,
+                &tenant,
+                &ViewFilters::default(),
+                &plan,
+                ENDLESS,
+                &[],
+                &ctx,
+                limits,
+            )
+            .await
+            .err()
+            .expect("only a stop ends the statement");
+            let took = started.elapsed();
+            canceller.await.unwrap();
+            let trigger = if name == "statement limit" {
+                Duration::from_secs(1)
+            } else {
+                after
+            };
+            eprintln!(
+                "SOF-CANCEL sqlquery plan {name}: ended {took:?} after the start (trigger at {trigger:?})"
+            );
+            assert!(
+                took + Duration::from_millis(50) >= trigger,
+                "{name}: the statement ended {took:?} after the start, before its trigger at \
+                 {trigger:?}"
+            );
+            assert!(
+                took <= trigger + bound,
+                "{name}: the statement ran {took:?}, more than {bound:?} past its trigger at {trigger:?}"
+            );
+            assert!(
+                matches!(&err, SqlQueryError::Stopped(c) if *c == cause),
+                "{name}: {err:?}"
+            );
+            let (got, code, _) = sqlquery_err_to_rest(err).client_response();
+            assert_eq!((got.as_u16(), code), (status, "timeout"), "{name}");
+        }
+    }
+
+    /// #1864 N11 (L1-F1, L3-F1; A14/A15): a request abandoned while its SQL
+    /// Query statement runs (a client disconnect or a `408` drops the plan's
+    /// future, and with it the supervisor) still stops the statement: the
+    /// supervisor's drop guard latches the stop on the engine, so the blocking
+    /// worker returns within the bound. The plan's own token is never fired
+    /// here, so only the drop can stop the worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_supervisor_still_stops_its_running_statement() {
+        const ENDLESS: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+                               WHERE x < 4000000000) SELECT count(*) AS n FROM c";
+        let bound = Duration::from_secs(1);
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel::<String>();
+        let ctx = RunContext::detached(RunKind::SqlQueryDependency);
+        let plan = tokio::spawn(async move {
+            let ctx = ctx;
+            on_engine(
+                InMemorySqlEngine::open().expect("open engine"),
+                &ctx,
+                Some(30),
+                move |engine| {
+                    let _ = started_tx.send(());
+                    let result = engine.execute_select(ENDLESS, &[], 10).map(|_| ());
+                    let _ = ended_tx.send(format!("{result:?}"));
+                    result
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the worker starts")
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            ended_rx.try_recv().is_err(),
+            "the statement is still running before the drop"
+        );
+        plan.abort();
+        let dropped = std::time::Instant::now();
+        let ended = tokio::task::spawn_blocking(move || ended_rx.recv_timeout(bound))
+            .await
+            .unwrap();
+        let took = dropped.elapsed();
+        eprintln!(
+            "SOF-CANCEL sqlquery abandoned supervisor: worker returned {took:?} after the drop"
+        );
+        let result = ended.expect("the worker returns within the bound after the drop");
+        assert_eq!(
+            result,
+            format!(
+                "{:?}",
+                Err::<(), _>(SqlQueryError::Stopped(StopCause::Cancelled))
+            ),
+            "the statement ends as the abandoned plan's stop"
         );
     }
 }

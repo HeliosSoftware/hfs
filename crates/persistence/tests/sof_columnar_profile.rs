@@ -37,7 +37,9 @@
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+use helios_persistence::core::sof_runner::{
+    RunContext, RunKind, RunRequest, SofRunner, ViewFilters,
+};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::{Value, json};
 
@@ -222,8 +224,13 @@ async fn run_stages(
     reset_peak_rss();
     let t = Instant::now();
     let mut stream = runner
-        .run_view(tenant, view.clone(), ViewFilters::default())
+        .run_view(
+            tenant,
+            RunRequest::new(view.clone(), ViewFilters::default()),
+            RunContext::detached(RunKind::UnlimitedRun),
+        )
         .await
+        .map(|output| output.rows)
         .expect("run_view");
     let mut rows: Vec<Value> = Vec::new();
     while let Some(row) = stream.next().await {
@@ -269,7 +276,11 @@ async fn run_stages(
     reset_peak_rss();
     let t = Instant::now();
     let mut stream = runner
-        .run_view_columnar(tenant, view.clone(), ViewFilters::default())
+        .run_view_columnar(
+            tenant,
+            RunRequest::new(view.clone(), ViewFilters::default()),
+            RunContext::detached(RunKind::UnlimitedRun),
+        )
         .await
         .expect("run_view_columnar")
         .expect("runner supports columnar");

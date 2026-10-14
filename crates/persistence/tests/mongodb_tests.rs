@@ -9911,7 +9911,9 @@ async fn mongodb_integration_large_id_seed_with_small_compartment_drives_from_th
 /// still takes the aggregation pipeline.
 #[tokio::test]
 async fn mongodb_integration_sof_runner_compartment_filters_fall_back_in_process() {
-    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{
+        RunContext, RunKind, RunRequest, SofRunner, ViewFilters,
+    };
     use tokio_stream::StreamExt;
 
     let Some(backend) = create_backend("sof_compartment_fallback").await else {
@@ -9966,8 +9968,13 @@ async fn mongodb_integration_sof_runner_compartment_filters_fall_back_in_process
             "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
         });
         let mut stream = runner
-            .run_view(tenant, view, filters)
+            .run_view(
+                tenant,
+                RunRequest::new(view, filters),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view must succeed");
         let mut ids = Vec::new();
         while let Some(row) = stream.next().await {
@@ -10019,7 +10026,9 @@ async fn mongodb_integration_sof_runner_compartment_filters_fall_back_in_process
 /// materialising the full Observation collection into memory.
 #[tokio::test]
 async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
-    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{
+        RunContext, RunKind, RunRequest, SofRunner, ViewFilters,
+    };
     use tokio_stream::StreamExt;
 
     // CHUNK_SIZE inside in_process.rs is 1024.  We seed 1_124 Observations
@@ -10096,8 +10105,13 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
         filters: ViewFilters,
     ) -> Vec<String> {
         let mut stream = runner
-            .run_view(tenant, view, filters)
+            .run_view(
+                tenant,
+                RunRequest::new(view, filters),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view");
         let mut ids = Vec::new();
         while let Some(row) = stream.next().await {
@@ -10176,7 +10190,7 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
 #[cfg(feature = "R4")]
 #[tokio::test]
 async fn mongodb_integration_sof_pr410_views_match_in_process_reference() {
-    use helios_persistence::core::sof_runner::ViewFilters;
+    use helios_persistence::core::sof_runner::{RunContext, RunKind, RunRequest, ViewFilters};
     use std::collections::BTreeMap;
     use tokio_stream::StreamExt;
 
@@ -10208,8 +10222,13 @@ async fn mongodb_integration_sof_pr410_views_match_in_process_reference() {
         .chain(sof_pr410_views::extra_cases())
     {
         let got = match runner
-            .run_view(&tenant, case.view, ViewFilters::default())
+            .run_view(
+                &tenant,
+                RunRequest::new(case.view, ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
         {
             Ok(mut stream) => {
                 let mut rows = Vec::new();
@@ -10245,7 +10264,9 @@ async fn mongodb_integration_sof_pr410_views_match_in_process_reference() {
 
 #[tokio::test]
 async fn mongodb_integration_sof_since_filter() {
-    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{
+        RunContext, RunKind, RunRequest, SofRunner, ViewFilters,
+    };
     use tokio_stream::StreamExt;
 
     // MongoDB uses a native in-DB aggregation runner for unfiltered queries.
@@ -10332,8 +10353,13 @@ async fn mongodb_integration_sof_since_filter() {
         filters: ViewFilters,
     ) -> Vec<String> {
         let mut stream = runner
-            .run_view(tenant, view, filters)
+            .run_view(
+                tenant,
+                RunRequest::new(view, filters),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view");
         let mut ids = Vec::new();
         while let Some(row) = stream.next().await {
@@ -10412,7 +10438,7 @@ async fn mongodb_integration_sof_since_filter() {
     let empty = collect_ids_since(
         runner.as_ref(),
         &tenant,
-        view,
+        view.clone(),
         ViewFilters {
             patient: vec!["Patient/since-pt-1".to_string()],
             since: Some(future_cutoff),
@@ -10424,6 +10450,51 @@ async fn mongodb_integration_sof_since_filter() {
         empty.is_empty(),
         "since set in the future must return no observations: {empty:?}"
     );
+
+    // #1864 (A18): MongoDB stores milliseconds, so a cutoff a fraction of a
+    // millisecond after the first resource's stamp rounds **up** to the next
+    // millisecond and drops it, on the native aggregation runner (no
+    // compartment filter) as on the in-process fallback. The native runner
+    // used to floor the cutoff and keep it. A cutoff equal to the stamp keeps
+    // it on both.
+    let sub_ms = before_at + chrono::Duration::microseconds(500);
+    for (path, patient) in [
+        ("native", Vec::new()),
+        ("fallback", vec!["Patient/since-pt-1".to_string()]),
+    ] {
+        let dropped = collect_ids_since(
+            runner.as_ref(),
+            &tenant,
+            view.clone(),
+            ViewFilters {
+                patient: patient.clone(),
+                since: Some(sub_ms),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            dropped,
+            vec!["since-obs-after"],
+            "{path}: since={sub_ms:?} is after the stored {before_at:?} and must drop it"
+        );
+        let kept = collect_ids_since(
+            runner.as_ref(),
+            &tenant,
+            view.clone(),
+            ViewFilters {
+                patient,
+                since: Some(before_at),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            kept,
+            vec!["since-obs-after", "since-obs-before"],
+            "{path}: since={before_at:?} equals the stored stamp and must keep it"
+        );
+    }
 }
 
 #[tokio::test]

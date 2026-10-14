@@ -547,6 +547,13 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.sof_runner()
     }
 
+    fn export_sof_runner(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> Option<Arc<dyn SofRunner>> {
+        self.composite.export_sof_runner(options)
+    }
+
     async fn count_by_types(
         &self,
         tenant: &TenantContext,
@@ -1655,6 +1662,24 @@ mod tests {
                 recent_writes: Some(1),
             })
         );
+    }
+
+    /// #1864: the submit-jobs wrapper forwards `export_sof_runner` to the
+    /// composite (and so to its primary's export runner), as production's
+    /// PostgreSQL + Elasticsearch bulk-submit wiring needs.
+    #[test]
+    fn export_sof_runner_is_forwarded_to_the_composite() {
+        use crate::core::export_runner::test_support::{
+            ExportMarkerStorage, assert_export_runner_is_forwarded, composite_over,
+        };
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let marker = Arc::new(ExportMarkerStorage::default());
+        let jobs = CompositeSubmitJobs::new(
+            sqlite as Arc<dyn BulkSubmitJobStore>,
+            Arc::new(composite_over(marker.clone())),
+        );
+        assert_export_runner_is_forwarded(&jobs, &marker);
     }
 
     /// #1912: the submit-jobs wrapper forwards the tenant existence probe to

@@ -2405,7 +2405,7 @@ async fn test_minio_tenant_has_resources_matches_discovery() {
 /// `content().clone()` would silently return null for both fields.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_minio_sof_scan_resources_include_server_meta() {
-    use helios_persistence::core::sof_runner::ViewFilters;
+    use helios_persistence::core::sof_runner::{RunContext, RunKind, RunRequest, ViewFilters};
     use tokio_stream::StreamExt;
 
     if skip_if_disabled("test_minio_sof_scan_resources_include_server_meta") {
@@ -2447,8 +2447,13 @@ async fn test_minio_sof_scan_resources_include_server_meta() {
         .sof_runner()
         .expect("S3 backend must provide a SOF runner");
     let mut stream = runner
-        .run_view(&t, view, ViewFilters::default())
+        .run_view(
+            &t,
+            RunRequest::new(view, ViewFilters::default()),
+            RunContext::detached(RunKind::Preview),
+        )
         .await
+        .map(|output| output.rows)
         .expect("run_view");
 
     let row = stream
@@ -2478,7 +2483,7 @@ async fn test_minio_sof_scan_resources_include_server_meta() {
 /// `meta.lastUpdated` happened to be embedded in the stored body, which it is not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_minio_sof_since_filter() {
-    use helios_persistence::core::sof_runner::ViewFilters;
+    use helios_persistence::core::sof_runner::{RunContext, RunKind, RunRequest, ViewFilters};
     use tokio_stream::StreamExt;
 
     if skip_if_disabled("test_minio_sof_since_filter") {
@@ -2547,7 +2552,15 @@ async fn test_minio_sof_since_filter() {
         let t = t.clone();
         let view = view.clone();
         async move {
-            let mut stream = runner.run_view(&t, view, filters).await.expect("run_view");
+            let mut stream = runner
+                .run_view(
+                    &t,
+                    RunRequest::new(view, filters),
+                    RunContext::detached(RunKind::Preview),
+                )
+                .await
+                .map(|output| output.rows)
+                .expect("run_view");
             let mut ids = Vec::new();
             while let Some(row) = stream.next().await {
                 ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());
@@ -2597,7 +2610,7 @@ async fn test_minio_sof_since_filter() {
 /// observations for each patient, and that the two sets are disjoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_minio_sof_patient_filter() {
-    use helios_persistence::core::sof_runner::ViewFilters;
+    use helios_persistence::core::sof_runner::{RunContext, RunKind, RunRequest, ViewFilters};
     use tokio_stream::StreamExt;
 
     if skip_if_disabled("test_minio_sof_patient_filter") {
@@ -2670,7 +2683,15 @@ async fn test_minio_sof_patient_filter() {
         let t = t.clone();
         let view = view.clone();
         async move {
-            let mut stream = runner.run_view(&t, view, filters).await.expect("run_view");
+            let mut stream = runner
+                .run_view(
+                    &t,
+                    RunRequest::new(view, filters),
+                    RunContext::detached(RunKind::Preview),
+                )
+                .await
+                .map(|output| output.rows)
+                .expect("run_view");
             let mut ids = Vec::new();
             while let Some(row) = stream.next().await {
                 ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());

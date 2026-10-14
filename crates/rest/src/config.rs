@@ -67,6 +67,17 @@ use clap::Parser;
 use helios_fhir::FhirVersion;
 use helios_persistence::BackendKind;
 
+/// The most seconds a SQL-on-FHIR budget (`HFS_SOF_RUN_TIMEOUT_SECS`,
+/// `HFS_EXPORT_JOB_TIMEOUT_SECS`) may have: in milliseconds it becomes a
+/// PostgreSQL `statement_timeout`, whose maximum is `i32::MAX`.
+pub const MAX_SOF_BUDGET_SECS: u64 = i32::MAX as u64 / 1000;
+
+/// How far under `HFS_REQUEST_TIMEOUT` a `$sql-run` that answers only once
+/// it has all its rows must end, so the caller gets the run's `504` rather
+/// than the request timeout's `408` (#1864 D-1b; the #1911 precedent keeps
+/// `count_by_tenant` 5 s under the default 30 s).
+pub const SOF_REQUEST_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Storage backend mode.
 ///
 /// Determines which backend configuration the server uses.
@@ -1553,6 +1564,35 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_CLEANUP_INTERVAL", default_value = "300")]
     pub export_cleanup_interval_secs: u64,
 
+    /// Time budget (seconds) of one `$sql-export` job.
+    ///
+    /// It starts when the job starts running (gets its concurrency slot; time
+    /// spent queued does not count) and is not renewed per subject or page.
+    /// Every run of the job, view subjects and SQL Query dependencies alike,
+    /// must end by then; a job still running at the end of it fails, and its
+    /// result answers `504` with code `timeout`. On PostgreSQL every export
+    /// statement runs under `SET LOCAL statement_timeout` from what is left of
+    /// it, and it is also the export connections' session `statement_timeout`
+    /// (a backstop). Must be at least 1 and at most 2147483 (`i32::MAX`
+    /// milliseconds, PostgreSQL's `statement_timeout` limit).
+    #[arg(long, env = "HFS_EXPORT_JOB_TIMEOUT_SECS", default_value = "3600")]
+    pub export_job_timeout_secs: u64,
+
+    /// Connections in the PostgreSQL pool `$sql-export` jobs read through.
+    ///
+    /// PostgreSQL gives export jobs their own connection pool (connections
+    /// named `hfs-export` in `pg_stat_activity`), so a long export never holds
+    /// a request-serving connection. A job runs one statement at a time;
+    /// unset, this is [`Self::export_max_concurrency`] (at least 1), one
+    /// connection per running job. With fewer connections, running jobs wait
+    /// for a free one (the export pool has no wait timeout) rather than fail,
+    /// and stay cancellable and bounded by their budget while they wait. These
+    /// connections are in addition to `HFS_PG_MAX_CONNECTIONS`, so budget the
+    /// server's `max_connections` for both. Must be greater than 0. Other
+    /// backends ignore it.
+    #[arg(long, env = "HFS_EXPORT_PG_MAX_CONNECTIONS")]
+    pub export_pg_max_connections: Option<usize>,
+
     /// Maximum rows in a SQL Query's own result, for `$sql-run` and
     /// `$sql-export` alike (dependencies are bounded separately by
     /// `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`).
@@ -1585,8 +1625,27 @@ pub struct ServerConfig {
 
     /// Hard timeout (seconds) for each SQL statement a SQL Query runs — its
     /// own SQL and each SQL View's — in `$sql-run` and `$sql-export` alike.
+    /// The run's own deadline caps it: a statement never outlives the
+    /// request's budget, or the export job's (`HFS_EXPORT_JOB_TIMEOUT_SECS`).
+    /// Dependency materialization is bounded by that deadline, not by this.
     #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
     pub sof_sqlquery_timeout_secs: u64,
+
+    /// Time budget (seconds) of a `$sql-run` ViewDefinition run that streams
+    /// its rows (`_format=ndjson`, `parquet` or `arrow` without `_limit` and
+    /// without the `Binary` envelope).
+    ///
+    /// Every other `$sql-run` (a run with `_limit`, any buffered format, a
+    /// SQL Query) answers only once it has all its rows, so it is bounded by
+    /// `HFS_REQUEST_TIMEOUT` minus 2 seconds (at least 1 second) instead, or by
+    /// this budget if smaller: the run ends with `504` (code `timeout`) just
+    /// before the request timeout would answer `408`. On PostgreSQL every SoF
+    /// statement runs under `SET LOCAL statement_timeout` from what is left of
+    /// its run's budget, so `HFS_PG_STATEMENT_TIMEOUT_MS` no longer bounds SoF
+    /// statements. Must be at least 1 and at most 2147483 (`i32::MAX`
+    /// milliseconds, PostgreSQL's `statement_timeout` limit).
+    #[arg(long, env = "HFS_SOF_RUN_TIMEOUT_SECS", default_value = "600")]
+    pub sof_run_timeout_secs: u64,
 
     /// Add an `X-HFS-Runner` response header naming the SQL-on-FHIR runner
     /// that served a `$sql-run` ViewDefinition request (e.g. `sqlite-indb`,
@@ -1726,10 +1785,13 @@ impl Default for ServerConfig {
             export_controller: "memory".to_string(),
             export_output_ttl_secs: 86_400,
             export_cleanup_interval_secs: 300,
+            export_job_timeout_secs: 3600,
+            export_pg_max_connections: None,
             sof_sqlquery_max_rows: 100_000,
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
             sof_sqlquery_timeout_secs: 30,
+            sof_run_timeout_secs: 600,
             sof_runner_header: false,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
@@ -1912,6 +1974,24 @@ impl ServerConfig {
             ));
         }
 
+        for (name, secs) in [
+            ("HFS_SOF_RUN_TIMEOUT_SECS", self.sof_run_timeout_secs),
+            ("HFS_EXPORT_JOB_TIMEOUT_SECS", self.export_job_timeout_secs),
+        ] {
+            if secs == 0 {
+                errors.push(format!("{name} cannot be 0"));
+            } else if secs > MAX_SOF_BUDGET_SECS {
+                errors.push(format!(
+                    "{name} cannot exceed {MAX_SOF_BUDGET_SECS} seconds (PostgreSQL's \
+                     statement_timeout limit of 2147483647 ms)"
+                ));
+            }
+        }
+
+        if let Err(error) = self.export_runner_options() {
+            errors.push(error);
+        }
+
         if let Err(mut bulk_errors) = self.bulk_export.validate() {
             errors.append(&mut bulk_errors);
         }
@@ -1936,6 +2016,58 @@ impl ServerConfig {
         } else {
             Err(errors)
         }
+    }
+
+    /// The budget of a `$sql-run` that streams its rows
+    /// (`HFS_SOF_RUN_TIMEOUT_SECS`).
+    pub fn sof_run_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.sof_run_timeout_secs.min(MAX_SOF_BUDGET_SECS))
+    }
+
+    /// The bound of a `$sql-run` that answers only once it has all its rows
+    /// (a preview with `_limit`, a buffered format, a SQL Query):
+    /// `HFS_REQUEST_TIMEOUT` minus [`SOF_REQUEST_TIMEOUT_MARGIN`], at least
+    /// one second, so the run ends with `504` before the request timeout
+    /// answers `408` (#1864 D-1b). Callers take the smaller of this and
+    /// [`Self::sof_run_budget`].
+    pub fn sof_buffered_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.request_timeout)
+            .saturating_sub(SOF_REQUEST_TIMEOUT_MARGIN)
+            .max(std::time::Duration::from_secs(1))
+    }
+
+    /// The budget of one export job (`HFS_EXPORT_JOB_TIMEOUT_SECS`), counted
+    /// from the moment the job starts running.
+    pub fn export_job_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.export_job_timeout_secs.min(MAX_SOF_BUDGET_SECS))
+    }
+
+    /// The settings for the runner `$sql-export` jobs read through, as the
+    /// storage layer takes them: `HFS_EXPORT_PG_MAX_CONNECTIONS` (default
+    /// `HFS_EXPORT_MAX_CONCURRENCY`, at least 1) and the export job budget as
+    /// the export connections' session `statement_timeout`.
+    ///
+    /// # Errors
+    ///
+    /// A configuration message when `HFS_EXPORT_PG_MAX_CONNECTIONS` is 0.
+    /// [`Self::validate`] reports the same message, so startup fails on it
+    /// rather than every export's first connection.
+    pub fn export_runner_options(
+        &self,
+    ) -> Result<helios_persistence::core::ExportRunnerOptions, String> {
+        let max_connections = match self.export_pg_max_connections {
+            Some(0) => return Err("HFS_EXPORT_PG_MAX_CONNECTIONS cannot be 0".to_string()),
+            Some(n) => n,
+            // A zero concurrency has no running job to serve; one connection
+            // keeps the pool well-formed.
+            None => self.export_max_concurrency.max(1),
+        };
+        let statement_timeout_ms =
+            u64::try_from(self.export_job_budget().as_millis()).unwrap_or(u64::MAX);
+        Ok(helios_persistence::core::ExportRunnerOptions {
+            max_connections,
+            statement_timeout_ms,
+        })
     }
 
     /// Creates a configuration suitable for testing.
@@ -2009,10 +2141,13 @@ impl ServerConfig {
             export_controller: "memory".to_string(),
             export_output_ttl_secs: 86_400,
             export_cleanup_interval_secs: 300,
+            export_job_timeout_secs: 3600,
+            export_pg_max_connections: None,
             sof_sqlquery_max_rows: 100_000,
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
             sof_sqlquery_timeout_secs: 30,
+            sof_run_timeout_secs: 600,
             sof_runner_header: false,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
@@ -2616,6 +2751,163 @@ mod tests {
         let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
         for config in [parsed, ServerConfig::default(), ServerConfig::for_testing()] {
             assert_eq!(config.max_body_size, 128 * 1024 * 1024);
+        }
+    }
+
+    // ── SQL-on-FHIR budgets and the PostgreSQL export pool (#1864) ──
+
+    /// Unset, the export pool has one connection per concurrent export job
+    /// and the job budget as its session timeout, on every construction path.
+    #[test]
+    fn test_export_pg_defaults() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        for config in [parsed, ServerConfig::default(), ServerConfig::for_testing()] {
+            assert_eq!(config.export_pg_max_connections, None);
+            assert_eq!(config.export_job_timeout_secs, 3600);
+            assert_eq!(config.sof_run_timeout_secs, 600);
+            let options = config.export_runner_options().unwrap();
+            assert_eq!(options.max_connections, config.export_max_concurrency);
+            assert_eq!(options.statement_timeout_ms, 3_600_000);
+            // `for_testing` has port 0, which `validate` refuses; none of the
+            // budget or export-pool settings is refused by default.
+            let errors = config.validate().err().unwrap_or_default();
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.contains("HFS_SOF_") || e.contains("HFS_EXPORT_")),
+                "{errors:?}"
+            );
+        }
+        // The pool follows a changed concurrency, never dropping below one.
+        let config = ServerConfig {
+            export_max_concurrency: 9,
+            ..Default::default()
+        };
+        assert_eq!(config.export_runner_options().unwrap().max_connections, 9);
+        let config = ServerConfig {
+            export_max_concurrency: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.export_runner_options().unwrap().max_connections, 1);
+    }
+
+    #[test]
+    fn test_cli_export_pg_knobs_parse() {
+        let parsed = ServerConfig::try_parse_from([
+            "rest-server",
+            "--export-pg-max-connections",
+            "3",
+            "--export-job-timeout-secs",
+            "10",
+            "--sof-run-timeout-secs",
+            "120",
+        ])
+        .unwrap();
+        assert_eq!(parsed.export_pg_max_connections, Some(3));
+        assert_eq!(parsed.export_job_timeout_secs, 10);
+        assert_eq!(parsed.sof_run_timeout_secs, 120);
+        let options = parsed.export_runner_options().unwrap();
+        assert_eq!(options.max_connections, 3);
+        assert_eq!(options.statement_timeout_ms, 10_000);
+        assert_eq!(
+            parsed.export_job_budget(),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(parsed.sof_run_budget(), std::time::Duration::from_secs(120));
+        assert!(parsed.validate().is_ok());
+
+        for (flag, value) in [
+            ("--export-pg-max-connections", "many"),
+            ("--export-job-timeout-secs", "-1"),
+            ("--sof-run-timeout-secs", "1.5"),
+        ] {
+            assert!(
+                ServerConfig::try_parse_from(["rest-server", flag, value]).is_err(),
+                "{flag} {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_export_pg_max_connections_fails_validation() {
+        let config = ServerConfig {
+            export_pg_max_connections: Some(0),
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == "HFS_EXPORT_PG_MAX_CONNECTIONS cannot be 0"),
+            "{errors:?}"
+        );
+    }
+
+    /// A budget of 0 is refused (it is not "unlimited"), and so is one whose
+    /// milliseconds do not fit PostgreSQL's `statement_timeout`.
+    #[test]
+    fn test_sof_budgets_out_of_range_fail_validation() {
+        for (name, zero, too_big) in [
+            (
+                "HFS_SOF_RUN_TIMEOUT_SECS",
+                ServerConfig {
+                    sof_run_timeout_secs: 0,
+                    ..Default::default()
+                },
+                ServerConfig {
+                    sof_run_timeout_secs: MAX_SOF_BUDGET_SECS + 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "HFS_EXPORT_JOB_TIMEOUT_SECS",
+                ServerConfig {
+                    export_job_timeout_secs: 0,
+                    ..Default::default()
+                },
+                ServerConfig {
+                    export_job_timeout_secs: MAX_SOF_BUDGET_SECS + 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let errors = zero.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|e| e == &format!("{name} cannot be 0")),
+                "{errors:?}"
+            );
+            let errors = too_big.validate().unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with(&format!("{name} cannot exceed 2147483 seconds"))),
+                "{errors:?}"
+            );
+        }
+        // The largest accepted budget is exactly i32::MAX ms, rounded down.
+        let config = ServerConfig {
+            export_job_timeout_secs: MAX_SOF_BUDGET_SECS,
+            sof_run_timeout_secs: MAX_SOF_BUDGET_SECS,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(config.export_runner_options().unwrap().statement_timeout_ms <= i32::MAX as u64);
+    }
+
+    /// A run that answers only once it has all its rows ends 2 s under the
+    /// request timeout (at least 1 s), so the caller sees its 504 (D-1b).
+    #[test]
+    fn test_sof_buffered_budget_sits_under_the_request_timeout() {
+        for (request_timeout, expected) in [(30, 28), (5, 3), (3, 1), (2, 1), (1, 1)] {
+            let config = ServerConfig {
+                request_timeout,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.sof_buffered_budget(),
+                std::time::Duration::from_secs(expected),
+                "HFS_REQUEST_TIMEOUT={request_timeout}"
+            );
         }
     }
 

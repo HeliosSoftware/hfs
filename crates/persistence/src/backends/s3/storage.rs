@@ -2658,13 +2658,96 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
+        self.scan_current(tenant, resource_type, None).await
+    }
+
+    /// `_since` against the instant S3 stored for each resource
+    /// ([`StoredResource::last_modified`], nanoseconds), not the JSON
+    /// `meta.lastUpdated` the scan yields, which is truncated to milliseconds:
+    /// a cutoff equal to the stored instant keeps the resource, one a
+    /// nanosecond later drops it (#1864).
+    async fn scan_resources_since(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
+        self.scan_current(tenant, resource_type, Some(cutoff)).await
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        use crate::core::sof_runner::SofError;
+        use futures::stream::{self, StreamExt};
+
+        // One GET per id against the `current.json` key — no LIST, so the cost
+        // is the number of ids rather than the size of the type's keyspace.
+        let loaded: Vec<Result<Option<StoredResource>, SofError>> =
+            stream::iter(ids.iter().cloned())
+                .map(|id| {
+                    let backend = self.clone();
+                    let tenant = tenant.clone();
+                    let resource_type = resource_type.to_string();
+                    async move {
+                        backend
+                            .load_current_with_meta(&tenant, &resource_type, &id)
+                            .await
+                            .map(|current| {
+                                current
+                                    .map(|c| c.resource)
+                                    .filter(|resource| !resource.is_deleted())
+                            })
+                            .map_err(sof_error_from_storage)
+                    }
+                })
+                .buffer_unordered(self.bulk_write_concurrency())
+                .collect()
+                .await;
+
+        let mut out = Vec::with_capacity(ids.len());
+        for result in loaded {
+            if let Some(resource) = result? {
+                out.push(resource.into_content_with_meta());
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The run error for a failed S3 read of a SQL-on-FHIR scan (LIST, GET, the
+/// tenant's location): a classified backend condition keeps its run kind
+/// ([`SofError::from_backend_error`]: throttling, an unreachable endpoint or a
+/// missing bucket stay [`SofError::Unavailable`], 503 with `Retry-After`);
+/// anything else is a storage fault.
+fn sof_error_from_storage(e: crate::error::StorageError) -> crate::core::sof_runner::SofError {
+    use crate::core::sof_runner::SofError;
+    match e {
+        crate::error::StorageError::Backend(backend) => SofError::from_backend_error(backend),
+        other => SofError::Storage(other.to_string()),
+    }
+}
+
+impl S3Backend {
+    /// The live resources of `resource_type` for `tenant`, listed one LIST page
+    /// at a time and read with pipelined GETs, keeping only those stored at or
+    /// after `since` when one is given (compared on the stored instant).
+    async fn scan_current(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
         use crate::core::sof_runner::SofError;
         use futures::stream::{self, StreamExt};
 
         let location = self
             .resource_location(tenant)
             .await
-            .map_err(|e| SofError::Storage(e.to_string()))?;
+            .map_err(sof_error_from_storage)?;
 
         // The type is listed one LIST page at a time as the stream is read, so
         // the first rows come after the first page, memory holds one page of
@@ -2688,7 +2771,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                     .client
                     .list_objects(&bucket, &prefix, token.as_deref(), Some(1000))
                     .await
-                    .map_err(|e| SofError::Storage(backend.map_client_error(e).to_string()));
+                    .map_err(|e| sof_error_from_storage(backend.map_client_error(e)));
                 Some(match page {
                     Ok(page) => {
                         let keys: Vec<(Result<String, SofError>, Option<String>)> = page
@@ -2727,7 +2810,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                     let read = backend
                         .get_json_object::<StoredResource>(&bucket, &key)
                         .await
-                        .map_err(|e| SofError::Storage(e.to_string()))?;
+                        .map_err(sof_error_from_storage)?;
                     Ok(read.map(|(resource, meta)| {
                         // Remember the tombstone under the ETag the GET saw; the
                         // LIST's ETag matches it when nothing was rewritten.
@@ -2744,58 +2827,21 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                 }
             })
             .buffer_unordered(concurrency)
-            .filter_map(|result| async move {
+            .filter_map(move |result| async move {
                 match result {
                     Err(e) => Some(Err(e)),
                     Ok(None) => None,
                     Ok(Some(resource)) if resource.is_deleted() => None,
+                    Ok(Some(resource))
+                        if since.is_some_and(|cutoff| resource.last_modified() < cutoff) =>
+                    {
+                        None
+                    }
                     Ok(Some(resource)) => Some(Ok(resource.into_content_with_meta())),
                 }
             });
 
         Ok(Box::pin(scan_stream))
-    }
-
-    async fn read_resources(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        ids: &[String],
-    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
-        use crate::core::sof_runner::SofError;
-        use futures::stream::{self, StreamExt};
-
-        // One GET per id against the `current.json` key — no LIST, so the cost
-        // is the number of ids rather than the size of the type's keyspace.
-        let loaded: Vec<Result<Option<StoredResource>, SofError>> =
-            stream::iter(ids.iter().cloned())
-                .map(|id| {
-                    let backend = self.clone();
-                    let tenant = tenant.clone();
-                    let resource_type = resource_type.to_string();
-                    async move {
-                        backend
-                            .load_current_with_meta(&tenant, &resource_type, &id)
-                            .await
-                            .map(|current| {
-                                current
-                                    .map(|c| c.resource)
-                                    .filter(|resource| !resource.is_deleted())
-                            })
-                            .map_err(|e| SofError::Storage(e.to_string()))
-                    }
-                })
-                .buffer_unordered(self.bulk_write_concurrency())
-                .collect()
-                .await;
-
-        let mut out = Vec::with_capacity(ids.len());
-        for result in loaded {
-            if let Some(resource) = result? {
-                out.push(resource.into_content_with_meta());
-            }
-        }
-        Ok(out)
     }
 }
 

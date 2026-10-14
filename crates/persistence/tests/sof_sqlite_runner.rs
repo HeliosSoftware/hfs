@@ -24,7 +24,9 @@ mod sqlite_runner_tests {
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
     use helios_persistence::core::ResourceStorage;
-    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{
+        RunContext, RunKind, RunRequest, SofRunner, ViewFilters,
+    };
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -89,12 +91,16 @@ mod sqlite_runner_tests {
             let cardinality = runner
                 .run_view(
                     &tenant,
-                    json!({"resourceType":"ViewDefinition", "resource":"Composition",
+                    RunRequest::new(
+                        json!({"resourceType":"ViewDefinition", "resource":"Composition",
                         "select":[{"column":[{"name":"subject", "path":"subject.reference",
                             "collection":false}]}]}),
-                    ViewFilters::default(),
+                        ViewFilters::default(),
+                    ),
+                    RunContext::detached(RunKind::Preview),
                 )
-                .await;
+                .await
+                .map(|output| output.rows);
             if version == FhirVersion::R5 {
                 assert!(matches!(
                     cardinality,
@@ -220,8 +226,13 @@ mod sqlite_runner_tests {
         });
         let runner = backend.sof_runner().expect("runner");
         let mut stream = runner
-            .run_view(&tenant, view, ViewFilters::default())
+            .run_view(
+                &tenant,
+                RunRequest::new(view, ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view");
         let mut rows: Vec<Value> = Vec::new();
         while let Some(row) = stream.next().await {
@@ -262,8 +273,13 @@ mod sqlite_runner_tests {
         view: Value,
     ) -> Vec<BTreeMap<String, Value>> {
         let mut stream = runner
-            .run_view(tenant, view, ViewFilters::default())
+            .run_view(
+                tenant,
+                RunRequest::new(view, ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view must succeed");
 
         let mut rows: Vec<BTreeMap<String, Value>> = Vec::new();
@@ -411,13 +427,17 @@ mod sqlite_runner_tests {
         let mut stream = runner
             .run_view(
                 &tenant,
-                view,
-                ViewFilters {
-                    limit: Some(2),
-                    ..Default::default()
-                },
+                RunRequest::new(
+                    view,
+                    ViewFilters {
+                        limit: Some(2),
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::Preview),
             )
             .await
+            .map(|output| output.rows)
             .expect("run_view must succeed");
 
         let mut count = 0;
@@ -511,8 +531,13 @@ mod sqlite_runner_tests {
 
         // unionAll now compiles to SQL UNION ALL — should succeed
         let stream = runner
-            .run_view(&tenant, view, ViewFilters::default())
+            .run_view(
+                &tenant,
+                RunRequest::new(view, ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("unionAll view must compile and run");
 
         let rows: Vec<_> = stream
@@ -1384,8 +1409,13 @@ mod sqlite_runner_tests {
         filters: ViewFilters,
     ) -> Vec<Value> {
         let mut stream = runner
-            .run_view(tenant, view, filters)
+            .run_view(
+                tenant,
+                RunRequest::new(view, filters),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run view");
         let mut rows = Vec::new();
         while let Some(row) = stream.next().await {
@@ -1397,6 +1427,49 @@ mod sqlite_runner_tests {
     fn preview_flat_view(resource: &str, alias: &str) -> Value {
         json!({"resourceType":"ViewDefinition", "resource":resource,
             "select":[{"column":[{"path":"id","name":alias}]}]})
+    }
+
+    /// A Patient view whose first two columns share the name `x` (a stored
+    /// view is not re-linted, so the runner can receive it).
+    fn duplicate_name_view() -> Value {
+        json!({"resourceType":"ViewDefinition", "resource":"Patient", "status":"active",
+        "select":[{"column":[
+            {"path":"id","name":"x"},
+            {"path":"gender","name":"x"},
+            {"path":"birthDate","name":"dob"}
+        ]}]})
+    }
+
+    /// Two output columns with the same name: the columnar path declines the
+    /// view, and the row path it falls back to still answers with one `x` key
+    /// per row (first position, last column's value), as main's runner did.
+    #[tokio::test]
+    async fn duplicate_column_names_fall_back_to_rows_with_one_key() {
+        let backend = make_backend().await;
+        seed_patients(&backend, &[("p1", "male", "1990-01-01")]).await;
+        let tenant = test_tenant();
+        let runner = backend.sof_runner().expect("in-DB runner");
+
+        let columnar = runner
+            .run_view_columnar(
+                &tenant,
+                RunRequest::new(duplicate_name_view(), ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
+            .await
+            .expect("run_view_columnar");
+        assert!(columnar.is_none(), "duplicate names have no columnar path");
+
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            duplicate_name_view(),
+            ViewFilters::default(),
+        )
+        .await;
+        assert_eq!(rows, [json!({"x": "male", "dob": "1990-01-01"})]);
+        let keys: Vec<&String> = rows[0].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["x", "dob"]);
     }
 
     static PREVIEW_SQL_TRACE: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
@@ -2244,7 +2317,9 @@ mod total_order_acceptance {
     use super::sof_prefix_matrix as matrix;
     use futures::StreamExt;
     use helios_persistence::backends::sqlite::SqliteBackend;
-    use helios_persistence::core::sof_runner::{SofError, SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{
+        RunContext, RunKind, RunRequest, SofError, SofRunner, ViewFilters,
+    };
     use helios_persistence::sof::sqlite::SqliteInDbRunner;
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use serde_json::{Value, json};
@@ -2258,8 +2333,13 @@ mod total_order_acceptance {
 
     async fn rows(runner: &dyn SofRunner, view: Value, filters: ViewFilters) -> Vec<Value> {
         let mut stream = runner
-            .run_view(&tenant(), view, filters)
+            .run_view(
+                &tenant(),
+                RunRequest::new(view, filters),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run view");
         let mut rows = Vec::new();
         while let Some(row) = stream.next().await {
@@ -2568,13 +2648,17 @@ mod total_order_acceptance {
         let result = runner
             .run_view(
                 &tenant(),
-                invalid,
-                ViewFilters {
-                    group: vec!["Group/g-empty".into()],
-                    ..Default::default()
-                },
+                RunRequest::new(
+                    invalid,
+                    ViewFilters {
+                        group: vec!["Group/g-empty".into()],
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::Preview),
             )
-            .await;
+            .await
+            .map(|output| output.rows);
         assert!(
             matches!(result, Err(SofError::Uncompilable { .. })),
             "NUL emission must fail before empty Group short circuit"

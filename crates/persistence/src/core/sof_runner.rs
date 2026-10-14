@@ -3,7 +3,7 @@
 //! This module defines the [`SofRunner`] trait, implemented per-backend. Two
 //! strategies exist:
 //!
-//! - **In-DB runners** compile a [`ViewDefinition`] to a native query executed
+//! - **In-DB runners** compile a `ViewDefinition` to a native query executed
 //!   inside the storage backend, skipping FHIRPath evaluation entirely: SQLite
 //!   and PostgreSQL compile to SQL, MongoDB compiles to an aggregation pipeline.
 //! - **In-process runners** stream the resources out of a backend that has no
@@ -19,13 +19,16 @@
 //! The handler layer streams the result rows directly into the HTTP response.
 //!
 //! Every runner streams rows from a spawned task (`tokio::spawn` or
-//! `spawn_blocking`) that owns the channel's sender. Runners must start that
-//! task and hand its `JoinHandle` to [`watch_row_producer`] so a panic or
-//! cancellation inside the task surfaces as an `Err` item on the stream
-//! instead of silently looking like a clean end of stream.
+//! `spawn_blocking`) that owns the channel's sender. The SQL runners use the
+//! producer core in [`sof_producer`](super::sof_producer) (a batch channel with
+//! an end marker, supervised tasks and one stop signal); the other runners
+//! start their task and hand its `JoinHandle` to [`watch_row_producer`]. Either
+//! way a panic or cancellation inside the task surfaces as an `Err` item on the
+//! stream instead of silently looking like a clean end of stream.
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -33,8 +36,10 @@ use helios_sof::arrow::record_batch::RecordBatch;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::sof_schema::ViewSchema;
 use crate::tenant::TenantContext;
 
 /// Filters that narrow which resources are processed by a view run.
@@ -83,7 +88,146 @@ pub type ViewRow = Value;
 /// responses, so it was removed.
 pub type RowStream = Pin<Box<dyn Stream<Item = Result<ViewRow, SofError>> + Send + 'static>>;
 
+/// What one view run asks for: the view and the filters that narrow it.
+///
+/// The row cap stays in [`ViewFilters::limit`].
+#[derive(Debug, Clone)]
+pub struct RunRequest {
+    /// The raw ViewDefinition JSON (any FHIR version).
+    pub view: Value,
+    /// Filters (patient, group, since, limit).
+    pub filters: ViewFilters,
+}
+
+impl RunRequest {
+    /// A request for `view` narrowed by `filters`.
+    pub fn new(view: Value, filters: ViewFilters) -> Self {
+        Self { view, filters }
+    }
+}
+
+/// Why a view runs, which decides its budget.
+///
+/// The REST layer turns the kind into the run's
+/// [`deadline`](RunContext::deadline); runners read only the deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RunKind {
+    /// A capped interactive `$viewdefinition-run` (a preview).
+    Preview,
+    /// A `$viewdefinition-run` without a row cap.
+    UnlimitedRun,
+    /// One subject (or leaf) of an export job.
+    ExportJob,
+    /// A ViewDefinition a SQL Query Library depends on, materialized for the
+    /// query.
+    SqlQueryDependency,
+}
+
+/// How a caller can stop a run: a cancel signal, an optional deadline, and the
+/// run's kind.
+///
+/// Dropping the returned row stream also counts as a cancel. See
+/// [`SofRunner::run_view`] for what each stop does to the stream.
+#[derive(Debug, Clone)]
+pub struct RunContext {
+    /// Fired by the caller to cancel the run.
+    pub cancel: CancellationToken,
+    /// The instant by which the run must have ended, if any. A
+    /// [`tokio::time::Instant`], so paused-clock tests can drive it.
+    pub deadline: Option<tokio::time::Instant>,
+    /// Why the view runs.
+    pub kind: RunKind,
+}
+
+impl RunContext {
+    /// A context nothing else cancels, with no deadline: the run stops only
+    /// when its stream is dropped.
+    pub fn detached(kind: RunKind) -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            deadline: None,
+            kind,
+        }
+    }
+}
+
+/// What a runner declares about one run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunCapabilities {
+    /// The rows come out in a total order. Which key that is depends on the
+    /// runner and the run kind: `(last_updated, id)` for a SQL preview or
+    /// unlimited run, the resource id for PostgreSQL export pages. SQL
+    /// flat/`forEach` runs have one; SQL `unionAll`/`repeat` runs, MongoDB and
+    /// the in-process runner do not.
+    pub total_order: bool,
+    /// The runner declared [`RunOutput::schema`]. `false` means the schema is
+    /// empty and says nothing about the rows.
+    pub declared_schema: bool,
+    /// Stopping the run also stops the work the database server is doing for
+    /// it, not only the client side of the run.
+    pub cancels_server_side: bool,
+}
+
+/// The result of starting a view run: its declared schema, its capabilities and
+/// its rows.
+pub struct RunOutput {
+    /// The output columns, in ViewDefinition document order.
+    pub schema: ViewSchema,
+    /// What the runner declares about this run.
+    pub capabilities: RunCapabilities,
+    /// The rows, one flat JSON object each. Every row has exactly the keys of
+    /// [`schema`](Self::schema), in its order, with an explicit `null` for an
+    /// empty column (see [`ViewSchema`]).
+    pub rows: RowStream,
+}
+
+impl RunOutput {
+    /// An output with `schema`, `capabilities` and `rows`.
+    pub fn new(schema: ViewSchema, capabilities: RunCapabilities, rows: RowStream) -> Self {
+        Self {
+            schema,
+            capabilities,
+            rows,
+        }
+    }
+
+    /// An output that declares nothing: an empty schema and no capabilities.
+    /// For wrappers and test doubles that only produce rows.
+    pub fn from_rows(rows: RowStream) -> Self {
+        Self::new(ViewSchema::default(), RunCapabilities::default(), rows)
+    }
+}
+
+impl std::fmt::Debug for RunOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOutput")
+            .field("schema", &self.schema)
+            .field("capabilities", &self.capabilities)
+            .field("rows", &"<row stream>")
+            .finish()
+    }
+}
+
 /// Errors that can occur during SQL-on-FHIR view execution.
+///
+/// Each variant is one *kind* of failure, and every caller maps a kind to the
+/// same answer: the REST layer has one mapping (`map_sof_error_to_rest` in
+/// `helios-rest`), used by `$sql-run` (ViewDefinition and Library subjects)
+/// and by the export job status.
+///
+/// | Kind | `$sql-run` answer |
+/// |---|---|
+/// | [`Uncompilable`](Self::Uncompilable), [`InvalidViewDefinition`](Self::InvalidViewDefinition), [`ResolutionLimit`](Self::ResolutionLimit) | 422 |
+/// | [`ClientInput`](Self::ClientInput) | its `status` (422, or 400 for any other value) |
+/// | [`NotFound`](Self::NotFound) | 400, OperationOutcome code `not-found` |
+/// | [`Unavailable`](Self::Unavailable) | 503 with `Retry-After` |
+/// | [`Timeout`](Self::Timeout) | 504, OperationOutcome code `timeout` |
+/// | [`Cancelled`](Self::Cancelled) | an export job reports its own status; a `$sql-run` client has already gone or been answered by the request timeout |
+/// | [`Storage`](Self::Storage), [`Backend`](Self::Backend) | 500 |
+///
+/// Only `Storage` and `Backend` are server faults. A kind is chosen where the
+/// failure is still typed (a PostgreSQL SQLSTATE, a MongoDB error code, a
+/// `BackendError`), never by matching message text.
 #[derive(Debug, thiserror::Error)]
 pub enum SofError {
     /// The ViewDefinition contains constructs that this runner cannot compile or execute.
@@ -100,23 +244,148 @@ pub enum SofError {
     #[error("invalid view definition: {0}")]
     InvalidViewDefinition(String),
 
-    /// An error occurred while fetching resources from the storage backend.
-    #[error("storage error: {0}")]
-    Storage(String),
-
-    /// A backend-level SQL or driver error.
-    #[error("backend error: {0}")]
-    Backend(String),
-
     /// A batch of resources references more distinct resources than the runner
     /// may read for `resolve()`. The handler layer maps this variant to a
     /// `422 Unprocessable Entity` OperationOutcome.
     #[error("too many references to resolve: {0}")]
     ResolutionLimit(String),
 
+    /// The request cannot be served as given, for a reason the caller can fix.
+    /// `status` is the HTTP status the caller should see: `422` for a request
+    /// that is well-formed but cannot be processed, any other value answers
+    /// `400`.
+    #[error("{message}")]
+    ClientInput {
+        /// The HTTP status for the caller (`422`, otherwise `400`).
+        status: u16,
+        /// Client-facing description of what is wrong with the request.
+        message: String,
+    },
+
+    /// A `patient` or `group` reference names a resource that does not exist
+    /// (or was deleted). `$sql-run` answers `400` with OperationOutcome code
+    /// `not-found`.
+    #[error("referenced resources not found: {}", references.join(", "))]
+    NotFound {
+        /// The references that did not resolve, as the caller wrote them.
+        references: Vec<String>,
+    },
+
+    /// The backend cannot serve the run right now: no connection could be
+    /// obtained, or the server is saturated or shutting down. A retry may
+    /// succeed. Answered with `503` and `Retry-After`.
+    #[error("backend unavailable: {message}")]
+    Unavailable {
+        /// Operator-facing detail (never sent to clients).
+        message: String,
+    },
+
+    /// The run, or one of its statements, exceeded a time limit and was
+    /// stopped. Answered with `504` and OperationOutcome code `timeout`.
+    #[error("view run timed out: {message}")]
+    Timeout {
+        /// The time limit that was exceeded, when the run itself set it.
+        /// `None` when a limit outside the run stopped it (for example a
+        /// connection pool's session `statement_timeout`).
+        budget: Option<Duration>,
+        /// Operator-facing detail (never sent to clients).
+        message: String,
+    },
+
     /// The view run was cancelled (e.g. client disconnected, export job cancelled).
     #[error("view run cancelled")]
     Cancelled,
+
+    /// An error occurred while fetching resources from the storage backend.
+    #[error("storage error: {0}")]
+    Storage(String),
+
+    /// A backend-level SQL or driver error: a server fault. Build it with
+    /// [`SofError::backend`] (no SQLSTATE) or
+    /// [`SofError::backend_with_sqlstate`].
+    #[error("backend error: {message}")]
+    Backend {
+        /// The PostgreSQL SQLSTATE of the error, when the backend is PostgreSQL
+        /// and the server reported one. Logged by the REST layer.
+        sqlstate: Option<String>,
+        /// Operator-facing detail (never sent to clients).
+        message: String,
+    },
+}
+
+impl SofError {
+    /// A [`SofError::Backend`] without a SQLSTATE.
+    pub fn backend(message: impl Into<String>) -> Self {
+        Self::Backend {
+            sqlstate: None,
+            message: message.into(),
+        }
+    }
+
+    /// A [`SofError::Backend`] that keeps the PostgreSQL SQLSTATE `sqlstate`.
+    pub fn backend_with_sqlstate(sqlstate: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Backend {
+            sqlstate: Some(sqlstate.into()),
+            message: message.into(),
+        }
+    }
+
+    /// Lowers a classified storage [`BackendError`](crate::error::BackendError)
+    /// to its run kind: unavailable, refused or exhausted connections become
+    /// [`SofError::Unavailable`], a server-side time limit becomes
+    /// [`SofError::Timeout`] (with no run budget), everything else
+    /// [`SofError::Backend`].
+    pub fn from_backend_error(err: crate::error::BackendError) -> Self {
+        use crate::error::BackendError as B;
+        match err {
+            B::Unavailable { .. } | B::ConnectionFailed { .. } | B::PoolExhausted { .. } => {
+                Self::Unavailable {
+                    message: err.to_string(),
+                }
+            }
+            B::Timeout { .. } => Self::Timeout {
+                budget: None,
+                message: err.to_string(),
+            },
+            other => Self::backend(other.to_string()),
+        }
+    }
+}
+
+/// Why a run stopped before its natural end.
+///
+/// A runner takes the kind of a stop it initiated from this reason, never from
+/// the error the backend reports for the interrupted work (a PostgreSQL
+/// `57014`, a SQLite interrupt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StopReason {
+    /// The consumer dropped the row stream. Nobody reads the stream any more,
+    /// so the run ends without an error item.
+    Dropped,
+    /// The caller fired [`RunContext::cancel`].
+    Cancelled,
+    /// [`RunContext::deadline`] passed.
+    DeadlineExceeded,
+}
+
+impl StopReason {
+    /// The error item a stop ends the stream with: none for
+    /// [`Dropped`](Self::Dropped), [`SofError::Cancelled`] for a cancel, and
+    /// [`SofError::Timeout`] carrying `budget` (the time the run had when it
+    /// started) for a deadline.
+    pub fn into_error(self, budget: Option<Duration>) -> Option<SofError> {
+        match self {
+            Self::Dropped => None,
+            Self::Cancelled => Some(SofError::Cancelled),
+            Self::DeadlineExceeded => Some(SofError::Timeout {
+                budget,
+                message: match budget {
+                    Some(budget) => format!("the run's deadline passed (budget {budget:?})"),
+                    None => "the run's deadline passed".to_string(),
+                },
+            }),
+        }
+    }
 }
 
 /// Sender half of a runner's row channel.
@@ -140,7 +409,7 @@ pub type BatchSender = mpsc::Sender<Result<RecordBatch, SofError>>;
 /// `spawn_blocking`) that owns the channel's original `Sender`; `tx` is a
 /// clone of that sender kept outside the task. If the task ends with a
 /// `JoinError` (panic or cancellation), an
-/// `Err(SofError::Backend("row producer failed: …"))` is sent through `tx`
+/// `Err(SofError::Backend { message: "row producer failed: …", .. })` is sent through `tx`
 /// and a `warn!` names the runner; if it ends normally, nothing is sent.
 /// Because `tx` stays alive until the outcome is known, the receiver only
 /// observes end-of-stream after the producer's fate has been reported —
@@ -158,7 +427,7 @@ pub fn watch_row_producer<T: Send + 'static>(
                 "SoF row producer ended before finishing its stream"
             );
             let _ = tx
-                .send(Err(SofError::Backend(format!("row producer failed: {e}"))))
+                .send(Err(SofError::backend(format!("row producer failed: {e}"))))
                 .await;
         }
     });
@@ -174,8 +443,8 @@ pub fn watch_row_producer<T: Send + 'static>(
 /// # Object safety
 ///
 /// `SofRunner` is object-safe and intended for use as `Arc<dyn SofRunner>`. The
-/// [`run_view`] method returns a heap-allocated [`RowStream`] to avoid associated
-/// types that would break object safety.
+/// [`run_view`](Self::run_view) method returns a heap-allocated
+/// [`RowStream`] to avoid associated types that would break object safety.
 ///
 /// # Threading
 ///
@@ -183,31 +452,85 @@ pub fn watch_row_producer<T: Send + 'static>(
 /// and shared across request tasks.
 #[async_trait]
 pub trait SofRunner: Send + Sync {
-    /// Execute a ViewDefinition and return a stream of output rows.
+    /// Start a view run and return its schema, capabilities and row stream.
     ///
     /// # Arguments
     ///
     /// * `tenant` — The tenant context; all resource access is scoped to this tenant.
-    /// * `view_definition` — The raw ViewDefinition JSON (any FHIR version).
-    /// * `filters` — Optional filters (patient, group, since, limit).
+    /// * `request` — The raw ViewDefinition JSON (any FHIR version) and its
+    ///   filters (patient, group, since, limit).
+    /// * `ctx` — The run's cancel signal, deadline and kind.
     ///
     /// # Returns
     ///
-    /// A [`RowStream`] that yields one flat JSON object per output row. The stream
-    /// may be infinite in theory; callers should honour the `filters.limit` cap or
+    /// A [`RunOutput`]: the declared [`ViewSchema`] (the view's columns in
+    /// ViewDefinition document order, known before the first row), the run's
+    /// [`RunCapabilities`], and a [`RowStream`] that yields one flat JSON
+    /// object per output row. Callers should honour the `filters.limit` cap or
     /// impose their own.
+    ///
+    /// Every row is normalized at the runner boundary: it has exactly the keys
+    /// of the schema, in schema order, with an explicit `null` for an empty
+    /// column, whatever order the runner's compiled query produces its columns
+    /// in (a `select` after a `unionAll`, say). A runner permutes its compiled
+    /// columns into schema order once per run; the emitted query, and so the
+    /// row order, does not depend on it.
+    ///
+    /// # Dropping the stream
+    ///
+    /// Dropping the row stream stops the run: the runner stops the work the
+    /// backend is doing for it (see [`RunCapabilities::cancels_server_side`])
+    /// and gives its connection back. A run that reaches its
+    /// [`ViewFilters::limit`] stops the same way. Neither adds an error item.
+    ///
+    /// A cancel, a deadline and a drop are one stop signal, and the target is
+    /// that the backend's work ends within one second of it. A runner that
+    /// stops server work bounds its cleanup from the stop: PostgreSQL sends a
+    /// cancel request while it still holds the connection, drains the
+    /// statement and rolls back, all inside a one-second cleanup envelope, and
+    /// a phase that stalls closes the connection instead. The drain timeout
+    /// only decides whether the connection is reused or closed; it never
+    /// extends the cleanup past the envelope. Three stops are bounded
+    /// by something other than the runner, and are documented as exceptions:
+    /// a FHIRPath terminology call in flight inside an in-process evaluation
+    /// (`FHIRPATH_TERMINOLOGY_TIMEOUT`), a MongoDB deployment that refuses
+    /// both the own-operation `killOp` and the disconnect kill (`maxTimeMS`,
+    /// the deadline), and a PostgreSQL cancel request that cannot reach the
+    /// server (`SET LOCAL statement_timeout`, the deadline; the connection is
+    /// still closed within the envelope).
     ///
     /// # Errors
     ///
-    /// Returns [`SofError::Uncompilable`] synchronously (before the stream is polled)
-    /// when this runner cannot handle the given ViewDefinition. The handler layer
-    /// must catch this and either fall back to the in-process runner or return `422`.
+    /// Returns [`SofError::Uncompilable`] synchronously (before the stream is
+    /// polled) when this runner cannot handle the given ViewDefinition. A
+    /// failure after the stream was returned is an `Err` item on the stream,
+    /// after which the stream ends. Either way the error carries its kind
+    /// (see [`SofError`]): for example a backend that is unavailable is
+    /// [`SofError::Unavailable`] and a server-side time limit is
+    /// [`SofError::Timeout`], never a [`SofError::Backend`] string. A stream
+    /// never ends early without an error item, so a partial row set cannot
+    /// look complete.
+    ///
+    /// A stop that is not a drop ends the stream with an error item whose
+    /// kind comes from the [`StopReason`]: [`SofError::Cancelled`] after
+    /// [`RunContext::cancel`], [`SofError::Timeout`] (with the run's budget)
+    /// after the deadline.
+    ///
+    /// # Deadlines
+    ///
+    /// [`RunContext::deadline`] is absolute: a runner never renews it per
+    /// statement or page. The SQL runners enforce it on the server where they
+    /// can (PostgreSQL runs every statement under `SET LOCAL
+    /// statement_timeout` from the time left; SQLite checks it from a
+    /// progress handler), and on the client for the steps the server cannot
+    /// see (connection checkout, delivery to a slow consumer). A run whose
+    /// deadline has already passed ends as a timeout without running.
     async fn run_view(
         &self,
         tenant: &TenantContext,
-        view_definition: Value,
-        filters: ViewFilters,
-    ) -> Result<RowStream, SofError>;
+        request: RunRequest,
+        ctx: RunContext,
+    ) -> Result<RunOutput, SofError>;
 
     /// Execute a ViewDefinition and return its rows as Arrow record batches,
     /// built straight from database values without the JSON step.
@@ -217,14 +540,24 @@ pub trait SofRunner: Send + Sync {
     /// returns `Ok(None)`, so existing runners and wrappers keep working, and
     /// a wrapper that does not forward this method silently takes the row path.
     ///
+    /// Everything [`run_view`](Self::run_view) states about stopping, errors
+    /// and deadlines holds here too, with `ctx` as the run's context (#1864):
+    /// dropping the batch stream, a cancel or the deadline stops the backend's
+    /// work within the same bound; a stop that is not a drop ends the stream
+    /// with its typed error item; a failure carries its [`SofError`] kind; and
+    /// the stream never ends early without an error item. The columns of every
+    /// batch are the view's output columns in ViewDefinition document order
+    /// (the order of [`RunOutput::schema`]), whatever order the compiled query
+    /// produces them in.
+    ///
     /// [`SofError::Uncompilable`] is returned synchronously, as for `run_view`.
     /// `Ok(Some(stream))` that ends without a batch means the view produced
     /// no rows; its schema is not known then.
     async fn run_view_columnar(
         &self,
         _tenant: &TenantContext,
-        _view_definition: Value,
-        _filters: ViewFilters,
+        _request: RunRequest,
+        _ctx: RunContext,
     ) -> Result<Option<BatchStream>, SofError> {
         Ok(None)
     }
@@ -235,17 +568,24 @@ pub trait SofRunner: Send + Sync {
     /// A runner for one export job, or `None` when this runner has nothing to
     /// share between the subjects of a job.
     ///
-    /// An export job runs many views one after another, and a runner that
-    /// reads a type by scanning storage (S3) would scan it once per view. The
-    /// runner returned here may keep what it read for the life of the job, so
-    /// views over the same type read it once and the job sees one snapshot.
+    /// An export job runs many views one after another. The job has no
+    /// job-wide snapshot: each view, and each page of a paged view, reads
+    /// storage as it is at that read, so a resource created or deleted while
+    /// the job runs may or may not appear in it.
     ///
-    /// A runner may also return a differently configured clone for the job
-    /// because an export, unlike a preview, reads a whole type: the PostgreSQL
-    /// runner reads each view in keyset pages over the resource id, so no
-    /// statement sorts or holds the entire type, and its rows come out in
-    /// bytewise id order (not `(last_updated, id)`) without a single snapshot
-    /// across pages.
+    /// - The PostgreSQL runner returns a clone that reads each view in keyset
+    ///   pages over the resource id, one statement (in its own `READ ONLY`
+    ///   transaction) per page, so no statement sorts or holds the entire
+    ///   type; its rows come out in bytewise id order (not
+    ///   `(last_updated, id)`).
+    /// - The in-process runner (S3) returns a runner whose scans go through a
+    ///   per-job cache, so the views of a job share one read of a type, but
+    ///   only for a type of 20,000 resources or fewer, keyed by
+    ///   `(tenant, type, cutoff)`: views with different `_since` cutoffs never
+    ///   share a read. A larger type is read again by each view.
+    ///
+    /// Every run of the job still takes its own [`RunContext`]: the job's
+    /// budget is the runs' deadline, so a shared runner never extends it.
     fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
         None
     }
@@ -289,7 +629,7 @@ mod tests {
             }
             let error_item = stream.next().await.expect("expected error item");
             match error_item {
-                Err(SofError::Backend(m)) => {
+                Err(SofError::Backend { message: m, .. }) => {
                     assert!(m.contains("row producer failed"), "unexpected message: {m}");
                 }
                 other => panic!("expected SofError::Backend, got {other:?}"),
@@ -321,7 +661,7 @@ mod tests {
 
             let error_item = stream.next().await.expect("expected error item");
             match error_item {
-                Err(SofError::Backend(m)) => {
+                Err(SofError::Backend { message: m, .. }) => {
                     assert!(m.contains("cancelled"), "unexpected message: {m}");
                 }
                 other => panic!("expected SofError::Backend, got {other:?}"),
@@ -355,5 +695,50 @@ mod tests {
         })
         .await
         .expect("stream consumption must not hang");
+    }
+
+    /// A classified storage error keeps its kind as a run error: a transient
+    /// condition stays retryable (`Unavailable`), a server-side time limit is
+    /// a `Timeout` with no run budget, and only the rest is a `Backend` fault.
+    #[test]
+    fn backend_errors_lower_to_their_run_kind() {
+        use crate::error::BackendError;
+        let name = || "postgres".to_string();
+        for err in [
+            BackendError::Unavailable {
+                backend_name: name(),
+                message: "shutting down".into(),
+            },
+            BackendError::ConnectionFailed {
+                backend_name: name(),
+                message: "refused".into(),
+            },
+            BackendError::PoolExhausted {
+                backend_name: name(),
+            },
+        ] {
+            let lowered = SofError::from_backend_error(err);
+            assert!(
+                matches!(lowered, SofError::Unavailable { .. }),
+                "{lowered:?}"
+            );
+        }
+        let lowered = SofError::from_backend_error(BackendError::Timeout {
+            backend_name: name(),
+            message: "57014".into(),
+        });
+        assert!(
+            matches!(lowered, SofError::Timeout { budget: None, ref message } if message.contains("57014")),
+            "{lowered:?}"
+        );
+        let lowered = SofError::from_backend_error(BackendError::Internal {
+            backend_name: name(),
+            message: "boom".into(),
+            source: None,
+        });
+        assert!(
+            matches!(lowered, SofError::Backend { sqlstate: None, ref message } if message.contains("boom")),
+            "{lowered:?}"
+        );
     }
 }

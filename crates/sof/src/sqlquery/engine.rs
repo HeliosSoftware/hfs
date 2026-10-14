@@ -2,6 +2,20 @@
 //!
 //! One connection per request. Each depends-on ViewDefinition is materialized
 //! into a named table; the user's SQL then runs against those tables.
+//!
+//! ## Stopping the engine
+//!
+//! Every engine carries an [`EngineStop`]: a latched stop reason plus the
+//! connection's interrupt handle. `sqlite3_interrupt` alone is not enough,
+//! because it only affects a statement that is running when it is called: an
+//! interrupt sent while the blocking worker is still queued, or between two
+//! statements, is lost. So the reason is set first and stays set, and the
+//! engine reads it at every point where work starts: a progress handler
+//! (installed at [`InMemorySqlEngine::open`]) aborts any statement once a reason
+//! is set, and [`InMemorySqlEngine::execute_select`],
+//! [`InMemorySqlEngine::create_table`], [`InMemorySqlEngine::create_view`] and
+//! each row [`InMemorySqlEngine::insert_rows`] inserts check it before running.
+//! A stopped operation ends with [`SqlQueryError::Stopped`] carrying the reason.
 
 use futures::Stream;
 use futures::StreamExt;
@@ -12,7 +26,83 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
-use super::{BoundParam, SqlQueryError};
+use super::{BoundParam, SourceError, SqlQueryError, StopCause};
+
+/// SQLite virtual-machine instructions between two calls of the engine's
+/// progress handler, which aborts a statement once a stop reason is set.
+const PROGRESS_OPS: i32 = 1_000;
+
+/// The latched stop of one [`InMemorySqlEngine`], shared with whoever may stop
+/// it (a supervisor on another task or thread).
+///
+/// [`stop`](Self::stop) sets the reason before it interrupts the connection, so
+/// whatever the interrupt ends reports that reason. The reason is never
+/// cleared: an engine that was stopped stays stopped, which is what makes a
+/// stop that arrives before a statement starts (or between two statements)
+/// take effect at the next one.
+#[derive(Clone)]
+pub struct EngineStop {
+    state: Arc<EngineStopState>,
+}
+
+struct EngineStopState {
+    /// The first reason set wins.
+    cause: OnceLock<StopCause>,
+    interrupt: rusqlite::InterruptHandle,
+}
+
+impl EngineStop {
+    fn new(conn: &Connection) -> Self {
+        Self {
+            state: Arc::new(EngineStopState {
+                cause: OnceLock::new(),
+                interrupt: conn.get_interrupt_handle(),
+            }),
+        }
+    }
+
+    /// Stops the engine for `cause`: latches the reason (an earlier reason
+    /// stays in effect), then interrupts the statement running now, if any.
+    /// Returns the reason in effect.
+    pub fn stop(&self, cause: StopCause) -> StopCause {
+        let _ = self.state.cause.set(cause);
+        self.state.interrupt.interrupt();
+        self.cause().unwrap_or(cause)
+    }
+
+    /// Interrupts the running statement again when a reason is latched; a
+    /// no-op otherwise. A supervisor calls it periodically until the blocking
+    /// work returns, so an interrupt that found no statement running is
+    /// repeated once one starts (the progress handler also aborts it).
+    pub fn interrupt(&self) {
+        if self.cause().is_some() {
+            self.state.interrupt.interrupt();
+        }
+    }
+
+    /// The latched reason, if the engine was stopped.
+    pub fn cause(&self) -> Option<StopCause> {
+        self.state.cause.get().copied()
+    }
+
+    /// Fails with [`SqlQueryError::Stopped`] once a reason is latched.
+    fn check(&self) -> Result<(), SqlQueryError> {
+        match self.cause() {
+            Some(cause) => Err(SqlQueryError::Stopped(cause)),
+            None => Ok(()),
+        }
+    }
+
+    /// The error an operation that failed ends with: its stop reason when the
+    /// engine was stopped (the failure is then the interrupt, whatever SQLite
+    /// called it), otherwise `error` itself.
+    fn or_stopped(&self, error: SqlQueryError) -> SqlQueryError {
+        match self.cause() {
+            Some(cause) => SqlQueryError::Stopped(cause),
+            None => error,
+        }
+    }
+}
 
 /// FHIR type code for a column. Mirrors the value-set used by
 /// `ViewDefinition.select.column.type` so we can pick the correct value[X]
@@ -233,6 +323,7 @@ pub struct QueryResult {
 /// The in-memory SQLite engine.
 pub struct InMemorySqlEngine {
     conn: Connection,
+    stop: EngineStop,
 }
 
 impl InMemorySqlEngine {
@@ -245,17 +336,23 @@ impl InMemorySqlEngine {
              PRAGMA temp_store = MEMORY;
              PRAGMA foreign_keys = OFF;",
         )?;
-        Ok(Self { conn })
+        let stop = EngineStop::new(&conn);
+        // Aborts whatever statement runs once a stop reason is latched, so a
+        // stop is not lost when its interrupt found no statement running.
+        let latched = Arc::clone(&stop.state);
+        conn.progress_handler(PROGRESS_OPS, Some(move || latched.cause.get().is_some()));
+        Ok(Self { conn, stop })
     }
 
-    /// Returns an interrupt handle that can cancel a running statement from
-    /// another thread (used by the request-level timeout watchdog).
-    pub fn interrupt_handle(&self) -> rusqlite::InterruptHandle {
-        self.conn.get_interrupt_handle()
+    /// The engine's stop, to be held by whoever may stop it from another task
+    /// or thread (see [`EngineStop`]).
+    pub fn stop_handle(&self) -> EngineStop {
+        self.stop.clone()
     }
 
     /// Create a table with the given label and schema.
     pub fn create_table(&self, label: &str, schema: &TableSchema) -> Result<(), SqlQueryError> {
+        self.stop.check()?;
         validate_identifier(label)?;
         let mut columns_ddl = Vec::with_capacity(schema.columns.len());
         for col in &schema.columns {
@@ -272,7 +369,9 @@ impl InMemorySqlEngine {
         } else {
             format!("CREATE TABLE \"{}\" ({})", label, columns_ddl.join(", "))
         };
-        self.conn.execute(&sql, [])?;
+        self.conn
+            .execute(&sql, [])
+            .map_err(|e| self.stop.or_stopped(e.into()))?;
         Ok(())
     }
 
@@ -283,12 +382,15 @@ impl InMemorySqlEngine {
     /// The view lives in this request's in-memory database and disappears
     /// with it.
     pub fn create_view(&self, label: &str, source: &str) -> Result<(), SqlQueryError> {
+        self.stop.check()?;
         validate_identifier(label)?;
         validate_identifier(source)?;
-        self.conn.execute(
-            &format!("CREATE VIEW \"{label}\" AS SELECT * FROM \"{source}\""),
-            [],
-        )?;
+        self.conn
+            .execute(
+                &format!("CREATE VIEW \"{label}\" AS SELECT * FROM \"{source}\""),
+                [],
+            )
+            .map_err(|e| self.stop.or_stopped(e.into()))?;
         // SQLite defers a view's column/table resolution to first use (the
         // same forward-reference allowance it grants triggers), so a missing
         // `source` would otherwise go unnoticed until a caller later queries
@@ -298,7 +400,7 @@ impl InMemorySqlEngine {
         // leaving a dangling one behind.
         if let Err(e) = self.conn.prepare(&format!("SELECT * FROM \"{label}\"")) {
             let _ = self.conn.execute(&format!("DROP VIEW \"{label}\""), []);
-            return Err(e.into());
+            return Err(self.stop.or_stopped(e.into()));
         }
         Ok(())
     }
@@ -324,6 +426,12 @@ impl InMemorySqlEngine {
     /// transaction has already been rolled back and the engine is dropped;
     /// callers are expected to abort the current plan rather than keep using
     /// a half-populated database.
+    ///
+    /// The stop reason is checked before each row is inserted, so a stopped
+    /// engine inserts nothing more and ends with [`SqlQueryError::Stopped`].
+    /// A row stream that is waiting for its next row is not woken by the
+    /// stop: the caller ends such a stream itself (the REST plan executor
+    /// races every `next()` against the same cancel).
     pub async fn insert_rows<S>(
         self,
         label: &str,
@@ -332,7 +440,7 @@ impl InMemorySqlEngine {
         max_rows: usize,
     ) -> Result<(Self, usize), SqlQueryError>
     where
-        S: Stream<Item = Result<Value, String>> + Send + 'static + ?Sized,
+        S: Stream<Item = Result<Value, SourceError>> + Send + 'static + ?Sized,
     {
         let label = label.to_string();
         let schema = schema.clone();
@@ -359,8 +467,9 @@ impl InMemorySqlEngine {
         handle: &tokio::runtime::Handle,
     ) -> Result<usize, SqlQueryError>
     where
-        S: Stream<Item = Result<Value, String>> + Send + ?Sized,
+        S: Stream<Item = Result<Value, SourceError>> + Send + ?Sized,
     {
+        self.stop.check()?;
         validate_identifier(label)?;
         for col in &schema.columns {
             validate_identifier(&col.name)?;
@@ -369,7 +478,8 @@ impl InMemorySqlEngine {
             // Drain the stream without inserting; nothing to persist.
             let mut n = 0usize;
             while let Some(item) = handle.block_on(rows.next()) {
-                item.map_err(SqlQueryError::SourceStream)?;
+                self.stop.check()?;
+                item.map_err(|e| self.stop.or_stopped(SqlQueryError::SourceStream(e)))?;
                 n += 1;
                 if n > max_rows {
                     return Err(SqlQueryError::RowCapExceeded { max: max_rows });
@@ -394,6 +504,7 @@ impl InMemorySqlEngine {
         let result: Result<usize, SqlQueryError> = (|| {
             let mut stmt = self.conn.prepare(&insert_sql)?;
             while let Some(item) = handle.block_on(rows.next()) {
+                self.stop.check()?;
                 let row = item.map_err(SqlQueryError::SourceStream)?;
                 inserted += 1;
                 if inserted > max_rows {
@@ -415,6 +526,10 @@ impl InMemorySqlEngine {
                 Ok(n)
             }
             Err(e) => {
+                let e = self.stop.or_stopped(e);
+                // On a stopped engine the progress handler may abort this
+                // ROLLBACK too; nothing is lost, the caller drops the engine
+                // after an error.
                 let _ = self.conn.execute("ROLLBACK", []);
                 Err(e)
             }
@@ -432,12 +547,16 @@ impl InMemorySqlEngine {
     /// the prepared statement. The authorizer is removed before returning, so
     /// the engine's own `create_table` / `insert_rows` / `create_view`
     /// statements are unaffected.
+    ///
+    /// A stopped engine runs nothing and returns [`SqlQueryError::Stopped`];
+    /// a stop while the statement runs aborts it with the same error.
     pub fn execute_select(
         &self,
         sql: &str,
         bindings: &[BoundParam],
         max_rows: usize,
     ) -> Result<QueryResult, SqlQueryError> {
+        self.stop.check()?;
         let refused: Arc<OnceLock<&'static str>> = Arc::default();
         let record = Arc::clone(&refused);
         let read_only = move |ctx: AuthContext<'_>| match ctx.action {
@@ -456,7 +575,7 @@ impl InMemorySqlEngine {
             .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         match refused.get() {
             Some(keyword) => Err(not_select(keyword)),
-            None => result,
+            None => result.map_err(|e| self.stop.or_stopped(e)),
         }
     }
 
@@ -622,6 +741,7 @@ use base64::Engine as _;
 
 #[cfg(test)]
 mod tests {
+    use super::super::SourceFailure;
     use super::*;
     use futures::stream;
     use serde_json::json;
@@ -799,24 +919,59 @@ mod tests {
         let s = schema(&[("id", ColumnFhirType::String("id".into()))]);
         engine.create_table("t", &s).unwrap();
         let ok_rows = (0..200).map(|i| Ok(json!({"id": format!("p{i}")})));
-        let rows = stream::iter(
-            ok_rows.chain(std::iter::once(Err("connection reset by peer".to_string()))),
-        );
+        let rows = stream::iter(ok_rows.chain(std::iter::once(Err(SourceError::backend(
+            "connection reset by peer",
+        )))));
         let err = match engine.insert_rows("t", &s, Box::pin(rows), 10_000).await {
             Ok(_) => panic!("expected SourceStream"),
             Err(e) => e,
         };
-        let SqlQueryError::SourceStream(msg) = &err else {
+        let SqlQueryError::SourceStream(source) = &err else {
             panic!("expected SourceStream, got {err:?}");
         };
+        assert_eq!(source.kind, SourceFailure::Backend);
         assert!(
-            msg.contains("connection reset by peer"),
-            "unexpected message: {msg}"
+            source.message.contains("connection reset by peer"),
+            "unexpected message: {}",
+            source.message
         );
         assert!(
             format!("{err}").starts_with("dependency source failed: "),
             "unexpected display: {err}"
         );
+    }
+
+    /// #1864 (council S2): a source that fails after some rows keeps its kind
+    /// through the blocking insertion path, so a dependency's 422, 503 or 504
+    /// is not flattened into a server error, and the insert is rolled back.
+    #[tokio::test]
+    async fn insert_rows_keeps_the_source_kind_after_rows() {
+        for kind in [
+            SourceFailure::ClientInput(422),
+            SourceFailure::NotFound,
+            SourceFailure::Unavailable,
+            SourceFailure::Timeout,
+            SourceFailure::Cancelled,
+            SourceFailure::Backend,
+        ] {
+            let engine = InMemorySqlEngine::open().unwrap();
+            let s = schema(&[("id", ColumnFhirType::String("id".into()))]);
+            engine.create_table("t", &s).unwrap();
+            let ok_rows = (0..3).map(|i| Ok(json!({"id": format!("p{i}")})));
+            let rows = stream::iter(
+                ok_rows.chain(std::iter::once(Err(SourceError::new(kind, "leaf failed")))),
+            );
+            let err = match engine.insert_rows("t", &s, Box::pin(rows), 100).await {
+                Ok(_) => panic!("{kind:?}: expected SourceStream"),
+                Err(e) => e,
+            };
+            match err {
+                SqlQueryError::SourceStream(source) => {
+                    assert_eq!(source, SourceError::new(kind, "leaf failed"));
+                }
+                other => panic!("{kind:?}: expected SourceStream, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -885,7 +1040,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn insert_rows_drains_tokio_mpsc_stream_past_coop_budget() {
         const ROW_COUNT: i64 = 1000;
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Value, String>>(256);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Value, SourceError>>(256);
 
         tokio::task::spawn_blocking(move || {
             for i in 0..ROW_COUNT {
@@ -1244,5 +1399,169 @@ mod tests {
             .execute_select("SELECT COUNT(*) FROM v", &[], 10)
             .unwrap();
         assert_eq!(result.rows[0][0], Some(Value::Number(2.into())));
+    }
+
+    // ------------------------------------------------------------------
+    // The latched stop (#1864, A14): a stop is never lost, whenever it
+    // arrives, and the error carries its reason.
+    // ------------------------------------------------------------------
+
+    /// The stop bound of #1864: a stopped statement ends within 1 s.
+    const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// A statement that runs for minutes unless it is stopped.
+    const ENDLESS: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+                           WHERE x < 4000000000) SELECT count(*) AS n FROM c";
+
+    /// Runs `work` on its own thread (the blocking worker) and returns its
+    /// result once it is joined, failing if that takes longer than the bound
+    /// after `stopped_at`.
+    fn join_within_bound<T: Send + 'static>(
+        worker: std::thread::JoinHandle<T>,
+        stopped_at: std::time::Instant,
+    ) -> T {
+        while !worker.is_finished() {
+            assert!(
+                stopped_at.elapsed() <= STOP_BOUND,
+                "the worker still runs {:?} after the stop",
+                stopped_at.elapsed()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let joined_after = stopped_at.elapsed();
+        eprintln!("SOF-CANCEL sqlquery engine: worker joined {joined_after:?} after the stop");
+        worker.join().expect("the worker does not panic")
+    }
+
+    #[test]
+    fn a_stop_set_before_execute_select_aborts_it() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let stop = engine.stop_handle();
+        let stopped_at = std::time::Instant::now();
+        stop.stop(StopCause::Cancelled);
+        let worker = std::thread::spawn(move || engine.execute_select(ENDLESS, &[], 10));
+        let result = join_within_bound(worker, stopped_at);
+        assert!(
+            matches!(result, Err(SqlQueryError::Stopped(StopCause::Cancelled))),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    /// The stop arrives while the blocking worker has not started its
+    /// statement yet (queued on the blocking pool): the interrupt finds nothing
+    /// to interrupt, and the latched reason stops the statement when it starts.
+    #[test]
+    fn a_stop_while_the_blocking_closure_is_queued_is_not_lost() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let stop = engine.stop_handle();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            go_rx.recv().expect("the test lets the worker start");
+            engine.execute_select(ENDLESS, &[], 10)
+        });
+        let stopped_at = std::time::Instant::now();
+        stop.stop(StopCause::DeadlineExceeded);
+        go_tx.send(()).unwrap();
+        let result = join_within_bound(worker, stopped_at);
+        assert!(
+            matches!(
+                result,
+                Err(SqlQueryError::Stopped(StopCause::DeadlineExceeded))
+            ),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    /// The stop arrives after one statement of a plan finished and before the
+    /// next starts (between two SQLView nodes): the next one does not run.
+    #[test]
+    fn a_stop_between_sqlview_statements_aborts_the_next() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine
+            .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
+            .unwrap();
+        let stop = engine.stop_handle();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let first = engine.execute_select("SELECT count(*) FROM t", &[], 10);
+            done_tx.send(()).unwrap();
+            go_rx.recv().expect("the test lets the worker go on");
+            let view = engine.create_view("label", "t");
+            let next = engine.execute_select(ENDLESS, &[], 10);
+            (first.is_ok(), view, next)
+        });
+        done_rx.recv().expect("the first statement ends");
+        let stopped_at = std::time::Instant::now();
+        stop.stop(StopCause::StatementTimeout { secs: 7 });
+        go_tx.send(()).unwrap();
+        let (first_ok, view, next) = join_within_bound(worker, stopped_at);
+        assert!(first_ok, "the statement before the stop completes");
+        let stopped = SqlQueryError::Stopped(StopCause::StatementTimeout { secs: 7 });
+        assert_eq!(view.err().map(|e| e.to_string()), Some(stopped.to_string()));
+        assert!(
+            matches!(
+                next,
+                Err(SqlQueryError::Stopped(StopCause::StatementTimeout {
+                    secs: 7
+                }))
+            ),
+            "{:?}",
+            next.err()
+        );
+    }
+
+    /// The stop arrives while the statement runs: the interrupt aborts it and
+    /// the error carries the reason, not SQLite's "interrupted".
+    #[test]
+    fn a_stop_during_a_running_statement_aborts_it() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let stop = engine.stop_handle();
+        let worker = std::thread::spawn(move || engine.execute_select(ENDLESS, &[], 10));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!worker.is_finished(), "the statement is still running");
+        let stopped_at = std::time::Instant::now();
+        assert_eq!(stop.stop(StopCause::Cancelled), StopCause::Cancelled);
+        let result = join_within_bound(worker, stopped_at);
+        assert!(
+            matches!(result, Err(SqlQueryError::Stopped(StopCause::Cancelled))),
+            "{:?}",
+            result.err()
+        );
+        // The first reason stays: a later one does not replace it.
+        assert_eq!(stop.stop(StopCause::DeadlineExceeded), StopCause::Cancelled);
+        assert_eq!(stop.cause(), Some(StopCause::Cancelled));
+    }
+
+    /// A stop while rows are being inserted inserts no further row and ends
+    /// the insert with the stop's reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_while_rows_are_inserted_ends_the_insert() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let sch = schema(&[("id", ColumnFhirType::String("string".into()))]);
+        engine.create_table("t", &sch).unwrap();
+        let stop = engine.stop_handle();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Value, SourceError>>(1);
+        let rows = Box::pin(stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|row| (row, rx))
+        }));
+        let feed = async move {
+            tx.send(Ok(json!({"id": "a"}))).await.unwrap();
+            stop.stop(StopCause::Cancelled);
+            // The insert may already have ended (and dropped the receiver).
+            let _ = tx.send(Ok(json!({"id": "b"}))).await;
+        };
+        let (result, ()) = tokio::time::timeout(STOP_BOUND, async {
+            tokio::join!(engine.insert_rows("t", &sch, rows, 100), feed)
+        })
+        .await
+        .expect("the insert ends within the bound");
+        assert!(
+            matches!(result, Err(SqlQueryError::Stopped(StopCause::Cancelled))),
+            "{:?}",
+            result.err()
+        );
     }
 }

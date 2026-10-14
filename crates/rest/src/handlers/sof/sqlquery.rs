@@ -53,8 +53,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_persistence::core::search::SearchProvider;
-use helios_persistence::core::sof_runner::ViewFilters;
-use helios_sof::sqlquery::SqlQueryError;
+use helios_persistence::core::sof_runner::{RunKind, SofError, ViewFilters};
+use helios_sof::sqlquery::{SourceError, SourceFailure, SqlQueryError, StopCause};
 use helios_sof::{
     ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef, bind_supplied_params,
     extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library, scan_sql,
@@ -64,6 +64,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
+use super::run::{RequestStop, map_sof_error_to_rest};
 use super::view_sources::extract_table_source_views;
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
@@ -96,8 +97,15 @@ pub struct SqlQueryRunQuery {
 /// then its SQL runs against the resulting tables.
 ///
 /// `filters` carries the request's `patient`, `group` and `_since` and narrows
-/// every dependency ViewDefinition. `_limit` is not in it and still caps only
-/// the final rows (applied after SQL, unchanged).
+/// every dependency ViewDefinition. Its references are checked once, before
+/// any dependency runs ([`super::patient_group_refs::check_stored_targets`]).
+/// `_limit` is not in it and still caps only the final rows (applied after
+/// SQL, unchanged).
+///
+/// `request_stop` is held for the whole call: when the request is abandoned
+/// (the client goes away, or `TimeoutLayer` answers 408) the handler future is
+/// dropped with it, which stops the dependency runs and the engine's statement.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_library_subject<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
@@ -106,6 +114,7 @@ pub(super) async fn run_library_subject<S>(
     headers: &HeaderMap,
     library_json: Value,
     filters: ViewFilters,
+    request_stop: RequestStop,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -174,6 +183,19 @@ where
         })?
         .clone();
 
+    // The `patient`/`group` rule (#1864, `patient_group_refs`), before any
+    // dependency runs: the 1000-value bound (this path used to skip it),
+    // every value's shape, then existence in storage. A missing or deleted
+    // target is a 400 `not-found`, as on every run path, instead of narrowing
+    // every dependency view to nothing.
+    super::patient_group_refs::check_stored_targets(
+        state.storage(),
+        tenant.context(),
+        &filters.patient,
+        &filters.group,
+    )
+    .await?;
+
     // Phase 1: resolve the full dependency graph — every ViewDefinition and
     // SQLView Library it reaches, at any depth — before materializing
     // anything. `library_json` was already classified by
@@ -213,6 +235,9 @@ where
         max_rows: state.config().sof_sqlquery_max_rows,
         timeout_secs: state.config().sof_sqlquery_timeout_secs,
     };
+    // The plan's own context: its leaves run as `SqlQueryDependency` runs
+    // under a child of it, and its engine statements stop with it.
+    let ctx = request_stop.run_context(RunKind::SqlQueryDependency);
     let (mut result, schemas_in_order) = super::graph::execute_plan(
         engine,
         &runner,
@@ -221,6 +246,7 @@ where
         &plan,
         &library.sql,
         &bindings,
+        &ctx,
         limits,
     )
     .await
@@ -543,9 +569,17 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
                  HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
             ),
         },
-        SqlQueryError::Timeout { secs } => RestError::UnprocessableEntity {
-            message: format!("query exceeded {secs}s timeout"),
+        // A statement ran past `HFS_SOF_SQLQUERY_TIMEOUT_SECS`, or the run's
+        // deadline passed: a timeout, so 504 `timeout` like every other SoF
+        // timeout (D-4; the statement limit was a 422 before #1864).
+        SqlQueryError::Stopped(cause @ StopCause::StatementTimeout { .. })
+        | SqlQueryError::Stopped(cause @ StopCause::DeadlineExceeded) => RestError::SofTimeout {
+            message: cause.to_string(),
         },
+        // A cancel is answered like a cancelled run: the request that sees it
+        // was abandoned (or timed out at the HTTP layer), and an export job
+        // that sees it is no longer running.
+        SqlQueryError::Stopped(StopCause::Cancelled) => map_sof_error_to_rest(SofError::Cancelled),
         SqlQueryError::NotSelect(msg) => RestError::BadRequest { message: msg },
         SqlQueryError::BindParameter(msg) => RestError::BadRequest { message: msg },
         SqlQueryError::InvalidIdentifier(name) => RestError::BadRequest {
@@ -564,9 +598,31 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
             }
         }
         SqlQueryError::Internal(message) => RestError::InternalError { message },
-        SqlQueryError::SourceStream(msg) => RestError::InternalError {
-            message: format!("dependency source failed: {msg}"),
+        // A dependency's run error keeps its kind across the engine, so it
+        // gets the answer the same error gets on `$sql-run` of the view.
+        SqlQueryError::SourceStream(source) => map_sof_error_to_rest(sof_error_from_source(source)),
+    }
+}
+
+/// The run error a dependency's [`SourceError`] stands for: the inverse of
+/// [`super::graph::source_error_from_sof`]. A server-side kind keeps the
+/// dependency context in its (logged) message.
+pub(crate) fn sof_error_from_source(source: SourceError) -> SofError {
+    let SourceError { kind, message } = source;
+    match kind {
+        SourceFailure::ClientInput(status) => SofError::ClientInput { status, message },
+        SourceFailure::NotFound => SofError::NotFound {
+            references: vec![message],
         },
+        SourceFailure::Unavailable => SofError::Unavailable {
+            message: format!("dependency source failed: {message}"),
+        },
+        SourceFailure::Timeout => SofError::Timeout {
+            budget: None,
+            message: format!("dependency source failed: {message}"),
+        },
+        SourceFailure::Cancelled => SofError::Cancelled,
+        SourceFailure::Backend => SofError::backend(format!("dependency source failed: {message}")),
     }
 }
 
@@ -576,19 +632,83 @@ mod tests {
 
     use super::*;
 
+    /// #1864 (A4, A6): a dependency's source error is answered by its kind,
+    /// as the same run error is on `$sql-run` of the view: only a server
+    /// fault (and the engine's own `Internal`) is a 500, never a dependency
+    /// the client can fix. The query's own timeout is a 504 (D-4).
     #[test]
-    fn source_stream_and_internal_errors_map_to_500() {
-        let source_stream = sqlquery_err_to_rest(SqlQueryError::SourceStream("x".into()));
-        assert_eq!(
-            source_stream.client_response().0,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+    fn source_stream_errors_keep_their_kind() {
+        let cases = [
+            (
+                SourceFailure::ClientInput(422),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "processing",
+            ),
+            (
+                SourceFailure::ClientInput(400),
+                StatusCode::BAD_REQUEST,
+                "invalid",
+            ),
+            (
+                SourceFailure::NotFound,
+                StatusCode::BAD_REQUEST,
+                "not-found",
+            ),
+            (
+                SourceFailure::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient",
+            ),
+            (
+                SourceFailure::Timeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+            ),
+            (
+                SourceFailure::Cancelled,
+                StatusCode::REQUEST_TIMEOUT,
+                "timeout",
+            ),
+            (
+                SourceFailure::Backend,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+            ),
+        ];
+        for (kind, status, code) in cases {
+            let (got_status, got_code, _) = sqlquery_err_to_rest(SqlQueryError::SourceStream(
+                SourceError::new(kind, "Group/missing"),
+            ))
+            .client_response();
+            assert_eq!((got_status, got_code), (status, code), "{kind:?}");
+        }
+
+        let (status, _, message) = sqlquery_err_to_rest(SqlQueryError::SourceStream(
+            SourceError::new(SourceFailure::NotFound, "Group/missing"),
+        ))
+        .client_response();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("Group/missing"), "{message}");
 
         let internal = sqlquery_err_to_rest(SqlQueryError::Internal("y".into()));
         assert_eq!(
             internal.client_response().0,
             StatusCode::INTERNAL_SERVER_ERROR
         );
+
+        let (status, code, _) =
+            sqlquery_err_to_rest(SqlQueryError::Stopped(StopCause::StatementTimeout {
+                secs: 30,
+            }))
+            .client_response();
+        assert_eq!((status, code), (StatusCode::GATEWAY_TIMEOUT, "timeout"));
+        let (status, code, _) =
+            sqlquery_err_to_rest(SqlQueryError::Stopped(StopCause::DeadlineExceeded))
+                .client_response();
+        assert_eq!((status, code), (StatusCode::GATEWAY_TIMEOUT, "timeout"));
+        let (status, code, _) =
+            sqlquery_err_to_rest(SqlQueryError::Stopped(StopCause::Cancelled)).client_response();
+        assert_eq!((status, code), (StatusCode::REQUEST_TIMEOUT, "timeout"));
 
         // A source failure must never be reported as if the client sent a
         // malformed request: row-cap violations still answer 422.

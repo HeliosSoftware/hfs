@@ -16,7 +16,9 @@ mod sof_export_tests {
     use helios_persistence::backends::sqlite::SqliteBackend;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::core::search::SearchProvider;
-    use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
+    use helios_persistence::core::sof_runner::{
+        RunContext, RunOutput, RunRequest, SofError, SofRunner,
+    };
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
     use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
@@ -1946,11 +1948,11 @@ mod sof_export_tests {
         async fn run_view(
             &self,
             _tenant: &TenantContext,
-            _view: Value,
-            _filters: ViewFilters,
-        ) -> Result<RowStream, SofError> {
-            Err(SofError::Backend(
-                "connection reset by peer (db.internal:5432)".to_string(),
+            _request: RunRequest,
+            _ctx: RunContext,
+        ) -> Result<RunOutput, SofError> {
+            Err(SofError::backend(
+                "connection reset by peer (db.internal:5432)",
             ))
         }
         fn runner_name(&self) -> &'static str {
@@ -3651,10 +3653,10 @@ mod sof_export_tests {
         async fn run_view(
             &self,
             _tenant: &TenantContext,
-            _view_definition: Value,
-            _filters: helios_persistence::core::sof_runner::ViewFilters,
+            _request: helios_persistence::core::sof_runner::RunRequest,
+            _ctx: helios_persistence::core::sof_runner::RunContext,
         ) -> Result<
-            helios_persistence::core::sof_runner::RowStream,
+            helios_persistence::core::sof_runner::RunOutput,
             helios_persistence::core::sof_runner::SofError,
         > {
             std::future::pending().await
@@ -3803,5 +3805,218 @@ mod sof_export_tests {
             sof_ordering::ExportOrder::LastUpdatedThenId,
         )
         .await;
+    }
+
+    /// #1864 (A19): a `patient` or `group` reference to a resource that was
+    /// deleted is missing, exactly like one that never existed: 404
+    /// `not-found` naming the reference. On the base commit the existence
+    /// check reads the resource, gets `Gone` and answers 500.
+    #[tokio::test]
+    async fn test_export_deleted_patient_or_group_ref_returns_404() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Group",
+                json!({"resourceType": "Group", "id": "g1", "type": "person", "actual": true,
+                    "member": [{"entity": {"reference": "Patient/p2"}}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed group");
+        backend
+            .delete(&tenant, "Patient", "p1")
+            .await
+            .expect("delete patient");
+        backend
+            .delete(&tenant, "Group", "g1")
+            .await
+            .expect("delete group");
+
+        for (query, reference) in [
+            ("patient=Patient/p1", "Patient/p1"),
+            ("group=Group/g1", "Group/g1"),
+        ] {
+            let resp = server
+                .post(&format!("/$sql-export?{query}"))
+                .add_header(PREFER, "respond-async")
+                .add_header(X_TENANT_ID, "test-tenant")
+                .json(&patient_view())
+                .await;
+            assert_eq!(
+                resp.status_code(),
+                StatusCode::NOT_FOUND,
+                "{query}: a deleted {reference} must be a 404; got {}: {}",
+                resp.status_code(),
+                resp.text()
+            );
+            let body: Value = resp.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "{body}");
+            assert_eq!(body["issue"][0]["code"], "not-found", "{body}");
+            let diag = body["issue"][0]["diagnostics"]
+                .as_str()
+                .or_else(|| body["issue"][0]["details"]["text"].as_str())
+                .unwrap_or_default();
+            assert!(diag.contains(reference), "must name {reference}: {body}");
+        }
+    }
+
+    /// A runner whose every run yields two `patient-flat` rows, then the error
+    /// `fail` builds: a source that fails after emitting rows.
+    struct MidStreamFailingRunner {
+        fail: fn() -> SofError,
+    }
+
+    #[async_trait::async_trait]
+    impl SofRunner for MidStreamFailingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _request: RunRequest,
+            _ctx: RunContext,
+        ) -> Result<RunOutput, SofError> {
+            let rows = vec![
+                Ok(json!({"patient_id": "p1", "family": "Smith", "active": true})),
+                Ok(json!({"patient_id": "p2", "family": "Jones", "active": true})),
+                Err((self.fail)()),
+            ];
+            Ok(RunOutput::from_rows(Box::pin(futures::stream::iter(rows))))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "mid-stream-failing-test-runner"
+        }
+    }
+
+    /// An export server whose runner is a [`MidStreamFailingRunner`] over `fail`.
+    async fn mid_stream_failing_export_server(
+        fail: fn() -> SofError,
+    ) -> (TestServer, Arc<SqliteBackend>) {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+        let controller = InMemoryController::new(
+            Arc::new(MidStreamFailingRunner { fail }),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let config = ServerConfig {
+            base_url: "http://localhost".to_string(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
+            .expect("failed to create test server");
+        (server, backend)
+    }
+
+    /// Kicks off `body`, polls the job until it finishes and returns the
+    /// result URL's response.
+    async fn export_result(server: &TestServer, body: &Value) -> axum_test::TestResponse {
+        let submit = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(body)
+            .await;
+        assert_eq!(
+            submit.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit.text()
+        );
+        let status_url = submit
+            .headers()
+            .get("content-location")
+            .expect("content-location")
+            .to_str()
+            .unwrap()
+            .to_string();
+        for _ in 0..200 {
+            let poll = server
+                .get(&status_url)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            match poll.status_code() {
+                StatusCode::ACCEPTED => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                }
+                StatusCode::SEE_OTHER => {
+                    let result_url = poll
+                        .headers()
+                        .get(axum::http::header::LOCATION)
+                        .expect("303 missing Location header")
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    return server
+                        .get(&result_url)
+                        .add_header(X_TENANT_ID, "test-tenant")
+                        .await;
+                }
+                other => panic!("unexpected poll status {other}: {}", poll.text()),
+            }
+        }
+        panic!("the export job did not finish within 4s");
+    }
+
+    /// The `(status, issue code)` of a failed export's result.
+    fn failed_status_and_code(result: &axum_test::TestResponse) -> (StatusCode, String) {
+        let outcome: Value = serde_json::from_str(&result.text()).expect("OperationOutcome body");
+        (
+            result.status_code(),
+            outcome["issue"][0]["code"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
+    /// #1864 (A6, council S2): a SQL Query export whose dependency fails after
+    /// emitting rows keeps the dependency's kind: a 422-class dependency fails
+    /// the job with a 422 result, as on `$sql-run`. On the base commit the
+    /// kind is stringified at the engine boundary and the result is a 500.
+    /// (The 503 and 504 kinds keep their status on `$sql-run`,
+    /// `sof_sqlquery.rs::a_dependency_failing_mid_stream_keeps_its_kind`; a
+    /// failed export job keeps 503/504 from D-6, with its own tests.)
+    #[tokio::test]
+    async fn a_sql_query_export_whose_leaf_fails_mid_stream_keeps_its_kind() {
+        let (server, backend) = mid_stream_failing_export_server(|| {
+            SofError::ResolutionLimit("too many references in this batch".into())
+        })
+        .await;
+        let vd_ref = seed_patient_flat_view(&backend).await;
+        let library = sql_library("SELECT patient_id FROM pt", &vd_ref, "pt");
+        let result = export_result(&server, &sqlquery_export_body(library, Some("dep_rows"))).await;
+        let (status, code) = failed_status_and_code(&result);
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, "processing"),
+            "{}",
+            result.text()
+        );
+    }
+
+    /// #1864 (A4): a view subject whose row stream fails after emitting rows
+    /// fails the job with the status the same error gets at the start of the
+    /// run (`JobFailure::from_sof`), not a blanket 500.
+    #[tokio::test]
+    async fn a_view_export_whose_rows_fail_mid_stream_keeps_its_kind() {
+        let (server, _backend) = mid_stream_failing_export_server(|| {
+            SofError::ResolutionLimit("too many references in this batch".into())
+        })
+        .await;
+        let result = export_result(&server, &patient_view()).await;
+        let (status, code) = failed_status_and_code(&result);
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, "processing"),
+            "{}",
+            result.text()
+        );
     }
 }

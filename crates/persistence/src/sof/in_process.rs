@@ -13,12 +13,45 @@
 //! access is abstracted behind [`ResourceScan`] so the runner is
 //! backend-agnostic.
 //!
-//! The chunk-processing loop runs in a `spawn_blocking` thread whose
-//! `JoinHandle` is watched by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer)
-//! so a panic reaches the consumer as an `Err` item instead of a silent end
-//! of stream.
+//! A run has two tasks. An async scan task reads the [`ResourceScan`] (with
+//! `_since` applied by the scan, see below), batches the resources and
+//! pre-resolves each batch's references;
+//! a `spawn_blocking` engine task evaluates the batches and sends the rows
+//! through the producer core's batch channel
+//! ([`row_batch_channel`](crate::core::sof_producer::row_batch_channel)).
+//!
+//! - **End marker.** The scan ends its batches with an explicit end marker.
+//!   Its `JoinHandle` is supervised, so a scan that panics or fails reaches
+//!   the consumer as an `Err` item; a scan that ends without the marker is a
+//!   failure unless the run was stopped. The engine is supervised the same
+//!   way, so a partial row set never looks complete.
+//! - **Stopping.** The run stops on the consumer dropping the stream, on
+//!   [`RunContext::cancel`] and at [`RunContext::deadline`]. The setup reads
+//!   (the compartment filter's documents, the start of the scan), each scan
+//!   step and each batch's reference reads are raced against the stop; the
+//!   engine checks it per chunk, and a stop sets a per-run flag that
+//!   [`PreparedViewDefinition::process_chunk_with_external_until`] reads before
+//!   each resource, so every Rayon worker stops after the resource it is
+//!   evaluating. The stream ends (with `Cancelled` or `Timeout` for a stop that
+//!   is not a drop) only after the engine's evaluation has returned and the
+//!   scan task has been joined, so no storage read of the run (an S3 GET the
+//!   scan's stream would still start, say) follows the end the consumer sees.
+//! - **Bound.** The scan stops within the stop bound; the evaluation stops
+//!   within one resource evaluation per Rayon worker. A FHIRPath terminology
+//!   call in flight inside that evaluation is bounded by its own timeout
+//!   (`FHIRPATH_TERMINOLOGY_TIMEOUT`), not by the stop.
+//! - **`_since`.** A run with a cutoff reads
+//!   [`ResourceScan::scan_resources_since`], so the comparison uses the instant
+//!   the storage records: the default compares the JSON `meta.lastUpdated`
+//!   (exact where storage keeps the same precision, as the MongoDB fallback
+//!   does), and S3 overrides it with its stored nanosecond instant (#1864).
+//!   `_since` is inclusive: a resource stored at the cutoff is kept.
+//! - **References.** A `patient`/`group` reference whose target does not exist
+//!   (or was deleted) is [`SofError::NotFound`] listing it, for callers that
+//!   reach the runner without the REST reference check.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -29,17 +62,19 @@ use helios_sof::{
     parse_view_definition_for_version,
 };
 use serde_json::{Map, Value};
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::debug;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, warn};
 
-use crate::core::sof_runner::{
-    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+use crate::core::sof_producer::{
+    BatchSender, RunStop, StopFlag, bridge_stop, row_batch_channel, supervise,
 };
+use crate::core::sof_runner::{
+    RunCapabilities, RunContext, RunOutput, RunRequest, SofError, SofRunner, StopReason, ViewRow,
+};
+use crate::core::sof_schema::ViewSchema;
 use crate::sof::reference_resolver::{StorageReferenceResolver, collect_missing_references};
 use crate::tenant::TenantContext;
-
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
 
 /// Number of resources handed to the engine per [`PreparedViewDefinition::process_chunk`]
 /// call. Bounds peak memory when scanning large resource types.
@@ -118,6 +153,46 @@ pub trait ResourceScan: Send + Sync {
         resource_type: &str,
         ids: &[String],
     ) -> Result<Vec<Value>, SofError>;
+
+    /// Like [`scan_resources`](Self::scan_resources), keeping only the
+    /// resources stored at or after `cutoff` (`_since`, inclusive).
+    ///
+    /// The default compares each resource's JSON `meta.lastUpdated` and drops
+    /// one without a parseable stamp. That is exact when storage records the
+    /// instant at the JSON stamp's precision (the MongoDB fallback: both in
+    /// milliseconds). A storage that records a finer instant than the JSON
+    /// stamp (S3: nanoseconds) overrides this to compare its own instant, so a
+    /// cutoff equal to the stored instant keeps the resource (#1864). An
+    /// override's stream is used as is: the runner does not filter it again.
+    async fn scan_resources_since(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ResourceStream, SofError> {
+        let stream = self.scan_resources(tenant, resource_type).await?;
+        Ok(stream
+            .filter(move |item| {
+                std::future::ready(match item {
+                    Ok(resource) => last_updated_at_or_after(resource, cutoff),
+                    // Errors pass through to the run.
+                    Err(_) => true,
+                })
+            })
+            .boxed())
+    }
+}
+
+/// Whether `resource`'s JSON `meta.lastUpdated` is at or after `cutoff`. A
+/// resource with no parseable stamp is not (it is dropped by `_since`).
+fn last_updated_at_or_after(resource: &Value, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
+    resource
+        .get("meta")
+        .and_then(|m| m.get("lastUpdated"))
+        .and_then(|lu| lu.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
+        .unwrap_or(false)
 }
 
 /// In-process SQL-on-FHIR runner backed by an arbitrary [`ResourceScan`].
@@ -168,14 +243,22 @@ impl InProcessSofRunner {
 /// [`JOB_SCAN_CACHE_MAX_RESOURCES`] is kept, so one that was dropped part way
 /// (cancelled, or capped by a row limit) or failed leaves nothing behind. Later
 /// scans of the type replay the kept resources instead of reading storage.
+///
+/// A `_since` scan is forwarded to the inner
+/// [`scan_resources_since`](ResourceScan::scan_resources_since), so the export
+/// path reaches a storage's own stored-instant comparison (S3), and is kept
+/// under its cutoff: the key is `(tenant, type, cutoff)`, so a scan with one
+/// cutoff (or none) never replays the resources of another (#1864).
 struct JobScanCache {
     inner: Arc<dyn ResourceScan>,
     kept: KeptScans,
 }
 
-/// Resources kept per `(tenant id, resource type)`.
-type KeptScans =
-    Arc<parking_lot::Mutex<std::collections::HashMap<(String, String), Arc<Vec<Value>>>>>;
+/// The key of one kept scan: tenant id, resource type and `_since` cutoff.
+type ScanKey = (String, String, Option<chrono::DateTime<chrono::Utc>>);
+
+/// Resources kept per [`ScanKey`].
+type KeptScans = Arc<parking_lot::Mutex<std::collections::HashMap<ScanKey, Arc<Vec<Value>>>>>;
 
 #[async_trait]
 impl ResourceScan for JobScanCache {
@@ -184,9 +267,41 @@ impl ResourceScan for JobScanCache {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> Result<ResourceStream, SofError> {
-        let key = (
+        self.scan_kept(tenant, resource_type, None).await
+    }
+
+    async fn scan_resources_since(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ResourceStream, SofError> {
+        self.scan_kept(tenant, resource_type, Some(cutoff)).await
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, SofError> {
+        self.inner.read_resources(tenant, resource_type, ids).await
+    }
+}
+
+impl JobScanCache {
+    /// Replays the kept scan of `(tenant, type, cutoff)`, or streams the inner
+    /// scan (with the cutoff, when there is one) and keeps what it read.
+    async fn scan_kept(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<ResourceStream, SofError> {
+        let key: ScanKey = (
             tenant.tenant_id().as_str().to_string(),
             resource_type.to_string(),
+            cutoff,
         );
         let hit = self.kept.lock().get(&key).cloned();
         if let Some(resources) = hit {
@@ -199,7 +314,14 @@ impl ResourceScan for JobScanCache {
             );
         }
 
-        let inner = self.inner.scan_resources(tenant, resource_type).await?;
+        let inner = match cutoff {
+            Some(cutoff) => {
+                self.inner
+                    .scan_resources_since(tenant, resource_type, cutoff)
+                    .await?
+            }
+            None => self.inner.scan_resources(tenant, resource_type).await?,
+        };
         let kept = Arc::clone(&self.kept);
         Ok(futures::stream::unfold(
             (inner, Some(Vec::<Value>::new()), kept, key),
@@ -227,32 +349,65 @@ impl ResourceScan for JobScanCache {
         )
         .boxed())
     }
-
-    async fn read_resources(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        ids: &[String],
-    ) -> Result<Vec<Value>, SofError> {
-        self.inner.read_resources(tenant, resource_type, ids).await
-    }
 }
+
+/// The suffix `helios_sof`'s absent-target error appends to its reference
+/// list (`CompartmentFilter::build`).
+const ABSENT_TARGET_SUFFIX: &str = " not found in supplied resources";
 
 /// Maps a `helios_sof` engine error onto the persistence-layer [`SofError`].
 ///
-/// Structural/validation problems and the spec's absent-target case become
-/// `InvalidViewDefinition` (surfaced as a 4xx); everything else is a runtime
-/// backend error.
+/// Structural/validation problems become `InvalidViewDefinition` (422); the
+/// spec's absent-target case becomes the typed [`SofError::NotFound`] (400
+/// `not-found`; the runner normally reports it itself, before the engine sees
+/// the filter, see [`missing_compartment_targets`]); everything else is a
+/// runtime backend error.
 fn map_engine_error(e: helios_sof::SofError) -> SofError {
     use helios_sof::SofError as E;
     match e {
         E::InvalidViewDefinition(m) => SofError::InvalidViewDefinition(m),
-        E::ReferencedResourceNotFound(m) => SofError::InvalidViewDefinition(m),
+        E::ReferencedResourceNotFound(m) => SofError::NotFound {
+            references: m
+                .strip_suffix(ABSENT_TARGET_SUFFIX)
+                .map(|list| list.split(", ").map(str::to_string).collect())
+                .unwrap_or_else(|| vec![m]),
+        },
         // A path the view's author wrote that FHIRPath rejects is a problem with
-        // the ViewDefinition, not a backend failure.
+        // the ViewDefinition, not a backend failure (#640, main).
         E::FhirPathError(m) => SofError::InvalidViewDefinition(m),
-        other => SofError::Backend(other.to_string()),
+        other => SofError::backend(other.to_string()),
     }
+}
+
+/// The `patient`/`group` references, as the caller wrote them, whose target is
+/// not among `supporting` (the documents read by id; a deleted one is never
+/// read). Mirrors the lookup of `CompartmentFilter::build`: a reference names
+/// `{Type}/{id}` with or without its type prefix, and the id ends at the next
+/// `/`.
+fn missing_compartment_targets(
+    patient: &[String],
+    group: &[String],
+    supporting: &[Value],
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for (refs, resource_type) in [(patient, "Patient"), (group, "Group")] {
+        for reference in refs {
+            let named = reference
+                .strip_prefix(resource_type)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .unwrap_or(reference);
+            let id = named.split('/').next().unwrap_or_default();
+            let found = !id.is_empty()
+                && supporting.iter().any(|resource| {
+                    resource.get("resourceType").and_then(Value::as_str) == Some(resource_type)
+                        && resource.get("id").and_then(Value::as_str) == Some(id)
+                });
+            if !found {
+                missing.push(reference.clone());
+            }
+        }
+    }
+    missing
 }
 
 /// Zips one engine row (`columns` × `values`) into a flat JSON object, the
@@ -307,13 +462,21 @@ impl SofRunner for InProcessSofRunner {
     async fn run_view(
         &self,
         tenant: &TenantContext,
-        view_definition: Value,
-        filters: ViewFilters,
-    ) -> Result<RowStream, SofError> {
+        request: RunRequest,
+        ctx: RunContext,
+    ) -> Result<RunOutput, SofError> {
+        let RunRequest {
+            view: view_definition,
+            filters,
+        } = request;
+        let schema = ViewSchema::from_view_definition(&view_definition);
         let uses_resolve = view_uses_resolve(&view_definition);
         let view = parse_view_definition_for_version(view_definition, self.fhir_version)
             .map_err(map_engine_error)?;
         let prepared = PreparedViewDefinition::new(view).map_err(map_engine_error)?;
+        // The evaluator already emits document order, so this is the identity
+        // (the walker mirrors the evaluator); checked once per run all the same.
+        let permutation = schema.permutation_from(prepared.columns())?;
         let resource_type = prepared.target_resource_type().to_string();
 
         debug!(
@@ -322,6 +485,11 @@ impl SofRunner for InProcessSofRunner {
             resource_type = %resource_type,
             "executing in-process ViewDefinition"
         );
+
+        // The run's channel and stop signal exist before the setup reads, so
+        // those reads are raced against the cancel and the deadline, and the
+        // budget a timeout reports counts from here.
+        let (out, stop, rows) = row_batch_channel(self.runner_name, &ctx);
 
         // Fetch the Patient/Group documents the compartment filter needs, by id.
         // `build` only ever looks at the resources its own references name —
@@ -338,12 +506,18 @@ impl SofRunner for InProcessSofRunner {
                 {
                     let ids = compartment_reference_ids(refs, supporting_type);
                     if !ids.is_empty() {
-                        supporting.extend(
-                            self.scan
-                                .read_resources(tenant, supporting_type, &ids)
-                                .await?,
-                        );
+                        let read = self.scan.read_resources(tenant, supporting_type, &ids);
+                        supporting.extend(race_setup(&stop, read).await?);
                     }
+                }
+                // A target that does not exist, or was deleted, is the typed
+                // not-found (400 `not-found` on `$sql-run`), never a 422.
+                let missing =
+                    missing_compartment_targets(&filters.patient, &filters.group, &supporting);
+                if !missing.is_empty() {
+                    return Err(SofError::NotFound {
+                        references: missing,
+                    });
                 }
                 Some(
                     CompartmentFilter::build(
@@ -358,194 +532,436 @@ impl SofRunner for InProcessSofRunner {
                 None
             };
 
-        let scan_stream = self.scan.scan_resources(tenant, &resource_type).await?;
-
-        let limit = filters.limit;
-        let version = self.fhir_version;
-        let since = filters.since;
-        let tenant_owned = tenant.clone();
-        let resolver = if uses_resolve {
-            self.resolver.clone()
-        } else {
-            None
+        // `_since` is applied by the scan, against the instant the storage
+        // records (see `ResourceScan::scan_resources_since`).
+        let scan_stream = match filters.since {
+            Some(cutoff) => {
+                let scan = self
+                    .scan
+                    .scan_resources_since(tenant, &resource_type, cutoff);
+                race_setup(&stop, scan).await?
+            }
+            None => race_setup(&stop, self.scan.scan_resources(tenant, &resource_type)).await?,
         };
 
         // Resource channel: batches of (resources, pre-resolved external refs)
-        // from the async scan task to the blocking engine task.
-        let (res_tx, mut res_rx) = tokio::sync::mpsc::channel::<
-            Result<(Vec<Value>, Vec<Value>), SofError>,
-        >(RESOURCE_CHANNEL_BUFFER);
+        // from the async scan task to the blocking engine task, ended by
+        // `ScanFrame::End`.
+        let (res_tx, res_rx) = mpsc::channel::<ScanFrame>(RESOURCE_CHANNEL_BUFFER);
+        let scan = ScanTask {
+            stream: scan_stream,
+            limit: filters.limit,
+            resolver: if uses_resolve {
+                self.resolver.clone()
+            } else {
+                None
+            },
+            tenant: tenant.clone(),
+            version: self.fhir_version,
+        };
+        let scan_handle = tokio::spawn(scan.run(res_tx.clone(), stop.clone()));
+        let scan_stopped = CancellationToken::new();
+        let scan_watcher =
+            supervise_scan(self.runner_name, scan_handle, res_tx, scan_stopped.clone());
 
-        // Row channel: output rows from the blocking engine to the caller.
-        let (row_tx, row_rx) =
-            tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
-        let guard_tx = row_tx.clone();
+        // Blocking engine task (CPU-bound FHIRPath evaluation), with the
+        // bridge that turns a stop into the evaluation's stop flag.
+        let reporter = out.reporter();
+        let flag = StopFlag::default();
+        let evaluation_stop = Arc::new(AtomicBool::new(false));
+        let done = CancellationToken::new();
+        let bridge = {
+            let evaluation_stop = Arc::clone(&evaluation_stop);
+            bridge_stop(stop.clone(), flag.clone(), done.clone(), move || {
+                evaluation_stop.store(true, Ordering::Relaxed)
+            })
+        };
+        let engine = Engine {
+            prepared,
+            compartment_filter,
+            limit: filters.limit,
+            version: self.fhir_version,
+            runner: self.runner_name,
+            stop,
+            flag,
+            evaluation_stop,
+            scan_stopped,
+            handle: tokio::runtime::Handle::current(),
+        };
+        let producer = tokio::task::spawn_blocking(move || {
+            let _done = done.drop_guard();
+            engine.produce(res_rx, out);
+        });
+        // The watcher is joined too, so an engine panic is reported only once
+        // the scan (which stops when the engine's receiver is gone) has stopped.
+        supervise(
+            self.runner_name,
+            reporter,
+            vec![producer, bridge, scan_watcher],
+        );
 
-        // Async scan task: drive the cursor, apply the `since` filter per resource,
-        // accumulate batches of CHUNK_SIZE, pre-resolve external refs per batch,
-        // and forward to the blocking engine via the resource channel.
-        tokio::spawn(async move {
-            let mut stream = scan_stream;
-            // A run with a row cap (a preview) starts with a batch no larger
-            // than the cap, so a simple view yields its rows after reading
-            // about `limit` resources rather than a full CHUNK_SIZE. Each
-            // flushed batch doubles the target up to CHUNK_SIZE, so a view
-            // whose `where` drops most inputs still reaches its cap.
-            let mut batch_target = limit.map_or(CHUNK_SIZE, |cap| cap.clamp(1, CHUNK_SIZE));
-            let mut batch: Vec<Value> = Vec::with_capacity(batch_target);
+        // Rows follow the scan's order, which no backend makes total; nothing
+        // here runs on a database server (a stop ends the storage reads and the
+        // evaluation, both in this process).
+        let capabilities = RunCapabilities {
+            total_order: false,
+            declared_schema: true,
+            cancels_server_side: false,
+        };
+        Ok(RunOutput::new(
+            schema,
+            capabilities,
+            permutation.normalize(rows),
+        ))
+    }
+}
 
-            while let Some(item) = stream.next().await {
-                // The engine is gone (the export was cancelled or failed): stop
-                // reading storage now rather than at the next full batch.
-                if res_tx.is_closed() {
+/// Runs a setup read of a run (the compartment filter's documents, the start
+/// of the scan) unless the run is cancelled or its deadline passes first.
+async fn race_setup<T>(
+    stop: &RunStop,
+    setup: impl std::future::Future<Output = Result<T, SofError>>,
+) -> Result<T, SofError> {
+    tokio::select! {
+        biased;
+        reason = stop.stopped() => Err(stop.error_for(reason).unwrap_or(SofError::Cancelled)),
+        result = setup => result,
+    }
+}
+
+/// What the scan task sends to the engine.
+enum ScanFrame {
+    /// A batch of resources and the external resources its references need.
+    Batch(Vec<Value>, Vec<Value>),
+    /// The scan read its stream to the end; nothing follows.
+    End,
+    /// The scan failed; nothing follows.
+    Failed(SofError),
+}
+
+/// The async half of a run: reads the scan (already narrowed by `_since`),
+/// batches, and pre-resolves each batch's references.
+struct ScanTask {
+    stream: ResourceStream,
+    limit: Option<usize>,
+    resolver: Option<Arc<dyn StorageReferenceResolver>>,
+    tenant: TenantContext,
+    version: FhirVersion,
+}
+
+impl ScanTask {
+    /// Sends the scan's batches, then [`ScanFrame::End`]. Returns without the
+    /// end marker when the run stops or the engine is gone: every await
+    /// (the next resource, a batch's reference reads, a send) is raced
+    /// against both.
+    async fn run(self, res_tx: mpsc::Sender<ScanFrame>, stop: RunStop) {
+        let ScanTask {
+            mut stream,
+            limit,
+            resolver,
+            tenant,
+            version,
+        } = self;
+        /// Awaits `step` unless the run stops or the engine goes away first.
+        async fn raced<T>(
+            stop: &RunStop,
+            res_tx: &mpsc::Sender<ScanFrame>,
+            step: impl std::future::Future<Output = T>,
+        ) -> Option<T> {
+            tokio::select! {
+                biased;
+                _ = stop.stopped() => None,
+                _ = res_tx.closed() => None,
+                value = step => Some(value),
+            }
+        }
+        async fn send(stop: &RunStop, res_tx: &mpsc::Sender<ScanFrame>, frame: ScanFrame) -> bool {
+            raced(stop, res_tx, res_tx.send(frame))
+                .await
+                .is_some_and(|sent| sent.is_ok())
+        }
+
+        // A run with a row cap (a preview) starts with a batch no larger
+        // than the cap, so a simple view yields its rows after reading
+        // about `limit` resources rather than a full CHUNK_SIZE. Each
+        // flushed batch doubles the target up to CHUNK_SIZE, so a view
+        // whose `where` drops most inputs still reaches its cap.
+        let mut batch_target = limit.map_or(CHUNK_SIZE, |cap| cap.clamp(1, CHUNK_SIZE));
+        let mut batch: Vec<Value> = Vec::with_capacity(batch_target);
+
+        loop {
+            let Some(item) = raced(&stop, &res_tx, stream.next()).await else {
+                return;
+            };
+            let Some(item) = item else { break };
+            let resource = match item {
+                Ok(v) => v,
+                Err(e) => {
+                    send(&stop, &res_tx, ScanFrame::Failed(e)).await;
                     return;
                 }
-                let resource = match item {
-                    Ok(v) => v,
+            };
+
+            batch.push(resource);
+
+            if batch.len() >= batch_target {
+                let resolved = resolve_batch_external(&resolver, &tenant, version, &batch);
+                let Some(resolved) = raced(&stop, &res_tx, resolved).await else {
+                    return;
+                };
+                let frame = match resolved {
+                    Ok(external) => ScanFrame::Batch(std::mem::take(&mut batch), external),
                     Err(e) => {
-                        let _ = res_tx.send(Err(e)).await;
+                        send(&stop, &res_tx, ScanFrame::Failed(e)).await;
                         return;
                     }
                 };
-
-                if let Some(cutoff) = since {
-                    // `_since` is inclusive, as in the SQL runners and `_lastUpdated`;
-                    // a resource with no parseable `meta.lastUpdated` is dropped.
-                    let passes = resource
-                        .get("meta")
-                        .and_then(|m| m.get("lastUpdated"))
-                        .and_then(|lu| lu.as_str())
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
-                        .unwrap_or(false);
-                    if !passes {
-                        continue;
-                    }
+                if !send(&stop, &res_tx, frame).await {
+                    return;
                 }
-
-                batch.push(resource);
-
-                if batch.len() >= batch_target {
-                    let external =
-                        match resolve_batch_external(&resolver, &tenant_owned, version, &batch)
-                            .await
-                        {
-                            Ok(external) => external,
-                            Err(e) => {
-                                let _ = res_tx.send(Err(e)).await;
-                                return;
-                            }
-                        };
-                    if res_tx
-                        .send(Ok((std::mem::take(&mut batch), external)))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    batch_target = (batch_target * 2).min(CHUNK_SIZE);
-                }
+                batch_target = (batch_target * 2).min(CHUNK_SIZE);
             }
+        }
 
-            if !batch.is_empty() {
-                let item = resolve_batch_external(&resolver, &tenant_owned, version, &batch)
-                    .await
-                    .map(|external| (batch, external));
-                let _ = res_tx.send(item).await;
+        if !batch.is_empty() {
+            let resolved = resolve_batch_external(&resolver, &tenant, version, &batch);
+            let Some(resolved) = raced(&stop, &res_tx, resolved).await else {
+                return;
+            };
+            let frame = match resolved {
+                Ok(external) => ScanFrame::Batch(batch, external),
+                Err(e) => {
+                    send(&stop, &res_tx, ScanFrame::Failed(e)).await;
+                    return;
+                }
+            };
+            if !send(&stop, &res_tx, frame).await {
+                return;
+            }
+        }
+        send(&stop, &res_tx, ScanFrame::End).await;
+    }
+}
+
+/// Watches the scan task: if it panics or is cancelled, the engine receives
+/// a [`ScanFrame::Failed`] (through `res_tx`, a sender kept outside the task)
+/// in place of the end marker, so the rows read before the failure cannot
+/// end the run as if they were complete.
+///
+/// Fires `stopped` once the scan task has been joined, however it ended (and
+/// if the watcher itself is dropped). Tokio drops a task's future before its
+/// `JoinHandle` resolves, so by then the scan's stream, and every storage read
+/// it had in flight, is gone. Returns the watcher's handle.
+fn supervise_scan(
+    runner: &'static str,
+    scan: tokio::task::JoinHandle<()>,
+    res_tx: mpsc::Sender<ScanFrame>,
+    stopped: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _stopped = stopped.drop_guard();
+        if let Err(e) = scan.await {
+            warn!(runner, error = %e, "SoF resource scan ended before finishing");
+            let _ = res_tx
+                .send(ScanFrame::Failed(SofError::backend(format!(
+                    "resource scan failed: {e}"
+                ))))
+                .await;
+        }
+    })
+}
+
+/// How a run ended before all its rows were sent.
+enum RunEnd {
+    Stopped(StopReason),
+    Failed(SofError),
+}
+
+/// The blocking half of a run: applies the compartment filter and evaluates
+/// each batch, stoppable per resource.
+struct Engine {
+    prepared: PreparedViewDefinition,
+    compartment_filter: Option<CompartmentFilter>,
+    limit: Option<usize>,
+    version: FhirVersion,
+    runner: &'static str,
+    stop: RunStop,
+    /// The stop reason, recorded by the bridge before it sets
+    /// `evaluation_stop`.
+    flag: StopFlag,
+    /// Read by the evaluation before each resource.
+    evaluation_stop: Arc<AtomicBool>,
+    /// Fired by [`supervise_scan`] once the scan task has been joined.
+    scan_stopped: CancellationToken,
+    handle: tokio::runtime::Handle,
+}
+
+impl Engine {
+    /// Evaluates the scan's batches into `out`, then ends the stream. The
+    /// stream ends here, after the evaluation (and its Rayon work) has
+    /// returned and the scan task has been joined, so the consumer sees the
+    /// end (a stop, a failure or the last row) only once nothing evaluates or
+    /// reads storage for this run any more.
+    fn produce(self, mut res_rx: mpsc::Receiver<ScanFrame>, mut out: BatchSender) {
+        let result = self.evaluate(&mut res_rx, &mut out);
+        // Dropping the receiver stops the scan: every await of the scan task
+        // is raced against `res_tx.closed()` (and against the stop). Then wait
+        // until it has stopped; a scan still polling its stream could start
+        // another storage read after the end.
+        drop(res_rx);
+        let Engine {
+            handle,
+            stop,
+            runner,
+            scan_stopped,
+            ..
+        } = self;
+        handle.block_on(scan_stopped.cancelled());
+        match result {
+            Ok(rows) => {
+                debug!(runner, rows, "in-process view run complete");
+                out.blocking_finish(&handle, &stop);
+            }
+            Err(RunEnd::Stopped(reason)) => {
+                debug!(runner, ?reason, "in-process view run stopped");
+                out.blocking_end_after_stop(&handle, &stop, reason);
+            }
+            Err(RunEnd::Failed(error)) => out.blocking_fail(&handle, &stop, error),
+        }
+    }
+
+    /// The reason the run must stop now, if any.
+    fn stopped(&self) -> Option<StopReason> {
+        self.flag.get().or_else(|| self.stop.check())
+    }
+
+    /// The next frame of the scan, unless the run stops first. A scan that
+    /// ended without its end marker is the stop's doing when the run
+    /// stopped, and a failure otherwise.
+    fn next_frame(&self, res_rx: &mut mpsc::Receiver<ScanFrame>) -> Result<ScanFrame, RunEnd> {
+        let stop = &self.stop;
+        let received = self.handle.block_on(async {
+            tokio::select! {
+                biased;
+                reason = stop.stopped() => Err(reason),
+                frame = res_rx.recv() => Ok(frame),
             }
         });
+        match received {
+            Err(reason) => Err(RunEnd::Stopped(reason)),
+            Ok(Some(frame)) => Ok(frame),
+            Ok(None) => Err(match self.stopped() {
+                Some(reason) => RunEnd::Stopped(reason),
+                None => RunEnd::Failed(SofError::backend(format!(
+                    "{}: resource scan ended before its end marker",
+                    self.runner
+                ))),
+            }),
+        }
+    }
 
-        // Blocking engine task: apply the compartment filter (CPU-bound FHIRPath
-        // evaluation) and drive PreparedViewDefinition::process_chunk_with_external.
-        let producer = tokio::task::spawn_blocking(move || {
-            let columns = prepared.columns().to_vec();
-            let mut emitted = 0usize;
-            let mut chunk_index = 0usize;
+    /// The batch loop. Returns the number of rows sent.
+    fn evaluate(
+        &self,
+        res_rx: &mut mpsc::Receiver<ScanFrame>,
+        out: &mut BatchSender,
+    ) -> Result<usize, RunEnd> {
+        let columns = self.prepared.columns().to_vec();
+        let mut emitted = 0usize;
+        let mut chunk_index = 0usize;
 
-            // One-batch lookahead. `is_last` has to mean "no further batches
-            // exist", which an `is_empty()` probe on the receiver cannot tell
-            // you — under backpressure the channel is momentarily drained for
-            // most batches whenever the engine outruns the scan. Holding the
-            // next batch back is the only way to know the current one is final.
-            let mut pending = res_rx.blocking_recv();
+        // One-batch lookahead: `is_last` means "no further batches exist",
+        // which only the end marker behind the current batch can tell.
+        let mut next = self.next_frame(res_rx)?;
+        loop {
+            let (resources, external_json) = match next {
+                ScanFrame::Batch(resources, external) => (resources, external),
+                ScanFrame::End => break,
+                ScanFrame::Failed(e) => return Err(RunEnd::Failed(e)),
+            };
+            next = self.next_frame(res_rx)?;
+            let is_last = matches!(next, ScanFrame::End);
 
-            while let Some(item) = pending.take() {
-                let (resources, external_json) = match item {
-                    Err(e) => {
-                        let _ = row_tx.blocking_send(Err(e));
-                        return;
-                    }
-                    Ok(batch) => batch,
-                };
-                pending = res_rx.blocking_recv();
-                let is_last = pending.is_none();
-
-                let resources: Vec<Value> = match &compartment_filter {
-                    Some(cf) => {
-                        let mut filtered = Vec::with_capacity(resources.len());
-                        for r in resources {
-                            match cf.apply(&r) {
-                                Ok(true) => filtered.push(r),
-                                Ok(false) => {}
-                                Err(e) => {
-                                    let _ = row_tx.blocking_send(Err(map_engine_error(e)));
-                                    return;
-                                }
-                            }
-                        }
-                        filtered
-                    }
-                    None => resources,
-                };
-
-                // An all-filtered-out batch produces no rows, but the final
-                // batch still has to reach the engine so `is_last` is actually
-                // delivered once per run.
-                if resources.is_empty() && !is_last {
-                    continue;
-                }
-
-                let external: Vec<_> = external_json
-                    .into_iter()
-                    .filter_map(|json| {
-                        helios_sof::parse_json_to_fhir_resource_pub(json, version).ok()
-                    })
-                    .collect();
-
-                let chunk = ResourceChunk {
-                    resources,
-                    chunk_index,
-                    is_last,
-                };
-                chunk_index += 1;
-
-                let result = match prepared.process_chunk_with_external(chunk, external) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = row_tx.blocking_send(Err(map_engine_error(e)));
-                        return;
-                    }
-                };
-
-                for row in &result.rows {
-                    if let Some(cap) = limit {
-                        if emitted >= cap {
-                            return;
-                        }
-                    }
-                    emitted += 1;
-                    let view_row = row_to_view_row(&columns, &row.values);
-                    if row_tx.blocking_send(Ok(view_row)).is_err() {
-                        return;
-                    }
-                }
+            // Per-chunk check: a cancel, the deadline or a dropped stream.
+            if let Some(reason) = self.stopped() {
+                return Err(RunEnd::Stopped(reason));
             }
 
-            debug!(rows = emitted, "in-process view run complete");
-        });
-        watch_row_producer(self.runner_name(), guard_tx, producer);
+            let resources: Vec<Value> = match &self.compartment_filter {
+                Some(cf) => {
+                    let mut filtered = Vec::with_capacity(resources.len());
+                    for r in resources {
+                        if self.evaluation_stop.load(Ordering::Relaxed) {
+                            return Err(RunEnd::Stopped(
+                                self.stopped().unwrap_or(StopReason::Dropped),
+                            ));
+                        }
+                        match cf.apply(&r) {
+                            Ok(true) => filtered.push(r),
+                            Ok(false) => {}
+                            Err(e) => return Err(RunEnd::Failed(map_engine_error(e))),
+                        }
+                    }
+                    filtered
+                }
+                None => resources,
+            };
 
-        Ok(Box::pin(ReceiverStream::new(row_rx)))
+            // An all-filtered-out batch produces no rows, but the final
+            // batch still has to reach the engine so `is_last` is actually
+            // delivered once per run.
+            if resources.is_empty() && !is_last {
+                continue;
+            }
+
+            let external: Vec<_> = external_json
+                .into_iter()
+                .filter_map(|json| {
+                    helios_sof::parse_json_to_fhir_resource_pub(json, self.version).ok()
+                })
+                .collect();
+
+            let chunk = ResourceChunk {
+                resources,
+                chunk_index,
+                is_last,
+            };
+            chunk_index += 1;
+
+            let result = match self.prepared.process_chunk_with_external_until(
+                chunk,
+                external,
+                &self.evaluation_stop,
+            ) {
+                Ok(Some(result)) => result,
+                // The bridge records the reason before it sets the flag.
+                Ok(None) => {
+                    return Err(RunEnd::Stopped(
+                        self.stopped().unwrap_or(StopReason::Dropped),
+                    ));
+                }
+                Err(e) => return Err(RunEnd::Failed(map_engine_error(e))),
+            };
+
+            for row in &result.rows {
+                if self.limit.is_some_and(|cap| emitted >= cap) {
+                    return Ok(emitted);
+                }
+                emitted += 1;
+                if out.push(Ok(row_to_view_row(&columns, &row.values))) {
+                    out.blocking_flush(&self.handle, &self.stop)
+                        .map_err(RunEnd::Stopped)?;
+                }
+            }
+            // A chunk's rows reach the consumer before the next chunk is
+            // evaluated.
+            out.blocking_flush(&self.handle, &self.stop)
+                .map_err(RunEnd::Stopped)?;
+            if self.limit.is_some_and(|cap| emitted >= cap) {
+                return Ok(emitted);
+            }
+        }
+        Ok(emitted)
     }
 }
 
@@ -558,6 +974,7 @@ mod sof_pr410_views;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::sof_runner::{RunKind, ViewFilters};
     use crate::sof::reference_resolver::StorageReferenceResolver;
     use crate::tenant::{TenantId, TenantPermissions};
     use serde_json::json;
@@ -677,8 +1094,13 @@ mod tests {
             InProcessSofRunner::new(StaticScan::of(vec![observation()]), FhirVersion::R4, "test")
                 .with_reference_resolver(Arc::new(LimitResolver));
         let mut stream = runner
-            .run_view(&tenant(), resolve_view(), ViewFilters::default())
+            .run_view(
+                &tenant(),
+                RunRequest::new(resolve_view(), ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view");
         let mut rows = 0;
         let mut error = None;
@@ -708,8 +1130,13 @@ mod tests {
             "select": [{"column": [{"name": "x", "path": "Bogus.name.family"}]}]
         });
         let mut stream = runner
-            .run_view(&tenant(), view, ViewFilters::default())
+            .run_view(
+                &tenant(),
+                RunRequest::new(view, ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view");
         let mut error = None;
         while let Some(item) = stream.next().await {
@@ -744,8 +1171,13 @@ mod tests {
                 continue;
             }
             let mut stream = runner
-                .run_view(&tenant(), case.view, ViewFilters::default())
+                .run_view(
+                    &tenant(),
+                    RunRequest::new(case.view, ViewFilters::default()),
+                    RunContext::detached(RunKind::Preview),
+                )
                 .await
+                .map(|output| output.rows)
                 .unwrap_or_else(|e| panic!("{}: {e}", case.name));
             let mut rows = Vec::new();
             while let Some(row) = stream.next().await {
@@ -851,14 +1283,91 @@ mod tests {
 
     async fn collect_rows(runner: &InProcessSofRunner) -> Vec<Value> {
         let mut stream = runner
-            .run_view(&tenant(), resolve_view(), ViewFilters::default())
+            .run_view(
+                &tenant(),
+                RunRequest::new(resolve_view(), ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view");
         let mut rows = Vec::new();
         while let Some(row) = stream.next().await {
             rows.push(row.expect("row"));
         }
         rows
+    }
+
+    /// #1864 A2/A3, in-process cell (the SQL and MongoDB cells run the shared
+    /// views of `tests/common/sof_prefix_matrix.rs` in the REST conformance
+    /// tests): the declared schema is the walker's document order, which is
+    /// the evaluator's column order, and every row carries exactly those keys
+    /// in that order, empty cells as explicit nulls; a `select` after a
+    /// `unionAll` included.
+    #[tokio::test]
+    async fn view_schema_matches_row_keys_in_document_order() {
+        let patients = vec![
+            json!({"resourceType": "Patient", "id": "a", "birthDate": "1990-01-01",
+                "name": [{"family": "Delta", "use": "official"}]}),
+            json!({"resourceType": "Patient", "id": "b",
+                "contact": [{"name": {"family": "Alpha"}}]}),
+            json!({"resourceType": "Patient", "id": "c"}),
+        ];
+        let views = [
+            json!({"resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [
+                {"unionAll": [
+                    {"forEach": "name", "column": [
+                        {"name": "family", "path": "family", "type": "string"},
+                        {"name": "use", "path": "use", "type": "code"}]},
+                    {"forEach": "contact.name", "column": [
+                        {"name": "family", "path": "family", "type": "string"},
+                        {"name": "use", "path": "use", "type": "code"}]}
+                ]},
+                {"column": [{"name": "born", "path": "birthDate", "type": "date"}]}
+            ]}),
+            json!({"resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [
+                {"column": [{"name": "id", "path": "getResourceKey()"}],
+                 "select": [{"forEachOrNull": "name",
+                    "column": [{"name": "family", "path": "family", "type": "string"}]}]},
+                {"column": [{"name": "born", "path": "birthDate", "type": "date"}]}
+            ]}),
+        ];
+        let runner = InProcessSofRunner::new(StaticScan::of(patients), FhirVersion::R4, "test");
+        for view in views {
+            let walker: Vec<String> = ViewSchema::from_view_definition(&view)
+                .names()
+                .map(str::to_string)
+                .collect();
+            let evaluator = PreparedViewDefinition::new(
+                parse_view_definition_for_version(view.clone(), FhirVersion::R4).unwrap(),
+            )
+            .unwrap()
+            .columns()
+            .to_vec();
+            assert_eq!(walker, evaluator, "walker = evaluator order: {view}");
+            let output = runner
+                .run_view(
+                    &tenant(),
+                    RunRequest::new(view.clone(), ViewFilters::default()),
+                    RunContext::detached(RunKind::Preview),
+                )
+                .await
+                .expect("run_view");
+            let schema: Vec<String> = output.schema.names().map(str::to_string).collect();
+            assert_eq!(schema, walker, "{view}");
+            let rows: Vec<Value> = output.rows.map(|row| row.expect("row")).collect().await;
+            assert!(!rows.is_empty(), "{view}");
+            for row in &rows {
+                let keys: Vec<&String> = row.as_object().expect("object").keys().collect();
+                assert_eq!(keys, schema.iter().collect::<Vec<_>>(), "{row}");
+            }
+            assert!(
+                rows.iter().any(|row| row["born"].is_null()),
+                "explicit nulls: {rows:?}"
+            );
+        }
     }
 
     /// With a resolver, `resolve()` dereferences the stored Patient and the
@@ -939,8 +1448,13 @@ mod tests {
 
     async fn observation_ids(runner: &dyn SofRunner, filters: ViewFilters) -> Vec<String> {
         let mut stream = runner
-            .run_view(&tenant(), observation_ids_view(), filters)
+            .run_view(
+                &tenant(),
+                RunRequest::new(observation_ids_view(), filters),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .expect("run_view");
         let mut ids = Vec::new();
         while let Some(row) = stream.next().await {
@@ -1023,13 +1537,17 @@ mod tests {
         let mut stream = runner
             .run_view(
                 &tenant(),
-                view,
-                ViewFilters {
-                    patient: vec!["Patient/p2".to_string()],
-                    ..Default::default()
-                },
+                RunRequest::new(
+                    view,
+                    ViewFilters {
+                        patient: vec!["Patient/p2".to_string()],
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::Preview),
             )
             .await
+            .map(|output| output.rows)
             .expect("run_view");
         let mut ids = Vec::new();
         while let Some(row) = stream.next().await {
@@ -1044,7 +1562,9 @@ mod tests {
     }
 
     /// A `group` reference that resolves to no stored Group is still the
-    /// spec's absent-target error, not an empty result.
+    /// spec's absent-target error, not an empty result: the typed
+    /// [`SofError::NotFound`] naming it (400 `not-found` on `$sql-run`; it was
+    /// `InvalidViewDefinition`, a 422, before #1864).
     #[tokio::test]
     async fn absent_group_is_an_error() {
         let scan = StaticScan::of(compartment_pool());
@@ -1053,18 +1573,181 @@ mod tests {
         let err = runner
             .run_view(
                 &tenant(),
-                observation_ids_view(),
-                ViewFilters {
-                    group: vec!["Group/nope".to_string()],
-                    ..Default::default()
-                },
+                RunRequest::new(
+                    observation_ids_view(),
+                    ViewFilters {
+                        group: vec!["Group/nope".to_string()],
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::Preview),
             )
             .await
+            .map(|output| output.rows)
             .err()
             .expect("an absent Group is refused");
         assert!(
-            matches!(err, SofError::InvalidViewDefinition(ref m) if m.contains("Group/nope")),
+            matches!(err, SofError::NotFound { ref references } if references == &["Group/nope"]),
             "{err:?}"
+        );
+    }
+
+    /// #1864 (A19): every absent target of a run is listed, as the caller wrote
+    /// it, in one typed not-found; present targets (relative or bare) are not.
+    #[tokio::test]
+    async fn absent_targets_are_one_typed_not_found() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(compartment_pool()), FhirVersion::R4, "test");
+        let err = runner
+            .run_view(
+                &tenant(),
+                RunRequest::new(
+                    observation_ids_view(),
+                    ViewFilters {
+                        patient: vec![
+                            "Patient/p1".to_string(),
+                            "absent".to_string(),
+                            "Patient/gone".to_string(),
+                        ],
+                        group: vec!["g1".to_string(), "Group/nope".to_string()],
+                        ..Default::default()
+                    },
+                ),
+                RunContext::detached(RunKind::Preview),
+            )
+            .await
+            .map(|output| output.rows)
+            .err()
+            .expect("absent targets are refused");
+        match err {
+            SofError::NotFound { references } => {
+                assert_eq!(references, ["absent", "Patient/gone", "Group/nope"]);
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// The engine's own absent-target error, if it is ever reached, maps to the
+    /// same typed not-found with the references it lists.
+    #[test]
+    fn the_engine_absent_target_error_maps_to_not_found() {
+        let err = map_engine_error(helios_sof::SofError::ReferencedResourceNotFound(
+            "Patient/a, Group/b not found in supplied resources".to_string(),
+        ));
+        assert!(
+            matches!(&err, SofError::NotFound { references } if references == &["Patient/a", "Group/b"]),
+            "{err:?}"
+        );
+    }
+
+    /// A scan whose `scan_resources_since` override answers by a stored instant
+    /// kept apart from the JSON stamp, as S3 does: each resource is
+    /// `(resource, stored instant)`. It records every call.
+    #[derive(Default)]
+    struct StoredInstantScan {
+        resources: Vec<(Value, chrono::DateTime<chrono::Utc>)>,
+        /// `None` for `scan_resources`, the cutoff for `scan_resources_since`.
+        calls: Mutex<Vec<Option<chrono::DateTime<chrono::Utc>>>>,
+    }
+
+    #[async_trait]
+    impl ResourceScan for StoredInstantScan {
+        async fn scan_resources(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+        ) -> Result<ResourceStream, SofError> {
+            self.calls.lock().unwrap().push(None);
+            let items: Vec<_> = self
+                .resources
+                .iter()
+                .filter(|(r, _)| r["resourceType"] == resource_type)
+                .map(|(r, _)| Ok(r.clone()))
+                .collect();
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+
+        async fn scan_resources_since(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            cutoff: chrono::DateTime<chrono::Utc>,
+        ) -> Result<ResourceStream, SofError> {
+            self.calls.lock().unwrap().push(Some(cutoff));
+            let items: Vec<_> = self
+                .resources
+                .iter()
+                .filter(|(r, stored)| r["resourceType"] == resource_type && *stored >= cutoff)
+                .map(|(r, _)| Ok(r.clone()))
+                .collect();
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+
+        async fn read_resources(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _ids: &[String],
+        ) -> Result<Vec<Value>, SofError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// #1864 (R-l, A18; council C1/S7): a run with `_since` reads the scan's
+    /// own `scan_resources_since` and does not filter its stream again on the
+    /// (millisecond) JSON stamp: a resource whose stored instant is at the
+    /// cutoff is kept although its JSON stamp is earlier. The export runner's
+    /// per-job cache forwards the cutoff and keys what it keeps by it: the same
+    /// cutoff replays, another cutoff (or none) reads the scan again and never
+    /// sees the first cutoff's resources.
+    #[tokio::test]
+    async fn since_reaches_the_scan_override_through_the_job_cache() {
+        let stored: chrono::DateTime<chrono::Utc> =
+            "2024-05-01T12:00:00.123456789Z".parse().unwrap();
+        let obs = |id: &str, stamp: &str| {
+            json!({"resourceType": "Observation", "id": id, "status": "final",
+                "code": {"text": "x"}, "meta": {"lastUpdated": stamp}})
+        };
+        let scan = Arc::new(StoredInstantScan {
+            resources: vec![
+                // JSON stamp truncated to the millisecond, before the cutoff.
+                (obs("at", "2024-05-01T12:00:00.123Z"), stored),
+                (
+                    obs("before", "2024-05-01T11:00:00.000Z"),
+                    "2024-05-01T11:00:00Z".parse().unwrap(),
+                ),
+            ],
+            ..Default::default()
+        });
+        let runner = InProcessSofRunner::new(scan.clone(), FhirVersion::R4, "test");
+        let since = |cutoff| ViewFilters {
+            since: Some(cutoff),
+            ..Default::default()
+        };
+
+        // The request runner: the override decides, unfiltered after it.
+        assert_eq!(observation_ids(&runner, since(stored)).await, ["at"]);
+
+        let job = runner.for_export_job().expect("an export job runner");
+        let later = stored + chrono::Duration::nanoseconds(1);
+        // Cache miss, then hit, for the same cutoff.
+        assert_eq!(observation_ids(job.as_ref(), since(stored)).await, ["at"]);
+        assert_eq!(observation_ids(job.as_ref(), since(stored)).await, ["at"]);
+        // Another cutoff is its own scan.
+        assert!(observation_ids(job.as_ref(), since(later)).await.is_empty());
+        // No cutoff is its own scan too, and sees everything.
+        assert_eq!(
+            observation_ids(job.as_ref(), ViewFilters::default()).await,
+            ["at", "before"]
+        );
+        // And the earlier cutoffs replay without reading storage again.
+        assert!(observation_ids(job.as_ref(), since(later)).await.is_empty());
+        assert_eq!(observation_ids(job.as_ref(), since(stored)).await, ["at"]);
+
+        assert_eq!(
+            *scan.calls.lock().unwrap(),
+            [Some(stored), Some(stored), Some(later), None],
+            "one request scan, then one job scan per distinct cutoff"
         );
     }
 
@@ -1175,5 +1858,271 @@ mod tests {
             .await;
             assert_eq!(ids.len(), cap, "limit {cap}");
         }
+    }
+
+    /// A `ResourceScan` whose stream yields `ok_items` Observations and then
+    /// panics while the runner reads it.
+    struct PanickingScan {
+        ok_items: usize,
+    }
+
+    #[async_trait]
+    impl ResourceScan for PanickingScan {
+        async fn scan_resources(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+        ) -> Result<ResourceStream, SofError> {
+            let ok_items = self.ok_items;
+            Ok(Box::pin(futures::stream::iter(0..).map(move |i| {
+                assert!(
+                    i < ok_items,
+                    "scan double: storage failed after {ok_items} items"
+                );
+                Ok(json!({
+                    "resourceType": "Observation",
+                    "id": format!("o{i}"),
+                    "status": "final",
+                    "code": {"text": "x"}
+                }))
+            })))
+        }
+
+        async fn read_resources(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _ids: &[String],
+        ) -> Result<Vec<Value>, SofError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// #1864 (A12): a scan that panics part way must fail the run. A run that
+    /// ends `Ok` with the rows read before the panic looks complete and is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_scan_fails_the_run() {
+        // More than one batch, so rows from before the panic reach the consumer.
+        let ok_items = CHUNK_SIZE + 10;
+        let runner = InProcessSofRunner::new(
+            Arc::new(PanickingScan { ok_items }),
+            FhirVersion::R4,
+            "test",
+        );
+        let mut stream = runner
+            .run_view(
+                &tenant(),
+                RunRequest::new(observation_ids_view(), ViewFilters::default()),
+                RunContext::detached(RunKind::Preview),
+            )
+            .await
+            .map(|output| output.rows)
+            .expect("run_view");
+        let mut rows = 0usize;
+        let mut error = None;
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(_) => rows += 1,
+                    Err(e) => {
+                        error = Some(e);
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(drained.is_ok(), "the run must end, not hang");
+        assert!(
+            error.is_some(),
+            "a scan that panicked after {ok_items} items must fail the run; it ended Ok with \
+             {rows} rows"
+        );
+    }
+    /// #1864 (A12): with the end marker, a scan that ends normally still ends
+    /// the run normally, with every row, whether it held no resource, one, a
+    /// whole number of batches or a partial last batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_scans_of_zero_one_and_many_batches_end_normally() {
+        for count in [0, 1, CHUNK_SIZE, 2 * CHUNK_SIZE, 2 * CHUNK_SIZE + 7] {
+            let resources: Vec<Value> = (0..count)
+                .map(|i| {
+                    json!({"resourceType": "Observation", "id": format!("o{i}"),
+                        "status": "final", "code": {"text": "x"}})
+                })
+                .collect();
+            let runner =
+                InProcessSofRunner::new(StaticScan::of(resources), FhirVersion::R4, "test");
+            let mut stream = runner
+                .run_view(
+                    &tenant(),
+                    RunRequest::new(observation_ids_view(), ViewFilters::default()),
+                    RunContext::detached(RunKind::Preview),
+                )
+                .await
+                .map(|output| output.rows)
+                .expect("run_view");
+            let mut ids = std::collections::HashSet::new();
+            let drained = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                while let Some(item) = stream.next().await {
+                    let row = item.unwrap_or_else(|e| panic!("{count} resources: {e}"));
+                    ids.insert(row["obs_id"].as_str().expect("obs_id").to_string());
+                }
+            })
+            .await;
+            assert!(drained.is_ok(), "{count} resources: the run must end");
+            assert_eq!(ids.len(), count, "{count} resources: every row, once");
+        }
+    }
+
+    /// #1864 (S4): a run stopped while a chunk is evaluated ends with the
+    /// stop's error item only after the evaluation returned, and the
+    /// evaluation stops per resource rather than finishing the chunk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_during_an_evaluation_ends_the_run_after_it_stopped() {
+        // Patients with many names under a `forEach`: one chunk takes far
+        // longer to evaluate than the stop bound allows.
+        let resources: Vec<Value> = (0..CHUNK_SIZE)
+            .map(|i| {
+                let names: Vec<Value> = (0..400)
+                    .map(|n| json!({"family": format!("f{i}-{n}")}))
+                    .collect();
+                json!({"resourceType": "Patient", "id": format!("p{i}"), "name": names})
+            })
+            .collect();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"forEach": "name", "column": [{"name": "family", "path": "family"}]}]
+        });
+        let runner = InProcessSofRunner::new(StaticScan::of(resources), FhirVersion::R4, "test");
+        let ctx = RunContext::detached(RunKind::Preview);
+        let cancel = ctx.cancel.clone();
+        let mut stream = runner
+            .run_view(
+                &tenant(),
+                RunRequest::new(view, ViewFilters::default()),
+                ctx,
+            )
+            .await
+            .map(|output| output.rows)
+            .expect("run_view");
+        // The engine is evaluating the only chunk.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        cancel.cancel();
+        let cancelled_at = std::time::Instant::now();
+        let mut rows = 0usize;
+        let last = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(_) => rows += 1,
+                    Err(e) => return Some(e),
+                }
+            }
+            None
+        })
+        .await
+        .expect("the run ends");
+        let ended_after = cancelled_at.elapsed();
+        eprintln!("SOF-CANCEL in-process evaluation: ended {ended_after:?} after the cancel");
+        assert_eq!(rows, 0, "a stopped chunk yields no partial rows");
+        assert!(
+            matches!(last, Some(SofError::Cancelled)),
+            "expected a Cancelled item, got {last:?}"
+        );
+        assert!(
+            ended_after < std::time::Duration::from_secs(1),
+            "the evaluation ran {ended_after:?} after the cancel"
+        );
+    }
+
+    /// Set once the scan stream that owns it has been dropped; the drop is
+    /// slow on purpose, so a run that ends without waiting for its scan
+    /// reports the stop before the flag is set.
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A `ResourceScan` whose endless stream holds a [`DropProbe`].
+    struct SlowDropScan {
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ResourceScan for SlowDropScan {
+        async fn scan_resources(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+        ) -> Result<ResourceStream, SofError> {
+            let probe = DropProbe(Arc::clone(&self.dropped));
+            Ok(Box::pin(futures::stream::iter(0..).map(move |i| {
+                let _probe = &probe;
+                Ok(json!({"resourceType": "Observation", "id": format!("o{i}"),
+                    "status": "final", "code": {"text": "x"}}))
+            })))
+        }
+
+        async fn read_resources(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _ids: &[String],
+        ) -> Result<Vec<Value>, SofError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// #1864 (BD-N5-2): a stopped run ends with its error item only after the
+    /// scan task stopped, so the scan's stream (and any storage read it would
+    /// still start, such as an S3 GET) is gone before the consumer sees the
+    /// end. Before the scan was joined, the engine ended the stream while the
+    /// scan could still be reading.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_run_ends_only_after_its_scan_stopped() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let runner = InProcessSofRunner::new(
+            Arc::new(SlowDropScan {
+                dropped: Arc::clone(&dropped),
+            }),
+            FhirVersion::R4,
+            "test",
+        );
+        let ctx = RunContext::detached(RunKind::Preview);
+        let cancel = ctx.cancel.clone();
+        let mut stream = runner
+            .run_view(
+                &tenant(),
+                RunRequest::new(observation_ids_view(), ViewFilters::default()),
+                ctx,
+            )
+            .await
+            .map(|output| output.rows)
+            .expect("run_view");
+        stream.next().await.expect("a row").expect("a row");
+        cancel.cancel();
+        let last = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(item) = stream.next().await {
+                if let Err(e) = item {
+                    return Some(e);
+                }
+            }
+            None
+        })
+        .await
+        .expect("the run ends");
+        let scan_gone = dropped.load(Ordering::SeqCst);
+        assert!(
+            matches!(last, Some(SofError::Cancelled)),
+            "expected a Cancelled item, got {last:?}"
+        );
+        assert!(
+            scan_gone,
+            "the run ended before its scan task stopped (the scan stream was still alive)"
+        );
     }
 }

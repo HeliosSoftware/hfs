@@ -103,12 +103,15 @@ pub(crate) mod bulk_submit_receipts;
 pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
+pub mod export_runner;
 pub mod history;
 pub mod patch;
 pub mod patient_compartment;
 pub mod preconditions;
 pub mod search;
+pub mod sof_producer;
 pub mod sof_runner;
+pub mod sof_schema;
 pub mod storage;
 pub mod tenant_discovery;
 pub mod transaction;
@@ -117,6 +120,9 @@ pub mod versioned;
 pub mod write_observer;
 
 // Re-export main types
+/// How a SQL runner decodes a column's text values; re-exported for
+/// [`ViewColumn::decode`]. Defined at [`crate::sof::decode::ColumnDecode`].
+pub use crate::sof::decode::ColumnDecode;
 pub use backend::{Backend, BackendCapability, BackendConfig, BackendKind, BackendPoolStats};
 pub use bulk_export::{
     BulkExportStorage, ExpiredExportRef, ExportDataProvider, ExportFileMetadata, ExportJobId,
@@ -162,6 +168,7 @@ pub use capabilities::{
     ResourceSearchCapabilities, SearchCapabilityProvider, SearchParamCapability,
     StorageCapabilities, SystemInteraction, UnsupportedFeatureType, UnsupportedSearchFeature,
 };
+pub use export_runner::ExportRunnerOptions;
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
@@ -180,7 +187,11 @@ pub use search::{
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
-pub use sof_runner::{BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow};
+pub use sof_runner::{
+    BatchStream, RowStream, RunCapabilities, RunContext, RunKind, RunOutput, RunRequest, SofError,
+    SofRunner, StopReason, ViewFilters, ViewRow,
+};
+pub use sof_schema::{ColumnPermutation, ViewColumn, ViewSchema};
 pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
     ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,

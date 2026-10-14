@@ -612,11 +612,6 @@ mod sof_sqlquery_tests {
             ),
             (
                 "/$sql-run",
-                vec![json!({"name": "group", "valueReference": {"reference": "Group/missing"}})],
-                json!([]),
-            ),
-            (
-                "/$sql-run",
                 vec![json!({"name": "_since", "valueInstant": "2000-01-01T00:00:00Z"})],
                 json!([
                     {"patient_id": "p1"},
@@ -631,6 +626,114 @@ mod sof_sqlquery_tests {
             let rows: Value = response.json();
             assert_eq!(rows, expected, "url={url} extra={extra:?}");
         }
+    }
+
+    /// #1864 (A19): a Library subject checks its `patient`/`group` references
+    /// before any dependency runs, like every run path. A missing or deleted
+    /// target is a 400 `not-found` naming it (it used to narrow every
+    /// dependency view to nothing, a 200 with no rows); an unusable value is a
+    /// 400 `invalid` naming its parameter; a Group without Patient members
+    /// still selects nothing (#1701).
+    #[tokio::test]
+    async fn library_subject_answers_missing_and_deleted_references_with_400_not_found() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        seed_patient(&backend, "p-gone", "Gone", true).await;
+        for (id, member) in [("g-empty", None), ("g-gone", Some("Patient/p1"))] {
+            let mut group = json!({"resourceType": "Group", "id": id, "type": "person",
+                "actual": true});
+            if let Some(member) = member {
+                group["member"] = json!([{"entity": {"reference": member}}]);
+            }
+            backend
+                .create(&tenant(), "Group", group, FhirVersion::R4)
+                .await
+                .expect("seed group");
+        }
+        backend
+            .delete(&tenant(), "Patient", "p-gone")
+            .await
+            .expect("delete patient");
+        backend
+            .delete(&tenant(), "Group", "g-gone")
+            .await
+            .expect("delete group");
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd(
+            "SELECT patient_id FROM t ORDER BY patient_id",
+            &vd_url,
+            "t",
+            vec![],
+        );
+
+        for (url, extra, missing) in [
+            (
+                "/$sql-run",
+                vec![json!({"name": "group", "valueReference": {"reference": "Group/missing"}})],
+                "Group/missing",
+            ),
+            ("/$sql-run?patient=Patient/absent", vec![], "Patient/absent"),
+            (
+                "/$sql-run",
+                vec![json!({"name": "patient", "valueReference": {"reference": "Patient/p-gone"}})],
+                "Patient/p-gone",
+            ),
+            (
+                "/$sql-run",
+                vec![json!({"name": "group", "valueReference": {"reference": "Group/g-gone"}})],
+                "Group/g-gone",
+            ),
+        ] {
+            let response = post_library_run(&server, url, lib.clone(), extra.clone()).await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{url} {extra:?}: {}",
+                response.text()
+            );
+            let outcome: Value = response.json();
+            assert_eq!(outcome["issue"][0]["code"], "not-found", "{outcome}");
+            assert!(
+                outcome["issue"][0]["details"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(missing),
+                "must name {missing}: {outcome}"
+            );
+        }
+
+        for (param, value) in [
+            ("patient", "http://example.org/fhir/Patient/p1"),
+            ("group", "Patient/p1"),
+            ("patient", "Patient/p1/_history/1"),
+        ] {
+            let response = post_library_run(
+                &server,
+                "/$sql-run",
+                lib.clone(),
+                vec![json!({"name": param, "valueReference": {"reference": value}})],
+            )
+            .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{param}={value}: {}",
+                response.text()
+            );
+            let outcome: Value = response.json();
+            assert_eq!(outcome["issue"][0]["code"], "invalid", "{outcome}");
+            assert!(outcome.to_string().contains(param), "{outcome}");
+        }
+
+        let response = post_library_run(
+            &server,
+            "/$sql-run",
+            lib,
+            vec![json!({"name": "group", "valueReference": {"reference": "Group/g-empty"}})],
+        )
+        .await;
+        response.assert_status(StatusCode::OK);
+        assert_eq!(response.json::<Value>(), json!([]));
     }
 
     /// #1701: `_limit` caps the subject's final rows, never a filtered
@@ -1510,5 +1613,280 @@ mod sof_sqlquery_tests {
             recorder.as_ref(),
         )
         .await;
+    }
+
+    /// #1864 (A6): a Library whose `depends-on` ViewDefinition the runner
+    /// cannot compile is the request's fault on every path: 422 on
+    /// `$sql-run`, as for the view on its own, and a Failed export whose
+    /// result answers 422. On the base commit the dependency error is
+    /// stringified at the graph boundary and answers 500.
+    #[tokio::test]
+    async fn an_uncompilable_dependency_answers_422_on_run_and_export() {
+        use helios_rest::export::{InMemoryController, InMemorySink};
+
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let controller = InMemoryController::new(
+            Arc::clone(&runner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let config = ServerConfig {
+            base_url: "http://localhost".to_string(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_sof_runner(runner)
+            .with_export_controller(Arc::new(controller));
+        let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
+            .expect("failed to create test server");
+        seed_patient(&backend, "p1", "One", true).await;
+
+        // Seven sibling two-branch `unionAll` clauses: valid, but their
+        // product (128 alternatives) exceeds the in-DB compiler's `unionAll`
+        // normalization limit (64), so the in-DB runner cannot compile it.
+        let select: Vec<Value> = (0..7)
+            .map(|i| {
+                let name = if i == 0 {
+                    "a".to_string()
+                } else {
+                    format!("c{i}")
+                };
+                let branch = json!({"column": [{"path": "id", "name": name, "type": "string"}]});
+                json!({"unionAll": [branch.clone(), branch]})
+            })
+            .collect();
+        let uncompilable = json!({
+            "resourceType": "ViewDefinition",
+            "id": "uncompilable-dep",
+            "resource": "Patient",
+            "status": "active",
+            "select": select
+        });
+        backend
+            .create_or_update(
+                &tenant(),
+                "ViewDefinition",
+                "uncompilable-dep",
+                uncompilable.clone(),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed view definition");
+
+        // Control: the view on its own is a 422.
+        let direct = server
+            .post("/$sql-run?_format=json")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&uncompilable)
+            .await;
+        assert_eq!(
+            direct.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the dependency on its own must be uncompilable: {}",
+            direct.text()
+        );
+
+        let library = library_with_canonical_vd(
+            "SELECT a FROM dep",
+            "ViewDefinition/uncompilable-dep",
+            "dep",
+            vec![],
+        );
+
+        // `$sql-run` of the Library.
+        let run = post_library_run(&server, "/$sql-run", library.clone(), vec![]).await;
+        assert_eq!(
+            run.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Library $sql-run with an uncompilable dependency must be a 422; got {}: {}",
+            run.status_code(),
+            run.text()
+        );
+
+        // `$sql-export` of the Library: refused at kick-off with 422, or a
+        // Failed job whose result answers 422.
+        let kickoff = server
+            .post("/$sql-export")
+            .add_header(HeaderName::from_static("prefer"), "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&json!({
+                "resourceType": "Parameters",
+                "parameter": [{"name": "subject", "part": [
+                    {"name": "name", "valueString": "dep_rows"},
+                    {"name": "subjectResource", "resource": library}
+                ]}]
+            }))
+            .await;
+        if kickoff.status_code() != StatusCode::ACCEPTED {
+            assert_eq!(
+                kickoff.status_code(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "export kick-off: {}",
+                kickoff.text()
+            );
+            return;
+        }
+        let status_url = kickoff
+            .headers()
+            .get("content-location")
+            .expect("content-location")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let status_path = status_url
+            .strip_prefix("http://localhost")
+            .unwrap_or(&status_url)
+            .to_string();
+        let mut result_path = None;
+        for _ in 0..200 {
+            let poll = server
+                .get(&status_path)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            if poll.status_code() == StatusCode::SEE_OTHER {
+                let location = poll
+                    .headers()
+                    .get("location")
+                    .expect("303 location")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                result_path = Some(
+                    location
+                        .strip_prefix("http://localhost")
+                        .unwrap_or(&location)
+                        .to_string(),
+                );
+                break;
+            }
+            assert_eq!(poll.status_code(), StatusCode::ACCEPTED, "{}", poll.text());
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let result_path = result_path.expect("the export job must finish");
+        let result = server
+            .get(&result_path)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            result.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the export of a Library with an uncompilable dependency must fail with 422; got \
+             {}: {}",
+            result.status_code(),
+            result.text()
+        );
+    }
+
+    /// A runner whose every run yields two rows of the `patient-flat` view,
+    /// then the error `fail` builds: a dependency that fails after emitting
+    /// rows.
+    struct MidStreamFailingRunner {
+        fail: fn() -> helios_persistence::core::sof_runner::SofError,
+    }
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::sof_runner::SofRunner for MidStreamFailingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _request: helios_persistence::core::sof_runner::RunRequest,
+            _ctx: helios_persistence::core::sof_runner::RunContext,
+        ) -> Result<
+            helios_persistence::core::sof_runner::RunOutput,
+            helios_persistence::core::sof_runner::SofError,
+        > {
+            let rows = vec![
+                Ok(json!({"patient_id": "p1", "family": "Smith", "active": true})),
+                Ok(json!({"patient_id": "p2", "family": "Jones", "active": true})),
+                Err((self.fail)()),
+            ];
+            Ok(helios_persistence::core::sof_runner::RunOutput::from_rows(
+                Box::pin(futures::stream::iter(rows)),
+            ))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "mid-stream-failing-test-runner"
+        }
+    }
+
+    /// #1864 (A6, council S2): a dependency that fails after emitting rows
+    /// keeps its kind through the engine's row-stream boundary, so a Library
+    /// `$sql-run` answers what the same error answers for the view itself:
+    /// 422 for a dependency the client can fix, 503 with `Retry-After` for an
+    /// unavailable backend, 504 `timeout` for a timeout. On the base commit
+    /// the error is stringified at the boundary and every cell answers 500.
+    #[tokio::test]
+    async fn a_dependency_failing_mid_stream_keeps_its_kind() {
+        use helios_persistence::core::sof_runner::SofError;
+
+        /// The dependency's error and the `(status, code)` answered.
+        type Case = (fn() -> SofError, StatusCode, &'static str);
+        let cases: [Case; 3] = [
+            (
+                || SofError::ResolutionLimit("too many references in this batch".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "processing",
+            ),
+            (
+                || SofError::Unavailable {
+                    message: "pool exhausted (db.internal:5432)".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient",
+            ),
+            (
+                || SofError::Timeout {
+                    budget: None,
+                    message: "canceling statement due to statement timeout".into(),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+            ),
+        ];
+        for (fail, status, code) in cases {
+            let backend = SqliteBackend::with_config(":memory:", Default::default())
+                .expect("failed to create SQLite backend");
+            backend.init_schema().expect("failed to init schema");
+            let backend = Arc::new(backend);
+            let vd_ref = seed_patient_view(&backend).await;
+            let runner: Arc<dyn helios_persistence::core::sof_runner::SofRunner> =
+                Arc::new(MidStreamFailingRunner { fail });
+            let state =
+                helios_rest::AppState::new(Arc::clone(&backend), ServerConfig::for_testing())
+                    .with_sof_runner(runner);
+            let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
+                .expect("failed to create test server");
+
+            let library =
+                library_with_canonical_vd("SELECT patient_id FROM pt", &vd_ref, "pt", vec![]);
+            let response = post_library_run(&server, "/$sql-run", library, vec![]).await;
+            let body = response.text();
+            assert_eq!(
+                response.status_code(),
+                status,
+                "{status}: a dependency failing mid-stream must keep its kind; got {}: {body}",
+                response.status_code()
+            );
+            let outcome: Value = serde_json::from_str(&body).expect("OperationOutcome body");
+            assert_eq!(outcome["issue"][0]["code"], json!(code), "{status}: {body}");
+            assert!(
+                !body.contains("db.internal"),
+                "{status}: server detail must not reach the client: {body}"
+            );
+            assert_eq!(
+                response.headers().get("retry-after").is_some(),
+                status == StatusCode::SERVICE_UNAVAILABLE,
+                "{status}: Retry-After goes with 503 only"
+            );
+        }
     }
 }

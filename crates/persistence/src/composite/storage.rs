@@ -1018,6 +1018,15 @@ impl ResourceStorage for CompositeStorage {
         self.primary.sof_runner()
     }
 
+    fn export_sof_runner(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> Option<Arc<dyn SofRunner>> {
+        // Exports read the same primary store as `sof_runner`, through the
+        // primary's export runner (its own pool on PostgreSQL).
+        self.primary.export_sof_runner(options)
+    }
+
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type))]
     async fn create(
         &self,
@@ -3122,6 +3131,18 @@ mod tests {
 
     fn make_tenant() -> TenantContext {
         TenantContext::new(TenantId::new("test"), TenantPermissions::full_access())
+    }
+
+    /// #1864: exports read through the primary's export runner (its own pool
+    /// on PostgreSQL), not through the primary's request runner.
+    #[test]
+    fn export_sof_runner_is_forwarded_to_the_primary() {
+        use crate::core::export_runner::test_support::{
+            ExportMarkerStorage, assert_export_runner_is_forwarded, composite_over,
+        };
+        let marker = Arc::new(ExportMarkerStorage::default());
+        let composite = composite_over(marker.clone());
+        assert_export_runner_is_forwarded(&composite, &marker);
     }
 
     fn make_composite_no_secondary() -> CompositeStorage {

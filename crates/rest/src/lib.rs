@@ -733,8 +733,30 @@ where
             "Using in-DB SofRunner"
         );
 
-        // Keep a clone for the export controller before moving runner into state.
-        let runner_for_export = Arc::clone(&runner);
+        // Export jobs read through the backend's export runner (#1864): on
+        // PostgreSQL a runner over its own `hfs-export` pool, so whole-result
+        // reads never hold request connections. The controller takes
+        // `for_export_job()` from it per job (the paged reader on
+        // PostgreSQL), and every row a job reads, view subjects and SQL Query
+        // dependencies alike, goes through it under the job's budget;
+        // `$sql-run` keeps `runner`. Backends without one export through
+        // `runner`. `ServerConfig::validate` rejects a bad
+        // `HFS_EXPORT_PG_MAX_CONNECTIONS` at startup; a caller that skipped it
+        // fails here, like the SOF check above.
+        let export_options = config
+            .export_runner_options()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let runner_for_export = storage_arc
+            .export_sof_runner(&export_options)
+            .unwrap_or_else(|| Arc::clone(&runner));
+        let job_budget = Some(config.export_job_budget());
+        info!(
+            runner = runner_for_export.runner_name(),
+            max_connections = export_options.max_connections,
+            job_budget_secs = config.export_job_timeout_secs,
+            run_budget_secs = config.sof_run_timeout_secs,
+            "Using export SofRunner (HFS_EXPORT_PG_MAX_CONNECTIONS applies to PostgreSQL only)"
+        );
         state = state.with_sof_runner(runner);
 
         // Wire the export job controller.
@@ -783,7 +805,8 @@ where
                             shard_rows,
                             cleanup,
                         )
-                        .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                        .with_max_jobs_per_tenant(max_jobs_per_tenant)
+                        .with_job_budget(job_budget),
                     ),
                     Err(e) => {
                         tracing::warn!(
@@ -800,7 +823,8 @@ where
                                 shard_rows,
                                 cleanup,
                             )
-                            .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                            .with_max_jobs_per_tenant(max_jobs_per_tenant)
+                            .with_job_budget(job_budget),
                         )
                     }
                 }
@@ -815,7 +839,8 @@ where
                         shard_rows,
                         cleanup,
                     )
-                    .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                    .with_max_jobs_per_tenant(max_jobs_per_tenant)
+                    .with_job_budget(job_budget),
                 )
             }
 
@@ -831,7 +856,8 @@ where
                         shard_rows,
                         cleanup,
                     )
-                    .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                    .with_max_jobs_per_tenant(max_jobs_per_tenant)
+                    .with_job_budget(job_budget),
                 )
             }
         };

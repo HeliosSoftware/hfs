@@ -19,9 +19,17 @@
 //! - (c) the [`CleanupConfig`]-driven reaper once a finished job ages past its
 //!   TTL.
 //!
-//! A cancelled job's task stops at its next checkpoint. The reaper drops a job's
-//! status entry only once its delete succeeds, retrying a failed delete on the
-//! next sweep.
+//! ## Stopping a job
+//!
+//! Each job has a [`JobHandle`]: its status entry plus a cancellation token
+//! that fires on every transition out of `Running` (a cancel, a failure, a
+//! completion), when the job's task ends, and when the reaper removes the job.
+//! The task races the start of every run and every row it reads against that
+//! token, and each run gets a child token of it, so a cancel stops the
+//! database work behind the run at once instead of at the next row or the next
+//! checkpoint (#1864). The checkpoints before each subject and shard stay. The
+//! reaper drops a job's status entry only once its delete succeeds, retrying a
+//! failed delete on the next sweep.
 //!
 //! ## Surviving a restart
 //!
@@ -38,7 +46,7 @@ pub mod planner;
 pub mod sink;
 
 pub use controller::{
-    CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobStatus,
+    CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobHandle, JobStatus,
     NamedSqlQuery, SqlExportLimits, SubmitError,
 };
 pub use in_memory::{CleanupConfig, InMemoryController};

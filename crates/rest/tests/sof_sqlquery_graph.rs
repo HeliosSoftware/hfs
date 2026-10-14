@@ -12,6 +12,7 @@ mod sof_sqlquery_graph_tests {
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::sqlite::SqliteBackend;
     use helios_persistence::core::ResourceStorage;
+    use helios_persistence::core::sof_runner::{RunContext, RunKind, RunRequest};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
     use serde_json::{Value, json};
@@ -912,8 +913,13 @@ mod sof_sqlquery_graph_tests {
         let direct: Vec<Value> = backend
             .sof_runner()
             .unwrap()
-            .run_view(&tenant(), union.clone(), Default::default())
+            .run_view(
+                &tenant(),
+                RunRequest::new(union.clone(), Default::default()),
+                RunContext::detached(RunKind::Preview),
+            )
             .await
+            .map(|output| output.rows)
             .unwrap()
             .try_collect()
             .await
