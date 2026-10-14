@@ -523,16 +523,18 @@ async fn healthy_independence(hanging: bool, attempts: usize) {
             .all(|(index, (_, receiver))| index == bad || receiver.events().len() == 1)
     })
     .await;
+    // Recording the request precedes sending and processing its HTTP response.
+    // Wait for healthy attempts to release their permits before checking progress.
+    if hanging {
+        wait_until(|| fixture.snapshot().active_attempts == 1).await;
+    } else {
+        wait_until(|| fixture.snapshot().active_attempts == 0).await;
+    }
     assert!(
         !task.is_finished(),
         "healthy delivery must precede the failing cycle's completion"
     );
     assert_eq!(receivers[bad].1.events().len(), 1);
-    if hanging {
-        assert_eq!(fixture.snapshot().active_attempts, 1);
-    } else {
-        wait_until(|| fixture.snapshot().active_attempts == 0).await;
-    }
     fixture.delete(&first).await;
     if let Some(held) = hanging_request {
         held.reply(200);
