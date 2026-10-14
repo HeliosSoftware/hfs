@@ -2149,17 +2149,14 @@ where
     ids
 }
 
-/// Spawns the periodic registry refresh from storage for the SQLite backend
-/// (#235). `HFS_SEARCH_PARAM_CACHE_TTL=0` disables it. A failed pass keeps
-/// serving the stale cache; the next tick retries.
-#[cfg(feature = "sqlite")]
 /// Keeps the SQLite WAL bounded on every write path, not only `$bulk-submit`
 /// (#2025). Every 2 s the -wal file's size is read (a `stat`, no pooled
 /// connection); past the threshold it is folded back into the database and
 /// truncated. Under 20 concurrent transaction Bundles the WAL grows by
 /// 200–250 MB/s, so a slower check lets it reach gigabytes between passes. A
-/// pass that finds readers or writers in the way gives up after its wait and
+/// pass that finds readers or writers in the way gives up after a second and
 /// the next one retries.
+#[cfg(feature = "sqlite")]
 fn spawn_sqlite_wal_maintenance(backend: Arc<SqliteBackend>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -2175,12 +2172,17 @@ fn spawn_sqlite_wal_maintenance(backend: Arc<SqliteBackend>) {
 
 /// Folds the SQLite WAL back and truncates it after the server drained, so a
 /// restart does not inherit it (#2025).
+#[cfg(feature = "sqlite")]
 async fn checkpoint_sqlite_wal_at_shutdown(backend: &SqliteBackend) {
     if let Err(e) = backend.checkpoint_wal_at_shutdown().await {
         warn!("SQLite WAL checkpoint at shutdown failed: {e}");
     }
 }
 
+/// Spawns the periodic registry refresh from storage for the SQLite backend
+/// (#235). `HFS_SEARCH_PARAM_CACHE_TTL=0` disables it. A failed pass keeps
+/// serving the stale cache; the next tick retries.
+#[cfg(feature = "sqlite")]
 fn spawn_sqlite_search_param_refresh(backend: Arc<SqliteBackend>, config: &ServerConfig) {
     let ttl = config.search_param_cache_ttl;
     if ttl == 0 {

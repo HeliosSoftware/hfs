@@ -8,9 +8,12 @@
 //! through it, and every start rebuilt its index (~15 s).
 //!
 //! Under 20 concurrent transaction Bundles the WAL grows by 200–250 MB/s, so
-//! the size is checked often and cheaply (a `stat`, no pooled connection), and
-//! the `TRUNCATE` waits longer for readers and writers the further the WAL is
-//! past its threshold: that wait is the back-pressure that bounds it.
+//! the size is checked often and cheaply (a `stat`, no pooled connection) and
+//! folded back in every pause of the load. The `TRUNCATE` waits only a second
+//! while the server runs: with long Bundle transactions a longer wait seldom
+//! truncated (118 of 143 passes still busy at 10 s) and held writers back,
+//! raising the "database is locked" 503s from 4.6 % to 7.9 % (#1636). Only the
+//! shutdown checkpoint, with no load left, waits longer.
 
 use std::time::Duration;
 
@@ -23,19 +26,13 @@ use crate::error::{BackendError, StorageError, StorageResult};
 /// the auto-checkpoint keeps up with is never touched.
 pub(super) const WAL_MAINTENANCE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Past this size the `TRUNCATE` waits [`HARD_TRUNCATE_WAIT`] instead of
-/// [`SOFT_TRUNCATE_WAIT`].
-pub(super) const WAL_HARD_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+/// How long a maintenance pass's `TRUNCATE` waits for readers and writers
+/// before leaving the rest to the next pass.
+const RUNNING_TRUNCATE_WAIT: Duration = Duration::from_secs(1);
 
-/// How long the `TRUNCATE` of a WAL past its threshold waits for readers and
-/// writers before leaving the rest to the next pass.
-const SOFT_TRUNCATE_WAIT: Duration = Duration::from_secs(1);
-
-/// How long the `TRUNCATE` of a WAL past [`WAL_HARD_LIMIT_BYTES`], or at
-/// shutdown, waits. New writers queue behind it (their own `busy_timeout` is
-/// 30 s); readers that start once the WAL is copied read the database file and
-/// no longer hold the WAL.
-const HARD_TRUNCATE_WAIT: Duration = Duration::from_secs(10);
+/// How long the shutdown checkpoint's `TRUNCATE` waits: the server has
+/// drained, so only stragglers can be in the way.
+const SHUTDOWN_TRUNCATE_WAIT: Duration = Duration::from_secs(10);
 
 /// What one maintenance pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +51,8 @@ impl SqliteBackend {
     /// grown past [`WAL_MAINTENANCE_BYTES`] (#2025). Meant to run every few
     /// seconds: below the threshold it only reads the file size, without a
     /// pooled connection. Past it, it copies passively first, then truncates,
-    /// waiting at most a second for readers and writers — ten past
-    /// [`WAL_HARD_LIMIT_BYTES`]. A busy pass leaves the rest to the next one.
+    /// waiting at most a second for readers and writers. A busy pass leaves the
+    /// rest to the next one.
     /// `None` when nothing was due, or for an in-memory database.
     pub async fn maintain_wal(&self) -> StorageResult<Option<WalMaintenance>> {
         self.maintain_wal_over(WAL_MAINTENANCE_BYTES).await
@@ -78,10 +75,10 @@ impl SqliteBackend {
         if before == 0 || before < threshold {
             return Ok(None);
         }
-        let wait = if threshold == 0 || before >= WAL_HARD_LIMIT_BYTES {
-            HARD_TRUNCATE_WAIT
+        let wait = if threshold == 0 {
+            SHUTDOWN_TRUNCATE_WAIT
         } else {
-            SOFT_TRUNCATE_WAIT
+            RUNNING_TRUNCATE_WAIT
         };
         let report = self
             .run_blocking(move |conn| {
