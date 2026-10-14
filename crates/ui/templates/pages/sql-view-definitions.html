@@ -12,7 +12,8 @@
   server-rendered "Recently used" group (#754/#755) restores the
   last-picked view on arrival and remembers up to `max_recent` more, with a
   `{id, name, meta}` snapshot so a recent still renders when it is off the
-  current page or filter. Save/Duplicate are submit buttons of one plain form
+  current page, or off the filtered list while its stored name still matches
+  the filter (#1275). Save/Duplicate are submit buttons of one plain form
   (POST back to this route); Delete rides conformance-crud.js like the other
   conformance viewers.
 
@@ -75,17 +76,29 @@
 <p class="notice">{{ i18n.t("vd-saved") }}</p>
 {% endif %}
 
-<div class="filter-layout filter-layout--two">
+{#- `hx-history="false"`: the rail filter replaces the URL (#1275); htmx must not
+    snapshot this page — editor text, `$sql-run` rows — into localStorage for it. -#}
+<div class="filter-layout filter-layout--two" hx-history="false">
   <aside class="filter-rail" aria-label="{{ i18n.t("vd-rail-label") }}">
     <div class="filter-rail__heading">{{ i18n.t("vd-rail-heading") }}</div>
     <form class="filter-rail__search" method="get" action="/ui/sql/view-definitions" role="search">
       {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
-      {% if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
+      {% if is_new %}
+      <input type="hidden" name="vd" value="new">
+      {% else if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
       <input type="hidden" name="vd" value="{{ sel.id }}">
       {% endif %}{% endif %}
       <span class="icon">{% include "icons/search.svg" %}</span>
+      {#- Filters as the user types (#1275): htmx swaps the list, the "Recently
+          used" group and the pagination from the same filtered render. Enter
+          still submits the form natively, which is also the no-JS path. -#}
       <input type="search" name="filter" value="{{ filter }}"
-             placeholder="{{ i18n.t("vd-filter") }}" aria-label="{{ i18n.t("vd-filter") }}">
+             placeholder="{{ i18n.t("vd-filter") }}" aria-label="{{ i18n.t("vd-filter") }}"
+             hx-get="/ui/sql/view-definitions" hx-include="closest form"
+             hx-trigger="input changed delay:300ms" hx-sync="this:replace"
+             hx-target="#vd-rail-list" hx-select="#vd-rail-list" hx-swap="outerHTML"
+             hx-select-oob="#vd-rail-recent,#vd-rail-pagination,#sql-selection-filtered,#sql-empty-state"
+             hx-replace-url="true" hx-headers='{"X-Rail-Filter":"1"}'>
     </form>
     {% call recent::group("vd-rail-recent", "vd-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
@@ -103,8 +116,7 @@
       <p class="filter-rail__empty" id="sql-rail-empty">{% if filter.is_empty() %}{{ i18n.t("vd-none") }}{% else %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% endif %}</p>
       {% endif %}
     </div>
-    {% if prev_href.is_some() || next_href.is_some() %}
-    <nav class="pagination" aria-label="{{ i18n.t("vd-pagination-label") }}">
+    <nav class="pagination" id="vd-rail-pagination" aria-label="{{ i18n.t("vd-pagination-label") }}"{% if prev_href.is_none() && next_href.is_none() %} hidden{% endif %}>
       {% if let Some(href) = prev_href %}
       <a class="btn" href="{{ href }}">{{ i18n.t("vd-page-prev") }}</a>
       {% endif %}
@@ -112,7 +124,6 @@
       <a class="btn" href="{{ href }}">{{ i18n.t("vd-page-next") }}</a>
       {% endif %}
     </nav>
-    {% endif %}
   </aside>
 
   <div class="filter-center">
@@ -149,9 +160,9 @@
         {% endif %}
       </div>
     </section>
-    {% if selection_filtered %}
-    <p class="page-head__lede" id="sql-selection-filtered">{{ i18n.t_arg("sql-rail-selection-filtered", "filter", filter.clone()) }} <a href="/ui/sql/view-definitions?vd={{ sel.id }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
-    {% endif %}
+    {#- Always emitted so the live rail filter can swap it (`hx-select-oob`);
+        `hidden` when the selection is on the filtered list (#1275). -#}
+    <p class="page-head__lede" id="sql-selection-filtered"{% if !selection_filtered %} hidden{% endif %}>{{ i18n.t_arg("sql-rail-selection-filtered", "filter", filter.clone()) }} <a href="/ui/sql/view-definitions?vd={{ sel.id }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
 
     {% if let Some(error) = save_error %}
     <p class="notice notice--warn">{{ error }}</p>
@@ -242,7 +253,8 @@
         (#839). -#}
     {{ run_results.render()?|safe }}
     {% else %}
-    <section class="card">
+    {#- `id`: the live rail filter swaps this card with the list (#1275). -#}
+    <section class="card" id="sql-empty-state">
       <div class="card-head">
         <h3>{% if !filter.is_empty() && rail.is_empty() %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% else %}{{ i18n.t("vd-none") }}{% endif %}</h3>
       </div>

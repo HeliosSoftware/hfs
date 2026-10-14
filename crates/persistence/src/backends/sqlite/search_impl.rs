@@ -427,6 +427,7 @@ impl SqliteBackend {
             .as_ref()
             .map(|f| format!(" AND rowid IN ({})", f.sql))
             .unwrap_or_default();
+        let first_page_source = first_page_source(search_filter.is_some(), query, count);
         let search_params = search_filter.map(|f| f.params).unwrap_or_default();
 
         // SELECT the sort key alongside the row so the next cursor can be built.
@@ -474,7 +475,7 @@ impl SqliteBackend {
             (sql, offset > 0)
         } else {
             let sql = format!(
-                "SELECT {cols} FROM resources \
+                "SELECT {cols} FROM {first_page_source} \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
                  {order} LIMIT {lim}",
                 cols = select_cols,
@@ -620,6 +621,26 @@ impl SqliteBackend {
             total,
             scores: Default::default(),
         })
+    }
+}
+
+/// The table expression of a first page (no cursor, no offset) of `count`
+/// resources: `resources`, or `resources NOT INDEXED` for a filtered one-row
+/// page on the default order.
+///
+/// SQLite plans that page (`LIMIT` 1 or 2) by reading every key of the
+/// filter's `rowid IN (…)` list and sorting them: it probes
+/// `idx_resources_live_type` for each key, then reads the row anyway for its
+/// `data`, so a broad filter (`date=le…`, `ne…`) paid two lookups per match
+/// (#1506). `NOT INDEXED` keeps that plan with the row read alone. From three
+/// rows up, and for `_sort=_lastUpdated` or `_id`, SQLite walks an index in
+/// the page order and stops when the page is full, which `NOT INDEXED` would
+/// forbid, so those pages and every `_sort` are left to the planner.
+fn first_page_source(filtered: bool, query: &SearchQuery, count: usize) -> &'static str {
+    if filtered && query.sort.is_empty() && count <= 1 {
+        "resources NOT INDEXED"
+    } else {
+        "resources"
     }
 }
 
@@ -2957,6 +2978,118 @@ mod tests {
             !plan.iter().any(|line| line.starts_with("SCAN si")),
             "{plan:#?}"
         );
+    }
+
+    thread_local! {
+        static TRACED_SQL: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// `Connection::trace_v2` callback: keeps each statement as it starts,
+    /// with its bound values written in.
+    fn record_traced_sql(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(statement, _) = event
+            && let Some(sql) = statement.expanded_sql()
+        {
+            TRACED_SQL.with(|traced| traced.borrow_mut().push(sql));
+        }
+    }
+
+    /// #1506: a filtered one-row page on the default order reads each match
+    /// by rowid, where SQLite would probe `idx_resources_live_type` first, and
+    /// a single date parameter is not wrapped in a `SELECT DISTINCT` that
+    /// re-probes `idx_search_composite` per key; `le`'s two ranges are a
+    /// `UNION ALL`. A longer page keeps the walk of `idx_resources_reindex`
+    /// that stops at the page, and both pages start with the same resource.
+    #[tokio::test]
+    async fn a_one_row_page_reads_its_matches_by_rowid() {
+        use crate::types::{SearchParamType, SearchPrefix};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for (id, start) in [
+            ("e1", "1990-01-01"),
+            ("e2", "1999-06-01"),
+            ("e3", "2005-01-01"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Encounter",
+                    json!({"resourceType": "Encounter", "id": id, "status": "finished",
+                           "class": {"code": "AMB"}, "period": {"start": start}}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let query = |count| {
+            let mut query = SearchQuery::new("Encounter").with_parameter(SearchParameter {
+                name: "date".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::new(SearchPrefix::Le, "2000")],
+                chain: vec![],
+                components: vec![],
+            });
+            query.count = Some(count);
+            query
+        };
+
+        let conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        );
+        let mut first = Vec::new();
+        for (count, read) in [
+            (1, "USING INTEGER PRIMARY KEY"),
+            (10, "idx_resources_reindex"),
+        ] {
+            TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+            let result = backend
+                .search_with_connection(&conn, &tenant, &query(count), None)
+                .unwrap();
+            let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+            assert_eq!(ids.len(), count.min(2) as usize, "{ids:?}");
+            first.push(ids[0].to_string());
+
+            let page = TRACED_SQL
+                .with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT id, version_id, data"))
+                        .cloned()
+                })
+                .expect("the page statement");
+            assert!(!page.contains("SELECT DISTINCT"), "{page}");
+            assert_eq!(page.matches(" UNION ALL ").count(), 1, "{page}");
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {page}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|line| line.starts_with("SEARCH resources") && line.contains(read)),
+                "_count={count}: {plan:#?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line.contains("idx_resources_live_type")),
+                "_count={count}: {plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_search_date_start")),
+                "{plan:#?}"
+            );
+        }
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        assert_eq!(first[0], first[1]);
     }
 
     /// #1955: a search on positive parameters takes its candidates straight

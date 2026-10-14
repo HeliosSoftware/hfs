@@ -260,6 +260,13 @@ fn cases() -> Vec<Case> {
         ..Default::default()
     };
     cases.push(anchors);
+    let mut exists_multi_step = patient(
+        "exists-multi-step",
+        json!([{"column":[{"path":"id","name":"id"}]}]),
+    );
+    exists_multi_step.view["where"] =
+        json!([{"path":"contact.telecom.exists(system = 'phone' and value = '555')"}]);
+    cases.push(exists_multi_step);
     // Keyset pages of an export read: range slots come last, no SQL LIMIT.
     for (name, source) in [
         ("export-page-flat", "flat"),
@@ -307,7 +314,7 @@ async fn check(dialect: SqlDialect, name: &str) {
         std::fs::create_dir_all(&directory).unwrap();
     }
     let cases = cases();
-    assert_eq!(cases.len(), 32, "all golden cases must execute");
+    assert_eq!(cases.len(), 33, "all golden cases must execute");
     for case in cases {
         let groups = || {
             vec![

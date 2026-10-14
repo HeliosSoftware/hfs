@@ -22,7 +22,12 @@
   `rail_page` and `max_recent` are the only values a client script needs to
   write this page's own `rails.<page>` record back — the single source for
   both is `rail_state::RailPage::key`/`rail_state::MAX_RECENT`, never
-  redeclared in JS. The container stays present-but-`hidden` with no entries
+  redeclared in JS. The group follows its rail's filter box (#1275): each
+  page narrows `entries` server-side with the same needle as its list
+  (`rail_state::retain_matching_recents`), or Resources/Search hide items
+  client-side; a filter matching nothing leaves it empty, hence `hidden`.
+  The htmx-filtered rails re-fetch it by id (`hx-select-oob`), which is why
+  the container is always emitted. The container stays present-but-`hidden` with no entries
   (no store configured renders the same way), so CSS never has to key off
   its absence.
 -->

@@ -55,7 +55,9 @@ pub enum FilterOp {
     Sa,
     /// Ends before (date)
     Eb,
-    /// Approximately equal
+    /// Approximately equal: the shared `ap` window for dates and quantities.
+    /// Undefined for string, token, reference and URI columns, where it
+    /// matches nothing.
     Ap,
 }
 
@@ -89,7 +91,10 @@ impl FilterOp {
             FilterOp::Ge => ">=",
             FilterOp::Le => "<=",
             // These need special handling (LIKE patterns)
-            FilterOp::Co | FilterOp::Sw | FilterOp::Ew | FilterOp::Ap => "LIKE",
+            FilterOp::Co | FilterOp::Sw | FilterOp::Ew => "LIKE",
+            // A range on dates and quantities, nothing elsewhere; never a
+            // single SQL operator.
+            FilterOp::Ap => "BETWEEN",
         }
     }
 }
@@ -485,18 +490,22 @@ impl FilterSqlGenerator {
         // Determine the column and condition based on parameter and operator.
         // A date binds one value per bound of its range comparison; every
         // other comparison binds exactly one.
-        let (condition, binds) = match self.build_date_condition(param, op, value, param_num) {
-            Some(date) => date,
-            None => {
-                let (_column, condition, sql_value) =
-                    self.build_condition(param, op, value, param_num);
-                (condition, vec![sql_value])
-            }
-        };
+        let (condition, binds): (String, Vec<SqlParam>) =
+            match self.build_date_condition(param, op, value, param_num) {
+                Some((condition, binds)) => {
+                    (condition, binds.into_iter().map(SqlParam::String).collect())
+                }
+                None if op == FilterOp::Ap => self.build_approx_condition(param, value, param_num),
+                None => {
+                    let (_column, condition, sql_value) =
+                        self.build_condition(param, op, value, param_num);
+                    (condition, vec![SqlParam::String(sql_value)])
+                }
+            };
         self.param_offset += binds.len();
 
         // `tenant_id = ?1` is not optional — see the sibling non-`_filter` path
-        // in `query_builder::build_parameter_condition`, which has always
+        // in `query_builder::parameter_condition`, which has always
         // carried it. Without it this sub-select scans every tenant's
         // `search_index` and returns a bare `resource_id` set that the outer
         // query intersects with this tenant's resources, so tenant A's
@@ -510,12 +519,51 @@ impl FilterSqlGenerator {
                 sql_string_literal(param),
                 condition
             ),
-            binds.into_iter().map(SqlParam::String).collect(),
+            binds,
         )
     }
 
+    /// The `ap` comparison for a non-date parameter (#1503).
+    ///
+    /// A quantity column uses the shared approximate window of the `ap` search
+    /// prefix (`approx_range`), as a closed `BETWEEN`. A literal that is not a
+    /// number matches nothing. `ap` has no defined meaning on a string, token,
+    /// reference or URI column, so it matches nothing there either, rather
+    /// than doing a substring match.
+    fn build_approx_condition(
+        &self,
+        param: &str,
+        value: &str,
+        param_num: usize,
+    ) -> (String, Vec<SqlParam>) {
+        use crate::search::FhirNumberValue;
+        use crate::types::SearchPrefix;
+
+        let column = self.infer_column(param);
+        if column != "value_quantity_value" {
+            tracing::warn!(
+                "_filter `ap` is only defined for date and quantity parameters; '{}' is not one — matching nothing",
+                param
+            );
+            return ("1 = 0".to_string(), Vec::new());
+        }
+        match FhirNumberValue::parse(value) {
+            Ok(number) => {
+                let frag = super::parameter_handlers::QuantityHandler::build_numeric_condition(
+                    column,
+                    number.value,
+                    number.text(),
+                    SearchPrefix::Ap,
+                    param_num,
+                );
+                (frag.sql, frag.params)
+            }
+            Err(_) => ("1 = 0".to_string(), Vec::new()),
+        }
+    }
+
     /// The comparison for a date parameter: the FHIR range comparison against
-    /// the stored `[value_date, value_date_end)` (#456, #1391), as the
+    /// the stored `[value_date_start, value_date_end)` (#456, #1391), as the
     /// unchained date search makes it. `None` when `param` is not a date or
     /// `op` is not a date prefix; the generic text operators then apply.
     fn build_date_condition(
@@ -547,7 +595,7 @@ impl FilterSqlGenerator {
         // have made of it.
         Some(
             super::parameter_handlers::date::date_range_condition_or_nothing(
-                "value_date",
+                "value_date_start",
                 "value_date_end",
                 prefix,
                 value,
@@ -634,19 +682,9 @@ impl FilterSqlGenerator {
                     format!("%{}", Self::escape_like(value)),
                 )
             }
-            FilterOp::Ap => {
-                // Approximately equal - for numbers, use a range; for strings, use LIKE
-                // Simple implementation: treat as contains for strings
-                (
-                    column,
-                    format!(
-                        "{col} IS NOT NULL AND {col} LIKE ?{}",
-                        param_num,
-                        col = column
-                    ),
-                    format!("%{}%", Self::escape_like(value)),
-                )
-            }
+            // `ap` never reaches here: `generate_comparison` routes it to
+            // `build_date_condition` or `build_approx_condition`.
+            FilterOp::Ap => (column, "1 = 0".to_string(), value.to_string()),
         }
     }
 
@@ -905,6 +943,63 @@ mod date_filter_tests {
         assert!(matches!(&frag.params[1], SqlParam::String(s) if s == "2024-01-01 10:00:00.560"));
         assert!(matches!(&frag.params[2], SqlParam::String(s) if s == "completed"));
         assert!(frag.sql.contains("value_token_code = ?4"), "{}", frag.sql);
+    }
+
+    /// #1503: `ap` on a quantity column is the shared closed window.
+    #[test]
+    fn filter_quantity_ap_is_the_shared_window() {
+        let frag = FilterSqlGenerator::new(1)
+            .generate(&FilterParser::parse("value-quantity ap 100").unwrap());
+        assert!(
+            frag.sql.contains("value_quantity_value BETWEEN ?2 AND ?3"),
+            "{}",
+            frag.sql
+        );
+        assert!(!frag.sql.contains("LIKE"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 2);
+        assert!(matches!(frag.params[0], SqlParam::Float(v) if (v - 90.0).abs() < 1e-9));
+        assert!(matches!(frag.params[1], SqlParam::Float(v) if (v - 110.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn filter_quantity_ap_keeps_following_numbering() {
+        let frag = FilterSqlGenerator::new(1)
+            .generate(&FilterParser::parse("age ap 5 and name eq Smith").unwrap());
+        assert_eq!(frag.params.len(), 3);
+        assert!(frag.sql.contains("BETWEEN ?2 AND ?3"), "{}", frag.sql);
+        assert!(frag.sql.contains("value_string = ?4"), "{}", frag.sql);
+        assert!(matches!(&frag.params[2], SqlParam::String(s) if s == "Smith"));
+    }
+
+    #[test]
+    fn filter_quantity_ap_non_number_matches_nothing() {
+        let frag = FilterSqlGenerator::new(1)
+            .generate(&FilterParser::parse("value-quantity ap abc").unwrap());
+        assert!(frag.sql.contains("AND 1 = 0"), "{}", frag.sql);
+        assert!(frag.params.is_empty());
+    }
+
+    #[test]
+    fn filter_ap_on_text_like_columns_matches_nothing() {
+        for param in ["name", "status", "subject", "url"] {
+            let frag = FilterSqlGenerator::new(1)
+                .generate(&FilterParser::parse(&format!("{param} ap abc")).unwrap());
+            assert!(frag.sql.contains("AND 1 = 0"), "{param}: {}", frag.sql);
+            assert!(!frag.sql.contains("LIKE"), "{param}: {}", frag.sql);
+            assert!(frag.params.is_empty(), "{param}");
+        }
+    }
+
+    #[test]
+    fn filter_co_still_uses_like_and_date_ap_is_unchanged() {
+        let co = FilterSqlGenerator::new(1).generate(&FilterParser::parse("name co mith").unwrap());
+        assert!(co.sql.contains("LIKE ?2"), "{}", co.sql);
+        let ap = FilterSqlGenerator::new(1)
+            .generate(&FilterParser::parse("birthdate ap 1995-10-02").unwrap());
+        assert!(ap.sql.contains("value_date"), "{}", ap.sql);
+        assert!(!ap.sql.contains("LIKE"), "{}", ap.sql);
+        assert!(ap.params.len() >= 2);
+        assert!(ap.params.iter().all(|p| matches!(p, SqlParam::String(_))));
     }
 
     /// Non-date columns keep the plain text operators.

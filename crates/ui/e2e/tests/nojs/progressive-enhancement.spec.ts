@@ -183,6 +183,14 @@ for (const { path, list, recent, param } of SQL_RAILS) {
       const recentGroup = page.locator(`#${recent}`);
       await expect(recentGroup).toBeVisible();
       await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+
+      // The filter narrows the group on a plain GET too (#1275): a matching
+      // term keeps the entry, a term matching nothing hides the group.
+      await page.goto(`${path}?filter=0znojs_${stamp}`);
+      await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+      await page.goto(`${path}?filter=zzzznomatch_${stamp}`);
+      await expect(recentGroup).toBeHidden();
+      await expect(recentGroup.locator(".filter-rail__item")).toHaveCount(0);
     } finally {
       await deleteResources(request, type, [id]);
     }

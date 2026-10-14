@@ -447,7 +447,7 @@ pub(crate) fn build_view(
             *base_counts.entry(base.as_str()).or_default() += 1;
         }
     }
-    let needle = query.q.to_lowercase();
+    let needle = query.q.trim().to_lowercase();
     let rail: Vec<RailItem> = base_counts
         .iter()
         .filter(|(name, _)| needle.is_empty() || name.to_lowercase().contains(&needle))
@@ -478,11 +478,10 @@ pub(crate) fn build_view(
     };
 
     // The "Recently used" group, resolved against every base with at least
-    // one parameter — unfiltered by the search box's `needle`, since a
-    // recent must stay visible even while the box hides it from the
-    // scrollable list. Every surviving base is also a valid live entry, so
-    // `resolve_recents`'s snapshot fallback never triggers here: type rails
-    // never store one (only the SQL rails do).
+    // one parameter, then narrowed by the search box's `needle` exactly like
+    // the scrollable list (#1275). Every surviving base is also a valid live
+    // entry, so `resolve_recents`'s snapshot fallback never triggers here:
+    // type rails never store one (only the SQL rails do).
     let recent_live: HashMap<String, rail_state::LiveRailItem> = base_counts
         .iter()
         .map(|(name, count)| {
@@ -504,7 +503,7 @@ pub(crate) fn build_view(
         })
         .collect();
     let recent_is_valid: &dyn Fn(&str) -> bool = &|id| recent_live.contains_key(id);
-    let recent = stored_rail.resolve_recents(
+    let mut recent = stored_rail.resolve_recents(
         &recent_live,
         |id| {
             query.href_with(
@@ -517,6 +516,7 @@ pub(crate) fn build_view(
         },
         Some(recent_is_valid),
     );
+    rail_state::retain_matching_recents(&mut recent, query.q.trim(), |_| false);
 
     // Facets are scoped to the current base type and show live counts.
     let in_base: Vec<&Arc<SearchParameterDefinition>> = params

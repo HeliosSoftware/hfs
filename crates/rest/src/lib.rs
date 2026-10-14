@@ -160,6 +160,7 @@ pub mod fhir_types;
 pub mod handlers;
 pub mod jwe;
 pub mod middleware;
+pub mod patient_compartment;
 pub(crate) mod public_url;
 pub(crate) mod rate_limit;
 pub mod responses;

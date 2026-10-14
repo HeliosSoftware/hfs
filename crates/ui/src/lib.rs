@@ -3787,15 +3787,19 @@ async fn resolve_vd_by_id(
 
 /// For View Definitions: the "Recently used" group's rows, resolved against
 /// this render's own page of the server-paged rail search so
-/// label/meta/href/current match what the list already shows. "The group
-/// is never itself filtered by `?filter=`" falls out for free: an id the
+/// label/meta/href/current match what the list already shows. An id the
 /// current page/filter excludes is simply absent from `summaries` (and so
 /// from `live`), so [`rail_state::RailState::resolve_recents`] renders it
 /// from its stored `{name, meta}` snapshot instead.
+///
+/// The group follows the rail's `?filter=` (#1275): an entry stays when the
+/// filtered page lists it or its label matches the filter, so a term that
+/// matches nothing leaves the group empty (and so `hidden`).
 fn resolve_vd_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_views::VdSummary],
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -3812,11 +3816,22 @@ fn resolve_vd_recents(
             )
         })
         .collect();
-    rail.resolve_recents(
+    let mut recents = rail.resolve_recents(
         &live,
         |id| format!("/ui/sql/view-definitions?vd={id}"),
         None,
-    )
+    );
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
+}
+
+/// Header the SQL rails' filter inputs send while filtering as you type
+/// (#1275). Such a request re-renders the page only to swap the rail, so it
+/// must not record the echoed `?vd=`/`?lib=` as a user pick.
+const RAIL_FILTER_HEADER: &str = "x-rail-filter";
+
+fn is_live_rail_filter(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(RAIL_FILTER_HEADER)
 }
 
 /// `GET /ui/sql/view-definitions`: the rail is one page of a server-side
@@ -3827,6 +3842,8 @@ fn resolve_vd_recents(
 /// carried over into `name:contains` — it was never a documented part of
 /// #649 and has no standard FHIR search expression (see
 /// [`sql_views::rail_search_params`] for why).
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_view_definitions_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -3834,9 +3851,11 @@ async fn sql_view_definitions_page(
     rt: RequestTenant,
     Query(query): Query<SqlVdQuery>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let live_filter = is_live_rail_filter(&headers);
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     // Absent or non-numeric falls back to page 1 rather than 400ing — a
     // stale or hand-edited `?page=` is a navigation mistake, not an error.
     let page = query
@@ -3905,15 +3924,21 @@ async fn sql_view_definitions_page(
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = record_snapshot_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    rail_state::RailPage::ViewDefinitions,
-                    rail_before,
-                    entry,
-                )
-                .await;
+                // Typing in the rail filter echoes the page's selection back
+                // as `?vd=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    record_snapshot_selection(
+                        &state,
+                        &settings.user_key,
+                        &rt.id,
+                        rail_state::RailPage::ViewDefinitions,
+                        rail_before,
+                        entry,
+                    )
+                    .await
+                };
                 (Some(SelectedVd { id, name, json }), Some(vd), rail)
             }
             None => {
@@ -3932,6 +3957,11 @@ async fn sql_view_definitions_page(
                 (None, None, rail)
             }
         }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
     } else {
         // No explicit selection: try the stored `last`, falling back to
         // the rail's first visible entry when there is none or it no
@@ -3992,8 +4022,12 @@ async fn sql_view_definitions_page(
     )
     .await;
 
-    let recent_entries =
-        resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
+    let recent_entries = resolve_vd_recents(
+        &rail,
+        &summaries,
+        selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
+    );
 
     // `?saved=1` (Save's own redirect) runs the just-stored definition
     // through $sql-run once, server-side, so the nojs path shows results
@@ -5877,16 +5911,18 @@ fn resolve_lib_of_kind(
 /// For the Library-backed rails (SQL Queries, SQL Views): the "Recently
 /// used" group's rows, resolved against this render's own (kind- and
 /// search-box-filtered) rail list so label/meta/href/current match what the
-/// list already shows. "The group is never itself filtered by `?filter=`"
-/// falls out for free: an id the current filter excludes is simply absent
+/// list already shows. An id the current filter excludes is simply absent
 /// from `summaries` (and so from `live`), so
 /// [`rail_state::RailState::resolve_recents`] renders it from its stored
-/// `{name, meta}` snapshot instead.
+/// `{name, meta}` snapshot instead — and the group then follows the rail's
+/// `?filter=` (#1275): an entry stays when the filtered list shows it or its
+/// label matches, so a term matching nothing leaves the group empty.
 fn resolve_lib_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_libraries::LibSummary],
     base_href: &str,
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -5903,7 +5939,9 @@ fn resolve_lib_recents(
             )
         })
         .collect();
-    rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None)
+    let mut recents = rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None);
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5917,8 +5955,9 @@ async fn sql_library_page(
     kind: &LibraryKind,
     settings: rail_state::RequestSettings,
     user_key: String,
+    live_filter: bool,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     let (mut libraries, degraded) = match state.conformance.fetch("Library", rv.0, &rt.id).await {
         Ok(resources) => (resources, None),
         Err(error) => {
@@ -5959,10 +5998,7 @@ async fn sql_library_page(
         .unwrap_or_else(|| stored_rail.clone());
     let summaries = {
         let mut s = sql_libraries::summarize(&libraries, kind.code);
-        if !filter.is_empty() {
-            let needle = filter.to_lowercase();
-            s.retain(|e| e.name.to_lowercase().contains(&needle));
-        }
+        s.retain(|e| rail_state::matches_rail_filter(&e.name, &filter));
         s
     };
 
@@ -5992,7 +6028,13 @@ async fn sql_library_page(
                 let status = sql_libraries::extract_status(&lib);
                 let meta = (!status.is_empty()).then(|| status.clone());
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = rail_before.select(entry).unwrap_or(rail_before);
+                // Typing in the rail filter echoes the page's selection back
+                // as `?lib=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    rail_before.select(entry).unwrap_or(rail_before)
+                };
                 (
                     Some(SelectedLib {
                         id,
@@ -6010,6 +6052,11 @@ async fn sql_library_page(
             // evidence of deletion. The existence sweep already decided it.
             None => (None, None, rail_before),
         }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
     } else {
         // No explicit selection: try the stored `last`, falling back to
         // the rail's first visible entry when there is none or it no
@@ -6070,6 +6117,7 @@ async fn sql_library_page(
         &summaries,
         kind.base_href,
         selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
     );
 
     // `?saved=1` (Save's own redirect) runs the just-stored Library through
@@ -8011,9 +8059,11 @@ async fn sql_queries_page(
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
     sql_library_page(
         state,
         locale,
@@ -8024,6 +8074,7 @@ async fn sql_queries_page(
         &SQL_QUERY_KIND,
         settings,
         user_key,
+        live_filter,
     )
     .await
 }
@@ -8103,9 +8154,11 @@ async fn sql_views_page(
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
     sql_library_page(
         state,
         locale,
@@ -8116,6 +8169,7 @@ async fn sql_views_page(
         &SQL_VIEW_KIND,
         settings,
         user_key,
+        live_filter,
     )
     .await
 }
