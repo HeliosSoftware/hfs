@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage, WriteKind};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider, WriteKind};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
@@ -18,6 +18,7 @@ use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
@@ -59,18 +60,38 @@ pub async fn create_handler<S>(
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync,
 {
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     admit_resource_type(&resource_type, &resource, fhir_version)?;
+
+    // A `patient/` scope creates inside the launch patient's compartment only
+    // (#1618): the submitted payload must reference the launch patient through
+    // a compartment parameter. A conditional create is refused outright — its
+    // `If-None-Exist` match could be another patient's resource, which the
+    // response would then disclose.
+    if compartment.is_confined() {
+        if conditional.if_none_exist().is_some() {
+            return Err(compartment.outside_compartment(
+                "a conditional create is not available under a patient/ scope: the If-None-Exist match cannot be confined to the launch patient's compartment".to_string(),
+            ));
+        }
+        compartment.assert_member(
+            || state.storage().search_param_registry(tenant.context()),
+            fhir_version,
+            &resource,
+            "create",
+        )?;
+    }
 
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {

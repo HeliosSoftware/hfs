@@ -2197,6 +2197,9 @@
         if (index >= railMaxRecent) item.remove();
       });
     railRecentGroup.hidden = false;
+    /* The clone inherits the source's `hidden`, and a live filter must
+     * still apply to the repainted group. */
+    applyRailFilter();
   }
 
   /* Serializes every `recordRailSelection` read-modify-write cycle behind
@@ -2316,16 +2319,30 @@
     if (document.getElementById("resources")) restoreLocationContext();
     else restoreRailMarkOnly();
   });
+  /* Applies the rail's filter box to every list in the rail: the full type
+   * list and the "Recently used" group above it (#1275). The group itself is
+   * hidden when it has no items left, so its divider (which CSS shows only
+   * after a non-hidden group) goes with it. */
+  function applyRailFilter() {
+    if (!railFilter) return;
+    var needle = railFilter.value.trim().toLowerCase();
+    function filterItems(host) {
+      var visible = 0;
+      host.querySelectorAll("a.filter-rail__item[data-type]").forEach(function (item) {
+        item.hidden =
+          !!needle && item.dataset.type.toLowerCase().indexOf(needle) < 0;
+        if (!item.hidden) visible += 1;
+      });
+      return visible;
+    }
+    if (railList) filterItems(railList);
+    if (railRecentGroup) {
+      railRecentGroup.hidden = filterItems(railRecentGroup) === 0;
+    }
+  }
+
   if (railFilter && railList) {
-    railFilter.addEventListener("input", function () {
-      var needle = railFilter.value.trim().toLowerCase();
-      railList
-        .querySelectorAll("a.filter-rail__item[data-type]")
-        .forEach(function (item) {
-          item.hidden =
-            !!needle && item.dataset.type.toLowerCase().indexOf(needle) < 0;
-        });
-    });
+    railFilter.addEventListener("input", applyRailFilter);
   }
 
 
