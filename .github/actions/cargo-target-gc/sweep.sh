@@ -4,7 +4,7 @@
 # and Windows steps in action.yml — see the header there for why this exists.
 #
 # Inputs arrive as environment variables (MODE, MAXSIZE, WANT, FREE_FLOOR_GB,
-# MIN_FREE_GB) rather than `${{ inputs.* }}` interpolation, so the two call
+# MIN_FREE_GB, INCREMENTAL_MAX_AGE_DAYS) rather than `${{ inputs.* }}` interpolation, so the two call
 # sites run byte-identical code and cannot drift.
 #
 # MODE=post (default) is the end-of-job sweep to MAXSIZE. MODE=preflight runs
@@ -31,6 +31,7 @@ MAXSIZE="${MAXSIZE:-}"
 WANT="${WANT:-}"
 FREE_FLOOR_GB="${FREE_FLOOR_GB:-0}"
 MIN_FREE_GB="${MIN_FREE_GB:-0}"
+INCREMENTAL_MAX_AGE_DAYS="${INCREMENTAL_MAX_AGE_DAYS:-0}"
 
 # `du` over a multi-million-file target dir is slow everywhere and *very* slow
 # on NTFS through Git Bash, where every stat crosses the Win32 layer. It is only
@@ -110,20 +111,22 @@ ensure_cargo_sweep() {
 }
 
 # cargo-sweep skips incremental/ entirely ("not tracked by fingerprint"): it
-# never removes those dirs, yet counts them toward --maxsize, so they grow
-# without bound and push warm dependencies out of the cap instead. When the
-# caller has turned incremental compilation off nothing will reuse them, so
-# drop them all. Sized first (bounded, may print "?") so the job log shows what
-# this was costing.
-purge_incremental() {
-  [ "${CARGO_INCREMENTAL:-}" = "0" ] || return 0
-  local inc sz
+# never removes those dirs, yet counts them toward --maxsize, so stale ones
+# grow without bound and push warm dependencies out of the cap instead. Prune
+# per-crate dirs (`incremental/<crate>-<hash>`) not written in
+# INCREMENTAL_MAX_AGE_DAYS. Directory mtime is the right clock: rustc creates a
+# new session dir inside on every compile of that crate, and it does not depend
+# on NTFS last-access updates the way cargo-sweep's atime LRU does.
+prune_incremental() {
+  [ "$INCREMENTAL_MAX_AGE_DAYS" -gt 0 ] 2>/dev/null || return 0
+  local inc n
   for inc in target/*/incremental target/*/*/incremental; do
     [ -d "$inc" ] || continue
-    sz=""
-    command -v timeout >/dev/null 2>&1 && sz="$(timeout 60 du -sh "$inc" 2>/dev/null | cut -f1)"
-    echo "Removing ${inc} (${sz:-?}; CARGO_INCREMENTAL=0 and cargo-sweep never evicts it)."
-    rm -rf "$inc" || true
+    n="$(find "$inc" -mindepth 1 -maxdepth 1 -type d -mtime +"$INCREMENTAL_MAX_AGE_DAYS" 2>/dev/null | wc -l | tr -d ' ')"
+    [ "${n:-0}" -gt 0 ] || continue
+    echo "Pruning ${n} incremental cache dir(s) under ${inc} not built in ${INCREMENTAL_MAX_AGE_DAYS}+ days (cargo-sweep never evicts these)."
+    find "$inc" -mindepth 1 -maxdepth 1 -type d -mtime +"$INCREMENTAL_MAX_AGE_DAYS" \
+      -exec rm -rf {} + 2>/dev/null || true
   done
 }
 
@@ -142,7 +145,7 @@ if ! printf '%s' "$MAXSIZE" | grep -qiE '^[0-9]+(\.[0-9]+)?[[:space:]]*(k|m|g|t)
 fi
 
 if [ "$MODE" = "preflight" ]; then
-  purge_incremental
+  prune_incremental
   free="$(free_gb)"
   if [ -z "$free" ] || [ "$MIN_FREE_GB" -le 0 ]; then
     echo "Pre-build headroom check disabled or free space unknown; nothing to do."
@@ -191,7 +194,7 @@ if ! ensure_cargo_sweep; then
 fi
 
 before="$(dir_size target)"
-purge_incremental
+prune_incremental
 cargo sweep --maxsize "$MAXSIZE" || true
 after="$(dir_size target)"
 if [ "${RUNNER_OS:-}" = "Windows" ]; then

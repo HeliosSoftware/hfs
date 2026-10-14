@@ -40,18 +40,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
-  # No incremental compilation in CI. Its caches under target/<profile>/incremental
-  # are invisible to cargo-sweep (it neither tracks nor removes them, by design),
-  # so on the `clean: false` runners every crate/test-target hash that stops
-  # being built, and every rustc session a cancelled run kills mid-compile,
-  # stays on disk forever. Worse, cargo-sweep still counts them toward
-  # `maxsize`, so they crowd the warm dependency artifacts out of the cap -- the
-  # leading suspect for the Windows agents' disk creeping back up until a build
-  # died mid-link (run 38627332199). The warm
-  # cache that keeps `test-rust` in budget is the dependency graph, which is
-  # never built incrementally anyway. cargo-target-gc purges leftover
-  # incremental dirs while this is 0. See .github/actions/cargo-target-gc.
-  CARGO_INCREMENTAL: 0
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
 
 jobs:

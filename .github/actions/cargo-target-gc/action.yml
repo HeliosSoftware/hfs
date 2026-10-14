@@ -22,8 +22,8 @@ description: >
 # hours old and several runs have already gone red.
 #
 # It is a soft cap, not a hard ceiling. cargo-sweep evicts the artifacts cargo
-# manages under `deps/`, `build/`, `.fingerprint/` and `incremental/` — which is
-# precisely the part that compounds — but it does not remove the linked outputs
+# manages under `deps/`, `build/` and `.fingerprint/` — most of the part that
+# compounds — but it does not remove the linked outputs
 # at `target/<profile>/<bin>`. Those are hardlinked to their `deps/` copy
 # (verified: link count 2), so sweeping the dep entry frees nothing while the
 # top-level name survives. That residue is a small constant per profile and is
@@ -34,8 +34,12 @@ description: >
 # removes it, but it does count it toward `maxsize`. Left alone, incremental
 # caches for hashes nobody builds any more (and rustc sessions a cancelled run
 # killed mid-compile) pile up there and squeeze the warm dependency artifacts
-# out of the cap. ci.yml therefore sets `CARGO_INCREMENTAL=0`, and while that
-# is set both modes of this action delete any incremental dirs left over.
+# out of the cap. So both modes of this action delete per-crate incremental
+# dirs that no build has touched in `incremental-max-age-days`. Age is read
+# from the directory's mtime, not atime: rustc creates a fresh session dir
+# inside it on every compile of that crate, which bumps the mtime, whereas
+# atime is unreliable on NTFS (last-access updates are often disabled). Crates
+# still being built keep their caches, so incremental rebuilds stay fast.
 #
 # Scope: this caps `target/` only. `~/.cargo/registry` also grows without bound
 # (every `.crate` tarball and unpacked source ever resolved), but far more
@@ -127,6 +131,12 @@ inputs:
       disk has this much free. `0` disables.
     required: false
     default: "0"
+  incremental-max-age-days:
+    description: >
+      Delete `target/*/incremental/<crate>-<hash>` dirs no build has written to
+      in this many days. cargo-sweep never evicts them. `0` disables.
+    required: false
+    default: "3"
   cargo-sweep-version:
     description: >
       Pinned cargo-sweep version. >=0.7.0 is required for unit suffixes on
@@ -146,6 +156,7 @@ runs:
         WANT: ${{ inputs.cargo-sweep-version }}
         FREE_FLOOR_GB: ${{ inputs.free-floor-gb }}
         MIN_FREE_GB: ${{ inputs.min-free-gb }}
+        INCREMENTAL_MAX_AGE_DAYS: ${{ inputs.incremental-max-age-days }}
       # `${GITHUB_ACTION_PATH//\\//}` — the runner hands this out in native form,
       # so on Windows it arrives with backslashes, which bash reads as escapes.
       # Normalising in both steps keeps the two `run:` bodies byte-identical.
@@ -160,4 +171,5 @@ runs:
         WANT: ${{ inputs.cargo-sweep-version }}
         FREE_FLOOR_GB: ${{ inputs.free-floor-gb }}
         MIN_FREE_GB: ${{ inputs.min-free-gb }}
+        INCREMENTAL_MAX_AGE_DAYS: ${{ inputs.incremental-max-age-days }}
       run: bash "${GITHUB_ACTION_PATH//\\//}/sweep.sh"
