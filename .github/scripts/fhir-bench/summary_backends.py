@@ -49,9 +49,6 @@ import json
 import os
 import re
 
-# Types the per-type indexing line names before it sums up the rest.
-IX_TYPES_SHOWN = 8
-
 results_dir = os.path.join(os.environ["GITHUB_WORKSPACE"], "bench-results", os.environ["BACKEND"])
 backend = os.environ["BACKEND"]
 
@@ -208,25 +205,17 @@ if drain:
           f"es_live={drain.get('es_live', '?')} missing={d_missing} "
           f"needs_reindex={drain.get('needs_reindex_after', '?')}.{d_warn}")
 
-# Indexing suite: one timed `$reindex` after search, of all types (`POST
-# /$reindex`, scope=all) or of one type (`POST /<type>/$reindex`; an
-# indexing.txt without scope= is one type) — run_indexing_suite in
-# suite-lib.sh documents what it measures and why it is comparable across
-# legs. indexing-hfs-log.txt holds the job's own `reindex ...` lines from the
-# HFS log: `reindex job finished` says where the time went, and for all types
-# each `reindex type finished` line gives one type's share.
+# Indexing suite: one timed `POST /<type>/$reindex` after search
+# (run_indexing_suite in suite-lib.sh documents what it measures and why it
+# is comparable across legs). indexing-hfs-log.txt holds the job's own
+# `reindex job finished` line from the HFS log: where the time went.
 ix = read_kv(f"{results_dir}/indexing.txt", "=")
 if ix:
     ix_status = ix.get("status", "?")
-    ix_all = ix.get("scope") == "all"
-    ix_type = "all types" if ix_all else ix.get("resource_type", "?")
-    ix_path = "/$reindex" if ix_all else f"/{ix_type}/$reindex"
+    ix_type = ix.get("resource_type", "?")
     if ix_status == "kickoff-failed":
-        print(f"\n**Indexing:** `POST {ix_path}` answered HTTP "
+        print(f"\n**Indexing:** `POST /{ix_type}/$reindex` answered HTTP "
               f"{ix.get('kickoff_http', '?')} — no indexing number for this leg. ⚠")
-    elif ix_status not in ("completed", "partial", "failed"):
-        print(f"\n**Indexing:** status `{ix_status}` ({ix.get('reason', '?')}) — no indexing "
-              "number for this leg. ⚠")
     else:
         def ix_int(key):
             try:
@@ -272,36 +261,6 @@ if ix:
                       f"{ix_s('write_ms')} (extract {ix_s('extract_ms')} · database/Elasticsearch "
                       f"wait {ix_s('db_wait_ms')}) · other {ix_s('other_ms')} of "
                       f"{ix_s('elapsed_ms')}; a writer that does not time a phase reports 0._")
-            # all types: the slowest types, from each `reindex type finished` line
-            # (one per type the job opened, its outcome included when not completed)
-            per_type = []
-            for l in (open(ix_log) if ix_all else []):
-                if "reindex type finished" not in l:
-                    continue
-                t_kv = dict(re.findall(r"(\w+)=(\S+)", l))
-                try:
-                    per_type.append((int(t_kv["type_elapsed_ms"]), t_kv["resource_type"],
-                                     int(t_kv["type_resources"]), int(t_kv["type_total"]),
-                                     float(t_kv["type_resources_per_s"]),
-                                     t_kv.get("outcome", "?")))
-                except (KeyError, ValueError):
-                    continue
-            if per_type:
-                per_type.sort(key=lambda t: -t[0])
-                shown = []
-                for ms, rt, n, tot, rps, outcome in per_type[:IX_TYPES_SHOWN]:
-                    part = f"{rt} {n:,}" + (f" of {tot:,}" if n != tot else "")
-                    part += f" in {ms / 1000:.1f} s ({rps:,.0f}/s"
-                    part += (f", {outcome})" if outcome != "completed" else ")")
-                    shown.append(part)
-                rest = per_type[IX_TYPES_SHOWN:]
-                if rest:
-                    shown.append(f"{len(rest)} more types in {sum(t[0] for t in rest) / 1000:.1f} s")
-                done = ""
-                if fin:
-                    done = (f", {fin_kv.get('types_done', '?')} of {fin_kv.get('types', '?')} "
-                            "types completed")
-                print(f"\n_HFS reindex by type (slowest first{done}): " + " · ".join(shown) + "._")
 
 # Host load (F9), every leg — not just Postgres ones (see the
 # Environment paragraph further below, which stays Postgres-only).
