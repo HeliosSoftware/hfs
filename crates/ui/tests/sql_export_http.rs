@@ -1904,6 +1904,59 @@ async fn new_page_shows_parameter_chips_and_open_values_rows_only_for_parameteri
     assert!(!html.contains(r#"name="param:Library/q2:from" required"#));
 }
 
+/// #2049: `sql-export-form.js` shows "This value is required." by finding the
+/// field's own `.field__hint--error` span inside its `label.field`, because
+/// the control's `aria-describedby` is rendered only alongside a server-side
+/// error. This pins that contract on a fresh page: every parameter field
+/// carries its error span, hidden and empty, while the control itself has
+/// neither `aria-invalid` nor `aria-describedby` (the no-JavaScript markup
+/// is unchanged).
+#[tokio::test]
+async fn new_page_renders_each_parameter_fields_error_span_hidden_inside_its_field() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, parameterized_subjects_source());
+
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = html::Dom::page(&html);
+
+    for (reference, name) in [
+        ("Library/q1", "ward"),
+        ("Library/q2", "days"),
+        ("Library/q2", "from"),
+    ] {
+        let field = dom.one(&format!(
+            r#"tr.row--params[data-subject="{reference}"] label.field[data-param-name="{name}"]"#
+        ));
+        let control = field.one(&format!(r#"[name="param:{reference}:{name}"]"#));
+        assert!(
+            !control.has_attr("aria-invalid"),
+            "{reference} {name}: a fresh page marks nothing invalid: {control:?}"
+        );
+        assert!(
+            !control.has_attr("aria-describedby"),
+            "{reference} {name}: aria-describedby is rendered only with a server error: {control:?}"
+        );
+
+        let error = field.one(".field__hint--error");
+        assert_eq!(
+            error.attr("id"),
+            Some(format!("param:{reference}:{name}-error").as_str()),
+            "{reference} {name}: the error span keeps its `{{prefix}}:{{name}}-error` id"
+        );
+        assert!(
+            error.has_attr("hidden"),
+            "{reference} {name}: the error span renders hidden: {error:?}"
+        );
+        assert_eq!(
+            error.text(),
+            "",
+            "{reference} {name}: the error span renders empty"
+        );
+    }
+}
+
 #[tokio::test]
 async fn marking_a_parameterized_query_sends_its_value_as_a_typed_subject_parameter() {
     let backend = backend_with_schema().await;
@@ -2025,6 +2078,22 @@ async fn a_missing_required_parameter_rerenders_with_an_inline_error_and_no_kick
         source.export_calls().is_empty(),
         "no kickoff on a validation error"
     );
+
+    // #2049: the no-JavaScript, server-rendered path is unchanged — the
+    // control is flagged and described by its own visible error span.
+    let dom = html::Dom::page(&html);
+    let control = dom.one(r#"[name="param:Library/q1:ward"]"#);
+    assert_eq!(control.attr("aria-invalid"), Some("true"));
+    assert_eq!(
+        control.attr("aria-describedby"),
+        Some("param:Library/q1:ward-error")
+    );
+    let error = dom.one(r#"[id="param:Library/q1:ward-error"]"#);
+    assert!(
+        !error.has_attr("hidden"),
+        "the server-rendered error is visible: {error:?}"
+    );
+    assert_eq!(error.text(), "This value is required.");
 }
 
 #[tokio::test]
