@@ -1007,6 +1007,7 @@ The SOF implementation supports Apache Parquet format for efficient columnar dat
   - `string`/`code`/`uri` → UTF8
   - `integer`/`positiveInt`/`unsignedInt` → INT32
   - `integer64` → INT64
+  - undeclared integer columns → INT32, or INT64 when any value in the column lies outside the 32-bit range
   - `decimal` → FLOAT64
   - `dateTime`/`date` → UTF8
   - `collection: true` columns and arrays → `List<UTF8>`

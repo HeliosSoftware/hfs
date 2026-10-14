@@ -78,6 +78,7 @@ Parameter precedence: request body > query params > `Accept` header.
 | string, code, uri | UTF8 |
 | integer, positiveInt, unsignedInt | INT32 |
 | integer64 | INT64 |
+| integer (no declared `type`) | INT32, or INT64 when any value in the column lies outside the 32-bit range |
 | decimal | FLOAT64 |
 | dateTime, date | UTF8 |
 | `collection: true` columns, arrays | List<UTF8> |

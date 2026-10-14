@@ -4388,7 +4388,8 @@ fn format_arrow_ipc_with_schema(
 /// [`format_output_with_schema`] to fix it from declared column types). Type
 /// mapping follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
 /// integer/positiveInt/unsignedInt→INT32, integer64→INT64, decimal→FLOAT64,
-/// dateTime/date→UTF8, `collection: true`→List<UTF8>). Row groups are cut
+/// dateTime/date→UTF8, `collection: true`→List<UTF8>); an inferred integer
+/// column is widened to INT64 when a value exceeds 32 bits. Row groups are cut
 /// by encoded size (`row_group_size_mb`). Use [`format_parquet_multi_file`]
 /// when the output needs to be split across files by size.
 pub fn format_parquet(
