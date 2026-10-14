@@ -15,6 +15,8 @@ pub struct TestInfo {
     pub context: String,
     /// `contextType` attribute: the declared type(s) of that focus, `|`-separated.
     pub context_type: String,
+    /// `ordered="false"`: the expected outputs may appear in any order.
+    pub unordered: bool,
     pub expression: String,
     pub outputs: Vec<(String, String)>, // (type, value)
 }
@@ -36,6 +38,7 @@ pub fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
             let predicate = test.attribute("predicate").unwrap_or("").to_string();
             let context = test.attribute("context").unwrap_or("").to_string();
             let context_type = test.attribute("contextType").unwrap_or("").to_string();
+            let unordered = test.attribute("ordered") == Some("false");
             let check_ordered_functions = test
                 .attribute("checkOrderedFunctions")
                 .unwrap_or("")
@@ -79,6 +82,7 @@ pub fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
                 check_ordered_functions,
                 context,
                 context_type,
+                unordered,
                 expression: expression_text,
                 outputs,
             });

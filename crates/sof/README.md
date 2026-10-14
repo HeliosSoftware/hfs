@@ -1007,9 +1007,17 @@ The SOF implementation supports Apache Parquet format for efficient columnar dat
   - `string`/`code`/`uri` → UTF8
   - `integer`/`positiveInt`/`unsignedInt` → INT32
   - `integer64` → INT64
+  - undeclared integer columns → INT32, or INT64 when any value in the column lies outside the 32-bit range
   - `decimal` → FLOAT64
   - `dateTime`/`date` → UTF8
   - `collection: true` columns and arrays → `List<UTF8>`
+- **In-database runners (`$viewdefinition-run` on HFS)**: for Parquet and Arrow IPC output
+  the SQLite and PostgreSQL runners append database values straight to typed Arrow builders
+  (`helios_sof::columnar`), skipping the JSON row step, and the batches are streamed through the
+  same encoder as the row path. Column types follow the declared mapping above, so an `integer`
+  column that is entirely null is `Int32` (not `Utf8`), and a value that does not parse as its
+  declared type is written as null. Undeclared columns are inferred from the first batch. Runners
+  without a columnar path fall back to the row path.
 - **Optimized for Large Datasets**:
   - Incremental encoding in batches of 8,192 rows; the schema is fixed before the first row
   - Row groups are cut by encoded size, so memory stays bounded by about one row group (see `docs/sof-parquet-streaming-benchmark.md`)

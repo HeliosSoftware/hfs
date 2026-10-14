@@ -170,3 +170,15 @@ inputs have fixed limits, each a `400` naming the limit: 64 `subject` entries,
 - Integration tests live in `tests/`.
 - ViewDefinition examples are embedded in test files.
 - For version-independent logic, use enum wrappers such as `SofViewDefinition` and traits such as `ViewDefinitionTrait`, `BundleTrait`, and `ResourceTrait`.
+
+## Columnar fast path (#1813)
+
+`SofRunner::run_view_columnar` (default `Ok(None)` = unsupported) lets the SQLite and PostgreSQL
+in-DB runners emit Arrow `RecordBatch`es directly via `helios_sof::columnar::ColumnarBatchBuilder`,
+used by `$viewdefinition-run` for Parquet/Arrow IPC: the handler streams the batches through the
+same blocking encoder as the row path (`columnar_stream::{ParquetStreamWriter, ArrowIpcStreamWriter}::write_batch`).
+Column kinds come from `ColumnDecode::column_kind`; `pin_declared_types` then gives declared columns
+the row path's Arrow type (`integer64` → Int64, `collection` → `List<Utf8>`), and the remaining
+`Json`/`Auto` columns stay `Deferred` (inferred at first flush).
+Profile with `crates/persistence/tests/sof_columnar_profile.rs` (`--ignored --nocapture`,
+`HFS_TEST_COLUMNAR_PROFILE_ROWS`).

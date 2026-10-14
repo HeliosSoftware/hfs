@@ -15,6 +15,9 @@
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
+#[path = "common/sof_columnar.rs"]
+mod sof_columnar;
+
 #[cfg(feature = "R4")]
 #[path = "common/sof_prefix_matrix.rs"]
 mod sof_prefix_matrix;
@@ -1635,6 +1638,18 @@ mod sof_pg_runner_tests {
         assert_pr410_cases(&["UsCoreBloodPressures"]).await;
     }
 
+    /// `exists(criteria)` over a path with more than one repeating step
+    /// (`component` and `coding`) sees every element (#1946).
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_exists_over_repeating_steps() {
+        assert_pr410_cases(&[
+            "ExistsAcrossRepeatingStepsWhere",
+            "ExistsAcrossRepeatingStepsColumns",
+        ])
+        .await;
+    }
+
     /// `forEach: "name.where(use = 'official').first()"`.
     #[cfg(feature = "R4")]
     #[tokio::test]
@@ -2019,6 +2034,172 @@ mod sof_pg_runner_tests {
         .await;
         let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["p1"]);
+    }
+
+    // =========================================================================
+    // Columnar path parity (run_view_columnar vs run_view)
+    // =========================================================================
+
+    /// Every PR #410 and extra case yields the same names, rows and cells on
+    /// the columnar path as on the row path.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_columnar_parity_pr410_cases() {
+        use super::sof_columnar::assert_columnar_parity;
+        use super::sof_pr410_views as pr410;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for (resource_type, resource) in pr410::resources() {
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .expect("seed PR #410 resource");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let cases: Vec<_> = pr410::pr410_cases()
+            .into_iter()
+            .chain(pr410::extra_cases())
+            .collect();
+        for case in cases {
+            // Views with duplicate column names have no columnar path.
+            let Some(_) = runner
+                .run_view_columnar(&tenant, case.view.clone(), ViewFilters::default())
+                .await
+                .expect("run_view_columnar")
+            else {
+                continue;
+            };
+            if case.name == "UsCoreBloodPressures" {
+                // Declared-type change: the row path votes `120` as Int32,
+                // the columnar path types the untyped Quantity.value from the
+                // view as Float64 and renders `120.0`. Pin that instead.
+                let batches = super::sof_columnar::columnar_batches(
+                    runner.as_ref(),
+                    &tenant,
+                    &case.view,
+                    &ViewFilters::default(),
+                )
+                .await;
+                let types = super::sof_columnar::column_types(&batches);
+                let (_, ty) = types
+                    .iter()
+                    .find(|(n, _)| n == "sbp_quantity_value")
+                    .expect("sbp_quantity_value column");
+                assert_eq!(*ty, helios_sof::arrow::datatypes::DataType::Float64);
+                continue;
+            }
+            assert_columnar_parity(
+                runner.as_ref(),
+                &tenant,
+                &case.view,
+                &ViewFilters::default(),
+                case.name,
+            )
+            .await;
+        }
+    }
+
+    /// Typed columns get their declared Arrow type, NULLs stay null, and
+    /// `_limit` caps rows.
+    #[tokio::test]
+    async fn test_pg_columnar_typed_columns_nulls_and_limit() {
+        use super::sof_columnar::{assert_columnar_parity, column_types};
+        use helios_sof::arrow::datatypes::DataType;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[
+                ("c1", "male", "1990-01-01"),
+                ("c2", "female", "1985-06-15"),
+                ("c3", "male", "2000-03-20"),
+            ],
+        )
+        .await;
+        // No `birthDate`/`gender` on this one: its cells are NULL.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "c4", "active": false}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed sparse patient");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "id", "type": "id"},
+                {"path": "gender", "name": "gender", "type": "code"},
+                {"path": "active", "name": "active", "type": "boolean"},
+                {"path": "name.count()", "name": "names", "type": "integer"}
+            ]}]
+        });
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let batches = assert_columnar_parity(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+            "typed",
+        )
+        .await;
+        let types = column_types(&batches);
+        assert_eq!(types[0].1, DataType::Utf8);
+        assert_eq!(types[1].1, DataType::Utf8);
+        assert_eq!(types[2].1, DataType::Boolean);
+        assert_eq!(types[3].1, DataType::Int32);
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 4);
+
+        let limited = ViewFilters {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let batches =
+            assert_columnar_parity(runner.as_ref(), &tenant, &view, &limited, "limit").await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// A view that matches no rows ends the stream without a batch.
+    #[tokio::test]
+    async fn test_pg_columnar_no_rows_yields_no_batches() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "id"}]}]
+        });
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let batches = super::sof_columnar::columnar_batches(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+        )
+        .await;
+        assert!(batches.is_empty());
+    }
+
+    /// An uncompilable view fails synchronously, before any stream exists.
+    #[tokio::test]
+    async fn test_pg_columnar_uncompilable_is_synchronous() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let result = runner
+            .run_view_columnar(
+                &tenant,
+                json!({"resourceType": "Nope"}),
+                ViewFilters::default(),
+            )
+            .await;
+        assert!(result.is_err(), "invalid view must be rejected up front");
     }
 }
 

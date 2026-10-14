@@ -78,19 +78,25 @@ impl<W: Write + Send> ParquetStreamWriter<W> {
 
     /// Encodes `rows` (in batches of [`STREAM_BATCH_ROWS`]), cutting a row
     /// group whenever the in-progress one reaches the configured size.
-    /// Encodes `rows` as record batches of at most [`STREAM_BATCH_ROWS`].
     pub fn write_rows(&mut self, rows: &[ProcessedRow]) -> Result<(), SofError> {
         for chunk in rows.chunks(STREAM_BATCH_ROWS) {
-            let batch = to_batch(&self.schema, chunk)?;
-            self.writer.write(&batch).map_err(|e| {
-                SofError::ParquetConversionError(format!("Failed to write RecordBatch: {e}"))
+            self.write_batch(&to_batch(&self.schema, chunk)?)?;
+        }
+        Ok(())
+    }
+
+    /// Encodes one already built batch, which must carry the writer's schema,
+    /// cutting a row group whenever the in-progress one reaches the
+    /// configured size.
+    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), SofError> {
+        self.writer.write(batch).map_err(|e| {
+            SofError::ParquetConversionError(format!("Failed to write RecordBatch: {e}"))
+        })?;
+        self.rows_written += batch.num_rows();
+        if self.writer.in_progress_size() >= self.row_group_bytes {
+            self.writer.flush().map_err(|e| {
+                SofError::ParquetConversionError(format!("Failed to flush row group: {e}"))
             })?;
-            self.rows_written += chunk.len();
-            if self.writer.in_progress_size() >= self.row_group_bytes {
-                self.writer.flush().map_err(|e| {
-                    SofError::ParquetConversionError(format!("Failed to flush row group: {e}"))
-                })?;
-            }
         }
         Ok(())
     }
@@ -207,14 +213,26 @@ impl<W: Write> ArrowIpcStreamWriter<W> {
         Ok(Self { writer, schema })
     }
 
+    /// Encodes `rows` as record batches of at most [`STREAM_BATCH_ROWS`].
     pub fn write_rows(&mut self, rows: &[ProcessedRow]) -> Result<(), SofError> {
         for chunk in rows.chunks(STREAM_BATCH_ROWS) {
-            let batch = to_batch(&self.schema, chunk)?;
-            self.writer.write(&batch).map_err(|e| {
-                SofError::ArrowConversionError(format!("Failed to write Arrow IPC batch: {e}"))
-            })?;
+            self.write_batch(&to_batch(&self.schema, chunk)?)?;
         }
         Ok(())
+    }
+
+    /// Encodes one already built batch, which must carry the writer's schema.
+    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), SofError> {
+        // The IPC writer does not check this itself; a mismatch would produce
+        // a stream readers reject.
+        if batch.schema().as_ref() != self.schema.as_ref() {
+            return Err(SofError::ArrowConversionError(
+                "Arrow IPC batch does not match the stream schema".to_string(),
+            ));
+        }
+        self.writer.write(batch).map_err(|e| {
+            SofError::ArrowConversionError(format!("Failed to write Arrow IPC batch: {e}"))
+        })
     }
 
     /// Writes the end-of-stream marker and returns the sink.
@@ -309,6 +327,35 @@ mod tests {
         let files = w.finish().unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(row_count(files.into_iter().next().unwrap()).0, 0);
+    }
+
+    #[test]
+    fn write_batch_matches_write_rows() {
+        let batch = to_batch(&schema(), &rows(0..10)).unwrap();
+        let opts = ParquetOptions::default();
+        let mut by_rows = ParquetStreamWriter::new(Vec::new(), schema(), &opts).unwrap();
+        by_rows.write_rows(&rows(0..10)).unwrap();
+        let mut by_batch = ParquetStreamWriter::new(Vec::new(), schema(), &opts).unwrap();
+        by_batch.write_batch(&batch).unwrap();
+        assert_eq!(by_batch.rows_written(), 10);
+        assert_eq!(by_rows.finish().unwrap(), by_batch.finish().unwrap());
+
+        let mut by_rows = ArrowIpcStreamWriter::new(Vec::new(), schema()).unwrap();
+        by_rows.write_rows(&rows(0..10)).unwrap();
+        let mut by_batch = ArrowIpcStreamWriter::new(Vec::new(), schema()).unwrap();
+        by_batch.write_batch(&batch).unwrap();
+        assert_eq!(by_rows.finish().unwrap(), by_batch.finish().unwrap());
+    }
+
+    #[test]
+    fn write_batch_rejects_another_schema() {
+        let other = Arc::new(Schema::new(vec![Field::new("x", DataType::Boolean, true)]));
+        let batch = to_batch(&schema(), &rows(0..1)).unwrap();
+        let mut w = ParquetStreamWriter::new(Vec::new(), other.clone(), &ParquetOptions::default())
+            .unwrap();
+        assert!(w.write_batch(&batch).is_err());
+        let mut w = ArrowIpcStreamWriter::new(Vec::new(), other).unwrap();
+        assert!(w.write_batch(&batch).is_err());
     }
 
     #[test]

@@ -3515,6 +3515,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "sqlparser",
+ "testcontainers",
  "tokio",
  "tokio-util",
  "tower",

@@ -56,7 +56,7 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | Elasticsearch index name prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | *(none)* | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | Elasticsearch basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | Timeout of every Elasticsearch request, including `_bulk`, in milliseconds. A `_bulk` request that times out is split in half and resent |
@@ -74,6 +74,7 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_S3_REGION` | *(AWS chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix for all S3 object keys |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
 
 ## Multi-Tenancy
 

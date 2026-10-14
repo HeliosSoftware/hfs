@@ -1072,7 +1072,7 @@ fn build_degenerate_chain_sql(
 /// `Index` steps stay grouped with the immediately-preceding `Field` so that
 /// `name[0].use` still drives a single navigation step into the first name
 /// before unnesting `use`. `OfType` / `TypeFilter` follow the same grouping.
-fn split_path_into_segments(path: &super::ir::JsonPath) -> Vec<super::ir::JsonPath> {
+pub(super) fn split_path_into_segments(path: &super::ir::JsonPath) -> Vec<super::ir::JsonPath> {
     let mut segments: Vec<super::ir::JsonPath> = Vec::new();
     let mut current: Vec<PathStep> = Vec::new();
     for step in &path.0 {
