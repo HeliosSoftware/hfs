@@ -26,6 +26,8 @@ BULK = "bulk-import, `$bulk-submit`"
 BULK_ROW = BULK + " (resources/s)"
 REINDEX = "reindex, `$reindex` Encounter"
 REINDEX_ROW = REINDEX + " (resources/s)"
+REINDEX_ALL = "reindex, `$reindex` all types"
+REINDEX_ANY = "reindex, `$reindex`"  # legs ran different scopes, or none names one plainly
 _guard = {"on": False}
 
 
@@ -72,12 +74,14 @@ def leg_files(leg, bundles=1000, run=RUN, **override):
 
 
 def indexing(status="completed", rate="1200.4", processed=5000, total=5000, errors=0,
-             reason="", seconds="4.2", rtype="Encounter"):
-    return ("status=%s\nreason=%s\nresource_type=%s\njob_id=j\nkickoff_http=202\n"
+             reason="", seconds="4.2", rtype="Encounter", scope=None):
+    """An indexing.txt body; scope=None writes none, as run_indexing_suite did before
+    the all-types default (scope=all|type)."""
+    return ("status=%s\nreason=%s\n%sresource_type=%s\njob_id=j\nkickoff_http=202\n"
             "total=%d\nprocessed=%d\nentries=%d\nerrors=%d\nseconds=%s\nwall_seconds=5\n"
             "resources_per_s=%s\nentries_per_resource=9.00\nbatch_size=1000\nbudget_s=240\n"
-            "es_refresh=n/a\n" % (status, reason, rtype, total, processed, processed * 9, errors,
-                                   seconds, rate))
+            "es_refresh=n/a\n" % (status, reason, "" if scope is None else "scope=%s\n" % scope,
+                                   rtype, total, processed, processed * 9, errors, seconds, rate))
 
 def bulk_txt(status="complete", **kv):
     """A bulk-import.txt body (key=value), complete by default."""
@@ -335,6 +339,15 @@ class CompareLegsTest(unittest.TestCase):
         put_dir(other, "postgres", leg_files("postgres", **{"indexing.txt": indexing(rate="800")}))
         md = render(other, ["sqlite", "postgres"])
         self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | n/a (no data) ‡ | 800 |")
+        # input rejected by run_indexing_suite's own check: no rate, and the reason stays out
+        bad = os.path.join(self.root, "bad")
+        put_dir(bad, "sqlite", leg_files("sqlite", **{
+            "indexing.txt": "status=invalid-input\nreason=invalid-scope-or-budget\n"}))
+        put_dir(bad, "postgres", leg_files("postgres", **{"indexing.txt": indexing(rate="800")}))
+        md = render(bad, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", REINDEX_ROW),
+                         "| " + REINDEX_ROW + " | n/a (invalid-input) | 800 |")
+        self.assertNotIn("invalid-scope-or-budget", md)
 
     def test_indexing_shown_when_requested_hidden_otherwise(self):
         put_dir(self.root, "sqlite", leg_files("sqlite"))
@@ -361,13 +374,54 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 |")
         self.assertIn(cl.REINDEX_NOTE, md)
 
-    def test_reindex_label_names_one_type_only(self):
+    def test_reindex_label_names_one_scope_only(self):
         put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
         put_dir(self.root, "postgres", leg_files("postgres", **{
             "indexing.txt": indexing(rate="800", rtype="Observation")}))
         md = render(self.root, ["sqlite", "postgres"])
+        # two types are two scopes: each cell names its own, and no crown
         self.assertEqual(row(md, "Throughput", "reindex, `$reindex` (resources/s)"),
-                         "| reindex, `$reindex` (resources/s) | **1,200** | 800 |")
+                         "| reindex, `$reindex` (resources/s) | 1,200 (Encounter) | 800 (Observation) |")
+
+    def test_reindex_all_types_label(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{
+            "indexing.txt": indexing(scope="all", rtype="")}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "indexing.txt": indexing(rate="800", scope="all", rtype="")}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", REINDEX_ALL + " (resources/s)"),
+                         "| " + REINDEX_ALL + " (resources/s) | **1,200** | 800 |")
+        self.assertEqual(row(md, "p95", REINDEX_ALL),
+                         "| " + REINDEX_ALL + " | n/a (one async job) | n/a (one async job) |")
+        self.assertEqual(row(md, "Errors", REINDEX_ALL), "| " + REINDEX_ALL + " | 0.0% | 0.0% |")
+        self.assertIn("`POST /$reindex`", cl.REINDEX_NOTE)
+        self.assertIn(cl.REINDEX_NOTE, md)
+        # scope=type names its type exactly as an indexing.txt with no scope= does
+        typed = os.path.join(self.root, "typed")
+        put_dir(typed, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(scope="type")}))
+        put_dir(typed, "postgres", leg_files("postgres", **{"indexing.txt": indexing(rate="800")}))
+        md = render(typed, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | **1,200** | 800 |")
+
+    def test_reindex_mixed_scopes_named_per_cell(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(
+            status="partial", reason="time-cap", rate="1500.0", scope="all", rtype="")}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "indexing.txt": indexing(rate="800", errors=2)}))  # no scope=: one type, Encounter
+        put_dir(self.root, "mongodb", leg_files("mongodb", **{
+            "indexing.txt": indexing(rate="900", scope="type", rtype="Enc|ounter")}))
+        md = render(self.root, ["sqlite", "postgres", "mongodb"])
+        self.assertEqual(row(md, "Throughput", REINDEX_ANY + " (resources/s)"),
+                         "| " + REINDEX_ANY + " (resources/s) | 1,500 (all types) (partial) | "
+                         "800 (Encounter) ‡ | 900 (scope unknown) |")
+        self.assertEqual(row(md, "Errors", REINDEX_ANY),
+                         "| " + REINDEX_ANY + " | 0.0% (all types) | 0.0% · **2 ✗** (Encounter) | "
+                         "0.0% (scope unknown) |")
+        self.assertEqual(row(md, "p95", REINDEX_ANY), "| " + REINDEX_ANY + " | n/a (one async job) | "
+                         "n/a (one async job) | n/a (one async job) |")
+        self.assertNotIn("ounter |", md)
+        self.assertNotIn("Enc|", md)
+        self.assertIn("each cell names its own", md)
 
     def test_reindex_type_must_be_a_plain_name(self):
         for i, bad in enumerate(("Enc|ounter", "", "Enc`ounter")):

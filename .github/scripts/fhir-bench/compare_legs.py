@@ -88,8 +88,11 @@ BULK_SUITE = "bulk-import"
 BULK_FILE = "bulk-import.txt"
 # Nor is indexing: "Run benchmark suites" runs it after search, before insert,
 # in the suite loop (run_indexing_suite in suite-lib.sh) and it writes
-# indexing.txt (key=value). Its row is labelled reindex, the operation it times;
-# its seconds and resource counts are in the leg's job summary (REINDEX_NOTE).
+# indexing.txt (key=value). Its row is labelled reindex, the operation it times,
+# and names the scope that ran: scope=all (`POST /$reindex`, every type) or
+# scope=type (`POST /<type>/$reindex`, resource_type=; no scope= key in older
+# artifacts, which means one type). Its seconds and resource counts are in the
+# leg's job summary (REINDEX_NOTE).
 INDEXING_SUITE = "indexing"
 INDEXING_FILE = "indexing.txt"
 # The rows that load or reindex the corpus, shown together in this order where
@@ -115,10 +118,13 @@ LEGEND = (
     "that suite (on bulk-import, any resource not ingested; on reindex, any reindex error or a "
     "failed job) · `⚠` contended host (postgres crud above 3 ms/call) or a backend container "
     "died · **bold** = best in its row, shown only when no leg in that row carries a marker or "
-    "`(partial)` · bulk-import is resources/s through `$bulk-submit` into a fresh database, "
-    "kick-off until the search index covers it; reindex is resources/s of one `$reindex` of the "
-    "type its row names, in the corpus import loaded, `(partial)` when it did not finish (the "
-    "reason is in that leg's job summary); each is one asynchronous job, so its p95 is n/a · "
+    "`(partial)` (on reindex, also only when every leg ran the same scope) · bulk-import is "
+    "resources/s through `$bulk-submit` into a fresh database, kick-off until the search index "
+    "covers it; reindex is resources/s of one `$reindex` of the scope its row names, all types "
+    "(`POST /$reindex`, the default) or one type (`POST /<type>/$reindex`), in the corpus import "
+    "loaded — when legs ran different scopes the row names none and each cell names its own — "
+    "`(partial)` when it did not finish (the reason is in that leg's job summary); each is one "
+    "asynchronous job, so its p95 is n/a · "
     "n/a = no result (reason in brackets)"
 )
 FOOTER = (
@@ -141,7 +147,8 @@ ROW_LABELS = {
     ("bulk-import", "rps"): "bulk-import, `$bulk-submit` (resources/s)",
     ("bulk-import", "p95"): "bulk-import, `$bulk-submit`",
     ("bulk-import", "err"): "bulk-import, `$bulk-submit`",
-    # one $reindex job; %s is " <type>" when every leg reindexed the same type (_reindex_type)
+    # one $reindex job; %s is " all types" or " <type>" when every leg ran the same scope
+    # (_reindex_scopes)
     ("indexing", "rps"): "reindex, `$reindex`%s (resources/s)",
     ("indexing", "p95"): "reindex, `$reindex`%s",
     ("indexing", "err"): "reindex, `$reindex`%s",
@@ -162,15 +169,21 @@ INSERT_NOTE = (
     "resources are in neither, and it never carries `†` because it does not read the corpus."
 )
 REINDEX_NOTE = (
-    "Reindex row: one timed `POST /<type>/$reindex` per leg (the `indexing` suite, after search "
-    "and before `insert`): HFS re-reads every stored resource of that type, re-extracts its "
-    "search parameters and rewrites the index that serves search (the primary's own index on "
-    "sqlite/postgres/mongodb, Elasticsearch on the +ES legs). **resources/s** = processed ÷ "
-    "(completedAt − startedAt) from `$reindex-status`. This is not the index cost paid inside "
-    "import, which stays in the import row. A job still running at the budget (`budget_s` in "
-    "indexing.txt) is cancelled and its rate covers the part that ran (`(partial)`). Its "
-    "seconds, resources reindexed, index entries per resource and phase split are in each "
-    "leg's job summary (writer-reported, so not comparable across backends)."
+    "Reindex row: one timed `$reindex` per leg (the `indexing` suite, after search and before "
+    "`insert`). By default it is the system-level `POST /$reindex` (row `all types`): HFS "
+    "re-reads every stored resource of every type (the corpus import loaded, what crud left, "
+    "and the SearchParameter and CompartmentDefinition resources it seeds at startup), "
+    "re-extracts its search parameters and rewrites the index that serves search (the "
+    "primary's own index on sqlite/postgres/mongodb, Elasticsearch on the +ES legs). The "
+    "`indexing_scope` input can name one type instead (`POST /<type>/$reindex`, row `<type>`, "
+    "the only scope before all types became the default). **resources/s** = processed ÷ "
+    "(completedAt − startedAt) from `$reindex-status`: for all types that is the whole job's "
+    "mix, led by Observation (42% of the corpus), so it does not compare with a one-type rate. "
+    "This is not the index cost paid inside import, which stays in the import row. A job still "
+    "running at the budget (`budget_s` in indexing.txt) is cancelled and its rate covers the "
+    "part that ran (`(partial)`). Its seconds, resources reindexed, index entries per resource, "
+    "phase split and, for all types, the slowest types are in each leg's job summary "
+    "(writer-reported, so not comparable across backends)."
 )
 
 
@@ -772,7 +785,7 @@ def _crowned(loaded, suite, key, pick, fmt, rows, nocrown):
     return set(d["leg"] for d in cand if fmt(d["suites"][suite][key]) == best)
 
 
-def _metric_cell(d, suite, kind, crown, rows):
+def _metric_cell(d, suite, kind, crown, rows, scope=None):
     if d["status"] in _LEG_NA:
         return "n/a (%s)" % _LEG_NA[d["status"]]
     s = d["suites"][suite]
@@ -785,6 +798,8 @@ def _metric_cell(d, suite, kind, crown, rows):
             text = _fmt_err(s["err"])
         if s["fails"] > 0:
             text += " · **{:,} ✗**".format(s["fails"])
+        if scope:
+            text += " (%s)" % md_cell(scope)
         return text
     value = s[kind]
     if value is None:
@@ -797,6 +812,8 @@ def _metric_cell(d, suite, kind, crown, rows):
         text = _fmt_rps(value) if kind == "rps" else _fmt_p95(value)
         if d["leg"] in crown:
             text = "**%s**" % text
+    if scope:
+        text += " (%s)" % md_cell(scope)
     if s.get("partial"):
         text += " (partial)"
     mk = _markers(d, suite, rows)
@@ -814,38 +831,58 @@ def _shown(rows):
     return others[:at] + loading + others[at:]
 
 
-def _reindex_type(loaded):
-    """The resource type every leg that ran `$reindex` reindexed, or None."""
-    types = set(d["indexing"].get("resource_type") or "" for d in loaded
-                if d.get("indexing") is not None
-                and d["indexing"].get("status") in _INDEXING_RAN)
-    if len(types) == 1:
-        t = types.pop()
-        if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", t):
-            return t
+REINDEX_ALL = "all types"
+
+
+def _reindex_scope(ix):
+    """What one leg's `$reindex` covered: REINDEX_ALL for `POST /$reindex` (scope=all),
+    the type for `POST /<type>/$reindex` (scope=type, or no scope key: indexing.txt from
+    before the all-types default), None when indexing.txt names neither plainly."""
+    scope = ix.get("scope") or "type"
+    if scope == "all":
+        return REINDEX_ALL
+    t = ix.get("resource_type") or ""
+    if scope == "type" and re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", t):
+        return t
     return None
 
 
-def _row_label(suite, kind, rtype):
+def _reindex_scopes(loaded):
+    """{leg: _reindex_scope} for every leg that ran `$reindex`."""
+    return dict((d["leg"], _reindex_scope(d["indexing"])) for d in loaded
+                if d.get("indexing") is not None
+                and d["indexing"].get("status") in _INDEXING_RAN)
+
+
+def _row_label(suite, kind, rscope):
     text = ROW_LABELS.get((suite, kind), suite)
     if suite == INDEXING_SUITE:
-        text = text % (" " + rtype if rtype else "")
+        text = text % (" " + rscope if rscope else "")
     return md_cell(text)
 
 
 def _metric_table(title, kind, datas, loaded, rows, nocrown):
-    rtype = _reindex_type(loaded)
+    scopes = _reindex_scopes(loaded)
+    distinct = set(scopes.values())
+    # one scope names the row; mixed scopes name each leg's cell and crown none
+    mixed = len(distinct) > 1
+    rscope = distinct.pop() if len(distinct) == 1 else None
     lines = ["### " + title, ""]
     lines.append("| Suite | " + " | ".join(label(d["leg"]) for d in datas) + " |")
     lines.append("|---|" + "---:|" * len(datas))
     for suite in _shown(rows):
         crown = set()
+        off = nocrown or (mixed and suite == INDEXING_SUITE)
         if kind == "rps":
-            crown = _crowned(loaded, suite, "rps", max, _fmt_rps, rows, nocrown)
+            crown = _crowned(loaded, suite, "rps", max, _fmt_rps, rows, off)
         elif kind == "p95":
-            crown = _crowned(loaded, suite, "p95", min, _fmt_p95, rows, nocrown)
-        cells = [_metric_cell(d, suite, kind, crown, rows) for d in datas]
-        lines.append("| " + _row_label(suite, kind, rtype) + " | " + " | ".join(cells) + " |")
+            crown = _crowned(loaded, suite, "p95", min, _fmt_p95, rows, off)
+        cells = [_metric_cell(d, suite, kind, crown, rows,
+                              (scopes[d["leg"]] or "scope unknown")
+                              if mixed and suite == INDEXING_SUITE and d["leg"] in scopes
+                              else None)
+                 for d in datas]
+        lines.append("| " + _row_label(suite, kind, rscope) + " | " + " | ".join(cells) + " |")
     lines.append("")
     return lines
 

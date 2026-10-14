@@ -30,8 +30,9 @@ name: FHIR Server Benchmark
 #         primary plus a single-node Elasticsearch that serves every search; the
 #         primary's own search index is not written (set_search_offloaded).
 #   • `backend`: core (default) = all six storage setups, about 3 h for
-#     prewarm/import/crud/search, plus up to ~70 min per leg for bulk-import
-#     (part of tests=all, see below);
+#     prewarm/import/crud/search, plus ~17-40 min per leg for indexing's full
+#     reindex and up to ~70 min per leg for bulk-import (both part of
+#     tests=all, see below);
 #     sqlite-postgres = the quick two-setup run (sqlite + postgres);
 #     elasticsearch = the three composites; or any single leg; all = same as
 #     core (an alias, kept for existing scripts and dispatches). `max_parallel`
@@ -83,14 +84,20 @@ name: FHIR Server Benchmark
 # `tests`. Its matrix throughput row is creates/s.
 #
 # A second suite is this repository's own, not upstream's: `indexing`
-# (after search in `all`, before insert) times one `POST /Encounter/$reindex` (batchSize 1000) per leg after
-# search — HFS re-extracts every Encounter's search parameters and rewrites
-# the index that serves search (the primary's own on sqlite/postgres/mongodb,
-# Elasticsearch on the *-elasticsearch legs). Past a 240 s budget the job is
-# cancelled and reported partial, so it adds at most ~5 min to a leg. See
-# run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh. Its matrix row
-# is labelled `reindex, $reindex Encounter` (resources/s) and sits with the
-# import (`POST /` transaction Bundles) and bulk-import (`$bulk-submit`) rows.
+# (after search in `all`, before insert) times one system-level
+# `POST /$reindex` (batchSize 1000) per leg after search — HFS re-extracts
+# every stored resource's search parameters, of every type, and rewrites the
+# index that serves search (the primary's own on sqlite/postgres/mongodb,
+# Elasticsearch on the *-elasticsearch legs). The `indexing_scope` input can
+# name one resource type instead (`POST /<type>/$reindex`, the suite's scope
+# before all types became the default). Past `indexing_budget_s` (default
+# 3600 s; a full reindex is estimated at ~17-40 min per leg) the job is
+# cancelled and reported partial, so it adds at most ~62 min to a leg (the
+# leg timeout is sized for it, see resolve-matrix.sh). See run_indexing_suite
+# in .github/scripts/fhir-bench/suite-lib.sh. Its matrix row is labelled
+# `reindex, $reindex all types` (or the one type; resources/s) and sits with
+# the import (`POST /` transaction Bundles) and bulk-import (`$bulk-submit`)
+# rows.
 #
 # Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
 #   • Rust toolchain buildable (clang + lld linker, configured below).
@@ -109,7 +116,7 @@ on:
   workflow_dispatch:
     inputs:
       backend:
-        description: "Backend legs: core (default) = all 6 storage setups, about 3 h without bulk-import (tests=all adds up to ~70 min per leg; tests=prewarm,import,crud,search skips it); sqlite-postgres = quick 2-setup run; elasticsearch = the 3 *-elasticsearch composites; or one backend; all = same as core"
+        description: "Backend legs: core (default) = all 6 storage setups, about 3 h without indexing and bulk-import (tests=all adds a full $reindex, ~17-40 min per leg, and bulk-import, up to ~70 min per leg; tests=prewarm,import,crud,search skips both); sqlite-postgres = quick 2-setup run; elasticsearch = the 3 *-elasticsearch composites; or one backend; all = same as core"
         type: choice
         required: false
         default: core
@@ -128,6 +135,14 @@ on:
         description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search,indexing,insert,bulk-import). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,indexing,insert' skips it"
         required: false
         default: "all"
+      indexing_scope:
+        description: "indexing suite: what one timed $reindex rebuilds — all (default) = POST /$reindex, every stored resource of every type; or one resource type name, e.g. Encounter (the suite's earlier scope) = POST /<type>/$reindex"
+        required: false
+        default: "all"
+      indexing_budget_s:
+        description: "indexing suite: seconds before the $reindex job is cancelled and reported partial (0..3600; a full reindex is estimated at ~17-40 min per leg)"
+        required: false
+        default: "3600"
       vus:
         description: "Advisory VUs override (only applies to suites without a fixed scenario)"
         required: false
@@ -279,6 +294,8 @@ jobs:
           IN_ES_SYNC_MODE: ${{ inputs.es_sync_mode }}
           IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
+          IN_INDEXING_SCOPE: ${{ inputs.indexing_scope }}
+          IN_INDEXING_BUDGET_S: ${{ inputs.indexing_budget_s }}
         run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
 
   # ────────────────────────────────────────────────────────────────────────────
@@ -1198,6 +1215,8 @@ jobs:
           BENCH_MAX_PARALLEL: ${{ needs.setup.outputs.max_parallel }}
           BENCH_LEG_TIMEOUT_MIN: ${{ needs.setup.outputs.leg_timeout_min }}
           BENCH_IN_TESTS: ${{ inputs.tests }}
+          BENCH_IN_INDEXING_SCOPE: ${{ inputs.indexing_scope }}
+          BENCH_IN_INDEXING_BUDGET_S: ${{ inputs.indexing_budget_s }}
           BENCH_IN_VUS: ${{ inputs.vus }}
           BENCH_IN_DURATION: ${{ inputs.duration }}
           IN_ES_HEAP: ${{ inputs.es_heap }}
@@ -1206,7 +1225,7 @@ jobs:
           # Exported as K6_SETUP_TIMEOUT for the import suite only: the env var
           # outranks the script's own setupTimeout: '600s'. Run 36546493701's
           # postgres-elasticsearch import setup() hit 600s (0/1000 imported);
-          # rerun 36704687935 needed ~540s. Import only, so the 150-minute leg
+          # rerun 36704687935 needed ~540s. Import only, so the 170-minute leg
           # budget keeps its margin.
           BENCH_IMPORT_SETUP_TIMEOUT: 1200s
           # bulk-import (last suite): cap from kick-off until searchable, and
@@ -1395,17 +1414,25 @@ jobs:
           # still runs against a possibly-incomplete index.
           ES_DRAIN_TIMEOUT_S=600
 
-          # The indexing suite times one `POST /$INDEXING_TYPE/$reindex` after
-          # search (run_indexing_suite in suite-lib.sh). Encounter is the
-          # largest type that fits the budget on every leg (67,692 on a
-          # 1000/1000 import in run 37782202746; Observation's 689,080 would
-          # need ~2,900 resources/s). batchSize 1000 is
+          # The indexing suite times one $reindex after search
+          # (run_indexing_suite in suite-lib.sh): the system-level
+          # `POST /$reindex` of every resource type by default, or
+          # `POST /<type>/$reindex` when the indexing_scope input names one
+          # type. Both inputs are validated by setup's resolve-matrix.sh and
+          # reach this step only through env:. batchSize 1000 is
           # HFS_REINDEX_BATCH_SIZE's default for the automatic post-import
-          # rebuild (a bare $reindex pages 100). Past INDEXING_BUDGET_S the job
-          # is cancelled and its rate covers the part that ran.
-          INDEXING_TYPE=Encounter
+          # rebuild (a bare $reindex pages 100). The budget default, 3600 s,
+          # is sized from bulk-import's deferred rebuild of the same corpus
+          # (318-1212 s into an empty index, runs 37986575337 / 38501925223)
+          # times each leg's populated-over-empty Encounter slowdown of
+          # 1.4-3.2x: ~17-40 min, so the slowest leg completes with margin.
+          # That estimate extrapolates Encounter's slowdown to every type and
+          # is unverified until the first all-types run, so compare each
+          # leg's indexing.txt seconds= against it. Past INDEXING_BUDGET_S the
+          # job is cancelled and its rate covers the part that ran.
+          INDEXING_SCOPE="${BENCH_IN_INDEXING_SCOPE:-all}"
           INDEXING_BATCH_SIZE=1000
-          INDEXING_BUDGET_S=240
+          INDEXING_BUDGET_S="${BENCH_IN_INDEXING_BUDGET_S:-3600}"
 
           if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \

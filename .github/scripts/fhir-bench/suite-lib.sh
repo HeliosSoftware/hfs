@@ -26,9 +26,10 @@
 # already set BY THE TIME THE FUNCTION IS CALLED (not by the time it is
 # defined) — in particular RESULTS_DIR (the leg's output directory) and
 # ES_DRAIN_TIMEOUT_S (the ES drain deadline), both set once near the top of
-# the step, INDEXING_TYPE / INDEXING_BATCH_SIZE / INDEXING_BUDGET_S (the
-# indexing suite's resource type, $reindex page size and time budget, set
-# next to ES_DRAIN_TIMEOUT_S) and the optional HFS_BENCH_LOG override (the
+# the step, INDEXING_SCOPE / INDEXING_BATCH_SIZE / INDEXING_BUDGET_S (the
+# indexing suite's scope — `all` or one resource type — $reindex page size
+# and time budget, set next to ES_DRAIN_TIMEOUT_S from the indexing_scope /
+# indexing_budget_s inputs) and the optional HFS_BENCH_LOG override (the
 # HFS log path; defaults to the file 'Start HFS server' writes, set only for
 # offline smoke runs), and, inside its per-suite loop, SUITE_WALL (the
 # current suite's wall-clock seconds, set right before each call this file's
@@ -83,8 +84,10 @@
 #                                     if it never ran this leg.
 #   run_indexing_suite               the `indexing` suite (every leg, after
 #                                     search, before insert):
-#                                     one timed POST /<type>/$reindex,
-#                                     cancelled at $INDEXING_BUDGET_S. Writes
+#                                     one timed POST /$reindex
+#                                     (INDEXING_SCOPE=all) or
+#                                     POST /<type>/$reindex, cancelled at
+#                                     $INDEXING_BUDGET_S. Writes
 #                                     indexing.txt, indexing-status.txt and
 #                                     indexing-hfs-log.txt.
 #   indexing_status_field BODY NAME  one value[x] of a $reindex Parameters
@@ -482,19 +485,28 @@ write_search_counts() {
 }
 
 # ── Indexing suite (`indexing`, every leg, after search) ─────────────
-# One timed `POST /$INDEXING_TYPE/$reindex` against the corpus import
-# loaded: HFS re-reads every stored resource of that type, re-extracts
+# One timed `POST /$reindex` (INDEXING_SCOPE=all, the default) or
+# `POST /$INDEXING_SCOPE/$reindex` (one resource type) against the corpus
+# import loaded: HFS re-reads every stored resource in scope, re-extracts
 # its search parameters and rewrites the index that serves search —
 # the primary's own search index on sqlite/postgres/mongodb,
 # Elasticsearch on the *-elasticsearch legs (an offloaded primary is not
 # a reindex target there, or its writer is a no-op: hfs main.rs
 # es_only_when_offloaded / mongodb storage.rs is_search_offloaded).
-# Same operation, resource type and page size on every leg, so
-# resources/s is comparable across all six; it is NOT the index cost
-# paid inside import (that stays folded into the import row).
+# For all types that is the whole corpus (~1.63 M resources, 24 Synthea
+# types, Observation 42% of them), whatever crud left behind, and the
+# SearchParameter / CompartmentDefinition resources HFS seeds at startup:
+# on a full import that is 26 types, the 24 Synthea types plus
+# SearchParameter and CompartmentDefinition. A system-level job lists and
+# counts the primary's types before its first page, inside the timed
+# window (startedAt is stamped first).
+# Same scope, operation and page size on every leg, so resources/s is
+# comparable across all six; it is NOT the index cost paid inside import
+# (that stays folded into the import row).
 #
 # Timing is the job's own `$reindex-status` startedAt → completedAt
-# (seconds=), not this 2 s poll loop (wall_seconds=). Bounded: past
+# (seconds=), not this 2 s poll loop (wall_seconds=), which prints a
+# progress line about every 30 s and the final status. Bounded: past
 # $INDEXING_BUDGET_S the job is cancelled (DELETE /$reindex-status/<id>)
 # and the rate covers the part that ran (status=partial
 # reason=time-cap). Never fails the leg. Worst case with an
@@ -502,11 +514,13 @@ write_search_counts() {
 # cancel + 45 s cancel wait, about budget + 2 min; with a responsive
 # one, the budget plus one poll.
 #
-# Writes indexing.txt, indexing-status.txt (the last status body, or
+# Writes indexing.txt (scope=all|type; resource_type= is empty for all),
+# indexing-status.txt (the last status body, or
 # the kick-off answer when it failed — .txt, not .json, so "Generate
 # step summary"'s *.json Results glob never reads it as a k6 summary)
-# and indexing-hfs-log.txt (this job's `reindex ...` lines from the HFS
-# log, read from the byte offset taken before kick-off so the
+# and indexing-hfs-log.txt (up to 400 of this job's `reindex ...` lines
+# from the HFS log: a started/finished pair per type plus a progress line
+# a minute, read from the byte offset taken before kick-off so the
 # 470-530 MB *-elasticsearch logs are not rescanned).
 run_indexing_suite() {
   local base="http://localhost:$BENCH_PORT"
@@ -516,6 +530,22 @@ run_indexing_suite() {
   local cancelled=false cancel_http="" cancel_until=0
   local status="" reason="" total="" processed="" entries="" errors=""
   local started="" completed="" s0="" s1="" seconds="" rate="" per_res="" es_refresh=n/a
+  local polls=0 final=false
+  local scope=type rtype="$INDEXING_SCOPE" what="$INDEXING_SCOPE" path="/$INDEXING_SCOPE/\$reindex"
+
+  if [ "$INDEXING_SCOPE" = all ]; then
+    scope=all; rtype=""; what="all types"; path="/\$reindex"
+  fi
+  # The scope goes into a URL path and the budget into arithmetic:
+  # resolve-matrix.sh validated both, this is the second check, for a
+  # function that is also sourced for offline smoke runs. Never echoes the
+  # raw values.
+  if { [ "$scope" = type ] && ! [[ "$INDEXING_SCOPE" =~ ^[A-Z][A-Za-z]{0,63}$ ]]; } \
+     || ! [[ "$INDEXING_BUDGET_S" =~ ^[0-9]+$ ]]; then
+    printf 'status=invalid-input\nreason=invalid-scope-or-budget\n' > "$out"
+    echo "::warning::indexing suite: INDEXING_SCOPE is neither 'all' nor a resource type name, or INDEXING_BUDGET_S is not a number of seconds — nothing run (indexing.txt)."
+    return 0
+  fi
 
   case "$BACKEND" in
     *-elasticsearch) es_refresh="${HFS_ELASTICSEARCH_REINDEX_REFRESH:-${HFS_ELASTICSEARCH_WRITE_REFRESH:-unknown}}" ;;
@@ -524,11 +554,11 @@ run_indexing_suite() {
     log_off=$(stat -c %s "$hfs_log" 2>/dev/null) || log_off=0
   fi
 
-  echo "── Indexing: POST /$INDEXING_TYPE/\$reindex (batchSize $INDEXING_BATCH_SIZE, budget ${INDEXING_BUDGET_S}s) ──"
+  echo "── Indexing: POST $path (batchSize $INDEXING_BATCH_SIZE, budget ${INDEXING_BUDGET_S}s) ──"
   kick=$(curl -s --max-time 30 -w '\n%{http_code}' -X POST \
       -H 'Content-Type: application/fhir+json' \
       -d "{\"resourceType\":\"Parameters\",\"parameter\":[{\"name\":\"batchSize\",\"valueInteger\":$INDEXING_BATCH_SIZE}]}" \
-      "$base/$INDEXING_TYPE/\$reindex" 2>/dev/null) || kick=$'\n000'
+      "$base$path" 2>/dev/null) || kick=$'\n000'
   http=$(printf '%s\n' "$kick" | tail -n1)
   job=$(indexing_status_field "$(printf '%s\n' "$kick" | head -n -1)" jobId)
   [[ "$job" =~ ^[A-Za-z0-9-]+$ ]] || job=""
@@ -537,23 +567,31 @@ run_indexing_suite() {
     {
       echo "status=kickoff-failed"
       echo "reason=http-$http"
-      echo "resource_type=$INDEXING_TYPE"
+      echo "scope=$scope"
+      echo "resource_type=$rtype"
       echo "kickoff_http=$http"
       echo "batch_size=$INDEXING_BATCH_SIZE"
       echo "budget_s=$INDEXING_BUDGET_S"
     } > "$out"
     printf '%s\n' "$kick" | head -n -1 | head -c 4096 > "$RESULTS_DIR/indexing-status.txt" || true
     cat "$out"
-    echo "::warning::indexing suite: POST /$INDEXING_TYPE/\$reindex answered HTTP $http — no indexing number for this leg (indexing.txt)."
+    echo "::warning::indexing suite: POST $path answered HTTP $http — no indexing number for this leg (indexing.txt)."
     return 0
   fi
 
   while :; do
     body=$(curl -sf --max-time 15 "$base/\$reindex-status/$job" 2>/dev/null) || body=""
+    polls=$((polls + 1))
     [ -n "$body" ] && last="$body"
     st=$(indexing_status_field "$body" status)
-    echo "  t=$((SECONDS - t0))s status=${st:-?} processed=$(indexing_status_field "$body" processed)/$(indexing_status_field "$body" total)"
-    case "$st" in completed|failed|cancelled) break ;; esac
+    case "$st" in completed|failed|cancelled) final=true ;; *) final=false ;; esac
+    # Every 2 s poll would print up to ~1,800 near-identical lines at the
+    # 3600 s budget: the first poll, then every 15th (about 30 s), and
+    # always the final status.
+    if [ "$final" = true ] || [ $((polls % 15)) -eq 1 ]; then
+      echo "  t=$((SECONDS - t0))s status=${st:-?} processed=$(indexing_status_field "$body" processed)/$(indexing_status_field "$body" total)"
+    fi
+    if [ "$final" = true ]; then break; fi
     if [ "$cancelled" = false ] && [ $((SECONDS - t0)) -ge "$INDEXING_BUDGET_S" ]; then
       cancel_http=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE \
           "$base/\$reindex-status/$job" 2>/dev/null) || cancel_http=000
@@ -597,7 +635,8 @@ run_indexing_suite() {
   {
     echo "status=$status"
     echo "reason=$reason"
-    echo "resource_type=$INDEXING_TYPE"
+    echo "scope=$scope"
+    echo "resource_type=$rtype"
     echo "job_id=$job"
     echo "kickoff_http=$http"
     echo "cancel_http=$cancel_http"
@@ -617,12 +656,12 @@ run_indexing_suite() {
   } > "$out"
   printf '%s\n' "$last" | head -c 65536 > "$RESULTS_DIR/indexing-status.txt" || true
   if [ -f "$hfs_log" ]; then
-    tail -c +$((log_off + 1)) "$hfs_log" 2>/dev/null | grep -F "job_id=$job " | tail -n 50 | cut -c1-2000 \
+    tail -c +$((log_off + 1)) "$hfs_log" 2>/dev/null | grep -F "job_id=$job " | tail -n 400 | cut -c1-2000 \
       > "$RESULTS_DIR/indexing-hfs-log.txt" || true
   fi
   cat "$out"
-  if [ "$status" != completed ] || { [[ "$errors" =~ ^[0-9]+$ ]] && [ "$errors" -gt 0 ]; }; then
-    echo "::warning::indexing suite: \$reindex of $INDEXING_TYPE ended status=$status${reason:+ reason=$reason} (processed ${processed:-?}/${total:-?}, errors ${errors:-?}) — see indexing.txt."
+  if [ "$status" != completed ] || [ "$total" = 0 ] || { [[ "$errors" =~ ^[0-9]+$ ]] && [ "$errors" -gt 0 ]; }; then
+    echo "::warning::indexing suite: \$reindex of $what ended status=$status${reason:+ reason=$reason} (processed ${processed:-?}/${total:-?}, errors ${errors:-?}) — see indexing.txt."
   fi
   return 0
 }

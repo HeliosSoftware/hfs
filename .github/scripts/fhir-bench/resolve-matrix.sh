@@ -20,6 +20,8 @@
 #   IN_ES_SYNC_MODE                 inputs.es_sync_mode
 #   IN_MONGO_WT_CACHE_GB            inputs.mongo_wt_cache_gb
 #   IN_HFS_MONGO_MAX_CONNECTIONS    inputs.hfs_mongo_max_connections
+#   IN_INDEXING_SCOPE               inputs.indexing_scope
+#   IN_INDEXING_BUDGET_S            inputs.indexing_budget_s
 #
 # Outputs (via $GITHUB_OUTPUT): matrix, max_parallel, es_heap_mb,
 # leg_timeout_min.
@@ -164,6 +166,39 @@ elif [ "$HFS_MONGO_POOL" -gt 1000 ]; then
   FAIL=1
 fi
 
+# indexing_scope: `all` (system-level POST /$reindex) or one resource type
+# name, which run_indexing_suite (suite-lib.sh) puts into the URL path
+# POST /<type>/$reindex. Every FHIR resource type name is letters only,
+# upper-case first, at most 64 characters, so this pattern cannot carry a
+# `/`, `?`, `.`, quote or newline into that URL or the step's shell; `all`
+# is not a FHIR type name. run_indexing_suite re-checks it before building
+# the URL. Any other casing of `all` (All, ALL) also matches the type
+# pattern, so it is rejected here rather than sent as a type, where it
+# would only 404 after the leg's earlier suites.
+INDEXING_SCOPE="${IN_INDEXING_SCOPE:-all}"
+if [ "$INDEXING_SCOPE" != all ] && [ "${INDEXING_SCOPE,,}" = all ]; then
+  echo "::error::indexing_scope: write 'all' in lower case to reindex every type (got '$INDEXING_SCOPE')"
+  FAIL=1
+elif [ "$INDEXING_SCOPE" != all ] && ! [[ "$INDEXING_SCOPE" =~ ^[A-Z][A-Za-z]{0,63}$ ]]; then
+  echo "::error::indexing_scope must be 'all' or one resource type name (letters only, upper-case first, e.g. Encounter; got '$INDEXING_SCOPE')"
+  FAIL=1
+fi
+
+# indexing_budget_s: whole seconds, 0..3600, no leading zeros (0 forces the
+# cancel path). Capped at 3600 so a leg whose $reindex overruns its budget
+# is cancelled, reported partial and still ends inside leg_timeout_min
+# (see the comment on it below); run_indexing_suite re-checks that it is
+# numeric before using it in arithmetic. At most 4 digits are matched
+# BEFORE the -gt 3600 test, same reason as hfs_mongo_max_connections above.
+INDEXING_BUDGET="${IN_INDEXING_BUDGET_S:-3600}"
+if ! [[ "$INDEXING_BUDGET" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
+  echo "::error::indexing_budget_s must be whole seconds with no leading zeros, at most 4 digits (got '$INDEXING_BUDGET')"
+  FAIL=1
+elif [ "$INDEXING_BUDGET" -gt 3600 ]; then
+  echo "::error::indexing_budget_s must be 0..3600 (got '$INDEXING_BUDGET')"
+  FAIL=1
+fi
+
 if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
@@ -174,15 +209,22 @@ fi
   echo "es_heap_mb=$ES_HEAP_MB"
 } >> "$GITHUB_OUTPUT"
 echo "Backend matrix: $MATRIX"
-echo "::notice title=Benchmark legs::backend=$BACKEND -> $LEG_COUNT leg(s) [$LEGS], max_parallel=$MAX_PARALLEL. A leg takes ~30-130 min; legs beyond max_parallel queue."
+echo "::notice title=Benchmark legs::backend=$BACKEND -> $LEG_COUNT leg(s) [$LEGS], max_parallel=$MAX_PARALLEL. A leg takes ~50-150 min; legs beyond max_parallel queue."
 
 # The benchmark job's timeout-minutes, and the base the "Reap stale
 # benchmark containers and verify Docker host storage" step (in the
-# `benchmark` job, fhir-benchmark.yml) sizes its age guard from. Must stay <= 175:
+# `benchmark` job, fhir-benchmark.yml) sizes its age guard from. 170 since
+# the indexing suite reindexes every resource type by default: the slowest
+# leg seen needed ~70 min before indexing (mongodb, run 37986575337), the
+# full reindex is estimated at up to ~40 min (budget 3600 s), and
+# bulk-import (up to ~32 min, skipped with under 15 min to its deadline)
+# gets this timeout minus BULK_IMPORT_LEG_RESERVE_S. At 150 that leg's
+# bulk-import would be squeezed or skipped, and a reindex cancelled at its
+# budget could leave the post steps past the job timeout. Must stay <= 175:
 # .github/actions/docker-host-gc (input container-max-age-min,
 # default 180; used by ci.yml / ci-extended / hts / keycloak-smoke
 # / ui-tests-matrix) reaps any `hfs-ci=true` container whose
 # `.State.StartedAt` is >= 180 min old, and GitHub gives a
 # cancelled job up to 5 more minutes to exit. Do not raise this
 # without re-checking that reaper's default.
-echo "leg_timeout_min=150" >> "$GITHUB_OUTPUT"
+echo "leg_timeout_min=170" >> "$GITHUB_OUTPUT"
