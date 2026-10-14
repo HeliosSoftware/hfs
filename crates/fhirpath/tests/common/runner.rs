@@ -9,6 +9,8 @@ pub struct TestScope<'a> {
     pub context: &'a str,
     /// Declared type(s) of that focus, `|`-separated, checked statically.
     pub context_type: &'a str,
+    /// `ordered="false"` on the test: the outputs may come back in any order.
+    pub unordered: bool,
 }
 
 /// Evaluates a test expression the way the conformance suite defines it: a
@@ -124,7 +126,36 @@ pub fn run_fhir_test(
     }
 
     // Check each result value to see if it matches expected
-    compare_results(&result_vec, expected)
+    if scope.unordered {
+        compare_results_unordered(&result_vec, expected)
+    } else {
+        compare_results(&result_vec, expected)
+    }
+}
+
+/// `ordered="false"` comparison: every expected output must match a distinct
+/// actual output, in any order (e.g. `distinct()`, whose order the spec leaves
+/// open).
+fn compare_results_unordered(
+    actual: &[EvaluationResult],
+    expected: &[EvaluationResult],
+) -> Result<(), String> {
+    let mut used = vec![false; actual.len()];
+    for (i, exp) in expected.iter().enumerate() {
+        let found = actual.iter().enumerate().position(|(j, act)| {
+            !used[j]
+                && compare_results(std::slice::from_ref(act), std::slice::from_ref(exp)).is_ok()
+        });
+        match found {
+            Some(j) => used[j] = true,
+            None => {
+                return Err(format!(
+                    "Unordered result: expected output {i} ({exp:?}) not found in {actual:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compare_results(
