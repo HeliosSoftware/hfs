@@ -42,6 +42,10 @@ use crate::types::{
 };
 
 use super::MongoBackend;
+use super::deferred_index::{
+    BundleDeferral, DeferredCommit, DeferredIndexSet, SEARCH_INDEX_PENDING_COLLECTION,
+    SEARCH_ROWS_PENDING_FIELD, inline_index_types, ledger_documents,
+};
 use super::retry::{BUNDLE_TRANSACTION_RETRY, jitter_fraction};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
@@ -78,6 +82,42 @@ enum PendingSearchParameterChange {
     Create,
     Update,
     Delete,
+}
+
+/// What one attempt at a Bundle transaction has staged for after its commit:
+/// the SearchParameter changes, and, for a Bundle that defers its search rows
+/// (#1975), the resources it left without them. Every attempt starts with its
+/// own, so an aborted attempt leaves nothing behind.
+struct BundleWrites {
+    search_parameter_changes: Vec<PendingSearchParameterChange>,
+    deferred: Option<DeferredIndexSet>,
+}
+
+impl BundleWrites {
+    fn new(deferral: Option<&BundleDeferral>) -> Self {
+        Self {
+            search_parameter_changes: Vec::new(),
+            deferred: deferral.map(DeferredIndexSet::new),
+        }
+    }
+
+    /// The marker to stamp on a `resources` document written in this attempt,
+    /// when its search rows are deferred: the id of the Bundle.
+    fn pending_marker(&self, resource_type: &str) -> Option<String> {
+        self.deferred
+            .as_ref()
+            .filter(|deferred| deferred.defers(resource_type))
+            .map(|deferred| deferred.bundle_id().to_string())
+    }
+}
+
+/// What a committed attempt at a Bundle transaction hands back: the entry
+/// results, the staged SearchParameter changes, and, for a Bundle that deferred
+/// its search rows, the ledger it committed with (#1975).
+struct CommittedAttempt {
+    results: Vec<BundleEntryResult>,
+    search_parameter_changes: Vec<PendingSearchParameterChange>,
+    deferred: Option<DeferredCommit>,
 }
 
 /// Request context shared by every entry in one MongoDB Bundle transaction.
@@ -387,6 +427,38 @@ fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> Bund
         index,
         message: format!("Entry processing failed: {err}"),
     })
+}
+
+/// Why a bundle attempt failed when its deferred-search-index ledger could not
+/// be written, given a transaction of `entries` entries (#1975).
+///
+/// The ledger belongs to no entry, so no entry is blamed for it. A cache
+/// failure (388) is [`TransactionError::TooLargeForCache`] and a transient abort
+/// is handed back as [`entry_attempt_error`] does, with no entry named, so the
+/// bundle loop's rules for a replay and for a lone eviction (#1895) apply to it
+/// unchanged. Anything else rolled the Bundle back on the server's side, a
+/// [`TransactionError::RolledBack`] (HTTP 500). A [`TransactionError::BundleError`]
+/// would answer 400 about an entry the client never sent.
+fn ledger_attempt_error(entries: usize, err: &StorageError) -> BundleAttemptError {
+    match entry_attempt_error(entries, entries, err) {
+        BundleAttemptError::TransientAbort {
+            code,
+            eviction,
+            reason,
+            ..
+        } => BundleAttemptError::TransientAbort {
+            entry: None,
+            code,
+            eviction,
+            reason,
+        },
+        too_large @ BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. }) => {
+            too_large
+        }
+        BundleAttemptError::Failed(_) => BundleAttemptError::Failed(TransactionError::RolledBack {
+            reason: format!("Failed to write the deferred search index ledger: {err}"),
+        }),
+    }
 }
 
 /// #1895: the error a transient abort ends the Bundle with instead of a replay,
@@ -2213,6 +2285,7 @@ impl ResourceStorage for MongoBackend {
             MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
             MongoBackend::RESOURCE_HISTORY_COLLECTION,
             MongoBackend::RESOURCES_COLLECTION,
+            super::deferred_index::SEARCH_INDEX_PENDING_COLLECTION,
         ] {
             db.collection::<Document>(collection)
                 .delete_many(doc! { "tenant_id": id })
@@ -4096,6 +4169,13 @@ impl BundleProvider for MongoBackend {
     /// and no transaction, and it is kept across replays until the commit.
     /// Dropping a queued request gives up its place.
     ///
+    /// Search rows (#1975): a Bundle of at least
+    /// [`Self::deferred_search_index_min_entries`] entries commits without its
+    /// `search_index` rows, writes a bounded ledger of the resources owed rows
+    /// in the same transaction, keeps its admission through the commit and
+    /// writes the rows after it. Smaller Bundles write their rows in the
+    /// transaction, as before.
+    ///
     /// Dropping this future — the request timed out, the client went away —
     /// drops the session, which aborts the transaction server-side. The slot
     /// frees immediately while that abort is still in flight, so under request
@@ -4120,6 +4200,28 @@ impl BundleProvider for MongoBackend {
         // past either (#1641, #1806). It also holds the room until the drop
         // after the commit.
         let gate = self.transaction_bundle_gate();
+
+        // A Bundle of at least `deferred_search_index_min_entries()` entries
+        // commits without its search rows and writes them after the commit
+        // (#1975). Decided once: every attempt of the Bundle shares it.
+        let deferral = self
+            .deferred_search_index_min_entries()
+            .filter(|min| entries.len() >= *min)
+            .map(|min| {
+                let deferral = BundleDeferral {
+                    bundle_id: uuid::Uuid::new_v4().to_string(),
+                    inline_types: inline_index_types(&entries),
+                };
+                tracing::debug!(
+                    entries = entries.len(),
+                    min_entries = min,
+                    bundle_id = %deferral.bundle_id,
+                    inline_types = ?deferral.inline_types,
+                    "transaction bundle defers its search rows until after the commit"
+                );
+                deferral
+            });
+
         let admission = gate.admit(entries.len()).await;
         let queued = admission.queued();
         if let Some(limit) = gate.limit() {
@@ -4137,7 +4239,7 @@ impl BundleProvider for MongoBackend {
         let mut session = begin_required_bundle_transaction_session(&db).await?;
 
         let mut attempts: u32 = 1;
-        let (results, pending_search_parameter_changes) = loop {
+        let committed = loop {
             let attempt_started = std::time::Instant::now();
             let attempt = self
                 .bundle_transaction_attempt(
@@ -4147,6 +4249,7 @@ impl BundleProvider for MongoBackend {
                     fhir_version,
                     validator,
                     &entries,
+                    deferral.as_ref(),
                 )
                 .await;
             let attempt_duration = attempt_started.elapsed();
@@ -4225,18 +4328,43 @@ impl BundleProvider for MongoBackend {
             );
         }
 
-        drop(admission);
+        let CommittedAttempt {
+            results,
+            search_parameter_changes,
+            deferred,
+        } = committed;
 
-        // Any SearchParameter change in this transaction alters a tenant's
-        // overlay — refresh the stored-param cache and drop the cached
-        // registries so the next access reflects the committed writes. Once,
-        // after the commit that counted, never after an aborted attempt.
-        if !pending_search_parameter_changes.is_empty() {
-            if let Err(e) = self
-                .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
-                .await
-            {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
+        match deferred {
+            None => {
+                drop(admission);
+                self.reload_after_search_parameter_changes(tenant, &search_parameter_changes)
+                    .await;
+            }
+            // The room is kept through the post-commit rows, so the next large
+            // Bundle does not compete with their inserts for cache (#1975).
+            Some(deferred) => {
+                // The rows are built with the committed registry.
+                self.reload_after_search_parameter_changes(tenant, &search_parameter_changes)
+                    .await;
+                // The rows stop being started at the Bundle's own deadline, so
+                // a committed Bundle is answered rather than timed out and
+                // resubmitted; the repair finishes what is left (#1975).
+                let stop_at = self.config().bundle_transaction_deadline.map(|deadline| {
+                    tokio::time::Instant::now()
+                        + deadline.saturating_sub(admission.elapsed().since_call)
+                });
+                // On the Bundle's own session, which is causally consistent: the
+                // first batch reads at or after the commit above.
+                self.write_deferred_search_rows(
+                    &db,
+                    &mut session,
+                    tenant.tenant_id().as_str(),
+                    &deferred,
+                    entries.len(),
+                    stop_at,
+                )
+                .await;
+                drop(admission);
             }
         }
 
@@ -4248,16 +4376,42 @@ impl BundleProvider for MongoBackend {
 }
 
 impl MongoBackend {
+    /// Any SearchParameter change in a Bundle transaction alters a tenant's
+    /// overlay — refresh the stored-param cache and drop the cached registries
+    /// so the next access reflects the committed writes. Once, after the commit
+    /// that counted, never after an aborted attempt.
+    async fn reload_after_search_parameter_changes(
+        &self,
+        tenant: &TenantContext,
+        changes: &[PendingSearchParameterChange],
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
+            .await
+        {
+            tracing::warn!("SearchParameter cache reload failed: {e}");
+        }
+    }
+
     /// One attempt at a bundle transaction: every entry in order, then commit.
     ///
-    /// Returns the entry results and the staged SearchParameter changes when
-    /// the transaction committed. Otherwise it returns why it did not, with the
-    /// server-side transaction already aborted (or failed at commit), so the
-    /// caller may begin another on the same session.
+    /// Returns the entry results, the staged SearchParameter changes and the
+    /// deferred-rows ledger (if any) when the transaction committed. Otherwise
+    /// it returns why it did not, with the server-side transaction already
+    /// aborted (or failed at commit), so the caller may begin another on the
+    /// same session.
     ///
     /// Each attempt clones the original entries before pinning references.
     /// Pins and payload rewrites stay in that attempt: a replay resolves its
     /// own targets and cannot retain identities from an aborted transaction.
+    ///
+    /// An attempt of a Bundle that defers its search rows (`deferral`, #1975)
+    /// writes its ledger last, inside the transaction, so the ledger commits or
+    /// aborts with the Bundle and an aborted attempt leaves no trace of it.
+    #[allow(clippy::too_many_arguments)]
     async fn bundle_transaction_attempt(
         &self,
         db: &mongodb::Database,
@@ -4266,8 +4420,8 @@ impl MongoBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
         entries: &[BundleEntry],
-    ) -> Result<(Vec<BundleEntryResult>, Vec<PendingSearchParameterChange>), BundleAttemptError>
-    {
+        deferral: Option<&BundleDeferral>,
+    ) -> Result<CommittedAttempt, BundleAttemptError> {
         let mut entries = entries.to_vec();
         // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
         // resolve against the transaction's starting view before any entry is
@@ -4307,7 +4461,7 @@ impl MongoBackend {
             }
         };
         let mut bundle_state = BundleTransactionState::new(references);
-        let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
+        let mut writes = BundleWrites::new(deferral);
 
         let entry_count = entries.len();
         for (idx, entry) in entries.iter_mut().enumerate() {
@@ -4340,7 +4494,7 @@ impl MongoBackend {
                     },
                     entry,
                     resource,
-                    &mut pending_search_parameter_changes,
+                    &mut writes,
                     targets.get(&idx),
                 )
                 .await;
@@ -4385,6 +4539,40 @@ impl MongoBackend {
             ));
         }
 
+        // The ledger goes in after the last entry and before the commit: the
+        // Bundle's writes and the record of the rows still owed commit together
+        // or not at all (#1975). A failure here is classified by `ledger_attempt_error`.
+        let mut deferred = None;
+        if let Some(set) = writes.deferred.as_ref().filter(|set| !set.is_empty()) {
+            let (documents, chunks) = ledger_documents(
+                tenant.tenant_id().as_str(),
+                set.bundle_id(),
+                entry_count,
+                set.refs(),
+                Utc::now(),
+            );
+            if let Err(e) = db
+                .collection::<Document>(SEARCH_INDEX_PENDING_COLLECTION)
+                .insert_many(documents)
+                .session(&mut *session)
+                .await
+            {
+                let _ = session.abort_transaction().await;
+                return Err(ledger_attempt_error(
+                    entry_count,
+                    &internal_driver_error(
+                        "Failed to write the deferred search index ledger in transaction",
+                        e,
+                    ),
+                ));
+            }
+            deferred = Some(DeferredCommit {
+                bundle_id: set.bundle_id().to_string(),
+                chunks,
+                resources: set.refs().len(),
+            });
+        }
+
         // A commit whose outcome is unknown may have applied. Sending the
         // commit again is safe (the driver's own documented recovery);
         // re-running the entries is not, since every POST would be stored a
@@ -4399,7 +4587,11 @@ impl MongoBackend {
             }
         }
 
-        Ok((results, pending_search_parameter_changes))
+        Ok(CommittedAttempt {
+            results,
+            search_parameter_changes: writes.search_parameter_changes,
+            deferred,
+        })
     }
 
     /// Resolves every URL-borne conditional entry inside the session, before
@@ -4470,7 +4662,7 @@ impl MongoBackend {
         context: BundleEntryContext<'_>,
         entry: &BundleEntry,
         resource: Option<Value>,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
         target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
         let BundleEntryContext {
@@ -4541,7 +4733,7 @@ impl MongoBackend {
                         &resource_type,
                         resource,
                         fhir_version,
-                        pending_search_parameter_changes,
+                        writes,
                     )
                     .await?;
                 Ok(BundleEntryResult::created(created))
@@ -4557,12 +4749,7 @@ impl MongoBackend {
                     return Ok(match &target.resolved {
                         Some(existing) => crate::core::conditional_update_entry(
                             self.update_resource_in_bundle_transaction(
-                                db,
-                                session,
-                                tenant,
-                                existing,
-                                resource,
-                                pending_search_parameter_changes,
+                                db, session, tenant, existing, resource, writes,
                             )
                             .await?,
                         ),
@@ -4574,7 +4761,7 @@ impl MongoBackend {
                                 &target.resource_type,
                                 resource,
                                 fhir_version,
-                                pending_search_parameter_changes,
+                                writes,
                             )
                             .await?,
                         ),
@@ -4601,12 +4788,7 @@ impl MongoBackend {
 
                         let updated = self
                             .update_resource_in_bundle_transaction(
-                                db,
-                                session,
-                                tenant,
-                                &existing,
-                                resource,
-                                pending_search_parameter_changes,
+                                db, session, tenant, &existing, resource, writes,
                             )
                             .await?;
                         Ok(BundleEntryResult::updated(updated))
@@ -4631,7 +4813,7 @@ impl MongoBackend {
                                 &resource_type,
                                 resource_with_id,
                                 fhir_version,
-                                pending_search_parameter_changes,
+                                writes,
                             )
                             .await?;
                         Ok(BundleEntryResult::created(created))
@@ -4648,7 +4830,7 @@ impl MongoBackend {
                                 tenant,
                                 &target.resource_type,
                                 existing.id(),
-                                pending_search_parameter_changes,
+                                writes,
                             )
                             .await?;
                             crate::core::conditional_delete_entry(existing)
@@ -4668,7 +4850,7 @@ impl MongoBackend {
                             &resource_type,
                             &id,
                             if_match,
-                            pending_search_parameter_changes,
+                            writes,
                         )
                         .await
                     {
@@ -4692,7 +4874,7 @@ impl MongoBackend {
                             tenant,
                             &resource_type,
                             &id,
-                            pending_search_parameter_changes,
+                            writes,
                         )
                         .await
                     {
@@ -4770,12 +4952,7 @@ impl MongoBackend {
                 };
                 let update_result = self
                     .update_resource_in_bundle_transaction(
-                        db,
-                        session,
-                        tenant,
-                        &existing,
-                        candidate,
-                        pending_search_parameter_changes,
+                        db, session, tenant, &existing, candidate, writes,
                     )
                     .await;
                 crate::core::transaction::patch_update_result(update_result)
@@ -4792,7 +4969,7 @@ impl MongoBackend {
         resource_type: &str,
         resource: Value,
         fhir_version: helios_fhir::FhirVersion,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<StoredResource> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -4834,19 +5011,26 @@ impl MongoBackend {
         let version_id = "1".to_string();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
+        let mut current = search_documents.resource_document(doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": &id,
+            "version_id": &version_id,
+            "data": Bson::Document(payload.clone()),
+            "created_at": now_bson,
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        });
+        // A Bundle that defers its search rows marks the resource until they
+        // are written (#1975). The history document carries no marker.
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            current.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
+
         resources
-            .insert_one(search_documents.resource_document(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": &id,
-                "version_id": &version_id,
-                "data": Bson::Document(payload.clone()),
-                "created_at": now_bson,
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            }))
+            .insert_one(current)
             .session(&mut *session)
             .await
             .map_err(|e| {
@@ -4884,11 +5068,14 @@ impl MongoBackend {
             resource_type,
             &id,
             search_documents,
+            writes,
         )
         .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Create);
+            writes
+                .search_parameter_changes
+                .push(PendingSearchParameterChange::Create);
         }
 
         Ok(StoredResource::from_storage(
@@ -4911,7 +5098,7 @@ impl MongoBackend {
         tenant: &TenantContext,
         current: &StoredResource,
         resource: Value,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<StoredResource> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -4965,6 +5152,18 @@ impl MongoBackend {
         let fhir_version = current.fhir_version();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
+        let mut set = doc! {
+            "version_id": &new_version,
+            "data": Bson::Document(payload.clone()),
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        };
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            set.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
+
         let update_result = resources
             .update_one(
                 doc! {
@@ -4974,16 +5173,7 @@ impl MongoBackend {
                     "version_id": current.version_id(),
                     "is_deleted": false,
                 },
-                search_documents.resource_update(doc! {
-                    "$set": {
-                        "version_id": &new_version,
-                        "data": Bson::Document(payload.clone()),
-                        "last_updated": now_bson,
-                        "is_deleted": false,
-                        "deleted_at": Bson::Null,
-                        "fhir_version": &fhir_version_str,
-                    }
-                }),
+                search_documents.resource_update(doc! { "$set": set }),
             )
             .session(&mut *session)
             .await
@@ -5026,11 +5216,14 @@ impl MongoBackend {
             resource_type,
             id,
             search_documents,
+            writes,
         )
         .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Update);
+            writes
+                .search_parameter_changes
+                .push(PendingSearchParameterChange::Update);
         }
 
         Ok(StoredResource::from_storage(
@@ -5053,7 +5246,7 @@ impl MongoBackend {
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -5107,6 +5300,17 @@ impl MongoBackend {
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
 
+        let mut set = doc! {
+            "version_id": &new_version,
+            "is_deleted": true,
+            "missing_params": Bson::Array(Vec::new()),
+            "deleted_at": now_bson,
+            "last_updated": now_bson,
+        };
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            set.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
+
         let update_result = resources
             .update_one(
                 doc! {
@@ -5116,15 +5320,7 @@ impl MongoBackend {
                     "version_id": &current_version,
                     "is_deleted": false,
                 },
-                doc! {
-                    "$set": {
-                        "version_id": &new_version,
-                        "is_deleted": true,
-                        "missing_params": Bson::Array(Vec::new()),
-                        "deleted_at": now_bson,
-                        "last_updated": now_bson,
-                    }
-                },
+                doc! { "$set": set },
             )
             .session(&mut *session)
             .await
@@ -5158,11 +5354,20 @@ impl MongoBackend {
                 internal_driver_error("Failed to insert delete history in transaction", e)
             })?;
 
-        self.delete_search_index_in_bundle_transaction(db, session, tenant_id, resource_type, id)
-            .await?;
+        self.delete_search_index_in_bundle_transaction(
+            db,
+            session,
+            tenant_id,
+            resource_type,
+            id,
+            writes,
+        )
+        .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Delete);
+            writes
+                .search_parameter_changes
+                .push(PendingSearchParameterChange::Delete);
         }
 
         Ok(())
@@ -5177,7 +5382,7 @@ impl MongoBackend {
         resource_type: &str,
         id: &str,
         expected_version: &str,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         let existing = self
             .read_resource_in_bundle_transaction(db, session, tenant, resource_type, id)
@@ -5201,15 +5406,8 @@ impl MongoBackend {
             ));
         }
 
-        self.delete_resource_in_bundle_transaction(
-            db,
-            session,
-            tenant,
-            resource_type,
-            id,
-            pending_search_parameter_changes,
-        )
-        .await
+        self.delete_resource_in_bundle_transaction(db, session, tenant, resource_type, id, writes)
+            .await
     }
 
     async fn read_resource_in_bundle_transaction(
@@ -5780,6 +5978,15 @@ impl MongoBackend {
         Ok(())
     }
 
+    /// Writes a resource's search rows inside the Bundle's transaction, or, when
+    /// the Bundle defers them for this type (#1975), only notes the resource for
+    /// the post-commit step: neither the two deletes nor the inserts run.
+    ///
+    /// The rows come from `docs`, which the caller built from the same
+    /// extraction as the resource's `missing_params`. A deferred type drops
+    /// `docs`: its `missing_params` are already on the resource document and
+    /// its rows are rebuilt after commit.
+    #[allow(clippy::too_many_arguments)]
     async fn index_resource_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
@@ -5788,17 +5995,27 @@ impl MongoBackend {
         resource_type: &str,
         resource_id: &str,
         docs: SearchIndexDocuments,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
             return Ok(());
         }
 
-        self.delete_search_index_in_bundle_transaction(
+        if let Some(deferred) = writes
+            .deferred
+            .as_mut()
+            .filter(|deferred| deferred.defers(resource_type))
+        {
+            deferred.record(resource_type, resource_id);
+            return Ok(());
+        }
+
+        self.delete_search_index_rows_for(
             db,
-            session,
             tenant_id,
             resource_type,
-            resource_id,
+            Bson::String(resource_id.to_string()),
+            Some(&mut *session),
         )
         .await?;
 
@@ -5806,6 +6023,9 @@ impl MongoBackend {
             .await
     }
 
+    /// Deletes a resource's search rows inside the Bundle's transaction, or,
+    /// when the Bundle defers them for this type (#1975), only notes the
+    /// resource: the post-commit step finds it deleted and leaves it no rows.
     async fn delete_search_index_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
@@ -5813,8 +6033,18 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
+            return Ok(());
+        }
+
+        if let Some(deferred) = writes
+            .deferred
+            .as_mut()
+            .filter(|deferred| deferred.defers(resource_type))
+        {
+            deferred.record(resource_type, resource_id);
             return Ok(());
         }
 
@@ -8863,6 +9093,79 @@ mod transient_abort_tests {
             entry_attempt_error(3, 10, &classified_io_error()),
             BundleAttemptError::TransientAbort { .. }
         ));
+    }
+
+    #[test]
+    fn a_ledger_write_that_overflows_the_cache_is_too_large_for_cache() {
+        for driver in [
+            command_error(388, "TransactionTooLargeForCache"),
+            insert_many_write_error(388),
+        ] {
+            let err = internal_driver_error(
+                "Failed to write the deferred search index ledger in transaction",
+                driver,
+            );
+            match ledger_attempt_error(7412, &err) {
+                BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                    entries, ..
+                }) => assert_eq!(entries, 7412),
+                other => panic!("expected TooLargeForCache, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_ledger_write_aborted_transiently_is_a_transient_abort_with_no_entry() {
+        let eviction = internal_driver_error(
+            "Failed to write the deferred search index ledger in transaction",
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+        );
+        match ledger_attempt_error(7412, &eviction) {
+            BundleAttemptError::TransientAbort {
+                entry: None,
+                code: Some(WRITE_CONFLICT_CODE),
+                eviction: true,
+                ..
+            } => {}
+            other => panic!("expected a transient abort, got {other:?}"),
+        }
+        let plain = internal_driver_error(
+            "Failed to write the deferred search index ledger in transaction",
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+        );
+        assert!(matches!(
+            ledger_attempt_error(7412, &plain),
+            BundleAttemptError::TransientAbort {
+                entry: None,
+                eviction: false,
+                ..
+            }
+        ));
+        // A dropped connection reaches the loop as `Unavailable`.
+        assert!(matches!(
+            ledger_attempt_error(7412, &classified_io_error()),
+            BundleAttemptError::TransientAbort { entry: None, .. }
+        ));
+    }
+
+    #[test]
+    fn any_other_ledger_write_failure_is_a_server_side_rollback_not_an_entry_error() {
+        for driver in [
+            command_error(2, "BadValue"),
+            command_error(121, "DocumentValidationFailure"),
+            insert_many_write_error(11000),
+        ] {
+            let err = internal_driver_error(
+                "Failed to write the deferred search index ledger in transaction",
+                driver,
+            );
+            match ledger_attempt_error(7412, &err) {
+                BundleAttemptError::Failed(TransactionError::RolledBack { reason }) => {
+                    assert!(reason.contains("deferred search index ledger"), "{reason}");
+                }
+                other => panic!("expected RolledBack, got {other:?}"),
+            }
+        }
     }
 
     /// A commit that failed with a write-concern error of `code`, as the driver

@@ -441,7 +441,7 @@ impl helios_persistence::composite::SecondarySyncObserver for CompositeSyncMetri
 }
 
 /// Reads a non-negative integer setting, falling back on anything else.
-#[cfg(feature = "elasticsearch")]
+#[cfg(any(feature = "elasticsearch", feature = "mongodb"))]
 fn env_u64(var: &str, default_value: u64) -> u64 {
     match std::env::var(var) {
         Ok(v) => v.trim().parse().unwrap_or_else(|_| {
@@ -1213,6 +1213,10 @@ async fn start_mongodb(
         "Initializing MongoDB backend"
     );
     let backend = MongoBackend::new(backend_config)?;
+    info!(
+        deferred_index_min_entries = ?backend.deferred_search_index_min_entries(),
+        "MongoDB transaction Bundles of at least this many entries write their search rows after the commit (None: never)"
+    );
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
@@ -1220,6 +1224,10 @@ async fn start_mongodb(
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_mongodb_search_param_refresh(backend.clone(), &config);
+    spawn_mongodb_deferred_index_repair(
+        backend.clone(),
+        deferred_index_repair_min_age(config.request_timeout),
+    );
     let serve_audit_state = audit_state.clone();
 
     // MongoDB is a full standalone primary, so it also hosts the per-user
@@ -2090,6 +2098,104 @@ fn spawn_mongodb_search_param_refresh(backend: Arc<MongoBackend>, config: &Serve
                     "SearchParameter registry refresh failed; serving the stale cache: {e}"
                 ),
             }
+        }
+    });
+}
+
+/// The youngest ledger document a deferred-index repair pass takes (#1975): at
+/// least a minute, and at least the Bundle deadline
+/// ([`bundle_transaction_deadline`]).
+///
+/// The request that wrote a ledger document starts no post-commit batch after
+/// its Bundle deadline, counted from its call, and the call precedes the
+/// document's `not_before`; an attempt still running at the deadline is cut. A
+/// document older than the deadline therefore has no live writer, and one
+/// instance's repair never duplicates a post-commit step that is still running.
+/// (A pass that did race one would only repeat work: the rewrite is gated on a
+/// per-resource marker.) The lag after a crash or a deadline cut is this age
+/// plus up to one repair interval.
+#[cfg(feature = "mongodb")]
+fn deferred_index_repair_min_age(request_timeout_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(60).max(bundle_transaction_deadline(request_timeout_secs))
+}
+
+/// Ledger documents (up to 5,000 resources each) one repair pass takes, so a
+/// pass over a large backlog stays bounded and the rest waits for the next.
+#[cfg(feature = "mongodb")]
+const DEFERRED_INDEX_REPAIR_CHUNKS_PER_PASS: usize = 20;
+
+/// Finishes the search rows of large transaction Bundles that were committed
+/// without them (#1975). Each pass re-runs the post-commit rewrite for ledger
+/// documents at least `min_age` ([`deferred_index_repair_min_age`]) old, up to
+/// [`DEFERRED_INDEX_REPAIR_CHUNKS_PER_PASS`] of them, so rows left by a crash,
+/// a cancelled request or the Bundle deadline are picked up. Runs right away
+/// (startup) and then every `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL`
+/// seconds (default 60; `0` disables the task, the ledger is still written).
+///
+/// Only spawned for the native MongoDB backend: with Elasticsearch serving
+/// search nothing is deferred, so there is nothing to repair.
+#[cfg(feature = "mongodb")]
+fn spawn_mongodb_deferred_index_repair(backend: Arc<MongoBackend>, min_age: std::time::Duration) {
+    let interval = env_u64("HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL", 60);
+    if interval == 0 {
+        info!(
+            "HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL=0: repair of deferred MongoDB search rows is off; large transaction Bundles still write their ledger"
+        );
+        return;
+    }
+    info!(
+        min_age_secs = min_age.as_secs(),
+        interval_secs = interval,
+        "Repair of deferred MongoDB search rows is on"
+    );
+    let interval = std::time::Duration::from_secs(interval);
+    tokio::spawn(async move {
+        let mut first_pass = true;
+        loop {
+            let started = std::time::Instant::now();
+            match backend
+                .repair_deferred_search_index(min_age, DEFERRED_INDEX_REPAIR_CHUNKS_PER_PASS)
+                .await
+            {
+                Ok(report) if report.examined > 0 => {
+                    let pass_ms = started.elapsed().as_millis() as u64;
+                    if report.failed > 0 {
+                        warn!(
+                            examined = report.examined,
+                            skipped = report.skipped,
+                            resources = report.resources,
+                            reindexed = report.reindexed,
+                            rows = report.rows,
+                            cleared = report.cleared,
+                            failed = report.failed,
+                            remaining = report.remaining,
+                            pass_ms,
+                            "Deferred search index repair pass finished"
+                        );
+                    } else {
+                        info!(
+                            examined = report.examined,
+                            skipped = report.skipped,
+                            resources = report.resources,
+                            reindexed = report.reindexed,
+                            rows = report.rows,
+                            cleared = report.cleared,
+                            failed = report.failed,
+                            remaining = report.remaining,
+                            pass_ms,
+                            "Deferred search index repair pass finished"
+                        );
+                    }
+                }
+                Ok(report) if first_pass && report.remaining > 0 => info!(
+                    remaining = report.remaining,
+                    "Deferred search index ledger holds chunks younger than the repair's minimum age; the next pass takes them"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!("Repair of deferred MongoDB search rows could not run: {e}"),
+            }
+            first_pass = false;
+            tokio::time::sleep(interval).await;
         }
     });
 }
@@ -5077,6 +5183,65 @@ mod tests {
         );
         let err = weight(Some("lots")).expect_err("invalid value must fail startup");
         assert!(format!("{err}").contains("HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_deferred_index_entries_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+        let entries = |value: Option<&'static str>| {
+            build_mongodb_config_with_env(&config, false, |name| match name {
+                "HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES" => {
+                    value.map(str::to_string)
+                }
+                _ => None,
+            })
+        };
+
+        assert_eq!(
+            entries(None)
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            None
+        );
+        assert_eq!(
+            entries(Some("off"))
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            Some(0)
+        );
+        assert_eq!(
+            entries(Some("0"))
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            Some(0)
+        );
+        assert_eq!(
+            entries(Some("auto"))
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            None
+        );
+        assert_eq!(
+            entries(Some("6000"))
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            Some(6000)
+        );
+        let err = entries(Some("lots")).expect_err("invalid value must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_deferred_index_repair_min_age_covers_the_bundle_deadline() {
+        use std::time::Duration;
+        // A short timeout leaves the one-minute floor.
+        assert_eq!(deferred_index_repair_min_age(30), Duration::from_secs(60));
+        assert_eq!(deferred_index_repair_min_age(0), Duration::from_secs(60));
+        // A long one is the Bundle deadline, `HFS_REQUEST_TIMEOUT` - 2 s.
+        assert_eq!(deferred_index_repair_min_age(600), Duration::from_secs(598));
+        assert_eq!(deferred_index_repair_min_age(900), Duration::from_secs(898));
     }
 
     #[cfg(feature = "mongodb")]
