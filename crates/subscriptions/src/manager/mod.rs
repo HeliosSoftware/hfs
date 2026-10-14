@@ -349,7 +349,8 @@ impl SubscriptionManager {
 
     /// Registers a subscription from a FHIR Subscription resource JSON.
     ///
-    /// Validates the topic URL, channel type, and filter criteria.
+    /// Validates the topic URL and filters against the supplied tenant's
+    /// definition, as well as the channel type.
     /// On success, the subscription is stored in the in-memory index.
     pub fn register(
         &self,
@@ -379,11 +380,12 @@ impl SubscriptionManager {
         let filter_strings = extract_filter_criteria(resource, fhir_version);
 
         // Validate topic exists.
-        let topic = self.topic_registry.get_topic(&topic_url).ok_or_else(|| {
-            SubscriptionError::TopicNotFound {
+        let topic = self
+            .topic_registry
+            .get_topic(tenant_id, &topic_url)
+            .ok_or_else(|| SubscriptionError::TopicNotFound {
                 url: topic_url.clone(),
-            }
-        })?;
+            })?;
 
         // Validate channel type is supported.
         if !self
@@ -1131,24 +1133,27 @@ pub(crate) mod tests {
     use crate::topics::{FilterDefinition, ResourceTrigger, TopicDefinition};
     use serde_json::json;
 
-    fn create_test_registry() -> Arc<InMemoryTopicRegistry> {
+    fn create_test_registry(tenant_id: &str) -> Arc<InMemoryTopicRegistry> {
         let registry = Arc::new(InMemoryTopicRegistry::new());
-        registry.add_topic(TopicDefinition {
-            canonical_url: "http://example.org/topic/encounter-start".to_string(),
-            title: Some("Encounter Start".to_string()),
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Encounter".to_string(),
-                interactions: vec![ResourceEventType::Create],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![FilterDefinition {
-                resource_type: Some("Encounter".to_string()),
-                filter_parameter: "patient".to_string(),
-                comparators: vec!["eq".to_string()],
-                modifiers: vec![],
-            }],
-            notification_shape: vec![],
-        });
+        registry.add_topic(
+            tenant_id,
+            TopicDefinition {
+                canonical_url: "http://example.org/topic/encounter-start".to_string(),
+                title: Some("Encounter Start".to_string()),
+                resource_triggers: vec![ResourceTrigger {
+                    resource_type: "Encounter".to_string(),
+                    interactions: vec![ResourceEventType::Create],
+                    fhirpath_criteria: None,
+                }],
+                can_filter_by: vec![FilterDefinition {
+                    resource_type: Some("Encounter".to_string()),
+                    filter_parameter: "patient".to_string(),
+                    comparators: vec!["eq".to_string()],
+                    modifiers: vec![],
+                }],
+                notification_shape: vec![],
+            },
+        );
         registry
     }
 
@@ -1244,7 +1249,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_register_r5_subscription() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1267,7 +1272,7 @@ pub(crate) mod tests {
     #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
     #[test]
     fn test_register_native_subscription_topic_and_channeltype_parsing() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = json!({
@@ -1308,7 +1313,7 @@ pub(crate) mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn test_register_r4_subscription_with_backport_extensions() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = r4_subscription_json();
@@ -1327,7 +1332,7 @@ pub(crate) mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn test_register_r4_subscription_payload_content_in_channel_payload_extension() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = json!({
@@ -1397,7 +1402,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_register_invalid_topic() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = build_subscription_json(
@@ -1414,8 +1419,73 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn registration_rejects_a_topic_owned_only_by_another_tenant() {
+        let registry = create_test_registry("tenant-a");
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+        let result = manager.register(
+            "tenant-b",
+            "foreign-sub",
+            &default_subscription_json(),
+            FhirVersion::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(SubscriptionError::TopicNotFound { .. })
+        ));
+        assert!(
+            manager
+                .get_subscription("tenant-b", "foreign-sub")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn registration_uses_the_owning_tenants_filter_definitions() {
+        let registry = create_test_registry("tenant-a");
+        let mut other_topic = registry
+            .get_topic("tenant-a", "http://example.org/topic/encounter-start")
+            .unwrap();
+        other_topic.can_filter_by[0].filter_parameter = "status".to_string();
+        registry.add_topic("tenant-b", other_topic);
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+
+        let filtered_resource = |parameter: &str| {
+            let mut resource = default_subscription_json();
+            if FhirVersion::default().as_str() == "R4" {
+                resource["extension"].as_array_mut().unwrap().push(json!({
+                    "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-filter-criteria",
+                    "valueString": format!("Encounter?{parameter}=value")
+                }));
+            } else {
+                resource["filterBy"] = json!([{"resourceType": "Encounter", "filterParameter": parameter, "value": "value"}]);
+            }
+            resource
+        };
+        let patient = filtered_resource("patient");
+        assert!(
+            manager
+                .register("tenant-a", "sub-a", &patient, FhirVersion::default())
+                .is_ok()
+        );
+        assert!(matches!(
+            manager.register("tenant-b", "wrong-filter", &patient, FhirVersion::default()),
+            Err(SubscriptionError::InvalidFilter { .. })
+        ));
+        let status = filtered_resource("status");
+        assert!(
+            manager
+                .register("tenant-b", "sub-b", &status, FhirVersion::default())
+                .is_ok()
+        );
+        assert!(matches!(
+            manager.register("tenant-a", "wrong-filter", &status, FhirVersion::default()),
+            Err(SubscriptionError::InvalidFilter { .. })
+        ));
+    }
+
+    #[test]
     fn test_register_unsupported_channel() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = build_subscription_json(
@@ -1433,7 +1503,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_register_rest_hook_missing_endpoint() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = build_subscription_json(
@@ -1451,7 +1521,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_deregister() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1468,7 +1538,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_active_subscriptions_for_topic() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1494,7 +1564,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_status_transitions() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1528,7 +1598,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_increment_event_count() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1546,7 +1616,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_record_and_reset_failures() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1564,7 +1634,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_tenant_isolation() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("tenant-a");
+        registry.add_topic(
+            "tenant-b",
+            registry
+                .get_topic("tenant-a", "http://example.org/topic/encounter-start")
+                .unwrap(),
+        );
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = default_subscription_json();
@@ -1587,7 +1663,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_register_with_filter_by() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         #[cfg(feature = "R4")]
@@ -1651,7 +1727,7 @@ pub(crate) mod tests {
     #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
     #[test]
     fn test_register_with_native_filter_by_comparator() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         let resource = json!({
@@ -1680,7 +1756,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_register_with_invalid_filter() {
-        let registry = create_test_registry();
+        let registry = create_test_registry("t1");
         let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
 
         #[cfg(feature = "R4")]
@@ -1753,7 +1829,7 @@ pub(crate) mod tests {
         failures: u32,
     ) -> SubscriptionManager {
         let manager =
-            SubscriptionManager::new(create_test_registry(), vec!["rest-hook".to_string()]);
+            SubscriptionManager::new(create_test_registry("t1"), vec!["rest-hook".to_string()]);
         manager
             .register(
                 "t1",
@@ -1867,7 +1943,7 @@ pub(crate) mod tests {
     #[test]
     fn test_first_registration_starts_at_zero() {
         let manager =
-            SubscriptionManager::new(create_test_registry(), vec!["rest-hook".to_string()]);
+            SubscriptionManager::new(create_test_registry("t1"), vec!["rest-hook".to_string()]);
         let sub = manager
             .register(
                 "t1",
@@ -1885,6 +1961,13 @@ pub(crate) mod tests {
     #[test]
     fn test_counters_are_tenant_scoped() {
         let manager = manager_with_state(SubscriptionStatusCode::Active, 6, 3);
+        manager.topic_registry.add_topic(
+            "t2",
+            manager
+                .topic_registry
+                .get_topic("t1", "http://example.org/topic/encounter-start")
+                .unwrap(),
+        );
 
         let other = manager
             .register(
@@ -2087,6 +2170,13 @@ pub(crate) mod tests {
     fn deletion_invalidates_only_the_deleted_tenant_and_never_reuses_its_token() {
         let manager = manager_with_state(SubscriptionStatusCode::Active, 3, 1);
         let deleted = manager.get_snapshot("t1", "sub-1").unwrap();
+        manager.topic_registry.add_topic(
+            "t2",
+            manager
+                .topic_registry
+                .get_topic("t1", "http://example.org/topic/encounter-start")
+                .unwrap(),
+        );
         let other = manager
             .register_snapshot(
                 "t2",
@@ -2315,7 +2405,7 @@ pub(crate) mod tests {
     #[test]
     fn test_entered_in_error_is_registered_as_itself() {
         let manager =
-            SubscriptionManager::new(create_test_registry(), vec!["rest-hook".to_string()]);
+            SubscriptionManager::new(create_test_registry("t1"), vec!["rest-hook".to_string()]);
         let sub = manager
             .register(
                 "t1",

@@ -22,7 +22,7 @@ The `SubscriptionEngine` orchestrates all five concerns. HFS feeds committed cre
 - **Topic lifecycle parity**: topic create/update/delete now updates the in-memory registry for both native `SubscriptionTopic` and R4 backport `Basic` topic resources
 - **Status state machine**: `Requested → Active → Error → Off` with validated transitions; subscriptions activate only after a successful handshake
 - **Exponential backoff retry**: configurable initial delay, max delay, backoff factor, and max attempts before transitioning to `error` or `off`
-- **Tenant isolation**: all in-memory maps are keyed by `(tenant_id, subscription_id)` — subscriptions in different tenants never interact
+- **Tenant isolation**: topics are keyed by `(tenant_id, canonical URL)` and subscriptions by `(tenant_id, subscription_id)`. Registration and event evaluation use only the owning tenant's topics; identical canonical URLs in different tenants remain independent, including after restart.
 - **TLS enforcement**: `full-resource` payload subscriptions over non-HTTPS endpoints are rejected at dispatch time
 - **WebSocket channel**: server-managed connection registry with short-lived binding tokens; clients connect to `/ws/subscriptions/bind`, then send `bind-with-token <token>` after calling `$get-ws-binding-token`
 - **Pluggable channels**: `ChannelDispatcher` trait allows new channel types (email, FHIR messaging) to be added without touching the engine

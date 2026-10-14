@@ -529,7 +529,10 @@ async fn healthy_independence(hanging: bool, attempts: usize) {
     );
     assert_eq!(receivers[bad].1.events().len(), 1);
     if hanging {
-        assert_eq!(fixture.snapshot().active_attempts, 1);
+        // Receivers record a request before replying, so the healthy attempts
+        // may still be finishing; only the hanging one must remain.
+        wait_until(|| fixture.snapshot().active_attempts == 1).await;
+        assert!(!task.is_finished());
     } else {
         wait_until(|| fixture.snapshot().active_attempts == 0).await;
     }
@@ -841,6 +844,10 @@ async fn same_subscription_id_across_tenants_has_independent_queues() {
     let other = format!("{}-other", fixture.tenant);
     fixture
         .engine
+        .on_resource_event(event(&other, topic_resource("topic", TOPIC)))
+        .await;
+    fixture
+        .engine
         .on_resource_event(event(
             &other,
             subscription_resource("shared-id", &healthy.endpoint, "requested"),
@@ -893,7 +900,7 @@ async fn control_writes_bypass_full_data_ingress_including_basic_delete_paths() 
         fixture
             .engine
             .topic_registry()
-            .get_topic(canonical)
+            .get_topic(&fixture.tenant, canonical)
             .is_some()
     );
     fixture.write(event(
@@ -914,14 +921,17 @@ async fn control_writes_bypass_full_data_ingress_including_basic_delete_paths() 
         fixture
             .engine
             .topic_registry()
-            .get_topic(canonical)
+            .get_topic(&fixture.tenant, canonical)
             .is_none()
     );
     if version() == FhirVersion::R4 {
         let previous_url = "https://example.org/topic/previous-only";
         let previous = topic_resource("previous-only", previous_url);
         let topic = helios_subscriptions::topics::InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(&previous).unwrap().unwrap();
-        fixture.engine.topic_registry().add_topic(topic);
+        fixture
+            .engine
+            .topic_registry()
+            .add_topic(&fixture.tenant, topic);
         let mut deleted = deletion(&fixture.tenant, "Basic", "previous-only");
         deleted.previous_resource = Some(previous);
         fixture.write(deleted);
@@ -929,7 +939,7 @@ async fn control_writes_bypass_full_data_ingress_including_basic_delete_paths() 
             fixture
                 .engine
                 .topic_registry()
-                .get_topic(previous_url)
+                .get_topic(&fixture.tenant, previous_url)
                 .is_none()
         );
     }

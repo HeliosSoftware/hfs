@@ -731,17 +731,20 @@ mod tests {
             },
             "http://localhost".into(),
         );
-        engine.topic_registry().add_topic(TopicDefinition {
-            canonical_url: "topic".into(),
-            title: None,
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Patient".into(),
-                interactions: vec![ResourceEventType::Create],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![],
-            notification_shape: vec![],
-        });
+        engine.topic_registry().add_topic(
+            "tenant",
+            TopicDefinition {
+                canonical_url: "topic".into(),
+                title: None,
+                resource_triggers: vec![ResourceTrigger {
+                    resource_type: "Patient".into(),
+                    interactions: vec![ResourceEventType::Create],
+                    fhirpath_criteria: None,
+                }],
+                can_filter_by: vec![],
+                notification_shape: vec![],
+            },
+        );
         engine
     }
     fn snapshot(engine: &SubscriptionEngine, id: &str) -> SubscriptionSnapshot {
