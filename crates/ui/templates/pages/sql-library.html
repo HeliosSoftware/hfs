@@ -14,7 +14,8 @@
   list, a server-rendered "Recently used" group (#754/#755) restores the
   last-picked library on arrival and remembers up to `max_recent` more,
   with a `{id, name, meta}` snapshot so a recent still renders when the
-  search box filters it out — the page key (`rail_page`) and heading
+  search box filters it out, as long as its stored name still matches the
+  filter (#1275) — the page key (`rail_page`) and heading
   (`all_heading_key`) come from the route's `LibraryKind`, never hardcoded
   here, so SQL Queries and SQL Views never share or contaminate each
   other's record.
@@ -89,17 +90,29 @@
 <p class="notice">{{ i18n.t("vd-saved") }}</p>
 {% endif %}
 
-<div class="filter-layout filter-layout--two">
+{#- `hx-history="false"`: the rail filter replaces the URL (#1275); htmx must not
+    snapshot this page — editor text, `$sql-run` rows — into localStorage for it. -#}
+<div class="filter-layout filter-layout--two" hx-history="false">
   <aside class="filter-rail" aria-label="{{ i18n.t(title_key) }}">
     <div class="filter-rail__heading">{{ i18n.t(title_key) }}</div>
     <form class="filter-rail__search" method="get" action="{{ base_href }}" role="search">
       {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
-      {% if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
+      {% if is_new %}
+      <input type="hidden" name="lib" value="new">
+      {% else if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
       <input type="hidden" name="lib" value="{{ sel.id }}">
       {% endif %}{% endif %}
       <span class="icon">{% include "icons/search.svg" %}</span>
+      {#- Filters as the user types (#1275): htmx swaps the list and the "Recently
+          used" group from the same filtered render. Enter still submits the form
+          natively, which is also the no-JS path. -#}
       <input type="search" name="filter" value="{{ filter }}"
-             placeholder="{{ i18n.t(filter_placeholder_key) }}" aria-label="{{ i18n.t(filter_placeholder_key) }}">
+             placeholder="{{ i18n.t(filter_placeholder_key) }}" aria-label="{{ i18n.t(filter_placeholder_key) }}"
+             hx-get="{{ base_href }}" hx-include="closest form"
+             hx-trigger="input changed delay:300ms" hx-sync="this:replace"
+             hx-target="#lib-rail-list" hx-select="#lib-rail-list" hx-swap="outerHTML"
+             hx-select-oob="#lib-rail-recent,#sql-selection-filtered,#sql-empty-state"
+             hx-replace-url="true" hx-headers='{"X-Rail-Filter":"1"}'>
     </form>
     {% call recent::group("lib-rail-recent", "lib-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
@@ -159,9 +172,9 @@
         {% endif %}
       </div>
     </section>
-    {% if selection_filtered %}
-    <p class="page-head__lede" id="sql-selection-filtered">{{ i18n.t_arg("sql-rail-selection-filtered", "filter", filter.clone()) }} <a href="{{ base_href }}?lib={{ sel.id }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
-    {% endif %}
+    {#- Always emitted so the live rail filter can swap it (`hx-select-oob`);
+        `hidden` when the selection is on the filtered list (#1275). -#}
+    <p class="page-head__lede" id="sql-selection-filtered"{% if !selection_filtered %} hidden{% endif %}>{{ i18n.t_arg("sql-rail-selection-filtered", "filter", filter.clone()) }} <a href="{{ base_href }}?lib={{ sel.id }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
 
     {% if let Some(error) = save_error %}
     <p class="notice notice--warn">{{ error }}</p>
@@ -325,7 +338,8 @@
     {{ notice.render()?|safe }}
     {% endmatch %}
     {% else %}
-    <section class="card">
+    {#- `id`: the live rail filter swaps this card with the list (#1275). -#}
+    <section class="card" id="sql-empty-state">
       <div class="card-head">
         <h3>{% if collection_unverified %}{{ i18n.t("sql-library-unavailable-title") }}{% else if !rail.is_empty() %}{{ i18n.t("sql-library-select-title") }}{% else if !filter.is_empty() && rail.is_empty() %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% else %}{{ i18n.t(empty_title_key) }}{% endif %}</h3>
       </div>

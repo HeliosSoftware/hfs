@@ -4026,6 +4026,14 @@ fn call_function(
             Ok(match invocation_base {
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Collection { .. } => unreachable!(),
+                // A complex value has no string representation, so the result is
+                // empty -- except a FHIR Quantity, which converts like System.Quantity.
+                EvaluationResult::Object { map, type_info } => {
+                    match fhir_quantity_from_object(map, type_info.as_ref()) {
+                        Some(quantity) => EvaluationResult::string(quantity.to_string_value()),
+                        None => EvaluationResult::Empty,
+                    }
+                }
                 single_item => EvaluationResult::string(single_item.to_string_value()),
             })
         }
@@ -9413,4 +9421,35 @@ fn extract_potential_polymorphic_base(field_name: &str) -> String {
     }
 
     field_name.to_string()
+}
+
+/// Reads a FHIR Quantity (or a profile of it, such as Age or Duration) held as
+/// an object into a `System.Quantity`. Uses the UCUM `code` when present and
+/// the display `unit` otherwise. Any other object yields `None`.
+fn fhir_quantity_from_object(
+    map: &HashMap<String, EvaluationResult>,
+    type_info: Option<&TypeInfoResult>,
+) -> Option<EvaluationResult> {
+    const QUANTITY_TYPES: &[&str] = &[
+        "Quantity",
+        "Age",
+        "Count",
+        "Distance",
+        "Duration",
+        "SimpleQuantity",
+        "MoneyQuantity",
+    ];
+    if !type_info.is_some_and(|t| QUANTITY_TYPES.contains(&t.name.as_str())) {
+        return None;
+    }
+    let value = match map.get("value")? {
+        EvaluationResult::Decimal(d, _, _) => *d,
+        EvaluationResult::Integer(i, _, _) => Decimal::from(*i),
+        _ => return None,
+    };
+    let unit = match map.get("code").or_else(|| map.get("unit")) {
+        Some(EvaluationResult::String(u, _, _)) => u.clone(),
+        _ => "1".to_string(),
+    };
+    Some(EvaluationResult::Quantity(value, unit, None, None))
 }

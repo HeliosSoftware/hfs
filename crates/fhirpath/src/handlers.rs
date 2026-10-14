@@ -48,6 +48,11 @@ pub async fn evaluate_fhirpath(
     let fhir_version = detect_fhir_version(&resource_json);
     let fhir_resource = parse_fhir_resource(resource_json.clone(), fhir_version)?;
 
+    // A declared contextType is checked statically before any evaluation
+    if let Some(error) = check_context_type(&expression, &extracted, fhir_version) {
+        return create_error_response(&expression, &extracted, error);
+    }
+
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
     context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
@@ -249,6 +254,11 @@ async fn evaluate_fhirpath_with_version(
     // Parse resource with specific version
     let fhir_resource = parse_fhir_resource(resource_json.clone(), version)?;
     let fhir_version = version;
+
+    // A declared contextType is checked statically before any evaluation
+    if let Some(error) = check_context_type(&expression, &extracted, fhir_version) {
+        return create_error_response(&expression, &extracted, error);
+    }
 
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
@@ -965,6 +975,23 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
     }
 }
 
+/// Statically checks `expression` against the request's `contextType`, if one
+/// was sent, returning the semantic error to report.
+///
+/// A parse error is not reported here: the normal evaluation path reports it.
+fn check_context_type(
+    expression: &str,
+    extracted: &ExtractedParameters,
+    fhir_version: FhirVersion,
+) -> Option<String> {
+    let context_type = extracted.context_type.as_deref()?;
+    let parsed = crate::parse_expression(expression).ok()?;
+    let focus_types = crate::semantic_check::parse_context_type(context_type);
+    crate::semantic_check::check_semantics(&parsed, &focus_types, fhir_version)
+        .err()
+        .map(|e| format!("Semantic error: {e}"))
+}
+
 /// Create error response
 fn create_error_response(
     expression: &str,
@@ -1270,6 +1297,7 @@ mod tests {
         let params = ExtractedParameters {
             expression: Some("Patient.name".to_string()),
             context: None,
+            context_type: None,
             resource: Some(json!({"resourceType": "Patient"})),
             variables: vec![],
             validate: false,
@@ -1313,6 +1341,7 @@ mod tests {
         let params = ExtractedParameters {
             expression: Some("Patient.name".to_string()),
             context: None,
+            context_type: None,
             resource: Some(json!({"resourceType": "Patient"})),
             variables: vec![],
             validate: false,

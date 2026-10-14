@@ -10,4 +10,4 @@ pub use context::{
 pub use known_failures::{KnownFailures, Outcome, Tally};
 // pub use parser::TestInfo;  // Currently unused
 pub use parser::{find_test_groups, parse_test_xml};
-pub use runner::{parse_output_value, run_fhir_test};
+pub use runner::{TestScope, evaluate_test_expression, parse_output_value, run_fhir_test};
