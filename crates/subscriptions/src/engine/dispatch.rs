@@ -745,11 +745,15 @@ mod tests {
         engine
     }
     fn snapshot(engine: &SubscriptionEngine, id: &str) -> SubscriptionSnapshot {
-        let resource = crate::manager::tests::build_subscription_json(
-            "topic",
-            "rest-hook",
-            Some("http://localhost/hook"),
-        );
+        snapshot_with_endpoint(engine, id, "http://localhost/hook")
+    }
+    fn snapshot_with_endpoint(
+        engine: &SubscriptionEngine,
+        id: &str,
+        endpoint: &str,
+    ) -> SubscriptionSnapshot {
+        let resource =
+            crate::manager::tests::build_subscription_json("topic", "rest-hook", Some(endpoint));
         engine
             .manager()
             .register("tenant", id, &resource, FhirVersion::default())
@@ -1012,13 +1016,24 @@ mod tests {
     }
     #[tokio::test]
     async fn activation_slot_release_revisits_pending_without_another_write() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Exercise slot release with successful handshakes, independently of
+        // services or connection-refusal timing on the machine's port 80.
+        let hook = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&hook)
+            .await;
         let mut engine = engine(2);
         Arc::get_mut(&mut engine.core)
             .unwrap()
             .config
             .handshake_initial_delay = Duration::from_millis(50);
-        let a = snapshot(&engine, "a");
-        let b = snapshot(&engine, "b");
+        let a = snapshot_with_endpoint(&engine, "a", &hook.uri());
+        let b = snapshot_with_endpoint(&engine, "b", &hook.uri());
         assert!(engine.scheduler.start(&engine.core));
         let mut first = engine.scheduler.state.request_activation(a);
         settle(|| engine.dispatch_snapshot().active_activations == 1).await;
