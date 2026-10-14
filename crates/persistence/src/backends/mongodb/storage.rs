@@ -214,11 +214,13 @@ enum WriteAttemptError {
 
 impl WriteAttemptError {
     /// Classifies a driver error raised inside the attempt's session. Only the
-    /// `WriteConflict` code says another writer got to the document; a
-    /// transaction the server aborted for any other reason keeps its driver
-    /// error so [`replay_aborted_writes`] can run the attempt again.
+    /// `WriteConflict` code says another writer got to the document, and not
+    /// when its message names a rollback for eviction ([`is_eviction_rollback`]):
+    /// that one is cache pressure, with nobody having won. A transaction the
+    /// server aborted for any other reason keeps its driver error so
+    /// [`replay_aborted_writes`] can decide what to do with it.
     fn driver(context: &str, err: MongoError) -> Self {
-        if has_server_code(&err, WRITE_CONFLICT_CODE) {
+        if has_server_code(&err, WRITE_CONFLICT_CODE) && !is_eviction_rollback(&err) {
             Self::Conflict(err)
         } else {
             Self::Storage(internal_driver_error(context, err))
@@ -231,13 +233,25 @@ impl WriteAttemptError {
 /// `TransientTransactionError` without the `WriteConflict` code. A chunk
 /// migration holding the critical section of one of the write's collections
 /// (`StaleConfig`) is the common case. The aborted attempt committed nothing;
-/// another attempt must still check the original version precondition.
+/// another attempt must still check the original version precondition. An
+/// eviction rollback is not one: see [`rolled_back_for_eviction`].
 fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError> {
     kept_driver_error(err).filter(|driver| {
         driver.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
             && !driver.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
             && !has_server_code(driver, WRITE_CONFLICT_CODE)
+            && !is_eviction_rollback(driver)
     })
+}
+
+/// The driver error behind `err` when WiredTiger rolled the write's
+/// transaction back under cache pressure ([`is_eviction_rollback`]): a labelled
+/// 112 naming the eviction, or a 365. Nothing committed and no writer won, so
+/// it is not a `VersionConflict`; it is not run again either, because the same
+/// write meets the same cache, the reason a lone Bundle's eviction is not
+/// replayed (#1895). It ends as `Unavailable`, a retryable 503.
+fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
+    kept_driver_error(err).filter(|driver| is_eviction_rollback(driver))
 }
 
 /// Runs one single-resource write again, up to [`WRITE_ABORT_RETRY`], while
@@ -245,7 +259,11 @@ fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError>
 /// ([`aborted_without_conflicting_writer`]). Every attempt starts its own
 /// session, so it begins from its first read. A write that keeps being
 /// aborted ends as `Unavailable`, which the REST layer answers with a
-/// retryable 503. Any other error ends the write at once.
+/// retryable 503, as does an eviction rollback ([`rolled_back_for_eviction`])
+/// without a second attempt. Any other error ends the write at once.
+///
+/// The client-facing message names the write and nothing else; the driver
+/// error goes to the log only.
 async fn replay_aborted_writes<T, F, Fut>(what: &str, mut attempt: F) -> StorageResult<T>
 where
     F: FnMut() -> Fut,
@@ -255,15 +273,26 @@ where
     loop {
         let err = match attempt().await {
             Err(err) if aborted_without_conflicting_writer(&err).is_some() => err,
+            Err(err) if rolled_back_for_eviction(&err).is_some() => {
+                tracing::warn!(
+                    error_code = rolled_back_for_eviction(&err).and_then(driver_error_code),
+                    "mongodb rolled the {what} transaction back for eviction under cache pressure; not running it again: {err}"
+                );
+                return Err(write_unavailable(format!(
+                    "The {what} was rolled back by the database under cache pressure; retry the request"
+                )));
+            }
             outcome => return outcome,
         };
         if attempts >= WRITE_ABORT_RETRY.max_attempts {
-            return Err(StorageError::Backend(BackendError::Unavailable {
-                backend_name: "mongodb".to_string(),
-                message: format!(
-                    "{what} aborted {attempts} times by the server without a conflicting writer: {err}"
-                ),
-            }));
+            tracing::warn!(
+                attempts,
+                error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
+                "mongodb aborted the {what} transaction {attempts} times without a conflicting writer; giving up: {err}"
+            );
+            return Err(write_unavailable(format!(
+                "The {what} was aborted by the database {attempts} times without a conflicting writer; retry the request"
+            )));
         }
         let backoff = WRITE_ABORT_RETRY.backoff(attempts);
         tracing::warn!(
@@ -275,6 +304,15 @@ where
         tokio::time::sleep(backoff).await;
         attempts += 1;
     }
+}
+
+/// `Unavailable` (a retryable 503) for a single-resource write that did not
+/// commit; see [`replay_aborted_writes`].
+fn write_unavailable(message: String) -> StorageError {
+    StorageError::Backend(BackendError::Unavailable {
+        backend_name: "mongodb".to_string(),
+        message,
+    })
 }
 
 impl<E: Into<StorageError>> From<E> for WriteAttemptError {
@@ -2693,6 +2731,13 @@ impl MongoBackend {
     /// the document that filter is then built from: a `DELETE` with `If-Match`
     /// used to be evaluated above this layer against an earlier read and then
     /// deleted whatever version was current by the time it got here (#1404).
+    ///
+    /// Two retries nest here. [`replay_aborted_writes`] runs the whole thing
+    /// again when the server aborts it without a conflicting writer, and inside
+    /// each of those runs an unconditional delete that lost a race gets its one
+    /// extra attempt. So an unconditional delete makes at most
+    /// `2 * WRITE_ABORT_RETRY.max_attempts` attempts, which needs a lost race
+    /// and an abort on every run.
     async fn soft_delete(
         &self,
         tenant: &TenantContext,
@@ -8712,6 +8757,55 @@ mod transient_abort_tests {
         ));
         let other = insert_many_write_error(13388);
         assert!(!has_server_code(&other, WRITE_CONFLICT_CODE));
+    }
+
+    #[test]
+    fn an_eviction_rollback_is_neither_a_lost_race_nor_replayed() {
+        for driver in [
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+            write_conflict_write_error(EVICTION_112),
+            command_error(365, "TemporarilyUnavailable"),
+        ] {
+            let WriteAttemptError::Storage(err) =
+                WriteAttemptError::driver("Failed to update resource (session)", driver)
+            else {
+                panic!("an eviction rollback is not a lost race");
+            };
+            assert!(rolled_back_for_eviction(&err).is_some(), "{err}");
+            assert!(aborted_without_conflicting_writer(&err).is_none(), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_insert_many_write_conflict_names_its_eviction() {
+        let insert_many: mongodb::error::InsertManyError = bson::from_document(doc! {
+            "writeErrors": [{ "index": 0, "code": WRITE_CONFLICT_CODE, "errmsg": EVICTION_112 }],
+        })
+        .expect("an InsertManyError deserializes from a server reply");
+        let driver = MongoError::from(MongoErrorKind::InsertMany(insert_many));
+        assert!(is_eviction_rollback(&driver));
+        assert!(matches!(
+            WriteAttemptError::driver("Failed to insert index rows", driver),
+            WriteAttemptError::Storage(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_eviction_rollback_ends_the_write_as_unavailable_at_once() {
+        let mut attempts = 0;
+        let result: StorageResult<()> = replay_aborted_writes("update", || {
+            attempts += 1;
+            std::future::ready(Err(internal_driver_error(
+                "Failed to insert search index entries",
+                command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+            )))
+        })
+        .await;
+        assert_eq!(attempts, 1);
+        let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = result else {
+            panic!("expected Unavailable, got {result:?}");
+        };
+        assert!(!message.contains("WiredTiger"), "{message}");
     }
 
     /// A `TemporarilyUnavailable` (365) the way a write inside the transaction

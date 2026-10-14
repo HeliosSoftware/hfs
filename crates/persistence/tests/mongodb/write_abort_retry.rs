@@ -244,12 +244,12 @@ async fn an_update_that_keeps_being_aborted_gives_up_as_unavailable() {
         .await;
     let entered = fail_point.off_and_count().await;
 
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
     assert!(
-        matches!(
-            result,
-            Err(StorageError::Backend(BackendError::Unavailable { .. }))
-        ),
-        "{result:?}"
+        !message.contains("StaleConfig") && !message.contains("13388"),
+        "the client-facing message leaves the driver error to the log: {message}"
     );
     assert_eq!(
         entered, WRITE_ABORT_ATTEMPTS,
@@ -301,6 +301,58 @@ async fn a_lost_race_is_still_a_version_conflict_without_a_second_attempt() {
         "{result:?}"
     );
     assert_eq!(entered, 1, "a lost race is not run again");
+}
+
+/// A rollback for eviction under cache pressure (365 inside the transaction)
+/// is neither a lost race nor run again: the same write meets the same cache
+/// (#1895). It ends as `Unavailable` after one attempt, with nothing committed.
+#[tokio::test]
+async fn an_update_rolled_back_for_eviction_is_unavailable_without_a_second_attempt() {
+    let app = "fp-write-abort-eviction";
+    let Some((backend, tenant)) = backend_with_observation("write_abort_eviction", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        doc! {
+            "failCommands": ["update"],
+            "errorCode": 365,
+            "errorLabels": ["TransientTransactionError"],
+        },
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::Backend(BackendError::Unavailable { .. }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(entered, 1, "an eviction rollback is not run again");
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("the resource is still there");
+    assert_eq!(current.version_id(), "1", "nothing committed");
+    assert_eq!(history_rows(&backend, "obs-1").await, 1);
 }
 
 /// `PUT` of a new id, aborted on the resource insert: the create is run again.
