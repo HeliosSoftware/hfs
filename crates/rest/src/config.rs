@@ -1265,7 +1265,9 @@ pub struct ServerConfig {
 
     /// Elasticsearch index refresh interval (e.g. "1s", "200ms", "-1" to disable
     /// periodic refresh). Controls how quickly indexed documents become
-    /// searchable when no per-write refresh is requested.
+    /// searchable when no per-write refresh is requested. Set on new indices
+    /// when they are created and applied to existing indices at startup. With
+    /// `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` it is the wait of every write.
     #[arg(long, env = "HFS_ELASTICSEARCH_REFRESH_INTERVAL", default_value = "1s")]
     pub elasticsearch_refresh_interval: String,
 
