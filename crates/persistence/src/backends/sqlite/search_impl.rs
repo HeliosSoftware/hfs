@@ -2980,6 +2980,77 @@ mod tests {
         );
     }
 
+    /// #1955: a reference search (`Observation?subject=Patient/x`) seeks the
+    /// partial `idx_search_reference` index. Without `value_reference IS NOT
+    /// NULL` beside the `=`-or-`_history`-range test, the planner does not
+    /// prove the partial index's `WHERE` and reads every `subject` row of the
+    /// type instead: 28 s instead of 1 s on 454k Observations.
+    #[test]
+    fn reference_search_seeks_the_partial_reference_index() {
+        let backend = create_test_backend();
+        let subject = |values: Vec<SearchValue>| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values,
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        // Patient/p1/Observation: membership through any compartment param.
+        let mut compartment = SearchQuery::new("Observation");
+        compartment.compartment = Some(crate::types::CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        for query in [
+            subject(vec![SearchValue::eq("Patient/p1")]),
+            subject(vec![
+                SearchValue::eq("Patient/p1"),
+                SearchValue::eq("Patient/p2"),
+            ]),
+            compartment,
+        ] {
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query);
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT id FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+             AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                fragment.sql
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new("t".to_string()),
+                Box::new("Observation".to_string()),
+            ];
+            for param in &fragment.params {
+                if let SqlParam::String(value) = param {
+                    params.push(Box::new(value.clone()));
+                }
+            }
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let plan: Vec<String> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            // The seek must be bounded on the value: an equality, or a range
+            // with both ends. `value_reference>?` alone reads to the end of
+            // the parameter's rows.
+            assert!(
+                plan.iter().any(|line| line.contains("idx_search_reference")
+                    && (line.contains("value_reference=?")
+                        || (line.contains("value_reference>")
+                            && line.contains("value_reference<")))),
+                "{plan:#?}"
+            );
+        }
+    }
+
     thread_local! {
         static TRACED_SQL: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
