@@ -618,6 +618,7 @@ async fn sparse_resource_sample_resume_and_fallback_share_expiry() {
     let plan = ResourceBatchPlan {
         filters: vec![predicate("code", "absent")],
         exclusions: vec![],
+        missing: vec![],
     };
     // Cover both the ordinary cursor and opposite-direction timestamp groups.
     for (id_direction, resume) in [(1, true), (-1, false)] {
