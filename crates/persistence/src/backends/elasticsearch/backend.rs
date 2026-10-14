@@ -269,6 +269,53 @@ impl Default for ElasticsearchConfig {
     }
 }
 
+/// An Elasticsearch `index.refresh_interval`, once read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshInterval {
+    /// `-1`: no periodic refresh. A `wait_for` write then blocks until
+    /// something else refreshes the index.
+    Disabled,
+    /// Refresh every so often.
+    Every(std::time::Duration),
+}
+
+/// Reads an Elasticsearch time value such as `1s`, `500ms` or `-1`.
+///
+/// Accepts `-1` (disabled), `0`, and a whole number followed by one of
+/// `nanos`, `micros`, `ms`, `s`, `m`, `h` or `d`. Anything else, including a
+/// fractional number, is `None`. This does not validate the setting:
+/// Elasticsearch still rejects an invalid value when it is applied.
+pub fn parse_refresh_interval(value: &str) -> Option<RefreshInterval> {
+    let value = value.trim();
+    match value {
+        "-1" => return Some(RefreshInterval::Disabled),
+        "0" => return Some(RefreshInterval::Every(std::time::Duration::ZERO)),
+        _ => {}
+    }
+    let split = value.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, unit) = value.split_at(split);
+    let amount: u64 = digits.parse().ok()?;
+    let duration = match unit {
+        "nanos" => std::time::Duration::from_nanos(amount),
+        "micros" => std::time::Duration::from_micros(amount),
+        "ms" => std::time::Duration::from_millis(amount),
+        "s" => std::time::Duration::from_secs(amount),
+        "m" => std::time::Duration::from_secs(amount.checked_mul(60)?),
+        "h" => std::time::Duration::from_secs(amount.checked_mul(3_600)?),
+        "d" => std::time::Duration::from_secs(amount.checked_mul(86_400)?),
+        _ => return None,
+    };
+    Some(RefreshInterval::Every(duration))
+}
+
+impl ElasticsearchConfig {
+    /// [`Self::refresh_interval`] as a [`RefreshInterval`], or `None` when it
+    /// is not a time value this crate understands.
+    pub fn refresh_interval_parsed(&self) -> Option<RefreshInterval> {
+        parse_refresh_interval(&self.refresh_interval)
+    }
+}
+
 /// Elasticsearch backend for FHIR resource search.
 ///
 /// This backend is designed as a search-optimized secondary in the composite
@@ -533,6 +580,18 @@ impl ElasticsearchBackend {
             0 => usize::MAX,
             bytes => bytes,
         }
+    }
+
+    /// Sets the configured `refresh_interval` on every existing index under
+    /// the index prefix that has a different one, and returns how many
+    /// indices changed.
+    ///
+    /// The interval is part of the settings each index is created with, so an
+    /// index created under an earlier value keeps it until this runs. It
+    /// overwrites a value an operator set by hand on any index matching
+    /// `{index_prefix}_*`.
+    pub async fn apply_refresh_interval(&self) -> crate::error::StorageResult<usize> {
+        super::schema::apply_refresh_interval(self).await
     }
 
     /// The client's per-request timeout, as configured.
@@ -822,6 +881,26 @@ impl Backend for ElasticsearchBackend {
                 limit,
                 "could not raise the Elasticsearch nested-object limit on existing indices; \
                  resources with more nested values than an index's current limit stay unsearchable"
+            ),
+        }
+
+        // `refresh_interval` is dynamic and, like the limit above, set only at
+        // creation (#1749): an index made under another value keeps it, and
+        // with `wait_for` writes that value is what every write waits out.
+        // Not fatal either.
+        let interval = self.config().refresh_interval.as_str();
+        match self.apply_refresh_interval().await {
+            Ok(0) => {}
+            Ok(changed) => tracing::info!(
+                indices = changed,
+                refresh_interval = interval,
+                "set the Elasticsearch refresh interval on existing indices"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                refresh_interval = interval,
+                "could not set the Elasticsearch refresh interval on existing indices; \
+                 they keep the one they were created with"
             ),
         }
 
@@ -1219,6 +1298,78 @@ mod tests {
         assert_eq!(config.request_timeout_ms, 30_000);
         assert_eq!(config.bulk_max_bytes, DEFAULT_BULK_MAX_BYTES);
         assert_eq!(config.reindex_refresh, None);
+        assert_eq!(config.refresh_interval, "1s");
+    }
+
+    /// Elasticsearch time values, as the `refresh_interval` setting takes them.
+    #[test]
+    fn parse_refresh_interval_reads_elasticsearch_time_values() {
+        use std::time::Duration;
+        let every = |d| Some(RefreshInterval::Every(d));
+        assert_eq!(
+            parse_refresh_interval("-1"),
+            Some(RefreshInterval::Disabled)
+        );
+        assert_eq!(parse_refresh_interval("0"), every(Duration::ZERO));
+        assert_eq!(parse_refresh_interval("1s"), every(Duration::from_secs(1)));
+        assert_eq!(
+            parse_refresh_interval(" 30s "),
+            every(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_refresh_interval("200ms"),
+            every(Duration::from_millis(200))
+        );
+        assert_eq!(
+            parse_refresh_interval("1000ms"),
+            parse_refresh_interval("1s")
+        );
+        assert_eq!(
+            parse_refresh_interval("500micros"),
+            every(Duration::from_micros(500))
+        );
+        assert_eq!(
+            parse_refresh_interval("7nanos"),
+            every(Duration::from_nanos(7))
+        );
+        assert_eq!(
+            parse_refresh_interval("2m"),
+            every(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_refresh_interval("1h"),
+            every(Duration::from_secs(3_600))
+        );
+        assert_eq!(
+            parse_refresh_interval("1d"),
+            every(Duration::from_secs(86_400))
+        );
+
+        for bad in ["", "s", "1", "1x", "1.5s", "-2", "-1s", "1 s", "abc", "30S"] {
+            assert_eq!(parse_refresh_interval(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            parse_refresh_interval(&format!("{}d", u64::MAX)),
+            None,
+            "an overflowing amount is not a value"
+        );
+    }
+
+    #[test]
+    fn config_exposes_its_parsed_refresh_interval() {
+        let config = ElasticsearchConfig {
+            refresh_interval: "30s".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.refresh_interval_parsed(),
+            Some(RefreshInterval::Every(std::time::Duration::from_secs(30)))
+        );
+        let config = ElasticsearchConfig {
+            refresh_interval: "soon".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.refresh_interval_parsed(), None);
     }
 
     /// A rebuild follows the ordinary write policy unless it is given its
