@@ -366,11 +366,21 @@ fn wal_checkpoint(conn: &rusqlite::Connection, mode: &str) -> rusqlite::Result<(
 /// and waits at most [`CHECKPOINT_TRUNCATE_BUSY_TIMEOUT`] for readers and
 /// writers before leaving the WAL for the next file boundary.
 pub(super) fn checkpoint_wal(conn: &rusqlite::Connection) -> rusqlite::Result<CheckpointReport> {
+    checkpoint_wal_waiting(conn, CHECKPOINT_TRUNCATE_BUSY_TIMEOUT)
+}
+
+/// [`checkpoint_wal`] with the `TRUNCATE` step waiting up to `truncate_wait`
+/// for readers and writers. WAL maintenance waits longer once the WAL is far
+/// past its threshold (#2025).
+pub(super) fn checkpoint_wal_waiting(
+    conn: &rusqlite::Connection,
+    truncate_wait: StdDuration,
+) -> rusqlite::Result<CheckpointReport> {
     let started = std::time::Instant::now();
     let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
     let (_, wal_frames, passive_checkpointed) = wal_checkpoint(conn, "PASSIVE")?;
     let (truncate_busy, truncate_frames, _) = {
-        let _short = BusyTimeoutGuard::shorten(conn, CHECKPOINT_TRUNCATE_BUSY_TIMEOUT)?;
+        let _short = BusyTimeoutGuard::shorten(conn, truncate_wait)?;
         wal_checkpoint(conn, "TRUNCATE")?
     };
     Ok(CheckpointReport {

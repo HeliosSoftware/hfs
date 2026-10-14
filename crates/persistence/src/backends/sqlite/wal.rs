@@ -6,15 +6,36 @@
 //! the WAL to 36 GB. Nothing shrank it afterwards: auto-checkpoint only runs on
 //! a commit, and the file keeps its size after a reset. Every later read went
 //! through it, and every start rebuilt its index (~15 s).
+//!
+//! Under 20 concurrent transaction Bundles the WAL grows by 200–250 MB/s, so
+//! the size is checked often and cheaply (a `stat`, no pooled connection), and
+//! the `TRUNCATE` waits longer for readers and writers the further the WAL is
+//! past its threshold: that wait is the back-pressure that bounds it.
+
+use std::time::Duration;
 
 use super::SqliteBackend;
-use super::bulk_submit::checkpoint_wal;
+use super::bulk_submit::checkpoint_wal_waiting;
 use crate::error::{BackendError, StorageError, StorageResult};
 
 /// A WAL file larger than this is folded back by [`SqliteBackend::maintain_wal`].
 /// It matches the `wal_autocheckpoint` of 50,000 pages (~200 MiB), so a WAL
 /// the auto-checkpoint keeps up with is never touched.
 pub(super) const WAL_MAINTENANCE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Past this size the `TRUNCATE` waits [`HARD_TRUNCATE_WAIT`] instead of
+/// [`SOFT_TRUNCATE_WAIT`].
+pub(super) const WAL_HARD_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// How long the `TRUNCATE` of a WAL past its threshold waits for readers and
+/// writers before leaving the rest to the next pass.
+const SOFT_TRUNCATE_WAIT: Duration = Duration::from_secs(1);
+
+/// How long the `TRUNCATE` of a WAL past [`WAL_HARD_LIMIT_BYTES`], or at
+/// shutdown, waits. New writers queue behind it (their own `busy_timeout` is
+/// 30 s); readers that start once the WAL is copied read the database file and
+/// no longer hold the WAL.
+const HARD_TRUNCATE_WAIT: Duration = Duration::from_secs(10);
 
 /// What one maintenance pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,11 +51,12 @@ pub struct WalMaintenance {
 
 impl SqliteBackend {
     /// Folds the WAL back into the database and truncates the file when it has
-    /// grown past [`WAL_MAINTENANCE_BYTES`] (#2025). Meant to run periodically:
-    /// it copies passively first and waits at most a second for readers and
-    /// writers before truncating, so it never stalls the server; a busy pass
-    /// leaves the rest to the next one. `None` when nothing was due, or for an
-    /// in-memory database.
+    /// grown past [`WAL_MAINTENANCE_BYTES`] (#2025). Meant to run every few
+    /// seconds: below the threshold it only reads the file size, without a
+    /// pooled connection. Past it, it copies passively first, then truncates,
+    /// waiting at most a second for readers and writers — ten past
+    /// [`WAL_HARD_LIMIT_BYTES`]. A busy pass leaves the rest to the next one.
+    /// `None` when nothing was due, or for an in-memory database.
     pub async fn maintain_wal(&self) -> StorageResult<Option<WalMaintenance>> {
         self.maintain_wal_over(WAL_MAINTENANCE_BYTES).await
     }
@@ -49,51 +71,51 @@ impl SqliteBackend {
         &self,
         threshold: u64,
     ) -> StorageResult<Option<WalMaintenance>> {
-        if self.is_memory() {
+        let Some(wal_path) = self.wal_path().map(std::path::Path::to_path_buf) else {
+            return Ok(None);
+        };
+        let before = file_bytes(&wal_path);
+        if before == 0 || before < threshold {
             return Ok(None);
         }
-        let outcome = self
+        let wait = if threshold == 0 || before >= WAL_HARD_LIMIT_BYTES {
+            HARD_TRUNCATE_WAIT
+        } else {
+            SOFT_TRUNCATE_WAIT
+        };
+        let report = self
             .run_blocking(move |conn| {
-                let before = wal_file_bytes(conn);
-                if before == 0 || before < threshold {
-                    return Ok(None);
-                }
-                let report = checkpoint_wal(conn).map_err(|e| {
+                checkpoint_wal_waiting(conn, wait).map_err(|e| {
                     StorageError::Backend(BackendError::Internal {
                         backend_name: "sqlite".to_string(),
                         message: format!("WAL checkpoint: {e}"),
                         source: None,
                     })
-                })?;
-                Ok(Some((report, before, wal_file_bytes(conn))))
+                })
             })
             .await?;
-        Ok(outcome.map(|(report, before, after)| {
-            tracing::info!(
-                wal_file_bytes = before,
-                wal_file_bytes_after = after,
-                wal_frames = report.wal_frames,
-                passive_checkpointed = report.passive_checkpointed,
-                truncate_busy = report.truncate_busy,
-                duration_ms = report.duration.as_millis() as u64,
-                "sqlite WAL folded back into the database"
-            );
-            WalMaintenance {
-                wal_file_bytes: before,
-                wal_file_bytes_after: after,
-                truncate_busy: report.truncate_busy,
-            }
+        let after = file_bytes(&wal_path);
+        tracing::info!(
+            wal_file_bytes = before,
+            wal_file_bytes_after = after,
+            wal_frames = report.wal_frames,
+            passive_checkpointed = report.passive_checkpointed,
+            truncate_busy = report.truncate_busy,
+            truncate_wait_ms = wait.as_millis() as u64,
+            duration_ms = report.duration.as_millis() as u64,
+            "sqlite WAL folded back into the database"
+        );
+        Ok(Some(WalMaintenance {
+            wal_file_bytes: before,
+            wal_file_bytes_after: after,
+            truncate_busy: report.truncate_busy,
         }))
     }
 }
 
-/// Size of the connection's `-wal` file, 0 when there is none.
-fn wal_file_bytes(conn: &rusqlite::Connection) -> u64 {
-    conn.path()
-        .filter(|path| !path.is_empty())
-        .and_then(|path| std::fs::metadata(format!("{path}-wal")).ok())
-        .map(|meta| meta.len())
-        .unwrap_or(0)
+/// Size of a file, 0 when it does not exist.
+fn file_bytes(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -137,6 +159,46 @@ mod tests {
 
         // Nothing left to do: the next pass is a no-op.
         assert_eq!(backend.maintain_wal_over(1).await.unwrap(), None);
+    }
+
+    /// A reader holding a WAL snapshot makes the pass give up after its wait,
+    /// without hanging; the next pass, once the reader is done, truncates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_in_the_wal_defers_truncation_to_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = backend_with_writes(dir.path()).await;
+        let reader = rusqlite::Connection::open(dir.path().join("wal.db")).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
+            .unwrap();
+        // A write after the reader's snapshot, so the WAL holds frames it
+        // still needs.
+        let tenant = TenantContext::new(TenantId::new("t"), TenantPermissions::full_access());
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "late" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let busy = backend.maintain_wal_over(1).await.unwrap().expect("due");
+        assert!(busy.truncate_busy);
+        assert!(busy.wal_file_bytes_after > 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        reader.execute_batch("COMMIT").unwrap();
+        let done = backend.maintain_wal_over(1).await.unwrap().expect("due");
+        assert!(!done.truncate_busy);
+        assert_eq!(done.wal_file_bytes_after, 0);
     }
 
     #[tokio::test]

@@ -2154,12 +2154,15 @@ where
 /// serving the stale cache; the next tick retries.
 #[cfg(feature = "sqlite")]
 /// Keeps the SQLite WAL bounded on every write path, not only `$bulk-submit`
-/// (#2025): every 30 s a WAL file past the threshold is folded back into the
-/// database and truncated. A pass that finds readers or writers in the way
-/// gives up after a second and the next one retries.
+/// (#2025). Every 2 s the -wal file's size is read (a `stat`, no pooled
+/// connection); past the threshold it is folded back into the database and
+/// truncated. Under 20 concurrent transaction Bundles the WAL grows by
+/// 200–250 MB/s, so a slower check lets it reach gigabytes between passes. A
+/// pass that finds readers or writers in the way gives up after its wait and
+/// the next one retries.
 fn spawn_sqlite_wal_maintenance(backend: Arc<SqliteBackend>) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;

@@ -133,6 +133,9 @@ pub struct SqliteBackend {
     pool: Pool<SqliteConnectionManager>,
     config: SqliteBackendConfig,
     is_memory: bool,
+    /// The `-wal` file next to a file database, watched by WAL maintenance
+    /// without taking a pooled connection (#2025). `None` in memory.
+    wal_path: Option<std::path::PathBuf>,
     /// Per-tenant search parameter registries: a shared base (embedded + spec +
     /// custom) plus each tenant's stored (POSTed) overlay, built lazily.
     registries: Arc<TenantSearchRegistries>,
@@ -505,10 +508,16 @@ impl SqliteBackend {
             );
         }
 
+        let wal_path = (!is_memory).then(|| {
+            let mut wal = path.as_ref().as_os_str().to_owned();
+            wal.push("-wal");
+            std::path::PathBuf::from(wal)
+        });
         let backend = Self {
             pool,
             config,
             is_memory,
+            wal_path,
             registries,
         };
 
@@ -727,6 +736,11 @@ impl SqliteBackend {
         }
 
         Ok(())
+    }
+
+    /// The `-wal` file of a file database, `None` in memory.
+    pub(super) fn wal_path(&self) -> Option<&std::path::Path> {
+        self.wal_path.as_deref()
     }
 
     /// Returns whether this is an in-memory database.
