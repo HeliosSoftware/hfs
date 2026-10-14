@@ -381,8 +381,17 @@ async fn a_transaction_too_large_for_cache_is_not_retried() {
             return;
         }
         match result {
-            Err(TransactionError::TooLargeForCache { entries, reason }) => {
+            Err(TransactionError::TooLargeForCache {
+                entries,
+                cause,
+                reason,
+            }) => {
                 assert_eq!(entries, 2);
+                assert_eq!(
+                    cause,
+                    TooLargeForCacheCause::WriteSetTooLarge,
+                    "388 is the write-set cause, labelled or not"
+                );
                 assert!(
                     reason.contains("388"),
                     "the log-only reason keeps the driver detail: {reason}"
@@ -430,7 +439,16 @@ async fn a_commit_too_large_for_cache_is_neither_re_sent_nor_replayed() {
             return;
         }
         match result {
-            Err(TransactionError::TooLargeForCache { entries, reason }) => {
+            Err(TransactionError::TooLargeForCache {
+                cause,
+                entries,
+                reason,
+            }) => {
+                assert_eq!(
+                    cause,
+                    TooLargeForCacheCause::WriteSetTooLarge,
+                    "a commit-time 388 is the write-set cause, labelled or not"
+                );
                 assert_eq!(entries, 2);
                 assert!(
                     reason.starts_with("Commit failed: "),
@@ -884,7 +902,8 @@ const TRANSIENT_RETRYING: &str = "aborted by a transient mongodb error; retrying
 /// #1895: a Bundle that holds the whole admission room ran alone, so a
 /// cache-pressure rollback at commit (code 365) is its own write set meeting the
 /// cache and a replay would meet it again. It ends after one attempt as
-/// `TooLargeForCache`, the outcome error 388 already has, and frees the room.
+/// `TooLargeForCache`, the outcome error 388 already has, with the lone-eviction
+/// cause (#1993), and frees the room.
 #[tokio::test]
 async fn a_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
     let app = "fp-txn-lone-evict-commit";
@@ -914,8 +933,17 @@ async fn a_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
     }
 
     match result {
-        Err(TransactionError::TooLargeForCache { entries, reason }) => {
+        Err(TransactionError::TooLargeForCache {
+            entries,
+            cause,
+            reason,
+        }) => {
             assert_eq!(entries, 2);
+            assert_eq!(
+                cause,
+                TooLargeForCacheCause::LoneEviction,
+                "a lone eviction rollback is not the write-set cause"
+            );
             assert!(
                 reason.contains("365") || reason.contains("TemporarilyUnavailable"),
                 "the log-only reason keeps the driver detail: {reason}"
@@ -980,8 +1008,17 @@ async fn a_lone_bundle_rolled_back_for_eviction_on_an_entry_write_is_not_replaye
     }
 
     match result {
-        Err(TransactionError::TooLargeForCache { entries, reason }) => {
+        Err(TransactionError::TooLargeForCache {
+            entries,
+            cause,
+            reason,
+        }) => {
             assert_eq!(entries, 2);
+            assert_eq!(
+                cause,
+                TooLargeForCacheCause::LoneEviction,
+                "a lone eviction rollback is not the write-set cause"
+            );
             assert!(
                 reason.contains("365") || reason.contains("TemporarilyUnavailable"),
                 "the log-only reason keeps the driver detail: {reason}"
@@ -1110,7 +1147,10 @@ async fn a_lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_
     }
 
     match result {
-        Err(TransactionError::TooLargeForCache { entries, .. }) => assert_eq!(entries, 2),
+        Err(TransactionError::TooLargeForCache { entries, cause, .. }) => {
+            assert_eq!(entries, 2);
+            assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
+        }
         other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
     }
     assert_eq!(entered, 1, "a lone eviction rollback is not replayed");
@@ -1157,7 +1197,16 @@ async fn a_lone_deferred_bundle_whose_commit_is_too_large_for_cache_ends_at_once
     }
 
     match result {
-        Err(TransactionError::TooLargeForCache { entries, reason }) => {
+        Err(TransactionError::TooLargeForCache {
+            cause,
+            entries,
+            reason,
+        }) => {
+            assert_eq!(
+                cause,
+                TooLargeForCacheCause::WriteSetTooLarge,
+                "a lone Bundle's commit-time 388 is the write-set cause, never a lone eviction"
+            );
             assert_eq!(entries, 2);
             assert!(
                 reason.starts_with("Commit failed: "),

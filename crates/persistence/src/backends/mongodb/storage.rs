@@ -28,7 +28,7 @@ use crate::core::{
 };
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
-    StorageResult, TransactionError,
+    StorageResult, TooLargeForCacheCause, TransactionError,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
@@ -411,8 +411,16 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
 /// `entries` is the Bundle's entry count. `reason` is the raw driver detail
 /// behind a prefix that says where it happened (`Entry N processing failed: `
 /// or `Commit failed: `). It is for the log only.
+///
+/// It carries [`TooLargeForCacheCause::WriteSetTooLarge`];
+/// [`lone_eviction_failure`] carries [`TooLargeForCacheCause::LoneEviction`]
+/// (#1993).
 fn write_set_too_large_for_cache(entries: usize, reason: String) -> TransactionError {
-    TransactionError::TooLargeForCache { entries, reason }
+    TransactionError::TooLargeForCache {
+        cause: TooLargeForCacheCause::WriteSetTooLarge,
+        entries,
+        reason,
+    }
 }
 
 /// Why a bundle attempt failed, given the error entry `index` raised in a
@@ -483,11 +491,14 @@ fn ledger_attempt_error(entries: usize, err: &StorageError) -> BundleAttemptErro
 /// or `None` to replay.
 ///
 /// A Bundle that held the whole admission room ran alone: no other Bundle of
-/// this backend was open. Its cache-pressure rollback is its own write set
+/// this backend was open. Its cache-pressure rollback is mostly its own write set
 /// meeting the cache, and a replay is rolled back again at about the same entry
 /// (benchmark: 49 of 50 such replays failed again while holding the whole
-/// room). So it ends as the outcome 388 already has (#1837). A Bundle that
-/// shared the room, or a plain `WriteConflict`, is replayed as before.
+/// room). So it ends as the outcome 388 already has (#1837), with
+/// [`TooLargeForCacheCause::LoneEviction`]: the room bounds only this backend's
+/// transaction Bundles and other writes share the cache, so the client is not
+/// told that a resubmit must fail (#1993). A Bundle that shared the room, or a
+/// plain `WriteConflict`, is replayed as before.
 fn lone_eviction_failure(
     holds_whole_room: bool,
     eviction: bool,
@@ -496,6 +507,7 @@ fn lone_eviction_failure(
     reason: &str,
 ) -> Option<TransactionError> {
     (holds_whole_room && eviction).then(|| TransactionError::TooLargeForCache {
+        cause: TooLargeForCacheCause::LoneEviction,
         entries,
         reason: match entry {
             Some(index) => format!(
@@ -8937,9 +8949,11 @@ mod transient_abort_tests {
             match entry_attempt_error(6959, 7412, &err) {
                 BundleAttemptError::Failed(TransactionError::TooLargeForCache {
                     entries,
+                    cause,
                     reason,
                 }) => {
                     assert_eq!(entries, 7412);
+                    assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
                     assert!(reason.contains("388"), "{reason}");
                     assert!(reason.contains("6959"), "{reason}");
                 }
@@ -8950,7 +8964,11 @@ mod transient_abort_tests {
         let err = StorageError::from(command_error(388, "TransactionTooLargeForCache"));
         assert!(matches!(
             entry_attempt_error(0, 2, &err),
-            BundleAttemptError::Failed(TransactionError::TooLargeForCache { entries: 2, .. })
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                entries: 2,
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
+                ..
+            })
         ));
     }
 
@@ -9062,7 +9080,10 @@ mod transient_abort_tests {
         );
         assert!(matches!(
             entry_attempt_error(3, 10, &err),
-            BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. })
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
+                ..
+            })
         ));
     }
 
@@ -9075,9 +9096,11 @@ mod transient_abort_tests {
         match lone_eviction_failure(true, true, 7412, Some(6959), &reason) {
             Some(TransactionError::TooLargeForCache {
                 entries,
+                cause,
                 reason: actual,
             }) => {
                 assert_eq!(entries, 7412);
+                assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
                 assert_eq!(
                     actual,
                     format!(
@@ -9090,8 +9113,13 @@ mod transient_abort_tests {
         }
         // At commit there is no failing entry to name.
         match lone_eviction_failure(true, true, 7412, None, "Commit failed: boom") {
-            Some(TransactionError::TooLargeForCache { entries, reason }) => {
+            Some(TransactionError::TooLargeForCache {
+                entries,
+                cause,
+                reason,
+            }) => {
                 assert_eq!(entries, 7412);
+                assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
                 assert_eq!(
                     reason,
                     "Commit rolled back for eviction while the Bundle ran alone; \
@@ -9178,8 +9206,13 @@ mod transient_abort_tests {
             );
             match ledger_attempt_error(7412, &err) {
                 BundleAttemptError::Failed(TransactionError::TooLargeForCache {
-                    entries, ..
-                }) => assert_eq!(entries, 7412),
+                    entries,
+                    cause,
+                    ..
+                }) => {
+                    assert_eq!(entries, 7412);
+                    assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
+                }
                 other => panic!("expected TooLargeForCache, got {other:?}"),
             }
         }
@@ -9502,7 +9535,16 @@ mod transient_abort_tests {
         ]);
         assert_eq!(steps.len(), 1, "the commit is not re-sent");
         match stopped_with(&steps[0]) {
-            BundleAttemptError::Failed(TransactionError::TooLargeForCache { entries, reason }) => {
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                cause,
+                entries,
+                reason,
+            }) => {
+                assert_eq!(
+                    *cause,
+                    TooLargeForCacheCause::WriteSetTooLarge,
+                    "a commit-time 388 is the write-set cause"
+                );
                 assert_eq!(*entries, DRIVEN_BUNDLE_ENTRIES);
                 assert!(reason.starts_with("Commit failed: "), "{reason}");
                 assert!(reason.contains("388"), "{reason}");
