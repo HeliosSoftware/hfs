@@ -460,12 +460,36 @@ impl SyncManager {
                 let mut errors = 0;
                 let mut last_error = None;
                 let mut failed_resource_ids = Vec::new();
+                // Set once a resource retried on its own failed because the
+                // backend is unavailable. A cluster that stopped answering
+                // makes every further retry wait out the request timeout
+                // `max_retries + 1` times, serially: a batch of N would block
+                // for N x (max_retries + 1) timeouts. The rest of the batch is
+                // recorded as failed instead, for the repair task to re-sync
+                // (#1749).
+                let mut backend_unavailable = false;
                 for ((resource_id, content), result) in resources.iter().zip(results) {
                     let Err(batch_error) = result else {
                         synced += 1;
                         recorder.resource_sync_succeeded(key(resource_id)).await;
                         continue;
                     };
+                    if backend_unavailable {
+                        errors += 1;
+                        recorder
+                            .resource_sync_failed(
+                                key(resource_id),
+                                SyncOperation::Create,
+                                content.pointer("/meta/versionId").and_then(|v| v.as_str()),
+                                &batch_error,
+                                // Only the batch attempt: no single retry was made.
+                                1,
+                            )
+                            .await;
+                        last_error = Some(batch_error.to_string());
+                        failed_resource_ids.push(resource_id.clone());
+                        continue;
+                    }
                     warn!(
                         backend_id = %backend_id,
                         resource_type = %resource_type,
@@ -487,6 +511,17 @@ impl SyncManager {
                             recorder.resource_sync_succeeded(key(resource_id)).await;
                         }
                         Err(e) => {
+                            if matches!(
+                                e,
+                                StorageError::Backend(BackendError::Unavailable { .. })
+                            ) {
+                                warn!(
+                                    backend_id = %backend_id,
+                                    resource_type = %resource_type,
+                                    "Backend unavailable; not retrying the rest of the batch one by one"
+                                );
+                                backend_unavailable = true;
+                            }
                             errors += 1;
                             recorder
                                 .resource_sync_failed(
