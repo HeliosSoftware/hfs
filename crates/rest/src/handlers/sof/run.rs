@@ -1520,7 +1520,8 @@ fn build_filters(
     })
 }
 
-/// Maps a `SofError` to a `RestError`, returning 422 for uncompilable views.
+/// Maps a `SofError` to a `RestError`, returning 422 for uncompilable views and
+/// 503 when the store is unavailable.
 pub(crate) fn map_sof_error_to_rest(e: SofError) -> RestError {
     match e {
         SofError::Uncompilable { reason }
@@ -1529,6 +1530,10 @@ pub(crate) fn map_sof_error_to_rest(e: SofError) -> RestError {
         SofError::Cancelled => RestError::InternalError {
             message: "View execution was cancelled".to_string(),
         },
+        SofError::Unavailable(message) => {
+            warn!(error = %message, "SofRunner storage unavailable");
+            RestError::ServiceUnavailable { message }
+        }
         other => {
             warn!(error = %other, "SofRunner error");
             RestError::InternalError {
@@ -2058,6 +2063,45 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A store that is down, throttling or unable to read an object after
+    /// retries answers 503 with `Retry-After`, not 500 (#2048).
+    #[test]
+    fn an_unavailable_store_is_a_503() {
+        let rest = map_sof_error_to_rest(SofError::Unavailable(
+            "backend unavailable: s3: failed to read object body after 3 attempts".to_string(),
+        ));
+        assert!(
+            matches!(rest, RestError::ServiceUnavailable { .. }),
+            "got {rest:?}"
+        );
+        assert_eq!(rest.client_response().0, StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = rest.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a 503 must carry Retry-After"
+        );
+    }
+
+    /// Only an unavailable store is a 503: other storage and backend failures
+    /// are still server faults.
+    #[test]
+    fn other_storage_errors_stay_500() {
+        for error in [
+            SofError::Storage("x".to_string()),
+            SofError::Backend("x".to_string()),
+        ] {
+            let rest = map_sof_error_to_rest(error);
+            assert!(
+                matches!(rest, RestError::InternalError { .. }),
+                "got {rest:?}"
+            );
+        }
     }
 
     #[tokio::test]

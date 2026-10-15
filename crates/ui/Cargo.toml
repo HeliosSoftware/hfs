@@ -16,11 +16,20 @@ keywords = ["helios-software", "fhir", "ui", "htmx"]
 # helios-sof (#753 ticket 03, ViewDefinition lint) forwards the same way: its
 # own R4/R4B/R5/R6 features gate the rest of that crate, even though
 # `lint::lint_view_definition` itself is FHIR-version-agnostic (RF5).
+#
+# This crate's version features must equal the set helios-fhir is unified to,
+# because the total `FhirVersion` matches gate each arm on THIS crate's
+# features: `capability::docs_version`, `compartments::provider_type_names` and
+# `lookup::supports_group_name_search`. A variant switched on by another crate
+# has no arm and fails with E0004 (#2051; same class as #356 and #1367).
+# Each feature therefore forwards `helios-persistence/<V>` too, and R5/R6 enable
+# this crate's `R4B`, because helios-persistence/R5|R6 -> helios-audit/R5|R6 ->
+# helios-fhir/R4B (the BALP baseline), mirroring helios-audit's own R5/R6.
 default = ["R4"]
-R4 = ["helios-fhir/R4", "helios-fhir-validator/R4", "helios-sof/R4"]
-R4B = ["helios-fhir/R4B", "helios-fhir-validator/R4B", "helios-sof/R4B"]
-R5 = ["helios-fhir/R5", "helios-fhir-validator/R5", "helios-sof/R5"]
-R6 = ["helios-fhir/R6", "helios-fhir-validator/R6", "helios-sof/R6"]
+R4 = ["helios-fhir/R4", "helios-fhir-validator/R4", "helios-sof/R4", "helios-persistence/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhir-validator/R4B", "helios-sof/R4B", "helios-persistence/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhir-validator/R5", "helios-sof/R5", "helios-persistence/R5", "R4B"]
+R6 = ["helios-fhir/R6", "helios-fhir-validator/R6", "helios-sof/R6", "helios-persistence/R6", "R4B"]
 
 [dependencies]
 # Read paths into the rest of the workspace: the SearchParameter spec loader
@@ -153,8 +162,10 @@ helios-observability = { path = "../observability", version = "0.2.4" }
 
 # Read path for the tenant-maintenance page: the `ResourceStorage` tenant
 # registry (list/register/deregister) + per-tenant resource counts. The UI
-# depends on the rest of the server, never the reverse.
-helios-persistence = { path = "../persistence", version = "0.2.4", default-features = false, features = ["R4"] }
+# depends on the rest of the server, never the reverse. The FHIR version
+# features above forward to it: a pinned `R4` here switched helios-fhir/R4 on in
+# every build with the UI, including R5-only and R4B-only builds (#2051).
+helios-persistence = { path = "../persistence", version = "0.2.4", default-features = false }
 
 
 [dev-dependencies]
