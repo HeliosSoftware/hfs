@@ -3711,6 +3711,7 @@ dependencies = [
  "http-body-util",
  "jsonpath-rust",
  "jsonwebtoken",
+ "libc",
  "mime",
  "p256 0.13.2",
  "p384",

@@ -40,6 +40,13 @@
   `hx-include` — alongside the rest of the document; the SQL Export builder
   passes nothing (its fields already live inside their own `<form>`), so
   this is the one caller whose behavior does not change.
+
+  The `{prefix}:{name}-error` span must stay unconditional: rendered hidden
+  even when there is no error, because `sql-export-form.js` finds it inside
+  the `.field` to show its "This value is required." message when a missing
+  value blocks the submit (#2049). The control's `aria-describedby` is
+  server-rendered only alongside an actual error, so the script cannot
+  reach the span through that attribute on a fresh page.
 -->
 {% macro fields(prefix, params, form="") %}
 <div class="param-grid">

@@ -44,13 +44,13 @@
 //! flattened relation.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::Stream;
 use helios_persistence::core::search::SearchProvider;
-use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
+use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
@@ -1150,7 +1150,10 @@ pub(crate) struct ExecLimits {
 /// error, a backend statement timeout, or a lost connection while streaming
 /// a leaf ViewDefinition's rows — never that the Library or its
 /// ViewDefinitions were malformed; callers must not treat it as a client
-/// error.
+/// error. When the store reports itself unavailable ([`SofError::Unavailable`],
+/// from `run_view` or from a row), the error is instead
+/// [`SqlQueryError::SourceUnavailable`], which the REST layer answers with
+/// `503` (#2048).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan(
     mut engine: InMemorySqlEngine,
@@ -1178,6 +1181,15 @@ pub(crate) async fn execute_plan(
                 let row_stream = match runner.run_view(tenant, view.clone(), filters.clone()).await
                 {
                     Ok(s) => s,
+                    Err(SofError::Unavailable(message)) => {
+                        warn!(
+                            table = %internal_name,
+                            view = %view_label,
+                            error = %message,
+                            "SQL query dependency unavailable"
+                        );
+                        return Err(SqlQueryError::SourceUnavailable(message));
+                    }
                     Err(e) => {
                         warn!(
                             table = %internal_name,
@@ -1190,7 +1202,11 @@ pub(crate) async fn execute_plan(
                         )));
                     }
                 };
-                let row_stream = adapt_row_stream(row_stream);
+                // The engine sees row errors as bare strings; this keeps the
+                // first one the store reported as unavailable, so the engine's
+                // `SourceStream` can be turned back into a 503 below (#2048).
+                let unavailable = Arc::new(OnceLock::new());
+                let row_stream = adapt_row_stream(row_stream, Arc::clone(&unavailable));
                 let (returned_engine, inserted) = match engine
                     .insert_rows(
                         internal_name,
@@ -1218,6 +1234,12 @@ pub(crate) async fn execute_plan(
                                     max,
                                 }
                             }
+                            // The row stream stopped on a store that reported
+                            // itself unavailable: transient, not a server bug.
+                            SqlQueryError::SourceStream(text) => match unavailable.get() {
+                                Some(message) => SqlQueryError::SourceUnavailable(message.clone()),
+                                None => SqlQueryError::SourceStream(text),
+                            },
                             other => other,
                         };
                         warn!(
@@ -1509,9 +1531,26 @@ async fn run_select_with_timeout(
 /// Converts a `RowStream<Result<Value, SofError>>` into a
 /// `Stream<Item = Result<Value, String>>` for the engine (it doesn't know the
 /// persistence crate's error type).
-fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, String>> + Send {
+///
+/// The conversion loses the error's kind, so the first [`SofError::Unavailable`]
+/// the stream yields is also recorded in `unavailable`: the caller reads it
+/// after the engine fails with `SourceStream`, to tell a store outage from a
+/// server fault (#2048). The engine stops at the first row error, so that
+/// error is the one it reports.
+fn adapt_row_stream(
+    stream: RowStream,
+    unavailable: Arc<OnceLock<String>>,
+) -> impl Stream<Item = Result<Value, String>> + Send {
     use futures::StreamExt;
-    stream.map(|r| r.map_err(|e| e.to_string()))
+    stream.map(move |r| {
+        r.map_err(|e| {
+            if let SofError::Unavailable(message) = &e {
+                // Only the first is kept: a later `set` finds the slot full.
+                let _ = unavailable.set(message.clone());
+            }
+            e.to_string()
+        })
+    })
 }
 
 // ============================================================================
@@ -1520,7 +1559,6 @@ fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, Strin
 
 #[cfg(test)]
 mod tests {
-    use helios_persistence::core::sof_runner::SofError;
     use helios_persistence::tenant::{TenantId, TenantPermissions};
 
     use helios_sof::sqlquery::engine::ColumnFhirType;
@@ -2347,6 +2385,121 @@ mod tests {
             .await
             .expect("a dependency of exactly the cap must run");
         assert_eq!(result.rows.len(), 3);
+    }
+
+    /// How a [`FailingStoreRunner`]'s store fails.
+    #[derive(Clone, Copy)]
+    enum StoreFailure {
+        /// `run_view` itself returns `SofError::Unavailable`.
+        UnavailableAtStart,
+        /// One good row, then an `Unavailable` row error.
+        UnavailableMidStream,
+        /// One good row, then a `Storage` row error (a server fault).
+        StorageMidStream,
+        /// `run_view` itself returns `SofError::Backend` (a server fault).
+        BackendAtStart,
+    }
+
+    /// A `SofRunner` whose store fails the way `failure` says.
+    struct FailingStoreRunner {
+        failure: StoreFailure,
+    }
+
+    const UNAVAILABLE_TEXT: &str = "failed to read object body after 3 attempts: connection reset";
+
+    #[async_trait]
+    impl SofRunner for FailingStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let rows = match self.failure {
+                StoreFailure::UnavailableAtStart => {
+                    return Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string()));
+                }
+                StoreFailure::BackendAtStart => {
+                    return Err(SofError::Backend("connection refused".to_string()));
+                }
+                StoreFailure::UnavailableMidStream => vec![
+                    Ok(json!({"id": "p0"})),
+                    Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string())),
+                ],
+                StoreFailure::StorageMidStream => vec![
+                    Ok(json!({"id": "p0"})),
+                    Err(SofError::Storage("bucket unreachable".to_string())),
+                ],
+            };
+            Ok(Box::pin(futures::stream::iter(rows)))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "failing-store-test-runner"
+        }
+    }
+
+    async fn run_plan_over_failing_store(failure: StoreFailure) -> SqlQueryError {
+        let runner: Arc<dyn SofRunner> = Arc::new(FailingStoreRunner { failure });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            &plan,
+            "SELECT * FROM obs",
+            &[],
+            limits(1000, 1000),
+        )
+        .await
+        .err()
+        .expect("a failing store must fail the plan")
+    }
+
+    /// #2048: a store that is unavailable keeps that fact through the plan, so
+    /// a SQL Query run answers 503 like a ViewDefinition run, whether the store
+    /// fails when the dependency starts or partway through its rows.
+    #[tokio::test]
+    async fn an_unavailable_store_is_a_503() {
+        for failure in [
+            StoreFailure::UnavailableAtStart,
+            StoreFailure::UnavailableMidStream,
+        ] {
+            let err = run_plan_over_failing_store(failure).await;
+            let SqlQueryError::SourceUnavailable(message) = &err else {
+                panic!("expected SourceUnavailable, got {err:?}");
+            };
+            assert_eq!(message, UNAVAILABLE_TEXT);
+
+            let rest = sqlquery_err_to_rest(err);
+            assert!(
+                matches!(rest, RestError::ServiceUnavailable { .. }),
+                "got {rest:?}"
+            );
+            assert_eq!(
+                rest.client_response().0,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
+
+    /// Only an unavailable store is a 503: any other source failure is still a
+    /// server fault (500), at the start of the dependency or partway through.
+    #[tokio::test]
+    async fn other_store_failures_stay_source_stream() {
+        for failure in [StoreFailure::StorageMidStream, StoreFailure::BackendAtStart] {
+            let err = run_plan_over_failing_store(failure).await;
+            assert!(
+                matches!(err, SqlQueryError::SourceStream(_)),
+                "expected SourceStream, got {err:?}"
+            );
+            assert_eq!(
+                sqlquery_err_to_rest(err).client_response().0,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
     }
 
     /// A node reached under two labels is named by the alphabetically first,

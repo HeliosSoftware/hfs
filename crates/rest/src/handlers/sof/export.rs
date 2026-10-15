@@ -985,11 +985,15 @@ where
             .into_response()),
 
         // Failed export → the failure's own status (the 4xx `$sql-run` gives
-        // a request's fault such as a row limit, 500 for a server fault) with
-        // an OperationOutcome body explaining it. `issue[0].expression` names
-        // the subject that failed by its output name (#1800); that is the
-        // client's own input, so it is there even when a server fault's
-        // `diagnostics` are generic.
+        // a request's fault such as a row limit, 503 when the store was
+        // unavailable, 500 for a server fault) with an OperationOutcome body
+        // explaining it. The 503 is the job's, not a transient answer to this
+        // request: it is stored, so it carries no `Retry-After` and re-reading
+        // the result URL returns it again; its `diagnostics` tell the client to
+        // submit the export again, in fixed wording like a server fault's.
+        // `issue[0].expression` names the subject that failed by its output
+        // name (#1800); that is the client's own input, so it is there even
+        // when the `diagnostics` are generic.
         Some(JobStatus::Failed {
             message,
             status,

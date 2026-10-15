@@ -592,6 +592,15 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         SqlQueryError::SourceStream(msg) => RestError::InternalError {
             message: format!("dependency source failed: {msg}"),
         },
+        // The store could not serve a dependency (an object read out of
+        // attempts, a dropped connection, throttling): transient, so a 503
+        // with `Retry-After` rather than a 500 (#2048).
+        SqlQueryError::SourceUnavailable(msg) => {
+            warn!(error = %msg, "dependency source unavailable during $sql-run");
+            RestError::ServiceUnavailable {
+                message: format!("dependency source unavailable: {msg}"),
+            }
+        }
     }
 }
 
@@ -621,6 +630,36 @@ mod tests {
         assert_eq!(
             row_cap.client_response().0,
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// #2048: a dependency the store could not serve (an object read that ran
+    /// out of attempts) is a retryable 503 with `Retry-After`, not a 500.
+    #[test]
+    fn an_unavailable_store_is_a_503() {
+        let rest = sqlquery_err_to_rest(SqlQueryError::SourceUnavailable(
+            "dependency failed to materialize: failed to read object body after 3 attempts".into(),
+        ));
+        assert!(
+            matches!(rest, RestError::ServiceUnavailable { .. }),
+            "got {rest:?}"
+        );
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert!(
+            message.contains("after 3 attempts"),
+            "the client needs the reason: {message}"
+        );
+
+        let response =
+            sqlquery_err_to_rest(SqlQueryError::SourceUnavailable("x".into())).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a 503 must carry Retry-After"
         );
     }
 
