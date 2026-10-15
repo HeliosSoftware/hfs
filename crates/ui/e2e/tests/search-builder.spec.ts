@@ -4,6 +4,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
 import { createResource, waitSearchable, deleteResources } from "../pages/api";
 import { seedSavedQuery } from "../pages/saved-search";
+import type { Route } from "@playwright/test";
 
 function catalogHtml(
   params: Array<{ code: string; type: string; targets?: string[] }>,
@@ -3223,3 +3224,206 @@ test("issue1772 visual builder and parameter suggestions work when settings are 
   await search.results.waitShown();
   await expect(search.results.error).toBeHidden();
 });
+
+function previousResultsBundle(ids: string[], total = ids.length, link: Array<{ relation: string; url: string }> = []) {
+  return {
+    resourceType: "Bundle", type: "searchset", total, link,
+    entry: ids.map(id => ({ resource: { resourceType: "Patient", id, name: [{ family: id }] } })),
+  };
+}
+
+for (const workspace of ["Resources", "Search"] as const) {
+  test(`issue2078 ${workspace} labels retained results when Recent, Saved or edits change the candidate`, async ({ page, request, resources, search }) => {
+    const prefix = `Issue2078${workspace}${Date.now()}`;
+    const familyA = `${prefix}A`, familyB = `${prefix}B`;
+    const queryA = `/Patient?family=${familyA}&_summary=true`;
+    const queryB = `/Patient?family=${familyB}`;
+    const saved = await seedSavedQuery(request, "Patient", `Saved2078 ${prefix}`, `family=${familyB}`);
+    test.skip(!saved, "no per-user settings store on this backend");
+    let runs = 0;
+    await page.route("**/Patient?*", async route => {
+      const family = new URL(route.request().url()).searchParams.get("family");
+      if (family !== familyA && family !== familyB) return route.continue();
+      runs++;
+      const ids = family === familyA ? [`${prefix}-a1`, `${prefix}-a2`, `${prefix}-a3`] : [`${prefix}-b`];
+      await route.fulfill({ contentType: "application/fhir+json", body: JSON.stringify(previousResultsBundle(ids)) });
+    });
+    const active = workspace === "Resources" ? resources : search;
+    async function waitRecent(query: string) {
+      await expect.poll(async () => {
+        const document = await (await request.get("/_user/settings")).json();
+        return document.recentSearches?.some((entry: { query: string }) => entry.query === query);
+      }).toBe(true);
+    }
+    async function loadRecent(query: string) {
+      await active.builder.recentToggle.click();
+      await active.builder.recentPanel.getByRole("button", { name: `GET ${query}`, exact: true }).click();
+      await expect(active.builder.url).toHaveValue(`GET ${query}`);
+    }
+    try {
+      if (workspace === "Resources") await resources.goto("Patient");
+      else await search.gotoBuilder("Patient");
+      const mode = page.locator("[data-mode-btn=builder]");
+      if (await mode.count()) await mode.click();
+      for (const [query, count] of [[queryA, 3], [queryB, 1]] as const) {
+        await active.builder.run(query);
+        await active.results.waitDone();
+        await expect(active.results.rows).toHaveCount(count);
+        await waitRecent(query);
+      }
+      await expect(active.results.meta).toHaveText(/^1 results/);
+      await expect(active.results.previous).toBeHidden();
+      const retainedB = await active.results.visibleState();
+
+      // Loading the query already represented by the table is still load-only.
+      await loadRecent(queryB);
+      await expect(active.results.previous).toBeHidden();
+      expect(runs).toBe(2);
+      await loadRecent(queryA);
+      expect(await active.results.visibleState()).toEqual(retainedB);
+      expect(runs, "Recent waits for an explicit Run").toBe(2);
+      await expect.soft(active.results.previous).toBeVisible();
+
+      await active.builder.runButton.click();
+      await active.results.waitDone();
+      await expect(active.results.rows).toHaveCount(3);
+      await expect(active.results.meta).toHaveText(/^3 results/);
+      await expect(active.results.previous).toBeHidden();
+      expect(runs).toBe(3);
+      await waitRecent(queryA);
+      const retainedA = await active.results.visibleState();
+
+      await active.builder.recentToggle.click();
+      await active.builder.recentPanel.getByRole("button", { name: saved!.entry.name, exact: true }).click();
+      await expect(active.builder.url).toHaveValue(`GET ${queryB}`);
+      await expect.soft(active.results.previous).toBeVisible();
+      await active.builder.setUrl(queryA);
+      await expect(active.results.previous).toBeHidden();
+      // Typing changes the candidate before blur or row hydration.
+      await active.builder.url.fill(queryB);
+      await expect.soft(active.results.previous).toBeVisible();
+      await active.builder.setUrl(queryA);
+      const value = active.builder.conditionRows.first().locator(".builder-row__value");
+      await value.fill(familyB);
+      await expect.soft(active.results.previous).toBeVisible();
+      await value.fill(familyA);
+      await expect(active.results.previous).toBeHidden();
+      expect(await active.results.visibleState()).toEqual(retainedA);
+      expect(runs, "Saved and editing preserve load-only behavior").toBe(3);
+    } finally {
+      await saved?.remove();
+    }
+  });
+
+  test(`issue2078 ${workspace} labels a successful response when its candidate was edited while waiting`, async ({ page, resources, search }) => {
+    let held: Route | undefined;
+    await page.route("**/Patient?*", route => {
+      if (new URL(route.request().url()).searchParams.get("family") !== "Issue2078Held") return route.continue();
+      held = route;
+    });
+    const active = workspace === "Resources" ? resources : search;
+    if (workspace === "Resources") await resources.goto("Patient");
+    else await search.gotoBuilder("Patient");
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    await active.builder.run("Patient?family=Issue2078Held");
+    await expect.poll(() => !!held).toBe(true);
+    await active.builder.setUrl("Patient?family=Issue2078Candidate");
+    await held!.fulfill({ contentType: "application/fhir+json", body: JSON.stringify(previousResultsBundle(["issue2078-held"])) });
+    await active.results.waitDone();
+    await expect(active.results.rows).toContainText(["issue2078-held"]);
+    await expect.soft(active.results.previous).toBeVisible();
+    await active.builder.setUrl("GET /Patient?family=Issue2078Held");
+    await expect(active.results.previous).toBeHidden();
+  });
+
+  test(`issue2078 ${workspace} keeps failed rerun results labeled after delayed Recent persistence`, async ({ page, request, resources, search }) => {
+    const settings = await request.get("/_user/settings");
+    test.skip(settings.status() === 501, "no per-user settings store on this backend");
+    const family = `Issue2078Failed${workspace}${Date.now()}`;
+    const query = `/Patient?family=${family}`;
+    const diagnostic = "Same-query rerun failed";
+    let runs = 0, delaySettings = false;
+    let heldSettings: Route | undefined;
+    await page.route("**/_user/settings", route => {
+      const request = route.request();
+      if (!delaySettings || request.method() !== "PATCH" || !request.postDataJSON().recentSearches?.some((entry: { query: string }) => entry.query === query)) return route.continue();
+      heldSettings = route;
+    });
+    await page.route("**/Patient?*", route => {
+      if (new URL(route.request().url()).searchParams.get("family") !== family) return route.continue();
+      runs++;
+      const body = runs === 1 ? previousResultsBundle(["issue2078-retained"]) : { resourceType: "OperationOutcome", issue: [{ severity: "error", code: "exception", diagnostics: diagnostic }] };
+      return route.fulfill({ status: runs === 1 ? 200 : 502, contentType: "application/fhir+json", body: JSON.stringify(body) });
+    });
+    const active = workspace === "Resources" ? resources : search;
+    if (workspace === "Resources") await resources.goto("Patient");
+    else await search.gotoBuilder("Patient");
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    await active.builder.run(query);
+    await active.results.waitDone();
+    await expect(active.results.rows).toContainText(["issue2078-retained"]);
+    await expect(active.results.previous).toBeHidden();
+    const recent = active.builder.recentPanel.getByText(`GET ${query}`, { exact: true });
+    await expect(recent).toHaveCount(1);
+    const previousRecent = await recent.elementHandle();
+    const retained = await active.results.visibleState();
+
+    delaySettings = true;
+    await active.builder.runButton.click();
+    await active.results.waitDone();
+    await expect.poll(() => !!heldSettings).toBe(true);
+    await expect(active.results.error).toHaveText(diagnostic);
+    await expect(active.results.previous).toBeVisible();
+    await heldSettings!.continue();
+    // The old Recent button detaches when the delayed settings callback
+    // renders, so the following checks run after that refresh, not before it.
+    await page.waitForFunction(button => !button!.isConnected, previousRecent);
+    await expect.soft(active.results.previous).toBeVisible();
+    await expect(active.results.error).toBeVisible();
+    await expect(active.results.error).toHaveText(diagnostic);
+    expect(await active.results.visibleState()).toEqual(retained);
+    expect(runs).toBe(2);
+  });
+
+  test(`issue2078 ${workspace} compares an opaque page and its refresh with the logical query`, async ({ page, resources, search }) => {
+    const query = "/Patient?family=Issue2078Paging&_count=1";
+    const opaque = "/_paging/issue2078?cursor=opaque%2Fpage";
+    let pageRequests = 0;
+    await page.route("**/*", async route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === "/Patient" && url.searchParams.get("family") === "Issue2078Paging") {
+        await route.fulfill({ contentType: "application/fhir+json", body: JSON.stringify(previousResultsBundle(["issue2078-page-one"], 2, [{ relation: "next", url: opaque }])) });
+      } else if (url.pathname === "/_paging/issue2078") {
+        pageRequests++;
+        await route.fulfill({ contentType: "application/fhir+json", body: JSON.stringify(previousResultsBundle(["issue2078-page-two"], 2)) });
+      } else await route.continue();
+    });
+    const active = workspace === "Resources" ? resources : search;
+    if (workspace === "Resources") await resources.goto("Patient");
+    else await search.gotoBuilder("Patient");
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    await active.builder.run(query);
+    await active.results.waitDone();
+    await expect(active.results.previous).toBeHidden();
+    await active.results.next.click();
+    await active.results.waitDone();
+    await expect(active.results.rows).toContainText(["issue2078-page-two"]);
+    await expect(active.results.previous).toBeHidden();
+    // The GET prefix and wire-only _total do not change the logical query
+    // represented by the opaque page.
+    await active.builder.setUrl(`GET ${query}`);
+    await expect(active.results.previous).toBeHidden();
+    await active.builder.setUrl("Patient?family=Issue2078Different&_count=1");
+    await expect.soft(active.results.previous).toBeVisible();
+    await page.evaluate(() => document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: "Patient" } })));
+    await expect.poll(() => pageRequests).toBe(2);
+    await active.results.waitDone();
+    await expect(active.results.rows).toContainText(["issue2078-page-two"]);
+    await expect.soft(active.results.previous).toBeVisible();
+    await active.builder.setUrl(query);
+    await expect(active.results.previous).toBeHidden();
+  });
+}
