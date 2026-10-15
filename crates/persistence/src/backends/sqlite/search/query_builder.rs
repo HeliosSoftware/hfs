@@ -202,6 +202,24 @@ impl ParameterCondition {
         }
     }
 
+    /// The subquery whose keys are exactly the condition's matches, or `None`
+    /// when the condition is not a positive membership.
+    fn positive_subquery(&self) -> Option<&str> {
+        match self {
+            ParameterCondition::Rows(rows) => Some(&rows.sql),
+            ParameterCondition::Other(fragment) => positive_membership_subquery(&fragment.sql),
+        }
+    }
+
+    /// The values the condition binds.
+    fn into_params(self) -> Vec<SqlParam> {
+        match self {
+            ParameterCondition::Rows(fragment) | ParameterCondition::Other(fragment) => {
+                fragment.params
+            }
+        }
+    }
+
     /// How many values the condition binds.
     fn param_count(&self) -> usize {
         match self {
@@ -317,16 +335,44 @@ impl QueryBuilder {
             }
         }
 
-        // One parameter answered from its own rows is the whole query: those
-        // rows are already this tenant's and this type's, so the subquery
-        // selects exactly the keys the wrapper below would. The wrapper probes
+        // When every condition is a positive `resource_key IN (<subquery>)`,
+        // the subqueries already yield the matching keys: one is the whole
+        // query, several are their intersection. Wrapping them in `SELECT
+        // DISTINCT resource_key FROM search_index WHERE … AND (…)` probes
         // `idx_search_composite` once per key and builds a second key list,
         // which on a broad `date=le…` or `ne…` cost more than finding the
-        // keys did (#1506).
-        if let [ParameterCondition::Rows(rows)] = conditions.as_mut_slice() {
-            base.sql = std::mem::take(&mut rows.sql);
-            base.params.append(&mut rows.params);
-            return base;
+        // keys did (#1506), and re-reads every index row of every candidate —
+        // millions of probes for a broad filter on a large store (#1955).
+        // Every caller embeds the fragment as `rowid IN (…)`, which ignores
+        // duplicates.
+        if !conditions.is_empty() {
+            let subqueries: Option<Vec<&str>> = conditions
+                .iter()
+                .map(ParameterCondition::positive_subquery)
+                .collect();
+            if let Some(subqueries) = subqueries {
+                base.sql = match subqueries.as_slice() {
+                    [only] => only.to_string(),
+                    // Compound operators share one precedence and bind left
+                    // to right, so a `UNION ALL` of date ranges is nested
+                    // before it is intersected.
+                    several => several
+                        .iter()
+                        .map(|subquery| {
+                            if subquery.contains(" UNION ") {
+                                format!("SELECT * FROM ({subquery})")
+                            } else {
+                                subquery.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" INTERSECT "),
+                };
+                for condition in conditions {
+                    base.params.extend(condition.into_params());
+                }
+                return base;
+            }
         }
 
         // Combine all conditions with AND
@@ -497,7 +543,8 @@ impl QueryBuilder {
                 branches.push((
                     format!(
                         "(param_name IN ({in_list}) AND value_reference IS NOT NULL \
-                         AND (value_reference = ?{} OR value_reference LIKE ?{} || '/_history/%'))",
+                         AND value_reference >= ?{0} AND value_reference < ?{1} || '/_history0' \
+                         AND (value_reference = ?{0} OR value_reference >= ?{1} || '/_history/'))",
                         offset + 1,
                         offset + 2
                     ),
@@ -709,7 +756,8 @@ impl QueryBuilder {
                 "resource_key IN (SELECT resource_key FROM search_index \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
                  AND value_reference IS NOT NULL \
-                 AND (value_reference = ?{p1} OR value_reference LIKE ?{p2} || '/_history/%'))"
+                 AND value_reference >= ?{p1} AND value_reference < ?{p2} || '/_history0' \
+                 AND (value_reference = ?{p1} OR value_reference >= ?{p2} || '/_history/'))"
             ),
             vec![SqlParam::string(base), SqlParam::string(base)],
         ))
@@ -1400,9 +1448,52 @@ impl QueryBuilder {
     }
 }
 
+/// The subquery of a condition that is exactly `resource_key IN (<subquery>)`,
+/// or `None` for anything else: `NOT IN`, an `OR` of memberships, a bare
+/// predicate. The opening parenthesis must close at the very end of the
+/// condition; parentheses inside single-quoted SQL literals are ignored.
+fn positive_membership_subquery(condition: &str) -> Option<&str> {
+    let body = condition.strip_prefix("resource_key IN (")?;
+    let mut depth = 1usize;
+    let mut in_literal = false;
+    for (index, ch) in body.char_indices() {
+        match ch {
+            '\'' => in_literal = !in_literal,
+            '(' if !in_literal => depth += 1,
+            ')' if !in_literal => {
+                depth -= 1;
+                if depth == 0 {
+                    return (index + 1 == body.len()).then(|| &body[..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positive_membership_subquery_takes_exactly_one_membership() {
+        assert_eq!(
+            positive_membership_subquery("resource_key IN (SELECT k FROM t WHERE (a) AND b = ')')"),
+            Some("SELECT k FROM t WHERE (a) AND b = ')'")
+        );
+        assert_eq!(
+            positive_membership_subquery("resource_key NOT IN (SELECT k FROM t)"),
+            None
+        );
+        assert_eq!(
+            positive_membership_subquery(
+                "resource_key IN (SELECT k FROM t) OR resource_key IN (SELECT k FROM u)"
+            ),
+            None
+        );
+        assert_eq!(positive_membership_subquery("1 = 0"), None);
+    }
 
     #[test]
     fn test_sql_fragment() {
@@ -1685,14 +1776,31 @@ mod tests {
         }
     }
 
-    /// The wrapper stays wherever it does work: it intersects several
-    /// conditions, and it is the universe a `NOT IN` is taken from.
+    /// The wrapper stays where it does work: it is the universe a `NOT IN`
+    /// is taken from, also beside a positive filter. Positive filters alone
+    /// are their subqueries, intersected (#1955); a date's `UNION ALL` of
+    /// ranges is nested first, as compound operators bind left to right.
     #[test]
     fn other_filters_keep_the_distinct_wrapper() {
         use crate::types::SearchPrefix;
         let wrapped = "SELECT DISTINCT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND (";
         let negated = SearchQuery::new("Encounter")
             .with_parameter(date_param(SearchPrefix::Eq, Some(SearchModifier::Not)));
+        let negated_beside_positive = SearchQuery::new("Encounter")
+            .with_parameter(date_param(SearchPrefix::Le, None))
+            .with_parameter(date_param(SearchPrefix::Eq, Some(SearchModifier::Not)));
+        for (name, query) in [
+            ("not", negated),
+            ("not beside positive", negated_beside_positive),
+        ] {
+            let fragment = QueryBuilder::new("tenant1", "Encounter").build(&query);
+            assert!(
+                fragment.sql.starts_with(wrapped),
+                "{name}: {}",
+                fragment.sql
+            );
+        }
+
         let two = SearchQuery::new("Encounter")
             .with_parameter(date_param(SearchPrefix::Le, None))
             .with_parameter(date_param(SearchPrefix::Ge, None));
@@ -1708,19 +1816,31 @@ mod tests {
             params: vec!["subject".to_string()],
             reference: "Patient/p1".to_string(),
         });
-
-        for (name, query) in [
-            ("not", negated),
-            ("two", two),
-            ("_id", id),
-            ("compartment", in_compartment),
+        for (name, query, intersections) in [
+            ("two", two, 1),
+            ("_id", id, 0),
+            ("compartment", in_compartment, 1),
         ] {
             let fragment = QueryBuilder::new("tenant1", "Encounter").build(&query);
             assert!(
-                fragment.sql.starts_with(wrapped),
+                !fragment.sql.contains("DISTINCT"),
                 "{name}: {}",
                 fragment.sql
             );
+            assert_eq!(
+                fragment.sql.matches(" INTERSECT ").count(),
+                intersections,
+                "{name}: {}",
+                fragment.sql
+            );
+            for operand in fragment.sql.split(" INTERSECT ") {
+                assert!(
+                    !operand.contains(" UNION ")
+                        || (operand.starts_with("SELECT * FROM (") && operand.ends_with(')')),
+                    "{name}: {}",
+                    fragment.sql
+                );
+            }
         }
     }
 
@@ -1728,7 +1848,12 @@ mod tests {
     fn missing_parameter_bypasses_generic_value_wrapper() {
         let builder = QueryBuilder::new("tenant1", "Patient");
 
-        for (value, membership) in [("true", "NOT IN"), ("false", "IN")] {
+        // `:missing=true` keeps its `NOT IN` inside the wrapper; `:missing=false`
+        // is a positive membership, so the fragment is its subquery (#1955).
+        for (value, membership) in [
+            ("true", "resource_key NOT IN"),
+            ("false", "SELECT resource_key FROM search_index"),
+        ] {
             let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
                 name: "birthdate".to_string(),
                 param_type: SearchParamType::Date,
@@ -1741,7 +1866,7 @@ mod tests {
             let fragment = builder.build(&query);
 
             assert!(
-                fragment.sql.contains(&format!("resource_key {membership}")),
+                fragment.sql.contains(membership),
                 "{value}: {}",
                 fragment.sql
             );
@@ -2351,8 +2476,10 @@ mod tests {
         });
         let frag = builder.build_contained(&query).unwrap();
         // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
+        // The compartment test reuses its own two (#1955): the bounded
+        // reference range and the exact test inside it.
         let filter = frag.sql.split(" HAVING ").next().unwrap();
-        assert_eq!(numbered_placeholders(filter), vec![1, 2, 3, 4, 5]);
+        assert_eq!(numbered_placeholders(filter), vec![1, 2, 3, 4, 5, 4, 5]);
         assert_eq!(frag.params.len(), 3);
         let having = frag.sql.split(" HAVING ").nth(1).expect(&frag.sql);
         // Counting names would let `subject` stand in for `code`.

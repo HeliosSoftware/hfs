@@ -112,7 +112,9 @@ sqlparser = { version = "0.54", features = ["visitor"] }
 base64 = "0.22"
 
 # S3 export sink (optional — only when s3 feature is enabled)
-aws-sdk-s3 = { version = "1", optional = true }
+# Use the modern HTTPS client, as persistence and audit do. Preserve the
+# SDK's signing, HTTP 1.x and Tokio features without enabling legacy rustls.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 
 # HTTP client for terminology server integration (HTS)

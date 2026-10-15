@@ -79,5 +79,7 @@ mod storage;
 mod sync_failures;
 mod transaction;
 mod user_settings;
+mod wal;
 
 pub use backend::{SqliteBackend, SqliteBackendConfig};
+pub use wal::WalMaintenance;

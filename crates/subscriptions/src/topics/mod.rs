@@ -87,11 +87,11 @@ pub struct TopicMatch {
 
 /// Registry for subscription topics.
 ///
-/// Stores topic definitions and evaluates which topics match a given
-/// resource event.
+/// Stores topic definitions by tenant and canonical URL. Every lookup and
+/// lifecycle operation is restricted to the supplied tenant.
 pub struct InMemoryTopicRegistry {
-    /// Topics keyed by canonical URL.
-    topics: RwLock<HashMap<String, TopicDefinition>>,
+    /// Tenant catalogs, each keyed by canonical URL.
+    topics: RwLock<HashMap<String, HashMap<String, TopicDefinition>>>,
 }
 
 impl InMemoryTopicRegistry {
@@ -102,43 +102,60 @@ impl InMemoryTopicRegistry {
         }
     }
 
-    /// Registers a topic definition.
-    pub fn add_topic(&self, topic: TopicDefinition) {
+    /// Registers or replaces a topic definition in the supplied tenant.
+    pub fn add_topic(&self, tenant_id: &str, topic: TopicDefinition) {
         let mut topics = self.topics.write().unwrap();
-        topics.insert(topic.canonical_url.clone(), topic);
+        topics
+            .entry(tenant_id.to_string())
+            .or_default()
+            .insert(topic.canonical_url.clone(), topic);
     }
 
-    /// Removes a topic by canonical URL.
-    pub fn remove_topic(&self, canonical_url: &str) -> bool {
+    /// Removes a topic by canonical URL from the supplied tenant only.
+    pub fn remove_topic(&self, tenant_id: &str, canonical_url: &str) -> bool {
         let mut topics = self.topics.write().unwrap();
-        topics.remove(canonical_url).is_some()
+        let Some(catalog) = topics.get_mut(tenant_id) else {
+            return false;
+        };
+        let removed = catalog.remove(canonical_url).is_some();
+        if catalog.is_empty() {
+            topics.remove(tenant_id);
+        }
+        removed
     }
 
-    /// Returns all registered topic canonical URLs.
-    pub fn list_topics(&self) -> Vec<String> {
+    /// Returns the supplied tenant's registered topic canonical URLs.
+    pub fn list_topics(&self, tenant_id: &str) -> Vec<String> {
         let topics = self.topics.read().unwrap();
-        topics.keys().cloned().collect()
+        topics
+            .get(tenant_id)
+            .map(|catalog| catalog.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
-    /// Returns a topic definition by canonical URL.
-    pub fn get_topic(&self, canonical_url: &str) -> Option<TopicDefinition> {
+    /// Returns a topic definition from the supplied tenant by canonical URL.
+    pub fn get_topic(&self, tenant_id: &str, canonical_url: &str) -> Option<TopicDefinition> {
         let topics = self.topics.read().unwrap();
-        topics.get(canonical_url).cloned()
+        topics.get(tenant_id)?.get(canonical_url).cloned()
     }
 
     /// Evaluates which topics match a resource event.
     ///
-    /// Checks all registered topics' resource triggers against the event's
-    /// resource type and interaction type.
+    /// Checks the supplied tenant's topic triggers against the event's resource
+    /// type and interaction type.
     pub fn matching_topics(
         &self,
+        tenant_id: &str,
         resource_type: &str,
         event_type: ResourceEventType,
     ) -> Vec<TopicMatch> {
         let topics = self.topics.read().unwrap();
         let mut matches = Vec::new();
+        let Some(catalog) = topics.get(tenant_id) else {
+            return matches;
+        };
 
-        for topic in topics.values() {
+        for topic in catalog.values() {
             for trigger in &topic.resource_triggers {
                 if trigger.resource_type == resource_type
                     && trigger.interactions.contains(&event_type)
@@ -642,28 +659,99 @@ mod tests {
     #[test]
     fn test_add_and_list_topics() {
         let registry = InMemoryTopicRegistry::new();
-        assert!(registry.list_topics().is_empty());
+        assert!(registry.list_topics("t1").is_empty());
 
-        registry.add_topic(sample_encounter_topic());
-        let topics = registry.list_topics();
+        registry.add_topic("t1", sample_encounter_topic());
+        let topics = registry.list_topics("t1");
         assert_eq!(topics.len(), 1);
         assert!(topics.contains(&"http://example.org/topic/encounter-start".to_string()));
     }
 
     #[test]
+    fn tenant_catalogs_keep_shared_canonicals_independent() {
+        let registry = InMemoryTopicRegistry::new();
+        let encounter = sample_encounter_topic();
+        let shared_url = encounter.canonical_url.clone();
+        let mut observation = sample_observation_topic();
+        observation.canonical_url = shared_url.clone();
+        registry.add_topic("tenant-a", encounter);
+        registry.add_topic("tenant-b", observation);
+        registry.add_topic("tenant-b", sample_observation_topic());
+
+        assert_eq!(
+            registry
+                .get_topic("tenant-a", &shared_url)
+                .unwrap()
+                .resource_triggers[0]
+                .resource_type,
+            "Encounter"
+        );
+        assert_eq!(
+            registry
+                .get_topic("tenant-b", &shared_url)
+                .unwrap()
+                .resource_triggers[0]
+                .resource_type,
+            "Observation"
+        );
+        assert!(
+            registry
+                .get_topic("tenant-a", "http://example.org/topic/new-lab-result")
+                .is_none()
+        );
+        assert_eq!(registry.list_topics("tenant-a"), vec![shared_url.clone()]);
+        assert_eq!(registry.list_topics("tenant-b").len(), 2);
+        assert!(registry.list_topics("unknown").is_empty());
+        assert!(registry.get_topic("unknown", &shared_url).is_none());
+        assert!(
+            registry
+                .matching_topics("unknown", "Encounter", ResourceEventType::Create)
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .matching_topics("tenant-a", "Encounter", ResourceEventType::Create)
+                .len(),
+            1
+        );
+        assert!(
+            registry
+                .matching_topics("tenant-a", "Observation", ResourceEventType::Create)
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .matching_topics("tenant-b", "Observation", ResourceEventType::Create)
+                .len(),
+            2
+        );
+
+        assert!(!registry.remove_topic("unknown", &shared_url));
+        assert!(registry.remove_topic("tenant-b", &shared_url));
+        assert!(registry.get_topic("tenant-b", &shared_url).is_none());
+        assert!(registry.get_topic("tenant-a", &shared_url).is_some());
+        assert_eq!(
+            registry
+                .matching_topics("tenant-a", "Encounter", ResourceEventType::Create)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn test_get_topic() {
         let registry = InMemoryTopicRegistry::new();
-        registry.add_topic(sample_encounter_topic());
+        registry.add_topic("t1", sample_encounter_topic());
 
         let topic = registry
-            .get_topic("http://example.org/topic/encounter-start")
+            .get_topic("t1", "http://example.org/topic/encounter-start")
             .unwrap();
         assert_eq!(topic.title.unwrap(), "Encounter Start");
         assert_eq!(topic.resource_triggers.len(), 1);
 
         assert!(
             registry
-                .get_topic("http://example.org/nonexistent")
+                .get_topic("t1", "http://example.org/nonexistent")
                 .is_none()
         );
     }
@@ -671,22 +759,22 @@ mod tests {
     #[test]
     fn test_remove_topic() {
         let registry = InMemoryTopicRegistry::new();
-        registry.add_topic(sample_encounter_topic());
+        registry.add_topic("t1", sample_encounter_topic());
 
-        assert!(registry.remove_topic("http://example.org/topic/encounter-start"));
-        assert!(registry.list_topics().is_empty());
+        assert!(registry.remove_topic("t1", "http://example.org/topic/encounter-start"));
+        assert!(registry.list_topics("t1").is_empty());
 
-        assert!(!registry.remove_topic("http://example.org/nonexistent"));
+        assert!(!registry.remove_topic("t1", "http://example.org/nonexistent"));
     }
 
     #[test]
     fn test_matching_topics_by_resource_type_and_interaction() {
         let registry = InMemoryTopicRegistry::new();
-        registry.add_topic(sample_encounter_topic());
-        registry.add_topic(sample_observation_topic());
+        registry.add_topic("t1", sample_encounter_topic());
+        registry.add_topic("t1", sample_observation_topic());
 
         // Encounter create should match encounter topic.
-        let matches = registry.matching_topics("Encounter", ResourceEventType::Create);
+        let matches = registry.matching_topics("t1", "Encounter", ResourceEventType::Create);
         assert_eq!(matches.len(), 1);
         assert_eq!(
             matches[0].topic_url,
@@ -695,7 +783,7 @@ mod tests {
         assert_eq!(matches[0].focus_resource_type, "Encounter");
 
         // Observation create should match observation topic.
-        let matches = registry.matching_topics("Observation", ResourceEventType::Create);
+        let matches = registry.matching_topics("t1", "Observation", ResourceEventType::Create);
         assert_eq!(matches.len(), 1);
         assert_eq!(
             matches[0].topic_url,
@@ -703,29 +791,29 @@ mod tests {
         );
 
         // Observation update should also match.
-        let matches = registry.matching_topics("Observation", ResourceEventType::Update);
+        let matches = registry.matching_topics("t1", "Observation", ResourceEventType::Update);
         assert_eq!(matches.len(), 1);
     }
 
     #[test]
     fn test_no_match_for_wrong_resource_type() {
         let registry = InMemoryTopicRegistry::new();
-        registry.add_topic(sample_encounter_topic());
+        registry.add_topic("t1", sample_encounter_topic());
 
-        let matches = registry.matching_topics("Patient", ResourceEventType::Create);
+        let matches = registry.matching_topics("t1", "Patient", ResourceEventType::Create);
         assert!(matches.is_empty());
     }
 
     #[test]
     fn test_no_match_for_wrong_interaction() {
         let registry = InMemoryTopicRegistry::new();
-        registry.add_topic(sample_encounter_topic());
+        registry.add_topic("t1", sample_encounter_topic());
 
         // Encounter topic only triggers on create, not update or delete.
-        let matches = registry.matching_topics("Encounter", ResourceEventType::Update);
+        let matches = registry.matching_topics("t1", "Encounter", ResourceEventType::Update);
         assert!(matches.is_empty());
 
-        let matches = registry.matching_topics("Encounter", ResourceEventType::Delete);
+        let matches = registry.matching_topics("t1", "Encounter", ResourceEventType::Delete);
         assert!(matches.is_empty());
     }
 
@@ -734,20 +822,23 @@ mod tests {
         let registry = InMemoryTopicRegistry::new();
 
         // Add two topics that both trigger on Observation create.
-        registry.add_topic(sample_observation_topic());
-        registry.add_topic(TopicDefinition {
-            canonical_url: "http://example.org/topic/vital-signs".to_string(),
-            title: Some("Vital Signs".to_string()),
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Observation".to_string(),
-                interactions: vec![ResourceEventType::Create],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![],
-            notification_shape: vec![],
-        });
+        registry.add_topic("t1", sample_observation_topic());
+        registry.add_topic(
+            "t1",
+            TopicDefinition {
+                canonical_url: "http://example.org/topic/vital-signs".to_string(),
+                title: Some("Vital Signs".to_string()),
+                resource_triggers: vec![ResourceTrigger {
+                    resource_type: "Observation".to_string(),
+                    interactions: vec![ResourceEventType::Create],
+                    fhirpath_criteria: None,
+                }],
+                can_filter_by: vec![],
+                notification_shape: vec![],
+            },
+        );
 
-        let matches = registry.matching_topics("Observation", ResourceEventType::Create);
+        let matches = registry.matching_topics("t1", "Observation", ResourceEventType::Create);
         assert_eq!(matches.len(), 2);
     }
 
