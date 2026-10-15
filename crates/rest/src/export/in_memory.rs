@@ -46,16 +46,36 @@ use helios_persistence::core::sof_runner::SofError;
 use helios_persistence::tenant::TenantContext;
 
 /// Why a job failed and how its result endpoint reports it. Every worker
-/// error funnels through here: a failure that is the request's own keeps the
-/// 4xx and issue code `$sql-run` would have answered with, an unavailable
-/// store keeps its `503` and `transient` code (#2048), and everything else
-/// is a `500` whose text (backend or driver detail) goes to the job log only;
-/// the stored result is generic (see [`server_fault_message`]).
+/// error funnels through here. `message` is the detailed text the
+/// `export job failed` log line records, and `status` and `code` are what the
+/// result endpoint answers with; what the stored result says is `wording`
+/// (see [`ResultWording`]). Only a failure that is the request's own shows
+/// `message` to the client: a backend's or driver's text never reaches a
+/// stored result (#1703), and that includes the text of an unavailable store
+/// (#2048), whose job is `503` / `transient` all the same.
 #[derive(Debug)]
 struct JobFailure {
+    /// The detailed text for the job log. Also the stored message when
+    /// `wording` is [`ResultWording::Own`].
     message: String,
     status: StatusCode,
     code: &'static str,
+    wording: ResultWording,
+}
+
+/// What a failed job's stored result (and so the result endpoint and the UI)
+/// says, as opposed to the detailed text the job log gets.
+#[derive(Debug)]
+enum ResultWording {
+    /// The request's own failure: the 4xx wording `$sql-run` gives the same
+    /// failure, which names no backend detail.
+    Own,
+    /// The store was unavailable: fixed wording naming `prefix`, the subject
+    /// (the client's own input), and nothing of the backend's error, whose
+    /// text can carry hosts, bucket names or a Debug dump of a driver error.
+    UnavailableStore { prefix: String },
+    /// A fault of the server: generic wording that names the job.
+    ServerFault,
 }
 
 impl JobFailure {
@@ -64,44 +84,52 @@ impl JobFailure {
             message,
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "processing",
+            wording: ResultWording::ServerFault,
         }
     }
 
     /// The store was unavailable: transient, so the result endpoint says `503`
-    /// instead of blaming the server. The failure is terminal for this job
-    /// though, and the result URL keeps answering it, so the stored wording
-    /// tells the client to submit the export again rather than poll on.
-    fn unavailable(message: String) -> Self {
+    /// instead of blaming the server. `detail` is the backend's own text, kept
+    /// for the job log only; the stored result gets fixed wording that names
+    /// `prefix` (see [`unavailable_store_message`]).
+    fn unavailable(prefix: &str, detail: String) -> Self {
         Self {
-            message: with_resubmit_hint(message),
+            message: format!("{prefix}: {detail}"),
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "transient",
+            wording: ResultWording::UnavailableStore {
+                prefix: prefix.to_string(),
+            },
         }
     }
 
-    /// Whether the stored result shows `message` to the client: the wording of
-    /// a request's own failure or of an unavailable store carries no backend
-    /// detail, unlike a server fault's.
-    fn shows_message(&self) -> bool {
-        shows_failure_message(self.status)
+    /// The message the job stores when it is marked failed, and so the one the
+    /// result endpoint returns: the request's own wording for a client
+    /// failure, fixed wording for an unavailable store, generic wording that
+    /// names `job_id` for a server fault. Neither of the last two echoes
+    /// `self.message`, which only the job log gets.
+    fn stored_message(&self, job_id: &str) -> String {
+        match &self.wording {
+            ResultWording::Own => self.message.clone(),
+            ResultWording::UnavailableStore { prefix } => unavailable_store_message(prefix),
+            ResultWording::ServerFault => server_fault_message(job_id),
+        }
     }
 
     /// A client-attributable REST error becomes a client failure with its
-    /// own wording, and an unavailable store a `503` with its own; a server
-    /// error keeps `detail` (the REST wording hides backend detail from
-    /// clients, the job log wants it).
+    /// own wording. An unavailable store becomes a `503` and a server error a
+    /// `500`; both keep `detail` for the job log (the REST wording hides
+    /// backend detail from clients, the log wants it) and store fixed wording.
     fn from_rest(prefix: &str, err: RestError, detail: String) -> Self {
         let (status, code, message) = err.client_response();
-        if shows_failure_message(status) {
-            let message = format!("{prefix}: {message}");
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            Self::unavailable(prefix, detail)
+        } else if status.is_client_error() {
             Self {
-                message: if status == StatusCode::SERVICE_UNAVAILABLE {
-                    with_resubmit_hint(message)
-                } else {
-                    message
-                },
+                message: format!("{prefix}: {message}"),
                 status,
                 code,
+                wording: ResultWording::Own,
             }
         } else {
             Self::server(format!("{prefix}: {detail}"))
@@ -123,28 +151,27 @@ impl JobFailure {
                 message: format!("{prefix}: {message}"),
                 status,
                 code,
+                wording: ResultWording::Own,
             },
-            ExportError::Unavailable(message) => Self::unavailable(format!("{prefix}: {message}")),
+            ExportError::Unavailable(detail) => Self::unavailable(prefix, detail),
             other => Self::server(format!("{prefix}: {other}")),
         }
     }
 }
 
-/// Appended to the stored wording of a job that failed on an unavailable
-/// store. A `503` with the `transient` issue code usually means "retry this
-/// request later", but the failed job stays failed: re-reading its result URL
-/// returns the same `503` for as long as the job is kept, and only a new
-/// kick-off can succeed (#2048).
+/// The remedy a job that failed on an unavailable store states. A `503` with
+/// the `transient` issue code means the failure may clear, but the job stays
+/// failed: re-reading its result URL returns the same `503` for as long as the
+/// job is kept, so only a new kick-off can succeed (#2048).
 const RESUBMIT_HINT: &str = "the export did not complete, submit it again";
 
-fn with_resubmit_hint(message: String) -> String {
-    format!("{message}; {RESUBMIT_HINT}")
-}
-
-/// Whether a failed job with `status` stores and returns its specific
-/// wording: the request's own failures (4xx) and an unavailable store (503).
-fn shows_failure_message(status: StatusCode) -> bool {
-    status.is_client_error() || status == StatusCode::SERVICE_UNAVAILABLE
+/// What an unavailable-store job stores and the result endpoint returns: fixed
+/// wording, with the subject (`prefix`, such as `view 'x'`) which is the
+/// client's own input, and none of the store's error text. That text stays in
+/// the server log under the same job id, the way a server fault's does (#1703,
+/// see [`server_fault_message`]).
+fn unavailable_store_message(prefix: &str) -> String {
+    format!("{prefix}: the store was unavailable while the export ran; {RESUBMIT_HINT}")
 }
 
 impl From<String> for JobFailure {
@@ -543,14 +570,11 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                         status = %failure.status,
                         "export job failed"
                     );
-                    // The request's own failure, or an unavailable store,
-                    // keeps its wording; a server fault's text stays in the
-                    // log line above (#1703).
-                    let message = if failure.shows_message() {
-                        failure.message
-                    } else {
-                        server_fault_message(&jid)
-                    };
+                    // Only the request's own failure keeps its wording. The
+                    // text of an unavailable store or a server fault stays in
+                    // the log line above; the stored result gets fixed
+                    // wording instead (#1703, #2048).
+                    let message = failure.stored_message(&jid);
                     // The failure belongs to the subject in flight, which the
                     // worker recorded as `current_subject` before running it.
                     // Its output name is the client's own input, so the result
@@ -1521,7 +1545,10 @@ async fn execute_sql_query(
     .map_err(|e| {
         // A limit the request ran into, or a subject the engine refuses, is
         // the client's answer; the REST wording of a server fault hides the
-        // backend detail, so that path keeps the engine's own text.
+        // backend detail, so that path keeps the engine's own text. The same
+        // goes for an unavailable store: the job reports it as such (#2048),
+        // but with the engine's text for the job log and fixed wording for
+        // the stored result, because that text can name the backend.
         let detail = e.to_string();
         let (status, code, message) = sqlquery_err_to_rest(e).client_response();
         if status.is_client_error() {
@@ -1531,9 +1558,7 @@ async fn execute_sql_query(
                 message,
             }
         } else if status == StatusCode::SERVICE_UNAVAILABLE {
-            // An unavailable store is retryable, and its REST wording carries
-            // no backend detail, so the job reports it as such (#2048).
-            ExportError::Unavailable(message)
+            ExportError::Unavailable(detail)
         } else {
             ExportError::Runner(detail)
         }
@@ -2307,8 +2332,20 @@ mod tests {
         }
     }
 
+    /// What an unavailable store's stored message must not carry: the
+    /// backend's own text (#1703 applies to it as it does to a server fault).
+    fn assert_no_backend_text(message: &str) {
+        for leaked in [UNAVAILABLE_TEXT, "after 3 attempts", "s3"] {
+            assert!(
+                !message.contains(leaked),
+                "the stored message must not echo backend text ({leaked:?}): {message}"
+            );
+        }
+    }
+
     /// #2048: a view whose store is unavailable partway through its rows fails
-    /// the job as a retryable 503 that keeps the reason, not as a 500.
+    /// the job as a 503 that tells the client to submit it again, not as a
+    /// 500, and the stored message carries none of the backend's text (#1703).
     #[tokio::test]
     async fn an_unavailable_store_fails_a_view_job_as_a_503() {
         let controller = InMemoryController::new(
@@ -2333,19 +2370,90 @@ mod tests {
                     message.starts_with("view 'patients': "),
                     "the subject is named: {message}"
                 );
-                assert!(
-                    message.contains("after 3 attempts"),
-                    "the reason is kept: {message}"
-                );
+                assert_no_backend_text(&message);
                 assert!(
                     message.ends_with("the export did not complete, submit it again"),
                     "the remedy is stated: {message}"
                 );
+                assert_eq!(message, unavailable_store_message("view 'patients'"));
                 assert_ne!(message, server_fault_message(&job_id));
                 assert_eq!(subject.as_deref(), Some("patients"));
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// #2048: every way a job learns its store was unavailable keeps the
+    /// backend's text in the failure the job log records and stores fixed
+    /// wording instead: a view's `SofError`, a SQL Query's `ExportError`, and
+    /// the constructor they both go through.
+    #[test]
+    fn an_unavailable_store_logs_its_text_but_stores_fixed_wording() {
+        let backend_text = "s3: AccessDenied for bucket phi-exports (s3.internal:9000)";
+        let failures = [
+            (
+                "view 'v'",
+                JobFailure::from_sof("view 'v'", SofError::Unavailable(backend_text.to_string())),
+            ),
+            (
+                "query 'q'",
+                JobFailure::from_export(
+                    "query 'q'",
+                    ExportError::Unavailable(format!(
+                        "dependency source unavailable: {backend_text}"
+                    )),
+                ),
+            ),
+            (
+                "view 'u'",
+                JobFailure::unavailable("view 'u'", backend_text.to_string()),
+            ),
+        ];
+        for (prefix, failure) in failures {
+            assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(failure.code, "transient");
+            assert!(
+                failure.message.starts_with(&format!("{prefix}: ")),
+                "the job log names the subject: {}",
+                failure.message
+            );
+            assert!(
+                failure.message.contains(backend_text),
+                "the job log keeps the backend text: {}",
+                failure.message
+            );
+            let stored = failure.stored_message("job-1");
+            assert_eq!(stored, unavailable_store_message(prefix));
+            for leaked in ["AccessDenied", "phi-exports", "s3.internal"] {
+                assert!(!stored.contains(leaked), "{leaked:?} leaked: {stored}");
+            }
+        }
+    }
+
+    /// The other two kinds of failure keep their stored wording: the request's
+    /// own 4xx is shown as is, a server fault is generic.
+    #[test]
+    fn only_a_clients_own_failure_stores_its_text() {
+        let client = JobFailure::from_export(
+            "query 'q'",
+            ExportError::Client {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "processing",
+                message: "row limit exceeded".to_string(),
+            },
+        );
+        assert_eq!(
+            client.stored_message("job-1"),
+            "query 'q': row limit exceeded"
+        );
+
+        let server = JobFailure::from_sof("view 'v'", SofError::Backend("db.internal".to_string()));
+        assert_eq!(server.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(server.message.contains("db.internal"), "{}", server.message);
+        assert_eq!(
+            server.stored_message("job-1"),
+            server_fault_message("job-1")
+        );
     }
 
     /// #2048: the same for a SQL Query subject, whose dependency is read through
@@ -2407,14 +2515,12 @@ mod tests {
                     message.starts_with("query 'patient_ids': "),
                     "the subject is named: {message}"
                 );
-                assert!(
-                    message.contains("after 3 attempts"),
-                    "the reason is kept: {message}"
-                );
+                assert_no_backend_text(&message);
                 assert!(
                     message.ends_with("the export did not complete, submit it again"),
                     "the remedy is stated: {message}"
                 );
+                assert_eq!(message, unavailable_store_message("query 'patient_ids'"));
                 assert_eq!(subject.as_deref(), Some("patient_ids"));
             }
             other => panic!("expected Failed, got {other:?}"),
