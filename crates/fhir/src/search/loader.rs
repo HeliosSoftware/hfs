@@ -757,13 +757,17 @@ impl SearchParameterLoader {
 
         // SQL-on-FHIR canonical resources: `url` and `version` are not in the
         // base FHIR R4/R4B search-parameters bundle for ViewDefinition (which
-        // first appears in R5+). The SoF `$viewdefinition-run`,
-        // `$viewdefinition-export`, and `$sqlquery-run` operations resolve
-        // `viewReference`/`queryReference` canonical URLs via SearchProvider;
-        // without these embedded fallbacks the resolver returns zero matches
-        // and the capability statement's `supportsCanonicalReference: true`
-        // claim isn't truthful.
-        for rt in ["ViewDefinition", "Library"] {
+        // first appears in R5+). The SoF `$sql-run` and `$sql-export`
+        // operations resolve a subject's and every dependency's canonical URL
+        // via SearchProvider — a dependency may be a ViewDefinition, a
+        // Library, a ValueSet or a ConceptMap (terminology in SQL, #1824) —
+        // and without these embedded fallbacks a deployment without the spec
+        // bundle resolves zero matches, so the capability statement's
+        // `supportsCanonicalReference: true` claim isn't truthful. The spec
+        // bundle's own `{ValueSet,ConceptMap,Library}-{url,version}` entries
+        // share these canonical URLs and collide benignly (`DuplicateUrl`),
+        // as `Library`'s always have.
+        for rt in ["ViewDefinition", "Library", "ValueSet", "ConceptMap"] {
             params.push(
                 SearchParameterDefinition::new(
                     format!("http://hl7.org/fhir/SearchParameter/{rt}-url"),
@@ -810,10 +814,11 @@ mod tests {
         // Exact, not `<=`: an upper bound alone passes when fallbacks are
         // *lost*, which is the direction that breaks indexing. The six
         // `Resource`-level parameters below plus `url`/`version` for each of
-        // `ViewDefinition` and `Library`.
+        // `ViewDefinition`, `Library`, `ValueSet` and `ConceptMap` (the four
+        // artifact kinds a SQL Query dependency may be, #1824).
         assert_eq!(
             params.len(),
-            10,
+            14,
             "Minimal fallback set changed; update this count and the names below: {:?}",
             params.iter().map(|p| &p.code).collect::<Vec<_>>()
         );
@@ -846,6 +851,23 @@ mod tests {
                 "{code} fallback expression must be resource-relative, got {:?}",
                 def.expression
             );
+        }
+
+        for rt in ["ViewDefinition", "Library", "ValueSet", "ConceptMap"] {
+            for (code, ty) in [
+                ("url", SearchParamType::Uri),
+                ("version", SearchParamType::Token),
+            ] {
+                let def = params
+                    .iter()
+                    .find(|p| p.code == code && p.base == vec![rt.to_string()])
+                    .unwrap_or_else(|| panic!("{rt}-{code} fallback missing"));
+                assert_eq!(def.param_type, ty, "{rt}-{code}");
+                assert_eq!(
+                    def.url,
+                    format!("http://hl7.org/fhir/SearchParameter/{rt}-{code}")
+                );
+            }
         }
 
         let has_patient_specific = params

@@ -186,6 +186,11 @@ where
     );
     let subject_url = library_json.get("url").and_then(|v| v.as_str());
     let fetcher = super::graph::StorageArtifactFetcher::new(&state, tenant.context());
+    let resolver = super::graph::JobResolver::new(
+        &fetcher,
+        &inline_views,
+        super::graph::ResolverLimits::from_config(state.config()),
+    );
     let max_vds = state.config().sof_sqlquery_max_vds;
     let subject_node = super::graph::SubjectNode {
         identity: subject_url,
@@ -195,7 +200,7 @@ where
         max_depends_on: super::input_limits::max_depends_on(max_vds),
         max_nodes: max_vds,
     };
-    let plan = super::graph::build_plan(&fetcher, &inline_views, subject_node)
+    let plan = super::graph::build_plan(&resolver, subject_node)
         .await
         .map_err(super::graph::errors_to_rest_error)?;
 
@@ -545,6 +550,26 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         },
         SqlQueryError::Timeout { secs } => RestError::UnprocessableEntity {
             message: format!("query exceeded {secs}s timeout"),
+        },
+        // term-20: the artifact resolved but its content cannot be turned
+        // into a relation. The spec's error table says 422 with issue code
+        // `invalid` (D8); a cap is `too-costly`. The issue points at the
+        // declaring `relatedArtifact` entry.
+        SqlQueryError::TerminologyContent {
+            kind,
+            label,
+            url,
+            error,
+        } => RestError::ValidationFailed {
+            outcome: serde_json::json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": error.issue_code(),
+                    "diagnostics": format!("dependency '{label}' ({kind} {url}): {error}"),
+                    "expression": [format!("relatedArtifact.where(label='{label}')")]
+                }]
+            }),
         },
         SqlQueryError::NotSelect(msg) => RestError::BadRequest { message: msg },
         SqlQueryError::BindParameter(msg) => RestError::BadRequest { message: msg },

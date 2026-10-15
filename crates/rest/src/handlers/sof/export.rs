@@ -326,8 +326,16 @@ where
     super::input_limits::check_export_subjects(subject_count)?;
 
     // Supporting artifacts supplied once for the whole job, matched to
-    // dependencies by canonical URL.
+    // dependencies by canonical URL. One resolver serves every subject, so
+    // the job sees one content per artifact (term-19) and shares one copy of
+    // each flattened terminology relation across subjects (#1824, D11).
     let table_sources = extract_table_source_views(body)?;
+    let fetcher = super::graph::StorageArtifactFetcher::new(state, tenant.context());
+    let resolver = super::graph::JobResolver::new(
+        &fetcher,
+        &table_sources,
+        super::graph::ResolverLimits::from_config(state.config()),
+    );
 
     let mut index = 0usize;
     for p in entries {
@@ -394,11 +402,10 @@ where
                 work.queries.push(
                     prepare_named_sqlquery(
                         state,
-                        tenant,
                         Some(output_name),
                         &subject.resource,
                         bindings.as_ref(),
-                        &table_sources,
+                        &resolver,
                     )
                     .await?,
                 );
@@ -436,11 +443,10 @@ fn subject_output_name(explicit: Option<&str>, resource: &Value, index: usize) -
 /// export job (Phase 2) needs no storage access to materialize it.
 async fn prepare_named_sqlquery<S>(
     state: &AppState<S>,
-    tenant: &TenantExtractor,
     name_hint: Option<String>,
     library_json: &Value,
     supplied_params: Option<&Value>,
-    table_sources: &[Value],
+    resolver: &super::graph::JobResolver<'_>,
 ) -> Result<NamedSqlQuery, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
@@ -455,7 +461,6 @@ where
         super::subject::SubjectKind::SqlView
     );
     let subject_url = library_json.get("url").and_then(|v| v.as_str());
-    let fetcher = super::graph::StorageArtifactFetcher::new(state, tenant.context());
     let max_vds = state.config().sof_sqlquery_max_vds;
     let subject_node = super::graph::SubjectNode {
         identity: subject_url,
@@ -465,7 +470,7 @@ where
         max_depends_on: super::input_limits::max_depends_on(max_vds),
         max_nodes: max_vds,
     };
-    let plan = super::graph::build_plan(&fetcher, table_sources, subject_node)
+    let plan = super::graph::build_plan(resolver, subject_node)
         .await
         .map_err(super::graph::errors_to_rest_error)?;
 

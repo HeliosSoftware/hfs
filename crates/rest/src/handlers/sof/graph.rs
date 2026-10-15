@@ -28,18 +28,23 @@
 //!   [`GraphPlan`] whose nodes are topologically ordered (leaves first).
 //! - **Phase 2 — execution** ([`execute_plan`]): materializes the plan's
 //!   nodes in order — leaf ViewDefinitions via the wired `SofRunner`,
+//!   terminology relations (a ValueSet's expansion or a ConceptMap,
+//!   flattened into rows during Phase 1; #1824) by inserting those rows,
 //!   interior SQLView nodes by running their own (already-validated) SQL
 //!   against the tables materialized so far — then runs the subject's own
 //!   SQL. A node shared by multiple edges is materialized once; each edge's
 //!   `relatedArtifact.label` becomes a table alias for whichever SQL
 //!   references it.
 //!
-//! [`build_plan`] takes its artifact source through the [`ArtifactFetcher`]
-//! trait, so it is fully testable without HTTP or a real storage backend —
-//! see the `#[cfg(test)]` module below.
+//! [`build_plan`] takes its artifact source through a [`JobResolver`] over
+//! the [`ArtifactFetcher`] trait, so it is fully testable without HTTP or a
+//! real storage backend — see the `#[cfg(test)]` module below. The resolver
+//! is per job: `$sql-export` plans every subject through one, so every plan
+//! sees one content per artifact (term-19) and shares one copy of each
+//! flattened relation.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -49,8 +54,8 @@ use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
-    BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
-    TableSchema,
+    BoundParam, DependencyKind, DependsOnView, FlattenLimits, InMemorySqlEngine, QueryResult,
+    SqlQueryError, TableSchema, TerminologyContentError,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -58,6 +63,7 @@ use tracing::{debug, warn};
 use super::references::{canonical_matches, resolve_resource_canonical_or_relative};
 use super::sqlquery::{sqlquery_err_to_rest, validate_select_only};
 use super::subject::{SubjectKind, classify_subject};
+use crate::config::ServerConfig;
 use crate::error::RestError;
 use crate::state::AppState;
 
@@ -66,16 +72,45 @@ use crate::state::AppState;
 /// configurable; raising it, if ever needed, is a one-line change here.
 pub(crate) const MAX_GRAPH_DEPTH: usize = 16;
 
-/// Resource kinds this resolver accepts as a dependency
-/// (`relatedArtifact.resource`), from either storage or the inline `context`
-/// list — the check applies identically after the fetch, regardless of
-/// origin (design #568). A SQLQuery Library may only be an operation
-/// *subject*, never a dependency of something else, so it is deliberately
-/// absent here. Extend this list — not the `match` in [`build_plan`] — when
-/// the spec adds further artifact kinds (e.g. terminology) as legal
-/// dependencies.
-const ACCEPTED_DEPENDENCY_KINDS: [SubjectKind; 2] =
-    [SubjectKind::ViewDefinition, SubjectKind::SqlView];
+/// The resource types a dependency URL is resolved against, in order
+/// (design #567, #1824). A relative `Type/id` reference tries only its own
+/// type. The phrase every "not found" and "wrong type" message uses is
+/// [`DEPENDENCY_KINDS_PHRASE`].
+pub(crate) const DEPENDENCY_RESOURCE_TYPES: [&str; 4] =
+    ["ViewDefinition", "Library", "ValueSet", "ConceptMap"];
+
+/// How error messages name the set of legal dependency artifacts.
+pub(crate) const DEPENDENCY_KINDS_PHRASE: &str = "ViewDefinition, Library, ValueSet or ConceptMap";
+
+/// What a fetched dependency artifact is, by `resourceType` and — for a
+/// Library — its type coding. A SQLQuery Library may only be an operation
+/// *subject*, never a dependency of something else, so [`build_plan`] rejects
+/// [`DependencyArtifact::SqlQuery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DependencyArtifact {
+    ViewDefinition,
+    SqlView,
+    SqlQuery,
+    ValueSet,
+    ConceptMap,
+    /// Any other `resourceType` (or none), carried for the error message.
+    Other(String),
+}
+
+/// Classifies a dependency artifact. `classify_subject` is untouched: a
+/// ValueSet is still not a legal operation subject.
+pub(crate) fn classify_dependency(artifact: &Value) -> DependencyArtifact {
+    match artifact.get("resourceType").and_then(Value::as_str) {
+        Some("ViewDefinition") => DependencyArtifact::ViewDefinition,
+        Some("ValueSet") => DependencyArtifact::ValueSet,
+        Some("ConceptMap") => DependencyArtifact::ConceptMap,
+        Some("Library") => match classify_subject(artifact) {
+            Ok(SubjectKind::SqlView) => DependencyArtifact::SqlView,
+            _ => DependencyArtifact::SqlQuery,
+        },
+        other => DependencyArtifact::Other(other.unwrap_or("<absent>").to_string()),
+    }
+}
 
 // ============================================================================
 // Plan types
@@ -123,6 +158,23 @@ pub(crate) enum PlanNode {
         /// how an error (see [`SqlQueryError::DependencyRowCapExceeded`])
         /// names this node. Not used for resolution.
         name: String,
+    },
+    /// A terminology relation (#1824): a ValueSet's expansion or a
+    /// ConceptMap, already flattened into rows in Phase 1. Carries **rows,
+    /// not the resource**, shared through the [`JobResolver`] so every plan
+    /// in a job that references the artifact points at one allocation, and
+    /// the export worker needs neither the flattener nor its error path.
+    Relation {
+        /// Canonical internal table name this node's rows are stored under.
+        internal_name: String,
+        /// Which relation shape (`ValueSet` or `ConceptMap`).
+        kind: DependencyKind,
+        /// The artifact's `name`, or its canonical URL when it has none.
+        name: String,
+        /// The fixed column set for `kind`.
+        schema: TableSchema,
+        /// One JSON object per row, keyed by column name.
+        rows: Arc<[Value]>,
     },
 }
 
@@ -195,11 +247,14 @@ pub(crate) trait ArtifactFetcher: Send + Sync {
 
 /// Storage-backed [`ArtifactFetcher`] used by the real HTTP handlers.
 ///
-/// A dependency URL may name either a leaf ViewDefinition or an interior
-/// SQLView Library, and neither URL form says which, so both resource types
-/// are tried — ViewDefinition first, since it is the more common dependency
-/// (mirrors [`super::subject::resolve_subject`]'s own dual-type lookup for
-/// the subject itself).
+/// A dependency URL may name a leaf ViewDefinition, an interior SQLView
+/// Library, a ValueSet or a ConceptMap, and no URL form says which, so the
+/// four types are tried in [`DEPENDENCY_RESOURCE_TYPES`] order — the first
+/// `Ok` wins, and any error other than "not found" aborts (mirrors
+/// [`super::subject::resolve_subject`]'s own dual-type lookup for the subject
+/// itself). A relative `Type/id` reference only ever matches its own type,
+/// since `resolve_resource_canonical_or_relative` keys the relative form on
+/// the type prefix.
 pub(crate) struct StorageArtifactFetcher<'a, S> {
     state: &'a AppState<S>,
     tenant: &'a TenantContext,
@@ -218,44 +273,403 @@ where
     S: SearchProvider + Send + Sync + 'static,
 {
     async fn fetch(&self, url: &str) -> Result<Value, RestError> {
-        match resolve_resource_canonical_or_relative(self.state, self.tenant, "ViewDefinition", url)
+        for resource_type in DEPENDENCY_RESOURCE_TYPES {
+            match resolve_resource_canonical_or_relative(
+                self.state,
+                self.tenant,
+                resource_type,
+                url,
+            )
             .await
-        {
-            Ok(v) => Ok(v),
-            Err(RestError::NotFound { .. }) => {
-                resolve_resource_canonical_or_relative(self.state, self.tenant, "Library", url)
-                    .await
+            {
+                Ok(v) => return Ok(v),
+                Err(RestError::NotFound { .. }) => continue,
+                Err(other) => return Err(other),
             }
-            Err(other) => Err(other),
+        }
+        Err(RestError::NotFound {
+            resource_type: DEPENDENCY_KINDS_PHRASE.to_string(),
+            id: url.to_string(),
+        })
+    }
+}
+
+// ============================================================================
+// Per-job resolution (#1824, D11)
+// ============================================================================
+
+/// Size bounds the [`JobResolver`] applies to terminology artifacts (D9).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResolverLimits {
+    /// Traversal caps for the flatteners.
+    pub flatten: FlattenLimits,
+    /// Most bytes (estimated, never serialized) one terminology artifact may
+    /// be, from any source (`HFS_SOF_TERMINOLOGY_MAX_ARTIFACT_BYTES`).
+    pub max_artifact_bytes: usize,
+    /// Most bytes one job may retain across every cached artifact and every
+    /// flattened relation (`HFS_SOF_TERMINOLOGY_MAX_JOB_BYTES`).
+    pub max_job_bytes: usize,
+}
+
+impl ResolverLimits {
+    /// The limits the server's configuration prescribes. The member cap is
+    /// the smaller of the terminology member cap and the per-dependency row
+    /// cap, since a relation past the row cap could never be materialized
+    /// anyway; the relation byte cap is the job budget, which no single
+    /// relation may exceed.
+    pub(crate) fn from_config(config: &ServerConfig) -> Self {
+        let max_members = config
+            .sof_terminology_max_expansion_members
+            .min(config.sof_sqlquery_max_source_rows_per_vd);
+        Self {
+            flatten: FlattenLimits::for_members(max_members, config.sof_terminology_max_job_bytes),
+            max_artifact_bytes: config.sof_terminology_max_artifact_bytes,
+            max_job_bytes: config.sof_terminology_max_job_bytes,
         }
     }
 }
 
-/// Resolves one dependency's artifact: the server's own storage is checked
-/// first via `fetcher`; only when storage has nothing at `url` is the inline
-/// `context` list consulted, matched with the same [`canonical_matches`] rule
-/// `resolve_by_canonical_url` uses for storage (including `url|version`
-/// treatment). This order is deliberate (design #568): `context` exists to
-/// fill gaps the server cannot resolve, not to override what it already has,
-/// so a `context` entry whose URL the server also resolves is silently
-/// ignored — there is nowhere to surface a warning in a streamed response.
-/// Returns `Err(RestError::NotFound)` when neither source has a match.
-async fn fetch_dependency(
-    fetcher: &dyn ArtifactFetcher,
-    inline: &[Value],
-    url: &str,
-) -> Result<Value, RestError> {
-    match fetcher.fetch(url).await {
-        Ok(v) => Ok(v),
-        Err(RestError::NotFound { .. }) => inline
-            .iter()
-            .find(|artifact| canonical_matches(artifact, url))
-            .cloned()
-            .ok_or_else(|| RestError::NotFound {
-                resource_type: "ViewDefinition or Library".to_string(),
-                id: url.to_string(),
+/// Where a resolved artifact came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The server's own storage.
+    Storage,
+    /// The request's inline `context` list.
+    Context,
+}
+
+/// A resolved artifact's identity, for logs and provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Identity {
+    pub resource_type: String,
+    pub id: Option<String>,
+    pub url: Option<String>,
+    pub version: Option<String>,
+}
+
+impl Identity {
+    pub(crate) fn of(artifact: &Value) -> Self {
+        let s = |key: &str| {
+            artifact
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        Self {
+            resource_type: s("resourceType").unwrap_or_default(),
+            id: s("id"),
+            url: s("url"),
+            version: s("version"),
+        }
+    }
+}
+
+/// What one dependency URL resolved to, cached for the whole job on first
+/// resolution so every plan in the job sees the same content (term-19) and
+/// no later plan can refetch (`[R5-1]`). A terminology artifact is cached as
+/// its flattened relation with the JSON already dropped; a content error is
+/// cached too, so every plan reports the same 422.
+#[derive(Debug)]
+pub(crate) enum ResolvedArtifact {
+    ViewDefinition {
+        identity: Identity,
+        origin: Origin,
+        resource: Arc<Value>,
+    },
+    SqlView {
+        identity: Identity,
+        origin: Origin,
+        resource: Arc<Value>,
+    },
+    /// A SQLQuery Library: rejected as a dependency, cached so the rejection
+    /// is stable.
+    SqlQuery {
+        identity: Identity,
+    },
+    Relation {
+        identity: Identity,
+        origin: Origin,
+        kind: DependencyKind,
+        name: String,
+        schema: TableSchema,
+        rows: Arc<[Value]>,
+    },
+    Unsupported {
+        resource_type: String,
+    },
+    NotFound,
+    ContentError {
+        kind: DependencyKind,
+        error: TerminologyContentError,
+    },
+}
+
+impl ResolvedArtifact {
+    /// The artifact's identity, for every variant that resolved to one.
+    pub(crate) fn identity(&self) -> Option<&Identity> {
+        match self {
+            Self::ViewDefinition { identity, .. }
+            | Self::SqlView { identity, .. }
+            | Self::SqlQuery { identity }
+            | Self::Relation { identity, .. } => Some(identity),
+            Self::Unsupported { .. } | Self::NotFound | Self::ContentError { .. } => None,
+        }
+    }
+
+    /// Where the artifact came from, for every variant that resolved.
+    pub(crate) fn origin(&self) -> Option<Origin> {
+        match self {
+            Self::ViewDefinition { origin, .. }
+            | Self::SqlView { origin, .. }
+            | Self::Relation { origin, .. } => Some(*origin),
+            Self::SqlQuery { .. }
+            | Self::Unsupported { .. }
+            | Self::NotFound
+            | Self::ContentError { .. } => None,
+        }
+    }
+}
+
+struct ResolverState {
+    cache: HashMap<String, Arc<ResolvedArtifact>>,
+    budget_used: usize,
+}
+
+/// One resolution per job, one copy per artifact (D11): wraps an
+/// [`ArtifactFetcher`] and the inline `context` list, caches every URL's
+/// [`ResolvedArtifact`] on first fetch, flattens terminology artifacts once
+/// under [`ResolverLimits`], and charges a per-job byte budget. `$sql-run`
+/// creates one per request; `$sql-export` creates one per kick-off and
+/// plans every subject through it, so two subjects depending on the same
+/// ValueSet share one rows allocation even if a third client updates the
+/// ValueSet between the two plans.
+pub(crate) struct JobResolver<'a> {
+    inner: &'a dyn ArtifactFetcher,
+    inline: &'a [Value],
+    limits: ResolverLimits,
+    state: Mutex<ResolverState>,
+}
+
+impl<'a> JobResolver<'a> {
+    pub(crate) fn new(
+        inner: &'a dyn ArtifactFetcher,
+        inline: &'a [Value],
+        limits: ResolverLimits,
+    ) -> Self {
+        Self {
+            inner,
+            inline,
+            limits,
+            state: Mutex::new(ResolverState {
+                cache: HashMap::new(),
+                budget_used: 0,
             }),
-        Err(other) => Err(other),
+        }
+    }
+
+    /// Bytes charged to the job budget so far.
+    #[cfg(test)]
+    pub(crate) fn budget_used(&self) -> usize {
+        self.state.lock().expect("resolver lock").budget_used
+    }
+
+    /// Resolves `url` — the cached entry when the job has seen it, else the
+    /// server's own storage first and the inline `context` list second
+    /// (design #568: `context` fills gaps, never overrides storage), then
+    /// classifies and, for a terminology artifact, flattens. Only an
+    /// infrastructure error or a job-budget overflow is returned as `Err`;
+    /// neither is cached.
+    pub(crate) async fn resolve(&self, url: &str) -> Result<Arc<ResolvedArtifact>, RestError> {
+        if let Some(hit) = self.state.lock().expect("resolver lock").cache.get(url) {
+            return Ok(Arc::clone(hit));
+        }
+        let fetched = match self.inner.fetch(url).await {
+            Ok(v) => Some((v, Origin::Storage)),
+            Err(RestError::NotFound { .. }) => self
+                .inline
+                .iter()
+                .find(|artifact| canonical_matches(artifact, url))
+                .cloned()
+                .map(|v| (v, Origin::Context)),
+            Err(other) => return Err(other),
+        };
+        let (resolved, artifact_bytes, relation_bytes) = match fetched {
+            None => (ResolvedArtifact::NotFound, 0, 0),
+            Some((artifact, origin)) => self.classify(artifact, origin, url)?,
+        };
+        let mut state = self.state.lock().expect("resolver lock");
+        // Charge the artifact while it is parsed, then the relation it
+        // became; a flattened terminology artifact's JSON is dropped, so its
+        // estimate is released again (D9/4).
+        let retained = match &resolved {
+            ResolvedArtifact::Relation { .. } => relation_bytes,
+            _ => artifact_bytes,
+        };
+        let peak = state
+            .budget_used
+            .saturating_add(artifact_bytes)
+            .saturating_add(relation_bytes);
+        if peak > self.limits.max_job_bytes {
+            return Err(job_budget_error(self.limits.max_job_bytes));
+        }
+        state.budget_used = state.budget_used.saturating_add(retained);
+        let entry = state
+            .cache
+            .entry(url.to_string())
+            .or_insert_with(|| Arc::new(resolved));
+        Ok(Arc::clone(entry))
+    }
+
+    /// Classifies a fetched artifact and flattens a terminology one. Returns
+    /// the entry plus the artifact's estimated bytes and, for a relation, the
+    /// rows' bytes.
+    fn classify(
+        &self,
+        artifact: Value,
+        origin: Origin,
+        url: &str,
+    ) -> Result<(ResolvedArtifact, usize, usize), RestError> {
+        let identity = Identity::of(&artifact);
+        let kind = classify_dependency(&artifact);
+        let (dependency_kind, is_value_set) = match kind {
+            DependencyArtifact::ViewDefinition => {
+                let bytes = helios_sof::sqlquery::estimate_json_bytes(&artifact, usize::MAX)
+                    .unwrap_or(usize::MAX);
+                return Ok((
+                    ResolvedArtifact::ViewDefinition {
+                        identity,
+                        origin,
+                        resource: Arc::new(artifact),
+                    },
+                    bytes,
+                    0,
+                ));
+            }
+            DependencyArtifact::SqlView => {
+                let bytes = helios_sof::sqlquery::estimate_json_bytes(&artifact, usize::MAX)
+                    .unwrap_or(usize::MAX);
+                return Ok((
+                    ResolvedArtifact::SqlView {
+                        identity,
+                        origin,
+                        resource: Arc::new(artifact),
+                    },
+                    bytes,
+                    0,
+                ));
+            }
+            DependencyArtifact::SqlQuery => {
+                return Ok((ResolvedArtifact::SqlQuery { identity }, 0, 0));
+            }
+            DependencyArtifact::Other(resource_type) => {
+                return Ok((ResolvedArtifact::Unsupported { resource_type }, 0, 0));
+            }
+            DependencyArtifact::ValueSet => (DependencyKind::ValueSet, true),
+            DependencyArtifact::ConceptMap => (DependencyKind::ConceptMap, false),
+        };
+
+        let content_error = |error: TerminologyContentError| {
+            (
+                ResolvedArtifact::ContentError {
+                    kind: dependency_kind,
+                    error,
+                },
+                0,
+                0,
+            )
+        };
+
+        // D9/3: the artifact byte cap applies at plan time to every
+        // terminology artifact from any source.
+        let artifact_bytes = match helios_sof::sqlquery::estimate_json_bytes(
+            &artifact,
+            self.limits.max_artifact_bytes,
+        ) {
+            Ok(n) => n,
+            Err(e) => return Ok(content_error(e)),
+        };
+
+        let name = artifact_display_name(&artifact, url).to_string();
+        let flattened = if is_value_set {
+            // D7: a `context` ValueSet without an expansion is expanded
+            // locally for this request when its compose is enumerated; a
+            // stored one is the materializer's job (PR 2) and is a plain
+            // "no expansion" here.
+            let expanded;
+            let source = if artifact.get("expansion").is_none() && origin == Origin::Context {
+                match helios_sof::sqlquery::expand_enumerated_compose(
+                    &artifact,
+                    chrono::Utc::now(),
+                    &format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                    self.limits.flatten,
+                ) {
+                    Ok(Some(v)) => {
+                        expanded = v;
+                        &expanded
+                    }
+                    Ok(None) => &artifact,
+                    Err(e) => return Ok(content_error(e)),
+                }
+            } else {
+                &artifact
+            };
+            helios_sof::sqlquery::flatten_value_set(source, self.limits.flatten)
+                .map(|(rows, bytes)| (rows.iter().map(|r| r.to_json()).collect::<Vec<_>>(), bytes))
+        } else {
+            helios_sof::sqlquery::flatten_concept_map(&artifact, self.limits.flatten)
+                .map(|(rows, bytes)| (rows.iter().map(|r| r.to_json()).collect::<Vec<_>>(), bytes))
+        };
+        let (rows, relation_bytes) = match flattened {
+            Ok(v) => v,
+            Err(e) => return Ok(content_error(e)),
+        };
+        let schema = if is_value_set {
+            helios_sof::sqlquery::value_set_schema()
+        } else {
+            helios_sof::sqlquery::concept_map_schema()
+        };
+        let expansion_identifier = artifact
+            .pointer("/expansion/identifier")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        debug!(
+            url = %url,
+            kind = %dependency_kind,
+            version = identity.version.as_deref().unwrap_or("-"),
+            rows = rows.len(),
+            expansion_identifier,
+            "flattened terminology dependency"
+        );
+        Ok((
+            ResolvedArtifact::Relation {
+                identity,
+                origin,
+                kind: dependency_kind,
+                name,
+                schema,
+                rows: Arc::from(rows),
+            },
+            artifact_bytes,
+            relation_bytes,
+        ))
+    }
+}
+
+/// The 422 for a job whose retained terminology bytes would exceed the budget.
+fn job_budget_error(max: usize) -> RestError {
+    RestError::ValidationFailed {
+        outcome: json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "too-costly",
+                "diagnostics": format!(
+                    "resolving this request's terminology dependencies would retain more than \
+                     {max} bytes (HFS_SOF_TERMINOLOGY_MAX_JOB_BYTES); narrow the value sets or \
+                     concept maps, or raise the budget"
+                )
+            }]
+        }),
     }
 }
 
@@ -333,7 +747,7 @@ fn count_node(resolved: &mut usize, max_nodes: usize) -> Option<RestError> {
 /// Phase 1: walks the dependency graph rooted at `subject`, producing a
 /// topologically-ordered [`GraphPlan`] or the aggregated list of every
 /// structural problem found. Runs no SQL and touches the in-memory engine
-/// not at all — only `fetcher` (and `inline`) perform I/O.
+/// not at all — only `resolver` performs I/O, and only once per URL per job.
 ///
 /// The walk stops at the first node past [`SubjectNode::max_nodes`], before
 /// fetching anything further, and returns the errors found so far plus
@@ -343,8 +757,7 @@ fn count_node(resolved: &mut usize, max_nodes: usize) -> Option<RestError> {
 /// recursion, so the graph's depth is bounded only by [`MAX_GRAPH_DEPTH`] and
 /// not by the Rust call stack.
 pub(crate) async fn build_plan(
-    fetcher: &dyn ArtifactFetcher,
-    inline: &[Value],
+    resolver: &JobResolver<'_>,
     subject: SubjectNode<'_>,
 ) -> Result<GraphPlan, Vec<RestError>> {
     let mut errors: Vec<RestError> = Vec::new();
@@ -386,8 +799,9 @@ pub(crate) async fn build_plan(
     let mut failed: HashSet<String> = HashSet::new();
     let mut label_registry: HashMap<String, String> = HashMap::new();
     let mut next_internal_id: usize = 0;
-    // A leaf counts once fetched, a SQLView once its frame is pushed (before
-    // its children are fetched); equals `nodes.len()` when the walk ends.
+    // A leaf or relation counts once resolved, a SQLView once its frame is
+    // pushed (before its children are fetched); equals `nodes.len()` when
+    // the walk ends.
     let mut resolved_nodes: usize = 0;
     let mut subject_edges: Vec<Edge> = Vec::new();
 
@@ -482,52 +896,57 @@ pub(crate) async fn build_plan(
             continue;
         }
 
-        let artifact = match fetch_dependency(fetcher, inline, &dep.url).await {
-            Ok(v) => v,
-            Err(RestError::NotFound { .. }) => {
+        let resolved = match resolver.resolve(&dep.url).await {
+            Ok(r) => r,
+            Err(other) => return Err(vec![other]),
+        };
+        debug!(
+            url = %dep.url,
+            label = %dep.label,
+            origin = ?resolved.origin(),
+            resource_type = resolved.identity().map(|i| i.resource_type.as_str()).unwrap_or("-"),
+            version = resolved.identity().and_then(|i| i.version.as_deref()).unwrap_or("-"),
+            "resolved dependency"
+        );
+
+        match &*resolved {
+            ResolvedArtifact::NotFound => {
                 errors.push(RestError::NotFound {
-                    resource_type: "ViewDefinition or Library".to_string(),
+                    resource_type: DEPENDENCY_KINDS_PHRASE.to_string(),
                     id: dep.url.clone(),
                 });
                 failed.insert(dep.url.clone());
-                continue;
             }
-            Err(other) => return Err(vec![other]),
-        };
-
-        let kind = match classify_subject(&artifact) {
-            Ok(k) => k,
-            Err(_) => {
-                let rt = artifact
-                    .get("resourceType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<absent>");
+            ResolvedArtifact::Unsupported { resource_type } => {
                 errors.push(RestError::BadRequest {
                     message: format!(
-                        "dependency '{}' must be a ViewDefinition or a SQLView Library, got \
-                         resourceType='{rt}'",
+                        "dependency '{}' must be a ViewDefinition, a SQLView Library, a ValueSet \
+                         or a ConceptMap, got resourceType='{resource_type}'",
                         dep.url
                     ),
                 });
                 failed.insert(dep.url.clone());
-                continue;
             }
-        };
-
-        if !ACCEPTED_DEPENDENCY_KINDS.contains(&kind) {
-            errors.push(RestError::BadRequest {
-                message: format!(
-                    "dependency '{}' is a SQLQuery Library; only a ViewDefinition or a \
-                     SQLView Library may appear as a dependency",
-                    dep.url
-                ),
-            });
-            failed.insert(dep.url.clone());
-            continue;
-        }
-
-        match kind {
-            SubjectKind::ViewDefinition => {
+            ResolvedArtifact::SqlQuery { .. } => {
+                errors.push(RestError::BadRequest {
+                    message: format!(
+                        "dependency '{}' is a SQLQuery Library; only a ViewDefinition, a SQLView \
+                         Library, a ValueSet or a ConceptMap may appear as a dependency",
+                        dep.url
+                    ),
+                });
+                failed.insert(dep.url.clone());
+            }
+            ResolvedArtifact::ContentError { kind, error } => {
+                errors.push(sqlquery_err_to_rest(SqlQueryError::TerminologyContent {
+                    kind: *kind,
+                    label: dep.label.clone(),
+                    url: dep.url.clone(),
+                    error: error.clone(),
+                }));
+                failed.insert(dep.url.clone());
+            }
+            ResolvedArtifact::ViewDefinition { resource, .. } => {
                 if let Some(err) = count_node(&mut resolved_nodes, max_nodes) {
                     errors.push(err);
                     return Err(errors);
@@ -536,7 +955,7 @@ pub(crate) async fn build_plan(
                 finished.insert(dep.url.clone(), internal_name.clone());
                 nodes.push(PlanNode::Leaf {
                     internal_name: internal_name.clone(),
-                    view: artifact,
+                    view: (**resource).clone(),
                 });
                 if let Some(err) = register_label(&mut label_registry, &dep.label, &internal_name) {
                     errors.push(err);
@@ -548,8 +967,40 @@ pub(crate) async fn build_plan(
                     });
                 }
             }
-            SubjectKind::SqlView => {
-                let library = match helios_sof::sqlquery::parse_sqlquery_library(&artifact) {
+            ResolvedArtifact::Relation {
+                kind,
+                name,
+                schema,
+                rows,
+                ..
+            } => {
+                // D6: a terminology leaf is a node like any other.
+                if let Some(err) = count_node(&mut resolved_nodes, max_nodes) {
+                    errors.push(err);
+                    return Err(errors);
+                }
+                let internal_name = next_internal_name(&mut next_internal_id);
+                finished.insert(dep.url.clone(), internal_name.clone());
+                nodes.push(PlanNode::Relation {
+                    internal_name: internal_name.clone(),
+                    kind: *kind,
+                    name: name.clone(),
+                    schema: schema.clone(),
+                    rows: Arc::clone(rows),
+                });
+                if let Some(err) = register_label(&mut label_registry, &dep.label, &internal_name) {
+                    errors.push(err);
+                } else {
+                    let top = stack.last_mut().expect("checked above");
+                    top.resolved_edges.push(Edge {
+                        label: dep.label.clone(),
+                        target_internal_name: internal_name,
+                    });
+                }
+            }
+            ResolvedArtifact::SqlView { resource, .. } => {
+                let artifact: &Value = resource;
+                let library = match helios_sof::sqlquery::parse_sqlquery_library(artifact) {
                     Ok(l) => l,
                     Err(e) => {
                         errors.push(sqlquery_err_to_rest(e));
@@ -587,7 +1038,7 @@ pub(crate) async fn build_plan(
                 }
                 on_stack.insert(dep.url.clone());
                 path.push(dep.url.clone());
-                let name = artifact_display_name(&artifact, &dep.url).to_string();
+                let name = artifact_display_name(artifact, &dep.url).to_string();
                 stack.push(Frame {
                     identity: dep.url.clone(),
                     depends_on: library.depends_on,
@@ -597,9 +1048,6 @@ pub(crate) async fn build_plan(
                     label_for_parent: Some(dep.label.clone()),
                     name,
                 });
-            }
-            SubjectKind::SqlQuery => {
-                unreachable!("rejected above by ACCEPTED_DEPENDENCY_KINDS")
             }
         }
     }
@@ -791,6 +1239,55 @@ pub(crate) async fn execute_plan(
                     "materialized SQL query dependency"
                 );
                 leaf_schemas.push(schema);
+                engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
+            }
+            PlanNode::Relation {
+                internal_name,
+                kind,
+                name,
+                schema,
+                rows,
+            } => {
+                // #1824: the rows were flattened in Phase 1 and are shared
+                // through an `Arc`, so the stream owns a pointer, not a copy,
+                // and is `'static` as `insert_rows` requires.
+                engine.create_table(internal_name, schema)?;
+                let start = std::time::Instant::now();
+                let shared: Arc<[Value]> = Arc::clone(rows);
+                let owned =
+                    futures::stream::iter((0..shared.len()).map(move |i| Ok(shared[i].clone())));
+                let (returned_engine, inserted) = match engine
+                    .insert_rows(
+                        internal_name,
+                        schema,
+                        Box::pin(owned),
+                        limits.max_source_rows_per_vd,
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(SqlQueryError::RowCapExceeded { max }) => {
+                        return Err(SqlQueryError::DependencyRowCapExceeded {
+                            label: dependency_label(&labels_by_target, internal_name, name)
+                                .to_string(),
+                            kind: *kind,
+                            view: name.clone(),
+                            max,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                };
+                engine = returned_engine;
+                let elapsed_ms = start.elapsed().as_millis();
+                debug!(
+                    table = %internal_name,
+                    kind = %kind,
+                    artifact = %name,
+                    rows = inserted,
+                    elapsed_ms,
+                    "materialized terminology relation"
+                );
+                leaf_schemas.push(schema.clone());
                 engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
             }
             PlanNode::SqlView {
@@ -1026,7 +1523,28 @@ mod tests {
     use helios_persistence::core::sof_runner::SofError;
     use helios_persistence::tenant::{TenantId, TenantPermissions};
 
+    use helios_sof::sqlquery::engine::ColumnFhirType;
+
     use super::*;
+
+    /// Resolver limits generous enough for every dry test.
+    fn test_limits() -> ResolverLimits {
+        ResolverLimits {
+            flatten: FlattenLimits::for_members(10_000, 64 << 20),
+            max_artifact_bytes: 8 << 20,
+            max_job_bytes: 64 << 20,
+        }
+    }
+
+    /// [`build_plan`] through a fresh per-call [`JobResolver`].
+    async fn plan(
+        fetcher: &dyn ArtifactFetcher,
+        inline: &[Value],
+        subject: SubjectNode<'_>,
+    ) -> Result<GraphPlan, Vec<RestError>> {
+        let resolver = JobResolver::new(fetcher, inline, test_limits());
+        build_plan(&resolver, subject).await
+    }
 
     /// A fixed in-memory [`ArtifactFetcher`] for dry Phase 1 tests.
     struct MapFetcher(HashMap<String, Value>);
@@ -1165,7 +1683,7 @@ mod tests {
         ]));
 
         let deps = vec![depends_on("mid_t", "http://example.org/mid")];
-        let plan = build_plan(&fetcher, &[], subject_node(&deps))
+        let plan = plan(&fetcher, &[], subject_node(&deps))
             .await
             .expect("plan should resolve");
 
@@ -1208,7 +1726,7 @@ mod tests {
             depends_on("a_t", "http://example.org/a"),
             depends_on("b_t", "http://example.org/b"),
         ];
-        let plan = build_plan(&fetcher, &[], subject_node(&deps))
+        let plan = plan(&fetcher, &[], subject_node(&deps))
             .await
             .expect("plan should resolve");
 
@@ -1244,7 +1762,7 @@ mod tests {
         ]));
 
         let deps = vec![depends_on("a_t", "http://example.org/a")];
-        let errors = build_plan(&fetcher, &[], subject_node(&deps))
+        let errors = plan(&fetcher, &[], subject_node(&deps))
             .await
             .expect_err("a cycle must be rejected");
 
@@ -1296,13 +1814,13 @@ mod tests {
         let mut map16 = HashMap::new();
         let deps16 = chain(&mut map16, 16);
         let fetcher16 = MapFetcher(map16);
-        let plan16 = build_plan(&fetcher16, &[], subject_node(&deps16)).await;
+        let plan16 = plan(&fetcher16, &[], subject_node(&deps16)).await;
         assert!(plan16.is_ok(), "16 levels must resolve: {plan16:?}");
 
         let mut map17 = HashMap::new();
         let deps17 = chain(&mut map17, 17);
         let fetcher17 = MapFetcher(map17);
-        let errors17 = build_plan(&fetcher17, &[], subject_node(&deps17))
+        let errors17 = plan(&fetcher17, &[], subject_node(&deps17))
             .await
             .expect_err("17 levels must be rejected");
         assert_eq!(errors17.len(), 1);
@@ -1327,7 +1845,7 @@ mod tests {
         });
         let fetcher = MapFetcher(HashMap::from([("http://example.org/bad".to_string(), bad)]));
         let deps = vec![depends_on("t", "http://example.org/bad")];
-        let errors = build_plan(&fetcher, &[], subject_node(&deps))
+        let errors = plan(&fetcher, &[], subject_node(&deps))
             .await
             .expect_err("a parameterized SQLView must be rejected");
         assert_eq!(errors.len(), 1);
@@ -1352,7 +1870,7 @@ mod tests {
             depends_on("a_t", "http://example.org/a"),
             depends_on("missing_t", "http://example.org/missing"),
         ];
-        let errors = build_plan(&fetcher, &[], subject_node(&deps))
+        let errors = plan(&fetcher, &[], subject_node(&deps))
             .await
             .expect_err("both problems must be reported");
 
@@ -1388,7 +1906,7 @@ mod tests {
         // `parse_sqlquery_library` would already reject a literal duplicate
         // label within one Library's own relatedArtifact list, so this
         // scenario is exercised directly against the resolver instead.
-        let errors = build_plan(&fetcher, &[], subject_node(&deps))
+        let errors = plan(&fetcher, &[], subject_node(&deps))
             .await
             .expect_err("same label, different targets, must be rejected");
         assert!(
@@ -1403,7 +1921,7 @@ mod tests {
         let fetcher = MapFetcher(HashMap::new());
         let inline = vec![view_definition("http://example.org/inline-leaf")];
         let deps = vec![depends_on("t", "http://example.org/inline-leaf")];
-        let plan = build_plan(&fetcher, &inline, subject_node(&deps))
+        let plan = plan(&fetcher, &inline, subject_node(&deps))
             .await
             .expect("inline artifact should resolve when the fetcher has nothing at that url");
         assert_eq!(plan.node_count(), 1);
@@ -1424,7 +1942,7 @@ mod tests {
         let fetcher = MapFetcher(HashMap::from([(url.to_string(), server_vd)]));
         let inline = vec![context_vd];
         let deps = vec![depends_on("t", url)];
-        let plan = build_plan(&fetcher, &inline, subject_node(&deps))
+        let plan = plan(&fetcher, &inline, subject_node(&deps))
             .await
             .expect("plan should resolve");
 
@@ -1462,7 +1980,7 @@ mod tests {
         )];
 
         let deps = vec![depends_on("mid_t", "http://example.org/mid")];
-        let plan = build_plan(&fetcher, &inline, subject_node(&deps))
+        let plan = plan(&fetcher, &inline, subject_node(&deps))
             .await
             .expect("plan should resolve via the context-supplied intermediate SQLView");
 
@@ -1491,7 +2009,7 @@ mod tests {
             bad,
         )]));
         let deps = vec![depends_on("t", "http://example.org/bad-sql")];
-        let errors = build_plan(&fetcher, &[], subject_node(&deps))
+        let errors = plan(&fetcher, &[], subject_node(&deps))
             .await
             .expect_err("a non-SELECT interior SQLView must be rejected");
         assert_eq!(errors.len(), 1);
@@ -1517,7 +2035,7 @@ mod tests {
             depends_on("a_t", "http://example.org/a"),
             depends_on("b_t", "http://example.org/b"),
         ];
-        let plan = build_plan(&fetcher, &[], subject_node(&deps))
+        let plan = plan(&fetcher, &[], subject_node(&deps))
             .await
             .expect("plan should resolve");
         assert!(check_max_nodes(&plan, 2).is_ok());
@@ -1540,7 +2058,7 @@ mod tests {
             .map(|i| depends_on(&format!("t{i}"), &format!("http://example.org/n/{i}")))
             .collect();
 
-        let errors = build_plan(
+        let errors = plan(
             &fetcher,
             &[],
             SubjectNode {
@@ -1604,7 +2122,7 @@ mod tests {
         ]));
         let deps = vec![depends_on("t1", "http://example.org/v1")];
 
-        let errors = build_plan(
+        let errors = plan(
             &fetcher,
             &[],
             SubjectNode {
@@ -1662,7 +2180,7 @@ mod tests {
             depends_on("b_t", "http://example.org/b"),
         ];
 
-        let plan = build_plan(
+        let plan = plan(
             &fetcher,
             &[],
             SubjectNode {
@@ -1696,7 +2214,7 @@ mod tests {
             depends_on("named_t", named_url),
             depends_on("unnamed_t", unnamed_url),
         ];
-        let plan = build_plan(&fetcher, &[], subject_node(&deps))
+        let plan = plan(&fetcher, &[], subject_node(&deps))
             .await
             .expect("plan should resolve");
         let names: Vec<&str> = plan
@@ -1704,7 +2222,7 @@ mod tests {
             .iter()
             .filter_map(|n| match n {
                 PlanNode::SqlView { name, .. } => Some(name.as_str()),
-                PlanNode::Leaf { .. } => None,
+                PlanNode::Leaf { .. } | PlanNode::Relation { .. } => None,
             })
             .collect();
         assert_eq!(names, vec!["female_patients", unnamed_url]);
@@ -1915,7 +2433,7 @@ mod tests {
         let deps: Vec<DependsOnView> = (0..5)
             .map(|i| depends_on(&format!("t{i}"), &format!("http://example.org/none/{i}")))
             .collect();
-        let errors = build_plan(
+        let errors = plan(
             &fetcher,
             &[],
             SubjectNode {
@@ -1949,7 +2467,7 @@ mod tests {
             sql_view("http://example.org/mid", "SELECT * FROM a_t", &child_refs),
         )]));
         let deps = vec![depends_on("mid_t", "http://example.org/mid")];
-        let errors = build_plan(
+        let errors = plan(
             &fetcher,
             &[],
             SubjectNode {
@@ -1983,7 +2501,7 @@ mod tests {
         let deps: Vec<DependsOnView> = (0..4)
             .map(|i| depends_on(&format!("t{i}"), &format!("http://example.org/leaf/{i}")))
             .collect();
-        let plan = build_plan(
+        let plan = plan(
             &fetcher,
             &[],
             SubjectNode {
@@ -2018,6 +2536,652 @@ mod tests {
         assert_eq!(
             message,
             "only SELECT queries are allowed; INSERT statements are not permitted"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Terminology dependencies (#1824): ValueSet and ConceptMap relations
+    // ------------------------------------------------------------------
+
+    fn expanded_value_set(url: &str) -> Value {
+        json!({
+            "resourceType": "ValueSet",
+            "url": url,
+            "version": "2026",
+            "name": "cvd",
+            "status": "active",
+            "expansion": {
+                "identifier": "urn:uuid:3c5a4d2e",
+                "timestamp": "2026-01-15T10:00:00Z",
+                "total": 3,
+                "contains": [{
+                    "system": "http://snomed.info/sct", "abstract": true,
+                    "contains": [
+                        {"system": "http://snomed.info/sct", "code": "22298006", "display": "MI"},
+                        {"system": "http://hl7.org/fhir/sid/icd-10", "code": "I21", "inactive": true}
+                    ]
+                }]
+            }
+        })
+    }
+
+    fn compose_only_value_set(url: &str, include: Value) -> Value {
+        json!({
+            "resourceType": "ValueSet",
+            "url": url,
+            "status": "active",
+            "compose": {"include": include}
+        })
+    }
+
+    fn concept_map(url: &str) -> Value {
+        json!({
+            "resourceType": "ConceptMap",
+            "url": url,
+            "status": "active",
+            "group": [{
+                "source": "http://snomed.info/sct",
+                "target": "http://hl7.org/fhir/sid/icd-10|2024",
+                "element": [
+                    {"code": "22298006", "target": [{"code": "I21", "relationship": "equivalent"}]},
+                    {"code": "102499006", "noMap": true}
+                ]
+            }]
+        })
+    }
+
+    fn relation_of(
+        plan: &GraphPlan,
+        index: usize,
+    ) -> (DependencyKind, &str, &TableSchema, &Arc<[Value]>) {
+        match &plan.nodes[index] {
+            PlanNode::Relation {
+                kind,
+                name,
+                schema,
+                rows,
+                ..
+            } => (*kind, name.as_str(), schema, rows),
+            other => panic!("expected a relation node, got {other:?}"),
+        }
+    }
+
+    fn is_terminology_422(e: &RestError, code: &str, needle: &str) -> bool {
+        match e {
+            RestError::ValidationFailed { outcome } => {
+                let issue = &outcome["issue"][0];
+                issue["code"] == code
+                    && issue["diagnostics"]
+                        .as_str()
+                        .is_some_and(|d| d.contains(needle))
+            }
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn value_set_dependency_becomes_a_relation_leaf_with_the_fixed_schema() {
+        let url = "http://example.org/ValueSet/cvd";
+        let fetcher = MapFetcher(HashMap::from([(url.to_string(), expanded_value_set(url))]));
+        let deps = vec![depends_on("cvd_codes", url)];
+        let plan = plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect("resolves");
+        assert_eq!(plan.nodes.len(), 1);
+        let (kind, name, schema, rows) = relation_of(&plan, 0);
+        assert_eq!(kind, DependencyKind::ValueSet);
+        assert_eq!(name, "cvd");
+        let columns: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            columns,
+            ["system", "version", "code", "display", "inactive"]
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["code"], "22298006");
+        assert_eq!(rows[0]["inactive"], Value::Null);
+        assert_eq!(rows[1]["inactive"], json!(true));
+        assert_eq!(plan.subject_edges[0].label, "cvd_codes");
+        assert_eq!(plan.subject_edges[0].target_internal_name, "__sof_node_0");
+    }
+
+    #[tokio::test]
+    async fn value_set_pinned_by_version_resolves_through_the_fetcher_url() {
+        // The fetcher is asked for the exact declared reference; the resolver
+        // does not strip the pin.
+        let url = "http://example.org/ValueSet/cvd|2026";
+        let fetcher = CountingFetcher::new(HashMap::from([(
+            url.to_string(),
+            expanded_value_set("http://example.org/ValueSet/cvd"),
+        )]));
+        let deps = vec![depends_on("cvd_codes", url)];
+        let plan = plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect("resolves");
+        assert_eq!(fetcher.fetched(), vec![url.to_string()]);
+        assert_eq!(relation_of(&plan, 0).3.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concept_map_dependency_becomes_a_nine_column_relation() {
+        let url = "http://example.org/ConceptMap/sct-to-icd10";
+        let fetcher = MapFetcher(HashMap::from([(url.to_string(), concept_map(url))]));
+        let deps = vec![depends_on("sct_to_icd10", url)];
+        let plan = plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect("resolves");
+        let (kind, name, schema, rows) = relation_of(&plan, 0);
+        assert_eq!(kind, DependencyKind::ConceptMap);
+        assert_eq!(name, url, "no `name`, so the URL names it");
+        assert_eq!(schema.columns.len(), 9);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["target_version"], "2024");
+        assert_eq!(rows[1]["target_code"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn context_value_set_satisfies_a_dependency_storage_cannot_and_storage_wins_otherwise() {
+        let url = "http://example.org/ValueSet/cvd";
+        let deps = vec![depends_on("cvd_codes", url)];
+
+        let empty = MapFetcher(HashMap::new());
+        let plan_from_context = plan(&empty, &[expanded_value_set(url)], subject_node(&deps))
+            .await
+            .expect("context satisfies it");
+        assert_eq!(relation_of(&plan_from_context, 0).3.len(), 2);
+
+        // Storage holds a one-member expansion for the same URL: it wins.
+        let mut stored = expanded_value_set(url);
+        stored["expansion"]["contains"] = json!([{"system": "s", "code": "only"}]);
+        stored["expansion"]["total"] = json!(1);
+        let fetcher = MapFetcher(HashMap::from([(url.to_string(), stored)]));
+        let plan_from_storage = plan(&fetcher, &[expanded_value_set(url)], subject_node(&deps))
+            .await
+            .expect("storage satisfies it");
+        let rows = relation_of(&plan_from_storage, 0).3;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["code"], "only");
+    }
+
+    #[tokio::test]
+    async fn value_set_reached_through_an_interior_sqlview_is_a_leaf_of_that_view() {
+        let vs_url = "http://example.org/ValueSet/cvd";
+        let view_url = "http://example.org/Library/cvd-view";
+        let fetcher = MapFetcher(HashMap::from([
+            (vs_url.to_string(), expanded_value_set(vs_url)),
+            (
+                view_url.to_string(),
+                sql_view(view_url, "SELECT code FROM cvd", &[("cvd", vs_url)]),
+            ),
+        ]));
+        let deps = vec![depends_on("cvd_view", view_url)];
+        let plan = plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect("resolves");
+        assert_eq!(plan.nodes.len(), 2);
+        assert!(matches!(plan.nodes[0], PlanNode::Relation { .. }));
+        match &plan.nodes[1] {
+            PlanNode::SqlView { edges, .. } => {
+                assert_eq!(edges[0].label, "cvd");
+                assert_eq!(edges[0].target_internal_name, "__sof_node_0");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn label_collision_between_a_view_definition_and_a_value_set_is_rejected() {
+        let vs_url = "http://example.org/ValueSet/cvd";
+        let vd_url = "http://example.org/vd";
+        let fetcher = MapFetcher(HashMap::from([
+            (vs_url.to_string(), expanded_value_set(vs_url)),
+            (vd_url.to_string(), view_definition(vd_url)),
+        ]));
+        let deps = vec![depends_on("t", vd_url), depends_on("t", vs_url)];
+        let errors = plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect_err("collision");
+        assert!(errors.iter().any(
+            |e| matches!(e, RestError::BadRequest { message } if message.contains("label 't' is used for two"))
+        ), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn node_cap_counts_a_terminology_relation() {
+        let vs_url = "http://example.org/ValueSet/cvd";
+        let vd_url = "http://example.org/vd";
+        let fetcher = MapFetcher(HashMap::from([
+            (vs_url.to_string(), expanded_value_set(vs_url)),
+            (vd_url.to_string(), view_definition(vd_url)),
+        ]));
+        let deps = vec![depends_on("vd", vd_url), depends_on("vs", vs_url)];
+        let mut subject = subject_node(&deps);
+        subject.max_nodes = 1;
+        let errors = plan(&fetcher, &[], subject)
+            .await
+            .expect_err("over the cap");
+        assert!(errors.iter().any(
+            |e| matches!(e, RestError::UnprocessableEntity { message } if message.contains("2 nodes"))
+        ), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn stored_value_set_without_expansion_is_a_422_aggregated_with_other_errors() {
+        let vs_url = "http://example.org/ValueSet/cvd";
+        let fetcher = MapFetcher(HashMap::from([(
+            vs_url.to_string(),
+            compose_only_value_set(vs_url, json!([{"system": "s", "concept": [{"code": "a"}]}])),
+        )]));
+        let deps = vec![
+            depends_on("cvd", vs_url),
+            depends_on("missing", "http://example.org/missing"),
+        ];
+        let errors = plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect_err("both");
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors.iter().any(|e| is_terminology_422(e, "invalid", "dependency 'cvd' (ValueSet http://example.org/ValueSet/cvd): the ValueSet has no expansion")),
+            "{errors:?}"
+        );
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            RestError::NotFound { resource_type, id }
+                if resource_type == DEPENDENCY_KINDS_PHRASE && id == "http://example.org/missing"
+        )), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn context_compose_only_value_set_is_expanded_locally_when_enumerated_else_422() {
+        let vs_url = "http://example.org/ValueSet/local";
+        let deps = vec![depends_on("vs", vs_url)];
+        let empty = MapFetcher(HashMap::new());
+
+        let eligible = compose_only_value_set(
+            vs_url,
+            json!([{"system": "s", "version": "1", "concept": [{"code": "a"}, {"code": "b"}]}]),
+        );
+        let plan_ok = plan(&empty, &[eligible], subject_node(&deps))
+            .await
+            .expect("local expansion");
+        let rows = relation_of(&plan_ok, 0).3;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["version"], "1");
+        assert_eq!(
+            rows[0]["inactive"],
+            Value::Null,
+            "a local expansion never asserts inactivity"
+        );
+
+        let ineligible = compose_only_value_set(
+            vs_url,
+            json!([{"system": "s", "filter": [{"property": "concept", "op": "is-a", "value": "x"}]}]),
+        );
+        let errors = plan(&empty, &[ineligible], subject_node(&deps))
+            .await
+            .expect_err("422");
+        assert_eq!(errors.len(), 1);
+        assert!(
+            is_terminology_422(&errors[0], "invalid", "has no expansion"),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_compose_only_value_set_is_never_expanded_at_run_time() {
+        // D7 applies to `context` only; a stored one is the materializer's job.
+        let vs_url = "http://example.org/ValueSet/local";
+        let fetcher = MapFetcher(HashMap::from([(
+            vs_url.to_string(),
+            compose_only_value_set(vs_url, json!([{"system": "s", "concept": [{"code": "a"}]}])),
+        )]));
+        let deps = vec![depends_on("vs", vs_url)];
+        let errors = plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect_err("422");
+        assert!(
+            is_terminology_422(&errors[0], "invalid", "has no expansion"),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_resource_type_and_sqlquery_dependency_name_the_four_kinds() {
+        let patient_url = "http://example.org/Patient/x";
+        let query_url = "http://example.org/Library/q";
+        let mut query = sql_view(query_url, "SELECT 1", &[]);
+        query["type"]["coding"][0]["code"] = json!("sql-query");
+        let fetcher = MapFetcher(HashMap::from([
+            (
+                patient_url.to_string(),
+                json!({"resourceType": "Patient", "url": patient_url}),
+            ),
+            (query_url.to_string(), query),
+        ]));
+        let deps = vec![depends_on("p", patient_url), depends_on("q", query_url)];
+        let errors = plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect_err("both");
+        let messages: Vec<String> = errors
+            .iter()
+            .map(|e| match e {
+                RestError::BadRequest { message } => message.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(messages[0].contains("must be a ViewDefinition, a SQLView Library, a ValueSet or a ConceptMap, got resourceType='Patient'"), "{messages:?}");
+        assert!(messages[1].contains("is a SQLQuery Library; only a ViewDefinition, a SQLView Library, a ValueSet or a ConceptMap"), "{messages:?}");
+    }
+
+    /// A fetcher whose content can be swapped between plans, standing in for
+    /// a concurrent update of a stored artifact.
+    struct SwitchFetcher(
+        std::sync::Mutex<HashMap<String, Value>>,
+        std::sync::Mutex<usize>,
+    );
+
+    impl SwitchFetcher {
+        fn swap(&self, url: &str, value: Value) {
+            self.0.lock().unwrap().insert(url.to_string(), value);
+        }
+        fn fetches(&self) -> usize {
+            *self.1.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ArtifactFetcher for SwitchFetcher {
+        async fn fetch(&self, url: &str) -> Result<Value, RestError> {
+            *self.1.lock().unwrap() += 1;
+            self.0
+                .lock()
+                .unwrap()
+                .get(url)
+                .cloned()
+                .ok_or_else(|| RestError::NotFound {
+                    resource_type: DEPENDENCY_KINDS_PHRASE.to_string(),
+                    id: url.to_string(),
+                })
+        }
+    }
+
+    #[tokio::test]
+    async fn job_resolver_fetches_and_flattens_once_and_never_refetches_after_eviction() {
+        let vs_url = "http://example.org/ValueSet/cvd";
+        let fetcher = SwitchFetcher(
+            std::sync::Mutex::new(HashMap::from([(
+                vs_url.to_string(),
+                expanded_value_set(vs_url),
+            )])),
+            std::sync::Mutex::new(0),
+        );
+        let resolver = JobResolver::new(&fetcher, &[], test_limits());
+        let deps_a = vec![depends_on("a", vs_url)];
+        let deps_b = vec![depends_on("b", vs_url)];
+
+        let first = build_plan(&resolver, subject_node(&deps_a))
+            .await
+            .expect("first plan");
+        // The artifact's JSON is dropped once the relation exists; only the
+        // relation's bytes stay charged.
+        let charged = resolver.budget_used();
+        assert!(charged > 0 && charged < 2_000, "{charged}");
+
+        // A third client now replaces the ValueSet with a one-member one.
+        let mut changed = expanded_value_set(vs_url);
+        changed["expansion"]["contains"] = json!([{"system": "s", "code": "only"}]);
+        changed["expansion"]["total"] = json!(1);
+        fetcher.swap(vs_url, changed);
+
+        let second = build_plan(&resolver, subject_node(&deps_b))
+            .await
+            .expect("second plan");
+        assert_eq!(fetcher.fetches(), 1, "one inner fetch per URL per job");
+        let rows_a = relation_of(&first, 0).3;
+        let rows_b = relation_of(&second, 0).3;
+        assert!(
+            Arc::ptr_eq(rows_a, rows_b),
+            "both plans share one rows allocation"
+        );
+        assert_eq!(
+            rows_b.len(),
+            2,
+            "the second plan sees the first content (term-19)"
+        );
+        assert_eq!(resolver.budget_used(), charged, "nothing charged twice");
+    }
+
+    #[tokio::test]
+    async fn job_resolver_caches_a_content_error_so_every_plan_reports_it() {
+        let vs_url = "http://example.org/ValueSet/cvd";
+        let fetcher = SwitchFetcher(
+            std::sync::Mutex::new(HashMap::from([(
+                vs_url.to_string(),
+                compose_only_value_set(
+                    vs_url,
+                    json!([{"system": "s", "concept": [{"code": "a"}]}]),
+                ),
+            )])),
+            std::sync::Mutex::new(0),
+        );
+        let resolver = JobResolver::new(&fetcher, &[], test_limits());
+        let deps = vec![depends_on("a", vs_url)];
+        build_plan(&resolver, subject_node(&deps))
+            .await
+            .expect_err("no expansion");
+        fetcher.swap(vs_url, expanded_value_set(vs_url));
+        let errors = build_plan(&resolver, subject_node(&deps))
+            .await
+            .expect_err("still");
+        assert!(is_terminology_422(
+            &errors[0],
+            "invalid",
+            "has no expansion"
+        ));
+        assert_eq!(fetcher.fetches(), 1);
+    }
+
+    #[tokio::test]
+    async fn visited_cap_rejects_an_abstract_only_expansion_before_the_member_cap() {
+        let vs_url = "http://example.org/ValueSet/deep";
+        let entries: Vec<Value> = (0..50)
+            .map(|_| json!({"system": "s", "abstract": true}))
+            .collect();
+        let vs =
+            json!({"resourceType": "ValueSet", "url": vs_url, "expansion": {"contains": entries}});
+        let fetcher = MapFetcher(HashMap::from([(vs_url.to_string(), vs)]));
+        let limits = ResolverLimits {
+            flatten: FlattenLimits::for_members(5, 64 << 20),
+            max_artifact_bytes: 8 << 20,
+            max_job_bytes: 64 << 20,
+        };
+        let resolver = JobResolver::new(&fetcher, &[], limits);
+        let deps = vec![depends_on("deep", vs_url)];
+        let errors = build_plan(&resolver, subject_node(&deps))
+            .await
+            .expect_err("too-costly");
+        assert!(
+            is_terminology_422(&errors[0], "too-costly", "more than 20 entries"),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_byte_cap_applies_to_a_context_artifact_at_plan_time() {
+        let vs_url = "http://example.org/ValueSet/big";
+        let big = json!({
+            "resourceType": "ValueSet", "url": vs_url,
+            "expansion": {"contains": [{"system": "s", "code": "a", "display": "x".repeat(5_000)}]}
+        });
+        let limits = ResolverLimits {
+            flatten: FlattenLimits::for_members(100, 64 << 20),
+            max_artifact_bytes: 1_000,
+            max_job_bytes: 64 << 20,
+        };
+        let empty = MapFetcher(HashMap::new());
+        let inline = [big];
+        let resolver = JobResolver::new(&empty, &inline, limits);
+        let deps = vec![depends_on("big", vs_url)];
+        let errors = build_plan(&resolver, subject_node(&deps))
+            .await
+            .expect_err("too-costly");
+        assert!(
+            is_terminology_422(&errors[0], "too-costly", "exceeds 1000 bytes"),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_budget_overflow_aborts_the_plan_with_one_too_costly_error() {
+        let a = "http://example.org/ValueSet/a";
+        let b = "http://example.org/ValueSet/b";
+        let fetcher = MapFetcher(HashMap::from([
+            (a.to_string(), expanded_value_set(a)),
+            (b.to_string(), expanded_value_set(b)),
+        ]));
+        let limits = ResolverLimits {
+            flatten: FlattenLimits::for_members(100, 64 << 20),
+            max_artifact_bytes: 8 << 20,
+            // Enough for one artifact's peak, not for two relations.
+            max_job_bytes: 1_200,
+        };
+        let resolver = JobResolver::new(&fetcher, &[], limits);
+        let deps = vec![depends_on("a", a), depends_on("b", b)];
+        let errors = build_plan(&resolver, subject_node(&deps))
+            .await
+            .expect_err("budget");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        match &errors[0] {
+            RestError::ValidationFailed { outcome } => {
+                assert_eq!(outcome["issue"][0]["code"], "too-costly");
+                assert!(
+                    outcome["issue"][0]["diagnostics"]
+                        .as_str()
+                        .unwrap()
+                        .contains("HFS_SOF_TERMINOLOGY_MAX_JOB_BYTES")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_dependency_distinguishes_the_six_shapes() {
+        assert_eq!(
+            classify_dependency(&view_definition("u")),
+            DependencyArtifact::ViewDefinition
+        );
+        assert_eq!(
+            classify_dependency(&sql_view("u", "SELECT 1", &[])),
+            DependencyArtifact::SqlView
+        );
+        let mut q = sql_view("u", "SELECT 1", &[]);
+        q["type"]["coding"][0]["code"] = json!("sql-query");
+        assert_eq!(classify_dependency(&q), DependencyArtifact::SqlQuery);
+        assert_eq!(
+            classify_dependency(&expanded_value_set("u")),
+            DependencyArtifact::ValueSet
+        );
+        assert_eq!(
+            classify_dependency(&concept_map("u")),
+            DependencyArtifact::ConceptMap
+        );
+        assert_eq!(
+            classify_dependency(&json!({"resourceType": "Patient"})),
+            DependencyArtifact::Other("Patient".into())
+        );
+        assert_eq!(
+            classify_dependency(&json!({})),
+            DependencyArtifact::Other("<absent>".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_artifact_reports_identity_and_origin() {
+        let vs_url = "http://example.org/ValueSet/cvd";
+        let empty = MapFetcher(HashMap::new());
+        let inline = [expanded_value_set(vs_url)];
+        let resolver = JobResolver::new(&empty, &inline, test_limits());
+        let resolved = resolver.resolve(vs_url).await.unwrap();
+        assert_eq!(resolved.origin(), Some(Origin::Context));
+        let identity = resolved.identity().unwrap();
+        assert_eq!(identity.resource_type, "ValueSet");
+        assert_eq!(identity.url.as_deref(), Some(vs_url));
+        assert_eq!(identity.version.as_deref(), Some("2026"));
+        let missing = resolver.resolve("http://example.org/none").await.unwrap();
+        assert!(matches!(*missing, ResolvedArtifact::NotFound));
+        assert!(missing.identity().is_none() && missing.origin().is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 — terminology relations are materialized from their rows
+    // ------------------------------------------------------------------
+
+    fn relation_plan(rows: usize, label: &str) -> GraphPlan {
+        let rows: Vec<Value> = (0..rows)
+            .map(|i| {
+                json!({"system": "http://snomed.info/sct", "version": null, "code": format!("c{i}"),
+                       "display": null, "inactive": if i % 2 == 0 { Value::Null } else { json!(true) }})
+            })
+            .collect();
+        GraphPlan {
+            nodes: vec![PlanNode::Relation {
+                internal_name: "__sof_node_0".to_string(),
+                kind: DependencyKind::ValueSet,
+                name: "cvd".to_string(),
+                schema: helios_sof::sqlquery::value_set_schema(),
+                rows: Arc::from(rows),
+            }],
+            subject_edges: vec![edge(label, "__sof_node_0")],
+        }
+    }
+
+    #[tokio::test]
+    async fn relation_rows_are_queryable_by_label_and_the_schema_is_reported() {
+        let plan = relation_plan(4, "cvd_codes");
+        let (result, schemas) = run_plan(
+            0,
+            limits(1_000, 1_000),
+            &plan,
+            "SELECT code FROM cvd_codes WHERE inactive IS NULL OR inactive = FALSE ORDER BY code",
+        )
+        .await
+        .expect("runs");
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][0], Some(json!("c0")));
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].columns[4].fhir_type, ColumnFhirType::Boolean);
+    }
+
+    #[tokio::test]
+    async fn relation_over_the_row_cap_is_named_with_terminology_wording() {
+        let plan = relation_plan(3, "cvd_codes");
+        let Err(err) = run_plan(0, limits(2, 1_000), &plan, "SELECT * FROM cvd_codes").await else {
+            panic!("expected the row cap to fire");
+        };
+        match err {
+            SqlQueryError::DependencyRowCapExceeded {
+                label,
+                kind,
+                view,
+                max,
+            } => {
+                assert_eq!(label, "cvd_codes");
+                assert_eq!(kind, DependencyKind::ValueSet);
+                assert_eq!(view, "cvd");
+                assert_eq!(max, 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        let text = SqlQueryError::DependencyRowCapExceeded {
+            label: "cvd_codes".into(),
+            kind: DependencyKind::ValueSet,
+            view: "cvd".into(),
+            max: 2,
+        }
+        .to_string();
+        assert!(
+            text.contains("more than 2 members") && text.contains("Narrow the value set"),
+            "{text}"
         );
     }
 }

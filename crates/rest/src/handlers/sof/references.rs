@@ -5,6 +5,7 @@
 //! with a `|version` suffix). This module centralises the resolution so both
 //! handlers stay in sync.
 
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use helios_persistence::core::SofError;
 use helios_persistence::core::search::SearchProvider;
@@ -67,12 +68,34 @@ where
     resolve_by_canonical_url(state, tenant, resource_type, trimmed).await
 }
 
-async fn resolve_by_canonical_url<S>(
+/// One stored resource whose `url`/`version` satisfy a canonical reference,
+/// before any selection among several (#1824, `[R5-2]`). The transaction
+/// overlay (`handlers::sof::terminology_materialize`) needs the full list so
+/// it can drop candidates the bundle deletes or replaces *before* choosing,
+/// never after; the direct resolver picks the newest with
+/// [`select_newest`].
+#[derive(Debug, Clone)]
+pub(crate) struct CanonicalCandidate {
+    /// The stored resource's id.
+    pub id: String,
+    /// When the stored version was written, when known.
+    pub last_modified: Option<DateTime<Utc>>,
+    /// The stored resource's content.
+    pub resource: Value,
+}
+
+/// Every stored `resource_type` whose canonical identity satisfies `url`
+/// (`url`, `url|version` or `url@version`), via `SearchProvider::search`
+/// with `url=` (and `version=` when pinned), re-checked with
+/// [`canonical_matches`]; on a backend without a search index, via a scan of
+/// the type. An empty list means nothing matched; a backend with neither
+/// search nor scan answers `501`.
+pub(crate) async fn canonical_candidates<S>(
     state: &AppState<S>,
     tenant: &TenantContext,
     resource_type: &str,
     url: &str,
-) -> Result<Value, RestError>
+) -> Result<Vec<CanonicalCandidate>, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
@@ -107,7 +130,7 @@ where
         // type instead; definitions are few, so matching them in process is
         // cheap.
         Err(StorageError::Backend(BackendError::UnsupportedCapability { .. })) => {
-            return resolve_by_scan(state, tenant, resource_type, url).await;
+            return scan_candidates(state, tenant, resource_type, url).await;
         }
         Err(e) => {
             return Err(RestError::InternalError {
@@ -121,42 +144,58 @@ where
     // re-checking with the same [`canonical_matches`] predicate used for the
     // `context` list keeps storage and inline lookups provably consistent
     // rather than trusting two independently-implemented notions of "matches".
-    let candidates: Vec<_> = result
+    Ok(result
         .resources
         .items
         .into_iter()
         .filter(|r| canonical_matches(r.content(), url))
-        .collect();
-    if candidates.is_empty() {
-        // SoF v2 spec maps "Library or ViewDefinition not found" to 404.
-        // Use the full canonical URL (including any |version) as the
-        // identifier in the NotFound payload so the client sees what we
-        // tried to resolve.
-        return Err(RestError::NotFound {
-            resource_type: resource_type.to_string(),
-            id: url.to_string(),
-        });
-    }
-    let chosen = candidates
-        .into_iter()
-        .max_by_key(|r| r.last_modified())
-        .ok_or_else(|| RestError::InternalError {
-            message: "unreachable: candidates was non-empty".into(),
-        })?;
-    Ok(chosen.content().clone())
+        .map(|r| CanonicalCandidate {
+            id: r.id().to_string(),
+            last_modified: Some(r.last_modified()),
+            resource: r.content().clone(),
+        })
+        .collect())
 }
 
-/// Resolves a canonical on a backend that has no search, by scanning the
-/// resource type and applying [`canonical_matches`] in process.
-///
-/// A backend with neither search nor scan cannot resolve canonicals at all;
-/// that is a capability gap and answers `501` with the reason, never a `500`.
-async fn resolve_by_scan<S>(
+/// The rule both the search path and the scan path apply when several
+/// stored resources satisfy one canonical: the most recently updated wins
+/// (the last of equal keys, as `max_by_key` keeps it).
+pub(crate) fn select_newest(candidates: Vec<CanonicalCandidate>) -> Option<CanonicalCandidate> {
+    candidates.into_iter().max_by_key(|c| c.last_modified)
+}
+
+async fn resolve_by_canonical_url<S>(
     state: &AppState<S>,
     tenant: &TenantContext,
     resource_type: &str,
     url: &str,
 ) -> Result<Value, RestError>
+where
+    S: SearchProvider + Send + Sync + 'static,
+{
+    let candidates = canonical_candidates(state, tenant, resource_type, url).await?;
+    // SoF v2 spec maps "Library or ViewDefinition not found" to 404. Use the
+    // full canonical URL (including any |version) as the identifier in the
+    // NotFound payload so the client sees what we tried to resolve.
+    select_newest(candidates)
+        .map(|c| c.resource)
+        .ok_or_else(|| RestError::NotFound {
+            resource_type: resource_type.to_string(),
+            id: url.to_string(),
+        })
+}
+
+/// Collects the candidates on a backend that has no search, by scanning the
+/// resource type and applying [`canonical_matches`] in process.
+///
+/// A backend with neither search nor scan cannot resolve canonicals at all;
+/// that is a capability gap and answers `501` with the reason, never a `500`.
+async fn scan_candidates<S>(
+    state: &AppState<S>,
+    tenant: &TenantContext,
+    resource_type: &str,
+    url: &str,
+) -> Result<Vec<CanonicalCandidate>, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
@@ -175,45 +214,54 @@ where
         .map_err(|e| RestError::InternalError {
             message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
         })?;
-    newest_canonical_match(resources, url)
+    scanned_canonical_candidates(resources, url)
         .await
         .map_err(|e| RestError::InternalError {
             message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-        })?
-        .ok_or_else(|| RestError::NotFound {
-            resource_type: resource_type.to_string(),
-            id: url.to_string(),
         })
 }
 
-/// Picks, among the scanned resources, the one [`canonical_matches`] selects
-/// for `url` — the most recently updated when several versions match, which is
-/// the rule the search path applies through `last_modified`.
-///
-/// Folds over the scan stream keeping only the running best, so a canonical
-/// lookup on a search-less backend costs one resource of memory rather than
-/// the whole resource type.
-async fn newest_canonical_match(
+/// Every scanned resource [`canonical_matches`] selects for `url`. Only the
+/// matches are retained, so a canonical lookup on a search-less backend
+/// costs the matching definitions of memory, not the whole resource type.
+async fn scanned_canonical_candidates(
     resources: ResourceStream,
     url: &str,
-) -> Result<Option<Value>, SofError> {
+) -> Result<Vec<CanonicalCandidate>, SofError> {
     let mut resources = resources;
-    let mut best: Option<(Option<chrono::DateTime<chrono::FixedOffset>>, Value)> = None;
+    let mut candidates = Vec::new();
     while let Some(resource) = resources.next().await {
         let resource = resource?;
         if !canonical_matches(&resource, url) {
             continue;
         }
-        let stamp = resource
+        let last_modified = resource
             .pointer("/meta/lastUpdated")
             .and_then(Value::as_str)
-            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok());
-        // `>=` mirrors `max_by_key`, which keeps the last of equal keys.
-        if best.as_ref().is_none_or(|(seen, _)| stamp >= *seen) {
-            best = Some((stamp, resource));
-        }
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+            .map(|stamp| stamp.with_timezone(&Utc));
+        candidates.push(CanonicalCandidate {
+            id: resource
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            last_modified,
+            resource,
+        });
     }
-    Ok(best.map(|(_, resource)| resource))
+    Ok(candidates)
+}
+
+/// Picks, among the scanned resources, the one [`canonical_matches`] selects
+/// for `url` — the most recently updated when several versions match, which is
+/// the rule the search path applies through `last_modified`.
+#[cfg(test)]
+async fn newest_canonical_match(
+    resources: ResourceStream,
+    url: &str,
+) -> Result<Option<Value>, SofError> {
+    Ok(select_newest(scanned_canonical_candidates(resources, url).await?).map(|c| c.resource))
 }
 
 /// The one canonical-matching rule shared by storage lookups

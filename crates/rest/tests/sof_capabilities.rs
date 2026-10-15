@@ -186,8 +186,9 @@ mod sof_capability_tests {
         assert_eq!(body["instance"], false);
     }
 
-    /// The three subject-naming parameters are declared; the parameters we
-    /// reject are omitted, which is how a client learns not to send them.
+    /// The three subject-naming parameters and `context` (#1824) are
+    /// declared; the parameters we reject are omitted, which is how a client
+    /// learns not to send them.
     #[tokio::test]
     async fn test_operation_definition_declares_the_supported_subset() {
         let server = create_test_server().await;
@@ -205,15 +206,18 @@ mod sof_capability_tests {
             .filter_map(|p| p["name"].as_str())
             .collect();
 
-        for supported in ["subjectCanonical", "subjectReference", "subjectResource"] {
+        for supported in [
+            "subjectCanonical",
+            "subjectReference",
+            "subjectResource",
+            "context",
+        ] {
             assert!(names.contains(&supported), "{supported} missing: {names:?}");
         }
-        for unsupported in ["context", "source"] {
-            assert!(
-                !names.contains(&unsupported),
-                "{unsupported} is rejected and must not be declared: {names:?}"
-            );
-        }
+        assert!(
+            !names.contains(&"source"),
+            "source is rejected and must not be declared: {names:?}"
+        );
     }
 
     /// `_format` carries the guide's `OutputFormatCodes` binding, so a client

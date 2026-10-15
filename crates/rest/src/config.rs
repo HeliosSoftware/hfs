@@ -1588,6 +1588,64 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
     pub sof_sqlquery_timeout_secs: u64,
 
+    /// Most distinct members (rows) a terminology relation — a ValueSet's
+    /// expansion or a ConceptMap's mappings, declared as a SQL Query
+    /// dependency (#1824) — may have, checked while the artifact is walked.
+    /// The visited-structure cap is fixed at 4 × this. Also the member cap
+    /// for an expansion HFS materializes on a Library or ValueSet write.
+    #[arg(
+        long,
+        env = "HFS_SOF_TERMINOLOGY_MAX_EXPANSION_MEMBERS",
+        default_value = "200000"
+    )]
+    pub sof_terminology_max_expansion_members: usize,
+
+    /// Most bytes one terminology artifact (ValueSet or ConceptMap) may be:
+    /// applied to a terminology server's response while it streams, to the
+    /// serialized resource before it is persisted, and at plan time to every
+    /// artifact a SQL Query depends on, from any source.
+    #[arg(
+        long,
+        env = "HFS_SOF_TERMINOLOGY_MAX_ARTIFACT_BYTES",
+        default_value = "8388608"
+    )]
+    pub sof_terminology_max_artifact_bytes: usize,
+
+    /// Most bytes one `$sql-run` request or `$sql-export` kick-off may retain
+    /// across every dependency artifact it caches and every terminology
+    /// relation it flattens (an accounting bound with a conservative
+    /// per-row factor, not a measured one).
+    #[arg(
+        long,
+        env = "HFS_SOF_TERMINOLOGY_MAX_JOB_BYTES",
+        default_value = "134217728"
+    )]
+    pub sof_terminology_max_job_bytes: usize,
+
+    /// What a Library or ValueSet write does about the terminology
+    /// dependencies it declares or satisfies (#1824): `strict` (default)
+    /// expands every ValueSet the Library depends on into HFS storage and
+    /// fails the write with 422 when it cannot; `lenient` warns and stores
+    /// the resource anyway; `off` never materializes (the Library then fails
+    /// at `$sql-run` time if a dependency has no expansion).
+    #[arg(
+        long,
+        env = "HFS_SOF_TERMINOLOGY_MATERIALIZE",
+        default_value = "strict"
+    )]
+    pub sof_terminology_materialize: String,
+
+    /// Total wall time, in seconds, one write may spend materializing all of
+    /// its terminology dependencies (sequentially, including calls to
+    /// `HFS_TERMINOLOGY_SERVER`). Must be lower than `HFS_REQUEST_TIMEOUT`;
+    /// raise the two together for very large value sets.
+    #[arg(
+        long,
+        env = "HFS_SOF_TERMINOLOGY_MATERIALIZE_BUDGET_SECS",
+        default_value = "20"
+    )]
+    pub sof_terminology_materialize_budget_secs: u64,
+
     /// Add an `X-HFS-Runner` response header naming the SQL-on-FHIR runner
     /// that served a `$sql-run` ViewDefinition request (e.g. `sqlite-indb`,
     /// `postgres-indb`, `in-process`).
@@ -1730,6 +1788,11 @@ impl Default for ServerConfig {
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
             sof_sqlquery_timeout_secs: 30,
+            sof_terminology_max_expansion_members: 200_000,
+            sof_terminology_max_artifact_bytes: 8 * 1024 * 1024,
+            sof_terminology_max_job_bytes: 128 * 1024 * 1024,
+            sof_terminology_materialize: "strict".to_string(),
+            sof_terminology_materialize_budget_secs: 20,
             sof_runner_header: false,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
@@ -1924,6 +1987,24 @@ impl ServerConfig {
             errors.append(&mut validation_errors);
         }
 
+        if !matches!(
+            self.sof_terminology_materialize.as_str(),
+            "strict" | "lenient" | "off"
+        ) {
+            errors.push(format!(
+                "HFS_SOF_TERMINOLOGY_MATERIALIZE must be strict, lenient or off, got '{}'",
+                self.sof_terminology_materialize
+            ));
+        }
+
+        if self.sof_terminology_materialize_budget_secs >= self.request_timeout {
+            errors.push(format!(
+                "HFS_SOF_TERMINOLOGY_MATERIALIZE_BUDGET_SECS ({}) must be lower than \
+                 HFS_REQUEST_TIMEOUT ({}); raise the two together",
+                self.sof_terminology_materialize_budget_secs, self.request_timeout
+            ));
+        }
+
         // Remote terminology checking needs a terminology server to call.
         if self.validation.terminology == "remote" && self.terminology_server.is_none() {
             errors.push(
@@ -2013,6 +2094,12 @@ impl ServerConfig {
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
             sof_sqlquery_timeout_secs: 30,
+            sof_terminology_max_expansion_members: 200_000,
+            sof_terminology_max_artifact_bytes: 8 * 1024 * 1024,
+            sof_terminology_max_job_bytes: 128 * 1024 * 1024,
+            sof_terminology_materialize: "strict".to_string(),
+            // Below `for_testing`'s 5 s request timeout, as `validate` requires.
+            sof_terminology_materialize_budget_secs: 2,
             sof_runner_header: false,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),

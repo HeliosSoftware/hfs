@@ -14,6 +14,7 @@ pub mod library;
 pub mod output;
 pub mod params;
 pub mod scan;
+pub mod terminology;
 
 pub use bind::{BINDABLE_PARAMETER_TYPES, BoundParam, bind_supplied_params};
 pub use engine::{ColumnFhirType, InMemorySqlEngine, QueryResult, TableSchema};
@@ -23,19 +24,58 @@ pub use params::{SqlQueryRunParams, extract_sqlquery_params_from_json};
 pub use scan::{
     Placeholder, ScanError, ScanResult, SourcePosition, TableRef, scan_sql, undeclared_tables,
 };
+pub use terminology::{
+    CONCEPT_MAP_COLUMNS, ConceptMapRow, FlattenLimits, TerminologyContentError, VALUE_SET_COLUMNS,
+    ValueSetRow, concept_map_schema, estimate_json_bytes, expand_enumerated_compose,
+    flatten_concept_map, flatten_value_set, local_expansion, row_bytes, value_set_schema,
+};
 
 use std::fmt;
 
 use thiserror::Error;
 
 /// The kind of artifact a `depends-on` dependency resolves to. Used to word
-/// [`SqlQueryError::DependencyRowCapExceeded`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [`SqlQueryError::DependencyRowCapExceeded`] and
+/// [`SqlQueryError::TerminologyContent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencyKind {
     /// A leaf ViewDefinition, materialized by the wired SQL-on-FHIR runner.
     ViewDefinition,
     /// An interior SQL View Library, materialized by running its SQL.
     SqlView,
+    /// A ValueSet exposed as a value set relation from its expansion
+    /// ([`terminology::flatten_value_set`]).
+    ValueSet,
+    /// A ConceptMap exposed as a concept map relation
+    /// ([`terminology::flatten_concept_map`]).
+    ConceptMap,
+}
+
+impl DependencyKind {
+    /// Whether this kind is a terminology relation rather than a view.
+    pub fn is_terminology(self) -> bool {
+        matches!(self, Self::ValueSet | Self::ConceptMap)
+    }
+
+    /// What one row of this kind is called, for row-cap messages.
+    fn row_noun(self) -> &'static str {
+        match self {
+            Self::ViewDefinition | Self::SqlView => "rows",
+            Self::ValueSet => "members",
+            Self::ConceptMap => "mappings",
+        }
+    }
+
+    /// How to shrink a dependency of this kind, for row-cap messages.
+    fn narrowing_advice(self) -> &'static str {
+        match self {
+            Self::ViewDefinition | Self::SqlView => {
+                "Narrow the dependency with a ViewDefinition 'where'"
+            }
+            Self::ValueSet => "Narrow the value set",
+            Self::ConceptMap => "Narrow the concept map",
+        }
+    }
 }
 
 impl fmt::Display for DependencyKind {
@@ -43,6 +83,8 @@ impl fmt::Display for DependencyKind {
         match self {
             Self::ViewDefinition => f.write_str("ViewDefinition"),
             Self::SqlView => f.write_str("SQL View"),
+            Self::ValueSet => f.write_str("ValueSet"),
+            Self::ConceptMap => f.write_str("ConceptMap"),
         }
     }
 }
@@ -68,25 +110,38 @@ pub enum SqlQueryError {
     #[error("row limit exceeded ({max} rows)")]
     RowCapExceeded { max: usize },
 
-    /// A `depends-on` dependency (a ViewDefinition or a SQL View) produced
-    /// more rows than the per-dependency cap
+    /// A `depends-on` dependency (a ViewDefinition, a SQL View, a ValueSet
+    /// or a ConceptMap) produced more rows than the per-dependency cap
     /// (`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`). The engine's bare
     /// [`SqlQueryError::RowCapExceeded`] names neither the dependency nor
     /// the setting; the plan executor maps it to this variant, which does.
     /// `label` is the name the consuming SQL selects the dependency by, and
-    /// `view` is the ViewDefinition's or SQL View's name (or canonical URL
-    /// when it has no name).
+    /// `view` is the artifact's name (or canonical URL when it has no name).
+    /// The wording is kind-aware: a value set has members and is narrowed,
+    /// not filtered with a ViewDefinition `where`.
     #[error(
-        "dependency '{label}' ({kind} {view}) produced more than {max} rows; SQL queries \
-         materialize each dependency in full before the query's WHERE runs. Narrow the \
-         dependency with a ViewDefinition 'where', or raise \
-         HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
+        "dependency '{label}' ({kind} {view}) produced more than {max} {}; SQL queries \
+         materialize each dependency in full before the query's WHERE runs. {}, or raise \
+         HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD.",
+        kind.row_noun(), kind.narrowing_advice()
     )]
     DependencyRowCapExceeded {
         label: String,
         kind: DependencyKind,
         view: String,
         max: usize,
+    },
+
+    /// A terminology dependency resolved, but its content cannot be turned
+    /// into a relation (term-20: 422 before any SQL runs). `label` is the
+    /// name the consuming SQL selects it by and `url` the canonical it was
+    /// declared with.
+    #[error("dependency '{label}' ({kind} {url}): {error}")]
+    TerminologyContent {
+        kind: DependencyKind,
+        label: String,
+        url: String,
+        error: TerminologyContentError,
     },
 
     #[error("query exceeded {secs}s timeout")]
@@ -166,5 +221,52 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("ViewDefinition female_patients"), "{text}");
+    }
+
+    #[test]
+    fn dependency_row_cap_message_is_kind_aware_for_terminology() {
+        let err = SqlQueryError::DependencyRowCapExceeded {
+            label: "cvd_codes".to_string(),
+            kind: DependencyKind::ValueSet,
+            view: "http://example.org/ValueSet/cvd".to_string(),
+            max: 10,
+        };
+        let text = err.to_string();
+        assert!(
+            text.starts_with(
+                "dependency 'cvd_codes' (ValueSet http://example.org/ValueSet/cvd) produced \
+                 more than 10 members;"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Narrow the value set, or raise"), "{text}");
+        assert!(!text.contains("ViewDefinition 'where'"), "{text}");
+        let map = SqlQueryError::DependencyRowCapExceeded {
+            label: "m".to_string(),
+            kind: DependencyKind::ConceptMap,
+            view: "cm".to_string(),
+            max: 1,
+        }
+        .to_string();
+        assert!(
+            map.contains("more than 1 mappings") && map.contains("Narrow the concept map"),
+            "{map}"
+        );
+    }
+
+    #[test]
+    fn terminology_content_error_names_label_kind_and_url() {
+        let err = SqlQueryError::TerminologyContent {
+            kind: DependencyKind::ValueSet,
+            label: "cvd".to_string(),
+            url: "http://example.org/vs|1".to_string(),
+            error: TerminologyContentError::NoExpansion,
+        };
+        let text = err.to_string();
+        assert!(
+            text.starts_with("dependency 'cvd' (ValueSet http://example.org/vs|1): "),
+            "{text}"
+        );
+        assert!(text.contains("has no expansion"), "{text}");
     }
 }
