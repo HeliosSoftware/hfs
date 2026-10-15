@@ -139,10 +139,12 @@ in-process fallback.
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's), capped by the run's remaining budget; does not cover materializing a dependency (the run's budget does). Past it: `504` `timeout` |
 | `HFS_SOF_RUN_TIMEOUT_SECS` | `600` | Budget, seconds, of a streamed `$sql-run` (`_format=ndjson`, `parquet` or `arrow`, no `_limit`, no `Binary` envelope); every other `$sql-run` gets `HFS_REQUEST_TIMEOUT` − 2 s (min 1 s) or this if smaller. Past it: `504` `timeout`. 1 to 2147483 |
-| `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3` |
+| `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3`. Any other value fails startup; `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink |
-| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3` |
-| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`; startup fails without it |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink; defaults to `us-east-1` when `HFS_EXPORT_S3_ENDPOINT` is set |
+| `HFS_EXPORT_S3_ENDPOINT` | *(AWS)* | Custom S3 endpoint URL for the `s3` sink (e.g. MinIO); must be an `http(s)` URL with a host. Setting it forces path-style addressing |
+| `HFS_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Use path-style S3 addressing for the `s3` sink; forced on when `HFS_EXPORT_S3_ENDPOINT` is set |
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for `s3`, seconds (spec requires ≥ 24h) |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs; default size of the PostgreSQL export pool |
 | `HFS_EXPORT_JOB_TIMEOUT_SECS` | `3600` | Budget, seconds, of one export job, from when it starts running, never renewed; past it the job fails with result `504` `timeout`. 1 to 2147483 |

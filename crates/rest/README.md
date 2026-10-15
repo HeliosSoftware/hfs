@@ -350,7 +350,7 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 | `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local-FS output root. |
 | `HFS_BULK_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
 | `HFS_BULK_EXPORT_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO). |
-| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers. |
+| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers. Forced on when `HFS_BULK_EXPORT_S3_ENDPOINT` is set. |
 | `HFS_BULK_EXPORT_S3_REGION` | *(falls back to `HFS_S3_REGION`, then AWS chain)* | AWS region override for export output. |
 | `HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`** (no pre-signed URLs). |
 | `HFS_BULK_EXPORT_FILE_URL_TTL` | `3600` | Pre-signed download-URL lifetime, seconds. |
@@ -599,10 +599,12 @@ which subject failed without parsing the message.
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs (the subject's SQL and each SQL View's SQL), capped by what is left of the run's budget. It does not cover materializing a dependency, which the run's budget bounds. A statement past it ends the run with `504` (`timeout`); it was a `422`. |
 | `HFS_SOF_RUN_TIMEOUT_SECS` | `600` | Time budget, seconds, of a `$sql-run` that streams its rows (`_format=ndjson`, `parquet` or `arrow` without `_limit` and without the `Binary` envelope). Every other `$sql-run` (a `_limit` preview, a buffered format, a SQL Query) is bounded by `HFS_REQUEST_TIMEOUT` minus 2 s (at least 1 s), or by this if smaller, so it answers `504` (`timeout`) before the request timeout answers `408`. 1 to 2147483; any other value fails startup. |
 | `HFS_SOF_RUNNER_HEADER` | `false` | Add an `X-HFS-Runner` response header naming the runner that served a `$sql-run` ViewDefinition request (`sqlite-indb`, `postgres-indb`, `in-process`). Off by default: it discloses the storage backend; turn it on for debugging. |
-| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
+| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. Any other value fails startup, and `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false`. |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. Job directories and output files are created owner-only (`0700` / `0600`) on Unix. |
-| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
-| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`; startup fails without it. |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. Defaults to `us-east-1` when `HFS_EXPORT_S3_ENDPOINT` is set. |
+| `HFS_EXPORT_S3_ENDPOINT` | *(AWS)* | Custom S3 endpoint URL for the `s3` sink (e.g. MinIO). Must be an `http(s)` URL with a host, or startup fails. Setting it forces path-style addressing. |
+| `HFS_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Use path-style S3 addressing for the `s3` sink. Forced on when `HFS_EXPORT_S3_ENDPOINT` is set. |
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). Each URL is capped at the job's remaining `HFS_EXPORT_OUTPUT_TTL` retention (never below 60 s), so a late poll does not hand out a URL that outlives the object. |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. On PostgreSQL it is also the default size of the export connection pool (`HFS_EXPORT_PG_MAX_CONNECTIONS`). |
 | `HFS_EXPORT_JOB_TIMEOUT_SECS` | `3600` | Time budget, seconds, of one export job, counted from when it starts running (time queued for a slot does not count) and never renewed per subject or page. A job still running at the end of it fails, and its result answers `504` (`timeout`). On PostgreSQL it is also the export connections' session `statement_timeout`, as a backstop. 1 to 2147483; any other value fails startup. |

@@ -777,57 +777,56 @@ where
                 ),
             });
 
+            // `ServerConfig::validate` rejects every case below at startup;
+            // these panics are a backstop for embedders that build the app
+            // without calling it, so a bad sink never silently becomes `fs`.
+            let export_sink = config.export_sink.trim().to_lowercase();
+            match export_sink.as_str() {
+                "fs" | "s3" => {}
+                other => panic!("HFS_EXPORT_SINK must be 'fs' or 's3', got '{other}'"),
+            }
+
             #[cfg(feature = "s3")]
-            if config.export_sink.to_lowercase() == "s3" {
+            if export_sink == "s3" {
                 use crate::export::S3Sink;
                 let bucket = config
                     .export_s3_bucket
-                    .clone()
-                    .unwrap_or_else(|| "hfs-exports".to_string());
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        panic!("HFS_EXPORT_S3_BUCKET is required when HFS_EXPORT_SINK=s3")
+                    });
                 let region = config.export_s3_region.clone();
+                let endpoint = config.export_s3_endpoint.clone();
+                let force_path_style = config.export_s3_force_path_style;
                 let ttl = config.export_presign_ttl_secs;
 
                 info!(bucket = %bucket, "Export controller: InMemory + S3Sink");
 
-                match tokio::task::block_in_place(|| {
+                let sink = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(S3Sink::from_config(
                         bucket.clone(),
                         region,
+                        endpoint,
+                        force_path_style,
                         String::new(),
                         ttl,
                     ))
-                }) {
-                    Ok(sink) => Arc::new(
-                        InMemoryController::with_options(
-                            runner_for_export,
-                            sink,
-                            max_concurrency,
-                            shard_rows,
-                            cleanup,
-                        )
-                        .with_max_jobs_per_tenant(max_jobs_per_tenant)
-                        .with_job_budget(job_budget),
-                    ),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            dir = %config.export_dir,
-                            "S3 export sink init failed — falling back to FilesystemSink"
-                        );
-                        let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                        Arc::new(
-                            InMemoryController::with_options(
-                                runner_for_export,
-                                sink,
-                                max_concurrency,
-                                shard_rows,
-                                cleanup,
-                            )
-                            .with_max_jobs_per_tenant(max_jobs_per_tenant)
-                            .with_job_budget(job_budget),
-                        )
-                    }
-                }
+                })
+                .unwrap_or_else(|e| panic!("S3 export sink init failed: {e}"));
+                Arc::new(
+                    InMemoryController::with_options(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                        cleanup,
+                    )
+                    .with_max_jobs_per_tenant(max_jobs_per_tenant)
+                    .with_job_budget(job_budget),
+                )
             } else {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
@@ -846,6 +845,12 @@ where
 
             #[cfg(not(feature = "s3"))]
             {
+                if export_sink == "s3" {
+                    panic!(
+                        "HFS_EXPORT_SINK=s3 requires the 's3' feature. \
+                         Build with: cargo build -p helios-hfs --features s3"
+                    );
+                }
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
                 Arc::new(
@@ -935,6 +940,8 @@ where
                 ),
                 ..default_sub_config
             };
+            let sub_config =
+                subscription_dispatch_config(sub_config, |name| std::env::var(name).ok());
             // Outbound auth provider was built above (static bearer when
             // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
             let public_url = PublicUrl::parse(&config.base_url)
@@ -1299,6 +1306,58 @@ fn subscription_bool_from_env(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Parse an explicit value so validation tests need no process-env mutation.
+#[cfg(feature = "subscriptions")]
+fn subscription_dispatch_limit(name: &str, value: Option<&str>, default: usize) -> usize {
+    let Some(value) = value else {
+        return default;
+    };
+    match value.trim().parse::<usize>() {
+        Ok(limit) if limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS => limit,
+        _ => {
+            warn!(
+                setting = name,
+                configured = value,
+                effective = default,
+                "Invalid subscription dispatch limit; using default"
+            );
+            default
+        }
+    }
+}
+
+#[cfg(feature = "subscriptions")]
+fn subscription_dispatch_config(
+    mut config: helios_subscriptions::SubscriptionConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> helios_subscriptions::SubscriptionConfig {
+    for (name, field) in [
+        (
+            "HFS_SUBSCRIPTION_EVENT_QUEUE_CAPACITY",
+            &mut config.event_queue_capacity,
+        ),
+        (
+            "HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS",
+            &mut config.max_pending_notifications,
+        ),
+        (
+            "HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY",
+            &mut config.per_subscription_queue_capacity,
+        ),
+        (
+            "HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY",
+            &mut config.dispatch_concurrency,
+        ),
+        (
+            "HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY",
+            &mut config.handshake_concurrency,
+        ),
+    ] {
+        *field = subscription_dispatch_limit(name, lookup(name).as_deref(), *field);
+    }
+    config
+}
+
 #[cfg(feature = "subscriptions")]
 fn subscription_u32_from_env(name: &str, default: u32) -> u32 {
     std::env::var(name)
@@ -1492,6 +1551,42 @@ mod builder_tests {
         config
     }
 
+    #[tokio::test]
+    #[should_panic(expected = "HFS_EXPORT_SINK must be 'fs' or 's3'")]
+    async fn unrecognised_export_sink_panics() {
+        let mut config = ServerConfig::default();
+        config.sof_enabled = true;
+        config.export_sink = "aws".to_string();
+        let _app: Router = create_app_with_auth_and_bulk(
+            backend(),
+            config,
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[tokio::test]
+    #[should_panic(expected = "requires the 's3' feature")]
+    async fn export_sink_s3_without_feature_panics() {
+        let mut config = ServerConfig::default();
+        config.sof_enabled = true;
+        config.export_sink = "s3".to_string();
+        config.export_s3_bucket = Some("hfs-sql-export".to_string());
+        let _app: Router = create_app_with_auth_and_bulk(
+            backend(),
+            config,
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
     /// The generic bulk builder wires a router with no bundles (bulk export and
     /// bulk submit both disabled).
     #[tokio::test]
@@ -1522,5 +1617,122 @@ mod builder_tests {
             None,
             Some(settings),
         );
+    }
+}
+
+#[cfg(all(test, feature = "subscriptions"))]
+mod subscription_dispatch_config_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_env_missing_preserves_defaults() {
+        let defaults = helios_subscriptions::SubscriptionConfig::default();
+        let config = subscription_dispatch_config(defaults.clone(), |_| None);
+        let engine = helios_subscriptions::SubscriptionEngine::new(
+            config,
+            "https://example.org/fhir".into(),
+        );
+        let actual = engine.dispatch_snapshot();
+        assert_eq!(actual.event_queue_capacity, defaults.event_queue_capacity);
+        assert_eq!(
+            actual.max_pending_notifications,
+            defaults.max_pending_notifications
+        );
+        assert_eq!(
+            actual.per_subscription_queue_capacity,
+            defaults.per_subscription_queue_capacity
+        );
+        assert_eq!(actual.dispatch_concurrency, defaults.dispatch_concurrency);
+        assert_eq!(actual.handshake_concurrency, defaults.handshake_concurrency);
+    }
+
+    #[test]
+    fn dispatch_env_wires_all_five_limits_and_engine_normalization() {
+        let config = subscription_dispatch_config(
+            helios_subscriptions::SubscriptionConfig::default(),
+            |name| {
+                Some(
+                    match name {
+                        "HFS_SUBSCRIPTION_EVENT_QUEUE_CAPACITY" => " 7 ",
+                        "HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS" => "3",
+                        "HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY" => "9",
+                        "HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY" => "2",
+                        "HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY" => "1",
+                        _ => panic!("unknown dispatch setting: {name}"),
+                    }
+                    .to_string(),
+                )
+            },
+        );
+        let engine = helios_subscriptions::SubscriptionEngine::new(
+            config,
+            "https://example.org/fhir".into(),
+        );
+        let actual = engine.dispatch_snapshot();
+        assert_eq!(actual.event_queue_capacity, 7);
+        assert_eq!(actual.max_pending_notifications, 3);
+        assert_eq!(actual.per_subscription_queue_capacity, 3);
+        assert_eq!(actual.dispatch_concurrency, 2);
+        assert_eq!(actual.handshake_concurrency, 1);
+    }
+
+    #[test]
+    fn dispatch_env_invalid_values_warn_and_use_defaults() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Writer(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for input in [
+                "",
+                "   ",
+                "nope",
+                "0",
+                "-1",
+                "184467440737095516160",
+                &(tokio::sync::Semaphore::MAX_PERMITS + 1).to_string(),
+            ] {
+                assert_eq!(
+                    subscription_dispatch_limit("LIMIT", Some(input), 17),
+                    17,
+                    "{input:?}"
+                );
+            }
+            assert_eq!(subscription_dispatch_limit("LIMIT", Some(" 23 "), 17), 23);
+            assert_eq!(
+                subscription_dispatch_limit(
+                    "LIMIT",
+                    Some(&tokio::sync::Semaphore::MAX_PERMITS.to_string()),
+                    17
+                ),
+                tokio::sync::Semaphore::MAX_PERMITS
+            );
+        });
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            output
+                .matches("Invalid subscription dispatch limit; using default")
+                .count(),
+            7,
+            "{output}"
+        );
+        assert!(output.contains("LIMIT"));
+        assert!(output.contains("effective=17"));
     }
 }

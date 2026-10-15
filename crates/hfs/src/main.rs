@@ -109,6 +109,16 @@ fn parse_env_bool(var: &str, default_value: bool) -> bool {
         .unwrap_or(default_value)
 }
 
+/// An S3 endpoint override, or `None` when it is unset or blank — so an empty
+/// `HFS_*_S3_ENDPOINT=` neither replaces the AWS endpoint nor forces
+/// path-style addressing.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+fn non_blank_endpoint(endpoint: Option<String>) -> Option<String> {
+    endpoint
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+}
+
 /// The `HFS_S3_*` variables that decide where tenants live on S3, read as raw
 /// strings so [`resolve`](Self::resolve) can be unit-tested without touching
 /// the process environment (#1598).
@@ -2568,14 +2578,17 @@ where
                     .ok()
                     .or_else(|| std::env::var("HFS_S3_REGION").ok());
                 let sdk_config = AwsS3Client::load_sdk_config(region.as_deref()).await;
+                let endpoint_url =
+                    non_blank_endpoint(std::env::var("HFS_BULK_EXPORT_S3_ENDPOINT").ok());
+                // A custom endpoint forces path-style addressing, as for the
+                // S3 storage backend and the `$sql-export` S3 sink.
+                let force_path_style = endpoint_url.is_some()
+                    || parse_env_bool("HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE", false);
                 let client = Arc::new(AwsS3Client::from_sdk_config_with_options(
                     &sdk_config,
                     AwsS3ClientOptions {
-                        endpoint_url: std::env::var("HFS_BULK_EXPORT_S3_ENDPOINT").ok(),
-                        force_path_style: parse_env_bool(
-                            "HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE",
-                            false,
-                        ),
+                        endpoint_url,
+                        force_path_style,
                     },
                 ));
                 Arc::new(S3OutputStore::new(
@@ -4596,6 +4609,17 @@ mod tests {
     use super::*;
     use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
+
+    #[test]
+    fn non_blank_endpoint_drops_unset_and_blank_values() {
+        assert_eq!(non_blank_endpoint(None), None);
+        assert_eq!(non_blank_endpoint(Some(String::new())), None);
+        assert_eq!(non_blank_endpoint(Some("   ".to_string())), None);
+        assert_eq!(
+            non_blank_endpoint(Some(" http://localhost:9000 ".to_string())),
+            Some("http://localhost:9000".to_string())
+        );
+    }
 
     // ── S3 tenancy from the environment (#1598) ───────────────────
 
