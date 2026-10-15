@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -24,6 +25,8 @@ IMPORT = "import, `POST /` transaction Bundles"  # Errors label; Throughput and 
 IMPORT_ROW = IMPORT + " (resources/s)"
 BULK = "bulk-import, `$bulk-submit`"
 BULK_ROW = BULK + " (resources/s)"
+INGEST_ROW = "bulk-import ingest (resources/s, seconds)"
+INDEX_ROW = "bulk-import initial index (seconds)"
 REINDEX = "reindex, `$reindex` Encounter"
 REINDEX_ROW = REINDEX + " (resources/s)"
 _guard = {"on": False}
@@ -342,7 +345,11 @@ class CompareLegsTest(unittest.TestCase):
         md = render(self.root, ["sqlite", "postgres"], tests="prewarm,import,crud,search")
         self.assertNotIn("| reindex", md)  # not requested, nothing written (older runs)
         self.assertNotIn(cl.REINDEX_NOTE, md)
-        md = render(self.root, ["sqlite", "postgres", "mongodb"])  # tests=all includes indexing
+        md = render(self.root, ["sqlite", "postgres", "mongodb"])  # tests=all: indexing is opt-in
+        self.assertNotIn("| reindex", md)
+        self.assertNotIn(cl.REINDEX_NOTE, md)
+        md = render(self.root, ["sqlite", "postgres", "mongodb"],
+                    tests="prewarm,import,crud,search,indexing,insert,bulk-import")  # named
         for heading, name in (("Throughput", REINDEX_ROW), ("p95", REINDEX), ("Errors", REINDEX)):
             name = name.replace(" Encounter", "")  # no leg reindexed anything
             self.assertEqual(row(md, heading, name),
@@ -360,6 +367,23 @@ class CompareLegsTest(unittest.TestCase):
         md = render(unasked, ["sqlite"], tests="prewarm,import,crud,search")
         self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 |")
         self.assertIn(cl.REINDEX_NOTE, md)
+
+    def test_indexing_not_in_default_suites(self):
+        self.assertNotIn("indexing", cl.CANONICAL_SUITES)
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
+        md = render(self.root, ["sqlite"])  # tests=all, but the leg wrote indexing.txt
+        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 |")
+        self.assertIn(cl.REINDEX_NOTE, md)
+
+    def test_canonical_matches_workflow(self):
+        # the suites tests=all runs are listed in two places; keep them in step
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "..", "..", "workflows", "fhir-benchmark.yml")
+        with open(path, encoding="utf-8") as fh:
+            m = re.search(r'CANONICAL="([^"]+)"', fh.read())
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), " ".join(cl.CANONICAL_SUITES))
+        self.assertNotIn("indexing", m.group(1).split())
 
     def test_reindex_label_names_one_type_only(self):
         put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
@@ -403,8 +427,9 @@ class CompareLegsTest(unittest.TestCase):
                 "indexing.txt": indexing(), "bulk-import.txt": bulk_txt(),
                 "insert.json": summary(800.0, 90.0), "insert.log": "k6\n"}))
         md = render(self.root, ["sqlite", "postgres"])
-        self.assertEqual(labels(md, "Throughput"), ["prewarm", IMPORT_ROW, BULK_ROW, REINDEX_ROW,
-                                                    "crud", "search", INSERT_ROW])
+        self.assertEqual(labels(md, "Throughput"),
+                         ["prewarm", IMPORT_ROW, BULK_ROW, INGEST_ROW, INDEX_ROW, REINDEX_ROW,
+                          "crud", "search", INSERT_ROW])
         self.assertEqual(labels(md, "p95"), ["prewarm", IMPORT + " (per Bundle)", BULK, REINDEX,
                                              "crud", "search", "insert"])
         self.assertEqual(labels(md, "Errors"), ["prewarm", IMPORT, BULK, REINDEX,
@@ -422,7 +447,8 @@ class CompareLegsTest(unittest.TestCase):
         md = render(self.root, ["sqlite", "postgres"],
                     tests="prewarm,crud,bulk-import,search,import,indexing")
         self.assertEqual(labels(md, "Throughput"),
-                         ["prewarm", "crud", IMPORT_ROW, BULK_ROW, REINDEX_ROW, "search"])
+                         ["prewarm", "crud", IMPORT_ROW, BULK_ROW, INGEST_ROW, INDEX_ROW,
+                          REINDEX_ROW, "search"])
         for suite in ("crud", "search"):  # shown after import, still marked as run before it
             self.assertTrue(row(md, "Throughput", suite).endswith("100 † |"), suite)
         self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | **1,200** | **1,200** |")
@@ -436,6 +462,14 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(row(md, "p95", BULK),
                          "| " + BULK + " | n/a (one async job) | n/a (one async job) |")
         self.assertEqual(row(md, "Errors", BULK), "| " + BULK + " | 0.0% | 0.0% |")
+        # the two phases sit right under the combined row, in the Throughput table only
+        self.assertEqual(row(md, "Throughput", INGEST_ROW),
+                         "| " + INGEST_ROW + " | **2,718** (600 s) | **2,718** (600 s) |")
+        self.assertEqual(row(md, "Throughput", INDEX_ROW),
+                         "| " + INDEX_ROW + " | **1,800 s** | **1,800 s** |")
+        for heading in ("p95", "Errors"):
+            self.assertNotIn(INGEST_ROW, labels(md, heading))
+            self.assertNotIn(INDEX_ROW, labels(md, heading))
         self.assertIn("### Bulk import (`$bulk-submit`)", md)
         table = md.split("### Bulk import", 1)[1]
         self.assertIn("| `sqlite` | ✓ | 1,630,685/1,630,685 | 600 s · 2,718/s | 1,800 s | 2,400 s | "
@@ -476,6 +510,148 @@ class CompareLegsTest(unittest.TestCase):
         md = render(self.root, ["sqlite"], tests="prewarm,import,crud,search")
         self.assertNotIn("| bulk-import", md)
         self.assertNotIn("### Bulk import", md)
+        self.assertNotIn(cl.BULK_PHASES_NOTE, md)
+
+    def test_bulk_phase_rows_deferred(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt()}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{"bulk-import.txt": bulk_txt(
+            ingest_seconds=500, ingest_resources_per_s=3261.4, index_seconds=587.4,
+            total_seconds=1087.4, resources_per_s=1499.6)}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", INGEST_ROW),
+                         "| " + INGEST_ROW + " | 2,718 (600 s) | **3,261** (500 s) |")
+        self.assertEqual(row(md, "Throughput", INDEX_ROW),
+                         "| " + INDEX_ROW + " | 1,800 s | **587 s** |")
+        self.assertEqual(labels(md, "Throughput"),
+                         ["prewarm", IMPORT_ROW, BULK_ROW, INGEST_ROW, INDEX_ROW,
+                          "crud", "search", INSERT_ROW])
+        for heading in ("p95", "Errors"):
+            self.assertNotIn(INGEST_ROW, labels(md, heading))
+            self.assertNotIn(INDEX_ROW, labels(md, heading))
+        self.assertIn(cl.BULK_PHASES_NOTE, md)
+        self.assertLess(md.index(cl.IMPORT_NOTE), md.index(cl.BULK_PHASES_NOTE))
+        self.assertLess(md.index(cl.BULK_PHASES_NOTE), md.index("### Leg health"))
+
+    def test_bulk_phase_rows_inline(self):
+        inline = dict(defer_indexing="false", index_status="inline", index_seconds=0,
+                      ingest_seconds=600, total_seconds=600, resources_per_s=2717.8)
+        # one leg deferred, one inline: their index times are different things
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt()}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "bulk-import.txt": bulk_txt(**inline)}))
+        md = render(self.root, ["sqlite", "postgres"])
+        index = row(md, "Throughput", INDEX_ROW)
+        self.assertEqual(index, "| " + INDEX_ROW + " | 1,800 s | inline (during ingest) |")
+        self.assertNotIn("**", index)
+        self.assertNotIn("**", row(md, "Throughput", INGEST_ROW))  # mixed: no best either
+        self.assertEqual(row(md, "Throughput", BULK_ROW), "| " + BULK_ROW + " | 680 | **2,718** |")
+        table = md.split("### Bulk import", 1)[1]
+        self.assertIn("| `postgres` | ✓ | 1,630,685/1,630,685 | 600 s · 2,718/s | "
+                      "inline (during ingest) | 600 s |", table)
+        # every leg inline: the ingest rows still compare, the index row has nothing to rank
+        other = os.path.join(self.root, "all-inline")
+        put_dir(other, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt(
+            **dict(inline, ingest_resources_per_s=2000.0))}))
+        put_dir(other, "postgres", leg_files("postgres", **{
+            "bulk-import.txt": bulk_txt(**inline)}))
+        md = render(other, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", INGEST_ROW),
+                         "| " + INGEST_ROW + " | 2,000 (600 s) | **2,718** (600 s) |")
+        self.assertEqual(row(md, "Throughput", INDEX_ROW),
+                         "| " + INDEX_ROW + " | inline (during ingest) | inline (during ingest) |")
+        # indexing off in the ingest, but a follow-up rebuild of the types the index rejected
+        rebuild = os.path.join(self.root, "rebuild")
+        put_dir(rebuild, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt(
+            defer_indexing="false", index_status="completed", index_seconds=12,
+            total_seconds=612)}))
+        md = render(rebuild, ["sqlite"])
+        self.assertEqual(row(md, "Throughput", INDEX_ROW),
+                         "| " + INDEX_ROW + " | inline (during ingest) + 12 s rebuild |")
+        self.assertIn("| inline (during ingest) + 12 s rebuild |",
+                      md.split("### Bulk import", 1)[1])
+
+    def test_bulk_phase_rows_na_and_markers(self):
+        legs = ["sqlite", "postgres", "mongodb", "sqlite-elasticsearch", "postgres-elasticsearch",
+                "mongodb-elasticsearch"]
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt(
+            resources_ok=1610685, resources_failed=20000)}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{"bulk-import.txt": bulk_txt(
+            searchable="no", check_observation_code=30000)}))
+        put_dir(self.root, "mongodb", leg_files("mongodb", **{"bulk-import.txt": bulk_txt(
+            "timeout", reason="index phase after 3,600 s", phase="index", index_status="",
+            index_seconds="", total_seconds="", resources_per_s="")}))
+        put_dir(self.root, "sqlite-elasticsearch", leg_files("sqlite-elasticsearch", **{
+            "es-drain.txt": "status=drained\nmissing=0\n",
+            "bulk-import.txt": bulk_txt(
+                "timeout", reason="ingest after 3,600 s", phase="ingest", ingest_seconds="",
+                ingest_resources_per_s="", index_status="", index_seconds="",
+                total_seconds="", resources_per_s="")}))
+        put_dir(self.root, "postgres-elasticsearch", leg_files("postgres-elasticsearch"))
+        md = render(self.root, legs)  # mongodb-elasticsearch is in the matrix with no artifact
+
+        def cells(label):
+            return [c.strip() for c in row(md, "Throughput", label).split("|")[2:-1]]
+
+        ingest, index = cells(INGEST_ROW), cells(INDEX_ROW)
+        self.assertEqual(ingest[0], "2,718 (600 s) ‡")
+        self.assertEqual(index[0], "1,800 s")  # the failures were in the ingest
+        self.assertEqual(ingest[1], "2,718 (600 s)")
+        self.assertEqual(index[1], "1,800 s †")  # search came back short
+        # the ingest finished and was recorded; only the index phase did not
+        self.assertEqual(ingest[2], "2,718 (600 s)")
+        self.assertEqual(index[2], "n/a (timeout: index phase after 3,600 s)")
+        self.assertEqual(ingest[3], "n/a (timeout: ingest after 3,600 s)")
+        self.assertEqual(index[3], "n/a (timeout: ingest after 3,600 s)")
+        self.assertEqual(ingest[4], "n/a (not run)")
+        self.assertEqual(index[4], "n/a (not run)")
+        self.assertEqual(ingest[5], "n/a (no artifact)")
+        self.assertEqual(index[5], "n/a (no artifact)")
+        # a marker anywhere in a row means no best in it
+        self.assertNotIn("**", row(md, "Throughput", INGEST_ROW))
+        self.assertNotIn("**", row(md, "Throughput", INDEX_ROW))
+        # a rebuild that failed, and a container that died
+        other = os.path.join(self.root, "x")
+        put_dir(other, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt(
+            index_status="failed", searchable="no", check_observation_code=30000)}))
+        put_dir(other, "postgres", leg_files("postgres", **{
+            "containers-state.txt": "hfs-bench-pg-x OOMKilled=true Status=running\n",
+            "bulk-import.txt": bulk_txt()}))
+        put_dir(other, "mongodb", leg_files("mongodb", **{"bulk-import.txt": bulk_txt(
+            index_errors=3)}))
+        md = render(other, ["sqlite", "postgres", "mongodb"])
+        self.assertEqual(row(md, "Throughput", INDEX_ROW),
+                         "| " + INDEX_ROW + " | 1,800 s (failed) †‡ | 1,800 s ⚠ | 1,800 s ‡ |")
+        self.assertEqual(row(md, "Throughput", INGEST_ROW),
+                         "| " + INGEST_ROW + " | 2,718 (600 s) | 2,718 (600 s) ⚠ | 2,718 (600 s) |")
+
+    def test_bulk_phase_rows_old_artifacts(self):
+        # before ingest_* / index_* existed: only the combined figures were written
+        old = ("status=complete\nresources_submitted=1630685\nresources_ok=1630685\n"
+               "resources_failed=0\ntotal_seconds=2400\nresources_per_s=679.5\nsearchable=yes\n")
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"bulk-import.txt": old}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{"bulk-import.txt": bulk_txt(
+            ingest_seconds="", ingest_resources_per_s="", index_status="", index_seconds="",
+            resources_per_s=700.0)}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", INGEST_ROW),
+                         "| " + INGEST_ROW + " | n/a (no ingest timing) | n/a (no ingest timing) |")
+        self.assertEqual(row(md, "Throughput", INDEX_ROW),
+                         "| " + INDEX_ROW + " | n/a (no index timing) | n/a (no index timing) |")
+        self.assertEqual(row(md, "Throughput", BULK_ROW), "| " + BULK_ROW + " | 680 | **700** |")
+        table = md.split("### Bulk import", 1)[1]
+        self.assertIn("| `sqlite` | ✓ | 1,630,685/1,630,685 | n/a | n/a | 2,400 s |", table)
+
+    def test_bulk_phase_rows_no_crown_on_hardware_mismatch(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt()}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "runner-info.txt": "runner_name: x\nrunner_cpus: 4\nrunner_ram: 23G\ngithub_run: 100\n",
+            "bulk-import.txt": bulk_txt(ingest_seconds=500, ingest_resources_per_s=3261.4,
+                                        index_seconds=587.4)}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", INGEST_ROW),
+                         "| " + INGEST_ROW + " | 2,718 (600 s) | 3,261 (500 s) |")
+        self.assertEqual(row(md, "Throughput", INDEX_ROW),
+                         "| " + INDEX_ROW + " | 1,800 s | 587 s |")
 
     def test_never_raises(self):
         gone = os.path.join(self.root, "missing")
