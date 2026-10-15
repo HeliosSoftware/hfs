@@ -943,6 +943,7 @@ fn schema_from_query_result(result: &QueryResult) -> TableSchema {
             .map(|(name, ty)| ColumnSchema {
                 name: name.clone(),
                 fhir_type: ty.clone(),
+                ansi: None,
             })
             .collect(),
     }

@@ -55,10 +55,11 @@ use axum::{
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_sof::sqlquery::SqlQueryError;
+use helios_sof::sqlquery::engine::DeclaredColumn;
 use helios_sof::{
-    ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef, bind_supplied_params,
-    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library, scan_sql,
-    undeclared_tables,
+    AnsiType, ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef,
+    bind_supplied_params, default_for_fhir_type, extract_sqlquery_params_from_json,
+    format_fhir_parameters, parse_sqlquery_library, scan_sql, undeclared_tables,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -241,36 +242,35 @@ where
     // we materialized from a leaf ViewDefinition anywhere in the dependency
     // graph, prefer the VD-declared FHIR type. Walk leaves in plan order so
     // the lookup is deterministic when two VDs declare the same column name.
-    let mut name_to_type: std::collections::HashMap<String, ColumnFhirType> =
+    let mut name_to_type: std::collections::HashMap<String, (ColumnFhirType, Option<AnsiType>)> =
         std::collections::HashMap::new();
     for schema in &schemas_in_order {
         for col in &schema.columns {
             name_to_type
                 .entry(col.name.clone())
-                .or_insert_with(|| col.fhir_type.clone());
+                .or_insert_with(|| (col.fhir_type.clone(), col.ansi));
         }
     }
     for (i, col) in result.columns.iter().enumerate() {
-        if let Some(t) = name_to_type.get(col) {
+        if let Some((t, _)) = name_to_type.get(col) {
             result.column_types[i] = t.clone();
         }
     }
 
     // Typed Parquet/Arrow schema: only columns that match a declared leaf
-    // column by name are typed; the rest keep value-based inference, since
+    // column by name are typed (by the leaf's resolved SQL type, so an
+    // `ansi/type` tag is honoured); the rest keep value-based inference, since
     // an arbitrary SQL result has no declared types of its own.
-    let declared_types: Vec<helios_sof::ColumnTypeInfo> = result
+    let declared: Vec<DeclaredColumn> = result
         .columns
         .iter()
         .filter_map(|col| {
-            let t = name_to_type.get(col)?;
-            let code = t.code();
-            Some(helios_sof::ColumnTypeInfo {
+            let (t, ansi) = name_to_type.get(col)?;
+            Some(DeclaredColumn {
                 name: col.clone(),
-                fhir_type: Some(code.to_string()),
+                fhir_type: Some(t.clone()),
                 collection: false,
-                ansi: Some(helios_sof::default_for_fhir_type(code)),
-                overridden: false,
+                ansi: Some(ansi.unwrap_or_else(|| default_for_fhir_type(t.code()))),
             })
         })
         .collect();
@@ -281,13 +281,8 @@ where
         .or_else(|| parse_header_str(query.header.as_deref()))
         .unwrap_or(true);
     let wrap_in_binary = wants_fhir_binary(&format, headers);
-    let (content_type, body) = render_output(
-        &format,
-        include_header,
-        &result,
-        wrap_in_binary,
-        &declared_types,
-    )?;
+    let (content_type, body) =
+        render_output(&format, include_header, &result, wrap_in_binary, &declared)?;
     Ok(build_response(content_type, body))
 }
 
@@ -418,7 +413,7 @@ fn render_output(
     include_header: bool,
     result: &QueryResult,
     wrap_in_binary: bool,
-    declared_types: &[helios_sof::ColumnTypeInfo],
+    declared: &[helios_sof::sqlquery::engine::DeclaredColumn],
 ) -> Result<(&'static str, Vec<u8>), RestError> {
     match format {
         "fhir" | "application/fhir+json" => {
@@ -444,7 +439,7 @@ fn render_output(
                     ),
                 }
             })?;
-            let body = helios_sof::format_output_typed(processed, ct, None, declared_types)
+            let body = helios_sof::format_output_with_schema(processed, ct, None, declared)
                 .map_err(|e| RestError::InternalError {
                     message: format!("output formatter failed: {e}"),
                 })?;

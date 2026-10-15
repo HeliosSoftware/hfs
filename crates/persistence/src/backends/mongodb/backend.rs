@@ -209,6 +209,11 @@ pub struct MongoBackendConfig {
     #[serde(default = "default_probe_timeout_ms")]
     pub probe_timeout_ms: u64,
 
+    /// Soft MongoDB search budget, checked at command and matching-batch boundaries.
+    /// Unset preserves unbounded backend execution. The HTTP timeout is separate.
+    #[serde(default)]
+    pub search_timeout_ms: Option<u64>,
+
     /// MongoDB connection string.
     #[serde(default = "default_connection_string")]
     pub connection_string: String,
@@ -490,11 +495,25 @@ impl MongoBackendConfig {
                 self.probe_timeout_ms = raw
                     .parse::<u64>()
                     .ok()
-                    .filter(|value| valid_probe_timeout_ms(*value))
+                    .filter(|value| valid_mongodb_timeout_ms(*value))
                     .ok_or_else(|| {
                         "HFS_MONGODB_PROBE_TIMEOUT_MS must be an integer from 1 to 2147483647"
                             .to_owned()
                     })?;
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_SEARCH_TIMEOUT_MS") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.search_timeout_ms = Some(
+                    raw.parse::<u64>()
+                        .ok()
+                        .filter(|value| valid_mongodb_timeout_ms(*value))
+                        .ok_or_else(|| {
+                            "HFS_MONGODB_SEARCH_TIMEOUT_MS must be an integer from 1 to 2147483647"
+                                .to_owned()
+                        })?,
+                );
             }
         }
         use super::search_admission::BROAD_SEARCH_CONCURRENCY_ENV;
@@ -625,7 +644,7 @@ fn default_probe_timeout_ms() -> u64 {
     super::search_impl::DEFAULT_PROBE_TIMEOUT_MS
 }
 
-fn valid_probe_timeout_ms(value: u64) -> bool {
+fn valid_mongodb_timeout_ms(value: u64) -> bool {
     (1..=i32::MAX as u64).contains(&value)
 }
 
@@ -654,6 +673,7 @@ impl Default for MongoBackendConfig {
         Self {
             adaptive_offset_paging: default_adaptive_offset_paging(),
             probe_timeout_ms: default_probe_timeout_ms(),
+            search_timeout_ms: None,
             connection_string: default_connection_string(),
             database_name: default_database_name(),
             max_connections: default_max_connections(),
@@ -735,10 +755,20 @@ impl MongoBackend {
     /// Creates a new MongoDB backend from the provided configuration.
     pub fn new(config: MongoBackendConfig) -> StorageResult<Self> {
         Self::validate_connection_string(&config.connection_string)?;
-        if !valid_probe_timeout_ms(config.probe_timeout_ms) {
+        if !valid_mongodb_timeout_ms(config.probe_timeout_ms) {
             return Err(StorageError::Backend(BackendError::Internal {
                 backend_name: "mongodb".to_owned(),
                 message: "probe_timeout_ms must be an integer from 1 to 2147483647".to_owned(),
+                source: None,
+            }));
+        }
+        if config
+            .search_timeout_ms
+            .is_some_and(|value| !valid_mongodb_timeout_ms(value))
+        {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_owned(),
+                message: "search_timeout_ms must be an integer from 1 to 2147483647".to_owned(),
                 source: None,
             }));
         }
@@ -2078,6 +2108,93 @@ mod tests {
                 "invalid permit limit: {limit}"
             );
         }
+    }
+
+    #[test]
+    fn search_deadline_configuration_is_optional_and_validated() {
+        assert_eq!(MongoBackendConfig::default().search_timeout_ms, None);
+        for initial in [None, Some(2500)] {
+            for value in [None, Some(""), Some("  ")] {
+                let mut config = MongoBackendConfig {
+                    search_timeout_ms: initial,
+                    ..Default::default()
+                };
+                config
+                    .apply_search_env(|name| {
+                        (name == "HFS_MONGODB_SEARCH_TIMEOUT_MS")
+                            .then_some(value)
+                            .flatten()
+                            .map(str::to_owned)
+                    })
+                    .unwrap();
+                assert_eq!(config.search_timeout_ms, initial);
+            }
+        }
+        for (value, expected) in [("1", 1), (" 2500 ", 2500), ("2147483647", i32::MAX as u64)] {
+            let mut config = MongoBackendConfig::default();
+            config
+                .apply_search_env(|name| {
+                    (name == "HFS_MONGODB_SEARCH_TIMEOUT_MS").then(|| value.to_owned())
+                })
+                .unwrap();
+            assert_eq!(config.search_timeout_ms, Some(expected));
+            assert!(MongoBackend::new(config).is_ok());
+        }
+        for value in [
+            "0",
+            "-1",
+            "1.5",
+            "false",
+            "2147483648",
+            "18446744073709551616",
+        ] {
+            assert!(
+                MongoBackendConfig::default()
+                    .apply_search_env(
+                        |name| (name == "HFS_MONGODB_SEARCH_TIMEOUT_MS").then(|| value.to_owned())
+                    )
+                    .is_err()
+            );
+        }
+        for value in [0, i32::MAX as u64 + 1, u64::MAX] {
+            assert!(
+                MongoBackend::new(MongoBackendConfig {
+                    search_timeout_ms: Some(value),
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_deadline_expires_in_admission_without_database_work() {
+        use crate::core::SearchProvider;
+        let backend = MongoBackend::new(MongoBackendConfig {
+            search_timeout_ms: Some(20),
+            broad_search_concurrency: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let gate = backend.broad_search_gate().unwrap();
+        let held = gate.acquire().await.unwrap();
+        let tenant = crate::tenant::TenantContext::new(
+            crate::tenant::TenantId::new("deadline"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let query = crate::types::SearchQuery::new("Patient");
+        let result = backend.search_count(&tenant, &query).await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::Timeout { .. }))
+        ));
+        assert!(
+            backend.client.get().is_none(),
+            "admission expiry must not initialize MongoDB"
+        );
+        drop(held);
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), 1);
     }
 
     #[test]

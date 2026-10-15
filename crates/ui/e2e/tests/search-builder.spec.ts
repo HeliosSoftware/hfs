@@ -2298,6 +2298,24 @@ test.describe("query builder", () => {
     await expect.poll(async () => search.builder.paramOptions.count()).toBeGreaterThan(0);
   });
 
+  test("the rail filter narrows the Recently used group too (#1275)", async ({ search }) => {
+    await search.railItem("Patient").click();
+    await expect(search.recentGroup).toBeVisible();
+    await expect(search.recentItem("Patient")).toBeVisible();
+
+    await search.railFilter.fill("zzzznomatch");
+    await expect(search.railItem("Patient")).toBeHidden();
+    await expect(search.recentItem("Patient")).toBeHidden();
+    await expect(search.recentGroup).toBeHidden();
+
+    await search.railFilter.fill("patie");
+    await expect(search.recentGroup).toBeVisible();
+    await expect(search.recentItem("Patient")).toBeVisible();
+
+    await search.railFilter.fill("");
+    await expect(search.railItem("Patient")).toBeVisible();
+  });
+
   // Picking a type updates the URL (and back navigates) without a full
   // reload — the click handler is an enhancement over the rail's real
   // <a href> (#541).

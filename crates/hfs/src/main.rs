@@ -291,6 +291,23 @@ fn describe_s3_tenancy(mode: &helios_persistence::backends::s3::S3TenancyMode) -
     }
 }
 
+/// Parses `HFS_S3_KEYSPACE_LAYOUT`: the layout new (empty) tenants are created
+/// with. Unset or blank is `v1`; anything but `v1`/`v2` is an error rather than
+/// a silent fall back to the flat layout.
+#[cfg(feature = "s3")]
+fn parse_s3_keyspace_layout(
+    raw: Option<&str>,
+) -> anyhow::Result<helios_persistence::backends::s3::KeyspaceLayout> {
+    use helios_persistence::backends::s3::KeyspaceLayout;
+
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(KeyspaceLayout::V1),
+        Some(value) => KeyspaceLayout::parse(value).ok_or_else(|| {
+            anyhow::anyhow!("HFS_S3_KEYSPACE_LAYOUT '{value}' invalid (expected v1|v2)")
+        }),
+    }
+}
+
 /// Builds the primary S3 backend's configuration from the `HFS_S3_*`
 /// environment: the one reader for `start_s3`, `start_s3_elasticsearch` and
 /// the shared database audit sink, so the three cannot disagree about where
@@ -302,8 +319,11 @@ fn s3_backend_config_from_env(
     use helios_persistence::backends::s3::S3BackendConfig;
 
     let tenancy_mode = S3TenancyEnv::from_env().resolve(default_tenant)?;
+    let default_keyspace_layout =
+        parse_s3_keyspace_layout(std::env::var("HFS_S3_KEYSPACE_LAYOUT").ok().as_deref())?;
     Ok(S3BackendConfig {
         tenancy_mode,
+        default_keyspace_layout,
         region: std::env::var("HFS_S3_REGION").ok(),
         prefix: std::env::var("HFS_S3_PREFIX").ok(),
         endpoint_url: std::env::var("HFS_S3_ENDPOINT")
@@ -526,6 +546,115 @@ fn es_reindex_refresh_from_config(
             .parse()
             .map(Some)
             .map_err(|e: String| anyhow::anyhow!("{} (from HFS_ELASTICSEARCH_REINDEX_REFRESH)", e)),
+    }
+}
+
+/// Subscription status-write budget in milliseconds, as the subscriptions
+/// engine reads it (`HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS`, default 5 s).
+#[cfg(feature = "elasticsearch")]
+fn subscription_status_write_timeout_ms() -> u64 {
+    std::env::var("HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(5_000)
+}
+
+/// Why `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` with this refresh interval
+/// would stall interactive writes, or `None` when it would not.
+///
+/// With `wait_for` every write blocks until the next refresh, so the interval
+/// is the price of each write: a disabled interval (`-1`) blocks until
+/// something else refreshes the index, and one at or above the Elasticsearch
+/// request timeout turns into a failed attempt and a retry (#1749). An
+/// interval at or above the subscriptions status-write budget makes every
+/// status transition time out when writes are synchronous. That is legal
+/// configuration, so it is a warning, not a startup failure.
+#[cfg(feature = "elasticsearch")]
+fn es_refresh_wait_warning(
+    write_refresh: helios_persistence::backends::elasticsearch::WriteRefreshPolicy,
+    refresh_interval: &str,
+    request_timeout_ms: u64,
+    status_write_timeout_ms: u64,
+    sync_mode: helios_persistence::composite::SyncMode,
+) -> Option<String> {
+    use helios_persistence::backends::elasticsearch::{
+        RefreshInterval, WriteRefreshPolicy, parse_refresh_interval,
+    };
+    use helios_persistence::composite::SyncMode;
+
+    if write_refresh != WriteRefreshPolicy::WaitFor {
+        return None;
+    }
+    let ms_of = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let reason = match parse_refresh_interval(refresh_interval)? {
+        RefreshInterval::Disabled => "periodic refresh is disabled (-1), so a wait_for write \
+             blocks until something else refreshes the index"
+            .to_string(),
+        RefreshInterval::Every(interval) => {
+            let interval_ms = ms_of(interval);
+            if interval_ms >= request_timeout_ms {
+                format!(
+                    "the interval ({interval_ms} ms) is not below \
+                     HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS ({request_timeout_ms} ms), so a write \
+                     can time out waiting for the refresh and be retried"
+                )
+            } else if interval_ms >= status_write_timeout_ms
+                && matches!(
+                    sync_mode,
+                    SyncMode::Synchronous
+                        | SyncMode::Hybrid {
+                            sync_for_search: true
+                        }
+                )
+            {
+                format!(
+                    "the interval ({interval_ms} ms) is not below \
+                     HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS ({status_write_timeout_ms} ms), so \
+                     a subscription status transition can time out and not be persisted"
+                )
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(format!(
+        "HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for with HFS_ELASTICSEARCH_REFRESH_INTERVAL=\
+         {refresh_interval}: {reason}. Use a short interval (the default is 1s) or \
+         HFS_ELASTICSEARCH_WRITE_REFRESH=false"
+    ))
+}
+
+/// Startup work on a freshly built Elasticsearch backend: warns about a refresh
+/// configuration that stalls writes, then applies the configured
+/// `refresh_interval` to indices that already exist (they are otherwise only
+/// given it when created). Never fails startup.
+#[cfg(feature = "elasticsearch")]
+async fn es_startup_refresh_setup(
+    es: &helios_persistence::backends::elasticsearch::ElasticsearchBackend,
+    config: &ServerConfig,
+) {
+    let es_config = es.config();
+    if let Some(message) = es_refresh_wait_warning(
+        es_config.write_refresh,
+        &es_config.refresh_interval,
+        es_config.request_timeout_ms,
+        subscription_status_write_timeout_ms(),
+        composite_sync_mode_from_env(),
+    ) {
+        warn!("{message}");
+    }
+    match es.apply_refresh_interval().await {
+        Ok(0) => {}
+        Ok(changed) => info!(
+            indices = changed,
+            refresh_interval = %config.elasticsearch_refresh_interval,
+            "applied the Elasticsearch refresh interval to existing indices"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            refresh_interval = %config.elasticsearch_refresh_interval,
+            "could not apply the Elasticsearch refresh interval to existing indices"
+        ),
     }
 }
 
@@ -1025,6 +1154,9 @@ async fn create_audit_s3_storage(
             region,
             prefix,
             validate_buckets_on_startup: validate_buckets,
+            default_keyspace_layout: parse_s3_keyspace_layout(
+                std::env::var("HFS_S3_KEYSPACE_LAYOUT").ok().as_deref(),
+            )?,
             ..Default::default()
         }
     } else {
@@ -1054,6 +1186,7 @@ async fn create_audit_s3_storage(
         region = ?s3_config.region,
         prefix = ?s3_config.prefix,
         validate_buckets = s3_config.validate_buckets_on_startup,
+        keyspace_layout = ?s3_config.default_keyspace_layout,
         dedicated = dedicated,
         "Initializing S3 storage for database audit sink"
     );
@@ -2016,6 +2149,36 @@ where
     ids
 }
 
+/// Keeps the SQLite WAL bounded on every write path, not only `$bulk-submit`
+/// (#2025). Every 2 s the -wal file's size is read (a `stat`, no pooled
+/// connection); past the threshold it is folded back into the database and
+/// truncated. Under 20 concurrent transaction Bundles the WAL grows by
+/// 200–250 MB/s, so a slower check lets it reach gigabytes between passes. A
+/// pass that finds readers or writers in the way gives up after a second and
+/// the next one retries.
+#[cfg(feature = "sqlite")]
+fn spawn_sqlite_wal_maintenance(backend: Arc<SqliteBackend>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(e) = backend.maintain_wal().await {
+                tracing::warn!("SQLite WAL maintenance failed; the next pass retries: {e}");
+            }
+        }
+    });
+}
+
+/// Folds the SQLite WAL back and truncates it after the server drained, so a
+/// restart does not inherit it (#2025).
+#[cfg(feature = "sqlite")]
+async fn checkpoint_sqlite_wal_at_shutdown(backend: &SqliteBackend) {
+    if let Err(e) = backend.checkpoint_wal_at_shutdown().await {
+        warn!("SQLite WAL checkpoint at shutdown failed: {e}");
+    }
+}
+
 /// Spawns the periodic registry refresh from storage for the SQLite backend
 /// (#235). `HFS_SEARCH_PARAM_CACHE_TTL=0` disables it. A failed pass keeps
 /// serving the stale cache; the next tick retries.
@@ -2222,6 +2385,8 @@ async fn start_sqlite(
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_sqlite_search_param_refresh(backend.clone(), &config);
+    spawn_sqlite_wal_maintenance(backend.clone());
+    let wal_backend = backend.clone();
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own). Cheap: the SQLite backend
     // shares one connection pool behind the Arc.
@@ -2262,7 +2427,7 @@ async fn start_sqlite(
         settings_store,
         ops,
     );
-    serve(
+    let served = serve(
         app,
         &config,
         serve_audit_state,
@@ -2271,7 +2436,9 @@ async fn start_sqlite(
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
-    .await
+    .await;
+    checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
+    served
 }
 
 /// Constructs an embedded SQLite job store for backends that can't host job
@@ -3139,6 +3306,8 @@ async fn start_sqlite_elasticsearch(
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
     spawn_sqlite_search_param_refresh(sqlite.clone(), &config);
+    spawn_sqlite_wal_maintenance(sqlite.clone());
+    let wal_backend = sqlite.clone();
 
     // Build Elasticsearch configuration from server config
     let es_nodes: Vec<String> = config
@@ -3189,10 +3358,14 @@ async fn start_sqlite_elasticsearch(
     );
 
     // Create ES backend sharing SQLite's search parameter registry
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        sqlite.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(
+            es_config,
+            sqlite.tenant_registries().clone(),
+        )
+        .await?,
+    );
+    es_startup_refresh_setup(&es, &config).await;
 
     // Build composite configuration
     let composite_config = CompositeConfig::builder()
@@ -3316,7 +3489,7 @@ async fn start_sqlite_elasticsearch(
     );
     // The UI's tenant-maintenance path goes through the composite (not the
     // bare primary) so a purge also clears the offloaded search documents.
-    serve(
+    let served = serve(
         app,
         &config,
         serve_audit_state,
@@ -3325,7 +3498,9 @@ async fn start_sqlite_elasticsearch(
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
-    .await
+    .await;
+    checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
+    served
 }
 
 /// Fallback when elasticsearch feature is not enabled.
@@ -3536,10 +3711,11 @@ async fn start_postgres_elasticsearch(
     );
 
     // Create ES backend sharing PostgreSQL's search parameter registry
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        pg.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(es_config, pg.tenant_registries().clone())
+            .await?,
+    );
+    es_startup_refresh_setup(&es, &config).await;
 
     // Build composite configuration
     let composite_config = CompositeConfig::builder()
@@ -3769,10 +3945,14 @@ async fn start_mongodb_elasticsearch(
     );
 
     // Create ES backend sharing MongoDB's search parameter registry
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        mongo.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(
+            es_config,
+            mongo.tenant_registries().clone(),
+        )
+        .await?,
+    );
+    es_startup_refresh_setup(&es, &config).await;
 
     // Build composite configuration
     let composite_config = CompositeConfig::builder()
@@ -3949,6 +4129,7 @@ async fn start_s3(
         prefix = ?s3_config.prefix,
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
+        keyspace_layout = ?s3_config.default_keyspace_layout,
         "Initializing S3 backend"
     );
 
@@ -4116,6 +4297,7 @@ async fn start_s3_elasticsearch(
         prefix = ?s3_config.prefix,
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
+        keyspace_layout = ?s3_config.default_keyspace_layout,
         "Initializing S3 backend (primary)"
     );
 
@@ -4150,6 +4332,12 @@ async fn start_s3_elasticsearch(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
+    if es_nodes.is_empty() {
+        anyhow::bail!(
+            "s3-elasticsearch mode requires at least one Elasticsearch node in HFS_ELASTICSEARCH_NODES"
+        );
+    }
 
     let es_auth = match (
         &config.elasticsearch_username,
@@ -4207,10 +4395,11 @@ async fn start_s3_elasticsearch(
             &data_dir,
         );
     }
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        s3.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(es_config, s3.tenant_registries().clone())
+            .await?,
+    );
+    es_startup_refresh_setup(&es, &config).await;
 
     // --- Composite wiring ---
     let composite_config = CompositeConfig::builder()
@@ -4606,6 +4795,42 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "s3")]
+    mod s3_keyspace_layout {
+        use super::*;
+        use helios_persistence::backends::s3::KeyspaceLayout;
+
+        #[test]
+        fn unset_or_blank_is_the_flat_layout() {
+            assert_eq!(parse_s3_keyspace_layout(None).unwrap(), KeyspaceLayout::V1);
+            assert_eq!(
+                parse_s3_keyspace_layout(Some("  ")).unwrap(),
+                KeyspaceLayout::V1
+            );
+        }
+
+        #[test]
+        fn v1_and_v2_parse_case_insensitively() {
+            assert_eq!(
+                parse_s3_keyspace_layout(Some("v1")).unwrap(),
+                KeyspaceLayout::V1
+            );
+            assert_eq!(
+                parse_s3_keyspace_layout(Some(" V2 ")).unwrap(),
+                KeyspaceLayout::V2
+            );
+        }
+
+        #[test]
+        fn anything_else_is_refused_with_the_expected_set() {
+            for bad in ["v3", "2", "sharded", "v1,v2"] {
+                let err = parse_s3_keyspace_layout(Some(bad)).unwrap_err().to_string();
+                assert!(err.contains("HFS_S3_KEYSPACE_LAYOUT"), "{err}");
+                assert!(err.contains("expected v1|v2"), "{err}");
+            }
+        }
+    }
+
     // ── PostgreSQL pool gauges (#1907) ────────────────────────────
 
     /// Each pool field lands in its own gauge; distinct values catch a swap.
@@ -4633,6 +4858,53 @@ mod tests {
     }
 
     // ── Elasticsearch rebuild wiring (#1125) ──────────────────────
+
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    fn test_es_refresh_wait_warning() {
+        use helios_persistence::backends::elasticsearch::WriteRefreshPolicy::{False, WaitFor};
+        use helios_persistence::composite::SyncMode::{Asynchronous, Synchronous};
+
+        // Defaults, and anything that is not wait_for, are quiet.
+        assert_eq!(
+            es_refresh_wait_warning(WaitFor, "1s", 30_000, 5_000, Synchronous),
+            None
+        );
+        assert_eq!(
+            es_refresh_wait_warning(False, "-1", 30_000, 5_000, Synchronous),
+            None
+        );
+        assert_eq!(
+            es_refresh_wait_warning(WaitFor, "bogus", 30_000, 5_000, Synchronous),
+            None
+        );
+
+        let disabled = es_refresh_wait_warning(WaitFor, "-1", 30_000, 5_000, Synchronous)
+            .expect("a disabled interval stalls wait_for writes");
+        assert!(
+            disabled.contains("HFS_ELASTICSEARCH_REFRESH_INTERVAL"),
+            "{disabled}"
+        );
+
+        let timeout = es_refresh_wait_warning(WaitFor, "30s", 30_000, 5_000, Asynchronous)
+            .expect("an interval at the request timeout");
+        assert!(
+            timeout.contains("HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS"),
+            "{timeout}"
+        );
+
+        let status = es_refresh_wait_warning(WaitFor, "10s", 30_000, 5_000, Synchronous)
+            .expect("an interval above the subscription status budget");
+        assert!(
+            status.contains("HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS"),
+            "{status}"
+        );
+        // Asynchronous writes do not hold up status transitions.
+        assert_eq!(
+            es_refresh_wait_warning(WaitFor, "10s", 30_000, 5_000, Asynchronous),
+            None
+        );
+    }
 
     #[cfg(feature = "elasticsearch")]
     #[test]

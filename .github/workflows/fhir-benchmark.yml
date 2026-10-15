@@ -59,6 +59,13 @@ name: FHIR Server Benchmark
 #     file concurrency 1); the clock runs from kick-off until the deferred
 #     search-index rebuild has finished, capped by BULK_IMPORT_TIMEOUT_S and by
 #     what is left of the leg budget; the bulk database is dropped afterwards.
+#     The comparison reports the one load as three Throughput rows:
+#     `bulk-import` (resources/s over both phases), `bulk-import ingest`
+#     (resources/s and the seconds from kick-off until the status manifest is
+#     final: how long loading the corpus takes) and `bulk-import initial
+#     index` (seconds of the deferred search-index rebuild that follows: how
+#     long until that freshly loaded data is indexed; `inline (during ingest)`
+#     when HFS indexed while ingesting, HFS_BULK_SUBMIT_DEFER_INDEXING=false).
 #     It starts no containers, so the capacity gate is unchanged. Logic in
 #     .github/scripts/fhir-bench/bulk-import.sh and bulk_import.py.
 #   • Every named volume this workflow creates is
@@ -82,13 +89,22 @@ name: FHIR Server Benchmark
 # after the result-size snapshot (search-counts.txt), wherever it appears in
 # `tests`. Its matrix throughput row is creates/s.
 #
-# A second suite is this repository's own, not upstream's: `indexing`
-# (after search in `all`, before insert) times one `POST /Encounter/$reindex` (batchSize 1000) per leg after
-# search — HFS re-extracts every Encounter's search parameters and rewrites
-# the index that serves search (the primary's own on sqlite/postgres/mongodb,
-# Elasticsearch on the *-elasticsearch legs). Past a 240 s budget the job is
-# cancelled and reported partial, so it adds at most ~5 min to a leg. See
-# run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh.
+# A second suite is this repository's own, not upstream's: `indexing`. It is
+# opt-in and NOT part of `all`: it runs only when `tests` names it, listed
+# after search (for example
+# tests=prewarm,import,crud,search,indexing,insert,bulk-import); insert and
+# bulk-import still run after it. It times one `POST /Encounter/$reindex`
+# (batchSize 1000) of the corpus import loaded — HFS re-extracts every
+# Encounter's search parameters and rewrites the index that serves search (the
+# primary's own on sqlite/postgres/mongodb, Elasticsearch on the
+# *-elasticsearch legs). Users never run a $reindex when they load data, and it
+# rewrites the search index right before insert and bulk-import, so a run that
+# includes it may skew both. How long freshly loaded data takes to become
+# indexed is bulk-import's `initial index` row instead. Past a 240 s budget the
+# job is cancelled and reported partial, so it adds at most ~5 min to a leg. See
+# run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh. Its matrix row
+# is labelled `reindex, $reindex Encounter` (resources/s) and sits with the
+# import (`POST /` transaction Bundles) and bulk-import (`$bulk-submit`) rows.
 #
 # Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
 #   • Rust toolchain buildable (clang + lld linker, configured below).
@@ -123,7 +139,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search,indexing,insert,bulk-import). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,indexing,insert' skips it"
+        description: "Suites to run: 'all' = prewarm,import,crud,search,insert,bulk-import | comma-separated from those plus indexing (a timed $reindex; opt-in only, never part of 'all', list it after search; it rewrites the index before insert and bulk-import and may skew both). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and initial-index rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,insert' skips it"
         required: false
         default: "all"
       vus:
@@ -1315,15 +1331,18 @@ jobs:
           } > "$RESULTS_DIR/runner-info.txt"
           cat "$RESULTS_DIR/runner-info.txt"
 
-          # Resolve suite list. 'search' needs data, so 'import' must precede it;
+          # Resolve suite list. 'search' needs data, so 'import' must precede it.
           # 'indexing' (a timed $reindex, not a k6 suite — run_indexing_suite)
-          # re-indexes what import loaded and runs after search so it cannot
-          # disturb crud/search, and before insert so insert's resources are
-          # not in the timed set; canonical order keeps those invariants for
-          # the 'all' case. bulk-import is last and is not a k6 suite: it is
-          # taken out of the list wherever it was listed and runs once after
-          # the result-size snapshot (below).
-          CANONICAL="prewarm import crud search indexing insert bulk-import"
+          # is opt-in and not in CANONICAL, so 'all' never runs it: users do
+          # not run $reindex when they load data, and rewriting the index here
+          # would skew insert and bulk-import, whose initial-index row measures
+          # indexing instead. Named explicitly, it runs where `tests` lists it
+          # (put it after search so it cannot disturb crud/search) and always
+          # before insert and bulk-import, which are moved last below.
+          # bulk-import is last and is not a k6 suite: it is taken out of the
+          # list wherever it was listed and runs once after the result-size
+          # snapshot (below).
+          CANONICAL="prewarm import crud search insert bulk-import"
           INPUT_TESTS="${BENCH_IN_TESTS:-all}"
           if [ "$INPUT_TESTS" = "all" ]; then
             SUITES="$CANONICAL"
@@ -1393,7 +1412,8 @@ jobs:
           # still runs against a possibly-incomplete index.
           ES_DRAIN_TIMEOUT_S=600
 
-          # The indexing suite times one `POST /$INDEXING_TYPE/$reindex` after
+          # The indexing suite (opt-in: only when tests names it) times one
+          # `POST /$INDEXING_TYPE/$reindex` after
           # search (run_indexing_suite in suite-lib.sh). Encounter is the
           # largest type that fits the budget on every leg (67,692 on a
           # 1000/1000 import in run 37782202746; Observation's 689,080 would
@@ -1505,7 +1525,7 @@ jobs:
             # without search, e.g. import,indexing): drain first, as
             # write_search_counts does, so the timed $reindex does not race the
             # sync worker's import/crud backlog (asynchronous es_sync_mode) and
-            # the matrix's indexing † (ES index not drained) has an
+            # the matrix's reindex-row † (ES index not drained) has an
             # es-drain.txt to read. Before probe_host/SUITE_START like the
             # search gate above, with the same pgstat reset after it.
             if [ "$SUITE" = indexing ] && [ -n "${ES_PORT:-}" ] \
@@ -2157,8 +2177,11 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
-  # errors), an indexing table (the `indexing` suite) and a leg-health table,
-  # so a reader does not have to scroll six stacked per-leg summaries.
+  # errors; the import, bulk-import and reindex rows name the operation each
+  # times and sit together; the Throughput table also splits bulk-import into
+  # its ingest and initial-index rows right under it; the reindex row appears
+  # only when a leg ran the opt-in indexing suite) and a leg-health table, so
+  # a reader does not have to scroll six stacked per-leg summaries.
   # Display only: the job is continue-on-error and
   # compare_legs.py always exits 0, so it can never change the run's
   # conclusion, and it adds nothing to the per-leg jobs.

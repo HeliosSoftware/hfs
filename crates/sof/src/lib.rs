@@ -183,6 +183,8 @@
 pub mod app;
 pub mod canonical;
 pub mod column_types;
+pub mod columnar;
+pub mod columnar_stream;
 pub mod compartment;
 pub mod constants;
 pub mod data_source;
@@ -227,8 +229,8 @@ pub use sqlquery::{
 
 use chrono::{DateTime, Utc};
 use helios_fhirpath::{
-    EvaluationContext, EvaluationResult, TerminologySession, evaluate_expression,
-    evaluate_expression_typed,
+    EvaluationContext, EvaluationResult, TerminologySession, UnresolvedIdentifierPolicy,
+    evaluate_expression, evaluate_expression_typed,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -238,7 +240,11 @@ use thiserror::Error;
 use traits::*;
 
 // Re-export commonly used types and traits for easier access
+/// Arrow and Parquet as built against by this crate, so dependents that
+/// handle record batches need no matching dependency of their own.
+pub use arrow;
 pub use helios_fhir::FhirVersion;
+pub use parquet;
 pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 
 /// Multi-version ViewDefinition container supporting version-agnostic operations.
@@ -296,13 +302,30 @@ pub enum SofViewDefinition {
 }
 
 impl SofViewDefinition {
-    /// Resolves the output type of every column (default mapping and
-    /// `ansi/type` tag), in declaration order; see [`resolve_columns`].
-    ///
-    /// Fails with [`SofError::InvalidViewDefinition`] on an unknown or
-    /// incompatible `ansi/type` tag.
-    pub fn column_types(&self) -> Result<Vec<ColumnTypeInfo>, SofError> {
-        let json = match self {
+    /// The columns declared by this ViewDefinition (name, optional FHIR `type`,
+    /// `collection`), used to fix the Parquet / Arrow schema before any row is
+    /// seen. Empty if the definition cannot be serialised.
+    pub fn declared_columns(&self) -> Vec<sqlquery::engine::DeclaredColumn> {
+        self.to_json()
+            .map(|v| sqlquery::engine::declared_columns(&v))
+            .unwrap_or_default()
+    }
+
+    /// Like [`Self::declared_columns`], but each column also carries its
+    /// resolved SQL type (default mapping or `ansi/type` tag), and an unknown,
+    /// non-string or incompatible `ansi/type` tag is an error naming the
+    /// column ([`SofError::InvalidViewDefinition`]) instead of being ignored.
+    pub fn try_declared_columns(&self) -> Result<Vec<sqlquery::engine::DeclaredColumn>, SofError> {
+        let json = self.to_json().map_err(|e| {
+            SofError::InvalidViewDefinition(format!(
+                "failed to serialize ViewDefinition to resolve column types: {e}"
+            ))
+        })?;
+        sqlquery::engine::try_declared_columns(&json)
+    }
+
+    fn to_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        match self {
             #[cfg(feature = "R4")]
             SofViewDefinition::R4(vd) => serde_json::to_value(vd),
             #[cfg(feature = "R4B")]
@@ -312,12 +335,6 @@ impl SofViewDefinition {
             #[cfg(feature = "R6")]
             SofViewDefinition::R6(vd) => serde_json::to_value(vd),
         }
-        .map_err(|e| {
-            SofError::InvalidViewDefinition(format!(
-                "failed to serialize ViewDefinition to resolve column types: {e}"
-            ))
-        })?;
-        resolve_columns(&json)
     }
 
     /// Returns the FHIR specification version of this ViewDefinition.
@@ -1949,6 +1966,8 @@ impl PreparedViewDefinition {
         let fhir_resource =
             parse_json_to_fhir_resource(resource_json.clone(), self.view_definition.version())?;
         let mut context = EvaluationContext::new(vec![fhir_resource]);
+        // ViewDefinition paths are user-authored: report a typo'd leading identifier.
+        context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
         // Expose the chunk-wide pool so `resolve()` can reach sibling resources.
         context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
         context.set_terminology_session(std::sync::Arc::clone(&self.terminology_session));
@@ -2567,9 +2586,8 @@ fn run_view_definition_inner(
     options: RunOptions,
     external: Vec<helios_fhir::FhirResource>,
 ) -> Result<Vec<u8>, SofError> {
-    // Resolve output column types while the typed ViewDefinition is in hand.
-    let column_types = view_definition.column_types()?;
-
+    // Declared column types fix the Parquet / Arrow schema, as on the REST path.
+    let declared = view_definition.try_declared_columns()?;
     // Process the ViewDefinition to generate tabular data
     let processed_result =
         process_view_definition_with_external(view_definition, bundle, external)?;
@@ -2582,11 +2600,11 @@ fn run_view_definition_inner(
     };
 
     // Format the result according to the requested content type
-    format_output_typed(
+    format_output_with_schema(
         processed_result,
         content_type,
         options.parquet_options.as_ref(),
-        &column_types,
+        &declared,
     )
 }
 
@@ -3053,6 +3071,8 @@ where
             for where_clause in wheres {
                 let fhir_resource = resource.to_fhir_resource();
                 let mut context = EvaluationContext::new(vec![fhir_resource]);
+                // ViewDefinition paths are user-authored: report a typo'd leading identifier.
+                context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
                 // Expose the whole bundle so `where` clauses can use `resolve()`.
                 context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
                 context.set_terminology_session(std::sync::Arc::clone(terminology));
@@ -3291,6 +3311,8 @@ where
 {
     let fhir_resource = resource.to_fhir_resource();
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    // ViewDefinition paths are user-authored: report a typo'd leading identifier.
+    context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
     // Expose the whole bundle so column/forEach paths can use `resolve()`. `this`
     // stays the current resource, so `%resource`/root semantics are unchanged.
     context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
@@ -4139,21 +4161,18 @@ pub fn format_output(
     content_type: ContentType,
     parquet_options: Option<&ParquetOptions>,
 ) -> Result<Vec<u8>, SofError> {
-    format_output_typed(result, content_type, parquet_options, &[])
+    format_output_with_schema(result, content_type, parquet_options, &[])
 }
 
-/// Like [`format_output`], but with the ViewDefinition's resolved column types
-/// (from [`SofViewDefinition::column_types`] or [`resolve_columns`]).
-///
-/// The typed columnar formats (Parquet, Arrow IPC) use them to pick each
-/// column's type per the SQL-on-FHIR default mappings and `ansi/type` tags;
-/// columns without an entry fall back to value inference. CSV, JSON and NDJSON
-/// are untyped and ignore `column_types`.
-pub fn format_output_typed(
+/// Like [`format_output`], but Parquet and Arrow IPC columns found in
+/// `declared` (see [`sqlquery::engine::declared_columns`]) take their Arrow
+/// type from the declared FHIR type instead of being inferred from the data.
+/// Other formats ignore `declared`.
+pub fn format_output_with_schema(
     result: ProcessedResult,
     content_type: ContentType,
     parquet_options: Option<&ParquetOptions>,
-    column_types: &[ColumnTypeInfo],
+    declared: &[sqlquery::engine::DeclaredColumn],
 ) -> Result<Vec<u8>, SofError> {
     match content_type {
         ContentType::Csv | ContentType::CsvWithHeader => {
@@ -4161,8 +4180,8 @@ pub fn format_output_typed(
         }
         ContentType::Json => format_json(result),
         ContentType::NdJson => format_ndjson(result),
-        ContentType::Parquet => format_parquet_typed(result, parquet_options, column_types),
-        ContentType::ArrowIpc => format_arrow_ipc_typed(result, column_types),
+        ContentType::Parquet => format_parquet_with_schema(result, parquet_options, declared),
+        ContentType::ArrowIpc => format_arrow_ipc_with_schema(result, declared),
     }
 }
 
@@ -4299,34 +4318,6 @@ pub fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     Ok(output)
 }
 
-/// Rows-per-batch for the columnar writers, estimated from sampled row sizes
-/// and clamped to keep memory bounded. Shared by Parquet and Arrow IPC so the
-/// two outputs batch identically.
-fn estimate_rows_per_batch(rows: &[ProcessedRow], target_batch_size_bytes: usize) -> usize {
-    const TARGET_ROWS_PER_BATCH: usize = 100_000; // Default batch size
-    const MAX_ROWS_PER_BATCH: usize = 500_000; // Maximum to prevent memory issues
-
-    // Estimate average row size from first 100 rows
-    let sample_size = std::cmp::min(100, rows.len());
-    let mut estimated_row_size = 100; // Default estimate in bytes
-
-    if sample_size > 0 {
-        let sample_json_size: usize = rows[..sample_size]
-            .iter()
-            .map(|row| {
-                row.values
-                    .iter()
-                    .filter_map(|v| v.as_ref())
-                    .map(|v| v.to_string().len())
-                    .sum::<usize>()
-            })
-            .sum();
-        estimated_row_size = (sample_json_size / sample_size).max(50);
-    }
-
-    (target_batch_size_bytes / estimated_row_size).clamp(TARGET_ROWS_PER_BATCH, MAX_ROWS_PER_BATCH)
-}
-
 /// Streams `result`'s rows to `write` as Arrow [`RecordBatch`]es of at most
 /// `batch_size` rows. The shared batch builder behind every columnar output
 /// (Parquet, Arrow IPC) and [`run_view_definition_record_batches`].
@@ -4366,7 +4357,7 @@ where
 /// their schema — the engine-side seam for columnar consumers (Parquet, Arrow
 /// IPC, and external bindings such as pysof).
 ///
-/// Type mapping is identical to the Parquet output, so
+/// Declared column types and inference are identical to the Parquet output, so
 /// every columnar representation of the same result agrees.
 pub fn run_view_definition_record_batches(
     view_definition: SofViewDefinition,
@@ -4378,15 +4369,11 @@ pub fn run_view_definition_record_batches(
     ),
     SofError,
 > {
-    let column_types = view_definition.column_types()?;
+    let declared = view_definition.try_declared_columns()?;
     let result = process_view_definition(view_definition, bundle)?;
-    let schema =
-        parquet_schema::create_arrow_schema_typed(&result.columns, &result.rows, &column_types)?;
+    let schema = parquet_schema::resolve_arrow_schema(&result.columns, &declared, &result.rows)?;
     let schema_ref = std::sync::Arc::new(schema);
-    let batch_size = estimate_rows_per_batch(
-        &result.rows,
-        (ParquetOptions::default().row_group_size_mb as usize) * 1024 * 1024,
-    );
+    let batch_size = columnar_stream::STREAM_BATCH_ROWS;
     let mut batches = Vec::new();
     for_each_record_batch(&schema_ref, &result, batch_size, |batch| {
         batches.push(batch);
@@ -4399,287 +4386,96 @@ pub fn run_view_definition_record_batches(
 /// (`application/vnd.apache.arrow.stream`).
 ///
 /// Schema inference and type mapping match [`format_parquet`] exactly, so the
-/// columnar outputs always agree. Batches are written incrementally and the
-/// stream carries its schema in-band, so consumers (DuckDB, pyarrow, polars,
-/// pandas) ingest live query results without any client-side parsing.
+/// columnar outputs always agree. The stream carries its schema in-band, so
+/// consumers (DuckDB, pyarrow, polars, pandas) ingest live query results
+/// without any client-side parsing. For output that is produced while rows
+/// are still arriving use [`columnar_stream::ArrowIpcStreamWriter`].
 pub fn format_arrow_ipc(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
-    format_arrow_ipc_typed(result, &[])
+    format_arrow_ipc_with_schema(result, &[])
 }
 
-/// Like [`format_arrow_ipc`], with resolved column types (see
-/// [`format_output_typed`]).
-pub fn format_arrow_ipc_typed(
+fn format_arrow_ipc_with_schema(
     result: ProcessedResult,
-    column_types: &[ColumnTypeInfo],
+    declared: &[sqlquery::engine::DeclaredColumn],
 ) -> Result<Vec<u8>, SofError> {
-    use arrow::ipc::writer::StreamWriter;
-
-    let schema =
-        parquet_schema::create_arrow_schema_typed(&result.columns, &result.rows, column_types)?;
-    let schema_ref = std::sync::Arc::new(schema);
-    let batch_size = estimate_rows_per_batch(
+    let schema = std::sync::Arc::new(parquet_schema::resolve_arrow_schema(
+        &result.columns,
+        declared,
         &result.rows,
-        (ParquetOptions::default().row_group_size_mb as usize) * 1024 * 1024,
-    );
-
-    let mut buffer = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buffer, schema_ref.as_ref()).map_err(|e| {
-            SofError::ArrowConversionError(format!("Failed to create Arrow IPC writer: {}", e))
-        })?;
-        for_each_record_batch(&schema_ref, &result, batch_size, |batch| {
-            writer.write(&batch).map_err(|e| {
-                SofError::ArrowConversionError(format!("Failed to write Arrow IPC batch: {}", e))
-            })
-        })?;
-        writer.finish().map_err(|e| {
-            SofError::ArrowConversionError(format!("Failed to finish Arrow IPC stream: {}", e))
-        })?;
-    }
-
-    Ok(buffer)
+    )?);
+    let mut writer = columnar_stream::ArrowIpcStreamWriter::new(Vec::new(), schema)?;
+    writer.write_rows(&result.rows)?;
+    writer.finish()
 }
 
 /// Encodes a [`ProcessedResult`] as a single Parquet file in memory.
 ///
-/// Column types are inferred from the row values; use [`format_parquet_typed`]
-/// to apply the ViewDefinition's declared types (SQL-on-FHIR default mappings
-/// and `ansi/type` tags, see [`parquet_schema`]). Use
-/// [`format_parquet_multi_file`] when the output needs to be split across
-/// files by size.
+/// The schema is inferred from `result.columns` and the row values (see
+/// [`format_output_with_schema`] to fix it from declared column types). Type
+/// mapping follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
+/// integer/positiveInt/unsignedInt→INT32, integer64→INT64, decimal→FLOAT64,
+/// dateTime/date→UTF8, `collection: true`→List<UTF8>); an inferred integer
+/// column is widened to INT64 when a value exceeds 32 bits. Row groups are cut
+/// by encoded size (`row_group_size_mb`). Use [`format_parquet_multi_file`]
+/// when the output needs to be split across files by size.
 pub fn format_parquet(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
 ) -> Result<Vec<u8>, SofError> {
-    format_parquet_typed(result, options, &[])
+    format_parquet_with_schema(result, options, &[])
 }
 
-/// Like [`format_parquet`], with resolved column types (see
-/// [`format_output_typed`]).
-pub fn format_parquet_typed(
+fn format_parquet_with_schema(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
-    column_types: &[ColumnTypeInfo],
+    declared: &[sqlquery::engine::DeclaredColumn],
 ) -> Result<Vec<u8>, SofError> {
-    use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
-    use parquet::file::properties::WriterProperties;
-    use std::io::Cursor;
-
-    // Create Arrow schema from the declared column types and sample data
-    let schema =
-        parquet_schema::create_arrow_schema_typed(&result.columns, &result.rows, column_types)?;
-    let schema_ref = std::sync::Arc::new(schema.clone());
-
-    // Get configuration from options or use defaults
-    let parquet_opts = options.cloned().unwrap_or_default();
-
-    // Calculate optimal batch size based on row count and estimated row size
-    let target_row_group_size_bytes = (parquet_opts.row_group_size_mb as usize) * 1024 * 1024;
-    let target_page_size_bytes = (parquet_opts.page_size_kb as usize) * 1024;
-    let optimal_batch_size = estimate_rows_per_batch(&result.rows, target_row_group_size_bytes);
-
-    // Parse compression algorithm
-    use parquet::basic::BrotliLevel;
-    use parquet::basic::GzipLevel;
-    use parquet::basic::ZstdLevel;
-
-    let compression = match parquet_opts.compression.as_str() {
-        "none" => Compression::UNCOMPRESSED,
-        "gzip" => Compression::GZIP(GzipLevel::default()),
-        "lz4" => Compression::LZ4,
-        "brotli" => Compression::BROTLI(BrotliLevel::default()),
-        "zstd" => Compression::ZSTD(ZstdLevel::default()),
-        _ => Compression::SNAPPY, // Default to snappy
-    };
-
-    // Set up writer properties with optimized settings
-    let props = WriterProperties::builder()
-        .set_compression(compression)
-        .set_max_row_group_size(target_row_group_size_bytes)
-        .set_data_page_row_count_limit(20_000) // Optimal for predicate pushdown
-        .set_data_page_size_limit(target_page_size_bytes)
-        .set_write_batch_size(8192) // Control write granularity
-        .build();
-
-    // Write to memory buffer
-    let mut buffer = Vec::new();
-    let mut cursor = Cursor::new(&mut buffer);
-    let mut writer =
-        ArrowWriter::try_new(&mut cursor, schema_ref.clone(), Some(props)).map_err(|e| {
-            SofError::ParquetConversionError(format!("Failed to create Parquet writer: {}", e))
-        })?;
-
-    // Process data in batches to handle large datasets efficiently
-    for_each_record_batch(&schema_ref, &result, optimal_batch_size, |batch| {
-        writer.write(&batch).map_err(|e| {
-            SofError::ParquetConversionError(format!("Failed to write RecordBatch: {}", e))
-        })
-    })?;
-
-    writer.close().map_err(|e| {
-        SofError::ParquetConversionError(format!("Failed to close Parquet writer: {}", e))
-    })?;
-
-    Ok(buffer)
+    let schema = std::sync::Arc::new(parquet_schema::resolve_arrow_schema(
+        &result.columns,
+        declared,
+        &result.rows,
+    )?);
+    let opts = options.cloned().unwrap_or_default();
+    let mut writer = columnar_stream::ParquetStreamWriter::new(Vec::new(), schema, &opts)?;
+    writer.write_rows(&result.rows)?;
+    writer.finish()
 }
 
-/// Format Parquet data with automatic file splitting when size exceeds limit
+/// Format Parquet data with automatic file splitting when size exceeds limit.
+///
+/// A file is closed once its estimated encoded size (flushed bytes plus the
+/// open row group) reaches `max_file_size_bytes`, so files can overshoot the
+/// limit by up to one batch plus the footer. Always returns at least one file.
 pub fn format_parquet_multi_file(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
     max_file_size_bytes: usize,
 ) -> Result<Vec<Vec<u8>>, SofError> {
-    format_parquet_multi_file_typed(result, options, max_file_size_bytes, &[])
+    format_parquet_multi_file_with_schema(result, options, max_file_size_bytes, &[])
 }
 
-/// Like [`format_parquet_multi_file`], with resolved column types (see
-/// [`format_output_typed`]).
-pub fn format_parquet_multi_file_typed(
+/// [`format_parquet_multi_file`] with declared column types (see
+/// [`format_output_with_schema`]).
+pub fn format_parquet_multi_file_with_schema(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
     max_file_size_bytes: usize,
-    column_types: &[ColumnTypeInfo],
+    declared: &[sqlquery::engine::DeclaredColumn],
 ) -> Result<Vec<Vec<u8>>, SofError> {
-    use arrow::record_batch::RecordBatch;
-    use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
-    use parquet::file::properties::WriterProperties;
-    use std::io::Cursor;
-
-    // Create Arrow schema from the declared column types and sample data
-    let schema =
-        parquet_schema::create_arrow_schema_typed(&result.columns, &result.rows, column_types)?;
-    let schema_ref = std::sync::Arc::new(schema.clone());
-
-    // Get configuration from options or use defaults
-    let parquet_opts = options.cloned().unwrap_or_default();
-
-    // Calculate optimal batch size
-    let target_row_group_size_bytes = (parquet_opts.row_group_size_mb as usize) * 1024 * 1024;
-    let target_page_size_bytes = (parquet_opts.page_size_kb as usize) * 1024;
-    const TARGET_ROWS_PER_BATCH: usize = 100_000;
-    const MAX_ROWS_PER_BATCH: usize = 500_000;
-
-    // Estimate average row size
-    let sample_size = std::cmp::min(100, result.rows.len());
-    let mut estimated_row_size = 100;
-
-    if sample_size > 0 {
-        let sample_json_size: usize = result.rows[..sample_size]
-            .iter()
-            .map(|row| {
-                row.values
-                    .iter()
-                    .filter_map(|v| v.as_ref())
-                    .map(|v| v.to_string().len())
-                    .sum::<usize>()
-            })
-            .sum();
-        estimated_row_size = (sample_json_size / sample_size).max(50);
-    }
-
-    let optimal_batch_size = (target_row_group_size_bytes / estimated_row_size)
-        .clamp(TARGET_ROWS_PER_BATCH, MAX_ROWS_PER_BATCH);
-
-    // Parse compression algorithm
-    use parquet::basic::BrotliLevel;
-    use parquet::basic::GzipLevel;
-    use parquet::basic::ZstdLevel;
-
-    let compression = match parquet_opts.compression.as_str() {
-        "none" => Compression::UNCOMPRESSED,
-        "gzip" => Compression::GZIP(GzipLevel::default()),
-        "lz4" => Compression::LZ4,
-        "brotli" => Compression::BROTLI(BrotliLevel::default()),
-        "zstd" => Compression::ZSTD(ZstdLevel::default()),
-        _ => Compression::SNAPPY,
-    };
-
-    // Set up writer properties
-    let props = WriterProperties::builder()
-        .set_compression(compression)
-        .set_max_row_group_size(target_row_group_size_bytes)
-        .set_data_page_row_count_limit(20_000)
-        .set_data_page_size_limit(target_page_size_bytes)
-        .set_write_batch_size(8192)
-        .build();
-
-    let mut file_buffers = Vec::new();
-    let mut current_buffer = Vec::new();
-    let mut current_cursor = Cursor::new(&mut current_buffer);
-    let mut current_writer =
-        ArrowWriter::try_new(&mut current_cursor, schema_ref.clone(), Some(props.clone()))
-            .map_err(|e| {
-                SofError::ParquetConversionError(format!("Failed to create Parquet writer: {}", e))
-            })?;
-
-    let mut row_offset = 0;
-    let mut _current_file_rows = 0;
-
-    while row_offset < result.rows.len() {
-        let batch_end = (row_offset + optimal_batch_size).min(result.rows.len());
-        let batch_rows = &result.rows[row_offset..batch_end];
-
-        // Convert batch to Arrow arrays
-        let batch_arrays =
-            parquet_schema::process_to_arrow_arrays(&schema, &result.columns, batch_rows)?;
-
-        // Create RecordBatch
-        let batch = RecordBatch::try_new(schema_ref.clone(), batch_arrays).map_err(|e| {
-            SofError::ParquetConversionError(format!(
-                "Failed to create RecordBatch for rows {}-{}: {}",
-                row_offset, batch_end, e
-            ))
-        })?;
-
-        // Write batch
-        current_writer.write(&batch).map_err(|e| {
-            SofError::ParquetConversionError(format!(
-                "Failed to write RecordBatch for rows {}-{}: {}",
-                row_offset, batch_end, e
-            ))
-        })?;
-
-        _current_file_rows += batch_end - row_offset;
-        row_offset = batch_end;
-
-        // Check if we should start a new file
-        // Get actual size of current buffer by flushing the writer
-        let current_size = current_writer.bytes_written();
-
-        if current_size >= max_file_size_bytes && row_offset < result.rows.len() {
-            // Close current file
-            current_writer.close().map_err(|e| {
-                SofError::ParquetConversionError(format!("Failed to close Parquet writer: {}", e))
-            })?;
-
-            // Save the buffer
-            file_buffers.push(current_buffer);
-
-            // Start new file
-            current_buffer = Vec::new();
-            current_cursor = Cursor::new(&mut current_buffer);
-            current_writer =
-                ArrowWriter::try_new(&mut current_cursor, schema_ref.clone(), Some(props.clone()))
-                    .map_err(|e| {
-                        SofError::ParquetConversionError(format!(
-                            "Failed to create new Parquet writer: {}",
-                            e
-                        ))
-                    })?;
-            _current_file_rows = 0;
-        }
-    }
-
-    // Close the final writer
-    current_writer.close().map_err(|e| {
-        SofError::ParquetConversionError(format!("Failed to close final Parquet writer: {}", e))
-    })?;
-
-    file_buffers.push(current_buffer);
-
-    Ok(file_buffers)
+    let schema = std::sync::Arc::new(parquet_schema::resolve_arrow_schema(
+        &result.columns,
+        declared,
+        &result.rows,
+    )?);
+    let opts = options.cloned().unwrap_or_default();
+    let mut writer = columnar_stream::RollingParquetWriter::new(
+        |_| Ok(Vec::new()),
+        schema,
+        &opts,
+        max_file_size_bytes,
+    );
+    writer.write_rows(&result.rows)?;
+    writer.finish()
 }
 
 #[cfg(test)]

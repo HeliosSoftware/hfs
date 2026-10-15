@@ -14,7 +14,7 @@ use std::sync::{Arc, OnceLock};
 
 use super::{BoundParam, SqlQueryError};
 use crate::SofError;
-use crate::column_types::{AnsiType, resolve_columns};
+use crate::column_types::{AnsiType, ColumnTypeInfo, default_for_fhir_type, resolve_columns};
 
 /// FHIR type code for a column. Mirrors the value-set used by
 /// `ViewDefinition.select.column.type` so we can pick the correct value[X]
@@ -115,6 +115,12 @@ impl ColumnFhirType {
 pub struct ColumnSchema {
     pub name: String,
     pub fhir_type: ColumnFhirType,
+    /// The resolved ISO/IEC 9075 type (the `ansi/type` tag if the column has
+    /// one, else the default for its declared `type`), when it is known. It is
+    /// kept beside `fhir_type` because a tag override is not recoverable from
+    /// the post-override `fhir_type` (a `DATE` tag and a declared `date` both
+    /// end up as [`ColumnFhirType::Date`]).
+    pub ansi: Option<AnsiType>,
 }
 
 /// Per-table schema: the column list (order matters for INSERT).
@@ -163,6 +169,7 @@ impl TableSchema {
                 ColumnSchema {
                     name: info.name,
                     fhir_type,
+                    ansi: info.ansi,
                 }
             })
             .collect();
@@ -184,6 +191,7 @@ fn collect_columns(select: &Value, out: &mut Vec<ColumnSchema>) {
             out.push(ColumnSchema {
                 name: name.to_string(),
                 fhir_type: ColumnFhirType::from_code(&type_code),
+                ansi: Some(default_for_fhir_type(&type_code)),
             });
         }
     }
@@ -197,6 +205,118 @@ fn collect_columns(select: &Value, out: &mut Vec<ColumnSchema>) {
             collect_columns(s, out);
         }
     }
+}
+
+/// One column as declared by a ViewDefinition, before any defaulting.
+///
+/// Unlike [`ColumnSchema`], a column without a `type` keeps `fhir_type: None`
+/// (so a columnar writer can fall back to inferring from the data) and the
+/// `collection` flag is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredColumn {
+    /// Column name.
+    pub name: String,
+    /// The declared FHIR `type`, or `None` to infer it from the data.
+    pub fhir_type: Option<ColumnFhirType>,
+    /// Whether the column is declared `collection: true`.
+    pub collection: bool,
+    /// The resolved ISO/IEC 9075 type: the `ansi/type` tag if the column has
+    /// one, else the default mapping for `fhir_type`. `None` when the column
+    /// declares neither (its type is inferred from the data).
+    pub ansi: Option<AnsiType>,
+}
+
+impl From<&ColumnTypeInfo> for DeclaredColumn {
+    fn from(info: &ColumnTypeInfo) -> Self {
+        DeclaredColumn {
+            name: info.name.clone(),
+            fhir_type: info.fhir_type.as_deref().map(ColumnFhirType::from_code),
+            collection: info.collection,
+            ansi: info.ansi,
+        }
+    }
+}
+
+/// Declared columns for a query result: each column takes the type the query
+/// reported, so every consumer (`$sql-run`, exports) builds the same schema.
+pub fn declared_from_query_types(
+    columns: &[String],
+    types: &[ColumnFhirType],
+) -> Vec<DeclaredColumn> {
+    columns
+        .iter()
+        .zip(types)
+        .map(|(name, t)| DeclaredColumn {
+            name: name.clone(),
+            fhir_type: Some(t.clone()),
+            collection: false,
+            ansi: Some(default_for_fhir_type(t.code())),
+        })
+        .collect()
+}
+
+/// Declared columns of a ViewDefinition, in declaration order, keeping the
+/// first declaration of each name (same walk as [`TableSchema::from_view_definition`]).
+///
+/// Infallible: if a column carries an invalid `ansi/type` tag, every column
+/// falls back to the default mapping for its declared `type` and the tag is
+/// ignored. Callers that must reject such a ViewDefinition use
+/// [`try_declared_columns`].
+pub fn declared_columns(view: &Value) -> Vec<DeclaredColumn> {
+    try_declared_columns(view).unwrap_or_else(|_| untagged_declared_columns(view))
+}
+
+/// Declared columns of a ViewDefinition with each column's resolved SQL type
+/// (the declared `type`'s default mapping, or its `ansi/type` tag). Fails with
+/// [`SofError::InvalidViewDefinition`], naming the column, when a tag is
+/// unknown, not a string, or incompatible with the column's `type`.
+pub fn try_declared_columns(view: &Value) -> Result<Vec<DeclaredColumn>, SofError> {
+    Ok(resolve_columns(view)?
+        .iter()
+        .map(DeclaredColumn::from)
+        .collect())
+}
+
+fn untagged_declared_columns(view: &Value) -> Vec<DeclaredColumn> {
+    fn walk(select: &Value, out: &mut Vec<DeclaredColumn>) {
+        if let Some(cols) = select.get("column").and_then(|v| v.as_array()) {
+            for col in cols {
+                let Some(name) = col.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let fhir_type = col
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(ColumnFhirType::from_code);
+                out.push(DeclaredColumn {
+                    name: name.to_string(),
+                    ansi: fhir_type.as_ref().map(|t| default_for_fhir_type(t.code())),
+                    fhir_type,
+                    collection: col
+                        .get("collection")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                });
+            }
+        }
+        for key in ["select", "unionAll"] {
+            if let Some(nested) = select.get(key).and_then(|v| v.as_array()) {
+                for s in nested {
+                    walk(s, out);
+                }
+            }
+        }
+    }
+
+    let mut columns = Vec::new();
+    if let Some(selects) = view.get("select").and_then(|v| v.as_array()) {
+        for s in selects {
+            walk(s, &mut columns);
+        }
+    }
+    let mut seen = HashSet::new();
+    columns.retain(|column| seen.insert(column.name.clone()));
+    columns
 }
 
 /// Result of running the user query.
@@ -613,6 +733,7 @@ mod tests {
                 .map(|(n, t)| ColumnSchema {
                     name: (*n).to_string(),
                     fhir_type: t.clone(),
+                    ansi: None,
                 })
                 .collect(),
         }
@@ -991,6 +1112,7 @@ mod tests {
         let decimal = ColumnSchema {
             name: "c".into(),
             fhir_type: ColumnFhirType::Decimal,
+            ansi: None,
         };
         assert_eq!(
             json_to_sqlite_value(&json!({"c": "1.5"}), &decimal),
@@ -999,6 +1121,7 @@ mod tests {
         let integer64 = ColumnSchema {
             name: "c".into(),
             fhir_type: ColumnFhirType::Integer64,
+            ansi: None,
         };
         assert_eq!(
             json_to_sqlite_value(&json!({"c": "9007199254740993"}), &integer64),
@@ -1007,6 +1130,7 @@ mod tests {
         let instant = ColumnSchema {
             name: "c".into(),
             fhir_type: ColumnFhirType::Instant,
+            ansi: None,
         };
         assert_eq!(
             json_to_sqlite_value(&json!({"c": "2024-01-01T00:00:00Z"}), &instant),

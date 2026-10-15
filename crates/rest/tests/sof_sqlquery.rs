@@ -558,6 +558,140 @@ mod sof_sqlquery_tests {
             .await
     }
 
+    /// `$sql-run` as Parquet, selecting from the ViewDefinition at `vd_ref`.
+    async fn run_sql_as_parquet(
+        server: &TestServer,
+        sql: &str,
+        vd_ref: &str,
+    ) -> axum_test::TestResponse {
+        let library = library_with_canonical_vd(sql, vd_ref, "t", vec![]);
+        server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&json!({"resourceType": "Parameters", "parameter": [
+                {"name": "_format", "valueCode": "parquet"},
+                {"name": "subjectResource", "resource": library},
+            ]}))
+            .await
+    }
+
+    /// SQLite stores a `boolean` column as the integers 0/1; the typed Parquet
+    /// schema must still be `Boolean` and carry the values (#569 review).
+    #[tokio::test]
+    async fn sqlquery_parquet_boolean_column_from_sqlite_integers() {
+        use arrow::array::{Array, BooleanArray};
+        use arrow::datatypes::DataType;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        seed_patient(&backend, "p2", "Jones", false).await;
+        let vd_ref = seed_patient_view(&backend).await;
+
+        let response = run_sql_as_parquet(
+            &server,
+            "SELECT patient_id, active FROM t ORDER BY patient_id",
+            &vd_ref,
+        )
+        .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(response.into_bytes()).expect("valid parquet");
+        assert_eq!(
+            builder
+                .schema()
+                .field_with_name("active")
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
+        );
+        let mut values = Vec::new();
+        for batch in builder.build().unwrap() {
+            let batch = batch.unwrap();
+            let active = batch
+                .column_by_name("active")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("boolean array");
+            values.extend((0..active.len()).map(|i| active.value(i)));
+        }
+        assert_eq!(values, vec![true, false]);
+    }
+
+    /// An `ansi/type` tag on a ViewDefinition column survives into the
+    /// `$sql-run` Parquet schema (#569 review): `DOUBLE PRECISION` on an
+    /// `integer` column gives `Float64`, not the default `Int32`.
+    #[tokio::test]
+    async fn sqlquery_parquet_honours_ansi_type_tag_of_the_view_column() {
+        use arrow::datatypes::DataType;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let (server, backend) = create_test_server().await;
+        backend
+            .create(
+                &tenant(),
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "multipleBirthInteger": 2}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed patient");
+        backend
+            .create_or_update(
+                &tenant(),
+                "ViewDefinition",
+                "patient-tagged",
+                json!({
+                    "resourceType": "ViewDefinition",
+                    "id": "patient-tagged",
+                    "name": "patient_tagged",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [
+                        {"path": "id", "name": "patient_id", "type": "string"},
+                        {"path": "multipleBirthInteger", "name": "birth_n", "type": "integer",
+                         "tag": [{"name": "ansi/type", "value": "DOUBLE PRECISION"}]}
+                    ]}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed view definition");
+
+        let response = run_sql_as_parquet(
+            &server,
+            "SELECT patient_id, birth_n FROM t",
+            "ViewDefinition/patient-tagged",
+        )
+        .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(response.into_bytes()).expect("valid parquet");
+        assert_eq!(
+            builder
+                .schema()
+                .field_with_name("birth_n")
+                .unwrap()
+                .data_type(),
+            &DataType::Float64
+        );
+    }
+
     /// #1701: `patient`, `group` and `_since` narrow every dependency
     /// ViewDefinition of a Library subject.
     #[tokio::test]

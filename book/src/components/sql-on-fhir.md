@@ -86,4 +86,4 @@ Parameter precedence: request body > query params > `Accept` header.
 
 A column `tag` named `ansi/type` overrides the default (for example `DATE` on a `date` column gives a native date); an unknown or incompatible value is rejected. Columns with no declared `type` are inferred from the values. See the [`helios-sof` README](https://github.com/HeliosSoftware/hfs/blob/main/crates/sof/README.md#column-type-mapping) for the accepted values and the per-emitter comparison. Decimal columns were previously FLOAT64; add `ansi/type: DOUBLE PRECISION` to keep that.
 
-All fields are OPTIONAL.
+All fields are OPTIONAL. Parquet and Arrow IPC are encoded incrementally with the schema fixed from the declared column types before the first row, so memory stays bounded rather than growing with the result.

@@ -7,6 +7,7 @@
 //! compiler records, per output column, how its text must be decoded and the
 //! row mappers apply that decision through [`decode_text`].
 
+use helios_sof::columnar::ColumnKind;
 use serde_json::Value;
 
 /// How the text value of one output column is turned into a JSON value.
@@ -48,6 +49,20 @@ impl ColumnDecode {
                 Self::Auto => Self::Json,
                 other => other,
             },
+        }
+    }
+
+    /// The Arrow-side kind of this column for the columnar output path.
+    ///
+    /// `Json` and `Auto` are polymorphic per value, so they are deferred:
+    /// their Arrow type is inferred from the data, as for the row path.
+    pub fn column_kind(self) -> ColumnKind {
+        match self {
+            Self::Text => ColumnKind::Text,
+            Self::Boolean => ColumnKind::Boolean,
+            Self::Integer => ColumnKind::Integer,
+            Self::Decimal => ColumnKind::Decimal,
+            Self::Json | Self::Auto => ColumnKind::Deferred,
         }
     }
 
@@ -211,6 +226,16 @@ mod tests {
             ColumnDecode::Json
         );
         assert_eq!(ColumnDecode::from_fhir_type("mystery"), ColumnDecode::Auto);
+    }
+
+    #[test]
+    fn column_kind_defers_polymorphic_modes() {
+        assert_eq!(ColumnDecode::Text.column_kind(), ColumnKind::Text);
+        assert_eq!(ColumnDecode::Boolean.column_kind(), ColumnKind::Boolean);
+        assert_eq!(ColumnDecode::Integer.column_kind(), ColumnKind::Integer);
+        assert_eq!(ColumnDecode::Decimal.column_kind(), ColumnKind::Decimal);
+        assert_eq!(ColumnDecode::Json.column_kind(), ColumnKind::Deferred);
+        assert_eq!(ColumnDecode::Auto.column_kind(), ColumnKind::Deferred);
     }
 
     #[test]

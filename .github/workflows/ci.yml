@@ -191,6 +191,18 @@ jobs:
           fi
           echo "All test subdirectories are wired into a top-level test binary."
 
+      # Make room before the build, not after it fails. On the Windows agents
+      # this build grows target/ by 130-150GB, and the end-of-job sweep below
+      # only caps what is left between jobs; a run that started with ~150GB
+      # free ran out mid-link (run 38627332199). 175 covers the largest growth
+      # seen plus margin, and is a no-op on the Linux agents (~230GB free, ~30GB
+      # growth). See "Pre-build headroom" in .github/actions/cargo-target-gc.
+      - name: Ensure build headroom
+        uses: ./.github/actions/cargo-target-gc
+        with:
+          mode: preflight
+          min-free-gb: "175"
+
       # `--all-features` enables R5, so this is the one job where the R5 FHIRPath
       # conformance suite is live rather than compiled to its `#[cfg(not(R5))]`
       # no-op twin. HFS_REQUIRE_R5 makes that a hard requirement here: if the
@@ -829,6 +841,23 @@ jobs:
         # reaching the bug would require AWS itself to send the hostile frame
         # stream. Remove this once the AWS SDK drops its hyper 0.14 fallback
         # client.
+        #
+        # rustls 0.21.12 (RUSTSEC-2026-0346, RUSTSEC-2026-0349). The copy we
+        # build ourselves is on the patched 0.23.46; this is the same legacy
+        # AWS fallback copy (rustls 0.21 <- aws-smithy-http-client 1.1.10
+        # `legacy-rustls-ring`), only linked under `--all-features`. The
+        # advisories' fix lands in >= 0.23.46 only, so no 0.21.x upgrade
+        # exists. Neither is reachable through that path:
+        #   - RUSTSEC-2026-0346 (derived `Debug` on client session values
+        #     prints the master secret / resumption PSK): only affects custom
+        #     `ClientSessionStore` impls that Debug-format those values; the
+        #     AWS SDK uses rustls's built-in, redacted session cache.
+        #   - RUSTSEC-2026-0349 (unauthenticated ServerHello downgrades later
+        #     handshakes from X25519MLKEM768 to classical X25519): rustls 0.21
+        #     has no post-quantum hybrid group, so its key exchange is already
+        #     classical-only and there is nothing to downgrade.
+        # Remove these with the h2 entry above, once the AWS SDK drops its
+        # hyper 0.14 fallback client.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0098
@@ -838,6 +867,8 @@ jobs:
           --ignore RUSTSEC-2026-0195
           --ignore RUSTSEC-2026-0235
           --ignore RUSTSEC-2026-0258
+          --ignore RUSTSEC-2026-0346
+          --ignore RUSTSEC-2026-0349
 
       # See the note in `test-rust`.
       - name: Cap target dir size

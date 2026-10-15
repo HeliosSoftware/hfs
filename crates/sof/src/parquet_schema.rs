@@ -45,7 +45,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::column_types::{AnsiType, ColumnTypeInfo};
+use crate::column_types::{AnsiType, default_for_fhir_type};
+use crate::sqlquery::ColumnFhirType;
+use crate::sqlquery::engine::DeclaredColumn;
 use crate::{ProcessedRow, SofError};
 
 /// Infers an Arrow type from sampled values (the fallback for columns that do
@@ -54,7 +56,6 @@ pub fn infer_arrow_type(values: &[Option<Value>]) -> DataType {
     let mut type_counts: HashMap<String, usize> = HashMap::new();
     let mut has_array = false;
     let mut has_object = false;
-    let mut array_element_type = None;
 
     for value in values.iter().flatten() {
         match value {
@@ -71,13 +72,8 @@ pub fn infer_arrow_type(values: &[Option<Value>]) -> DataType {
             Value::String(_) => {
                 *type_counts.entry("string".to_string()).or_insert(0) += 1;
             }
-            Value::Array(arr) => {
+            Value::Array(_) => {
                 has_array = true;
-                if !arr.is_empty() && array_element_type.is_none() {
-                    let element_values: Vec<Option<Value>> =
-                        arr.iter().map(|v| Some(v.clone())).collect();
-                    array_element_type = Some(infer_arrow_type(&element_values));
-                }
             }
             Value::Object(_) => {
                 has_object = true;
@@ -86,12 +82,10 @@ pub fn infer_arrow_type(values: &[Option<Value>]) -> DataType {
         }
     }
 
+    // Without a declaration the element type of a collection is not known, so
+    // an inferred list is always `List<Utf8>`.
     if has_array {
-        if let Some(element_type) = array_element_type {
-            return DataType::List(Arc::new(Field::new("item", element_type, true)));
-        } else {
-            return DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-        }
+        return utf8_list_type();
     }
 
     if has_object {
@@ -163,39 +157,86 @@ pub fn arrow_type_for_ansi(ansi: AnsiType) -> DataType {
     }
 }
 
-/// Builds the Arrow schema purely by inspecting values; see
-/// [`create_arrow_schema_typed`] for the declaration-driven variant.
-pub fn create_arrow_schema(columns: &[String], rows: &[ProcessedRow]) -> Result<Schema, SofError> {
-    create_arrow_schema_typed(columns, rows, &[])
+/// Number of leading rows sampled to infer the type of undeclared columns.
+pub const SCHEMA_SAMPLE_ROWS: usize = 100;
+
+/// Arrow field metadata key marking a column whose type comes from the
+/// ViewDefinition (a declared `type`, an `ansi/type` tag or `collection:
+/// true`). Array building is strict for such a column: a value that does not
+/// fit the type is an error naming the column. For any other column the type
+/// is only a guess from the data seen so far, so a misfit becomes null.
+pub const DECLARED_FIELD_KEY: &str = "helios.sof.declared";
+
+/// A `Field` for `name`, marked as declared when `declared` is true.
+pub fn schema_field(name: &str, data_type: DataType, declared: bool) -> Field {
+    let field = Field::new(name, data_type, true);
+    if declared {
+        field.with_metadata(HashMap::from([(
+            DECLARED_FIELD_KEY.to_string(),
+            "true".to_string(),
+        )]))
+    } else {
+        field
+    }
 }
 
-/// Builds the Arrow schema for `columns`. A column with a matching entry in
-/// `column_types` (by name) that has a resolved SQL type uses it; any other
-/// column falls back to value inference over the first 100 rows.
-pub fn create_arrow_schema_typed(
+fn utf8_list_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+}
+
+/// Arrow type for a ViewDefinition column with a declared FHIR `type` and no
+/// `ansi/type` tag: the spec default for that type (see [`default_for_fhir_type`]).
+/// A `collection: true` column is a `List` of that type.
+pub fn arrow_type_for_declared(fhir_type: &ColumnFhirType, collection: bool) -> DataType {
+    arrow_type_for_resolved(default_for_fhir_type(fhir_type.code()), collection)
+}
+
+/// Arrow type for an already resolved SQL type, wrapped in a `List` for
+/// `collection: true` columns.
+pub fn arrow_type_for_resolved(ansi: AnsiType, collection: bool) -> DataType {
+    let element = arrow_type_for_ansi(ansi);
+    if collection {
+        DataType::List(Arc::new(Field::new("item", element, true)))
+    } else {
+        element
+    }
+}
+
+/// Builds the Arrow schema purely by inspecting values; see
+/// [`resolve_arrow_schema`] for the declaration-driven variant.
+pub fn create_arrow_schema(columns: &[String], rows: &[ProcessedRow]) -> Result<Schema, SofError> {
+    resolve_arrow_schema(columns, &[], rows)
+}
+
+/// Decides the Arrow schema for `columns`.
+///
+/// A column found (by name) in `declared` with a resolved SQL type (the
+/// declared `type`, overridden by an `ansi/type` tag) gets that type's Arrow
+/// mapping; every other column is inferred from at most
+/// [`SCHEMA_SAMPLE_ROWS`] rows of `rows` (widening `Int32` to `Int64` if any
+/// row has a larger integer). Column order and names come from `columns`.
+/// Shared by the buffered and the incremental writers so both agree.
+pub fn resolve_arrow_schema(
     columns: &[String],
+    declared: &[DeclaredColumn],
     rows: &[ProcessedRow],
-    column_types: &[ColumnTypeInfo],
 ) -> Result<Schema, SofError> {
-    let sample_size = std::cmp::min(100, rows.len());
+    let sample_size = std::cmp::min(SCHEMA_SAMPLE_ROWS, rows.len());
     let mut fields = Vec::new();
 
     for (col_idx, column_name) in columns.iter().enumerate() {
-        let declared = column_types
-            .iter()
-            .find(|c| &c.name == column_name)
-            .and_then(|c| c.ansi.map(|a| (a, c.collection)));
-
-        let data_type = match declared {
-            Some((ansi, collection)) => {
-                let element = arrow_type_for_ansi(ansi);
-                if collection {
-                    DataType::List(Arc::new(Field::new("item", element, true)))
-                } else {
-                    element
-                }
-            }
-            None => {
+        let decl = declared.iter().find(|d| &d.name == column_name);
+        let is_declared = decl.is_some_and(|d| d.ansi.is_some() || d.collection);
+        let data_type = match decl {
+            Some(DeclaredColumn {
+                ansi: Some(ansi),
+                collection,
+                ..
+            }) => arrow_type_for_resolved(*ansi, *collection),
+            Some(DeclaredColumn {
+                collection: true, ..
+            }) => utf8_list_type(),
+            _ => {
                 let sample_values: Vec<Option<Value>> = rows
                     .iter()
                     .take(sample_size)
@@ -209,7 +250,7 @@ pub fn create_arrow_schema_typed(
                 )
             }
         };
-        fields.push(Field::new(column_name, data_type, true));
+        fields.push(schema_field(column_name, data_type, is_declared));
     }
 
     Ok(Schema::new(fields))
@@ -256,8 +297,43 @@ fn as_i64(value: &Value) -> Option<i64> {
     }
 }
 
-fn build_array_from_values(
+/// Builds an array of `data_type` from raw cell values, without a column name
+/// for error messages (used by the columnar accumulator).
+///
+/// Lenient: a value that does not fit `data_type` becomes null, because the
+/// type of such a column was inferred from earlier data and cannot change
+/// once the stream has started. Declared columns use [`build_named_array`],
+/// which reports a misfit instead.
+pub(crate) fn build_array_from_values(
     values: Vec<Option<Value>>,
+    data_type: &DataType,
+) -> Result<ArrayRef, SofError> {
+    if let Ok(array) = build_named_array(&values, data_type, "column") {
+        return Ok(array);
+    }
+    // Slow path, only after a misfit: null out the values that do not fit.
+    let cleaned: Vec<Option<Value>> = values
+        .into_iter()
+        .map(|value| match value {
+            Some(v) if !v.is_null() => {
+                let one = [Some(v)];
+                if build_named_array(&one, data_type, "column").is_ok() {
+                    let [kept] = one;
+                    kept
+                } else {
+                    None
+                }
+            }
+            other => other,
+        })
+        .collect();
+    build_named_array(&cleaned, data_type, "column")
+}
+
+/// Builds an array of `data_type` from raw cell values; a value that does not
+/// fit is an error naming `column`.
+pub(crate) fn build_named_array(
+    values: &[Option<Value>],
     data_type: &DataType,
     column: &str,
 ) -> Result<ArrayRef, SofError> {
@@ -266,12 +342,23 @@ fn build_array_from_values(
     match data_type {
         DataType::Boolean => {
             let mut builder = BooleanBuilder::new();
-            for value in &values {
+            for value in values {
                 match value {
                     Some(Value::Bool(b)) => builder.append_value(*b),
-                    Some(Value::String(s)) if s == "true" || s == "false" => {
-                        builder.append_value(s == "true")
+                    // PostgreSQL renders booleans as 't' / 'f'; SQLite stores
+                    // them as the integers 0 / 1.
+                    Some(Value::String(s))
+                        if matches!(s.to_ascii_lowercase().as_str(), "true" | "t") =>
+                    {
+                        builder.append_value(true)
                     }
+                    Some(Value::String(s))
+                        if matches!(s.to_ascii_lowercase().as_str(), "false" | "f") =>
+                    {
+                        builder.append_value(false)
+                    }
+                    Some(Value::Number(n)) if n.as_i64() == Some(1) => builder.append_value(true),
+                    Some(Value::Number(n)) if n.as_i64() == Some(0) => builder.append_value(false),
                     v if is_null(v) => builder.append_null(),
                     Some(other) => return Err(conversion_error(column, "BOOLEAN", other)),
                     None => unreachable!(),
@@ -281,7 +368,7 @@ fn build_array_from_values(
         }
         DataType::Int32 => {
             let mut builder = Int32Builder::new();
-            for value in &values {
+            for value in values {
                 match value {
                     v if is_null(v) => builder.append_null(),
                     Some(other) => match as_i64(other).and_then(|i| i32::try_from(i).ok()) {
@@ -295,7 +382,7 @@ fn build_array_from_values(
         }
         DataType::Int64 => {
             let mut builder = Int64Builder::new();
-            for value in &values {
+            for value in values {
                 match value {
                     v if is_null(v) => builder.append_null(),
                     Some(other) => match as_i64(other) {
@@ -309,7 +396,7 @@ fn build_array_from_values(
         }
         DataType::Float64 => {
             let mut builder = Float64Builder::new();
-            for value in &values {
+            for value in values {
                 match value {
                     Some(Value::Number(n)) => match n.as_f64() {
                         Some(f) => builder.append_value(f),
@@ -359,7 +446,7 @@ fn build_array_from_values(
         }
         DataType::Binary => {
             let mut builder = BinaryBuilder::new();
-            for value in &values {
+            for value in values {
                 match value {
                     Some(Value::String(s)) => {
                         match base64::engine::general_purpose::STANDARD.decode(s.trim()) {
@@ -388,7 +475,7 @@ fn build_array_from_values(
                 "TIMESTAMP"
             };
             let mut builder = TimestampMicrosecondBuilder::new();
-            for value in &values {
+            for value in values {
                 match value {
                     Some(Value::String(s)) => {
                         let micros = if with_tz {
@@ -420,7 +507,7 @@ fn build_array_from_values(
         }
         DataType::Date32 => {
             let mut builder = Date32Builder::new();
-            for value in &values {
+            for value in values {
                 match value {
                     Some(Value::String(s)) => match parse_date32(s) {
                         Some(d) => builder.append_value(d),
@@ -441,7 +528,7 @@ fn build_array_from_values(
         }
         DataType::Time64(TimeUnit::Microsecond) => {
             let mut builder = Time64MicrosecondBuilder::new();
-            for value in &values {
+            for value in values {
                 match value {
                     Some(Value::String(s)) => match parse_time_micros(s) {
                         Some(t) => builder.append_value(t),
@@ -471,7 +558,7 @@ fn build_array_from_values(
                     Some(Value::Array(arr)) => {
                         lengths.push(arr.len());
                         validity.push(true);
-                        flat.extend(arr.into_iter().map(Some));
+                        flat.extend(arr.iter().cloned().map(Some));
                     }
                     None | Some(Value::Null) => {
                         lengths.push(0);
@@ -481,11 +568,11 @@ fn build_array_from_values(
                     Some(single) => {
                         lengths.push(1);
                         validity.push(true);
-                        flat.push(Some(single));
+                        flat.push(Some(single.clone()));
                     }
                 }
             }
-            let elements = build_array_from_values(flat, field.data_type(), column)?;
+            let elements = build_named_array(&flat, field.data_type(), column)?;
             let list = ListArray::try_new(
                 field.clone(),
                 OffsetBuffer::from_lengths(lengths),
@@ -520,7 +607,11 @@ pub fn process_to_arrow_arrays(
             .map(|row| row.values.get(col_idx).cloned().flatten())
             .collect();
 
-        let array = build_array_from_values(values, field.data_type(), field.name())?;
+        let array = if field.metadata().contains_key(DECLARED_FIELD_KEY) {
+            build_named_array(&values, field.data_type(), field.name())?
+        } else {
+            build_array_from_values(values, field.data_type())?
+        };
         arrays.push(array);
     }
 
@@ -640,7 +731,7 @@ mod tests {
             Some(json!(false)),
             Some(json!(true)),
         ];
-        let array = build_array_from_values(values, &DataType::Boolean, "c").unwrap();
+        let array = build_named_array(&values, &DataType::Boolean, "c").unwrap();
         let bool_array = array
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
@@ -662,7 +753,7 @@ mod tests {
             Some(json!({"key": "value"})),
             None,
         ];
-        let array = build_array_from_values(values, &DataType::Utf8, "c").unwrap();
+        let array = build_named_array(&values, &DataType::Utf8, "c").unwrap();
         let string_array = array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
@@ -674,5 +765,186 @@ mod tests {
         assert_eq!(string_array.value(2), "true");
         assert!(string_array.value(3).contains("\"key\""));
         assert!(array.is_null(4));
+    }
+
+    #[test]
+    fn test_boolean_array_accepts_postgres_text_and_sqlite_integers() {
+        let values = vec![
+            Some(json!("t")),
+            Some(json!("F")),
+            Some(json!("TRUE")),
+            Some(json!("maybe")),
+            Some(json!(1)),
+            Some(json!(0)),
+        ];
+        let array = build_array_from_values(values, &DataType::Boolean).unwrap();
+        let b = array
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert!(b.value(0) && !b.value(1) && b.value(2));
+        assert!(array.is_null(3));
+        assert!(b.value(4) && !b.value(5));
+        // A declared boolean column reports the misfit instead.
+        let err = build_named_array(&[Some(json!("maybe"))], &DataType::Boolean, "flag")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("flag"), "{err}");
+    }
+
+    #[test]
+    fn test_infer_integer_type_widens_to_int64_when_sample_exceeds_i32() {
+        let values = vec![Some(json!(1)), Some(json!(3_000_000_000_i64)), None];
+        let schema = create_arrow_schema(
+            &["n".to_string()],
+            &values
+                .into_iter()
+                .map(|v| ProcessedRow { values: vec![v] })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn test_create_schema_widens_integer_column_past_the_sample() {
+        // The kind is inferred from the first 100 rows; the width must be
+        // decided from every row, or row 101 wraps or fails at write time.
+        let columns = vec!["n".to_string()];
+        let mut rows: Vec<ProcessedRow> = (0..100)
+            .map(|i| ProcessedRow {
+                values: vec![Some(json!(i))],
+            })
+            .collect();
+        rows.push(ProcessedRow {
+            values: vec![Some(json!(3_000_000_000_i64))],
+        });
+
+        let schema = create_arrow_schema(&columns, &rows).unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn test_build_int32_array_nulls_out_of_range_when_inferred() {
+        let values = vec![
+            Some(json!(1)),
+            Some(json!(3_000_000_000_i64)),
+            Some(json!(-3_000_000_000_i64)),
+            Some(json!("42")),
+        ];
+        let array = build_array_from_values(values.clone(), &DataType::Int32).unwrap();
+        let ints = array
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert_eq!(ints.value(0), 1);
+        assert!(array.is_null(1));
+        assert!(array.is_null(2));
+        assert_eq!(ints.value(3), 42);
+
+        // A declared column reports the first misfit, naming the column.
+        let err = build_named_array(&values, &DataType::Int32, "n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("column 'n'"), "{err}");
+    }
+
+    #[test]
+    fn test_build_int64_array() {
+        let values = vec![
+            Some(json!(3_000_000_000_i64)),
+            Some(json!(-3_000_000_000_i64)),
+            None,
+            Some(json!(i64::MAX)),
+            Some(json!(i64::MIN)),
+            Some(json!("not a number")),
+            Some(json!(u64::MAX)),
+        ];
+        let array = build_array_from_values(values, &DataType::Int64).unwrap();
+        let ints = array
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(array.len(), 7);
+        assert_eq!(ints.value(0), 3_000_000_000);
+        assert_eq!(ints.value(1), -3_000_000_000);
+        assert!(array.is_null(2));
+        assert_eq!(ints.value(3), i64::MAX);
+        assert_eq!(ints.value(4), i64::MIN);
+        assert!(array.is_null(5));
+        assert!(array.is_null(6));
+    }
+
+    #[test]
+    fn test_resolve_schema_declared_inferred_and_collection() {
+        use crate::sqlquery::engine::declared_columns;
+        let view = json!({"select": [{"column": [
+            {"name": "n", "type": "integer"},
+            {"name": "big", "type": "integer64"},
+            {"name": "d", "type": "decimal"},
+            {"name": "b", "type": "boolean"},
+            {"name": "tags", "type": "string", "collection": true},
+            {"name": "untyped", "path": "x"},
+        ]}]});
+        let declared = declared_columns(&view);
+        assert_eq!(declared.len(), 6);
+        assert!(declared[5].fhir_type.is_none());
+        let columns: Vec<String> = declared.iter().map(|d| d.name.clone()).collect();
+        let rows = vec![ProcessedRow {
+            values: vec![
+                Some(json!(1)),
+                Some(json!(1)),
+                Some(json!(1)), // integer-looking value, declared decimal
+                Some(json!(true)),
+                Some(json!(["a"])),
+                Some(json!(7)),
+            ],
+        }];
+        let schema = resolve_arrow_schema(&columns, &declared, &rows).unwrap();
+        let types: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        assert_eq!(types[0], DataType::Int32);
+        assert_eq!(types[1], DataType::Int64);
+        assert_eq!(types[2], DataType::Utf8); // decimal is character data
+        assert_eq!(types[3], DataType::Boolean);
+        assert_eq!(types[4], utf8_list_type());
+        assert_eq!(types[5], DataType::Int32); // inferred
+        // Only the declared columns are marked strict.
+        let strict: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|f| f.metadata().contains_key(DECLARED_FIELD_KEY))
+            .collect();
+        assert_eq!(strict, vec![true, true, true, true, true, false]);
+    }
+
+    #[test]
+    fn test_inferred_lists_are_always_utf8() {
+        let values = vec![Some(json!([1, 2, 3]))];
+        assert_eq!(infer_arrow_type(&values), utf8_list_type());
+    }
+
+    #[test]
+    fn test_inferred_column_misfit_is_null_but_declared_misfit_is_an_error() {
+        let columns = vec!["n".to_string()];
+        let rows = vec![
+            ProcessedRow {
+                values: vec![Some(json!(1))],
+            },
+            ProcessedRow {
+                values: vec![Some(json!("x"))],
+            },
+        ];
+        // Inferred Int32 (the sample is all one kind here).
+        let schema = Schema::new(vec![Field::new("n", DataType::Int32, true)]);
+        let arrays = process_to_arrow_arrays(&schema, &columns, &rows).unwrap();
+        assert_eq!(arrays[0].null_count(), 1);
+        // The same type, declared.
+        let schema = Schema::new(vec![schema_field("n", DataType::Int32, true)]);
+        let err = process_to_arrow_arrays(&schema, &columns, &rows).unwrap_err();
+        assert!(err.to_string().contains("column 'n'"), "{err}");
     }
 }

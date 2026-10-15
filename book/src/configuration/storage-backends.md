@@ -91,6 +91,9 @@ worker index and the `__system__` tenant's AuditEvents. It is optional, but
 without it those endpoints answer `501`, login sessions stay in process, and a
 database audit sink needs its own `HFS_AUDIT_S3_BUCKET`.
 
+#### Keyspace layout on S3
+**S3 keyspace layout (`HFS_S3_KEYSPACE_LAYOUT`).** Each tenant has one layout, `v1` or `v2`, recorded in a marker object `history/_keyspace.json` (`{"layout":2}`). The variable only decides the layout of a tenant that has no marker and no data yet; a tenant that already holds objects without a marker is always `v1`, and a stamped marker always wins, so changing the variable never moves existing data. `v2` stores `resources/{type}/{h2}/{id}/…` and `history/type/{type}/{h2}/…` with `h2 = hex(sha256(id))[0..2]` (256 sub-prefixes) and drops the tenant-wide `history/system/` index (system history is served from `history/type/`), so each write does 3 PUTs instead of 4. The layout of a tenant is immutable: there is no migration, and `purge_tenant_data` keeps the marker. To change it, stop every instance and delete the tenant's prefix by hand. `v2` requires every instance that writes the bucket to run a build that reads the marker and to use the same setting; an older binary ignores the marker and would write `v1` keys into a `v2` tenant, leaving them unreachable. Opt-in: the default is `v1`.
+
 ### S3 + Elasticsearch
 
 ```bash

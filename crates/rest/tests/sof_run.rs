@@ -2822,4 +2822,80 @@ mod sof_run_tests {
             }
         }
     }
+
+    // =========================================================================
+    // Streamed parquet / arrow
+    // =========================================================================
+
+    async fn run_columnar(format: &str, patients: usize) -> axum_test::TestResponse {
+        let (server, backend) = create_test_server().await;
+        for i in 0..patients {
+            seed_patient(&backend, &format!("pt-{i:03}"), &format!("Family{i}")).await;
+        }
+        server
+            .post(&format!("/$sql-run?_format={format}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await
+    }
+
+    /// Stored data run as `_format=parquet` is streamed (chunked, no
+    /// `Content-Length`) and decodes to every seeded row.
+    #[tokio::test]
+    async fn test_run_stored_data_parquet_streams_and_decodes() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let response = run_columnar("parquet", 120).await;
+        response.assert_status(StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/vnd.apache.parquet"
+        );
+        assert!(
+            headers
+                .get("content-disposition")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("output.parquet"))
+        );
+        let bytes = response.as_bytes().clone();
+        assert!(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"));
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).expect("valid parquet");
+        let names: Vec<String> = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, ["patient_id", "family"]);
+        let total: usize = builder
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(total, 120);
+    }
+
+    /// Stored data run as `_format=arrow` decodes with the IPC stream reader.
+    #[tokio::test]
+    async fn test_run_stored_data_arrow_streams_and_decodes() {
+        let response = run_columnar("arrow", 120).await;
+        response.assert_status(StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/vnd.apache.arrow.stream"
+        );
+        let reader = arrow::ipc::reader::StreamReader::try_new(
+            std::io::Cursor::new(response.as_bytes().to_vec()),
+            None,
+        )
+        .expect("valid arrow stream");
+        let total: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(total, 120);
+    }
 }

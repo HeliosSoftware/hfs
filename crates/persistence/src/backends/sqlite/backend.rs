@@ -133,6 +133,9 @@ pub struct SqliteBackend {
     pool: Pool<SqliteConnectionManager>,
     config: SqliteBackendConfig,
     is_memory: bool,
+    /// The `-wal` file next to a file database, watched by WAL maintenance
+    /// without taking a pooled connection (#2025). `None` in memory.
+    wal_path: Option<std::path::PathBuf>,
     /// Per-tenant search parameter registries: a shared base (embedded + spec +
     /// custom) plus each tenant's stored (POSTed) overlay, built lazily.
     registries: Arc<TenantSearchRegistries>,
@@ -374,6 +377,11 @@ impl SqliteBackend {
             // never fsyncs anyway.
             if enable_wal && !is_memory {
                 conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+                // Without a limit the -wal file keeps its high-water size
+                // after every reset: once concurrent writes had grown it to
+                // 36 GB it stayed there, and every start rebuilt its index
+                // (#2025). With it, SQLite truncates the file at each reset.
+                conn.execute_batch("PRAGMA journal_size_limit = 268435456;")?;
             }
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
@@ -500,10 +508,16 @@ impl SqliteBackend {
             );
         }
 
+        let wal_path = (!is_memory).then(|| {
+            let mut wal = path.as_ref().as_os_str().to_owned();
+            wal.push("-wal");
+            std::path::PathBuf::from(wal)
+        });
         let backend = Self {
             pool,
             config,
             is_memory,
+            wal_path,
             registries,
         };
 
@@ -722,6 +736,11 @@ impl SqliteBackend {
         }
 
         Ok(())
+    }
+
+    /// The `-wal` file of a file database, `None` in memory.
+    pub(super) fn wal_path(&self) -> Option<&std::path::Path> {
+        self.wal_path.as_deref()
     }
 
     /// Returns whether this is an in-memory database.
