@@ -187,18 +187,13 @@ async fn configured_soft_timeout_awaits_driver_completion_and_releases_admission
     );
     let disabled = disable_failpoint(&session).await;
     assert_eq!(failpoint_hits(&disabled) - failpoint_hits(&armed), 1);
+    // The follow-up only proves the backend is usable again; an outer budget
+    // overrides the 100 ms one so a slow plan selection cannot fail it.
     let plain = SearchQuery::new("Observation").with_count(1);
-    assert_eq!(
-        fixture
-            .backend
-            .search(&fixture.tenant, &plain)
-            .await
-            .unwrap()
-            .resources
-            .items
-            .len(),
-        1
-    );
+    let followup = search_deadline::run(30_000, fixture.backend.search(&fixture.tenant, &plain))
+        .await
+        .unwrap();
+    assert_eq!(followup.resources.items.len(), 1);
     fixture.close().await;
 }
 
