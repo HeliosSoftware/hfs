@@ -1324,8 +1324,8 @@ fn table_option(
 }
 
 /// `POST /ui/lookup/table-options` — the *Add table* combobox's own result
-/// fragment (#842): up to 8 ViewDefinitions and `sql-view` Libraries whose
-/// `name` contains `q` — all of them, name-sorted, when `q` is empty (#842's
+/// fragment (#842): up to 8 ViewDefinitions, `sql-view` Libraries, ValueSets
+/// and ConceptMaps (#1824) whose `name` contains `q` — all of them, name-sorted, when `q` is empty (#842's
 /// own "browse" default; unlike the Patient/Group pickers above, which stay
 /// closed until the visitor types, an artifact list this short is worth
 /// showing up front) — excluding `exclude` (the artifact currently open, so
@@ -1419,10 +1419,33 @@ pub(crate) async fn table_options(
         .take(FETCH_BUFFER)
         .collect();
 
+    // Terminology relations (#1824): stored ValueSets and ConceptMaps, in
+    // the server's own resolution order after ViewDefinitions and SQL
+    // Views, searched by `name` exactly like ViewDefinitions.
+    let mut terminology_options: Vec<LookupOption> = Vec::new();
+    for (resource_type, kind_key) in [
+        ("ValueSet", "lib-tables-kind-value-set"),
+        ("ConceptMap", "lib-tables-kind-concept-map"),
+    ] {
+        let kind_label = i18n.t(kind_key);
+        if let Ok(page) = state
+            .conformance
+            .search_page(resource_type, &vd_params, FETCH_BUFFER, 0, rv.0, &rt.id)
+            .await
+        {
+            terminology_options.extend(
+                page.resources
+                    .iter()
+                    .filter_map(|r| table_option(r, resource_type, &kind_label, exclude)),
+            );
+        }
+    }
+
     let mut options = Vec::new();
     let mut seen = HashSet::new();
     append_options(vd_options, &mut options, &mut seen);
     append_options(sql_view_options, &mut options, &mut seen);
+    append_options(terminology_options, &mut options, &mut seen);
 
     let message = if options.is_empty() {
         i18n.t("lib-tables-options-empty")

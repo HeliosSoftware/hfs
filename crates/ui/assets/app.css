@@ -3740,6 +3740,17 @@ tr:hover .result-id__copy,
   margin: 0;
 }
 
+/* #1824: a resolved ValueSet with no expansion yet — a warning, not an
+   error: the row still links to its target. */
+.lib-tables__warning {
+  color: var(--warn);
+}
+
+/* #1824: the relation's row count after a ValueSet/ConceptMap link. */
+.lib-tables__note {
+  margin-left: 6px;
+}
+
 .lib-tables__add {
   display: flex;
   flex-wrap: wrap;

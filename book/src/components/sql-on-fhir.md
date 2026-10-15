@@ -29,6 +29,11 @@ cargo run --bin sof-server
 
 `POST /$sql-run`
 
+`sof-server` runs ViewDefinition subjects only. SQL Query and SQL View
+Libraries, including their ValueSet and ConceptMap dependencies, run on the
+HFS server; see [SQL Query and SQL View
+Subjects](../ch06-sql-on-fhir.md#sql-query-and-sql-view-subjects).
+
 Request body parameters (JSON):
 
 | Parameter | Description |

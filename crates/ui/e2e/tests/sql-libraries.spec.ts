@@ -1768,6 +1768,151 @@ test.describe("Tables panel", () => {
 // Unknown-table lint and Columns (#842/04): the live run's own gate ahead of
 // $sql-run — a table the SQL reads that no dependency declares never
 // runs at all — and the Columns card it feeds once a run actually succeeds.
+test.describe("Terminology dependencies (#1824)", () => {
+  // A ValueSet and a ConceptMap can be declared as `depends-on` tables and
+  // are exposed as relations with a fixed column set. The Tables card
+  // resolves both (chip, link, row count, the "no expansion yet" warning)
+  // and the Columns card traces a relation column to its fixed schema.
+  test("Add table offers a stored ValueSet, Reads from resolves it with its member count, and a compose-only ValueSet warns", async ({
+    page,
+    request,
+  }) => {
+    const suffix = Date.now();
+    const vsName = `e2e_cvd_vs_${suffix}`;
+    const vsCanonical = `http://example.org/ValueSet/e2e-cvd-${suffix}`;
+    const vsId = await createResource(request, "ValueSet", {
+      name: vsName,
+      url: vsCanonical,
+      status: "active",
+      expansion: {
+        total: 3,
+        contains: [
+          {
+            system: "http://snomed.info/sct",
+            abstract: true,
+            contains: [
+              { system: "http://snomed.info/sct", code: "22298006" },
+              { system: "http://hl7.org/fhir/sid/icd-10", code: "I21" },
+            ],
+          },
+        ],
+      },
+    });
+    const composeOnlyName = `e2e_compose_vs_${suffix}`;
+    const composeOnlyCanonical = `http://example.org/ValueSet/e2e-compose-${suffix}`;
+    const composeOnlyId = await createResource(request, "ValueSet", {
+      name: composeOnlyName,
+      url: composeOnlyCanonical,
+      status: "active",
+      compose: { include: [{ system: "http://snomed.info/sct", concept: [{ code: "22298006" }] }] },
+    });
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_terminology_query_${suffix}`,
+      composeOnlyCanonical,
+      "SELECT code FROM v",
+    );
+    await waitSearchable(request, "ValueSet", vsId);
+    await waitSearchable(request, "ValueSet", composeOnlyId);
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const tablesCard = page.locator("#lib-tables");
+
+    // The stored dependency is a compose-only ValueSet: resolved (chip,
+    // link into the Resources workspace), but flagged as not expanded.
+    const composeRow = tablesCard.locator(".lib-tables__row", { hasText: composeOnlyName });
+    await expect(composeRow).toBeVisible();
+    await expect(composeRow.locator(".tag")).toHaveText("ValueSet");
+    await expect(composeRow.locator(".lib-tables__warning")).toContainText("No expansion yet");
+    await expect(composeRow.locator("a")).toHaveAttribute(
+      "href",
+      `/ui/resources?url=ValueSet%3F_id%3D${composeOnlyId}&return_to=${encodeURIComponent(`/ui/sql/queries?lib=${libId}`)}`,
+    );
+
+    // Add table lists the expanded ValueSet; adding it resolves with the
+    // member count (two non-abstract entries) and no warning.
+    const search = page.locator('#lib-tables-add-table input[role="combobox"]');
+    await search.fill(vsName);
+    const option = page.locator("#lib-tables-add-table [data-combobox-option]", { hasText: vsName });
+    await expect(option).toBeVisible({ timeout: 10000 });
+    await expect(option).toContainText("ValueSet");
+    await option.click();
+    await expect(page.locator("input[name='table_alias']")).toHaveValue(vsName);
+    await page.locator("button[name='op'][value='add-table']").click();
+
+    const row = tablesCard.locator(".lib-tables__row", { hasText: vsName });
+    await expect(row).toBeVisible({ timeout: 3000 });
+    await expect(row.locator(".tag")).toHaveText("ValueSet");
+    await expect(row.locator(".lib-tables__note")).toHaveText("2 members");
+    await expect(row.locator(".lib-tables__warning")).toHaveCount(0);
+    await expect(page.locator("textarea[name='json']")).toHaveValue(
+      new RegExp(vsCanonical.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      { timeout: 3000 },
+    );
+
+    // Nothing was saved.
+    const untouched = await readResource(request, "Library", libId);
+    expect(untouched.relatedArtifact).toHaveLength(1);
+    await deleteResources(request, "Library", [libId]);
+    await deleteResources(request, "ValueSet", [vsId, composeOnlyId]);
+  });
+
+  test("a ConceptMap dependency resolves with its mapping count and the Columns card traces relationship to its fixed schema", async ({
+    page,
+    request,
+  }) => {
+    const suffix = Date.now();
+    const mapName = `e2e_sct_to_icd10_${suffix}`;
+    const mapCanonical = `http://example.org/ConceptMap/e2e-map-${suffix}`;
+    const mapId = await createResource(request, "ConceptMap", {
+      name: mapName,
+      url: mapCanonical,
+      status: "active",
+      group: [
+        {
+          source: "http://snomed.info/sct",
+          target: "http://hl7.org/fhir/sid/icd-10|2019",
+          element: [
+            { code: "22298006", target: [{ code: "I21", relationship: "equivalent" }] },
+            { code: "102499006", noMap: true },
+          ],
+        },
+      ],
+    });
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_map_query_${suffix}`,
+      mapCanonical,
+      "SELECT source_code, target_code, relationship FROM v",
+    );
+    await waitSearchable(request, "ConceptMap", mapId);
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const row = page.locator("#lib-tables .lib-tables__row", { hasText: mapName });
+    await expect(row).toBeVisible();
+    await expect(row.locator(".tag")).toHaveText("ConceptMap");
+    await expect(row.locator(".lib-tables__note")).toHaveText("2 mappings");
+
+    // The run succeeded and the Columns card names the relation's own
+    // fixed column types and origin (`v.relationship` is a `code`).
+    await expect(page.locator("#run-results .data-table th")).toHaveText([
+      "source_code",
+      "target_code",
+      "relationship",
+    ]);
+    const columns = page.locator("#lib-columns tbody tr");
+    await expect(columns).toHaveCount(3);
+    const relationship = columns.filter({ hasText: "relationship" });
+    await expect(relationship.locator("td").nth(1)).toHaveText("code");
+    await expect(relationship.locator("td").nth(2)).toHaveText("v.relationship");
+
+    await deleteResources(request, "Library", [libId]);
+    await deleteResources(request, "ConceptMap", [mapId]);
+  });
+});
+
 test.describe("Unknown-table lint and Columns", () => {
   test("a typo in the SQL is linted live, Declare fills the alias and focuses the search, and resolving it clears the lint and fills Columns", async ({
     page,

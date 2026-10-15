@@ -164,6 +164,67 @@ inputs have fixed limits, each a `400` naming the limit: 64 `subject` entries,
 `HFS_EXPORT_*` reference lives in the
 [helios-rest README](../../../crates/rest/README.md#sql-on-fhir-async-export).
 
+## Terminology dependencies (#1824)
+
+A SQL Query or SQL View Library may declare a **ValueSet** or a
+**ConceptMap** as a `relatedArtifact[type=depends-on]` entry (SQL on FHIR
+"Terminology in SQL", HL7/sql-on-fhir#407). The runner exposes it under its
+`label` as a relation with a fixed column set (`helios_sof::sqlquery::
+terminology`, `VALUE_SET_COLUMNS` / `CONCEPT_MAP_COLUMNS`):
+
+- ValueSet: `system`, `version`, `code`, `display`, `inactive` — one row per
+  distinct `(system, version, code)` among the non-abstract
+  `expansion.contains` entries at any depth; `inactive` is null when the
+  expansion does not say.
+- ConceptMap: `source_system`, `source_version`, `source_code`,
+  `source_display`, `target_system`, `target_version`, `target_code`,
+  `target_display`, `relationship` — one row per `group.element.target` plus
+  one per `noMap` element (R4 `equivalence` is mapped onto R5
+  `relationship`). Maps with `dependsOn`, `product` or `valueSet` targets
+  are rejected with `422`.
+
+The query path never calls the terminology server: a ValueSet is read from
+its stored `expansion`. Expansion happens on the **write path** — when a
+Library declaring the dependency is written (POST/PUT/PATCH, batch entry,
+transaction entry), and when a ValueSet some stored Library depends on is
+written without an `expansion`. With `HFS_TERMINOLOGY_SERVER` set, HTS is the
+expansion engine (and the source of definitions HFS does not store, which are
+stored tagged `fetched-from-terminology-server`); without it, only a
+`compose` of enumerated concepts is expanded locally (no `filter`, no
+`valueSet` include, no `compose.inactive`, no `lockedDate`, no
+`version: "*"`). A materialized expansion is tagged
+`http://heliossoftware.com/fhir/CodeSystem/sof-terminology|materialized-expansion`.
+To refresh one, `PUT` the ValueSet without its `expansion`. Inline artifacts
+go in `context` (matched by canonical URL; a compose-only `context` ValueSet
+is expanded locally for that request only and never persisted). Each relation
+counts as one node against `HFS_SOF_SQLQUERY_MAX_VDS`.
+
+Materialization acts under the caller's SMART scopes: update on `ValueSet`
+for an expansion, create on `ValueSet`/`ConceptMap` for a definition fetched
+from HTS; otherwise `403` in strict mode. A conditional create
+(`If-None-Exist`) whose dependencies fail after the Library was stored
+answers `422` carrying the Library's `Location`/`ETag` and a
+`created-unmaterialized` coding; `PUT` the same body to that `Location`
+(re-POSTing matches the stored Library and does not materialize). Inside a
+transaction nothing outside the bundle is ever written: a dependency that
+would need a side write, or a conditional POST/PUT/DELETE on a terminology
+type or Library mixed with materialization, is a `422` before persistence.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_SOF_TERMINOLOGY_MATERIALIZE` | `strict` | `strict` fails the write (`422`/`403`) when a dependency cannot be materialized; `lenient` warns and stores it (the run then `422`s); `off` never materializes |
+| `HFS_SOF_TERMINOLOGY_MATERIALIZE_BUDGET_SECS` | `20` | Wall time one write (or one bundle) may spend materializing all its dependencies; must be lower than `HFS_REQUEST_TIMEOUT` (`validate()` rejects otherwise); the per-call HTS timeout is `min(remaining, 30 s)` |
+| `HFS_SOF_TERMINOLOGY_MAX_EXPANSION_MEMBERS` | `200000` | Most distinct rows a relation may have, checked while walking; the visited-structure cap is 4 × this |
+| `HFS_SOF_TERMINOLOGY_MAX_ARTIFACT_BYTES` | `8388608` | Most bytes one ValueSet/ConceptMap may be: HTS response stream, serialized resource before persistence, and the plan-time estimate of any artifact |
+| `HFS_SOF_TERMINOLOGY_MAX_JOB_BYTES` | `134217728` | Most bytes one `$sql-run` request or `$sql-export` kick-off may retain across cached artifacts and flattened relations |
+
+Code: pure flatteners and the local expander in
+`crates/sof/src/sqlquery/terminology.rs`; plan-time resolution
+(`JobResolver`, `PlanNode::Relation`) in `crates/rest/src/handlers/sof/graph.rs`;
+the write-path materializer in
+`crates/rest/src/handlers/sof/terminology_materialize.rs`. Plan:
+`docs/issue-1824-terminology-in-sql-plan.md`.
+
 ## Testing
 
 - Unit tests live in `src/` files.

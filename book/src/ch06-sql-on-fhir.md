@@ -421,6 +421,49 @@ These limits apply to SQL Query and SQL View subjects of `$sql-run` and `$sql-ex
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in the resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries. |
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, in seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's). It does not cover materializing a dependency. |
 
+### Terminology Dependencies
+
+A SQL Query or SQL View Library may also declare a ValueSet or a ConceptMap
+as a `depends-on` dependency (SQL on FHIR "Terminology in SQL"). The runner
+exposes each one under its `label` as an ordinary relation with a fixed
+column set, so code membership and code translation become plain joins:
+
+| Dependency | Columns |
+|------------|---------|
+| ValueSet | `system`, `version`, `code`, `display`, `inactive` — one row per distinct non-abstract entry of `expansion.contains`, at any depth |
+| ConceptMap | `source_system`, `source_version`, `source_code`, `source_display`, `target_system`, `target_version`, `target_code`, `target_display`, `relationship` — one row per `group.element.target`, plus one per `noMap` element |
+
+A ValueSet is read from its stored `expansion`, never expanded at query
+time: HFS materializes the expansion into its own database when the Library
+that declares the dependency is written, and when a ValueSet that a stored
+Library depends on is written without one. With `HFS_TERMINOLOGY_SERVER`
+set, the terminology server is the expansion engine; without it, HFS
+expands only a `compose` made of enumerated concepts (no filters, no
+`compose.inactive`, no `lockedDate`, no `version: "*"`) and refuses the
+rest. A ConceptMap needs no expansion. Both kinds may also be supplied
+inline through the `context` parameter, matched by canonical URL, and are
+never persisted from there. Each relation counts as one node against
+`HFS_SOF_SQLQUERY_MAX_VDS`.
+
+A Library write that cannot materialize a dependency fails with `422`
+(`HFS_SOF_TERMINOLOGY_MATERIALIZE=strict`, the default); `lenient` stores
+the Library with a warning and the run fails instead; `off` disables
+materialization. Materializing writes the ValueSet, so the caller's SMART
+scopes must permit updating ValueSets, and creating ValueSets or
+ConceptMaps when a definition is fetched from the terminology server. To
+refresh an expansion, `PUT` the ValueSet without its `expansion`. A
+conditional create (`If-None-Exist`) whose dependencies fail to materialize
+after the Library was stored answers `422` with the new Library's
+`Location` and `ETag`; `PUT` the same body to that `Location` to retry.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SOF_TERMINOLOGY_MATERIALIZE` | `strict` | `strict` fails a write whose dependency cannot be expanded; `lenient` warns and stores it; `off` never materializes. |
+| `HFS_SOF_TERMINOLOGY_MATERIALIZE_BUDGET_SECS` | `20` | Wall time one write may spend materializing all of its dependencies. Must be lower than `HFS_REQUEST_TIMEOUT`. |
+| `HFS_SOF_TERMINOLOGY_MAX_EXPANSION_MEMBERS` | `200000` | Most distinct rows a value set or concept map relation may have. |
+| `HFS_SOF_TERMINOLOGY_MAX_ARTIFACT_BYTES` | `8388608` | Most bytes one ValueSet or ConceptMap may be, from any source. |
+| `HFS_SOF_TERMINOLOGY_MAX_JOB_BYTES` | `134217728` | Most bytes one request or export kick-off may retain across its dependency artifacts and relations. |
+
 ---
 
 ## Reading from Cloud Storage

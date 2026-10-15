@@ -1167,22 +1167,29 @@ lib-tables-empty = No tables declared yet.
 # The resolved-target chip text. "SQL View" reuses `sql-views-chip` — the
 # same chip the title row and *Used by* already show for that kind.
 lib-tables-kind-view-definition = ViewDefinition
+# Terminology dependencies (#1824): a ValueSet is exposed as a value set
+# relation, a ConceptMap as a concept map relation.
+lib-tables-kind-value-set = ValueSet
+lib-tables-kind-concept-map = ConceptMap
+lib-tables-value-set-members = { $count } members
+lib-tables-concept-map-mappings = { $count } mappings
+lib-tables-value-set-no-expansion = No expansion yet. Saving this Library materializes one (through the terminology server when configured); or store the ValueSet with an expansion.
 lib-tables-target-not-found = Not found
-lib-tables-target-not-found-detail = No ViewDefinition or SQL View answers to { $resource }. Fix the canonical in Details or remove the row.
+lib-tables-target-not-found-detail = No ViewDefinition, SQL View, ValueSet or ConceptMap answers to { $resource }. Fix the canonical in Details or remove the row.
 lib-tables-target-not-a-table = Not a table
-lib-tables-target-not-a-table-detail = Only a ViewDefinition or a SQL View can be read.
+lib-tables-target-not-a-table-detail = Only a ViewDefinition, a SQL View, a ValueSet or a ConceptMap can be read.
 lib-tables-add-table-label = Table
 # The always-visible add row's own search field placeholder (#1238).
 lib-tables-add-table-placeholder = Add a table…
-lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} or Library/{"{"}id{"}"}
+lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"}, Library/{"{"}id{"}"}, ValueSet/{"{"}id{"}"} or ConceptMap/{"{"}id{"}"}
 lib-tables-alias-label = Alias
 lib-tables-add-submit = Add
 # The add row's own single help line (#1238) — the only hint the row
 # carries; the combobox's own `hint`/`fallback-hint` are passed empty.
-lib-tables-add-hint = Search a view definition or SQL view; the alias defaults to its name.
+lib-tables-add-hint = Search a view definition, SQL view, value set or concept map; the alias defaults to its name.
 # `add-table`'s own validation messages (#842), in the order they are
 # checked.
-lib-tables-add-error-required = Pick a view definition or SQL view
+lib-tables-add-error-required = Pick a view definition, SQL view, value set or concept map
 lib-tables-add-error-alias-required = Alias is required
 lib-tables-add-error-alias-invalid = Alias must match ^[A-Za-z][A-Za-z0-9_]*$
 lib-tables-add-error-alias-duplicate = Alias { $alias } is already declared
@@ -1193,7 +1200,7 @@ lib-tables-options-empty = No matches.
 # The unknown-table lint's own row (#842/04): a table the SQL reads that no
 # dependency declares, appended after every resolved row.
 lib-tables-unknown = Unknown table
-lib-tables-unknown-detail = Used in the SQL but not declared. Pick a view definition or SQL view, or fix the name.
+lib-tables-unknown-detail = Used in the SQL but not declared. Pick a view definition, SQL view, value set or concept map, or fix the name.
 lib-tables-declare = Declare { $name }
 # The row's own visible *Declare* button text (#1238) — the accessible
 # name carries the table's own name instead (`lib-tables-declare`).

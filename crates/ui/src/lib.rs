@@ -4987,7 +4987,7 @@ struct LibParamsCard {
 /// [`sql_libraries::TableTarget`] classification (#842/04) — `None` only
 /// for `TableTarget::NotFound`, since nothing was ever fetched. *Reads
 /// from* only needs the classification; the Columns card's own origin
-/// lookup ([`resolve_view_definition_dependencies`]) is what needs the
+/// lookup ([`resolve_dependency_schemas`]) is what needs the
 /// document itself, to read its `select[].column[]` list.
 async fn resolve_table_reference(
     state: &WebState,
@@ -5012,36 +5012,41 @@ async fn resolve_table_reference(
             }
         }
         DependencyLookup::Canonical { canonical, .. } => {
+            // The server's own order (`DEPENDENCY_RESOURCE_TYPES`, #1824):
+            // ViewDefinition, then Library (the rail's own list, reused),
+            // then ValueSet, then ConceptMap — the first that answers wins.
             let params = vec![("url".to_string(), canonical)];
-            if let Ok(page) = state
-                .conformance
-                .search_page(
-                    "ViewDefinition",
-                    &params,
-                    sql_views::PAGE_SIZE,
-                    0,
-                    version,
-                    tenant,
-                )
-                .await
-                && let Some(vd) = page
-                    .resources
-                    .iter()
-                    .find(|vd| sql_libraries::matches_reference(reference, "ViewDefinition", vd))
-            {
-                let target = sql_libraries::classify_table_artifact("ViewDefinition", vd);
-                return (target, Some(vd.clone()));
-            }
-            match libraries
-                .iter()
-                .find(|lib| sql_libraries::matches_reference(reference, "Library", lib))
-            {
-                Some(lib) => {
-                    let target = sql_libraries::classify_table_artifact("Library", lib);
-                    (target, Some(lib.clone()))
+            for resource_type in sql_libraries::TABLE_RESOURCE_TYPES {
+                if resource_type == "Library" {
+                    if let Some(lib) = libraries
+                        .iter()
+                        .find(|lib| sql_libraries::matches_reference(reference, "Library", lib))
+                    {
+                        let target = sql_libraries::classify_table_artifact("Library", lib);
+                        return (target, Some(lib.clone()));
+                    }
+                    continue;
                 }
-                None => (TableTarget::NotFound, None),
+                if let Ok(page) = state
+                    .conformance
+                    .search_page(
+                        resource_type,
+                        &params,
+                        sql_views::PAGE_SIZE,
+                        0,
+                        version,
+                        tenant,
+                    )
+                    .await
+                    && let Some(artifact) = page.resources.iter().find(|artifact| {
+                        sql_libraries::matches_reference(reference, resource_type, artifact)
+                    })
+                {
+                    let target = sql_libraries::classify_table_artifact(resource_type, artifact);
+                    return (target, Some(artifact.clone()));
+                }
             }
+            (TableTarget::NotFound, None)
         }
     }
 }
@@ -5052,7 +5057,7 @@ async fn resolve_table_reference(
 /// once per render (#842's own "no redundant requests"). Returns each
 /// dependency's own [`sql_libraries::TableRow`] paired with the resolved
 /// artifact's raw JSON (#842/04) — *Reads from*'s own render only needs the
-/// former; [`resolve_view_definition_dependencies`] filters the latter down
+/// former; [`resolve_dependency_schemas`] filters the latter down
 /// to the ViewDefinitions the Columns card needs.
 async fn resolve_table_rows(
     state: &WebState,
@@ -5088,13 +5093,14 @@ async fn resolve_table_rows(
     rows
 }
 
-/// Resolves every dependency in `deps` down to the ViewDefinitions among
-/// them — the Columns card's own origin lookup (#842/04): `(label,
-/// resolved document)` for each dependency [`resolve_table_rows`] resolved
-/// to a `TableTarget::ViewDefinition`, in declaration order. A dependency
-/// that fails to resolve, or resolves to a SQL View or anything else, is
-/// simply absent — SQL Views never contribute a column origin (#842's own
-/// "out of scope" rule).
+/// Resolves every dependency in `deps` down to the ones with a known
+/// schema — the Columns card's own origin lookup (#842/04): `(label,
+/// schema)` for each dependency [`resolve_table_rows`] resolved to a
+/// ViewDefinition (its declared columns), a ValueSet or a ConceptMap (the
+/// fixed relation columns, #1824, via [`sql_libraries::dependency_schema`]),
+/// in declaration order. A dependency that fails to resolve, or resolves to
+/// a SQL View or anything else, is simply absent — SQL Views never
+/// contribute a column origin (#842's own "out of scope" rule).
 ///
 /// Only ever called after a successful `$sql-run` (#842/04's own NF1): this
 /// performs the identical fetch [`resolve_table_rows`] does for the Tables
@@ -5102,21 +5108,25 @@ async fn resolve_table_rows(
 /// ran at all — a good run's own dependency resolution "happens once per
 /// dependency", not once per keystroke that leaves the run unable to
 /// happen.
-async fn resolve_view_definition_dependencies(
+async fn resolve_dependency_schemas(
     state: &WebState,
     version: helios_fhir::FhirVersion,
     tenant: &str,
     deps: &[sql_libraries::TableDependency],
     libraries: &[serde_json::Value],
-) -> Vec<(String, serde_json::Value)> {
+) -> Vec<(String, helios_sof::sqlquery::TableSchema)> {
     resolve_table_rows(state, version, tenant, deps, libraries)
         .await
         .into_iter()
-        .filter_map(|(row, doc)| match (row.target, doc) {
-            (sql_libraries::TableTarget::ViewDefinition { .. }, Some(doc)) => {
-                Some((row.label, doc))
-            }
-            _ => None,
+        .filter_map(|(row, doc)| {
+            let resource_type = match row.target {
+                sql_libraries::TableTarget::ViewDefinition { .. } => "ViewDefinition",
+                sql_libraries::TableTarget::ValueSet { .. } => "ValueSet",
+                sql_libraries::TableTarget::ConceptMap { .. } => "ConceptMap",
+                _ => return None,
+            };
+            let schema = sql_libraries::dependency_schema(resource_type, &doc?)?;
+            Some((row.label, schema))
         })
         .collect()
 }
@@ -5250,6 +5260,13 @@ struct TableRowView {
     /// The failure detail line under a `NotFound`/`NotATable` row's own
     /// chip (#842); `None` for a resolved row.
     detail: Option<String>,
+    /// A warning line under a resolved row that `$sql-run` would still
+    /// refuse (#1824): a ValueSet without an expansion. Unlike `detail`,
+    /// the row keeps its link and is not an alert row.
+    warning: Option<String>,
+    /// A short note after the link — the relation's row count for a
+    /// ValueSet or ConceptMap (#1824); `None` otherwise.
+    note: Option<String>,
 }
 
 /// Localizes one resolved [`sql_libraries::TableRow`] into a
@@ -5270,6 +5287,8 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> Ta
             )),
             link_label: Some(name),
             detail: None,
+            warning: None,
+            note: None,
         },
         sql_libraries::TableTarget::SqlView { id, name } => TableRowView {
             label: row.label,
@@ -5281,6 +5300,46 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> Ta
             )),
             link_label: Some(name),
             detail: None,
+            warning: None,
+            note: None,
+        },
+        // Terminology relations (#1824) link to the resource itself in the
+        // Resources workspace — there is no dedicated editor for either.
+        sql_libraries::TableTarget::ValueSet {
+            id,
+            name,
+            expanded,
+            members,
+        } => TableRowView {
+            label: row.label,
+            chip: i18n.t("lib-tables-kind-value-set"),
+            chip_class: "type",
+            link_href: Some(navigation::with_return(
+                &format!("/ui/resources?url=ValueSet%3F_id%3D{id}"),
+                Some(origin),
+            )),
+            link_label: Some(name),
+            detail: None,
+            warning: (!expanded).then(|| i18n.t("lib-tables-value-set-no-expansion")),
+            note: members
+                .map(|n| i18n.t_arg("lib-tables-value-set-members", "count", n.to_string())),
+        },
+        sql_libraries::TableTarget::ConceptMap { id, name, mappings } => TableRowView {
+            label: row.label,
+            chip: i18n.t("lib-tables-kind-concept-map"),
+            chip_class: "type",
+            link_href: Some(navigation::with_return(
+                &format!("/ui/resources?url=ConceptMap%3F_id%3D{id}"),
+                Some(origin),
+            )),
+            link_label: Some(name),
+            detail: None,
+            warning: None,
+            note: Some(i18n.t_arg(
+                "lib-tables-concept-map-mappings",
+                "count",
+                mappings.to_string(),
+            )),
         },
         sql_libraries::TableTarget::NotFound => TableRowView {
             chip: i18n.t("lib-tables-target-not-found"),
@@ -5292,6 +5351,8 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> Ta
                 "resource",
                 row.resource,
             )),
+            warning: None,
+            note: None,
             label: row.label,
         },
         sql_libraries::TableTarget::NotATable => TableRowView {
@@ -5300,6 +5361,8 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> Ta
             link_href: None,
             link_label: None,
             detail: Some(i18n.t("lib-tables-target-not-a-table-detail")),
+            warning: None,
+            note: None,
             label: row.label,
         },
     }
@@ -6292,15 +6355,11 @@ async fn sql_library_page(
                         .map(|s| s.sql.as_str())
                         .unwrap_or_default();
                     let used_deps = sql_libraries::dependencies_used_by_sql(run_sql, &deps);
-                    let view_definitions = resolve_view_definition_dependencies(
-                        &state, rv.0, &rt.id, &used_deps, &libraries,
-                    )
-                    .await;
-                    let columns = sql_libraries::analyze_columns(
-                        &table.columns,
-                        &raw_rows,
-                        &view_definitions,
-                    );
+                    let schemas =
+                        resolve_dependency_schemas(&state, rv.0, &rt.id, &used_deps, &libraries)
+                            .await;
+                    let columns =
+                        sql_libraries::analyze_columns(&table.columns, &raw_rows, &schemas);
                     (
                         standard_notice(RunResultsState::Success(table, ms)),
                         columns,
@@ -6965,7 +7024,7 @@ struct LibRunFragment {
 /// (#842/04, NF1): fetches the tenant's Library list, resolves whichever of
 /// `deps` the SQL actually reads down to their ViewDefinitions
 /// (`sql_libraries::dependencies_used_by_sql`,
-/// [`resolve_view_definition_dependencies`]), and analyzes `table`/
+/// [`resolve_dependency_schemas`]), and analyzes `table`/
 /// `raw_rows` against them ([`sql_libraries::analyze_columns`]). A SQL
 /// Query and a SQL View share this identical "good run" shape, differing
 /// only in whether declared parameters were involved getting here — called
@@ -6985,9 +7044,8 @@ async fn columns_fragment_for_success(
     libraries: &[serde_json::Value],
 ) -> ColumnsFragment {
     let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
-    let view_definitions =
-        resolve_view_definition_dependencies(state, version, tenant, &used_deps, libraries).await;
-    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &view_definitions);
+    let schemas = resolve_dependency_schemas(state, version, tenant, &used_deps, libraries).await;
+    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &schemas);
     ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
 }
 
@@ -7649,7 +7707,7 @@ async fn resolve_table_target(
     else {
         return None;
     };
-    if resource_type != "ViewDefinition" && resource_type != "Library" {
+    if !sql_libraries::TABLE_RESOURCE_TYPES.contains(&resource_type) {
         return None;
     }
     let artifact = state
@@ -7658,7 +7716,7 @@ async fn resolve_table_target(
         .await
         .ok()?;
     let valid = match resource_type {
-        "ViewDefinition" => true,
+        "ViewDefinition" | "ValueSet" | "ConceptMap" => true,
         "Library" => {
             sql_libraries::has_library_code(&artifact, "sql-view")
                 && (own_id.is_empty() || id != own_id)

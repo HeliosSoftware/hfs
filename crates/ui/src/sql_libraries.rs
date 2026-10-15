@@ -522,16 +522,23 @@ fn split_canonical_version(reference: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The resource types a dependency reference is resolved against, in the
+/// order the server's own `StorageArtifactFetcher::fetch` tries them
+/// (`crates/rest/.../graph.rs` `DEPENDENCY_RESOURCE_TYPES`, #1824): a
+/// ViewDefinition, a `sql-view` Library, a ValueSet (exposed as a value set
+/// relation) or a ConceptMap (a concept map relation).
+pub(crate) const TABLE_RESOURCE_TYPES: [&str; 4] =
+    ["ViewDefinition", "Library", "ValueSet", "ConceptMap"];
+
 /// How a `relatedArtifact.resource` (or an *Add table* combobox/textarea
 /// submission, which shares the same two shapes) names its target —
 /// [`dependency_lookup`]'s own pure result, before any I/O resolves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DependencyLookup {
     /// A relative `{resource_type}/{id}` reference, `resource_type` one of
-    /// `"ViewDefinition"`/`"Library"` — the two types #842's own resolution
-    /// ever reads (mirrors `resolve_resource_canonical_or_relative`'s own
-    /// dual-type lookup server-side, minus the types this UI never needs to
-    /// try, since a table dependency can only ever be one of these two).
+    /// [`TABLE_RESOURCE_TYPES`] (mirrors
+    /// `resolve_resource_canonical_or_relative`'s own typed lookup
+    /// server-side).
     TypeId {
         resource_type: &'static str,
         id: String,
@@ -545,13 +552,13 @@ pub(crate) enum DependencyLookup {
 
 /// Classifies `reference` the same way `crates/rest/.../graph.rs`'s own
 /// `StorageArtifactFetcher::fetch` does (#842's own resolution imitates,
-/// never replaces, the server's own): a `ViewDefinition/{id}` or
-/// `Library/{id}` prefix names a relative
-/// reference (only the id up to the next `/`, matching
+/// never replaces, the server's own): a `ViewDefinition/{id}`,
+/// `Library/{id}`, `ValueSet/{id}` or `ConceptMap/{id}` prefix names a
+/// relative reference (only the id up to the next `/`, matching
 /// `resolve_resource_canonical_or_relative`'s own `rest.split('/').next()`);
 /// anything else is an absolute canonical URL, optionally `|version`.
 pub(crate) fn dependency_lookup(reference: &str) -> DependencyLookup {
-    for resource_type in ["ViewDefinition", "Library"] {
+    for resource_type in TABLE_RESOURCE_TYPES {
         if let Some(rest) = reference
             .strip_prefix(resource_type)
             .and_then(|rest| rest.strip_prefix('/'))
@@ -616,14 +623,64 @@ pub(crate) enum TableTarget {
     ViewDefinition { id: String, name: String },
     /// Resolved to a stored `sql-view` Library.
     SqlView { id: String, name: String },
+    /// Resolved to a stored ValueSet, exposed as a value set relation
+    /// (#1824). `expanded` is whether it carries an `expansion` — the runner
+    /// answers 422 for one that does not, until a Library write (or a
+    /// ValueSet write) materializes one; `members` is the relation's row
+    /// count (distinct non-abstract `expansion.contains` entries at any
+    /// depth), `None` when there is no usable expansion.
+    ValueSet {
+        id: String,
+        name: String,
+        expanded: bool,
+        members: Option<usize>,
+    },
+    /// Resolved to a stored ConceptMap, exposed as a concept map relation
+    /// (#1824). `mappings` is the relation's row count (one per
+    /// `group.element.target` plus one per `noMap` element); `0` also for
+    /// a map the relation cannot represent (`dependsOn`, `product`,
+    /// `valueSet` targets), which the runner rejects.
+    ConceptMap {
+        id: String,
+        name: String,
+        mappings: usize,
+    },
     /// Neither storage nor the in-memory Library list has anything
     /// answering to the dependency's own `resource` (the starter
     /// document's own `change-me` canonical, for instance).
     NotFound,
-    /// Resolved to something storage holds, but not a ViewDefinition or a
-    /// `sql-view` Library — a `sql-query` Library, most commonly, which
-    /// `$sql-run`'s own graph walk would reject the same way.
+    /// Resolved to something storage holds, but not a ViewDefinition, a
+    /// `sql-view` Library, a ValueSet or a ConceptMap — a `sql-query`
+    /// Library, most commonly, which `$sql-run`'s own graph walk would
+    /// reject the same way.
     NotATable,
+}
+
+/// Traversal caps for counting a terminology artifact's relation rows in
+/// the UI (#1824): the server's own default member cap and job budget, so
+/// a stored artifact the server would still run is never miscounted here.
+fn counting_limits() -> helios_sof::sqlquery::FlattenLimits {
+    helios_sof::sqlquery::FlattenLimits::for_members(200_000, 128 << 20)
+}
+
+/// The fixed table schema a dependency of `resource_type` exposes (#1824):
+/// a ViewDefinition's own declared columns, the five value set relation
+/// columns for a ValueSet, the nine concept map relation columns for a
+/// ConceptMap — straight from `helios_sof`, so this UI never hard-codes a
+/// relation's shape. `None` for a Library (a SQL View's columns are only
+/// known by running it) or anything else.
+pub(crate) fn dependency_schema(
+    resource_type: &str,
+    artifact: &Value,
+) -> Option<helios_sof::sqlquery::TableSchema> {
+    match resource_type {
+        "ViewDefinition" => Some(helios_sof::sqlquery::TableSchema::from_view_definition(
+            artifact,
+        )),
+        "ValueSet" => Some(helios_sof::sqlquery::value_set_schema()),
+        "ConceptMap" => Some(helios_sof::sqlquery::concept_map_schema()),
+        _ => None,
+    }
 }
 
 /// Classifies an already-fetched `artifact` of `resource_type` into a
@@ -645,6 +702,26 @@ pub(crate) fn classify_table_artifact(resource_type: &str, artifact: &Value) -> 
     match resource_type {
         "ViewDefinition" => TableTarget::ViewDefinition { id, name },
         "Library" if has_library_code(artifact, "sql-view") => TableTarget::SqlView { id, name },
+        "ValueSet" => {
+            let expanded = artifact.get("expansion").is_some_and(Value::is_object);
+            let members = expanded
+                .then(|| helios_sof::sqlquery::flatten_value_set(artifact, counting_limits()).ok())
+                .flatten()
+                .map(|(rows, _)| rows.len());
+            TableTarget::ValueSet {
+                id,
+                name,
+                expanded,
+                members,
+            }
+        }
+        "ConceptMap" => TableTarget::ConceptMap {
+            id,
+            name,
+            mappings: helios_sof::sqlquery::flatten_concept_map(artifact, counting_limits())
+                .map(|(rows, _)| rows.len())
+                .unwrap_or(0),
+        },
         _ => TableTarget::NotATable,
     }
 }
@@ -840,11 +917,12 @@ pub(crate) struct ColumnInfo {
 
 /// Builds one [`ColumnInfo`] per entry of `columns` (the last good run's
 /// own result columns, in order) — the Columns card's own analysis
-/// (#842/04). `view_definitions` is every dependency already resolved to a
-/// `ViewDefinition` (label, resolved document), from `crate::
-/// resolve_view_definition_dependencies` — SQL View dependencies never
-/// reach here at all (#842's own "no origin from a SQL View" rule is
-/// simply that this list never contains one). `rows` are the raw JSON
+/// (#842/04). `dependencies` is every dependency already resolved to a
+/// known schema (label, [`dependency_schema`]) — a ViewDefinition's own
+/// declared columns, or the fixed value set / concept map relation columns
+/// (#1824) — from `crate::resolve_dependency_schemas`; SQL View
+/// dependencies never reach here at all (#842's own "no origin from a SQL
+/// View" rule is simply that this list never contains one). `rows` are the raw JSON
 /// objects `$sql-run` returned, before [`crate::sql_views::build_table`]
 /// stringifies them — needed so a column with no origin can still infer a
 /// type from the values' own JSON shape rather than their rendered text.
@@ -882,16 +960,11 @@ pub(crate) fn dependencies_used_by_sql(
 pub(crate) fn analyze_columns(
     columns: &[String],
     rows: &[Value],
-    view_definitions: &[(String, Value)],
+    dependencies: &[(String, helios_sof::sqlquery::TableSchema)],
 ) -> Vec<ColumnInfo> {
-    let schemas: Vec<(&str, helios_sof::sqlquery::TableSchema)> = view_definitions
+    let schemas: Vec<(&str, &helios_sof::sqlquery::TableSchema)> = dependencies
         .iter()
-        .map(|(label, vd)| {
-            (
-                label.as_str(),
-                helios_sof::sqlquery::TableSchema::from_view_definition(vd),
-            )
-        })
+        .map(|(label, schema)| (label.as_str(), schema))
         .collect();
 
     columns
@@ -1535,6 +1608,133 @@ mod tests {
     }
 
     #[test]
+    fn dependency_lookup_recognizes_terminology_type_id_prefixes_in_rest_order() {
+        assert_eq!(
+            TABLE_RESOURCE_TYPES,
+            ["ViewDefinition", "Library", "ValueSet", "ConceptMap"]
+        );
+        assert_eq!(
+            dependency_lookup("ValueSet/cvd"),
+            DependencyLookup::TypeId {
+                resource_type: "ValueSet",
+                id: "cvd".to_string(),
+            }
+        );
+        assert_eq!(
+            dependency_lookup("ConceptMap/sct-to-icd10/_history/2"),
+            DependencyLookup::TypeId {
+                resource_type: "ConceptMap",
+                id: "sct-to-icd10".to_string(),
+            }
+        );
+        assert!(matches!(
+            dependency_lookup("http://example.org/ValueSet/cvd|2026"),
+            DependencyLookup::Canonical { ref canonical, version: Some(ref v) }
+                if canonical == "http://example.org/ValueSet/cvd" && v == "2026"
+        ));
+    }
+
+    #[test]
+    fn classify_table_artifact_counts_value_set_members_and_concept_map_mappings() {
+        let expanded = json!({
+            "resourceType": "ValueSet", "id": "cvd", "name": "cvd",
+            "expansion": {"total": 3, "contains": [{
+                "system": "s", "abstract": true,
+                "contains": [{"system": "s", "code": "a"}, {"system": "s", "code": "b"}]
+            }]}
+        });
+        assert_eq!(
+            classify_table_artifact("ValueSet", &expanded),
+            TableTarget::ValueSet {
+                id: "cvd".to_string(),
+                name: "cvd".to_string(),
+                expanded: true,
+                members: Some(2),
+            }
+        );
+        let compose_only = json!({"resourceType": "ValueSet", "id": "c",
+            "compose": {"include": [{"system": "s", "concept": [{"code": "a"}]}]}});
+        assert_eq!(
+            classify_table_artifact("ValueSet", &compose_only),
+            TableTarget::ValueSet {
+                id: "c".to_string(),
+                name: "c".to_string(),
+                expanded: false,
+                members: None,
+            }
+        );
+        let map = json!({"resourceType": "ConceptMap", "id": "m", "name": "sct_to_icd10",
+        "group": [{"source": "s", "target": "t|1", "element": [
+            {"code": "1", "target": [{"code": "x", "relationship": "equivalent"}]},
+            {"code": "2", "noMap": true}
+        ]}]});
+        assert_eq!(
+            classify_table_artifact("ConceptMap", &map),
+            TableTarget::ConceptMap {
+                id: "m".to_string(),
+                name: "sct_to_icd10".to_string(),
+                mappings: 2,
+            }
+        );
+        assert_eq!(
+            classify_table_artifact("Patient", &json!({"id": "p"})),
+            TableTarget::NotATable
+        );
+    }
+
+    #[test]
+    fn dependency_schema_exposes_the_fixed_relation_columns_from_helios_sof() {
+        let vs = dependency_schema("ValueSet", &json!({})).expect("value set schema");
+        let names: Vec<&str> = vs.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            helios_sof::sqlquery::VALUE_SET_COLUMNS
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+        );
+        let cm = dependency_schema("ConceptMap", &json!({})).expect("concept map schema");
+        assert_eq!(
+            cm.columns.len(),
+            helios_sof::sqlquery::CONCEPT_MAP_COLUMNS.len()
+        );
+        assert!(dependency_schema("Library", &json!({})).is_none());
+        let vd = dependency_schema(
+            "ViewDefinition",
+            &json!({"select": [{"column": [{"name": "id", "path": "id", "type": "id"}]}]}),
+        )
+        .expect("view definition schema");
+        assert_eq!(vd.columns[0].name, "id");
+    }
+
+    #[test]
+    fn analyze_columns_traces_relation_columns_to_their_fixed_schema() {
+        let columns = vec![
+            "code".to_string(),
+            "relationship".to_string(),
+            "n".to_string(),
+        ];
+        let rows = vec![json!({"code": "a", "relationship": "equivalent", "n": 1})];
+        let deps = vec![
+            ("cvd".to_string(), helios_sof::sqlquery::value_set_schema()),
+            ("m".to_string(), helios_sof::sqlquery::concept_map_schema()),
+        ];
+        let info = analyze_columns(&columns, &rows, &deps);
+        assert_eq!(info[0].type_code.as_deref(), Some("code"));
+        assert_eq!(
+            info[0].origin,
+            Some(("cvd".to_string(), "code".to_string()))
+        );
+        assert_eq!(info[1].type_code.as_deref(), Some("code"));
+        assert_eq!(
+            info[1].origin,
+            Some(("m".to_string(), "relationship".to_string()))
+        );
+        assert_eq!(info[2].type_code.as_deref(), Some("integer"));
+        assert_eq!(info[2].origin, None);
+    }
+
+    #[test]
     fn classify_table_artifact_matches_view_definitions_and_sql_view_libraries_only() {
         let vd = json!({"id": "vd-1", "name": "patients_flat"});
         assert_eq!(
@@ -1765,15 +1965,16 @@ mod tests {
     // analyze_columns() / infer_column_type_from_rows() (#842/04)
     // -----------------------------------------------------------------
 
-    fn view_definition_with_columns(cols: &[(&str, &str)]) -> Value {
-        json!({
+    fn view_definition_with_columns(cols: &[(&str, &str)]) -> helios_sof::sqlquery::TableSchema {
+        let vd = json!({
             "resourceType": "ViewDefinition",
             "select": [{
                 "column": cols.iter().map(|(name, type_code)| json!({
                     "name": name, "type": type_code,
                 })).collect::<Vec<_>>(),
             }],
-        })
+        });
+        dependency_schema("ViewDefinition", &vd).expect("view definition schema")
     }
 
     #[test]

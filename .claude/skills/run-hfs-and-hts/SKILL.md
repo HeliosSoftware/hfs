@@ -69,6 +69,12 @@ With both wired together:
 - `crates/ui` terminology-proxy handlers (e.g. `/ui/editor/expand`), which
   read HTS through `WebState.terminology` rather than calling it directly
   from the browser.
+- SQL on FHIR terminology dependencies (#1824): when a SQL Query or SQL View
+  Library declaring a ValueSet dependency is written, HFS asks HTS
+  (`POST /ValueSet/$expand` with the stored definition inline) for the
+  expansion and stores it in its own database; `$sql-run` then reads the
+  stored expansion and never calls HTS. Definitions HFS does not store are
+  fetched from HTS once and stored. See the `work-with-sof` skill.
 
 Without `HFS_TERMINOLOGY_SERVER` set, these features degrade gracefully
 (no terminology-backed filtering / proxy handlers return empty) rather

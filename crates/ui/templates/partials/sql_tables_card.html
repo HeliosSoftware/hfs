@@ -81,6 +81,9 @@
           {% if let Some(href) = row.link_href %}
           <a data-editor-link href="{{ href }}">{% if let Some(label) = row.link_label %}{{ label }}{% endif %}</a>
           {% endif %}
+          {% if let Some(note) = row.note %}
+          <span class="card-head__meta lib-tables__note">{{ note }}</span>
+          {% endif %}
         </span>
         {#- One shared form, one row removed per click: this button's own
             `name="table_label"` pair is the only one the browser submits
@@ -97,6 +100,12 @@
         </button>
         {% if let Some(detail) = row.detail %}
         <p class="field__hint field__hint--error lib-tables__detail" role="alert">{{ detail }}</p>
+        {% endif %}
+        {#- #1824: a resolved ValueSet with no expansion yet — the row keeps
+            its chip and link, but `$sql-run` refuses it until a Library or
+            ValueSet write materializes one. -#}
+        {% if let Some(warning) = row.warning %}
+        <p class="field__hint lib-tables__detail lib-tables__warning" role="status">{{ warning }}</p>
         {% endif %}
       </li>
       {% endfor %}
