@@ -27213,6 +27213,58 @@ mod postgres_integration {
         assert_eq!(timeout, "300ms");
     }
 
+    /// #2040: a system-level `$reindex` lists the tenant's resource types
+    /// first, and that scan followed the session `statement_timeout`; a cut-off
+    /// listing failed the job before it counted anything. The listing lifts the
+    /// timeout for itself only; the session keeps it.
+    #[tokio::test]
+    async fn postgres_reindex_list_types_outlives_statement_timeout() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-list-types-timeout");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"listed"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let pooled = backend.get_client().await.unwrap();
+        pooled
+            .batch_execute("SET statement_timeout = '300ms'")
+            .await
+            .unwrap();
+        drop(pooled);
+
+        // Hold the listing past the timeout, then let it through.
+        let locker = reindex_test_client_for(&dbname).await;
+        locker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            locker.batch_execute("ROLLBACK").await.unwrap();
+        });
+
+        let types = ReindexSource::list_resource_types(&backend, &tenant)
+            .await
+            .unwrap();
+        release.await.unwrap();
+        assert_eq!(types, vec!["Patient".to_string()]);
+
+        let pooled = backend.get_client().await.unwrap();
+        let timeout: String = pooled
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(timeout, "300ms");
+    }
+
     /// #939 C9: during the full-corpus rebuild the hourly SearchParameter
     /// refresh scanned the whole table (no `tenant_id` in its predicate) and hit
     /// the session `statement_timeout` every hour. The refresh now probes each
