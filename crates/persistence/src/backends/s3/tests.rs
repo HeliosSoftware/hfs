@@ -8356,11 +8356,33 @@ mod scan_read_limit {
     /// An `S3Api` that counts the `GetObject`s in flight and keeps each one
     /// open for `delay`, so overlapping GETs are observable. Everything else
     /// delegates to the mock.
+    ///
+    /// [`Self::stall_all_but`] makes every GET except those for one resource
+    /// hang until it is dropped, so a test can hold GETs open at a chosen
+    /// moment.
     struct GaugedGetClient {
         inner: Arc<MockS3Client>,
         delay: Duration,
         in_flight: AtomicUsize,
         peak: AtomicUsize,
+        /// `Some(id)`: a GET for any key without `/{id}/` never completes.
+        stall_all_but: std::sync::Mutex<Option<String>>,
+    }
+
+    impl GaugedGetClient {
+        /// From now on, GETs for every resource but `id` block until the GET
+        /// is dropped (they are never released otherwise).
+        fn stall_all_but(&self, id: &str) {
+            *self.stall_all_but.lock().unwrap() = Some(id.to_string());
+        }
+
+        fn is_stalled(&self, key: &str) -> bool {
+            self.stall_all_but
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|id| !key.contains(&format!("/{id}/")))
+        }
     }
 
     #[async_trait]
@@ -8383,6 +8405,9 @@ mod scan_read_limit {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
             let _leave = InFlight(&self.in_flight);
+            if self.is_stalled(key) {
+                std::future::pending::<()>().await;
+            }
             tokio::time::sleep(self.delay).await;
             self.inner.get_object(bucket, key).await
         }
@@ -8465,6 +8490,7 @@ mod scan_read_limit {
             delay: Duration::from_millis(10),
             in_flight: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            stall_all_but: std::sync::Mutex::new(None),
         });
         let config = S3BackendConfig {
             tenancy_mode: S3TenancyMode::PrefixPerTenant {
@@ -8624,22 +8650,36 @@ mod scan_read_limit {
         }
     }
 
-    /// A scan that is dropped half-way aborts its GETs, and the permits come
-    /// back.
+    /// A scan that is dropped half-way aborts the GETs it has in flight, and
+    /// the permits come back.
+    ///
+    /// Every GET except the first resource's hangs forever (the gauged client's
+    /// `stall_all_but`), so when the stream is dropped at least one GET is
+    /// still blocked, holding a permit. Each GET runs on its own task: only
+    /// the abort-on-drop guard stops that task, so without it the blocked GET
+    /// and its permit would never be given back, however long we wait.
     #[tokio::test(start_paused = true)]
     async fn dropping_a_scan_returns_its_permits() {
         let (backend, client) = gauged_backend(2);
         let t = tenant("tenant-a");
         seed_patients(&backend, &client, &t, 10).await;
+        client.stall_all_but("p00");
 
         let scan = backend.resource_scan().expect("scan hook");
         let mut stream = scan.scan_resources(&t, "Patient").await.expect("scan");
         stream.next().await.expect("an item").expect("scanned");
-        drop(stream);
 
+        // The setup holds: a stalled GET is open and owns a permit.
+        assert!(
+            client.in_flight.load(Ordering::SeqCst) >= 1,
+            "no GET was blocked when the stream was dropped"
+        );
+        assert!(backend.scan_limit.available_permits() < 2);
+
+        drop(stream);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(backend.scan_limit.available_permits(), 2);
         assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_limit.available_permits(), 2);
     }
 
     /// The other read fan-outs (type count, the live scan behind conditional

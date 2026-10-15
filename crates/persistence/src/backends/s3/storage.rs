@@ -9,6 +9,7 @@ use helios_fhir::FhirVersion;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::core::history::{
@@ -263,14 +264,19 @@ impl S3Backend {
         let client = Arc::clone(&self.client);
         let limit = Arc::clone(&self.scan_limit);
         let (bucket, key) = (bucket.to_owned(), key.to_owned());
-        let mut task = AbortOnDrop(tokio::spawn(async move {
-            let Ok(_permit) = limit.acquire().await else {
-                return Err(S3ClientError::Internal(
-                    "the S3 read limit was closed".to_string(),
-                ));
-            };
-            client.get_object(&bucket, &key).await
-        }));
+        // The task keeps the caller's tracing span, so its logs and the
+        // client's request events stay attached to the request that asked.
+        let mut task = AbortOnDrop(tokio::spawn(
+            async move {
+                let Ok(_permit) = limit.acquire().await else {
+                    return Err(S3ClientError::Internal(
+                        "the S3 read limit was closed".to_string(),
+                    ));
+                };
+                client.get_object(&bucket, &key).await
+            }
+            .in_current_span(),
+        ));
         let fetched = match (&mut task.0).await {
             Ok(fetched) => fetched,
             Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
@@ -635,10 +641,12 @@ impl S3Backend {
     /// Scans every live (non-deleted) resource of `resource_type` for `tenant`
     /// and returns their raw FHIR JSON content.
     ///
-    /// Shares the `list_current_keys` + `get_json_object` walk used by bulk
-    /// export ([`super::bulk_export`]); used by the in-process SQL-on-FHIR
-    /// runner to feed the `helios-sof` engine, and by the SearchParameter
-    /// overlay reload (`reload_stored_cache_for_tenant`).
+    /// Shares the `list_current_keys` walk with bulk export
+    /// ([`super::bulk_export`]); used by the in-process SQL-on-FHIR runner to
+    /// feed the `helios-sof` engine, and by the SearchParameter overlay reload
+    /// (`reload_stored_cache_for_tenant`). Its GETs go through the
+    /// backend-wide read limit ([`Self::get_json_object_limited`]), while bulk
+    /// export keeps its own fan-out (`bulk_write_concurrency`).
     ///
     /// Fetches concurrently under the backend-wide read limit
     /// (`scan_concurrency`, `HFS_S3_SCAN_CONCURRENCY`, #2063) — a resource type
