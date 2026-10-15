@@ -141,6 +141,9 @@ p384 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-
 # same output size. No C toolchain is required for either.
 flate2 = { version = "1", features = ["zlib-rs"] }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # HTTP testing
 axum-test = "18.0"
