@@ -1962,12 +1962,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // An R5 or R6 build has no R4, so an unset HFS_DEFAULT_FHIR_VERSION falls
-    // back to R4B (#2064): say so rather than serve a version nobody chose.
+    // A build without R4 that enables several versions has no default FHIR
+    // version to fall back to (#2064): every R5 or R6 build also enables R4B,
+    // and serving R4B because nobody chose a version is hard to undo. Refuse to
+    // start, in the same form and with the same exit code as the
+    // `config.validate()` failure below.
     if let Some(message) =
-        config.implicit_default_fhir_version_warning(default_fhir_version_is_implicit)
+        config.implicit_default_fhir_version_error(default_fhir_version_is_implicit)
     {
-        warn!(default_fhir_version = %config.default_fhir_version, "{message}");
+        eprintln!("Configuration error: {}", message);
+        std::process::exit(1);
     }
 
     if let Err(errors) = config.validate() {

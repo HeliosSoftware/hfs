@@ -164,48 +164,61 @@ fn server_config_parses_without_arguments() {
     }
 }
 
-/// Whether a build with this feature set should warn about an implicit default:
-/// it has no R4, and more than one version to choose between.
-fn build_should_warn_about_implicit_default() -> bool {
+/// Whether a build with this feature set must refuse an implicit default: it
+/// has no R4, and more than one version to choose between.
+fn build_requires_explicit_default() -> bool {
     let enabled = FhirVersion::enabled_versions();
     !enabled.iter().any(|v| v.as_str() == "R4") && enabled.len() > 1
 }
 
-/// A server that never set `HFS_DEFAULT_FHIR_VERSION` must be told when that
-/// default is a version nobody chose (R4B in an R5/R6 build, #2064).
+/// The enabled versions as the startup error lists them.
+fn enabled_versions_list() -> String {
+    FhirVersion::enabled_versions()
+        .iter()
+        .map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A server that never set `HFS_DEFAULT_FHIR_VERSION` must refuse to start when
+/// it would otherwise serve a version nobody chose (R4B in an R5/R6 build, #2064).
 #[test]
-fn implicit_default_fhir_version_warns_only_in_builds_without_r4() {
+fn implicit_default_fhir_version_is_an_error_only_in_builds_without_r4() {
     for &v in FhirVersion::enabled_versions() {
         let config = ServerConfig {
             default_fhir_version: v,
             ..ServerConfig::for_testing()
         };
         assert!(
-            config
-                .implicit_default_fhir_version_warning(false)
-                .is_none(),
-            "{v:?}: an explicit default never warns"
+            config.implicit_default_fhir_version_error(false).is_none(),
+            "{v:?}: an explicit default is never an error"
         );
 
-        let warning = config.implicit_default_fhir_version_warning(true);
+        let error = config.implicit_default_fhir_version_error(true);
         assert_eq!(
-            warning.is_some(),
-            build_should_warn_about_implicit_default(),
-            "{v:?}: {warning:?}"
+            error.is_some(),
+            build_requires_explicit_default(),
+            "{v:?}: {error:?}"
         );
-        if let Some(message) = warning {
+        if let Some(message) = error {
             assert!(
-                message.contains("HFS_DEFAULT_FHIR_VERSION") && message.contains(v.as_str()),
-                "the warning names the variable and the version in use: {message}"
+                message.contains("HFS_DEFAULT_FHIR_VERSION"),
+                "the error names the variable: {message}"
+            );
+            assert!(
+                message.contains(&enabled_versions_list()),
+                "the error lists exactly the enabled versions ({}): {message}",
+                enabled_versions_list()
             );
         }
     }
 }
 
 /// `hfs` startup: an unset variable is reported as implicit and, in a build
-/// without R4, produces the warning; an explicit `--default-fhir-version` does not.
+/// without R4 that enables several versions, produces the error; an explicit
+/// `--default-fhir-version` does not.
 #[test]
-fn default_fhir_version_provenance_drives_the_startup_warning() {
+fn default_fhir_version_provenance_drives_the_startup_error() {
     let explicit = FhirVersion::default_enabled();
     let (config, implicit) = ServerConfig::try_parse_from_with_provenance([
         "hfs",
@@ -217,7 +230,7 @@ fn default_fhir_version_provenance_drives_the_startup_warning() {
     assert!(!implicit, "an explicit flag is not implicit");
     assert!(
         config
-            .implicit_default_fhir_version_warning(implicit)
+            .implicit_default_fhir_version_error(implicit)
             .is_none()
     );
 
@@ -225,11 +238,11 @@ fn default_fhir_version_provenance_drives_the_startup_warning() {
         let (config, implicit) =
             ServerConfig::try_parse_from_with_provenance(["hfs"]).unwrap_or_else(|e| panic!("{e}"));
         assert!(implicit, "no flag and no env var is the built-in default");
-        assert_eq!(
-            config
-                .implicit_default_fhir_version_warning(implicit)
-                .is_some(),
-            build_should_warn_about_implicit_default()
-        );
+        let error = config.implicit_default_fhir_version_error(implicit);
+        assert_eq!(error.is_some(), build_requires_explicit_default());
+        if let Some(message) = error {
+            assert!(message.contains("HFS_DEFAULT_FHIR_VERSION"), "{message}");
+            assert!(message.contains(&enabled_versions_list()), "{message}");
+        }
     }
 }
