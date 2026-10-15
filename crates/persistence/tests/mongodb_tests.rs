@@ -11366,10 +11366,21 @@ async fn mongodb_integration_reindex_page_batches_index_writes() {
             inserts <= 1,
             "a reindex page must issue at most one insert_many, got {inserts}: {entries:?}"
         );
+        let writes = entries
+            .iter()
+            .filter(|e| matches!(e.get_str("op").ok(), Some("remove" | "insert" | "update")))
+            .count();
         assert!(
-            entries.len() <= 2,
-            "a reindex page must issue at most 2 write commands total, got {}: {entries:?}",
-            entries.len()
+            writes <= 2,
+            "a reindex page must issue at most 2 write commands total, got {writes}: {entries:?}"
+        );
+        // The only other commands are the page's two verification reads of
+        // this collection: the row ids left after its delete and the row ids
+        // present after its insert.
+        let reads = entries.len() - writes;
+        assert!(
+            reads <= 2,
+            "a reindex page issues two verification reads besides its writes, got {reads}: {entries:?}"
         );
     }
 
@@ -23946,3 +23957,6 @@ mongodb_bundle_identity_test!(
 
 #[path = "mongodb/missing_index.rs"]
 mod missing_index;
+
+#[path = "mongodb/reindex_failures.rs"]
+mod reindex_failures;

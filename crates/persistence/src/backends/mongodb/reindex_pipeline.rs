@@ -16,11 +16,14 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures::TryStreamExt;
+use mongodb::bson::oid::ObjectId;
 use mongodb::bson::{Bson, Document, doc};
 
-use crate::error::StorageResult;
+use crate::error::{BackendError, StorageError, StorageResult, classify_mongodb_error};
 use crate::search::reindex::ReindexPageStats;
 use crate::types::StoredResource;
 
@@ -32,6 +35,10 @@ pub(super) const REINDEX_SUBBATCH_FIRST: usize = 32;
 pub(super) const REINDEX_SUBBATCH_TARGET_DOCS: usize = 2_500;
 /// Largest resources a single sub-batch may hold (#1403).
 pub(super) const REINDEX_SUBBATCH_MAX: usize = 512;
+/// Bounded cleanup attempts; survivors are reported for resource recovery,
+/// regardless of how long a concurrent migration or writer takes.
+const VERIFY_CLEANUP_ATTEMPTS: u32 = 3;
+const VERIFY_CLEANUP_BACKOFF: Duration = Duration::from_millis(100);
 /// Mirrors PostgreSQL's reindex prepare minimum page size: the smallest page
 /// for which the serial writer still tries the rayon pool (#1403).
 pub(super) const REINDEX_SERIAL_POOL_MIN_PAGE: usize = 16;
@@ -234,17 +241,241 @@ fn resource_version_filter(tenant_id: &str, resource: &StoredResource) -> Docume
     }
 }
 
+/// A failure whose scope is the page, kept distinct from attributable document
+/// errors until the public writer boundary. This does not authorize replay of
+/// the saved page: a command may have applied despite an uncertain reply.
+#[derive(Debug)]
+pub(super) struct PageFailure {
+    kind: Box<PageFailureKind>,
+    permanent: HashMap<usize, String>,
+}
+
+#[derive(Debug)]
+enum PageFailureKind {
+    Driver {
+        context: String,
+        error: mongodb::error::Error,
+    },
+    Metadata(Document),
+    Internal(String),
+    Storage(Arc<StorageError>),
+}
+
+impl PageFailure {
+    pub(super) fn driver(context: &str, error: mongodb::error::Error) -> Self {
+        Self {
+            kind: Box::new(PageFailureKind::Driver {
+                context: context.into(),
+                error,
+            }),
+            permanent: HashMap::new(),
+        }
+    }
+
+    pub(super) fn storage(error: StorageError) -> Self {
+        Self {
+            kind: Box::new(PageFailureKind::Storage(Arc::new(error))),
+            permanent: HashMap::new(),
+        }
+    }
+
+    /// Overlay known permanent failures that take precedence over those already
+    /// attached to this later page failure. Callers add earlier sub-batches or
+    /// destinations here; an own-row failure must replace a contained/metadata
+    /// failure already present, so collisions deliberately use the incoming map.
+    pub(super) fn with_permanent(mut self, failures: HashMap<usize, String>) -> Self {
+        self.permanent.extend(failures);
+        self
+    }
+
+    fn with_outcomes(
+        mut self,
+        extraction: Vec<Option<String>>,
+        inserts: HashMap<usize, String>,
+    ) -> Self {
+        self = self.with_permanent(inserts);
+        for (owner, message) in extraction.into_iter().enumerate() {
+            if let Some(message) = message {
+                self.permanent.insert(owner, message);
+            }
+        }
+        self
+    }
+
+    fn classified(&self) -> StorageError {
+        match self.kind.as_ref() {
+            PageFailureKind::Driver { context, error } => {
+                let classification = classify_mongodb_error(context, error.clone());
+                let concern = match error.kind.as_ref() {
+                    mongodb::error::ErrorKind::InsertMany(error) => {
+                        error.write_concern_error.as_ref()
+                    }
+                    mongodb::error::ErrorKind::Write(
+                        mongodb::error::WriteFailure::WriteConcernError(error),
+                    ) => Some(error),
+                    _ => None,
+                };
+                if concern.is_some_and(|error| {
+                    matches!(error.code, 50 | 262)
+                        || error
+                            .details
+                            .as_ref()
+                            .and_then(|info| info.get_bool("wtimeout").ok())
+                            == Some(true)
+                }) {
+                    return BackendError::Timeout {
+                        backend_name: "mongodb".into(),
+                        message: format!("{context}: {error}"),
+                    }
+                    .into();
+                }
+                // Keep server deadlines ahead of labels and leave the shared
+                // CRUD/query classifier unchanged.
+                if matches!(classification, BackendError::Internal { .. })
+                    && (error.contains_label("RetryableWriteError")
+                        || error.contains_label("RetryableError"))
+                {
+                    BackendError::Unavailable {
+                        backend_name: "mongodb".into(),
+                        message: format!("{context}: {error}"),
+                    }
+                    .into()
+                } else {
+                    classification.into()
+                }
+            }
+            PageFailureKind::Metadata(reply) => {
+                let concern = reply.get_document("writeConcernError").ok();
+                let message = format!("Unacknowledged reindex missing metadata update: {reply}");
+                let timeout = concern.is_some_and(|error| {
+                    matches!(error.get_i32("code"), Ok(50 | 262))
+                        || error
+                            .get_document("errInfo")
+                            .ok()
+                            .and_then(|info| info.get_bool("wtimeout").ok())
+                            == Some(true)
+                });
+                if timeout {
+                    BackendError::Timeout {
+                        backend_name: "mongodb".into(),
+                        message,
+                    }
+                    .into()
+                } else if has_retryable_label(reply) || concern.is_some_and(has_retryable_label) {
+                    BackendError::Unavailable {
+                        backend_name: "mongodb".into(),
+                        message,
+                    }
+                    .into()
+                } else {
+                    internal_error(message)
+                }
+            }
+            PageFailureKind::Internal(message) => internal_error(message.clone()),
+            PageFailureKind::Storage(error) => copy_page_error(error),
+        }
+    }
+
+    pub(super) fn fan_out(&self, n: usize) -> Vec<StorageResult<usize>> {
+        // One page failure has one classification. StorageError is not Clone;
+        // share its source chain while constructing each resource's outcome.
+        let classified = match self.kind.as_ref() {
+            PageFailureKind::Storage(error) => Arc::clone(error),
+            _ => Arc::new(self.classified()),
+        };
+        (0..n)
+            .map(|owner| {
+                Err(match self.permanent.get(&owner) {
+                    Some(message) => internal_error(message.clone()),
+                    None => copy_page_error(&classified),
+                })
+            })
+            .collect()
+    }
+}
+
+impl From<String> for PageFailure {
+    fn from(message: String) -> Self {
+        Self {
+            kind: Box::new(PageFailureKind::Internal(message)),
+            permanent: HashMap::new(),
+        }
+    }
+}
+
+impl From<&str> for PageFailure {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_owned())
+    }
+}
+
+/// Duplicate the classification, not the driver error or its source chain.
+fn copy_page_error(error: &Arc<StorageError>) -> StorageError {
+    match error.as_ref() {
+        StorageError::Backend(BackendError::Unavailable {
+            backend_name,
+            message,
+        }) => BackendError::Unavailable {
+            backend_name: backend_name.clone(),
+            message: message.clone(),
+        }
+        .into(),
+        StorageError::Backend(BackendError::Timeout {
+            backend_name,
+            message,
+        }) => BackendError::Timeout {
+            backend_name: backend_name.clone(),
+            message: message.clone(),
+        }
+        .into(),
+        StorageError::Backend(BackendError::ConnectionFailed {
+            backend_name,
+            message,
+        }) => BackendError::ConnectionFailed {
+            backend_name: backend_name.clone(),
+            message: message.clone(),
+        }
+        .into(),
+        StorageError::Backend(BackendError::PoolExhausted { backend_name }) => {
+            BackendError::PoolExhausted {
+                backend_name: backend_name.clone(),
+            }
+            .into()
+        }
+        StorageError::Backend(BackendError::Internal {
+            backend_name,
+            message,
+            source,
+        }) => BackendError::Internal {
+            backend_name: backend_name.clone(),
+            message: message.clone(),
+            // Wrapping the original can repeat its message but keeps its non-Clone source reachable.
+            source: source
+                .as_ref()
+                .map(|_| Box::new(Arc::clone(error)) as Box<dyn std::error::Error + Send + Sync>),
+        }
+        .into(),
+        _ => internal_error(error.to_string()),
+    }
+}
+
+fn has_retryable_label(reply: &Document) -> bool {
+    reply.get_array("errorLabels").is_ok_and(|labels| {
+        labels.iter().any(|label| {
+            matches!(
+                label.as_str(),
+                Some("RetryableWriteError" | "RetryableError")
+            )
+        })
+    })
+}
+
 /// Parse the actual update-command reply, attributing statement errors to the
 /// original page owners rather than the sub-batch's local statement positions.
 fn metadata_update_result(
     reply: &Document,
     updates: &[(usize, Document)],
-) -> Result<(usize, HashMap<usize, String>), String> {
-    if let Some(error) = reply.get("writeConcernError") {
-        return Err(format!(
-            "Unacknowledged reindex missing metadata update: {error}"
-        ));
-    }
+) -> Result<(usize, HashMap<usize, String>), PageFailure> {
     let mut failures = HashMap::new();
     if reply.contains_key("writeErrors") {
         let errors = reply
@@ -264,6 +495,12 @@ fn metadata_update_result(
             failures.insert(owner, format!("Failed to update missing metadata: {error}"));
         }
     }
+    if reply.contains_key("writeConcernError") {
+        return Err(PageFailure {
+            kind: Box::new(PageFailureKind::Metadata(reply.clone())),
+            permanent: failures,
+        });
+    }
     let matched = reply
         .get_i64("n")
         .or_else(|_| reply.get_i32("n").map(i64::from))
@@ -281,7 +518,7 @@ fn metadata_update_result(
 async fn update_missing_metadata(
     db: &mongodb::Database,
     updates: &[(usize, Document)],
-) -> Result<HashMap<usize, String>, String> {
+) -> Result<HashMap<usize, String>, PageFailure> {
     let mut failures = HashMap::new();
     for chunk in updates.chunks(REINDEX_SUBBATCH_MAX) {
         let statements: Vec<_> = chunk.iter().map(|(_, update)| update.clone()).collect();
@@ -292,8 +529,12 @@ async fn update_missing_metadata(
                 "ordered": false,
             })
             .await
-            .map_err(|error| format!("Failed to update reindex missing metadata: {error}"))?;
-        let (_, write_failures) = metadata_update_result(&reply, chunk)?;
+            .map_err(|error| {
+                PageFailure::driver("Failed to update reindex missing metadata", error)
+                    .with_permanent(failures.clone())
+            })?;
+        let (_, write_failures) = metadata_update_result(&reply, chunk)
+            .map_err(|failure| failure.with_permanent(failures.clone()))?;
         failures.extend(write_failures);
     }
     Ok(failures)
@@ -303,7 +544,7 @@ async fn update_missing_metadata(
 /// its own delete/insert phase timing and counts, and its outcome (#1403).
 struct DbTask<T> {
     stats: ReindexPageStats,
-    result: Result<T, String>,
+    result: Result<T, PageFailure>,
 }
 
 /// Per-resource write errors for one sub-batch's insert, kept separate by
@@ -312,6 +553,77 @@ struct DbTask<T> {
 struct InsertFailures {
     own: HashMap<usize, String>,
     contained: HashMap<usize, String>,
+}
+
+/// The `_id`s one page wrote, per collection, each with the page position of
+/// the resource it belongs to. The page assigns them before the inserts, so
+/// verification knows exactly which rows are its own whatever the insert
+/// outcome was, and how many it wrote per resource.
+#[derive(Default)]
+struct InsertedIds {
+    own: Vec<(usize, Bson)>,
+    contained: Vec<(usize, Bson)>,
+}
+
+type ResourceKey = (String, String);
+type ResourceRowIds = HashMap<ResourceKey, Vec<Bson>>;
+
+/// Rows observed after both initial deletes and before any page insert.
+/// Cleanup never acquires ownership of rows discovered after this snapshot.
+#[derive(Default)]
+struct PreviousIds {
+    own: ResourceRowIds,
+    contained: ResourceRowIds,
+}
+
+impl InsertedIds {
+    fn extend(&mut self, other: InsertedIds) {
+        self.own.extend(other.own);
+        self.contained.extend(other.contained);
+    }
+}
+
+/// One sub-batch's insert outcome: attributable failures and the ids written.
+struct SubBatchInsert {
+    failures: InsertFailures,
+    inserted: InsertedIds,
+}
+
+/// Gives every document an `_id` now, so the page knows the ids it inserts
+/// even when the driver reports an error for the command. `owners` holds the
+/// page position of each document's resource.
+fn assign_ids(docs: &mut [Document], owners: &[usize]) -> Vec<(usize, Bson)> {
+    docs.iter_mut()
+        .zip(owners)
+        .map(|(doc, owner)| {
+            let id = Bson::ObjectId(ObjectId::new());
+            doc.insert("_id", id.clone());
+            (*owner, id)
+        })
+        .collect()
+}
+
+/// Observed unresolved rows and resource-level verification failures. Missing
+/// expected rows fail a resource without any rows remaining.
+#[derive(Default)]
+struct PageVerification {
+    stale_rows_found: u64,
+    stale_rows_remaining: u64,
+    verification_failures: Vec<ResourceVerificationFailure>,
+}
+
+struct ResourceVerificationFailure {
+    resource_type: String,
+    resource_id: String,
+    mismatch: RowMismatch,
+}
+
+/// Rows that verification could not account for after cleanup.
+#[derive(Debug, PartialEq, Eq)]
+struct RowMismatch {
+    remaining: u64,
+    unknown: u64,
+    missing: u64,
 }
 
 /// Adds exactly `t`'s delete/insert phase fields to `stats`. Never calls
@@ -324,6 +636,9 @@ fn absorb_db_task(stats: &mut ReindexPageStats, t: &ReindexPageStats) {
     stats.deleted_entries += t.deleted_entries;
     stats.inserted_entries += t.inserted_entries;
     stats.insert_commands += t.insert_commands;
+    stats.verify += t.verify;
+    stats.stale_rows_found += t.stale_rows_found;
+    stats.stale_rows_remaining += t.stale_rows_remaining;
 }
 
 /// Records `d` as time the page's thread spent waiting on a joined database
@@ -367,23 +682,52 @@ fn page_outcomes(
         .collect()
 }
 
-/// `n` copies of `Err(msg)`, for a page-level failure that could not be
-/// attributed to specific resources (#1403).
-fn fan_out(n: usize, msg: &str) -> Vec<StorageResult<usize>> {
-    (0..n)
-        .map(|_| Err(internal_error(msg.to_string())))
-        .collect()
+/// Fails the resources whose rows verification could not account for,
+/// preserving earlier permanent errors.
+fn apply_verification_outcomes(
+    outcomes: &mut [StorageResult<usize>],
+    verification_failures: Vec<ResourceVerificationFailure>,
+    resources: &[StoredResource],
+) {
+    let positions: HashMap<(&str, &str), usize> = resources
+        .iter()
+        .enumerate()
+        .map(|(i, resource)| ((resource.resource_type(), resource.id()), i))
+        .collect();
+    for stale in verification_failures {
+        let key = (stale.resource_type.as_str(), stale.resource_id.as_str());
+        if let Some(&i) = positions.get(&key)
+            && outcomes[i].is_ok()
+        {
+            // Retryable: the bounded recovery rewrites the resource from a
+            // fresh read, which is the repair for rows a cleanup could not remove.
+            outcomes[i] = Err(BackendError::Unavailable {
+                backend_name: "mongodb".into(),
+                message: format!(
+                    "search index mismatch for {}/{} after cleanup: {} unresolved rows, {} with uncertain ownership, {} missing expected rows",
+                    stale.resource_type,
+                    stale.resource_id,
+                    stale.mismatch.remaining,
+                    stale.mismatch.unknown,
+                    stale.mismatch.missing
+                ),
+            }
+            .into());
+        }
+    }
 }
 
 /// Turns a joined database task's `JoinError` into a page-level failure
 /// message. A panic resumes here, exactly where an un-spawned call would
 /// itself have panicked, so the panic still propagates instead of being
 /// silently swallowed as an ordinary `Err` (#1403).
-fn join_failure(e: tokio::task::JoinError, what: &str) -> String {
+fn join_failure(e: tokio::task::JoinError, what: &str) -> PageFailure {
     if e.is_panic() {
         std::panic::resume_unwind(e.into_panic());
     }
-    format!("search index {what} task ended without a result: {e}")
+    PageFailure::from(format!(
+        "search index {what} task ended without a result: {e}"
+    ))
 }
 
 /// Joins a spawned sub-batch insert, absorbing its stats into `stats` and its
@@ -393,19 +737,21 @@ fn join_failure(e: tokio::task::JoinError, what: &str) -> String {
 /// sub-batch has been extracted. Returns the page-level failure message on a
 /// join or insert error (#1403).
 async fn join_insert(
-    mut task: AbortOnDrop<DbTask<InsertFailures>>,
+    mut task: AbortOnDrop<DbTask<SubBatchInsert>>,
     stats: &mut ReindexPageStats,
     page_wait: &mut Duration,
     insert_failures: &mut HashMap<usize, String>,
-) -> Result<(), String> {
+    inserted: &mut InsertedIds,
+) -> Result<(), PageFailure> {
     let waited = std::time::Instant::now();
     let joined = task.join().await;
     add_db_wait(stats, page_wait, waited.elapsed());
     let done = joined.map_err(|e| join_failure(e, "insert"))?;
     absorb_db_task(stats, &done.stats);
     match done.result {
-        Ok(failures) => {
-            merge_insert_failures(insert_failures, failures);
+        Ok(sub_batch) => {
+            merge_insert_failures(insert_failures, sub_batch.failures);
+            inserted.extend(sub_batch.inserted);
             Ok(())
         }
         Err(msg) => Err(msg),
@@ -461,38 +807,76 @@ async fn delete_page(
     own: mongodb::Collection<Document>,
     contained: mongodb::Collection<Document>,
     filters: Vec<Document>,
-) -> DbTask<()> {
+) -> DbTask<PreviousIds> {
     let started = std::time::Instant::now();
     let mut stats = ReindexPageStats::default();
-    for filter in filters {
+    for filter in &filters {
         match own.delete_many(filter.clone()).await {
             Ok(result) => stats.deleted_entries += result.deleted_count,
             Err(e) => {
                 stats.delete += started.elapsed();
                 return DbTask {
                     stats,
-                    result: Err(format!("Failed to delete search entries: {e}")),
+                    result: Err(PageFailure::driver("Failed to delete search entries", e)),
                 };
             }
         }
-        match contained.delete_many(filter).await {
+        match contained.delete_many(filter.clone()).await {
             Ok(result) => stats.deleted_entries += result.deleted_count,
             Err(e) => {
                 stats.delete += started.elapsed();
                 return DbTask {
                     stats,
-                    result: Err(format!(
-                        "Failed to delete search_index_contained entries: {e}"
+                    result: Err(PageFailure::driver(
+                        "Failed to delete search_index_contained entries",
+                        e,
                     )),
                 };
             }
         }
     }
     stats.delete += started.elapsed();
-    DbTask {
-        stats,
-        result: Ok(()),
+    let started = std::time::Instant::now();
+    let result = async {
+        let own = snapshot_row_ids(&own, &filters, "search index").await?;
+        let contained = snapshot_row_ids(&contained, &filters, "search_index_contained").await?;
+        Ok(PreviousIds { own, contained })
     }
+    .await;
+    stats.verify += started.elapsed();
+    DbTask { stats, result }
+}
+
+async fn snapshot_row_ids(
+    collection: &mongodb::Collection<Document>,
+    filters: &[Document],
+    context: &str,
+) -> Result<ResourceRowIds, PageFailure> {
+    let mut rows: ResourceRowIds = HashMap::new();
+    for filter in filters {
+        let mut cursor = collection
+            .find(filter.clone())
+            .projection(doc! { "_id": 1, "resource_type": 1, "resource_id": 1 })
+            .await
+            .map_err(|e| {
+                PageFailure::driver(&format!("Failed to snapshot remaining {context} rows"), e)
+            })?;
+        while let Some(row) = cursor.try_next().await.map_err(|e| {
+            PageFailure::driver(&format!("Failed to read remaining {context} rows"), e)
+        })? {
+            let key = (
+                row.get_str("resource_type")
+                    .map_err(|_| PageFailure::from("snapshot row without resource type"))?
+                    .to_owned(),
+                row.get_str("resource_id")
+                    .map_err(|_| PageFailure::from("snapshot row without resource id"))?
+                    .to_owned(),
+            );
+            let id = row.get("_id").ok_or("snapshot row without _id")?.clone();
+            rows.entry(key).or_default().push(id);
+        }
+    }
+    Ok(rows)
 }
 
 /// Inserts one sub-batch's extracted documents: `docs.own` into `own`
@@ -509,9 +893,13 @@ async fn insert_sub_batch(
     contained: mongodb::Collection<Document>,
     db: mongodb::Database,
     missing_updates: Vec<(usize, Document)>,
-    docs: SubBatchDocs,
-) -> DbTask<InsertFailures> {
+    mut docs: SubBatchDocs,
+) -> DbTask<SubBatchInsert> {
     let mut stats = ReindexPageStats::default();
+    let inserted = InsertedIds {
+        own: assign_ids(&mut docs.own_docs, &docs.own_owners),
+        contained: assign_ids(&mut docs.contained_docs, &docs.contained_owners),
+    };
     let started = std::time::Instant::now();
     let own_result = super::storage::insert_search_entries_chunk(
         &own,
@@ -548,7 +936,7 @@ async fn insert_sub_batch(
             Err(msg) => {
                 return DbTask {
                     stats,
-                    result: Err(msg),
+                    result: Err(msg.with_permanent(own_failures)),
                 };
             }
         };
@@ -565,17 +953,438 @@ async fn insert_sub_batch(
         Err(message) => {
             return DbTask {
                 stats,
-                result: Err(message),
+                result: Err(message
+                    .with_permanent(contained_failures)
+                    .with_permanent(own_failures)),
             };
         }
     }
     DbTask {
         stats,
-        result: Ok(InsertFailures {
-            own: own_failures,
-            contained: contained_failures,
+        result: Ok(SubBatchInsert {
+            failures: InsertFailures {
+                own: own_failures,
+                contained: contained_failures,
+            },
+            inserted,
         }),
     }
+}
+
+/// Verifies ownership after all page inserts. The pre-insert snapshot bounds
+/// cleanup ownership; rows discovered here never become deletion candidates.
+async fn verify_page(
+    own: mongodb::Collection<Document>,
+    contained: mongodb::Collection<Document>,
+    resources: mongodb::Collection<Document>,
+    page: &PageRows<'_>,
+    inserted: &InsertedIds,
+    previous: &PreviousIds,
+) -> DbTask<PageVerification> {
+    let started = std::time::Instant::now();
+    let mut stats = ReindexPageStats::default();
+    let mut verification = PageVerification::default();
+    let result = async {
+        // Read versions after the survivor snapshot and all page writes. This
+        // also selects changed/deleted owners whose row count did not grow.
+        let states = resource_states(&resources, page).await?;
+        for index in [
+            IndexCollection {
+                collection: &own,
+                inserted: &inserted.own,
+                previous: &previous.own,
+                context: "search index",
+            },
+            IndexCollection {
+                collection: &contained,
+                inserted: &inserted.contained,
+                previous: &previous.contained,
+                context: "search_index_contained",
+            },
+        ] {
+            verify_collection(index, &resources, page, &states, &mut verification).await?;
+        }
+        Ok(verification)
+    }
+    .await;
+    stats.verify += started.elapsed();
+    if let Ok(verification) = &result {
+        stats.stale_rows_found = verification.stale_rows_found;
+        stats.stale_rows_remaining = verification.stale_rows_remaining;
+        if verification.stale_rows_found > 0 || verification.stale_rows_remaining > 0 {
+            tracing::warn!(
+                stale_rows_found = verification.stale_rows_found,
+                stale_rows_remaining = verification.stale_rows_remaining,
+                "reindex page found stale or uncertain rows"
+            );
+        }
+    }
+    DbTask { stats, result }
+}
+
+/// The page's resources as verification sees them: scope filters per type, the
+/// resources with the versions the page read, and the positions whose insert
+/// failed (a failed owner is reported already and is not verified).
+struct PageRows<'a> {
+    filters: &'a [Document],
+    tenant_id: &'a str,
+    resources: &'a [StoredResource],
+    failed: &'a HashMap<usize, String>,
+}
+
+impl PageRows<'_> {
+    fn position_of(&self, resource_type: &str, id: &str) -> Option<usize> {
+        self.resources
+            .iter()
+            .position(|resource| resource.resource_type() == resource_type && resource.id() == id)
+    }
+}
+
+/// One index collection as verification sees it: the rows this page wrote
+/// into it and the rows left in it after the page's delete.
+struct IndexCollection<'a> {
+    collection: &'a mongodb::Collection<Document>,
+    inserted: &'a [(usize, Bson)],
+    previous: &'a ResourceRowIds,
+    context: &'a str,
+}
+
+async fn verify_collection(
+    index: IndexCollection<'_>,
+    resources: &mongodb::Collection<Document>,
+    page: &PageRows<'_>,
+    states: &[ResourceState],
+    verification: &mut PageVerification,
+) -> Result<(), PageFailure> {
+    let IndexCollection {
+        collection,
+        inserted,
+        previous,
+        context,
+    } = index;
+    let mut wrote: HashMap<usize, Vec<Bson>> = HashMap::new();
+    for (owner, id) in inserted {
+        wrote.entry(*owner).or_default().push(id.clone());
+    }
+    let mut present = snapshot_row_ids(collection, page.filters, context).await?;
+    for (resource_type, id) in present.keys() {
+        page.position_of(resource_type, id)
+            .ok_or("index snapshot contains an owner outside the page")?;
+    }
+    for (position, resource) in page.resources.iter().enumerate() {
+        if page.failed.contains_key(&position) {
+            continue;
+        }
+        let key = (
+            resource.resource_type().to_owned(),
+            resource.id().to_owned(),
+        );
+        let old_ids = previous.get(&key).map(Vec::as_slice).unwrap_or_default();
+        let page_ids = wrote.get(&position).map(Vec::as_slice).unwrap_or_default();
+        let initial = classify_cleanup_rows(
+            present.remove(&key).unwrap_or_default(),
+            page_ids,
+            old_ids,
+            states[position],
+        );
+        let scope = doc! {
+            "tenant_id": page.tenant_id,
+            "resource_type": resource.resource_type(),
+            "resource_id": resource.id(),
+        };
+        let mut cleanup = clean_resource(
+            collection,
+            &scope,
+            page_ids,
+            old_ids,
+            states[position],
+            context,
+            initial,
+        )
+        .await?;
+        if cleanup.mismatch.is_some()
+            && matches!(
+                states[position],
+                ResourceState::Absent | ResourceState::Unchanged
+            )
+        {
+            // A later update can change row ownership. Already changed/deleted
+            // resources keep the same ownership and must not restart cleanup.
+            let state = resource_state_now(resources, page.tenant_id, resource).await?;
+            if matches!(state, ResourceState::Changed | ResourceState::Deleted) {
+                let rows = classify_cleanup_rows(
+                    row_ids(collection, &scope, context).await?,
+                    page_ids,
+                    old_ids,
+                    state,
+                );
+                let again =
+                    clean_resource(collection, &scope, page_ids, old_ids, state, context, rows)
+                        .await?;
+                cleanup = CleanupResult {
+                    found: cleanup.found.max(again.found),
+                    remaining: again.remaining,
+                    mismatch: again.mismatch,
+                };
+            }
+        }
+        verification.stale_rows_found += cleanup.found;
+        verification.stale_rows_remaining += cleanup.remaining;
+        if let Some(mismatch) = cleanup.mismatch {
+            verification
+                .verification_failures
+                .push(ResourceVerificationFailure {
+                    resource_type: resource.resource_type().to_owned(),
+                    resource_id: resource.id().to_owned(),
+                    mismatch,
+                });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourceState {
+    /// ReindexTarget can receive resources from another store. Local absence
+    /// is not a deletion signal; the supplied resource remains authoritative.
+    Absent,
+    Unchanged,
+    Changed,
+    Deleted,
+}
+
+/// Batched resource reads, one per type, rather than one query per owner.
+async fn resource_states(
+    resources: &mongodb::Collection<Document>,
+    page: &PageRows<'_>,
+) -> Result<Vec<ResourceState>, PageFailure> {
+    // A hard purge is indistinguishable from an external source here. Only
+    // an explicit local tombstone can authorize deletion of this page's IDs.
+    let mut states = vec![ResourceState::Absent; page.resources.len()];
+    for filter in page.filters {
+        let mut filter = filter.clone();
+        let ids = filter
+            .remove("resource_id")
+            .ok_or("page filter without resource ids")?;
+        filter.insert("id", ids);
+        let mut cursor = resources
+            .find(filter)
+            .projection(doc! { "resource_type": 1, "id": 1, "version_id": 1, "is_deleted": 1 })
+            .await
+            .map_err(|e| PageFailure::driver("Failed to read page resource versions", e))?;
+        while let Some(row) = cursor
+            .try_next()
+            .await
+            .map_err(|e| PageFailure::driver("Failed to read page resource version cursor", e))?
+        {
+            let resource_type = row
+                .get_str("resource_type")
+                .map_err(|_| "resource without type")?;
+            let id = row.get_str("id").map_err(|_| "resource without id")?;
+            let position = page
+                .position_of(resource_type, id)
+                .ok_or("resource version contains an owner outside the page")?;
+            states[position] = resource_state(Some(&row), page.resources[position].version_id());
+        }
+    }
+    Ok(states)
+}
+
+/// The state of one resource right now, for a mismatch found after the
+/// page's batched version read.
+async fn resource_state_now(
+    resources: &mongodb::Collection<Document>,
+    tenant_id: &str,
+    resource: &StoredResource,
+) -> Result<ResourceState, PageFailure> {
+    let current = resources
+        .find_one(doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource.resource_type(),
+            "id": resource.id(),
+        })
+        .projection(doc! { "version_id": 1, "is_deleted": 1 })
+        .await
+        .map_err(|e| PageFailure::driver("Failed to re-read the resource version", e))?;
+    Ok(resource_state(current.as_ref(), resource.version_id()))
+}
+
+/// A document without a readable version is treated like an absent one: the
+/// page's copy stays authoritative.
+fn resource_state(current: Option<&Document>, page_version: &str) -> ResourceState {
+    let Some(current) = current else {
+        return ResourceState::Absent;
+    };
+    if current.get_bool("is_deleted").unwrap_or(false) {
+        return ResourceState::Deleted;
+    }
+    match current.get_str("version_id").ok() {
+        None => ResourceState::Absent,
+        Some(version) if version == page_version => ResourceState::Unchanged,
+        Some(_) => ResourceState::Changed,
+    }
+}
+
+struct CleanupRows {
+    removable: Vec<Bson>,
+    unknown: u64,
+    missing: u64,
+}
+
+impl CleanupRows {
+    fn unresolved(&self) -> u64 {
+        self.removable.len() as u64 + self.unknown
+    }
+
+    /// Changed/deleted resources may retain another writer's rows, but never
+    /// report clean while this page's obsolete rows remain.
+    fn mismatch(&self, state: ResourceState) -> Option<RowMismatch> {
+        match state {
+            ResourceState::Changed | ResourceState::Deleted if !self.removable.is_empty() => {
+                Some(RowMismatch {
+                    remaining: self.removable.len() as u64,
+                    unknown: 0,
+                    missing: 0,
+                })
+            }
+            ResourceState::Changed | ResourceState::Deleted => None,
+            ResourceState::Absent | ResourceState::Unchanged
+                if self.unresolved() > 0 || self.missing > 0 =>
+            {
+                Some(RowMismatch {
+                    remaining: self.unresolved(),
+                    unknown: self.unknown,
+                    missing: self.missing,
+                })
+            }
+            ResourceState::Absent | ResourceState::Unchanged => None,
+        }
+    }
+}
+
+/// Exact IDs captured before the page's inserts are the only older generation
+/// it can remove. After a change only the page's own IDs are removed; the rest
+/// belong to the newer version or to a generation its rewrite clears. Foreign
+/// rows first seen after the inserts are never claimed by cleanup.
+fn classify_cleanup_rows(
+    ids: Vec<Bson>,
+    page_ids: &[Bson],
+    previous: &[Bson],
+    state: ResourceState,
+) -> CleanupRows {
+    let mut result = CleanupRows {
+        removable: Vec::new(),
+        unknown: 0,
+        missing: if matches!(state, ResourceState::Absent | ResourceState::Unchanged) {
+            page_ids.iter().filter(|id| !ids.contains(id)).count() as u64
+        } else {
+            0
+        },
+    };
+    for id in ids {
+        let ours = page_ids.contains(&id);
+        let captured = previous.contains(&id);
+        let removable = match state {
+            ResourceState::Absent | ResourceState::Unchanged => captured,
+            ResourceState::Changed | ResourceState::Deleted => ours,
+        };
+        if removable {
+            result.removable.push(id);
+        } else if matches!(state, ResourceState::Absent | ResourceState::Unchanged) && !ours {
+            result.unknown += 1;
+        }
+    }
+    result
+}
+
+struct CleanupResult {
+    found: u64,
+    remaining: u64,
+    mismatch: Option<RowMismatch>,
+}
+
+/// Retries only deletion of IDs with established provenance. Re-reading the
+/// collection can identify an unresolved conflict, but cannot expand ownership.
+async fn clean_resource(
+    collection: &mongodb::Collection<Document>,
+    scope: &Document,
+    page_ids: &[Bson],
+    previous: &[Bson],
+    state: ResourceState,
+    context: &str,
+    mut rows: CleanupRows,
+) -> Result<CleanupResult, PageFailure> {
+    let mut found = 0;
+    let mut attempt = 0;
+    loop {
+        found = found.max(rows.unresolved());
+        if rows.removable.is_empty() || attempt == VERIFY_CLEANUP_ATTEMPTS {
+            return Ok(CleanupResult {
+                found,
+                remaining: rows.unresolved(),
+                mismatch: rows.mismatch(state),
+            });
+        }
+        if attempt > 0 {
+            tokio::time::sleep(VERIFY_CLEANUP_BACKOFF * attempt).await;
+        }
+        // Keep command size bounded even for resources with many search rows.
+        for ids in rows.removable.chunks(1000) {
+            let mut filter = scope.clone();
+            filter.insert("_id", doc! { "$in": ids.to_vec() });
+            collection.delete_many(filter).await.map_err(|e| {
+                PageFailure::driver(&format!("Failed to remove stale {context} rows"), e)
+            })?;
+        }
+        rows = classify_cleanup_rows(
+            row_ids(collection, scope, context).await?,
+            page_ids,
+            previous,
+            state,
+        );
+        attempt += 1;
+    }
+}
+
+async fn row_ids(
+    collection: &mongodb::Collection<Document>,
+    scope: &Document,
+    context: &str,
+) -> Result<Vec<Bson>, PageFailure> {
+    let mut cursor = collection
+        .find(scope.clone())
+        .projection(doc! { "_id": 1 })
+        .await
+        .map_err(|e| PageFailure::driver(&format!("Failed to list stale {context} rows"), e))?;
+    let mut ids = Vec::new();
+    while let Some(row) = cursor
+        .try_next()
+        .await
+        .map_err(|e| PageFailure::driver(&format!("Failed to read stale {context} rows"), e))?
+    {
+        ids.push(
+            row.get("_id")
+                .ok_or("search index row without _id")?
+                .clone(),
+        );
+    }
+    Ok(ids)
+}
+
+/// Verifies a page after inserts and returns resources requiring recovery.
+async fn verify_clean_page(
+    own: mongodb::Collection<Document>,
+    contained: mongodb::Collection<Document>,
+    resources: mongodb::Collection<Document>,
+    page: &PageRows<'_>,
+    inserted: &InsertedIds,
+    previous: &PreviousIds,
+    stats: &mut ReindexPageStats,
+) -> Result<Vec<ResourceVerificationFailure>, PageFailure> {
+    let done = verify_page(own, contained, resources, page, inserted, previous).await;
+    absorb_db_task(stats, &done.stats);
+    done.result
+        .map(|verification| verification.verification_failures)
 }
 
 impl super::MongoBackend {
@@ -602,7 +1411,7 @@ impl super::MongoBackend {
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
         multi_thread: bool,
-    ) -> Vec<StorageResult<usize>> {
+    ) -> Result<Vec<StorageResult<usize>>, PageFailure> {
         let n = resources.len();
 
         let own = db.collection::<Document>(Self::SEARCH_INDEX_COLLECTION);
@@ -633,30 +1442,60 @@ impl super::MongoBackend {
         stats.pool_sub_batches += u64::from(on_pool);
 
         let filters = delete_filters(tenant_id, resources);
-        let done = delete_page(own.clone(), contained.clone(), filters).await;
+        let done = delete_page(own.clone(), contained.clone(), filters.clone()).await;
         absorb_db_task(stats, &done.stats);
-        if let Err(msg) = done.result {
-            // Serial db_wait is the awaited delete plus the awaited insert;
-            // on this early return only the delete has run.
-            stats.db_wait = Some(stats.delete + stats.insert);
-            return fan_out(n, &msg);
-        }
-
-        let done = insert_sub_batch(own, contained, db.clone(), missing_updates, batch).await;
-        absorb_db_task(stats, &done.stats);
-        stats.db_wait = Some(stats.delete + stats.insert);
-        let insert_failures = match done.result {
-            Ok(failures) => {
-                let mut into = HashMap::new();
-                merge_insert_failures(&mut into, failures);
-                into
+        let previous = match done.result {
+            Ok(previous) => previous,
+            Err(msg) => {
+                stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
+                return Err(msg.with_outcomes(extract_failures, HashMap::new()));
             }
-            Err(msg) => return fan_out(n, &msg),
         };
+
+        let done = insert_sub_batch(
+            own.clone(),
+            contained.clone(),
+            db.clone(),
+            missing_updates,
+            batch,
+        )
+        .await;
+        absorb_db_task(stats, &done.stats);
+        stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
+        let (insert_failures, inserted) = match done.result {
+            Ok(sub_batch) => {
+                let mut into = HashMap::new();
+                merge_insert_failures(&mut into, sub_batch.failures);
+                (into, sub_batch.inserted)
+            }
+            Err(msg) => return Err(msg.with_outcomes(extract_failures, HashMap::new())),
+        };
+        let page = PageRows {
+            filters: &filters,
+            tenant_id,
+            resources,
+            failed: &insert_failures,
+        };
+        let resources_collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let verification_failures = verify_clean_page(
+            own,
+            contained,
+            resources_collection,
+            &page,
+            &inserted,
+            &previous,
+            stats,
+        )
+        .await;
+        stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
+        let verification_failures = verification_failures
+            .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?;
 
         let docs: u64 = doc_counts.iter().sum::<usize>() as u64;
         record_page_perf(stats, stats.db_wait.unwrap_or_default(), docs);
-        page_outcomes(extract_failures, insert_failures, &doc_counts)
+        let mut outcomes = page_outcomes(extract_failures, insert_failures, &doc_counts);
+        apply_verification_outcomes(&mut outcomes, verification_failures, resources);
+        Ok(outcomes)
     }
 
     /// Overlapped writer (#1403): while sub-batch k's insert runs on a
@@ -673,7 +1512,7 @@ impl super::MongoBackend {
         tenant_id: &str,
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
-    ) -> Vec<StorageResult<usize>> {
+    ) -> Result<Vec<StorageResult<usize>>, PageFailure> {
         let n = resources.len();
 
         let own = db.collection::<Document>(Self::SEARCH_INDEX_COLLECTION);
@@ -698,13 +1537,15 @@ impl super::MongoBackend {
         let mut delete = Some(AbortOnDrop::spawn(delete_page(
             own.clone(),
             contained.clone(),
-            filters,
+            filters.clone(),
         )));
         let mut planner = SubBatchPlanner::new(n, seed, min_size);
         let mut extract_failures: Vec<Option<String>> = vec![None; n];
         let mut doc_counts: Vec<usize> = vec![0; n];
         let mut insert_failures: HashMap<usize, String> = HashMap::new();
-        let mut in_flight: Option<AbortOnDrop<DbTask<InsertFailures>>> = None;
+        let mut inserted = InsertedIds::default();
+        let mut previous = PreviousIds::default();
+        let mut in_flight: Option<AbortOnDrop<DbTask<SubBatchInsert>>> = None;
         let mut page_wait = Duration::ZERO;
 
         while let Some(range) = planner.next_range() {
@@ -731,20 +1572,30 @@ impl super::MongoBackend {
                 add_db_wait(stats, &mut page_wait, waited.elapsed());
                 let done = match joined {
                     Ok(done) => done,
-                    Err(e) => return fan_out(n, &join_failure(e, "delete")),
+                    Err(e) => {
+                        return Err(join_failure(e, "delete")
+                            .with_outcomes(extract_failures, insert_failures));
+                    }
                 };
                 absorb_db_task(stats, &done.stats);
-                if let Err(msg) = done.result {
-                    return fan_out(n, &msg);
-                }
+                previous = match done.result {
+                    Ok(previous) => previous,
+                    Err(msg) => return Err(msg.with_outcomes(extract_failures, insert_failures)),
+                };
             }
             // At most one insert is ever in flight: finish the previous
             // sub-batch's insert before starting this one.
             if let Some(task) = in_flight.take()
-                && let Err(msg) =
-                    join_insert(task, stats, &mut page_wait, &mut insert_failures).await
+                && let Err(msg) = join_insert(
+                    task,
+                    stats,
+                    &mut page_wait,
+                    &mut insert_failures,
+                    &mut inserted,
+                )
+                .await
             {
-                return fan_out(n, &msg);
+                return Err(msg.with_outcomes(extract_failures, insert_failures));
             }
             in_flight = Some(AbortOnDrop::spawn(insert_sub_batch(
                 own.clone(),
@@ -756,10 +1607,38 @@ impl super::MongoBackend {
         }
         // Drain the last sub-batch's insert the same way.
         if let Some(task) = in_flight.take()
-            && let Err(msg) = join_insert(task, stats, &mut page_wait, &mut insert_failures).await
+            && let Err(msg) = join_insert(
+                task,
+                stats,
+                &mut page_wait,
+                &mut insert_failures,
+                &mut inserted,
+            )
+            .await
         {
-            return fan_out(n, &msg);
+            return Err(msg.with_outcomes(extract_failures, insert_failures));
         }
+        let waited = std::time::Instant::now();
+        let page = PageRows {
+            filters: &filters,
+            tenant_id,
+            resources,
+            failed: &insert_failures,
+        };
+        let resources_collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let verification_failures = verify_clean_page(
+            own,
+            contained,
+            resources_collection,
+            &page,
+            &inserted,
+            &previous,
+            stats,
+        )
+        .await;
+        add_db_wait(stats, &mut page_wait, waited.elapsed());
+        let verification_failures = verification_failures
+            .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?;
 
         // Success only: remember the type's documents per resource, forward to perf.
         let docs: u64 = doc_counts.iter().sum::<usize>() as u64;
@@ -767,7 +1646,9 @@ impl super::MongoBackend {
             self.record_reindex_docs(t, n as u64, docs);
         }
         record_page_perf(stats, page_wait, docs);
-        page_outcomes(extract_failures, insert_failures, &doc_counts)
+        let mut outcomes = page_outcomes(extract_failures, insert_failures, &doc_counts);
+        apply_verification_outcomes(&mut outcomes, verification_failures, resources);
+        Ok(outcomes)
     }
 
     /// Logs `mongodb reindex writer configuration` once per backend instance,
@@ -809,6 +1690,316 @@ impl super::MongoBackend {
 mod tests {
     use super::*;
 
+    fn command_error(code: i32) -> mongodb::error::Error {
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+            "code": code, "codeName": "test", "errmsg": "synthetic command failure"
+        })
+        .unwrap();
+        mongodb::error::ErrorKind::Command(command).into()
+    }
+
+    fn concern_error(label: &str) -> mongodb::error::Error {
+        let concern: mongodb::error::WriteConcernError = mongodb::bson::from_document(doc! {
+            "code": 91, "errmsg": "synthetic acknowledgement failure", "errorLabels": [label]
+        })
+        .unwrap();
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(concern))
+            .into()
+    }
+
+    #[test]
+    fn page_failures_classify_driver_errors_without_changing_shared_classifier() {
+        for label in ["RetryableWriteError", "RetryableError"] {
+            let mut error = concern_error(label);
+            // A command failure with the same server label follows the same path.
+            error.kind = command_error(91).kind;
+            assert!(matches!(
+                classify_mongodb_error("delete", error.clone()),
+                BackendError::Internal { .. }
+            ));
+            let failure = PageFailure::driver("delete page", error);
+            assert!(matches!(
+                failure.kind.as_ref(),
+                PageFailureKind::Driver { .. }
+            ));
+            for result in failure.fan_out(3) {
+                assert!(matches!(
+                    result,
+                    Err(StorageError::Backend(BackendError::Unavailable { .. }))
+                ));
+            }
+        }
+        for code in [50, 262] {
+            let mut error = concern_error("RetryableWriteError");
+            error.kind = command_error(code).kind;
+            assert!(matches!(
+                PageFailure::driver("insert page", error).classified(),
+                StorageError::Backend(BackendError::Timeout { .. })
+            ));
+        }
+        assert!(matches!(
+            PageFailure::driver("delete page", command_error(91)).classified(),
+            StorageError::Backend(BackendError::Internal { .. })
+        ));
+        let io =
+            mongodb::error::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(matches!(
+            PageFailure::driver("insert page", io).classified(),
+            StorageError::Backend(BackendError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            PageFailure::from("invalid reply").classified(),
+            StorageError::Backend(BackendError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn metadata_concern_preserves_reply_details_labels_and_permanent_owners() {
+        for nested in [false, true] {
+            let mut concern = doc! { "code": 91, "codeName": "ShutdownInProgress", "errmsg": "acknowledgement uncertain", "errInfo": { "detail": "retained" } };
+            let mut reply = doc! { "n": 1, "writeErrors": [{ "index": 1, "code": 121, "errmsg": "permanent rejection" }] };
+            if nested {
+                concern.insert("errorLabels", vec!["RetryableError"]);
+            } else {
+                reply.insert("errorLabels", vec!["RetryableWriteError"]);
+            }
+            reply.insert("writeConcernError", concern);
+            let failure =
+                metadata_update_result(&reply, &[(0, doc! {}), (2, doc! {})]).unwrap_err();
+            match failure.kind.as_ref() {
+                PageFailureKind::Metadata(saved) => assert_eq!(saved, &reply),
+                _ => panic!("raw acknowledgement evidence must survive"),
+            }
+            let results = failure.fan_out(3);
+            assert!(matches!(
+                &results[0],
+                Err(StorageError::Backend(BackendError::Unavailable { .. }))
+            ));
+            assert!(matches!(
+                &results[2],
+                Err(StorageError::Backend(BackendError::Internal { .. }))
+            ));
+            assert!(
+                results[2]
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("permanent rejection")
+            );
+            assert!(
+                results[0]
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retained")
+            );
+        }
+    }
+
+    #[test]
+    fn write_concern_timeouts_and_permanent_failures_keep_their_classification() {
+        for concern in [
+            doc! { "code": 50, "errmsg": "deadline" },
+            doc! { "code": 262, "errmsg": "deadline" },
+            doc! { "code": 64, "errmsg": "replication wait", "errInfo": { "wtimeout": true } },
+        ] {
+            let reply = doc! { "n": 0, "writeConcernError": concern.clone(), "errorLabels": ["RetryableWriteError"] };
+            let failure = metadata_update_result(&reply, &[(0, doc! {})]).unwrap_err();
+            assert!(matches!(
+                failure.classified(),
+                StorageError::Backend(BackendError::Timeout { .. })
+            ));
+            let concern = mongodb::bson::from_document(concern).unwrap();
+            let error = mongodb::error::ErrorKind::Write(
+                mongodb::error::WriteFailure::WriteConcernError(concern),
+            )
+            .into();
+            assert!(matches!(
+                PageFailure::driver("insert", error).classified(),
+                StorageError::Backend(BackendError::Timeout { .. })
+            ));
+        }
+        let reply =
+            doc! { "n": 0, "writeConcernError": { "code": 100, "errmsg": "unknown concern mode" } };
+        assert!(matches!(
+            metadata_update_result(&reply, &[(0, doc! {})])
+                .unwrap_err()
+                .classified(),
+            StorageError::Backend(BackendError::Internal { .. })
+        ));
+        let reply = doc! { "n": 0, "errorLabels": ["RetryableWriteError"], "writeErrors": [{ "index": 0, "code": 121, "errmsg": "invalid document" }] };
+        let (_, failures) = metadata_update_result(&reply, &[(0, doc! {})]).unwrap();
+        let outcomes = page_outcomes(vec![None], failures, &[0]);
+        assert!(matches!(
+            &outcomes[0],
+            Err(StorageError::Backend(BackendError::Internal { .. }))
+        ));
+    }
+
+    #[test]
+    fn page_failure_keeps_prior_permanent_errors_and_extraction_precedence() {
+        let failure = PageFailure::driver("insert", concern_error("RetryableWriteError"))
+            .with_permanent(HashMap::from([
+                (0, "own document rejected".into()),
+                (1, "contained rejected".into()),
+            ]))
+            .with_outcomes(
+                vec![Some("extraction failed".into()), None, None],
+                HashMap::new(),
+            );
+        let outcomes = failure.fan_out(3);
+        assert!(
+            outcomes[0]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("extraction failed")
+        );
+        assert!(
+            outcomes[1]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("contained rejected")
+        );
+        assert!(matches!(
+            &outcomes[2],
+            Err(StorageError::Backend(BackendError::Unavailable { .. }))
+        ));
+        let failure = PageFailure::storage(
+            BackendError::ConnectionFailed {
+                backend_name: "mongodb".into(),
+                message: "offline".into(),
+            }
+            .into(),
+        );
+        assert!(matches!(
+            &failure.fan_out(2)[1],
+            Err(StorageError::Backend(BackendError::ConnectionFailed { .. }))
+        ));
+    }
+
+    #[test]
+    fn permanent_overlays_replace_existing_lower_priority_errors() {
+        // A failed metadata command already contains its own permanent owners.
+        let failure = PageFailure {
+            kind: Box::new(PageFailureKind::Metadata(doc! {
+                "writeConcernError": { "code": 91 }, "errorLabels": ["RetryableWriteError"]
+            })),
+            permanent: HashMap::from([
+                (0, "metadata zero".into()),
+                (1, "metadata one".into()),
+                (2, "metadata two".into()),
+                (3, "metadata three".into()),
+            ]),
+        }
+        .with_permanent(HashMap::from([
+            (0, "contained zero".into()),
+            (1, "contained one".into()),
+            (2, "contained two".into()),
+        ]))
+        .with_permanent(HashMap::from([
+            (0, "own zero".into()),
+            (1, "own one".into()),
+        ]));
+        assert_eq!(failure.permanent[&0], "own zero");
+        assert_eq!(failure.permanent[&1], "own one");
+        assert_eq!(failure.permanent[&2], "contained two");
+        assert_eq!(failure.permanent[&3], "metadata three");
+
+        let failure = failure.with_outcomes(
+            vec![Some("extraction zero".into()), None, None, None, None],
+            HashMap::from([(1, "earlier sub-batch one".into())]),
+        );
+        assert_eq!(failure.permanent[&0], "extraction zero");
+        assert_eq!(failure.permanent[&1], "earlier sub-batch one");
+        let outcomes = failure.fan_out(5);
+        assert!(outcomes[..4].iter().all(|outcome| matches!(
+            outcome,
+            Err(StorageError::Backend(BackendError::Internal { .. }))
+        )));
+        assert!(matches!(
+            &outcomes[4],
+            Err(StorageError::Backend(BackendError::Unavailable { .. }))
+        ));
+    }
+
+    #[test]
+    fn fan_out_copies_one_classification_and_shares_its_original_source() {
+        let failure = PageFailure::driver("delete page", command_error(2));
+        let outcomes = failure.fan_out(3);
+        let mut sources = Vec::new();
+        for outcome in &outcomes {
+            let Err(StorageError::Backend(BackendError::Internal {
+                message,
+                source: Some(source),
+                ..
+            })) = outcome
+            else {
+                panic!("permanent driver failure must retain its source");
+            };
+            assert!(message.starts_with("delete page:"));
+            sources.push(source.downcast_ref::<Arc<StorageError>>().unwrap());
+        }
+        assert!(Arc::ptr_eq(sources[0], sources[1]));
+        assert!(Arc::ptr_eq(sources[1], sources[2]));
+        let StorageError::Backend(BackendError::Internal {
+            source: Some(driver),
+            ..
+        }) = sources[0].as_ref()
+        else {
+            panic!("shared classification must retain the original driver error");
+        };
+        assert!(driver.downcast_ref::<mongodb::error::Error>().is_some());
+
+        // Every supported transient category and its message survive copying.
+        for error in [
+            BackendError::Unavailable {
+                backend_name: "mongodb".into(),
+                message: "offline".into(),
+            },
+            BackendError::Timeout {
+                backend_name: "mongodb".into(),
+                message: "deadline".into(),
+            },
+            BackendError::ConnectionFailed {
+                backend_name: "mongodb".into(),
+                message: "connection".into(),
+            },
+            BackendError::PoolExhausted {
+                backend_name: "mongodb".into(),
+            },
+        ] {
+            let expected_kind = std::mem::discriminant(&error);
+            let expected_message = error.to_string();
+            for outcome in PageFailure::storage(error.into()).fan_out(2) {
+                let error = outcome.unwrap_err();
+                let StorageError::Backend(backend) = &error else {
+                    panic!("backend classification must survive fan-out");
+                };
+                assert_eq!(std::mem::discriminant(backend), expected_kind);
+                assert_eq!(error.to_string(), expected_message);
+            }
+        }
+
+        let original = BackendError::Internal {
+            backend_name: "mongodb".into(),
+            message: "database setup failed".into(),
+            source: Some(Box::new(std::io::Error::other("original setup source"))),
+        };
+        let expected_message = original.to_string();
+        for outcome in PageFailure::storage(original.into()).fan_out(2) {
+            let error = outcome.unwrap_err();
+            assert_eq!(error.to_string(), expected_message);
+            let mut source: &(dyn std::error::Error + 'static) = &error;
+            while let Some(next) = source.source() {
+                source = next;
+            }
+            let original_source = source.downcast_ref::<std::io::Error>().unwrap();
+            assert_eq!(original_source.to_string(), "original setup source");
+        }
+    }
+
     #[test]
     fn metadata_update_errors_keep_page_owners_and_unmatched_counts() {
         let updates = vec![(7, doc! {}), (12, doc! {})];
@@ -843,6 +2034,8 @@ mod tests {
         assert!(
             metadata_update_result(&reply, &updates)
                 .unwrap_err()
+                .classified()
+                .to_string()
                 .contains("Unacknowledged")
         );
         for reply in [
@@ -1018,6 +2211,316 @@ mod tests {
         merge_insert_failures(&mut into, InsertFailures { own, contained });
         assert_eq!(into.get(&3), Some(&"own failed".to_string()));
         assert_eq!(into.get(&4), Some(&"contained only".to_string()));
+    }
+
+    #[test]
+    fn assign_ids_writes_the_id_it_returns_into_each_document_with_its_owner() {
+        let mut docs = vec![doc! { "a": 1 }, doc! { "b": 2 }, doc! { "c": 3 }];
+        let ids = assign_ids(&mut docs, &[4, 4, 9]);
+        for (doc, (_, id)) in docs.iter().zip(&ids) {
+            assert_eq!(doc.get("_id"), Some(id));
+            assert!(matches!(id, Bson::ObjectId(_)));
+        }
+        assert_eq!(
+            ids.iter().map(|(owner, _)| *owner).collect::<Vec<_>>(),
+            [4, 4, 9]
+        );
+        assert_ne!(ids[0].1, ids[1].1);
+    }
+
+    #[test]
+    fn cleanup_never_claims_ids_discovered_after_the_snapshot() {
+        let page = vec![Bson::ObjectId(ObjectId::new())];
+        let previous = vec![Bson::ObjectId(ObjectId::new())];
+        let foreign = Bson::ObjectId(ObjectId::new());
+        let present = vec![page[0].clone(), previous[0].clone(), foreign.clone()];
+        let unchanged =
+            classify_cleanup_rows(present.clone(), &page, &previous, ResourceState::Unchanged);
+        assert_eq!(unchanged.removable, previous);
+        assert_eq!(unchanged.unknown, 1);
+        assert_eq!(
+            unchanged.mismatch(ResourceState::Unchanged),
+            Some(RowMismatch {
+                remaining: 2,
+                unknown: 1,
+                missing: 0,
+            })
+        );
+        let changed =
+            classify_cleanup_rows(present.clone(), &page, &previous, ResourceState::Changed);
+        assert_eq!(changed.removable, page);
+        assert_eq!(
+            changed.unknown, 0,
+            "after an update the other rows are its own or a generation its rewrite clears"
+        );
+        let deleted = classify_cleanup_rows(present, &page, &previous, ResourceState::Deleted);
+        assert_eq!(deleted.removable, page);
+        assert_eq!(deleted.unknown, 0);
+        let current =
+            classify_cleanup_rows(vec![foreign], &page, &previous, ResourceState::Changed);
+        assert!(
+            current.removable.is_empty(),
+            "preserve foreign rows without claiming their generation"
+        );
+        assert_eq!(current.mismatch(ResourceState::Changed), None);
+    }
+
+    #[test]
+    fn overlapping_same_version_pages_do_not_delete_each_others_new_rows() {
+        let a = vec![Bson::ObjectId(ObjectId::new())];
+        let b = vec![Bson::ObjectId(ObjectId::new())];
+        let present = vec![a[0].clone(), b[0].clone()];
+        for page in [&a, &b] {
+            let rows = classify_cleanup_rows(present.clone(), page, &[], ResourceState::Unchanged);
+            assert!(rows.removable.is_empty());
+            assert_eq!(
+                rows.unknown, 1,
+                "overlap is a retryable conflict, never clean success"
+            );
+        }
+        // If B captured A before B inserted, only B may remove A. A's
+        // snapshot cannot have captured B, so ownership cannot form a cycle.
+        let b_cleanup = classify_cleanup_rows(present.clone(), &b, &a, ResourceState::Unchanged);
+        assert_eq!(b_cleanup.removable, a);
+        let a_cleanup =
+            classify_cleanup_rows(vec![b[0].clone()], &a, &[], ResourceState::Unchanged);
+        assert!(a_cleanup.removable.is_empty());
+        assert_eq!(a_cleanup.unknown, 1);
+    }
+
+    #[test]
+    fn exact_identity_detects_same_count_replacement_and_missing_rows() {
+        let page = vec![Bson::ObjectId(ObjectId::new())];
+        let other = Bson::ObjectId(ObjectId::new());
+        let replaced = classify_cleanup_rows(vec![other], &page, &[], ResourceState::Unchanged);
+        assert!(replaced.removable.is_empty());
+        assert_eq!(
+            replaced.mismatch(ResourceState::Unchanged),
+            Some(RowMismatch {
+                remaining: 1,
+                unknown: 1,
+                missing: 1,
+            })
+        );
+        let missing = classify_cleanup_rows(vec![], &page, &[], ResourceState::Unchanged);
+        assert_eq!(
+            missing.mismatch(ResourceState::Unchanged),
+            Some(RowMismatch {
+                remaining: 0,
+                unknown: 0,
+                missing: 1,
+            })
+        );
+        let intact = classify_cleanup_rows(page.clone(), &page, &[], ResourceState::Unchanged);
+        assert_eq!(intact.mismatch(ResourceState::Unchanged), None);
+    }
+
+    #[test]
+    fn absent_local_resource_preserves_supplied_page_ids() {
+        let page = vec![Bson::ObjectId(ObjectId::new())];
+        let captured = vec![Bson::ObjectId(ObjectId::new())];
+        let intact = classify_cleanup_rows(page.clone(), &page, &[], ResourceState::Absent);
+        assert!(
+            intact.removable.is_empty(),
+            "external-source rows are not deleted"
+        );
+        assert_eq!(intact.mismatch(ResourceState::Absent), None);
+        let leftovers = classify_cleanup_rows(
+            vec![page[0].clone(), captured[0].clone()],
+            &page,
+            &captured,
+            ResourceState::Absent,
+        );
+        assert_eq!(leftovers.removable, captured);
+        let missing = classify_cleanup_rows(vec![], &page, &[], ResourceState::Absent);
+        assert_eq!(
+            missing.mismatch(ResourceState::Absent),
+            Some(RowMismatch {
+                remaining: 0,
+                unknown: 0,
+                missing: 1,
+            })
+        );
+        // A confirmed tombstone, unlike absence, invalidates the supplied page.
+        let deleted = classify_cleanup_rows(page.clone(), &page, &[], ResourceState::Deleted);
+        assert_eq!(deleted.removable, page);
+    }
+
+    #[test]
+    fn changed_and_deleted_resources_require_removal_of_page_owned_rows() {
+        let page = vec![Bson::ObjectId(ObjectId::new())];
+        let previous = vec![Bson::ObjectId(ObjectId::new())];
+        let foreign = Bson::ObjectId(ObjectId::new());
+        for state in [ResourceState::Changed, ResourceState::Deleted] {
+            let remaining = classify_cleanup_rows(
+                vec![page[0].clone(), previous[0].clone(), foreign.clone()],
+                &page,
+                &previous,
+                state,
+            );
+            assert_eq!(remaining.removable, page);
+            assert_eq!(
+                remaining.mismatch(state),
+                Some(RowMismatch {
+                    remaining: 1,
+                    unknown: 0,
+                    missing: 0,
+                }),
+                "obsolete page-owned rows must request recovery: {state:?}"
+            );
+            for retained in [vec![], vec![previous[0].clone(), foreign.clone()]] {
+                let clean = classify_cleanup_rows(retained, &page, &previous, state);
+                assert!(clean.removable.is_empty());
+                assert_eq!(clean.mismatch(state), None, "{state:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_rows_report_retryable_conflict_without_overriding_permanent_errors() {
+        let tenant = crate::tenant::TenantId::new("t");
+        let resource = StoredResource::new(
+            "Observation",
+            "a",
+            tenant,
+            serde_json::json!({ "resourceType": "Observation", "id": "a" }),
+            helios_fhir::FhirVersion::default(),
+        );
+        for permanent in [false, true] {
+            let mut outcomes = vec![if permanent {
+                Err(internal_error("permanent rejection".into()))
+            } else {
+                Ok(1)
+            }];
+            apply_verification_outcomes(
+                &mut outcomes,
+                vec![ResourceVerificationFailure {
+                    resource_type: "Observation".into(),
+                    resource_id: "a".into(),
+                    mismatch: RowMismatch {
+                        remaining: 2,
+                        unknown: 2,
+                        missing: 0,
+                    },
+                }],
+                std::slice::from_ref(&resource),
+            );
+            let error = outcomes[0].as_ref().unwrap_err();
+            if permanent {
+                assert!(error.to_string().contains("permanent rejection"));
+            } else {
+                assert!(matches!(
+                    error,
+                    StorageError::Backend(BackendError::Unavailable { .. })
+                ));
+                assert!(error.to_string().contains("uncertain ownership"));
+            }
+        }
+    }
+
+    #[test]
+    fn stale_outcomes_fail_only_the_named_resources_that_were_ok() {
+        let tenant = crate::tenant::TenantId::new("t");
+        let resource = |resource_type: &str, id: &str| {
+            StoredResource::new(
+                resource_type,
+                id,
+                tenant.clone(),
+                serde_json::json!({ "resourceType": resource_type, "id": id }),
+                helios_fhir::FhirVersion::default(),
+            )
+        };
+        let resources = [
+            resource("Observation", "a"),
+            resource("Observation", "b"),
+            resource("Patient", "b"),
+        ];
+        let mut outcomes: Vec<StorageResult<usize>> = vec![
+            Ok(3),
+            Err(internal_error("extraction failed".into())),
+            Ok(5),
+        ];
+        apply_verification_outcomes(
+            &mut outcomes,
+            vec![
+                ResourceVerificationFailure {
+                    resource_type: "Observation".into(),
+                    resource_id: "b".into(),
+                    mismatch: RowMismatch {
+                        remaining: 4,
+                        unknown: 0,
+                        missing: 0,
+                    },
+                },
+                ResourceVerificationFailure {
+                    resource_type: "Patient".into(),
+                    resource_id: "b".into(),
+                    mismatch: RowMismatch {
+                        remaining: 2,
+                        unknown: 0,
+                        missing: 0,
+                    },
+                },
+                ResourceVerificationFailure {
+                    resource_type: "Observation".into(),
+                    resource_id: "unknown".into(),
+                    mismatch: RowMismatch {
+                        remaining: 1,
+                        unknown: 0,
+                        missing: 0,
+                    },
+                },
+            ],
+            &resources,
+        );
+        assert!(matches!(outcomes[0], Ok(3)));
+        assert!(
+            outcomes[1]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("extraction failed"),
+            "an earlier failure keeps its message"
+        );
+        let patient = outcomes[2].as_ref().unwrap_err();
+        assert!(
+            matches!(
+                patient,
+                StorageError::Backend(BackendError::Unavailable { .. })
+            ),
+            "a resource with rows left after cleanup is retryable: {patient:?}"
+        );
+        assert!(
+            patient
+                .to_string()
+                .contains("search index mismatch for Patient/b after cleanup: 2 unresolved rows"),
+            "{patient}"
+        );
+    }
+
+    #[test]
+    fn absorb_db_task_carries_the_verification_fields() {
+        let mut stats = ReindexPageStats::default();
+        let t = ReindexPageStats {
+            verify: Duration::from_millis(11),
+            stale_rows_found: 34,
+            stale_rows_remaining: 17,
+            ..ReindexPageStats::default()
+        };
+        absorb_db_task(&mut stats, &t);
+        assert_eq!(stats.verify, Duration::from_millis(11));
+        assert_eq!(stats.stale_rows_found, 34);
+        assert_eq!(stats.stale_rows_remaining, 17);
+        let mut total = ReindexPageStats::default();
+        total.accumulate(&stats);
+        total.accumulate(&stats);
+        assert_eq!(total.stale_rows_found, 68);
+        assert_eq!(total.verify, Duration::from_millis(22));
+        assert_eq!(
+            total.db_wait_or_busy(),
+            Duration::from_millis(22),
+            "the serial busy time includes verification"
+        );
     }
 
     #[test]
