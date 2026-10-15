@@ -1602,7 +1602,7 @@ test.describe("Tables panel", () => {
     await expect(row.locator("code")).toHaveText("v");
     await expect(row.locator(".tag--failed")).toHaveText("Not found");
     await expect(row).toContainText(
-      "No ViewDefinition or SQL View answers to http://example.org/ViewDefinition/change-me. Fix the canonical in Details or remove the row.",
+      "No ViewDefinition, SQL View, ValueSet or ConceptMap answers to http://example.org/ViewDefinition/change-me. Fix the canonical in Details or remove the row.",
     );
 
     // #842/04: the starter's own SQL ("SELECT * FROM v") still reads `v` —
@@ -1773,7 +1773,7 @@ test.describe("Terminology dependencies (#1824)", () => {
   // are exposed as relations with a fixed column set. The Tables card
   // resolves both (chip, link, row count, the "no expansion yet" warning)
   // and the Columns card traces a relation column to its fixed schema.
-  test("Add table offers a stored ValueSet, Reads from resolves it with its member count, and a compose-only ValueSet warns", async ({
+  test("Add table offers a stored ValueSet, a Library write materializes a compose-only dependency, and an unexpanded ValueSet warns until saved", async ({
     page,
     request,
   }) => {
@@ -1798,11 +1798,21 @@ test.describe("Terminology dependencies (#1824)", () => {
         ],
       },
     });
+    // Enumerated compose, no expansion: the Library write below materializes
+    // it (no terminology server in e2e, so the local expander does it).
     const composeOnlyName = `e2e_compose_vs_${suffix}`;
     const composeOnlyCanonical = `http://example.org/ValueSet/e2e-compose-${suffix}`;
     const composeOnlyId = await createResource(request, "ValueSet", {
       name: composeOnlyName,
       url: composeOnlyCanonical,
+      status: "active",
+      compose: { include: [{ system: "http://snomed.info/sct", concept: [{ code: "22298006" }] }] },
+    });
+    // Same shape, but no Library depends on it, so it stays unexpanded.
+    const unexpandedName = `e2e_unexpanded_vs_${suffix}`;
+    const unexpandedId = await createResource(request, "ValueSet", {
+      name: unexpandedName,
+      url: `http://example.org/ValueSet/e2e-unexpanded-${suffix}`,
       status: "active",
       compose: { include: [{ system: "http://snomed.info/sct", concept: [{ code: "22298006" }] }] },
     });
@@ -1814,25 +1824,49 @@ test.describe("Terminology dependencies (#1824)", () => {
     );
     await waitSearchable(request, "ValueSet", vsId);
     await waitSearchable(request, "ValueSet", composeOnlyId);
+    await waitSearchable(request, "ValueSet", unexpandedId);
     await waitSearchable(request, "Library", libId);
+
+    // The Library write stored an expansion on its compose-only dependency.
+    const materialized = await readResource(request, "ValueSet", composeOnlyId);
+    expect((materialized.expansion as { contains?: unknown[] } | undefined)?.contains).toHaveLength(1);
 
     await page.goto(`/ui/sql/queries?lib=${libId}`);
     const tablesCard = page.locator("#lib-tables");
 
-    // The stored dependency is a compose-only ValueSet: resolved (chip,
-    // link into the Resources workspace), but flagged as not expanded.
+    // The stored dependency resolves: chip, member count, link into the
+    // Resources workspace, and no warning now that it is expanded.
     const composeRow = tablesCard.locator(".lib-tables__row", { hasText: composeOnlyName });
     await expect(composeRow).toBeVisible();
     await expect(composeRow.locator(".tag")).toHaveText("ValueSet");
-    await expect(composeRow.locator(".lib-tables__warning")).toContainText("No expansion yet");
+    await expect(composeRow.locator(".lib-tables__note")).toHaveText("1 members");
+    await expect(composeRow.locator(".lib-tables__warning")).toHaveCount(0);
     await expect(composeRow.locator("a")).toHaveAttribute(
       "href",
       `/ui/resources?url=ValueSet%3F_id%3D${composeOnlyId}&return_to=${encodeURIComponent(`/ui/sql/queries?lib=${libId}`)}`,
     );
 
-    // Add table lists the expanded ValueSet; adding it resolves with the
-    // member count (two non-abstract entries) and no warning.
+    // Add table lists ValueSets. An unexpanded one is added to the unsaved
+    // document and flagged: saving the Library is what materializes it.
     const search = page.locator('#lib-tables-add-table input[role="combobox"]');
+    await search.fill(unexpandedName);
+    const unexpandedOption = page.locator("#lib-tables-add-table [data-combobox-option]", {
+      hasText: unexpandedName,
+    });
+    await expect(unexpandedOption).toBeVisible({ timeout: 10000 });
+    await expect(unexpandedOption).toContainText("ValueSet");
+    await unexpandedOption.click();
+    await expect(page.locator("input[name='table_alias']")).toHaveValue(unexpandedName);
+    await page.locator("button[name='op'][value='add-table']").click();
+
+    const unexpandedRow = tablesCard.locator(".lib-tables__row", { hasText: unexpandedName });
+    await expect(unexpandedRow).toBeVisible({ timeout: 3000 });
+    await expect(unexpandedRow.locator(".tag")).toHaveText("ValueSet");
+    await expect(unexpandedRow.locator(".lib-tables__warning")).toContainText("No expansion yet");
+    await expect(unexpandedRow.locator(".lib-tables__note")).toHaveCount(0);
+
+    // Adding the expanded ValueSet resolves with the member count (two
+    // non-abstract entries) and no warning.
     await search.fill(vsName);
     const option = page.locator("#lib-tables-add-table [data-combobox-option]", { hasText: vsName });
     await expect(option).toBeVisible({ timeout: 10000 });
@@ -1855,7 +1889,7 @@ test.describe("Terminology dependencies (#1824)", () => {
     const untouched = await readResource(request, "Library", libId);
     expect(untouched.relatedArtifact).toHaveLength(1);
     await deleteResources(request, "Library", [libId]);
-    await deleteResources(request, "ValueSet", [vsId, composeOnlyId]);
+    await deleteResources(request, "ValueSet", [vsId, composeOnlyId, unexpandedId]);
   });
 
   test("a ConceptMap dependency resolves with its mapping count and the Columns card traces relationship to its fixed schema", async ({
