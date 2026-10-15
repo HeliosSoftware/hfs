@@ -290,6 +290,8 @@ struct Counting<S> {
     inner: Arc<S>,
     searches: Mutex<HashMap<String, u64>>,
     reference_calls: Mutex<u64>,
+    /// Answer `Ok(None)` to `search_reference_values`, as before #1753.
+    hide_hook: bool,
 }
 
 impl<S> Counting<S> {
@@ -298,7 +300,13 @@ impl<S> Counting<S> {
             inner,
             searches: Mutex::new(HashMap::new()),
             reference_calls: Mutex::new(0),
+            hide_hook: false,
         }
+    }
+
+    fn without_hook(mut self) -> Self {
+        self.hide_hook = true;
+        self
     }
 
     fn searches_of(&self, resource_type: &str) -> u64 {
@@ -392,6 +400,9 @@ impl<S: SearchProvider> SearchProvider for Counting<S> {
         query: &SearchQuery,
         reference_param: &str,
     ) -> StorageResult<Option<Vec<String>>> {
+        if self.hide_hook {
+            return Ok(None);
+        }
         let result = self
             .inner
             .search_reference_values(tenant, query, reference_param)
@@ -695,6 +706,99 @@ async fn has_resolution_issues_no_source_type_search() {
         .await
         .expect("Patient search");
     assert_eq!(ids(&result), set(&["p1", "p3"]));
+}
+
+// ============================================================================
+// Manual benchmark (ignored): `_has` latency with and without the hook
+// ============================================================================
+
+/// Loads `HFS_BENCH_OBS` Observations (default 200000; 90% carry the height
+/// code) over `HFS_BENCH_PATIENTS` Patients (default 11705) and times the
+/// reverse-chain resolution through the paged fallback and through the hook.
+/// Run: `cargo test -p helios-persistence --features elasticsearch --test
+/// elasticsearch_has_chain_tests -- --ignored --nocapture bench_has_latency`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual benchmark"]
+async fn bench_has_latency() {
+    use futures::StreamExt;
+    use std::time::Instant;
+
+    let observations: usize = std::env::var("HFS_BENCH_OBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let patients: usize = std::env::var("HFS_BENCH_PATIENTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(11_705);
+
+    let es_env = shared_es().await;
+    let mut config = es_config(es_env);
+    config.write_refresh = WriteRefreshPolicy::False;
+    config.refresh_interval = "1s".to_string();
+    let es = Arc::new(
+        ElasticsearchBackend::with_shared_registry(config, build_search_registry())
+            .expect("create ElasticsearchBackend"),
+    );
+    initialize_when_ready(&es).await;
+    let t = tenant("bench-has");
+
+    let started = Instant::now();
+    let patient_docs = futures::stream::iter(0..patients).map(|i| {
+        let es = es.clone();
+        let t = t.clone();
+        async move { put(&*es, &t, "Patient", patient(&format!("p{i}"))).await }
+    });
+    patient_docs.buffer_unordered(64).collect::<Vec<_>>().await;
+    let observation_docs = futures::stream::iter(0..observations).map(|i| {
+        let es = es.clone();
+        let t = t.clone();
+        async move {
+            let code = if i % 10 == 0 { OTHER_CODE } else { HEIGHT };
+            let subject = format!("Patient/p{}", i % patients);
+            put(
+                &*es,
+                &t,
+                "Observation",
+                observation(&format!("o{i}"), code, &subject),
+            )
+            .await
+        }
+    });
+    observation_docs
+        .buffer_unordered(64)
+        .collect::<Vec<_>>()
+        .await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    eprintln!(
+        "BENCH loaded {patients} Patients + {observations} Observations in {:?}",
+        started.elapsed()
+    );
+
+    for round in ["cold", "warm"] {
+        for (label, hide) in [("paged (before)", true), ("hook (after)", false)] {
+            let mut counting = Counting::new(es.clone());
+            if hide {
+                counting = counting.without_hook();
+            }
+            let begin = Instant::now();
+            let resolved = resolve_chains(&counting, &t, &has_height_query())
+                .await
+                .expect("resolve _has");
+            let resolve_time = begin.elapsed();
+            let result = counting
+                .search(&t, &resolved)
+                .await
+                .expect("Patient search");
+            eprintln!(
+                "BENCH {round} {label}: resolve {resolve_time:?}, total {:?}, \
+                 Observation searches {}, Patients returned {}",
+                begin.elapsed(),
+                counting.searches_of("Observation"),
+                ids(&result).len()
+            );
+        }
+    }
 }
 
 // ============================================================================
