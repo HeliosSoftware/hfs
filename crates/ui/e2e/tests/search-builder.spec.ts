@@ -3223,3 +3223,81 @@ test("issue1772 visual builder and parameter suggestions work when settings are 
   await search.results.waitShown();
   await expect(search.results.error).toBeHidden();
 });
+
+for (const workspace of ["Resources", "Search"] as const) {
+  test(`issue2079 ${workspace} summarizes Observation components as text`, async ({ page, request, resources, search }) => {
+    const systolic = {
+      code: { coding: [{ system: "http://loinc.org", code: "8480-6", display: "Systolic blood pressure" }] },
+      valueQuantity: { value: 120, unit: "mmHg", system: "http://unitsofmeasure.org", code: "mm[Hg]" },
+    };
+    const fixtures = [
+      {
+        component: [systolic],
+        effectivePeriod: { start: "2026-10-15" },
+        expected: "Systolic blood pressure",
+        period: '{"start":"2026-10-15"}',
+      },
+      {
+        component: [systolic, {
+          code: { coding: [{ system: "http://loinc.org", code: "8462-4", display: "Diastolic blood pressure" }] },
+          valueQuantity: { value: 80, unit: "mmHg", system: "http://unitsofmeasure.org", code: "mm[Hg]" },
+        }],
+        expected: "Systolic blood pressure +1",
+      },
+      {
+        component: [{ ...systolic, code: { ...systolic.code, text: "Systolic reading" } }],
+        effectivePeriod: { start: "2026-10-15T09:00:00Z", end: "2026-10-15T09:01:00Z" },
+        expected: "Systolic reading",
+        period: '{"start":"2026-10-15T09:00:00Z","end":"2026-10-15T09:01:00Z"…',
+      },
+      {
+        component: [{ ...systolic, code: { coding: [{ system: "http://loinc.org", code: "8480-6" }] } }],
+        expected: "8480-6",
+      },
+    ];
+    const ids: string[] = [];
+    try {
+      for (const { component, effectivePeriod } of fixtures) {
+        ids.push(await createResource(request, "Observation", {
+          status: "final",
+          code: { coding: [{ system: "http://loinc.org", code: "85354-9", display: "Blood pressure panel" }] },
+          component,
+          ...(effectivePeriod ? { effectivePeriod } : {}),
+        }));
+      }
+      for (const id of ids) await waitSearchable(request, "Observation", id);
+      const active = workspace === "Resources" ? resources : search;
+      if (workspace === "Resources") await resources.goto("Observation");
+      else await search.gotoBuilder("Observation");
+      const mode = page.locator("[data-mode-btn=builder]");
+      if (await mode.count()) await mode.click();
+
+      for (const projection of ["", "&_elements=id,code,component,effectivePeriod"]) {
+        await active.builder.run(`Observation?_id=${ids.join(",")}&_count=5${projection}`);
+        await active.results.waitDone();
+        await expect(active.results.rows).toHaveCount(fixtures.length);
+        const headers = await page.locator("#query-results-head th").allTextContents();
+        const componentIndex = headers.indexOf("component");
+        const periodIndex = headers.indexOf("effectivePeriod");
+        expect(componentIndex).toBeGreaterThan(0);
+        expect(periodIndex).toBeGreaterThan(0);
+        for (const [i, { expected, period }] of fixtures.entries()) {
+          const row = active.results.rows.filter({ has: page.locator(`[data-resource-id="${ids[i]}"]`) });
+          const componentCell = row.locator("td").nth(componentIndex);
+          await expect(componentCell).toBeVisible();
+          await expect(componentCell).toHaveText(expected);
+          await expect(componentCell).toHaveAttribute("data-full-name", expected);
+          if (period) {
+            const periodCell = row.locator("td").nth(periodIndex);
+            await expect(periodCell).toHaveText(period);
+            await expect(periodCell).toHaveAttribute("data-full-name", period);
+          }
+        }
+        await expect(active.results.card).not.toContainText("[object Object]");
+        await expect(active.results.error).toBeHidden();
+      }
+    } finally {
+      await deleteResources(request, "Observation", ids);
+    }
+  });
+}
