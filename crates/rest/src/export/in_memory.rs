@@ -1251,6 +1251,18 @@ async fn run_views_job<Sink: ExportSink>(
             &named.name,
         );
 
+        // Reject an invalid `ansi/type` tag before running the view, whatever
+        // the format and whether or not the view returns rows.
+        try_declared_columns(&named.view).map_err(|e| match e {
+            // A bad tag is the request's own fault: keep the 4xx and the
+            // column name in the job's stored result.
+            helios_sof::SofError::InvalidViewDefinition(msg) => JobFailure::from_sof(
+                &format!("view '{}'", named.name),
+                SofError::InvalidViewDefinition(msg),
+            ),
+            other => JobFailure::server(format!("view '{}': {other}", named.name)),
+        })?;
+
         let stream = runner
             .run_view(&task.tenant, named.view.clone(), task.filters.clone())
             .await

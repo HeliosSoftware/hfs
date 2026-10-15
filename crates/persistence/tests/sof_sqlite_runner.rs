@@ -1006,6 +1006,64 @@ mod sqlite_runner_tests {
         assert_eq!(rows[0]["dec"].as_f64(), Some(42.5));
     }
 
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_sqlite_typed_columnar_values_and_parity() {
+        use super::sof_columnar as sc;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().expect("runner");
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::patient_typed_view(),
+            "patient",
+        )
+        .await;
+        sc::assert_patient_typed(&b);
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::observation_typed_view(),
+            "observation",
+        )
+        .await;
+        sc::assert_observation_typed(&b);
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_sqlite_typed_columnar_strict_and_invalid_tags() {
+        use super::sof_columnar as sc;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "tp2", "birthDate": "1980"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed tp2");
+        let runner = backend.sof_runner().expect("runner");
+        sc::assert_strict_and_rejected(runner.as_ref(), &tenant).await;
+    }
+
     #[tokio::test]
     async fn test_invalid_ansi_type_tag_is_rejected() {
         let backend = make_backend().await;

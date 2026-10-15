@@ -809,7 +809,13 @@ fn read_columns(
         // (where(), join(), etc.) keeps its scalar form.
         let final_expr = if collection {
             match expr {
-                SqlExpr::JsonPath { root, path } => SqlExpr::CollectionAgg { root, path },
+                SqlExpr::JsonPath { root, path } => {
+                    // The aggregate is a JSON array; the element type lives in
+                    // the Arrow schema. Casting the array to the element type
+                    // would turn `[1,2]` into 0 (SQLite) or fail (PostgreSQL).
+                    ty = SqlType::Text;
+                    SqlExpr::CollectionAgg { root, path }
+                }
                 other => other,
             }
         } else {

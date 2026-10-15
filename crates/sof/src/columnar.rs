@@ -116,6 +116,10 @@ pub struct ColumnarBatchBuilder {
     /// [`pin_declared_types`](Self::pin_declared_types)); their schema field
     /// carries the declared marker, as on the row path.
     declared_cols: Vec<bool>,
+    /// The first value that did not fit a declared column's type; reported by
+    /// the next [`flush`](Self::flush) (a declared column never writes null for
+    /// a misfit).
+    strict_error: Option<String>,
     batch_rows: usize,
     rows: usize,
     schema: Option<Arc<Schema>>,
@@ -146,6 +150,7 @@ impl ColumnarBatchBuilder {
             cols,
             warned,
             declared_cols: vec![false; kinds_len],
+            strict_error: None,
             batch_rows: batch_rows.max(1),
             rows: 0,
             schema: None,
@@ -414,6 +419,9 @@ impl ColumnarBatchBuilder {
     /// Emits the pending rows as a [`RecordBatch`], or `None` when there are
     /// none. Builders are reset for the next batch.
     pub fn flush(&mut self) -> Result<Option<RecordBatch>, SofError> {
+        if let Some(message) = self.strict_error.take() {
+            return Err(SofError::ParquetConversionError(message));
+        }
         if self.rows == 0 {
             return Ok(None);
         }
@@ -464,6 +472,15 @@ impl ColumnarBatchBuilder {
     }
 
     fn warn_once(&mut self, col: usize, got: &str) {
+        if self.declared_cols[col] {
+            if self.strict_error.is_none() {
+                self.strict_error = Some(format!(
+                    "column '{}': a {got} value cannot be represented in its declared type {:?}",
+                    self.names[col], self.kinds[col]
+                ));
+            }
+            return;
+        }
         if !self.warned[col] {
             self.warned[col] = true;
             warn!(
@@ -933,5 +950,26 @@ mod tests {
             .downcast_ref::<BooleanArray>()
             .unwrap();
         assert_eq!((t.value(0), t.value(1)), (true, false));
+    }
+
+    #[test]
+    fn declared_column_misfit_is_an_error_but_undeclared_is_null() {
+        // Declared `integer` on an Integer-kind column: its natural type
+        // already matches, but a value outside the i32 range is an error.
+        let mut b = builder(&[ColumnKind::Integer, ColumnKind::Integer], 10);
+        b.pin_declared_types(&[declared("c0", Some("integer"), false)])
+            .unwrap();
+        b.append_i64(0, 3_000_000_000);
+        b.append_i64(1, 3_000_000_000);
+        b.end_row();
+        let err = b.flush().unwrap_err().to_string();
+        assert!(err.contains("column 'c0'"), "{err}");
+
+        // The undeclared column only warns and writes null.
+        let mut b = builder(&[ColumnKind::Integer], 10);
+        b.append_i64(0, 3_000_000_000);
+        b.end_row();
+        let batch = b.flush().unwrap().unwrap();
+        assert_eq!(batch.column(0).null_count(), 1);
     }
 }

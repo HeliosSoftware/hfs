@@ -1771,6 +1771,10 @@ impl PreparedViewDefinition {
     ///
     /// This performs all validation upfront so that chunk processing is efficient.
     pub fn new(view_definition: SofViewDefinition) -> Result<Self, SofError> {
+        // Reject an unknown or incompatible `ansi/type` column tag up front, so
+        // every path that prepares a view (chunked NDJSON, the in-process
+        // runner, ...) fails the same way as the buffered formatters.
+        view_definition.try_declared_columns()?;
         // Extract target resource type and column names based on version
         let (target_resource_type, variables, column_names) = match &view_definition {
             #[cfg(feature = "R4")]

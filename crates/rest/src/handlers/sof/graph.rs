@@ -723,7 +723,14 @@ pub(crate) async fn execute_plan(
                 internal_name,
                 view,
             } => {
-                let schema = TableSchema::from_view_definition(view);
+                // An invalid `ansi/type` tag is a client error: name the view
+                // and column instead of silently dropping the tag.
+                let schema = TableSchema::try_from_view_definition(view).map_err(|e| {
+                    SqlQueryError::MalformedLibrary(format!(
+                        "dependency view '{}': {e}",
+                        artifact_display_name(view, internal_name)
+                    ))
+                })?;
                 engine.create_table(internal_name, &schema)?;
                 let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();
