@@ -964,7 +964,7 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
         "resourceType": "Parameters",
         "parameter": [{"name": "output", "part": [
             {"name": "name", "valueString": "patients"},
-            {"name": "location", "valueUri": "http://s/export/job-1/patients-0.csv"},
+            {"name": "location", "valueUri": "http://localhost:8080/export/job-1/patients-0.csv"},
         ]}]
     });
     let source = StaticConformanceSource::empty()
@@ -990,8 +990,8 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
     assert_eq!(job["status"], "complete");
     assert_eq!(
         job["outputs"],
-        // The manifest's absolute location is persisted as a same-origin
-        // path (#833).
+        // A location under the server's own `HFS_BASE_URL` (the mount's
+        // `http://localhost:8080`) is persisted as a same-origin path (#833).
         serde_json::json!([{"name": "patients", "locations": ["/export/job-1/patients-0.csv"]}])
     );
     assert!(!job["finishedAt"].as_str().unwrap_or_default().is_empty());
@@ -1000,6 +1000,46 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
     assert!(job["subjectsDone"].is_null());
     assert!(job["subjectsTotal"].is_null());
     assert!(job["currentSubject"].is_null());
+}
+
+/// #2050: with `HFS_EXPORT_SINK=s3` the manifest's locations are S3
+/// pre-signed URLs on another host. They must be persisted and linked
+/// byte-for-byte; stripping the host sent the browser to HFS, which 404ed.
+#[tokio::test]
+async fn a_done_job_keeps_an_s3_presigned_location_verbatim_and_links_to_it() {
+    const PRESIGNED: &str = "https://my-bucket.s3.us-east-2.amazonaws.com/exports/job-1/shard-0.ndjson?x-id=GetObject&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20261014%2Fus-east-2%2Fs3%2Faws4_request&X-Amz-Date=20261014T120000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=0123abcd";
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": PRESIGNED},
+        ]}]
+    });
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_manifest(Ok(manifest));
+    let app = app(&backend, source);
+
+    // `load_detail` polls once and renders the post-poll job.
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body_text(response).await;
+    let dom = html::Dom::page(&page);
+    assert_eq!(
+        dom.one("a[download]").attr("href"),
+        Some(PRESIGNED),
+        "the file link must be the pre-signed URL, not an HFS path"
+    );
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "complete");
+    assert_eq!(
+        job["outputs"],
+        serde_json::json!([{"name": "patients", "locations": [PRESIGNED]}])
+    );
 }
 
 #[tokio::test]
