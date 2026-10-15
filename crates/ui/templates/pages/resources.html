@@ -191,9 +191,9 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
             </aside>
             <div>
               <div class="history__controls" id="resource-history-controls" hidden>
-                <label class="history__select"><span>{{ i18n.t("history-from") }}</span><select id="resource-history-from"></select></label>
+                <div class="history__select"><span id="resource-history-from-label">{{ i18n.t("history-from") }}</span><select id="resource-history-from" aria-labelledby="resource-history-from-label" data-combobox-select></select></div>
                 <span class="history__arrow">→</span>
-                <label class="history__select"><span>{{ i18n.t("history-to") }}</span><select id="resource-history-to"></select></label>
+                <div class="history__select"><span id="resource-history-to-label">{{ i18n.t("history-to") }}</span><select id="resource-history-to" aria-labelledby="resource-history-to-label" data-combobox-select></select></div>
                 <label class="history__meta-toggle"><input type="checkbox" id="resource-history-metadata"> {{ i18n.t("history-show-metadata") }}</label>
               </div>
               <div id="resource-history-diff">
@@ -209,6 +209,7 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 
 <script src="/ui/assets/fhir-search-value.js" defer></script>
 <script src="/ui/assets/typeahead.js" defer></script>
+<script src="/ui/assets/combobox.js" defer></script>
 <script src="/ui/assets/search-builder.js" defer></script>
 <script src="/ui/assets/row-navigation.js" defer></script>
 {% if nl.configured %}<script src="/ui/assets/nl-search.js" defer></script>{% endif %}

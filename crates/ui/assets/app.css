@@ -1682,6 +1682,17 @@ textarea.field__input {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* SQL numeric parameters retain their native value, step and keyboard
+   semantics. Only the JS-enhanced presentation removes OS spinner arrows. */
+.js .field__input--number[type="number"] {
+  appearance: textfield;
+}
+.js .field__input--number::-webkit-inner-spin-button,
+.js .field__input--number::-webkit-outer-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
 .field__input[aria-invalid="true"] {
   border-color: var(--danger);
 }
@@ -2290,6 +2301,9 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   gap: 6px;
   font-size: 12px;
   color: var(--muted);
+  --combobox-width: 88px;
+  --combobox-height: 30px;
+  --combobox-font-size: 13px;
 }
 
 .history__select select {
@@ -4562,6 +4576,14 @@ tr:hover .result-id__copy,
   color: var(--muted);
 }
 
+/* The projection keeps the original control's place in the builder's flex
+   rows; its shared component owns the button and popup styling. */
+.combobox--inline:has(> .builder-row__key) { --combobox-width: 190px; }
+.combobox--inline:has(> .builder-row__modifier) { --combobox-width: 110px; }
+.combobox--inline:has(> .builder-row__comparator) { --combobox-width: 72px; }
+.combobox--inline:has(> .builder-row__ctype) { --combobox-width: 130px; }
+.combobox--inline:has(> .builder-row__itarget) { --combobox-width: 120px; }
+
 .builder-row__value {
   flex: 1;
   min-width: 0;
@@ -5630,6 +5652,13 @@ details.card > summary.card-head::-webkit-details-marker {
   border-radius: 6px;
 }
 
+.editor-add__choice .combobox--inline {
+  --combobox-height: 26px;
+  --combobox-font-size: 12px;
+  --combobox-width: min(65%, 320px);
+  margin-left: auto;
+}
+
 /* The ad-hoc extension: any URL, at any node. The thing the surveyed editors
    cannot do without a profile. */
 .editor-add__ext {
@@ -6261,6 +6290,8 @@ details.card > summary.card-head::-webkit-details-marker {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  --combobox-width: 200px;
+  --combobox-height: 30px;
 }
 
 .query-results__sort select {
@@ -6275,6 +6306,11 @@ details.card > summary.card-head::-webkit-details-marker {
   border: 1px solid var(--surface-border);
   border-radius: 8px;
   outline: none;
+}
+
+.query-results__sort .combobox--inline {
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 /* Related-data rows (#396). */
@@ -6810,6 +6846,7 @@ details.card > summary.card-head::-webkit-details-marker {
 }
 
 .combobox__enhancement {
+  display: block;
   position: relative;
 }
 
@@ -6821,6 +6858,7 @@ details.card > summary.card-head::-webkit-details-marker {
 }
 
 .combobox__control {
+  display: block;
   position: relative;
 }
 
@@ -6898,6 +6936,40 @@ details.card > summary.card-head::-webkit-details-marker {
   cursor: pointer;
   text-align: left;
 }
+.combobox__trigger [data-combobox-value] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.combobox__trigger:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+/* Adopted selects keep their native business classes. Callers can size this
+   shared composition with variables instead of copying those classes to buttons. */
+.combobox--inline {
+  display: inline-block;
+  width: var(--combobox-width, auto);
+  max-width: 100%;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+.combobox--inline .combobox__trigger {
+  height: var(--combobox-height, 32px);
+  padding: 0 8px;
+  gap: 6px;
+  border-radius: 8px;
+  font-size: var(--combobox-font-size, 12.5px);
+}
+.combobox--fixed .combobox__listbox {
+  position: fixed;
+  z-index: calc(var(--z-dialog-panel) + 1);
+  top: auto;
+  right: auto;
+  left: auto;
+  max-width: calc(100vw - 16px);
+}
 .combobox__chevron {
   display: flex;
   flex-shrink: 0;
@@ -6911,6 +6983,12 @@ details.card > summary.card-head::-webkit-details-marker {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  overflow-wrap: anywhere;
+}
+.combobox--fixed .combobox__option[aria-disabled="true"] {
+  color: var(--muted);
+  background: transparent;
+  cursor: default;
 }
 .combobox--fixed .combobox__option[aria-selected="true"] {
   color: var(--text-strong);

@@ -172,6 +172,10 @@
   var diffTicket = 0;
 
   function renderDiff() {
+    if (window.HfsCombobox) {
+      window.HfsCombobox.refresh(fromSel);
+      window.HfsCombobox.refresh(toSel);
+    }
     var fromIndex = Number(fromSel.value);
     var toIndex = Number(toSel.value);
     var from = versions[fromIndex];

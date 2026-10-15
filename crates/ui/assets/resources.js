@@ -196,6 +196,7 @@
    * mounted editor outlives it. */
   function resetEditorBody() {
     renderSeq++;
+    if (window.HfsCombobox) window.HfsCombobox.destroy(editorBody);
     JsonEditor.destroy(editorBody);
     var fresh = document.createElement(editorBody.tagName);
     fresh.id = editorBody.id;
@@ -245,6 +246,7 @@
     current = { type: type, id: id };
     setSubject(type + "/" + id);
     openModal();
+    if (window.HfsCombobox) window.HfsCombobox.destroy(editorBody);
     editorBody.innerHTML = "";
     fetch("/" + type + "/" + id, { headers: fhirHeaders() })
       .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
@@ -265,6 +267,7 @@
     current = { type: type, id: "" };
     setSubject(type + " · " + "new");
     openModal();
+    if (window.HfsCombobox) window.HfsCombobox.destroy(editorBody);
     editorBody.innerHTML = "";
     renderEditor({ resourceType: type }).then(function () { if (unsaved) unsaved.reset(); });
   }
@@ -471,6 +474,10 @@
   function opt(v, label) { var o = document.createElement("option"); o.value = String(v); o.textContent = label; return o; }
 
   function renderDiff() {
+    if (window.HfsCombobox) {
+      window.HfsCombobox.refresh(fromSel);
+      window.HfsCombobox.refresh(toSel);
+    }
     var from = versions[Number(fromSel.value)];
     var to = versions[Number(toSel.value)];
     if (!from || !to) return;

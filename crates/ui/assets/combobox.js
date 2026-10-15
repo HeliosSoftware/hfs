@@ -103,91 +103,322 @@
     return option.getAttribute("data-name") || "";
   }
 
-  var fixedMounted = new WeakSet();
+  var fixedMounts = new WeakMap();
   var installedScopes = new WeakSet();
+  var fixedCounter = 0;
 
-  // Fixed-choice mode: the native select owns values and successful form
-  // submission throughout. Every listener is removed if mounting fails.
-  function initializeFixed(root) {
-    if (fixedMounted.has(root)) return;
-    var native = root.querySelector("[data-combobox-native]");
+  // Viewport coordinates, independent of the scrollable editor containing the
+  // control. Keep the popup in its DOM owner (including aria-modal dialogs).
+  function fixedPlacement(rect, height, viewportWidth, viewportHeight) {
+    var margin = 8;
+    var gap = 4;
+    var width = Math.max(0, Math.min(Math.max(rect.width, 160), viewportWidth - margin * 2));
+    var below = Math.max(0, viewportHeight - rect.bottom - gap - margin);
+    var above = Math.max(0, rect.top - gap - margin);
+    var wanted = Math.min(height, 280);
+    var up = wanted > below && (wanted <= above || above > below);
+    var maxHeight = Math.min(280, up ? above : below);
+    var actualHeight = Math.min(wanted, maxHeight);
+    return {
+      left: Math.max(margin, Math.min(rect.left, viewportWidth - width - margin)),
+      top: up ? rect.top - gap - actualHeight : rect.bottom + gap,
+      width: width,
+      maxHeight: maxHeight,
+    };
+  }
+
+  function createFixedRoot(native) {
+    var doc = native.ownerDocument;
+    var root = doc.createElement("span");
+    root.id = native.id ? native.id + "-combobox" : "fixed-combobox-" + ++fixedCounter;
+    root.className = "combobox combobox--fixed combobox--inline";
+    root.setAttribute("data-combobox", "");
+    root.setAttribute("data-combobox-mode", "fixed");
+    root.setAttribute("data-combobox-generated", "");
+    var enhancement = doc.createElement("span");
+    enhancement.className = "combobox__enhancement";
+    enhancement.setAttribute("data-combobox-enhancement", "");
+    enhancement.hidden = true;
+    var control = doc.createElement("span");
+    control.className = "combobox__control";
+    var trigger = doc.createElement("button");
+    trigger.type = "button";
+    trigger.className = "field__input combobox__trigger";
+    trigger.disabled = true;
+    trigger.setAttribute("role", "combobox");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.setAttribute("aria-haspopup", "listbox");
+    trigger.setAttribute("aria-controls", root.id + "-listbox");
+    var label = doc.createElement("span");
+    label.id = root.id + "-value";
+    label.setAttribute("data-combobox-value", "");
+    var chevron = doc.createElement("span");
+    chevron.className = "combobox__chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    var svg = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 12 12");
+    var path = doc.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", "M2 4l4 4 4-4");
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "currentColor");
+    path.setAttribute("stroke-width", "1.5");
+    svg.appendChild(path);
+    chevron.appendChild(svg);
+    trigger.appendChild(label);
+    trigger.appendChild(chevron);
+    var listbox = doc.createElement("span");
+    listbox.id = root.id + "-listbox";
+    listbox.className = "combobox__listbox";
+    listbox.setAttribute("data-combobox-listbox", "");
+    listbox.setAttribute("role", "listbox");
+    listbox.hidden = true;
+    control.appendChild(trigger);
+    control.appendChild(listbox);
+    enhancement.appendChild(control);
+    root.appendChild(enhancement);
+    try {
+      native.parentNode.insertBefore(root, native);
+      root.insertBefore(native, enhancement);
+    } catch (error) {
+      if (root.parentNode) root.replaceWith(native);
+      throw error;
+    }
+    return root;
+  }
+
+  // Opt-in enhancement of an existing SELECT. It remains the only value/form
+  // control; business attributes and classes never move onto the trigger.
+  function adopt(native, config) {
+    if (!native || native.tagName !== "SELECT" || native.multiple || !native.parentNode) return null;
+    var mounted = fixedMounts.get(native);
+    if (mounted) {
+      if (config) mounted.refresh(config);
+      return mounted;
+    }
+    var doc = native.ownerDocument;
+    var view = doc.defaultView;
+    var root = native.closest('[data-combobox-mode="fixed"]');
+    if (root && root.querySelector("[data-combobox-native]") !== native) root = null;
+    var available = config && typeof config.available === "boolean"
+      ? config.available : root ? !root.hidden : !native.hidden;
+    var originalNativeMarker = native.getAttribute("data-combobox-native");
+    // Read real labels before inserting generated option text into the owner.
+    var fallbackLabel = Array.prototype.map.call(native.labels || [], function (node) {
+      var copy = node.cloneNode(true);
+      copy.querySelectorAll("select, [data-combobox-enhancement]").forEach(function (child) { child.remove(); });
+      return copy.textContent.trim();
+    }).filter(Boolean).join(" ");
+    try {
+      if (!root) root = createFixedRoot(native);
+    } catch (_) {
+      if (root && root.hasAttribute("data-combobox-generated") && root.parentNode) root.replaceWith(native);
+      return null;
+    }
     var enhancement = root.querySelector("[data-combobox-enhancement]");
     var trigger = root.querySelector('[role="combobox"]');
     var label = root.querySelector("[data-combobox-value]");
     var listbox = root.querySelector("[data-combobox-listbox]");
-    if (!native || !enhancement || !trigger || !label || !listbox) return;
+    if (!enhancement || !trigger || !label || !listbox) {
+      native.hidden = !available;
+      root.removeAttribute("data-combobox-ready");
+      if (enhancement) enhancement.hidden = true;
+      if (trigger) trigger.disabled = true;
+      if (root.hasAttribute("data-combobox-generated") && root.parentNode) root.replaceWith(native);
+      return null;
+    }
     var cleanup = [];
     var activeIndex = -1;
     var items = [];
-    var view = root.ownerDocument.defaultView;
+    var signature = "";
+    var destroyed = false;
+    var resetTimer = 0;
+    var anchorRect = null;
+    // The pre-existing fixed_select macro's Since consumers depend on these
+    // notifications. Newly adopted SELECTs retain native silent reset semantics.
+    var notifyRestore = !root.hasAttribute("data-combobox-generated");
     function listen(target, event, handler) {
       target.addEventListener(event, handler);
       cleanup.push(function () { target.removeEventListener(event, handler); });
+    }
+    function optionDisabled(index) {
+      var option = native.options[index];
+      return !option || option.disabled || (option.parentElement.tagName === "OPTGROUP" && option.parentElement.disabled);
+    }
+    function firstEnabled(start, step) {
+      for (var i = start; i >= 0 && i < native.options.length; i += step) {
+        if (!optionDisabled(i)) return i;
+      }
+      return -1;
+    }
+    function disabled() {
+      return native.disabled || native.matches(":disabled");
     }
     function setActive(index) {
       activeIndex = index;
       items.forEach(function (item, i) {
         item.classList.toggle("combobox__option--active", i === index);
       });
-      if (index < 0) trigger.removeAttribute("aria-activedescendant");
+      if (index < 0 || !items[index]) trigger.removeAttribute("aria-activedescendant");
       else {
-        trigger.setAttribute("aria-activedescendant", items[index].id);
-        items[index].scrollIntoView({ block: "nearest" });
+        var item = items[index];
+        trigger.setAttribute("aria-activedescendant", item.id);
+        // Scroll the list alone, never its editor tree or the page behind it.
+        if (item.offsetTop < listbox.scrollTop) listbox.scrollTop = item.offsetTop;
+        else if (item.offsetTop + item.offsetHeight > listbox.scrollTop + listbox.clientHeight) {
+          listbox.scrollTop = item.offsetTop + item.offsetHeight - listbox.clientHeight;
+        }
       }
     }
-    function close() {
+    function close(event) {
+      if (event && event.type === "scroll") {
+        if (listbox.hidden || listbox.contains(event.target)) return;
+        var current = trigger.getBoundingClientRect();
+        // A scroll queued by focus/auto-scroll can arrive after open() has
+        // already measured the final anchor. Only dismiss if it actually moved.
+        if (anchorRect && ["left", "top", "width", "height"].every(function (key) {
+          return Math.abs(current[key] - anchorRect[key]) < 0.5;
+        })) return;
+      }
+      anchorRect = null;
       listbox.hidden = true;
       trigger.setAttribute("aria-expanded", "false");
       setActive(-1);
     }
     function synchronize() {
-      label.textContent = native.options[native.selectedIndex].textContent;
+      var option = native.options[native.selectedIndex];
+      label.textContent = option ? option.textContent : "";
+      var labelledBy = native.getAttribute("aria-labelledby");
+      var name = native.getAttribute("aria-label") || fallbackLabel || native.title || native.name;
+      if (labelledBy) {
+        trigger.setAttribute("aria-labelledby", labelledBy + " " + label.id);
+        trigger.removeAttribute("aria-label");
+        listbox.setAttribute("aria-labelledby", labelledBy);
+        listbox.removeAttribute("aria-label");
+      } else {
+        trigger.removeAttribute("aria-labelledby");
+        trigger.setAttribute("aria-label", (name + " " + label.textContent).trim());
+        listbox.removeAttribute("aria-labelledby");
+        listbox.setAttribute("aria-label", name);
+      }
+      ["aria-describedby", "aria-invalid"].forEach(function (attr) {
+        if (native.hasAttribute(attr)) trigger.setAttribute(attr, native.getAttribute(attr));
+        else trigger.removeAttribute(attr);
+      });
+      trigger.disabled = disabled() || firstEnabled(0, 1) < 0;
       items.forEach(function (item, index) {
         item.setAttribute("aria-selected", String(index === native.selectedIndex));
       });
     }
-    function open() {
+    function refresh(options) {
+      if (destroyed) return null;
+      if (options && typeof options.available === "boolean") available = options.available;
+      close();
+      var nextSignature = JSON.stringify(Array.prototype.map.call(native.options, function (option, index) {
+        return [option.value, option.textContent, Boolean(optionDisabled(index))];
+      }));
+      if (signature !== nextSignature) {
+        listbox.replaceChildren();
+        items = [];
+        Array.prototype.forEach.call(native.options, function (option, index) {
+          var item = doc.createElement("span");
+          item.className = "combobox__option";
+          item.id = root.id + "-option-" + index;
+          item.setAttribute("role", "option");
+          item.setAttribute("data-value", option.value);
+          item.setAttribute("aria-disabled", String(Boolean(optionDisabled(index))));
+          item.textContent = option.textContent;
+          listbox.appendChild(item);
+          items.push(item);
+        });
+        signature = nextSignature;
+      }
       synchronize();
+      root.hidden = !available;
+      native.hidden = true;
+      return api;
+    }
+    function position() {
+      var rect = trigger.getBoundingClientRect();
+      anchorRect = rect;
+      var width = view.innerWidth || doc.documentElement.clientWidth;
+      var height = view.innerHeight || doc.documentElement.clientHeight;
+      var placement = fixedPlacement(rect, 0, width, height);
+      listbox.style.width = placement.width + "px";
+      listbox.style.maxHeight = "280px";
+      placement = fixedPlacement(rect, listbox.scrollHeight + 2, width, height);
+      listbox.style.left = placement.left + "px";
+      listbox.style.top = placement.top + "px";
+      listbox.style.maxHeight = placement.maxHeight + "px";
+    }
+    function open() {
+      refresh();
+      if (!available || trigger.disabled || !native.isConnected) return;
       listbox.hidden = false;
       trigger.setAttribute("aria-expanded", "true");
-      setActive(native.selectedIndex);
+      position();
+      setActive(optionDisabled(native.selectedIndex) ? firstEnabled(0, 1) : native.selectedIndex);
     }
     function choose(index) {
+      // The owner can lock a projection or replace its options while this
+      // popup is open. Recheck the source, not only the last painted button.
+      if (destroyed || !available || disabled() || !native.isConnected || optionDisabled(index) ||
+          !items[index] || items[index].getAttribute("data-value") !== native.options[index].value) {
+        refresh();
+        return;
+      }
       native.selectedIndex = index;
       synchronize();
       close();
       trigger.focus();
+      native.dispatchEvent(new view.Event("input", { bubbles: true }));
       native.dispatchEvent(new view.Event("change", { bubbles: true }));
     }
-    try {
+    function destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      view.clearTimeout(resetTimer);
+      cleanup.reverse().forEach(function (remove) { remove(); });
+      close();
       listbox.replaceChildren();
-      Array.prototype.forEach.call(native.options, function (option, index) {
-        var item = root.ownerDocument.createElement("div");
-        item.className = "combobox__option";
-        item.id = root.id + "-option-" + index;
-        item.setAttribute("role", "option");
-        item.setAttribute("data-value", option.value);
-        item.textContent = option.textContent;
-        listbox.appendChild(item);
-        items.push(item);
-      });
-      if (!items.length || native.selectedIndex < 0) throw new Error("No fixed choices");
-      synchronize();
+      trigger.disabled = true;
+      enhancement.hidden = true;
+      native.hidden = !available;
+      root.hidden = !available;
+      root.removeAttribute("data-combobox-ready");
+      if (originalNativeMarker === null) native.removeAttribute("data-combobox-native");
+      else native.setAttribute("data-combobox-native", originalNativeMarker);
+      fixedMounts.delete(native);
+      if (root.hasAttribute("data-combobox-generated") && root.parentNode) root.replaceWith(native);
+    }
+    var api = { root: root, trigger: trigger, refresh: refresh, close: close, destroy: destroy,
+      focus: function () { if (!destroyed && available) trigger.focus(); } };
+    try {
+      native.setAttribute("data-combobox-native", "");
+      trigger.setAttribute("data-combobox-trigger", "");
       listen(trigger, "click", function () { if (listbox.hidden) open(); else close(); });
       listen(trigger, "keydown", function (event) {
         var key = event.key;
         if (key === "Tab" || key === "Escape") {
-          if (key === "Escape" && !listbox.hidden) event.preventDefault();
+          if (key === "Escape" && !listbox.hidden) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
           close();
         } else if (["ArrowDown", "ArrowUp", "Home", "End", "Enter", " "].indexOf(key) >= 0) {
           event.preventDefault();
           var wasClosed = listbox.hidden;
           if (wasClosed) open();
-          if (key === "Home") setActive(0);
-          else if (key === "End") setActive(items.length - 1);
+          if (listbox.hidden) return;
+          if (key === "Home") setActive(firstEnabled(0, 1));
+          else if (key === "End") setActive(firstEnabled(items.length - 1, -1));
           else if ((key === "Enter" || key === " ") && !wasClosed) choose(activeIndex);
-          else if (!wasClosed && key === "ArrowDown") setActive(Math.min(activeIndex + 1, items.length - 1));
-          else if (!wasClosed && key === "ArrowUp") setActive(Math.max(activeIndex - 1, 0));
+          else if (!wasClosed && key === "ArrowDown") {
+            var next = firstEnabled(activeIndex + 1, 1);
+            if (next >= 0) setActive(next);
+          } else if (!wasClosed && key === "ArrowUp") {
+            var previous = firstEnabled(activeIndex - 1, -1);
+            if (previous >= 0) setActive(previous);
+          }
         }
       });
       listen(listbox, "mousedown", function (event) { event.preventDefault(); });
@@ -198,38 +429,51 @@
       });
       listen(root, "focusout", function (event) { if (!root.contains(event.relatedTarget)) close(); });
       listen(root, "hfs:combobox-close", close);
-      listen(native, "change", function () { synchronize(); close(); });
+      listen(native, "change", function () { refresh(); });
       if (native.form) listen(native.form, "reset", function () {
         // Reset fires before the browser restores default selectedness.
-        view.setTimeout(function () {
-          synchronize();
-          close();
-          native.dispatchEvent(new view.Event("change", { bubbles: true }));
+        view.clearTimeout(resetTimer);
+        resetTimer = view.setTimeout(function () {
+          if (destroyed || !native.isConnected) return;
+          refresh();
+          if (notifyRestore) native.dispatchEvent(new view.Event("change", { bubbles: true }));
         }, 0);
       });
       listen(root, "hfs:combobox-restore", function () {
-        synchronize();
-        close();
-        native.dispatchEvent(new view.Event("change", { bubbles: true }));
+        if (!native.isConnected) return;
+        refresh();
+        if (notifyRestore) native.dispatchEvent(new view.Event("change", { bubbles: true }));
       });
-      trigger.disabled = false;
+      refresh();
       enhancement.hidden = false;
-      native.hidden = true;
       root.setAttribute("data-combobox-ready", "true");
-      fixedMounted.add(root);
+      fixedMounts.set(native, api);
+      return api;
     } catch (_) {
-      cleanup.reverse().forEach(function (remove) { remove(); });
-      listbox.replaceChildren();
-      trigger.disabled = true;
-      enhancement.hidden = true;
-      native.hidden = false;
-      root.removeAttribute("data-combobox-ready");
-      close();
+      destroy();
+      return null;
     }
   }
 
+  function refreshFixed(native, config) {
+    var mounted = fixedMounts.get(native);
+    return mounted ? mounted.refresh(config) : adopt(native, config);
+  }
+
+  function destroyFixed(scope) {
+    if (!scope) return;
+    var natives = scope.matches && scope.matches("select") ? [scope]
+      : Array.prototype.slice.call(scope.querySelectorAll("select[data-combobox-native]"));
+    natives.forEach(function (native) {
+      var mounted = fixedMounts.get(native);
+      if (mounted) mounted.destroy();
+    });
+  }
+
   function initialize(root) {
-    if (root.getAttribute("data-combobox-mode") === "fixed") return initializeFixed(root);
+    if (root.getAttribute("data-combobox-mode") === "fixed") {
+      return adopt(root.querySelector("[data-combobox-native]"));
+    }
     if (root.getAttribute("data-combobox-ready") === "true") return;
 
     var name = root.getAttribute("data-combobox-name");
@@ -831,15 +1075,33 @@
   function install(scope) {
     if (scope.matches && scope.matches("[data-combobox]")) initialize(scope);
     Array.prototype.slice.call(scope.querySelectorAll("[data-combobox]")).forEach(initialize);
+    if (scope.matches && scope.matches("select[data-combobox-select]")) adopt(scope);
+    Array.prototype.slice.call(scope.querySelectorAll("select[data-combobox-select]")).forEach(function (native) {
+      adopt(native);
+    });
     if (installedScopes.has(scope)) return;
     installedScopes.add(scope);
     // Delegate restoration through live elements so a window listener does
     // not retain every fixed field removed by an HTMX navigation.
-    if (scope.nodeType === 9) scope.defaultView.addEventListener("pageshow", function () {
-      scope.querySelectorAll('[data-combobox-mode="fixed"][data-combobox-ready="true"]').forEach(function (root) {
-        root.dispatchEvent(new scope.defaultView.Event("hfs:combobox-restore"));
+    if (scope.nodeType === 9) {
+      scope.defaultView.addEventListener("pageshow", function () {
+        scope.querySelectorAll('[data-combobox-mode="fixed"][data-combobox-ready="true"]').forEach(function (root) {
+          root.dispatchEvent(new scope.defaultView.Event("hfs:combobox-restore"));
+        });
       });
-    });
+      // Delegate through live DOM so removed projections cannot be retained by
+      // per-control window listeners. Ignore queued scrolls whose anchor has
+      // already settled, as well as scrolling the option list itself.
+      function closeFixedPopups(event) {
+        scope.querySelectorAll('[data-combobox-mode="fixed"][data-combobox-ready="true"]').forEach(function (root) {
+          var mounted = fixedMounts.get(root.querySelector("[data-combobox-native]"));
+          if (mounted) mounted.close(event);
+        });
+      }
+      scope.defaultView.addEventListener("scroll", closeFixedPopups, true);
+      scope.defaultView.addEventListener("resize", closeFixedPopups);
+      scope.addEventListener("htmx:beforeCleanupElement", function (event) { destroyFixed(event.target); });
+    }
     scope.addEventListener("click", function (event) {
       scope.querySelectorAll('[data-combobox][data-combobox-ready="true"]').forEach(function (root) {
         if (!root.contains(event.target)) root.dispatchEvent(new CustomEvent("hfs:combobox-close"));
@@ -868,5 +1130,7 @@
     });
   }
 
-  return { install: install, parseValues: parseValues, preparePaste: preparePaste, atCapacity: atCapacity, validReference: validReference, nearBottom: nearBottom, remainingLoadingMs: remainingLoadingMs };
+  return { install: install, adopt: adopt, refresh: refreshFixed, destroy: destroyFixed,
+    fixedPlacement: fixedPlacement, parseValues: parseValues, preparePaste: preparePaste,
+    atCapacity: atCapacity, validReference: validReference, nearBottom: nearBottom, remainingLoadingMs: remainingLoadingMs };
 });
