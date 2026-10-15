@@ -2,11 +2,13 @@
 //! validator, the CLI default and `$validate` can serve. helios-audit's R5/R6
 //! switch helios-fhir/R4B on, so run this with
 //! `--no-default-features --features R5,sqlite` to exercise a version the build
-//! did not ask for.
+//! did not ask for. It fails there if helios-rest's own R5/R6 stop enabling
+//! `R4B`; default features (R4 only) and `--all-features` cannot fail it. CI
+//! runs it that way in the "FHIR version feature subsets (#1367)" step.
 //!
 //! The file compiles under any feature set: it only uses
-//! `FhirVersion::enabled_versions()`, `default_enabled()` and `as_mime_param()`,
-//! plus one `#[cfg(feature = "R4")]` assertion.
+//! `FhirVersion::enabled_versions()`, `default_enabled()`, `as_str()` and
+//! `as_mime_param()`, plus one `#[cfg(feature = "R4")]` assertion.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -87,9 +89,8 @@ fn validation_service_builds_for_every_enabled_default_version() {
 async fn validate_operation_serves_every_enabled_fhir_version() {
     let server = create_test_server().await;
     for &v in FhirVersion::enabled_versions() {
-        // `.content_type()` must come after `.json()`: `.json()` sets
-        // application/json, and a second Content-Type header would be ignored
-        // by the extractor.
+        // `.json()` resets the content type to application/json, so
+        // `.content_type()` must come after it.
         let response = server
             .post("/Patient/$validate")
             .json(&json!({
@@ -160,5 +161,75 @@ fn server_config_parses_without_arguments() {
     let config = ServerConfig::try_parse_from(["hfs"]).unwrap_or_else(|e| panic!("{e}"));
     if std::env::var_os("HFS_DEFAULT_FHIR_VERSION").is_none() {
         assert_eq!(config.default_fhir_version, FhirVersion::default_enabled());
+    }
+}
+
+/// Whether a build with this feature set should warn about an implicit default:
+/// it has no R4, and more than one version to choose between.
+fn build_should_warn_about_implicit_default() -> bool {
+    let enabled = FhirVersion::enabled_versions();
+    !enabled.iter().any(|v| v.as_str() == "R4") && enabled.len() > 1
+}
+
+/// A server that never set `HFS_DEFAULT_FHIR_VERSION` must be told when that
+/// default is a version nobody chose (R4B in an R5/R6 build, #2064).
+#[test]
+fn implicit_default_fhir_version_warns_only_in_builds_without_r4() {
+    for &v in FhirVersion::enabled_versions() {
+        let config = ServerConfig {
+            default_fhir_version: v,
+            ..ServerConfig::for_testing()
+        };
+        assert!(
+            config
+                .implicit_default_fhir_version_warning(false)
+                .is_none(),
+            "{v:?}: an explicit default never warns"
+        );
+
+        let warning = config.implicit_default_fhir_version_warning(true);
+        assert_eq!(
+            warning.is_some(),
+            build_should_warn_about_implicit_default(),
+            "{v:?}: {warning:?}"
+        );
+        if let Some(message) = warning {
+            assert!(
+                message.contains("HFS_DEFAULT_FHIR_VERSION") && message.contains(v.as_str()),
+                "the warning names the variable and the version in use: {message}"
+            );
+        }
+    }
+}
+
+/// `hfs` startup: an unset variable is reported as implicit and, in a build
+/// without R4, produces the warning; an explicit `--default-fhir-version` does not.
+#[test]
+fn default_fhir_version_provenance_drives_the_startup_warning() {
+    let explicit = FhirVersion::default_enabled();
+    let (config, implicit) = ServerConfig::try_parse_from_with_provenance([
+        "hfs",
+        "--default-fhir-version",
+        explicit.as_str(),
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(config.default_fhir_version, explicit);
+    assert!(!implicit, "an explicit flag is not implicit");
+    assert!(
+        config
+            .implicit_default_fhir_version_warning(implicit)
+            .is_none()
+    );
+
+    if std::env::var_os("HFS_DEFAULT_FHIR_VERSION").is_none() {
+        let (config, implicit) =
+            ServerConfig::try_parse_from_with_provenance(["hfs"]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(implicit, "no flag and no env var is the built-in default");
+        assert_eq!(
+            config
+                .implicit_default_fhir_version_warning(implicit)
+                .is_some(),
+            build_should_warn_about_implicit_default()
+        );
     }
 }

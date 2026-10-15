@@ -22,7 +22,7 @@ default = ["R4", "sqlite"]
 # without them reaches a catch-all arm. For the validator that arm panics (#2064).
 # helios-audit's R5/R6 (reached directly and through helios-persistence) enable
 # helios-fhir/R4B as the BALP baseline, so R5/R6 enable this crate's own `R4B`,
-# as helios-audit and helios-ui (#2051) do.
+# as helios-audit does.
 R4 = ["helios-fhir/R4", "helios-persistence/R4", "helios-audit/R4", "helios-serde?/R4", "helios-sof/R4", "helios-subscriptions?/R4", "helios-fhir-validator/R4"]
 R4B = ["helios-fhir/R4B", "helios-persistence/R4B", "helios-audit/R4B", "helios-serde?/R4B", "helios-sof/R4B", "helios-subscriptions?/R4B", "helios-fhir-validator/R4B"]
 R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-audit/R5", "helios-serde?/R5", "helios-sof/R5", "helios-subscriptions?/R5", "helios-fhir-validator/R5", "R4B"]

@@ -1941,7 +1941,8 @@ async fn main() -> anyhow::Result<()> {
     // Keep the skipped sub-configs populated while surfacing invalid CLI and
     // environment values instead of silently replacing the whole config with
     // defaults.
-    let mut config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
+    let (mut config, default_fhir_version_is_implicit) =
+        ServerConfig::try_from_env_with_provenance().unwrap_or_else(|error| error.exit());
     // The REST builder uses this same flag to start the dashboard's background
     // work. A binary without the UI must not seed or reconcile unseen figures.
     config.ui_enabled = effective_ui_enabled(config.ui_enabled);
@@ -1959,6 +1960,14 @@ async fn main() -> anyhow::Result<()> {
             bind_address = %config.socket_addr(),
             "{message}. Set HFS_BASE_URL to the public HTTP(S) origin clients can reach"
         );
+    }
+
+    // An R5 or R6 build has no R4, so an unset HFS_DEFAULT_FHIR_VERSION falls
+    // back to R4B (#2064): say so rather than serve a version nobody chose.
+    if let Some(message) =
+        config.implicit_default_fhir_version_warning(default_fhir_version_is_implicit)
+    {
+        warn!(default_fhir_version = %config.default_fhir_version, "{message}");
     }
 
     if let Err(errors) = config.validate() {
