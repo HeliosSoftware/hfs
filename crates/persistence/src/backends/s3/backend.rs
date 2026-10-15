@@ -57,6 +57,11 @@ pub struct S3Backend {
     /// settled layouts are cached; an empty tenant read under a `V2` default is
     /// answered `V2` without being remembered, so a later write stamps it.
     pub(crate) layouts: Arc<RwLock<HashMap<(String, String), KeyspaceLayout>>>,
+    /// The backend-wide read limit (`HFS_S3_SCAN_CONCURRENCY`, #2063): one
+    /// permit per `GetObject` a read fan-out has in flight. Shared by every
+    /// clone, so concurrent scans split one budget instead of each fanning out
+    /// on its own. See [`S3Backend::get_json_object_limited`].
+    pub(crate) scan_limit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Upper bound on remembered tombstones; past it scans simply read them.
@@ -258,6 +263,8 @@ impl S3Backend {
         ));
 
         let (registries, stored_by_tenant) = Self::new_registries();
+        // Built before the literal: `config` is moved into its first field.
+        let scan_limit = Arc::new(tokio::sync::Semaphore::new(config.scan_concurrency));
         let backend = Self {
             config,
             fhir_version: FhirVersion::default_enabled(),
@@ -266,6 +273,7 @@ impl S3Backend {
             stored_by_tenant,
             tombstone_etags: Arc::default(),
             layouts: Arc::default(),
+            scan_limit,
         };
 
         if backend.config.validate_buckets_on_startup {
@@ -285,6 +293,7 @@ impl S3Backend {
     ) -> StorageResult<Self> {
         config.validate()?;
         let (registries, stored_by_tenant) = Self::new_registries();
+        let scan_limit = Arc::new(tokio::sync::Semaphore::new(config.scan_concurrency));
         Ok(Self {
             config,
             fhir_version: FhirVersion::default_enabled(),
@@ -293,6 +302,7 @@ impl S3Backend {
             stored_by_tenant,
             tombstone_etags: Arc::default(),
             layouts: Arc::default(),
+            scan_limit,
         })
     }
 
