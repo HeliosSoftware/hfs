@@ -2400,6 +2400,11 @@ test.describe("query builder", () => {
       await page.reload({ waitUntil: "networkidle" });
       await search.showBuilder();
       await search.builder.recentToggle.click();
+      // #1759: a SAVED row sits in the same .recent-item wrapper as a RECENT
+      // row, so both sections share padding, row height and hover.
+      await expect(
+        search.builder.recentPanel.locator(".recent-item > [data-saved-load]", { hasText: savedName }),
+      ).toHaveCount(1);
       await search.builder.recentPanel.locator("[data-saved-load]", { hasText: savedName }).click();
       await expect(search.builder.url).toHaveValue(expected);
       const values = search.builder.conditionRows.first().locator(".builder-row__value");

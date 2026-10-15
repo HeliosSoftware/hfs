@@ -466,7 +466,7 @@
       idEl.textContent = "v" + v.versionId;
       var whenEl = document.createElement("span");
       whenEl.className = "history-version__when";
-      whenEl.textContent = v.lastUpdated ? new Date(v.lastUpdated).toLocaleString() : "";
+      whenEl.textContent = shortTime(v.lastUpdated);
       var kindEl = document.createElement("span");
       kindEl.className = "history-version__kind history-version__kind--" + v.method;
       kindEl.textContent = i === 0 ? historyEl.dataset.msgCurrent : opLabel(v.method);
@@ -481,6 +481,13 @@
     document.getElementById("resource-history-controls").hidden = versions.length < 1;
     if (versions.length >= 2) { fromSel.value = "1"; toSel.value = "0"; }
     renderDiff();
+  }
+
+  /* Local date; an unparseable value is shown raw, never as "Invalid Date". */
+  function shortTime(iso) {
+    if (!iso) return "";
+    var date = new Date(iso);
+    return isNaN(date) ? iso : date.toLocaleString();
   }
 
   /* POST=create, PUT=update, PATCH=patch, DELETE=delete; same mapping as history.js. */
