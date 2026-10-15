@@ -193,7 +193,7 @@ where
                 message: "Bundle must have a type".to_string(),
             })?;
 
-    match bundle_type {
+    let result = match bundle_type {
         "batch" => {
             process_batch(
                 &state,
@@ -222,7 +222,17 @@ where
                 bundle_type
             ),
         }),
+    };
+
+    // A large Bundle leaves gigabytes freed but kept by the allocator; hand
+    // them back once the body and its parse are gone (#2020).
+    let body_len = body.len();
+    drop(bundle);
+    drop(body);
+    if body_len >= crate::memory_trim::TRIM_AFTER_BYTES {
+        crate::memory_trim::release_free_memory();
     }
+    result
 }
 
 /// Hard ceiling on batch entry concurrency, independent of configuration.
