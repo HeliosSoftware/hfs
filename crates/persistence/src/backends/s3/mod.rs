@@ -12,6 +12,7 @@ mod bundle;
 mod client;
 mod conditional;
 mod config;
+mod get_retry;
 mod keyspace;
 mod login_sessions;
 mod models;
