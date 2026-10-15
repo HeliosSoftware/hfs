@@ -237,7 +237,7 @@ AWS_REGION=us-east-1 \
 | `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |
 | `HFS_DATA_DIR` | `./data` | Directory containing FHIR data files (search parameters) |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` | FHIR version (R4, R4B, R5, R6) |
+| `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | FHIR version (R4, R4B, R5, R6) |
 | `HFS_LOG_LEVEL` | `info` | Log level (error, warn, info, debug, trace) |
 | `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. Set `false` for headless deployments; `/ui` then returns `404` + OperationOutcome. Has no effect on a binary built without the `ui` feature. |
 | `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes against storage (CLI `--dashboard-reconcile-interval-secs`). Whole seconds, must be `> 0`; `0` or a non-numeric value is a startup error. A tenant's full recount is additionally spaced to at most every max(interval, 10 × its last recount duration); also how soon a failed background seed is retried. |
@@ -363,6 +363,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure `http://` endpoint URLs (only relevant when `HFS_S3_ENDPOINT` is set) |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
 | `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
 
 **S3 keyspace layout (`HFS_S3_KEYSPACE_LAYOUT`).** Each tenant has one layout, `v1` or `v2`, recorded in a marker object `history/_keyspace.json` (`{"layout":2}`). The variable only decides the layout of a tenant that has no marker and no data yet; a tenant that already holds objects without a marker is always `v1`, and a stamped marker always wins, so changing the variable never moves existing data. `v2` stores `resources/{type}/{h2}/{id}/…` and `history/type/{type}/{h2}/…` with `h2 = hex(sha256(id))[0..2]` (256 sub-prefixes) and drops the tenant-wide `history/system/` index (system history is served from `history/type/`), so each write does 3 PUTs instead of 4. The layout of a tenant is immutable: there is no migration, and `purge_tenant_data` keeps the marker. To change it, stop every instance and delete the tenant's prefix by hand. `v2` requires every instance that writes the bucket to run a build that reads the marker and to use the same setting; an older binary ignores the marker and would write `v1` keys into a `v2` tenant, leaving them unreachable. Opt-in: the default is `v1`.
 

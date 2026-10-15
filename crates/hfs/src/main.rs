@@ -112,7 +112,12 @@ fn parse_env_bool(var: &str, default_value: bool) -> bool {
 /// An S3 endpoint override, or `None` when it is unset or blank — so an empty
 /// `HFS_*_S3_ENDPOINT=` neither replaces the AWS endpoint nor forces
 /// path-style addressing.
-#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+// Only bulk export's S3 output store calls it, and that is built only with a
+// SQL backend; the unit test keeps it exercised in every build.
+#[cfg_attr(
+    not(all(feature = "s3", any(feature = "sqlite", feature = "postgres"))),
+    allow(dead_code)
+)]
 fn non_blank_endpoint(endpoint: Option<String>) -> Option<String> {
     endpoint
         .map(|e| e.trim().to_string())
@@ -318,6 +323,23 @@ fn parse_s3_keyspace_layout(
     }
 }
 
+/// Parses `HFS_S3_SCAN_CONCURRENCY`: the most `GetObject` requests the S3 read
+/// fan-outs may have in flight at once. Unset or blank is the default (32); a
+/// value that is not a whole number of at least 1 is an error rather than a
+/// silent fall back, since `0` would stall every scan.
+#[cfg(feature = "s3")]
+fn parse_s3_scan_concurrency(raw: Option<&str>) -> anyhow::Result<usize> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(helios_persistence::backends::s3::DEFAULT_SCAN_CONCURRENCY),
+        Some(value) => match value.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => anyhow::bail!(
+                "HFS_S3_SCAN_CONCURRENCY '{value}' invalid (expected a whole number of at least 1)"
+            ),
+        },
+    }
+}
+
 /// Builds the primary S3 backend's configuration from the `HFS_S3_*`
 /// environment: the one reader for `start_s3`, `start_s3_elasticsearch` and
 /// the shared database audit sink, so the three cannot disagree about where
@@ -331,9 +353,12 @@ fn s3_backend_config_from_env(
     let tenancy_mode = S3TenancyEnv::from_env().resolve(default_tenant)?;
     let default_keyspace_layout =
         parse_s3_keyspace_layout(std::env::var("HFS_S3_KEYSPACE_LAYOUT").ok().as_deref())?;
+    let scan_concurrency =
+        parse_s3_scan_concurrency(std::env::var("HFS_S3_SCAN_CONCURRENCY").ok().as_deref())?;
     Ok(S3BackendConfig {
         tenancy_mode,
         default_keyspace_layout,
+        scan_concurrency,
         region: std::env::var("HFS_S3_REGION").ok(),
         prefix: std::env::var("HFS_S3_PREFIX").ok(),
         endpoint_url: std::env::var("HFS_S3_ENDPOINT")
@@ -1951,7 +1976,8 @@ async fn main() -> anyhow::Result<()> {
     // Keep the skipped sub-configs populated while surfacing invalid CLI and
     // environment values instead of silently replacing the whole config with
     // defaults.
-    let mut config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
+    let (mut config, default_fhir_version_is_implicit) =
+        ServerConfig::try_from_env_with_provenance().unwrap_or_else(|error| error.exit());
     // The REST builder uses this same flag to start the dashboard's background
     // work. A binary without the UI must not seed or reconcile unseen figures.
     config.ui_enabled = effective_ui_enabled(config.ui_enabled);
@@ -1969,6 +1995,18 @@ async fn main() -> anyhow::Result<()> {
             bind_address = %config.socket_addr(),
             "{message}. Set HFS_BASE_URL to the public HTTP(S) origin clients can reach"
         );
+    }
+
+    // A build without R4 that enables several versions has no default FHIR
+    // version to fall back to (#2064): every R5 or R6 build also enables R4B,
+    // and serving R4B because nobody chose a version is hard to undo. Refuse to
+    // start, in the same form and with the same exit code as the
+    // `config.validate()` failure below.
+    if let Some(message) =
+        config.implicit_default_fhir_version_error(default_fhir_version_is_implicit)
+    {
+        eprintln!("Configuration error: {}", message);
+        std::process::exit(1);
     }
 
     if let Err(errors) = config.validate() {
@@ -3018,14 +3056,17 @@ async fn build_bulk_submit(
                     .ok()
                     .or_else(|| std::env::var("HFS_S3_REGION").ok());
                 let sdk_config = AwsS3Client::load_sdk_config(region.as_deref()).await;
+                let endpoint_url =
+                    non_blank_endpoint(std::env::var("HFS_BULK_SUBMIT_S3_ENDPOINT").ok());
+                // A custom endpoint forces path-style addressing, as for bulk
+                // export, the S3 storage backend and the `$sql-export` S3 sink.
+                let force_path_style = endpoint_url.is_some()
+                    || parse_env_bool("HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE", false);
                 let client = Arc::new(AwsS3Client::from_sdk_config_with_options(
                     &sdk_config,
                     AwsS3ClientOptions {
-                        endpoint_url: std::env::var("HFS_BULK_SUBMIT_S3_ENDPOINT").ok(),
-                        force_path_style: parse_env_bool(
-                            "HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE",
-                            false,
-                        ),
+                        endpoint_url,
+                        force_path_style,
                     },
                 ));
                 Arc::new(S3OutputStore::new(
@@ -4143,6 +4184,7 @@ async fn start_s3(
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
+        scan_concurrency = s3_config.scan_concurrency,
         "Initializing S3 backend"
     );
 
@@ -4311,6 +4353,7 @@ async fn start_s3_elasticsearch(
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
+        scan_concurrency = s3_config.scan_concurrency,
         "Initializing S3 backend (primary)"
     );
 
@@ -4851,6 +4894,34 @@ mod tests {
                 let err = parse_s3_keyspace_layout(Some(bad)).unwrap_err().to_string();
                 assert!(err.contains("HFS_S3_KEYSPACE_LAYOUT"), "{err}");
                 assert!(err.contains("expected v1|v2"), "{err}");
+            }
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    mod s3_scan_concurrency {
+        use super::*;
+
+        #[test]
+        fn unset_or_blank_is_the_default() {
+            assert_eq!(parse_s3_scan_concurrency(None).unwrap(), 32);
+            assert_eq!(parse_s3_scan_concurrency(Some("  ")).unwrap(), 32);
+        }
+
+        #[test]
+        fn whole_numbers_of_at_least_one_parse() {
+            assert_eq!(parse_s3_scan_concurrency(Some("1")).unwrap(), 1);
+            assert_eq!(parse_s3_scan_concurrency(Some(" 8 ")).unwrap(), 8);
+        }
+
+        #[test]
+        fn zero_negative_and_junk_are_refused() {
+            for bad in ["0", "-1", "abc", "1.5", "32x"] {
+                let err = parse_s3_scan_concurrency(Some(bad))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("HFS_S3_SCAN_CONCURRENCY"), "{err}");
+                assert!(err.contains("at least 1"), "{err}");
             }
         }
     }

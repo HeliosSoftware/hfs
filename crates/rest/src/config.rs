@@ -26,7 +26,7 @@
 //! | `HFS_NL_SEARCH_RATE_WINDOW_SECS` | 60 | Rate-limit window size (seconds) |
 //! | `HFS_NL_SEARCH_DAILY_LIMIT` | 200 | NL search requests per key per UTC day (slow-drip backstop) |
 //! | `HFS_NL_SEARCH_MAX_CHARS` | 500 | Maximum accepted input length (characters) |
-//! | `HFS_DEFAULT_FHIR_VERSION` | R4 | Default FHIR version (R4, R4B, R5, R6) |
+//! | `HFS_DEFAULT_FHIR_VERSION` | R4 (a build without R4 uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version (R4, R4B, R5, R6) |
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
@@ -63,7 +63,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use helios_fhir::FhirVersion;
 use helios_persistence::BackendKind;
 
@@ -1201,11 +1201,19 @@ pub struct ServerConfig {
 
     /// Default FHIR version for operations that need it before request parsing
     /// (e.g., tenant resolution, resource type detection).
+    ///
+    /// Defaults to R4. A build without the `R4` feature has no R4 to fall back
+    /// to: with a single enabled version that version is the default
+    /// (`FhirVersion::default_enabled()`; a literal "R4" default failed to
+    /// parse in such builds, #2064), and with several there is no default, so
+    /// `hfs` refuses to start unless this is set
+    /// ([`ServerConfig::implicit_default_fhir_version_error`]). R5/R6 builds
+    /// always include R4B, so they must set it.
     #[arg(
         long,
         env = "HFS_DEFAULT_FHIR_VERSION",
         value_enum,
-        default_value = "R4"
+        default_value_t = FhirVersion::default_enabled()
     )]
     pub default_fhir_version: FhirVersion,
 
@@ -1643,7 +1651,31 @@ impl ServerConfig {
     /// Loads configuration for the HFS binary and reports command-line,
     /// environment, and validation errors to the caller.
     pub fn try_from_env() -> Result<Self, clap::Error> {
-        Self::finish_parsed(Self::try_parse()?)
+        Self::try_from_env_with_provenance().map(|(config, _)| config)
+    }
+
+    /// Like [`ServerConfig::try_from_env`], and also reports whether
+    /// `default_fhir_version` came from its built-in default (`true`) rather
+    /// than from `--default-fhir-version` or `HFS_DEFAULT_FHIR_VERSION`.
+    ///
+    /// Pass the flag to [`ServerConfig::implicit_default_fhir_version_error`].
+    pub fn try_from_env_with_provenance() -> Result<(Self, bool), clap::Error> {
+        Self::try_parse_from_with_provenance(std::env::args_os())
+    }
+
+    /// [`ServerConfig::try_from_env_with_provenance`] over an explicit
+    /// argument list, whose first item is the program name.
+    pub fn try_parse_from_with_provenance<I, T>(args: I) -> Result<(Self, bool), clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut matches = Self::command().try_get_matches_from(args)?;
+        let version_is_implicit = matches.value_source("default_fhir_version")
+            == Some(clap::parser::ValueSource::DefaultValue);
+        let parsed = Self::from_arg_matches_mut(&mut matches)
+            .map_err(|error| error.format(&mut Self::command()))?;
+        Ok((Self::finish_parsed(parsed)?, version_is_implicit))
     }
 
     fn finish_parsed(mut config: Self) -> Result<Self, clap::Error> {
@@ -1775,6 +1807,26 @@ impl ServerConfig {
             .as_str()
             .to_string();
         Ok(())
+    }
+
+    /// Returns a startup error when `default_fhir_version` was not chosen by
+    /// the operator and this build has no R4 to default to.
+    ///
+    /// `version_is_implicit` is the flag from
+    /// [`ServerConfig::try_from_env_with_provenance`]. Without the `R4` feature
+    /// the built-in default is the first enabled version. Every R5 or R6 build
+    /// also enables R4B (helios-audit turns it on), so that first version would
+    /// be R4B, and a server left on it would parse, store and advertise R4B
+    /// (4.3.0) for requests that name no version. That is hard to undo once
+    /// data is written (#2064), so the operator has to choose. A build with a
+    /// single enabled version (for example R4B only) has nothing to choose
+    /// between, and a build with R4 defaults to R4; neither returns an error.
+    pub fn implicit_default_fhir_version_error(&self, version_is_implicit: bool) -> Option<String> {
+        let enabled: Vec<&str> = FhirVersion::enabled_versions()
+            .iter()
+            .map(|version| version.as_str())
+            .collect();
+        implicit_default_fhir_version_error_for(&enabled, version_is_implicit)
     }
 
     /// Returns why a loopback public base is unsafe for the configured listener.
@@ -2087,6 +2139,30 @@ impl ServerConfig {
     pub fn multitenancy(&self) -> &MultitenancyConfig {
         &self.multitenancy
     }
+}
+
+/// Decides whether an implicit default FHIR version is a startup error, given
+/// the names of the versions this build enables.
+///
+/// Takes plain names rather than reading [`FhirVersion::enabled_versions`] so
+/// the decision and its message can be unit-tested in any build, including the
+/// default R4 build where the error never fires.
+fn implicit_default_fhir_version_error_for(
+    enabled: &[&str],
+    version_is_implicit: bool,
+) -> Option<String> {
+    let has_r4 = enabled.contains(&"R4");
+    if !version_is_implicit || has_r4 || enabled.len() < 2 {
+        return None;
+    }
+
+    let enabled_list = enabled.join(", ");
+    Some(format!(
+        "HFS_DEFAULT_FHIR_VERSION is not set and this build does not include R4, so there is \
+         no default FHIR version to fall back to. This build enables: {enabled_list}. R4B is \
+         always enabled alongside R5 and R6 because helios-audit requires it. Set \
+         HFS_DEFAULT_FHIR_VERSION (or --default-fhir-version) to one of the enabled versions"
+    ))
 }
 
 #[cfg(test)]
@@ -3020,6 +3096,86 @@ mod tests {
             ..Default::default()
         };
         assert!(public.loopback_public_base_warning().is_none());
+    }
+
+    #[test]
+    fn test_default_fhir_version_provenance() {
+        // The CLI value wins over the built-in default, whatever the build enables.
+        let version = FhirVersion::default_enabled();
+        let (config, implicit) = ServerConfig::try_parse_from_with_provenance([
+            "rest-server",
+            "--default-fhir-version",
+            version.as_str(),
+        ])
+        .unwrap();
+        assert_eq!(config.default_fhir_version, version);
+        assert!(
+            !implicit,
+            "an explicit --default-fhir-version is not implicit"
+        );
+
+        // With nothing on the command line the value is the built-in default,
+        // unless the environment sets it (then it is not implicit either).
+        let (config, implicit) =
+            ServerConfig::try_parse_from_with_provenance(["rest-server"]).unwrap();
+        if std::env::var_os("HFS_DEFAULT_FHIR_VERSION").is_none() {
+            assert!(implicit, "no flag and no env var is the built-in default");
+            assert_eq!(config.default_fhir_version, FhirVersion::default_enabled());
+        } else {
+            assert!(!implicit, "HFS_DEFAULT_FHIR_VERSION is an explicit choice");
+        }
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error() {
+        let config = ServerConfig::default();
+        // Only an implicit default can be an error, in every build.
+        assert!(config.implicit_default_fhir_version_error(false).is_none());
+        // This unit-test module needs `R4`, and a build with R4 never errors
+        // (the build without R4 is covered by tests/fhir_version_coverage.rs).
+        assert!(config.implicit_default_fhir_version_error(true).is_none());
+    }
+
+    // The decision helper takes plain version names, so these run in every
+    // build, including the default R4 build where the error never fires.
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4b_r5() {
+        let error = implicit_default_fhir_version_error_for(&["R4B", "R5"], true)
+            .expect("an implicit default without R4 is an error");
+        assert!(
+            error.contains("This build enables: R4B, R5."),
+            "message must list the enabled versions: {error}"
+        );
+        assert!(
+            error.contains("HFS_DEFAULT_FHIR_VERSION"),
+            "message must name the setting to choose: {error}"
+        );
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4b_r5_r6() {
+        let error = implicit_default_fhir_version_error_for(&["R4B", "R5", "R6"], true)
+            .expect("an implicit default without R4 is an error");
+        assert!(
+            error.contains("This build enables: R4B, R5, R6."),
+            "message must list every enabled version: {error}"
+        );
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_explicit_choice() {
+        assert!(implicit_default_fhir_version_error_for(&["R4B", "R5"], false).is_none());
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4_present() {
+        assert!(implicit_default_fhir_version_error_for(&["R4", "R5"], true).is_none());
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_single_version() {
+        assert!(implicit_default_fhir_version_error_for(&["R4B"], true).is_none());
     }
 
     // ── multitenancy() accessor ───────────────────────────────────

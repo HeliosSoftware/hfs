@@ -159,6 +159,7 @@ pub mod extractors;
 pub mod fhir_types;
 pub mod handlers;
 pub mod jwe;
+pub mod memory_trim;
 pub mod middleware;
 pub mod patient_compartment;
 pub(crate) mod public_url;

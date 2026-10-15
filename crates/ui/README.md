@@ -1162,7 +1162,11 @@ falls through to the normal REST surface.
   `sql_export.rs`), so the detail page's Output files table survives the
   reaper and a server restart the same way the list does — the one exception
   being the download links themselves, which expire with whatever the storage
-  backend's presigned-URL TTL is. Only a job still `in-progress` triggers a
+  backend's presigned-URL TTL is. Locations under the server's own
+  `HFS_BASE_URL` are stored as same-origin paths, so they survive a reverse
+  proxy or a different port (#833); any other location, such as an S3
+  pre-signed URL under `HFS_EXPORT_SINK=s3`, is stored and linked verbatim
+  (#2050). Only a job still `in-progress` triggers a
   poll: one when the page (or its htmx fragment) renders, exactly like the
   list. An id belonging to another user or tenant is a `404` rendered by the
   shared `pages/not-found.html`/`render_not_found` helper (`crates/ui/src/

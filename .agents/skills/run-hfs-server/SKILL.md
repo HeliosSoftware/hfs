@@ -134,6 +134,7 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure HTTP endpoint URLs when `HFS_S3_ENDPOINT` is set |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
 | `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
 
 `HFS_S3_KEYSPACE_LAYOUT=v2` only affects new, empty tenants: each tenant's layout is stamped in `history/_keyspace.json` and is immutable; `v2` needs every writing instance on a build that reads the marker.
 
@@ -320,7 +321,7 @@ curl http://localhost:8080/clinic-a/Patient
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` | Default FHIR version: R4, R4B, R5, R6 |
+| `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version: R4, R4B, R5, R6 |
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources instead of 404 |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |

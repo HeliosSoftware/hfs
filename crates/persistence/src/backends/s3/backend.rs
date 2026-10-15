@@ -57,6 +57,11 @@ pub struct S3Backend {
     /// settled layouts are cached; an empty tenant read under a `V2` default is
     /// answered `V2` without being remembered, so a later write stamps it.
     pub(crate) layouts: Arc<RwLock<HashMap<(String, String), KeyspaceLayout>>>,
+    /// The backend-wide read limit (`HFS_S3_SCAN_CONCURRENCY`, #2063): one
+    /// permit per `GetObject` a read fan-out has in flight. Shared by every
+    /// clone, so concurrent scans split one budget instead of each fanning out
+    /// on its own. See [`S3Backend::get_json_object_limited`].
+    pub(crate) scan_limit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Upper bound on remembered tombstones; past it scans simply read them.
@@ -258,6 +263,8 @@ impl S3Backend {
         ));
 
         let (registries, stored_by_tenant) = Self::new_registries();
+        // Built before the literal: `config` is moved into its first field.
+        let scan_limit = Arc::new(tokio::sync::Semaphore::new(config.scan_concurrency));
         let backend = Self {
             config,
             fhir_version: FhirVersion::default_enabled(),
@@ -266,6 +273,7 @@ impl S3Backend {
             stored_by_tenant,
             tombstone_etags: Arc::default(),
             layouts: Arc::default(),
+            scan_limit,
         };
 
         if backend.config.validate_buckets_on_startup {
@@ -285,6 +293,7 @@ impl S3Backend {
     ) -> StorageResult<Self> {
         config.validate()?;
         let (registries, stored_by_tenant) = Self::new_registries();
+        let scan_limit = Arc::new(tokio::sync::Semaphore::new(config.scan_concurrency));
         Ok(Self {
             config,
             fhir_version: FhirVersion::default_enabled(),
@@ -293,6 +302,7 @@ impl S3Backend {
             stored_by_tenant,
             tombstone_etags: Arc::default(),
             layouts: Arc::default(),
+            scan_limit,
         })
     }
 
@@ -669,6 +679,18 @@ impl S3Backend {
             S3ClientError::PreconditionFailed => StorageError::Backend(BackendError::QueryError {
                 message: "S3 precondition failed".to_string(),
             }),
+            // Transient (#2047): S3 had a conflicting conditional write in flight
+            // and wrote nothing. Deliberately NOT `QueryError`, which the
+            // resource paths read as a lost precondition (AlreadyExists /
+            // VersionConflict). `Unavailable` is served as 503 with Retry-After.
+            S3ClientError::ConditionalConflict(message) => {
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "s3".to_string(),
+                    message: format!(
+                        "S3 reported a conflicting concurrent write (HTTP 409); retry: {message}"
+                    ),
+                })
+            }
             S3ClientError::Throttled(message) => StorageError::Backend(BackendError::Unavailable {
                 backend_name: "s3".to_string(),
                 message,

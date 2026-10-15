@@ -3250,7 +3250,7 @@ async fn search_parameters(
     let fhir_version = version
         .as_deref()
         .and_then(search_params::version_from_str)
-        .unwrap_or_default();
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
     if raw.refresh.is_some() {
         state.sp_catalog.invalidate(&rt.id, fhir_version);
     }
@@ -8593,7 +8593,7 @@ async fn compartments_page(
     let fhir_version = version
         .as_deref()
         .and_then(search_params::version_from_str)
-        .unwrap_or_default();
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
     if raw.refresh.is_some() {
         state.compartments.invalidate(&rt.id, fhir_version);
     }
