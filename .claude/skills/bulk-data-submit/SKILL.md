@@ -60,6 +60,8 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Status-artifact store: `local-fs` or `s3` |
 | `HFS_BULK_SUBMIT_OUTPUT_DIR` | `${HFS_DATA_DIR}/submit` | Local filesystem artifact root |
 | `HFS_BULK_SUBMIT_S3_BUCKET` | none | S3 bucket, required when output backend is s3 |
+| `HFS_BULK_SUBMIT_S3_ENDPOINT` | AWS | S3-compatible endpoint URL, such as MinIO; blank is treated as unset |
+| `HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers; forced on when `HFS_BULK_SUBMIT_S3_ENDPOINT` is set |
 | `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture; false is invalid with local-fs |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit worker count |
 | `HFS_BULK_SUBMIT_FILE_CONCURRENCY` | `1` | Files of one manifest ingested at once. SQLite always uses `1`. Standalone PostgreSQL uses independent file tasks only when the effective value exceeds `1`; all other modes remain inline |

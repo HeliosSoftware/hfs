@@ -23,7 +23,7 @@ See the full reference in [Environment Variables](configuration/environment-vari
 | `HFS_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 | `HFS_STORAGE_BACKEND` | `sqlite` | `sqlite`, `sqlite-es`, `postgres`, `pg-es`, `s3`, `s3-es` |
 | `HFS_DATABASE_URL` | `fhir.db` | SQLite path or PostgreSQL connection string |
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` | `R4`, `R4B`, `R5`, `R6` |
+| `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | `R4`, `R4B`, `R5`, `R6` |
 | `HFS_DEFAULT_TENANT` | `default` | Default tenant ID |
 | `HFS_TENANT_ROUTING_MODE` | `header_only` | `header_only`, `url_path`, `both` |
 
