@@ -1859,11 +1859,7 @@ mod tests {
         for ct in [ContentType::Parquet, ContentType::ArrowIpc] {
             let response = columnar(
                 rows.iter()
-                    .map(|r| {
-                        r.as_ref()
-                            .map(Clone::clone)
-                            .map_err(|_| SofError::Cancelled)
-                    })
+                    .map(|r| r.as_ref().cloned().map_err(|_| SofError::Cancelled))
                     .collect(),
                 ct,
                 None,
