@@ -1549,6 +1549,48 @@ impl SearchProvider for CompositeStorage {
         result
     }
 
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        // Same selection as `search_ids`. A routed auxiliary merge filters the
+        // page by id sets, which a one-pass distinct-value read would skip, so
+        // the resolver keeps paging in that case.
+        if !self.has_dedicated_search_backend() {
+            let decision = self
+                .router
+                .route(query)
+                .map_err(|error| self.routing_error_to_storage_error(error))?;
+            if !decision.auxiliary_targets.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        let preferred_id = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            .map(|backend| backend.id.as_str());
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        let backend_id = preferred_id
+            .filter(|id| self.search_providers.contains_key(*id))
+            .unwrap_or(primary_id);
+        let Some(provider) = self.search_providers.get(backend_id) else {
+            return Ok(None);
+        };
+        let result = provider
+            .search_reference_values(tenant, query, reference_param)
+            .await;
+        self.update_health(
+            backend_id,
+            result.is_ok(),
+            result.as_ref().err().map(|error| error.to_string()),
+        );
+        result
+    }
+
     async fn search_count(
         &self,
         tenant: &TenantContext,
@@ -3524,6 +3566,8 @@ mod tests {
         /// When set, `search` answers `UnsupportedCapability`, as a primary
         /// without the routed feature does.
         unsupported: std::sync::atomic::AtomicBool,
+        /// Reference parameters passed to `search_reference_values`.
+        reference_calls: Mutex<Vec<String>>,
     }
 
     impl RecordingSearchProvider {
@@ -3535,7 +3579,15 @@ mod tests {
                 registry: None,
                 native_reverse: std::sync::atomic::AtomicBool::new(false),
                 unsupported: std::sync::atomic::AtomicBool::new(false),
+                reference_calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn reference_call_count(&self) -> usize {
+            self.reference_calls
+                .lock()
+                .expect("reference_calls mutex poisoned")
+                .len()
         }
 
         /// Attaches a search-parameter registry so `search_param_registry`
@@ -3656,6 +3708,19 @@ mod tests {
                 SearchResult::new(Page::new(self.results.clone(), PageInfo::end()))
                     .with_total(self.results.len() as u64),
             )
+        }
+
+        async fn search_reference_values(
+            &self,
+            _tenant: &TenantContext,
+            _query: &SearchQuery,
+            reference_param: &str,
+        ) -> StorageResult<Option<Vec<String>>> {
+            self.reference_calls
+                .lock()
+                .expect("reference_calls mutex poisoned")
+                .push(reference_param.to_string());
+            Ok(Some(vec![format!("Patient/{}", self.name)]))
         }
 
         async fn search_count(
@@ -3782,6 +3847,99 @@ mod tests {
             StorageError::Backend(BackendError::UnsupportedCapability { backend_name, .. })
                 if backend_name == "primary"
         ));
+    }
+
+    #[tokio::test]
+    async fn search_reference_values_uses_the_same_provider_fallback_as_search_ids() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Observation");
+        let (mut composite, primary, search) = make_composite_with_dedicated_search(vec![], vec![]);
+
+        let values = composite
+            .search_reference_values(&tenant, &query, "subject")
+            .await
+            .unwrap();
+        assert_eq!(values, Some(vec!["Patient/search".to_string()]));
+        assert_eq!(search.reference_call_count(), 1);
+        assert_eq!(primary.reference_call_count(), 0);
+
+        composite.search_providers.remove("search");
+        let values = composite
+            .search_reference_values(&tenant, &query, "subject")
+            .await
+            .unwrap();
+        assert_eq!(values, Some(vec!["Patient/primary".to_string()]));
+        assert_eq!(primary.reference_call_count(), 1);
+
+        composite.search_providers.remove("primary");
+        let values = composite
+            .search_reference_values(&tenant, &query, "subject")
+            .await
+            .unwrap();
+        assert_eq!(values, None, "no provider means the resolver pages");
+    }
+
+    #[tokio::test]
+    async fn search_reference_values_without_dedicated_backend_uses_primary() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let (composite, primary) = make_composite_no_search_backend(vec![]);
+        let values = composite
+            .search_reference_values(&tenant, &SearchQuery::new("Observation"), "patient")
+            .await
+            .unwrap();
+        assert_eq!(values, Some(vec!["Patient/primary".to_string()]));
+        assert_eq!(primary.reference_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_reference_values_is_none_when_routing_has_auxiliary_targets() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .graph_backend("graph", BackendKind::Sqlite)
+            .with_routing_rule(
+                super::super::config::RoutingRule::new("reverse", "graph")
+                    .with_trigger(super::super::analyzer::QueryFeature::ReverseChaining),
+            )
+            .build()
+            .unwrap();
+        let primary = Arc::new(RecordingSearchProvider::new("primary", vec![]));
+        let graph = Arc::new(RecordingSearchProvider::new("graph", vec![]));
+        let mut backends = HashMap::new();
+        backends.insert("primary".into(), primary.clone() as DynStorage);
+        backends.insert("graph".into(), graph.clone() as DynStorage);
+        let mut providers = HashMap::new();
+        providers.insert("primary".into(), primary.clone() as DynSearchProvider);
+        providers.insert("graph".into(), graph.clone() as DynSearchProvider);
+        let merged = CompositeStorage::new(config, backends)
+            .unwrap()
+            .with_search_providers(providers);
+
+        let mut query = SearchQuery::new("Patient");
+        query
+            .reverse_chains
+            .push(crate::types::ReverseChainedParameter::terminal(
+                "Observation",
+                "patient",
+                "code",
+                SearchValue::eq("http://loinc.org|8302-2"),
+            ));
+        let values = merged
+            .search_reference_values(&tenant, &query, "patient")
+            .await
+            .unwrap();
+        assert_eq!(values, None);
+        assert_eq!(primary.reference_call_count(), 0);
+        assert_eq!(graph.reference_call_count(), 0);
     }
 
     #[test]
