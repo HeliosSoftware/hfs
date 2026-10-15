@@ -89,7 +89,7 @@ are compressed when the client sends `Accept-Encoding`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` | Default FHIR version: `R4`, `R4B`, `R5`, `R6` |
+| `HFS_DEFAULT_FHIR_VERSION` | `R4` (first enabled version in builds without `R4`) | Default FHIR version: `R4`, `R4B`, `R5`, `R6` |
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources (vs 404) |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |

@@ -26,7 +26,7 @@
 //! | `HFS_NL_SEARCH_RATE_WINDOW_SECS` | 60 | Rate-limit window size (seconds) |
 //! | `HFS_NL_SEARCH_DAILY_LIMIT` | 200 | NL search requests per key per UTC day (slow-drip backstop) |
 //! | `HFS_NL_SEARCH_MAX_CHARS` | 500 | Maximum accepted input length (characters) |
-//! | `HFS_DEFAULT_FHIR_VERSION` | R4 | Default FHIR version (R4, R4B, R5, R6) |
+//! | `HFS_DEFAULT_FHIR_VERSION` | R4 (first enabled version in builds without R4) | Default FHIR version (R4, R4B, R5, R6) |
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
@@ -1201,11 +1201,16 @@ pub struct ServerConfig {
 
     /// Default FHIR version for operations that need it before request parsing
     /// (e.g., tenant resolution, resource type detection).
+    ///
+    /// Defaults to R4, or, in a build without the `R4` feature, to the first
+    /// enabled version (`FhirVersion::default_enabled()`); a literal "R4"
+    /// default failed to parse in such builds (#2064). R5/R6 builds always
+    /// include R4B, so they default to R4B unless this is set.
     #[arg(
         long,
         env = "HFS_DEFAULT_FHIR_VERSION",
         value_enum,
-        default_value = "R4"
+        default_value_t = FhirVersion::default_enabled()
     )]
     pub default_fhir_version: FhirVersion,
 
