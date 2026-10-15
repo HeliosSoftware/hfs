@@ -445,8 +445,11 @@
       var resource = entry.resource || {};
       var response = entry.response || {};
       var etag = /"([^"]+)"/.exec(response.etag || "");
+      var meta = resource.meta || {};
       return {
-        versionId: (resource.meta && resource.meta.versionId) || (etag && etag[1]) || "",
+        versionId: meta.versionId || (etag && etag[1]) || "",
+        lastUpdated: meta.lastUpdated || response.lastModified || "",
+        method: opKey(((entry.request || {}).method || "").toUpperCase()),
         resource: resource,
       };
     });
@@ -457,7 +460,19 @@
       var row = document.createElement("button");
       row.type = "button";
       row.className = "history-version" + (i === 0 ? " history-version--current" : "");
-      row.textContent = "v" + v.versionId + (i === 0 ? " · " + historyEl.dataset.msgCurrent : "");
+      row.dataset.index = String(i);
+      var idEl = document.createElement("span");
+      idEl.className = "history-version__id";
+      idEl.textContent = "v" + v.versionId;
+      var whenEl = document.createElement("span");
+      whenEl.className = "history-version__when";
+      whenEl.textContent = v.lastUpdated ? new Date(v.lastUpdated).toLocaleString() : "";
+      var kindEl = document.createElement("span");
+      kindEl.className = "history-version__kind history-version__kind--" + v.method;
+      kindEl.textContent = i === 0 ? historyEl.dataset.msgCurrent : opLabel(v.method);
+      row.appendChild(idEl);
+      row.appendChild(whenEl);
+      row.appendChild(kindEl);
       row.addEventListener("click", function () { toSel.value = String(i); fromSel.value = String(Math.min(i + 1, versions.length - 1)); renderDiff(); });
       versionsHost.appendChild(row);
       fromSel.appendChild(opt(i, "v" + v.versionId));
@@ -468,12 +483,37 @@
     renderDiff();
   }
 
+  /* POST=create, PUT=update, PATCH=patch, DELETE=delete; same mapping as history.js. */
+  function opKey(method) {
+    if (method === "POST") return "create";
+    if (method === "PUT") return "update";
+    if (method === "PATCH") return "patch";
+    if (method === "DELETE") return "delete";
+    return "version";
+  }
+
+  function opLabel(method) {
+    return historyEl.dataset["msgOp" + method.charAt(0).toUpperCase() + method.slice(1)] || method;
+  }
+
+  /* The two versions being compared get the from/to marker. */
+  function markSelected() {
+    var from = Number(fromSel.value);
+    var to = Number(toSel.value);
+    versionsHost.querySelectorAll(".history-version").forEach(function (row) {
+      var index = Number(row.dataset.index);
+      row.classList.toggle("history-version--from", index === from);
+      row.classList.toggle("history-version--to", index === to);
+    });
+  }
+
   function opt(v, label) { var o = document.createElement("option"); o.value = String(v); o.textContent = label; return o; }
 
   function renderDiff() {
     var from = versions[Number(fromSel.value)];
     var to = versions[Number(toSel.value)];
     if (!from || !to) return;
+    markSelected();
     var body = new URLSearchParams();
     body.set("from", JSON.stringify(from.resource));
     body.set("to", JSON.stringify(to.resource));
