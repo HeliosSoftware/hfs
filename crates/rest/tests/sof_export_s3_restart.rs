@@ -865,12 +865,19 @@ mod sof_export_s3_restart_tests {
         let client = sdk_client().await;
         let bucket = fresh_bucket(&client).await;
 
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", MINIO_ROOT_USER);
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", MINIO_ROOT_PASSWORD);
-        }
-
-        let sink = S3Sink::from_config(
+        // Inject credentials through the loader rather than `AWS_*` env vars:
+        // the other tests in this binary run concurrently. The region,
+        // endpoint and path-style handling is `from_config`'s own.
+        let creds = Credentials::new(
+            MINIO_ROOT_USER,
+            MINIO_ROOT_PASSWORD,
+            None,
+            None,
+            "export-tests",
+        );
+        let loader = aws_config::defaults(BehaviorVersion::latest()).credentials_provider(creds);
+        let sink = S3Sink::from_config_loader(
+            loader,
             bucket.clone(),
             None,
             Some(shared.endpoint_url.clone()),

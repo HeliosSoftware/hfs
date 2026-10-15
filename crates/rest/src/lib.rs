@@ -755,6 +755,9 @@ where
                 ),
             });
 
+            // `ServerConfig::validate` rejects every case below at startup;
+            // these panics are a backstop for embedders that build the app
+            // without calling it, so a bad sink never silently becomes `fs`.
             let export_sink = config.export_sink.trim().to_lowercase();
             match export_sink.as_str() {
                 "fs" | "s3" => {}

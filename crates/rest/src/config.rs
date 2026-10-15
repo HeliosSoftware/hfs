@@ -1922,32 +1922,52 @@ impl ServerConfig {
             ));
         }
 
-        match self.export_sink.trim().to_lowercase().as_str() {
-            "fs" => {}
-            "s3" => {
-                if !cfg!(feature = "s3") {
-                    errors.push(
-                        "HFS_EXPORT_SINK=s3 requires the 's3' feature. \
-                         Build with: cargo build -p helios-hfs --features s3"
-                            .to_string(),
-                    );
+        // The export sink is only wired when SQL-on-FHIR is, so a leftover
+        // `HFS_EXPORT_*` setting on a server with SoF off is not an error.
+        if self.sof_enabled {
+            match self.export_sink.trim().to_lowercase().as_str() {
+                "fs" => {}
+                "s3" => {
+                    if !cfg!(feature = "s3") {
+                        errors.push(
+                            "HFS_EXPORT_SINK=s3 requires the 's3' feature. \
+                             Build with: cargo build -p helios-hfs --features s3"
+                                .to_string(),
+                        );
+                    }
+                    if self
+                        .export_s3_bucket
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty())
+                        .is_none()
+                    {
+                        errors.push(
+                            "HFS_EXPORT_S3_BUCKET is required when HFS_EXPORT_SINK=s3".to_string(),
+                        );
+                    }
+                    if let Some(endpoint) = self
+                        .export_s3_endpoint
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|e| !e.is_empty())
+                    {
+                        let valid = url::Url::parse(endpoint).is_ok_and(|u| {
+                            matches!(u.scheme(), "http" | "https") && u.host_str().is_some()
+                        });
+                        if !valid {
+                            errors.push(format!(
+                                "HFS_EXPORT_S3_ENDPOINT must be an http(s) URL with a host, \
+                                 e.g. http://localhost:9000; got '{endpoint}'"
+                            ));
+                        }
+                    }
                 }
-                if self
-                    .export_s3_bucket
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|b| !b.is_empty())
-                    .is_none()
-                {
-                    errors.push(
-                        "HFS_EXPORT_S3_BUCKET is required when HFS_EXPORT_SINK=s3".to_string(),
-                    );
+                other => {
+                    errors.push(format!(
+                        "HFS_EXPORT_SINK must be 'fs' or 's3', got '{other}'"
+                    ));
                 }
-            }
-            other => {
-                errors.push(format!(
-                    "HFS_EXPORT_SINK must be 'fs' or 's3', got '{other}'"
-                ));
             }
         }
 
@@ -2196,6 +2216,55 @@ mod tests {
             assert!(
                 errors.iter().any(|e| e.contains("HFS_EXPORT_S3_BUCKET")),
                 "bucket {bucket:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_ignores_export_sink_when_sof_disabled() {
+        let config = ServerConfig {
+            sof_enabled: false,
+            export_sink: "s3".to_string(),
+            export_s3_bucket: None,
+            export_s3_endpoint: Some("not a url".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn test_validate_export_s3_endpoint_must_be_http_url() {
+        for endpoint in ["localhost:9000", "ftp://minio:9000", "http://", "not a url"] {
+            let config = ServerConfig {
+                export_sink: "s3".to_string(),
+                export_s3_bucket: Some("hfs-sql-export".to_string()),
+                export_s3_endpoint: Some(endpoint.to_string()),
+                ..Default::default()
+            };
+            let errors = config
+                .validate()
+                .expect_err("a malformed endpoint must fail startup validation");
+            assert!(
+                errors.iter().any(|e| e.contains("HFS_EXPORT_S3_ENDPOINT")),
+                "endpoint {endpoint:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn test_validate_export_s3_endpoint_accepts_http_url_or_blank() {
+        for endpoint in [" http://localhost:9000 ", "https://s3.example.com", "  "] {
+            let config = ServerConfig {
+                export_sink: "s3".to_string(),
+                export_s3_bucket: Some("hfs-sql-export".to_string()),
+                export_s3_endpoint: Some(endpoint.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "endpoint {endpoint:?}: {:?}",
+                config.validate()
             );
         }
     }

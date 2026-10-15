@@ -606,12 +606,36 @@ impl S3Sink {
         key_prefix: String,
         presign_ttl_secs: u64,
     ) -> Result<Self, ExportError> {
+        Self::from_config_loader(
+            aws_config::defaults(aws_config::BehaviorVersion::latest()),
+            bucket,
+            region,
+            endpoint,
+            force_path_style,
+            key_prefix,
+            presign_ttl_secs,
+        )
+        .await
+    }
+
+    /// [`from_config`](Self::from_config) over a caller-supplied AWS config
+    /// loader, so credentials can be injected (e.g. in tests) without touching
+    /// the process environment. The region, endpoint and path-style rules are
+    /// the same.
+    pub async fn from_config_loader(
+        mut loader: aws_config::ConfigLoader,
+        bucket: String,
+        region: Option<String>,
+        endpoint: Option<String>,
+        force_path_style: bool,
+        key_prefix: String,
+        presign_ttl_secs: u64,
+    ) -> Result<Self, ExportError> {
         let endpoint = endpoint
             .as_deref()
             .map(str::trim)
             .filter(|e| !e.is_empty())
             .map(str::to_string);
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         match region {
             Some(r) => loader = loader.region(aws_config::Region::new(r)),
             None if endpoint.is_some() => {
@@ -636,9 +660,9 @@ impl S3Sink {
         })
     }
 
-    /// Builds an `S3Sink` around an already-configured client, e.g. one aimed
-    /// at an S3-compatible endpoint such as MinIO with path-style addressing,
-    /// which [`from_config`](Self::from_config) cannot express.
+    /// Builds an `S3Sink` around an already-configured client, for settings
+    /// [`from_config`](Self::from_config) does not expose (custom credentials
+    /// providers, retry or timeout policy, and so on).
     ///
     /// - `key_prefix` — prepended verbatim to every object key, so include a
     ///   trailing `/` (e.g. `"hfs/"`), or pass it empty
