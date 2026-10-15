@@ -7456,6 +7456,411 @@ mod postgres_integration {
 
     #[cfg(feature = "R4")]
     #[tokio::test]
+    async fn postgres_2075_broad_count_preserves_exact_membership_and_reused_bindings() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::IMPLICIT_TOKEN_SYSTEM;
+        use helios_persistence::types::{SearchValue, TotalMode};
+
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let _reserved = backend.get_client().await.unwrap();
+        let tenant = create_tenant("broad-membership-2075");
+        let other = create_tenant("broad-membership-other-2075");
+        let observation = |id: &str, patient: &str, coding: serde_json::Value| {
+            json!({"resourceType":"Observation", "id":id, "status":"final",
+                   "subject":{"reference":format!("Patient/{patient}")},
+                   "code":{"coding":[coding]}})
+        };
+        let loinc = || json!({"system":"http://loinc.org","code":"8302-2"});
+        for id in [
+            "explicit",
+            "implicit",
+            "no-system",
+            "wrong-system",
+            "split",
+            "contained",
+            "other",
+            "collision-only",
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":id}),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        for (id, patient, coding) in [
+            ("explicit-ob", "explicit", loinc()),
+            ("implicit-ob", "implicit", json!({"code":"8302-2"})),
+            ("no-system-ob", "no-system", json!({"code":"8302-2"})),
+            (
+                "wrong-system-ob",
+                "wrong-system",
+                json!({"system":"http://example.org","code":"8302-2"}),
+            ),
+            (
+                "split-ref",
+                "split",
+                json!({"system":"http://loinc.org","code":"wrong"}),
+            ),
+            ("split-code", "explicit", loinc()),
+            ("hash-ob-47973", "explicit", loinc()),
+            (
+                "hash-ob-226852",
+                "collision-only",
+                json!({"system":"http://loinc.org","code":"wrong"}),
+            ),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    observation(id, patient, coding),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        // The prefilter is allowed to see this contained token, but the exact
+        // guard must reject it even with a valid top-level patient index row.
+        let mut contained = observation(
+            "contained-ob",
+            "contained",
+            json!({"system":"http://loinc.org","code":"wrong"}),
+        );
+        contained["contained"] = json!([observation("child", "contained", loinc())]);
+        backend
+            .create(&tenant, "Observation", contained, FhirVersion::R4)
+            .await
+            .unwrap();
+        backend
+            .create(
+                &other,
+                "Patient",
+                json!({"resourceType":"Patient","id":"other"}),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &other,
+                "Observation",
+                observation("explicit-ob", "other", loinc()),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        let client = backend.get_client().await.unwrap();
+        let hash_collision: bool = client
+            .query_one(
+                "SELECT hashtext('hash-ob-47973') = hashtext('hash-ob-226852')",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            hash_collision,
+            "exercise a real PostgreSQL 16 hash collision"
+        );
+        // Exercise the supported implicit-system index marker separately from
+        // a Coding that genuinely omits system (stored as NULL by the writer).
+        assert_eq!(client.execute(
+            "UPDATE search_index SET value_token_system=$2 WHERE tenant_id=$1 AND resource_id='implicit-ob' AND param_name='code'",
+            &[&tenant.tenant_id().as_str(), &IMPLICIT_TOKEN_SYSTEM]).await.unwrap(), 1);
+        let contained_code_rows: i64 = client.query_one(
+            "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_id='contained-ob' AND param_name='code' AND is_contained=TRUE AND value_token_code='8302-2'",
+            &[&tenant.tenant_id().as_str()]).await.unwrap().get(0);
+        let top_level_patient_rows: i64 = client.query_one(
+            "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_id='contained-ob' AND param_name='patient' AND is_contained=FALSE AND value_reference='Patient/contained'",
+            &[&tenant.tenant_id().as_str()]).await.unwrap().get(0);
+        assert!(contained_code_rows > 0);
+        assert_eq!(top_level_patient_rows, 1);
+        client
+            .batch_execute("SET plan_cache_mode=auto")
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut query = native_has_1579_query();
+        query.total = Some(TotalMode::Accurate);
+        query.count = Some(1);
+        let first = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(first.total, Some(2));
+        assert_eq!(first.resources.items.len(), 1);
+        query.cursor = first.next_cursor().cloned();
+        assert!(query.cursor.is_some());
+        let second = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(second.total, Some(2));
+        assert_ne!(
+            first.resources.items[0].id(),
+            second.resources.items[0].id()
+        );
+        let mut ids = vec![
+            first.resources.items[0].id(),
+            second.resources.items[0].id(),
+        ];
+        ids.sort();
+        assert_eq!(ids, ["explicit", "implicit"]);
+        assert_eq!(
+            backend.search_count(&tenant, &query).await.unwrap(),
+            2,
+            "count ignores cursor and limit"
+        );
+        query.cursor = None;
+        query.offset = Some(99);
+        assert_eq!(
+            backend.search_count(&tenant, &query).await.unwrap(),
+            2,
+            "count ignores offset"
+        );
+        // Reuse one cached statement across tenants and different token values.
+        for _ in 0..6 {
+            assert_eq!(backend.search_count(&other, &query).await.unwrap(), 1);
+            query.reverse_chains[0].value = Some(SearchValue::eq("http://example.org|8302-2"));
+            assert_eq!(
+                backend.search_count(&tenant, &query).await.unwrap(),
+                2,
+                "requested or implicit system"
+            );
+            query.reverse_chains[0].value = Some(SearchValue::eq("http://loinc.org|absent"));
+            assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 0);
+            query.reverse_chains[0].value = Some(SearchValue::eq("http://loinc.org|8302-2"));
+            assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 2);
+        }
+        let client = backend.get_client().await.unwrap();
+        let uses: i64 = client.query_one(
+            "SELECT custom_plans + generic_plans FROM pg_prepared_statements WHERE statement LIKE 'SELECT COUNT(*) FROM resources%' AND statement LIKE '%WITH referenced_observations AS MATERIALIZED%'", &[]).await.unwrap().get(0);
+        assert!(
+            uses >= 24,
+            "reuse the prepared count past PostgreSQL's automatic-plan threshold"
+        );
+        let mode: String = client
+            .query_one("SHOW plan_cache_mode", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(mode, "auto");
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn postgres_2075_broad_prepared_count_skips_negative_source_probes() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchValue, TotalMode};
+
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let _reserved = backend.get_client().await.unwrap();
+        let tenant = create_tenant("broad-plan-2075");
+        let tenant_id = tenant.tenant_id().as_str();
+        // Multiple outer targets are essential: an _id-scoped plan does not
+        // expose the repeated exact code probes of a broad accurate count.
+        let client = backend.get_client().await.unwrap();
+        client.execute(
+            "INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) \
+             SELECT $1,'Patient','negative-'||n,'1',jsonb_build_object('resourceType','Patient','id','negative-'||n),statement_timestamp(),FALSE FROM generate_series(1,32) n", &[&tenant_id]).await.unwrap();
+        client.execute(
+            "INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) \
+             SELECT $1,'Observation','negative-ob-'||n,'1',jsonb_build_object('resourceType','Observation','id','negative-ob-'||n, \
+             'subject',jsonb_build_object('reference','Patient/negative-'||n)),statement_timestamp(),FALSE FROM generate_series(1,32) n", &[&tenant_id]).await.unwrap();
+        client.execute(
+            "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_reference) \
+             SELECT $1,'Observation','negative-ob-'||n,'patient','Patient/negative-'||n FROM generate_series(1,32) n", &[&tenant_id]).await.unwrap();
+        client.execute(
+            "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) \
+             SELECT $1,'Observation','negative-ob-'||n,'code','http://loinc.org','negative-code-'||c \
+             FROM generate_series(1,32) n CROSS JOIN generate_series(1,32) c", &[&tenant_id]).await.unwrap();
+        drop(client);
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"positive"}),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        backend.create(&tenant, "Observation", json!({"resourceType":"Observation","id":"positive-ob","status":"final", "subject":{"reference":"Patient/positive"},"code":{"coding":[{"system":"http://loinc.org","code":"8302-2"}]}}), FhirVersion::R4).await.unwrap();
+        let mut query = native_has_1579_query();
+        query.total = Some(TotalMode::Accurate);
+        query.count = Some(5);
+        assert_eq!(
+            backend.search(&tenant, &query).await.unwrap().total,
+            Some(1)
+        );
+        let client = backend.get_client().await.unwrap();
+        let rows = client.query(
+            "SELECT name,statement,parameter_types::text FROM pg_prepared_statements \
+             WHERE statement LIKE 'SELECT COUNT(*) FROM resources%' AND statement LIKE '%WITH referenced_observations AS MATERIALIZED%'", &[]).await.unwrap();
+        assert_eq!(rows.len(), 1, "capture the actual cached broad count");
+        let name: String = rows[0].get(0);
+        let sql: String = rows[0].get(1);
+        assert_eq!(rows[0].get::<_, String>(2), "{text,text,text,text}");
+        println!("2075 actual count SQL: {sql}");
+
+        fn nodes<'a>(node: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            out.push(node);
+            if let Some(children) = node["Plans"].as_array() {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+        let mut violations = vec![];
+        for density in ["sparse", "dense", "overflow-distinct", "overflow-duplicate"] {
+            if density == "dense" {
+                // Index-only candidates deliberately include stale sources.
+                // They stress membership size without changing exact matches.
+                client.execute(
+                    "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) \
+                     SELECT $1,'Observation','dense-'||n,'code','http://loinc.org','8302-2' FROM generate_series(1,8192) n", &[&tenant_id]).await.unwrap();
+            }
+            let overflow = density.starts_with("overflow-");
+            if overflow {
+                client.execute("DELETE FROM search_index WHERE tenant_id=$1 AND (resource_id LIKE 'dense-%' OR resource_id LIKE 'overflow-%')", &[&tenant_id]).await.unwrap();
+                // Exceed the cap in input rows, both with distinct keys and with
+                // one repeated key. A partial map could lose real sources;
+                // overflow must disable the prefilter for this statement.
+                let duplicate = density == "overflow-duplicate";
+                client.execute(
+                    "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) \
+                     SELECT $1,'Observation',CASE WHEN $2 THEN 'overflow-duplicate' ELSE 'overflow-'||n END, \
+                     'code','http://loinc.org','8302-2' FROM generate_series(1,262145) n", &[&tenant_id, &duplicate]).await.unwrap();
+            }
+            client
+                .batch_execute("ANALYZE resources; ANALYZE search_index")
+                .await
+                .unwrap();
+            for code in ["8302-2", "absent"] {
+                let execute = format!(
+                    "EXECUTE \"{name}\" ('{tenant_id}','Patient','http://loinc.org','{code}')"
+                );
+                let total: i64 = client.query_one(&execute, &[]).await.unwrap().get(0);
+                assert_eq!(total, i64::from(code == "8302-2"));
+                for work_mem in ["4MB", "64kB"] {
+                    for mode in ["force_custom_plan", "force_generic_plan"] {
+                        client.batch_execute(&format!("SET plan_cache_mode={mode}; SET work_mem='{work_mem}'; DISCARD PLANS")).await.unwrap();
+                        let explain = format!(
+                            "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) EXECUTE \"{name}\" ('{tenant_id}','Patient','http://loinc.org','{code}')"
+                        );
+                        let plan: serde_json::Value =
+                            client.query_one(&explain, &[]).await.unwrap().get(0);
+                        let mut all = vec![];
+                        nodes(&plan[0]["Plan"], &mut all);
+                        let slice = all
+                            .iter()
+                            .find(|node| node["Subplan Name"] == "CTE scoped_code")
+                            .expect("unchanged exact resource-scoped guard");
+                        let probes = slice["Actual Loops"].as_u64().unwrap();
+                        let body_loops: u64 = all
+                            .iter()
+                            .filter(|node| node["Alias"] == "observation")
+                            .map(|node| node["Actual Loops"].as_u64().unwrap())
+                            .sum();
+                        let expected = u64::from(code == "8302-2");
+                        let expected_probes = if overflow && expected == 1 {
+                            33
+                        } else {
+                            expected
+                        };
+                        println!(
+                            "2075 {density} {code} {work_mem} {mode}: exact code probes={probes}, body guard loops={body_loops}; plan={plan}"
+                        );
+                        if probes != expected_probes {
+                            violations.push(format!("{density} {code} {work_mem} {mode}: {probes} exact code probes, expected {expected_probes}; negative sources skip the exact code guard unless the candidate cap disables prefiltering"));
+                        }
+                        assert_eq!(body_loops, expected, "{plan}");
+                        let candidate = all
+                            .iter()
+                            .find(|node| node["Alias"] == "code_candidates")
+                            .expect("token-only candidate scan");
+                        assert_eq!(
+                            candidate["Actual Loops"], 1,
+                            "candidate scan must run once: {plan}"
+                        );
+                        let initplans = all
+                            .iter()
+                            .filter(|node| {
+                                node["Parent Relationship"] == "InitPlan"
+                                    && node["Node Type"] == "Aggregate"
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(initplans.len(), 1, "one scalar membership InitPlan: {plan}");
+                        assert_eq!(initplans[0]["Actual Loops"], 1, "{plan}");
+                        let mut membership_nodes = vec![];
+                        nodes(initplans[0], &mut membership_nodes);
+                        let cap = membership_nodes
+                            .iter()
+                            .find(|node| node["Node Type"] == "Limit")
+                            .expect("bounded aggregate input");
+                        assert_eq!(cap["Actual Loops"], 1, "{plan}");
+                        if overflow && expected == 1 {
+                            assert_eq!(
+                                cap["Actual Rows"], 262145,
+                                "overflow reads only cap plus one rows: {plan}"
+                            );
+                        } else {
+                            assert!(cap["Actual Rows"].as_u64().unwrap() < 262145, "{plan}");
+                        }
+                        for candidate in all.iter().filter(|node| {
+                            node["Relation Name"] == "search_index"
+                                && ["Index Cond", "Filter", "Recheck Cond"]
+                                    .iter()
+                                    .any(|field| {
+                                        node[*field].as_str().is_some_and(|condition| {
+                                            condition.contains("value_token_code")
+                                                && !condition.contains("source.id")
+                                        })
+                                    })
+                        }) {
+                            if candidate["Actual Loops"].as_u64().unwrap() > 1 {
+                                violations.push(format!("{density} {work_mem} {mode}: candidate index rescanned: {candidate}"));
+                            }
+                        }
+                        // An uncorrelated candidate relation must be built once.
+                        // A materialize rescanned per source is the low-memory
+                        // failure mode this fixture is intended to expose.
+                        for candidate in
+                            all.iter().filter(|node| node["Node Type"] == "Materialize")
+                        {
+                            let conditions = candidate.to_string();
+                            if candidate["Actual Loops"].as_u64().unwrap() > 1
+                                && conditions.contains("value_token_code")
+                                && !conditions.contains("resource_id = source.id")
+                            {
+                                violations.push(format!("{density} {work_mem} {mode}: candidate materialization rescanned: {candidate}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        client
+            .batch_execute("RESET plan_cache_mode; RESET work_mem")
+            .await
+            .unwrap();
+        client.execute("DELETE FROM search_index WHERE tenant_id=$1 AND (resource_id LIKE 'dense-%' OR resource_id LIKE 'overflow-%')", &[&tenant_id]).await.unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+        drop(client);
+        query.reverse_chains[0].value = Some(SearchValue::eq("http://loinc.org|absent"));
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 0);
+        assert!(
+            violations.is_empty(),
+            "broad count physical regression:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
     async fn postgres_1579_native_has_membership_count_ids_and_pagination() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::search::resolve_chains;
