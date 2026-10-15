@@ -1198,9 +1198,11 @@ Subjects table controls (on `/ui/sql/export/new`):
 ### 11.7 Optional S3 sink (`sqlite`/`postgres` rows)
 
 Restart with `HFS_EXPORT_SINK=s3 HFS_EXPORT_S3_BUCKET=hfs-sql-export
-HFS_EXPORT_S3_REGION=us-east-1` (MinIO credentials and
-`AWS_ENDPOINT_URL=http://localhost:9000`) and repeat 7.a; the pills must be
-pre-signed URLs that download.
+HFS_EXPORT_S3_ENDPOINT=http://localhost:9000` plus the MinIO credentials from
+section 5 (the endpoint forces path-style addressing and a `us-east-1` region) and
+repeat 7.a; the pills must be pre-signed MinIO URLs that download. The server needs
+an `s3` build: without the feature, or without `HFS_EXPORT_S3_BUCKET`, it must
+refuse to start.
 
 Pass criteria: every kick-off in 7.a–7.d, 7.g–7.k, and 7.m–7.q produces a card that
 reaches **Complete**; the files parse in their declared format with the stated contents and
