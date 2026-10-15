@@ -169,9 +169,19 @@ if bi:
 
     bi_status = bi.get("status", "?")
     if bi_status == "complete":
+        # index_seconds=0 with index_status=inline means HFS indexed while ingesting,
+        # not that indexing was free; say so instead of printing a zero-second rebuild.
+        bi_ingest = f"ingest {bi.get('ingest_seconds', '?')} s"
+        if bi.get("index_status") == "inline" or bi.get("defer_indexing") == "false":
+            bi_phases = f"{bi_ingest}, search index built inline during ingest"
+            if bi.get("index_status") not in ("inline", "", None):
+                bi_phases += (f" + {bi.get('index_seconds', '?')} s rebuild of rejected types, "
+                              f"`{bi.get('index_status')}`")
+        else:
+            bi_phases = (f"{bi_ingest} + search-index rebuild {bi.get('index_seconds', '?')} s, "
+                         f"`{bi.get('index_status', '?')}`")
         print(f"\n**Bulk import (`$bulk-submit`):** {bi_n('resources_ok')}/{bi_n('resources_submitted')} "
-              f"resources in {bi.get('total_seconds', '?')} s (ingest {bi.get('ingest_seconds', '?')} s + "
-              f"search-index rebuild {bi.get('index_seconds', '?')} s, `{bi.get('index_status', '?')}`) = "
+              f"resources in {bi.get('total_seconds', '?')} s ({bi_phases}) = "
               f"**{bi.get('resources_per_s', '?')} resources/s** end to end, "
               f"{bi.get('ingest_resources_per_s', '?')} resources/s ingest only; fresh database, "
               f"`defer_indexing={bi.get('defer_indexing', '?')}`.")
@@ -205,7 +215,7 @@ if drain:
           f"es_live={drain.get('es_live', '?')} missing={d_missing} "
           f"needs_reindex={drain.get('needs_reindex_after', '?')}.{d_warn}")
 
-# Indexing suite: one timed `POST /<type>/$reindex` after search
+# Indexing suite (opt-in: only when tests names it): one timed `POST /<type>/$reindex` after search
 # (run_indexing_suite in suite-lib.sh documents what it measures and why it
 # is comparable across legs). indexing-hfs-log.txt holds the job's own
 # `reindex job finished` line from the HFS log: where the time went.

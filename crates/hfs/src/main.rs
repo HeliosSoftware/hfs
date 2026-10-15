@@ -109,6 +109,21 @@ fn parse_env_bool(var: &str, default_value: bool) -> bool {
         .unwrap_or(default_value)
 }
 
+/// An S3 endpoint override, or `None` when it is unset or blank — so an empty
+/// `HFS_*_S3_ENDPOINT=` neither replaces the AWS endpoint nor forces
+/// path-style addressing.
+// Only bulk export's S3 output store calls it, and that is built only with a
+// SQL backend; the unit test keeps it exercised in every build.
+#[cfg_attr(
+    not(all(feature = "s3", any(feature = "sqlite", feature = "postgres"))),
+    allow(dead_code)
+)]
+fn non_blank_endpoint(endpoint: Option<String>) -> Option<String> {
+    endpoint
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+}
+
 /// The `HFS_S3_*` variables that decide where tenants live on S3, read as raw
 /// strings so [`resolve`](Self::resolve) can be unit-tested without touching
 /// the process environment (#1598).
@@ -308,6 +323,23 @@ fn parse_s3_keyspace_layout(
     }
 }
 
+/// Parses `HFS_S3_SCAN_CONCURRENCY`: the most `GetObject` requests the S3 read
+/// fan-outs may have in flight at once. Unset or blank is the default (32); a
+/// value that is not a whole number of at least 1 is an error rather than a
+/// silent fall back, since `0` would stall every scan.
+#[cfg(feature = "s3")]
+fn parse_s3_scan_concurrency(raw: Option<&str>) -> anyhow::Result<usize> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(helios_persistence::backends::s3::DEFAULT_SCAN_CONCURRENCY),
+        Some(value) => match value.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => anyhow::bail!(
+                "HFS_S3_SCAN_CONCURRENCY '{value}' invalid (expected a whole number of at least 1)"
+            ),
+        },
+    }
+}
+
 /// Builds the primary S3 backend's configuration from the `HFS_S3_*`
 /// environment: the one reader for `start_s3`, `start_s3_elasticsearch` and
 /// the shared database audit sink, so the three cannot disagree about where
@@ -321,9 +353,12 @@ fn s3_backend_config_from_env(
     let tenancy_mode = S3TenancyEnv::from_env().resolve(default_tenant)?;
     let default_keyspace_layout =
         parse_s3_keyspace_layout(std::env::var("HFS_S3_KEYSPACE_LAYOUT").ok().as_deref())?;
+    let scan_concurrency =
+        parse_s3_scan_concurrency(std::env::var("HFS_S3_SCAN_CONCURRENCY").ok().as_deref())?;
     Ok(S3BackendConfig {
         tenancy_mode,
         default_keyspace_layout,
+        scan_concurrency,
         region: std::env::var("HFS_S3_REGION").ok(),
         prefix: std::env::var("HFS_S3_PREFIX").ok(),
         endpoint_url: std::env::var("HFS_S3_ENDPOINT")
@@ -1949,7 +1984,8 @@ async fn main() -> anyhow::Result<()> {
     // Keep the skipped sub-configs populated while surfacing invalid CLI and
     // environment values instead of silently replacing the whole config with
     // defaults.
-    let mut config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
+    let (mut config, default_fhir_version_is_implicit) =
+        ServerConfig::try_from_env_with_provenance().unwrap_or_else(|error| error.exit());
     // The REST builder uses this same flag to start the dashboard's background
     // work. A binary without the UI must not seed or reconcile unseen figures.
     config.ui_enabled = effective_ui_enabled(config.ui_enabled);
@@ -1967,6 +2003,18 @@ async fn main() -> anyhow::Result<()> {
             bind_address = %config.socket_addr(),
             "{message}. Set HFS_BASE_URL to the public HTTP(S) origin clients can reach"
         );
+    }
+
+    // A build without R4 that enables several versions has no default FHIR
+    // version to fall back to (#2064): every R5 or R6 build also enables R4B,
+    // and serving R4B because nobody chose a version is hard to undo. Refuse to
+    // start, in the same form and with the same exit code as the
+    // `config.validate()` failure below.
+    if let Some(message) =
+        config.implicit_default_fhir_version_error(default_fhir_version_is_implicit)
+    {
+        eprintln!("Configuration error: {}", message);
+        std::process::exit(1);
     }
 
     if let Err(errors) = config.validate() {
@@ -2155,6 +2203,36 @@ where
         ids.push(default);
     }
     ids
+}
+
+/// Keeps the SQLite WAL bounded on every write path, not only `$bulk-submit`
+/// (#2025). Every 2 s the -wal file's size is read (a `stat`, no pooled
+/// connection); past the threshold it is folded back into the database and
+/// truncated. Under 20 concurrent transaction Bundles the WAL grows by
+/// 200–250 MB/s, so a slower check lets it reach gigabytes between passes. A
+/// pass that finds readers or writers in the way gives up after a second and
+/// the next one retries.
+#[cfg(feature = "sqlite")]
+fn spawn_sqlite_wal_maintenance(backend: Arc<SqliteBackend>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(e) = backend.maintain_wal().await {
+                tracing::warn!("SQLite WAL maintenance failed; the next pass retries: {e}");
+            }
+        }
+    });
+}
+
+/// Folds the SQLite WAL back and truncates it after the server drained, so a
+/// restart does not inherit it (#2025).
+#[cfg(feature = "sqlite")]
+async fn checkpoint_sqlite_wal_at_shutdown(backend: &SqliteBackend) {
+    if let Err(e) = backend.checkpoint_wal_at_shutdown().await {
+        warn!("SQLite WAL checkpoint at shutdown failed: {e}");
+    }
 }
 
 /// Spawns the periodic registry refresh from storage for the SQLite backend
@@ -2461,6 +2539,8 @@ async fn start_sqlite(
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_sqlite_search_param_refresh(backend.clone(), &config);
+    spawn_sqlite_wal_maintenance(backend.clone());
+    let wal_backend = backend.clone();
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own). Cheap: the SQLite backend
     // shares one connection pool behind the Arc.
@@ -2501,7 +2581,7 @@ async fn start_sqlite(
         settings_store,
         ops,
     );
-    serve(
+    let served = serve(
         app,
         &config,
         serve_audit_state,
@@ -2510,7 +2590,9 @@ async fn start_sqlite(
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
-    .await
+    .await;
+    checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
+    served
 }
 
 /// Constructs an embedded SQLite job store for backends that can't host job
@@ -2640,14 +2722,17 @@ where
                     .ok()
                     .or_else(|| std::env::var("HFS_S3_REGION").ok());
                 let sdk_config = AwsS3Client::load_sdk_config(region.as_deref()).await;
+                let endpoint_url =
+                    non_blank_endpoint(std::env::var("HFS_BULK_EXPORT_S3_ENDPOINT").ok());
+                // A custom endpoint forces path-style addressing, as for the
+                // S3 storage backend and the `$sql-export` S3 sink.
+                let force_path_style = endpoint_url.is_some()
+                    || parse_env_bool("HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE", false);
                 let client = Arc::new(AwsS3Client::from_sdk_config_with_options(
                     &sdk_config,
                     AwsS3ClientOptions {
-                        endpoint_url: std::env::var("HFS_BULK_EXPORT_S3_ENDPOINT").ok(),
-                        force_path_style: parse_env_bool(
-                            "HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE",
-                            false,
-                        ),
+                        endpoint_url,
+                        force_path_style,
                     },
                 ));
                 Arc::new(S3OutputStore::new(
@@ -3077,14 +3162,17 @@ async fn build_bulk_submit(
                     .ok()
                     .or_else(|| std::env::var("HFS_S3_REGION").ok());
                 let sdk_config = AwsS3Client::load_sdk_config(region.as_deref()).await;
+                let endpoint_url =
+                    non_blank_endpoint(std::env::var("HFS_BULK_SUBMIT_S3_ENDPOINT").ok());
+                // A custom endpoint forces path-style addressing, as for bulk
+                // export, the S3 storage backend and the `$sql-export` S3 sink.
+                let force_path_style = endpoint_url.is_some()
+                    || parse_env_bool("HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE", false);
                 let client = Arc::new(AwsS3Client::from_sdk_config_with_options(
                     &sdk_config,
                     AwsS3ClientOptions {
-                        endpoint_url: std::env::var("HFS_BULK_SUBMIT_S3_ENDPOINT").ok(),
-                        force_path_style: parse_env_bool(
-                            "HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE",
-                            false,
-                        ),
+                        endpoint_url,
+                        force_path_style,
                     },
                 ));
                 Arc::new(S3OutputStore::new(
@@ -3378,6 +3466,8 @@ async fn start_sqlite_elasticsearch(
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
     spawn_sqlite_search_param_refresh(sqlite.clone(), &config);
+    spawn_sqlite_wal_maintenance(sqlite.clone());
+    let wal_backend = sqlite.clone();
 
     // Build Elasticsearch configuration from server config
     let es_nodes: Vec<String> = config
@@ -3559,7 +3649,7 @@ async fn start_sqlite_elasticsearch(
     );
     // The UI's tenant-maintenance path goes through the composite (not the
     // bare primary) so a purge also clears the offloaded search documents.
-    serve(
+    let served = serve(
         app,
         &config,
         serve_audit_state,
@@ -3568,7 +3658,9 @@ async fn start_sqlite_elasticsearch(
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
     )
-    .await
+    .await;
+    checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
+    served
 }
 
 /// Fallback when elasticsearch feature is not enabled.
@@ -4198,6 +4290,7 @@ async fn start_s3(
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
+        scan_concurrency = s3_config.scan_concurrency,
         "Initializing S3 backend"
     );
 
@@ -4366,6 +4459,7 @@ async fn start_s3_elasticsearch(
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
+        scan_concurrency = s3_config.scan_concurrency,
         "Initializing S3 backend (primary)"
     );
 
@@ -4665,6 +4759,17 @@ mod tests {
     use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
 
+    #[test]
+    fn non_blank_endpoint_drops_unset_and_blank_values() {
+        assert_eq!(non_blank_endpoint(None), None);
+        assert_eq!(non_blank_endpoint(Some(String::new())), None);
+        assert_eq!(non_blank_endpoint(Some("   ".to_string())), None);
+        assert_eq!(
+            non_blank_endpoint(Some(" http://localhost:9000 ".to_string())),
+            Some("http://localhost:9000".to_string())
+        );
+    }
+
     // ── S3 tenancy from the environment (#1598) ───────────────────
 
     #[cfg(feature = "s3")]
@@ -4895,6 +5000,34 @@ mod tests {
                 let err = parse_s3_keyspace_layout(Some(bad)).unwrap_err().to_string();
                 assert!(err.contains("HFS_S3_KEYSPACE_LAYOUT"), "{err}");
                 assert!(err.contains("expected v1|v2"), "{err}");
+            }
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    mod s3_scan_concurrency {
+        use super::*;
+
+        #[test]
+        fn unset_or_blank_is_the_default() {
+            assert_eq!(parse_s3_scan_concurrency(None).unwrap(), 32);
+            assert_eq!(parse_s3_scan_concurrency(Some("  ")).unwrap(), 32);
+        }
+
+        #[test]
+        fn whole_numbers_of_at_least_one_parse() {
+            assert_eq!(parse_s3_scan_concurrency(Some("1")).unwrap(), 1);
+            assert_eq!(parse_s3_scan_concurrency(Some(" 8 ")).unwrap(), 8);
+        }
+
+        #[test]
+        fn zero_negative_and_junk_are_refused() {
+            for bad in ["0", "-1", "abc", "1.5", "32x"] {
+                let err = parse_s3_scan_concurrency(Some(bad))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("HFS_S3_SCAN_CONCURRENCY"), "{err}");
+                assert!(err.contains("at least 1"), "{err}");
             }
         }
     }

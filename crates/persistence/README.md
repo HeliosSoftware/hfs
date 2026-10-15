@@ -975,6 +975,7 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 | `HFS_S3_PREFIX` | (none) | Optional global key prefix |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate buckets on startup via `HeadBucket` |
 | `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
 
 AWS credentials are resolved via the standard AWS provider chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, EC2 instance metadata, shared credentials file, SSO, etc.).
 
@@ -1328,6 +1329,7 @@ let config = S3BackendConfig {
 | `validate_buckets_on_startup` | `true` | Validate configured buckets with `HeadBucket` on startup |
 | `bulk_submit_batch_size` | `100` | Default ingestion batch size for bulk submit processing |
 | `default_keyspace_layout` | `KeyspaceLayout::V1` | Layout given to new, empty tenants (`V1` flat, `V2` sharded); an existing tenant keeps what its marker or data says |
+| `scan_concurrency` | `32` | Most `GetObject` requests the read fan-outs (SQL-on-FHIR scans and by-id reads, type counts, conditional-create and SearchParameter scans, `_history`) may have in flight at once, shared by every request on the backend; at least 1. Writes keep their own fan-out |
 
 ### Tenancy Modes
 

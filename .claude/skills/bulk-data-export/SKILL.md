@@ -29,7 +29,7 @@ All kick-offs require `Prefer: respond-async`. The default response is `202 Acce
 | `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local filesystem output root |
 | `HFS_BULK_EXPORT_S3_BUCKET` | none | S3 bucket, required when output backend is s3 |
 | `HFS_BULK_EXPORT_S3_ENDPOINT` | AWS | S3-compatible endpoint URL, such as MinIO |
-| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers |
+| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers; forced on when `HFS_BULK_EXPORT_S3_ENDPOINT` is set |
 | `HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: auto, true, or false; false is invalid with local-fs |
 | `HFS_BULK_EXPORT_FILE_URL_TTL` | `3600` | Pre-signed download URL lifetime in seconds |
 | `HFS_BULK_EXPORT_OUTPUT_TTL` | `86400` | Output retention after job completion in seconds |

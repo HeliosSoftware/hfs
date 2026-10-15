@@ -191,6 +191,18 @@ jobs:
           fi
           echo "All test subdirectories are wired into a top-level test binary."
 
+      # Make room before the build, not after it fails. On the Windows agents
+      # this build grows target/ by 130-150GB, and the end-of-job sweep below
+      # only caps what is left between jobs; a run that started with ~150GB
+      # free ran out mid-link (run 38627332199). 175 covers the largest growth
+      # seen plus margin, and is a no-op on the Linux agents (~230GB free, ~30GB
+      # growth). See "Pre-build headroom" in .github/actions/cargo-target-gc.
+      - name: Ensure build headroom
+        uses: ./.github/actions/cargo-target-gc
+        with:
+          mode: preflight
+          min-free-gb: "175"
+
       # `--all-features` enables R5, so this is the one job where the R5 FHIRPath
       # conformance suite is live rather than compiled to its `#[cfg(not(R5))]`
       # no-op twin. HFS_REQUIRE_R5 makes that a hard requirement here: if the
@@ -635,28 +647,72 @@ jobs:
       # arm that is only used under R4. Kept to two invocations: each rebuilds
       # the generated `helios-fhir` model for its feature set.
       #
+      # `ui` is listed on the `helios-hfs` spec because `--no-default-features`
+      # drops it, and helios-ui gates its own total `FhirVersion` matches on its
+      # own features. With `ui` dropped, an R5-without-R4B set never compiled it
+      # (#2051). helios-fhir's feature set is unchanged by adding it, so this is
+      # still two model builds.
+      #
       # Same Windows/non-Windows split as the #1291 step above: a bare
       # `shell: bash` is WSL's bash on the self-hosted Windows agent.
       - name: Check builds with FHIR version feature subsets (#1367)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite"; do
+          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite,ui"; do
             set -- $spec
             echo "::group::$1 --no-default-features --features $2"
             cargo clippy -p "$1" --no-default-features --features "$2" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
             echo "::endgroup::"
           done
+          # helios-rest and helios-hfs R5/R6 enable R4B on purpose (#2064), so
+          # neither spec above still compiles a crate whose own features lack a
+          # variant helios-fhir has. helios-persistence R5 does not enable its
+          # R4B (only helios-audit turns helios-fhir/R4B on), nor do the
+          # helios-sof and helios-fhirpath it pulls in, so this spec keeps the
+          # #1367-style E0004 coverage for them. It ends up with the same
+          # FHIR version set as the helios-hfs spec above.
+          echo "::group::helios-persistence --no-default-features --features R5,sqlite"
+          cargo clippy -p helios-persistence --no-default-features --features R5,sqlite -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+          echo "::endgroup::"
+          # `cargo clippy` cannot catch a runtime panic, and #2064 was one: a
+          # validator catch-all arm that panicked for a FHIR version helios-fhir
+          # had enabled (through helios-audit R5) but the validator was built
+          # without. The regression test only fails in an R5/R6 build that does
+          # not enable R4B; default features (R4 only) and --all-features
+          # (every version) cannot fail it, so run it under R5 here.
+          echo "::group::helios-rest fhir_version_coverage --no-default-features --features R5,sqlite"
+          cargo test -p helios-rest --no-default-features --features R5,sqlite --test fhir_version_coverage
+          echo "::endgroup::"
       - name: Check builds with FHIR version feature subsets (#1367) (Windows)
         if: runner.os == 'Windows'
         shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
         run: |
-          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite"; do
+          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite,ui"; do
             set -- $spec
             echo "::group::$1 --no-default-features --features $2"
             cargo clippy -p "$1" --no-default-features --features "$2" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
             echo "::endgroup::"
           done
+          # helios-rest and helios-hfs R5/R6 enable R4B on purpose (#2064), so
+          # neither spec above still compiles a crate whose own features lack a
+          # variant helios-fhir has. helios-persistence R5 does not enable its
+          # R4B (only helios-audit turns helios-fhir/R4B on), nor do the
+          # helios-sof and helios-fhirpath it pulls in, so this spec keeps the
+          # #1367-style E0004 coverage for them. It ends up with the same
+          # FHIR version set as the helios-hfs spec above.
+          echo "::group::helios-persistence --no-default-features --features R5,sqlite"
+          cargo clippy -p helios-persistence --no-default-features --features R5,sqlite -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+          echo "::endgroup::"
+          # `cargo clippy` cannot catch a runtime panic, and #2064 was one: a
+          # validator catch-all arm that panicked for a FHIR version helios-fhir
+          # had enabled (through helios-audit R5) but the validator was built
+          # without. The regression test only fails in an R5/R6 build that does
+          # not enable R4B; default features (R4 only) and --all-features
+          # (every version) cannot fail it, so run it under R5 here.
+          echo "::group::helios-rest fhir_version_coverage --no-default-features --features R5,sqlite"
+          cargo test -p helios-rest --no-default-features --features R5,sqlite --test fhir_version_coverage
+          echo "::endgroup::"
 
       # Git for Windows defaults to `core.symlinks=false` and checks a symlink
       # out as a text file holding the link target, which broke the Windows

@@ -695,6 +695,34 @@ pub enum BackendError {
     },
 }
 
+impl BackendError {
+    /// Whether this is a transient infrastructure failure (the backend is
+    /// down, unreachable or saturated) rather than a fault in the request or
+    /// the server: [`Self::Unavailable`], [`Self::ConnectionFailed`] and
+    /// [`Self::PoolExhausted`].
+    ///
+    /// This is the single definition of "transient" for the layers that answer
+    /// `503` rather than `500` for these errors, so adding a variant here
+    /// changes their status codes together (#2048).
+    /// [`Self::Timeout`] is deliberately not included: it is a `504`.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            BackendError::Unavailable { .. }
+                | BackendError::ConnectionFailed { .. }
+                | BackendError::PoolExhausted { .. }
+        )
+    }
+}
+
+impl StorageError {
+    /// Whether this error is a transient backend failure; see
+    /// [`BackendError::is_unavailable`].
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, StorageError::Backend(e) if e.is_unavailable())
+    }
+}
+
 /// Errors related to bulk export operations.
 #[derive(Error, Debug)]
 pub enum BulkExportError {
@@ -1106,12 +1134,12 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 /// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
 ///   message this helper's callers produced before.
 ///
-/// HFS sets `maxTimeMS` on one command only: the cross-tenant
-/// `count_by_tenant` aggregate (#1828,
-/// `MongoBackendConfig::count_by_tenant_max_time_ms`). Elsewhere the timeout
-/// arm fires only when the deadline comes from the server or a
-/// connection-string option. `maxTimeMS` bounds server execution at interrupt
-/// points; server selection, pool checkout and socket time are outside it.
+/// Search commands can set `maxTimeMS` from an optional whole-search deadline.
+/// Optional planner probes classify their own shorter timeouts before this helper.
+/// The cross-tenant `count_by_tenant` aggregate has a separate budget (#1828,
+/// `MongoBackendConfig::count_by_tenant_max_time_ms`). `maxTimeMS` bounds server
+/// execution at interrupt points; server selection, pool checkout and socket
+/// time are outside it.
 #[cfg(feature = "mongodb")]
 pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> BackendError {
     use mongodb::error::ErrorKind;
@@ -1565,6 +1593,54 @@ mod tests {
         };
         let storage_err: StorageError = submit_err.into();
         assert!(matches!(storage_err, StorageError::BulkSubmit(_)));
+    }
+
+    /// #2048: the one predicate the 503-vs-500 decisions share.
+    #[test]
+    fn is_unavailable_is_true_only_for_transient_backend_failures() {
+        let transient = [
+            BackendError::Unavailable {
+                backend_name: "s3".to_string(),
+                message: "slow down".to_string(),
+            },
+            BackendError::ConnectionFailed {
+                backend_name: "postgres".to_string(),
+                message: "refused".to_string(),
+            },
+            BackendError::PoolExhausted {
+                backend_name: "postgres".to_string(),
+            },
+        ];
+        for err in transient {
+            assert!(err.is_unavailable(), "{err:?}");
+            assert!(StorageError::Backend(err).is_unavailable());
+        }
+
+        let not_transient = [
+            BackendError::Timeout {
+                backend_name: "postgres".to_string(),
+                message: "statement_timeout".to_string(),
+            },
+            BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: "boom".to_string(),
+                source: None,
+            },
+            BackendError::QueryError {
+                message: "syntax".to_string(),
+            },
+        ];
+        for err in not_transient {
+            assert!(!err.is_unavailable(), "{err:?}");
+            assert!(!StorageError::Backend(err).is_unavailable());
+        }
+
+        let not_backend: StorageError = ResourceError::NotFound {
+            resource_type: "Patient".to_string(),
+            id: "1".to_string(),
+        }
+        .into();
+        assert!(!not_backend.is_unavailable());
     }
 
     #[test]
