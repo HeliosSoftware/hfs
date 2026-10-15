@@ -172,3 +172,75 @@ fn typed_view_definition_fixes_the_parquet_schema() {
     assert_eq!(ty("b"), DataType::Boolean);
     assert!(matches!(ty("tags"), DataType::List(_)), "{:?}", ty("tags"));
 }
+
+/// What the maintainer asked for in review of #1989: `decimal` is `Utf8`,
+/// `instant` is `Timestamp(µs, UTC)`, `base64Binary` is `Binary` and a
+/// collection column is a typed list, through the incremental writers too.
+#[test]
+fn streaming_writers_follow_the_spec_type_table() {
+    use arrow::array::{Array, BinaryArray, Int32Array, ListArray, StringArray};
+    use arrow::datatypes::{DataType, TimeUnit};
+    use helios_sof::sqlquery::engine::try_declared_columns;
+
+    let view = json!({"select": [{"column": [
+        {"name": "d", "path": "x", "type": "decimal"},
+        {"name": "i", "path": "x", "type": "instant"},
+        {"name": "b", "path": "x", "type": "base64Binary"},
+        {"name": "ns", "path": "x", "type": "integer", "collection": true},
+    ]}]});
+    let declared = try_declared_columns(&view).unwrap();
+    let r = ProcessedResult {
+        columns: ["d", "i", "b", "ns"].map(String::from).to_vec(),
+        rows: vec![ProcessedRow {
+            values: vec![
+                Some(json!(1.5)),
+                Some(json!("2024-01-01T12:00:00+02:00")),
+                Some(json!("aGVsbG8=")),
+                Some(json!([1, 2, 3])),
+            ],
+        }],
+    };
+    let schema = Arc::new(resolve_arrow_schema(&r.columns, &declared, &r.rows).unwrap());
+    assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    assert_eq!(
+        schema.field(1).data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+    );
+    assert_eq!(schema.field(2).data_type(), &DataType::Binary);
+    assert!(
+        matches!(schema.field(3).data_type(), DataType::List(f) if f.data_type() == &DataType::Int32)
+    );
+
+    let mut w = ParquetStreamWriter::new(Vec::new(), schema, &ParquetOptions::default()).unwrap();
+    w.write_rows(&r.rows).unwrap();
+    let (_, batch, _) = read_parquet(w.finish().unwrap());
+
+    let d = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(d.value(0), "1.5");
+    let b = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(b.value(0), b"hello");
+    let ns = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let items = ns.value(0);
+    let items = items.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(items.values(), &[1, 2, 3]);
+    // 12:00 at +02:00 is 10:00 UTC.
+    let micros = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(micros, 1_704_103_200_000_000);
+}
