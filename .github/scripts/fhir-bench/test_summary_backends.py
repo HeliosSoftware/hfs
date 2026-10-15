@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Unit tests for summary_backends.py's indexing-suite lines: stdlib unittest,
+# Unit tests for summary_backends.py's indexing-suite and bulk-import lines: stdlib unittest,
 # synthetic bench-results/<leg>/ files built in code, the script run as the
 # workflow runs it (its own python process, GITHUB_WORKSPACE + BACKEND set).
 # Not wired into CI. Run from the repo root:
@@ -20,7 +20,7 @@ FINISHED = ("2026-10-09T13:19:08.201143Z  INFO helios_persistence::search::reind
             "writer_other_ms=7401 yield_ms=31 other_ms=74 db_wait_ms=0\n")
 
 
-class SummaryIndexingTest(unittest.TestCase):
+class SummaryRunMixin(object):
     def summary(self, files, backend="sqlite"):
         ws = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, ws, True)
@@ -34,6 +34,41 @@ class SummaryIndexingTest(unittest.TestCase):
                               stderr=subprocess.PIPE, universal_newlines=True,
                               check=True).stdout
 
+
+def bulk_txt(**kv):
+    """A complete bulk-import.txt body (key=value), deferred indexing by default."""
+    fields = {"status": "complete", "resources_submitted": 1630685, "resources_ok": 1630685,
+              "resources_failed": 0, "defer_indexing": "true", "ingest_seconds": 600,
+              "index_status": "completed", "index_seconds": 1800, "total_seconds": 2400,
+              "resources_per_s": 679.5, "ingest_resources_per_s": 2717.8, "searchable": "yes"}
+    fields.update(kv)
+    return "".join("%s=%s\n" % (k, v) for k, v in fields.items())
+
+
+class SummaryBulkImportTest(SummaryRunMixin, unittest.TestCase):
+    def test_bulk_line_deferred_unchanged(self):
+        out = self.summary({"bulk-import.txt": bulk_txt()})
+        self.assertIn("resources in 2400 s (ingest 600 s + search-index rebuild 1800 s, "
+                      "`completed`) = **679.5 resources/s** end to end, 2717.8 resources/s "
+                      "ingest only; fresh database, `defer_indexing=true`.", out)
+
+    def test_bulk_line_inline(self):
+        out = self.summary({"bulk-import.txt": bulk_txt(
+            defer_indexing="false", index_status="inline", index_seconds=0, total_seconds=600)})
+        self.assertIn("(ingest 600 s, search index built inline during ingest)", out)
+        self.assertNotIn("rebuild 0 s", out)
+        self.assertNotIn("search-index rebuild", out)
+
+    def test_bulk_line_inline_with_rebuild_of_rejected_types(self):
+        out = self.summary({"bulk-import.txt": bulk_txt(
+            defer_indexing="false", index_status="completed", index_seconds=12,
+            total_seconds=612)})
+        self.assertIn("(ingest 600 s, search index built inline during ingest + 12 s rebuild "
+                      "of rejected types, `completed`)", out)
+        self.assertNotIn("search-index rebuild", out)
+
+
+class SummaryIndexingTest(SummaryRunMixin, unittest.TestCase):
     def test_completed_with_phase_split(self):
         out = self.summary({
             "indexing.txt": "status=completed\nreason=\nresource_type=Encounter\ntotal=5000\n"
