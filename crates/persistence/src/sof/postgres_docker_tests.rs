@@ -426,8 +426,8 @@ async fn paged_export_stops_during_the_bound_lookup() {
 
 /// D-a (C4/S13): every page of an export runs in its own transaction under
 /// `SET LOCAL statement_timeout` from what is left of the run's deadline:
-/// one value per page, non-increasing, each at most the time left when it
-/// was sent (rounded up), in the order BEGIN, bound, page, COMMIT.
+/// one value per page, non-increasing, each the time left when its
+/// transaction started (rounded up), in the order BEGIN, bound, page, COMMIT.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paged_export_pages_run_under_set_local_from_the_remaining_deadline() {
     let pg = shared_pg().await;
@@ -442,6 +442,7 @@ async fn paged_export_pages_run_under_set_local_from_the_remaining_deadline() {
     let recorder = run.recorder.clone().unwrap();
     let ctx = ctx_with_deadline(Some(Duration::from_secs(30)));
     let deadline = ctx.deadline.unwrap();
+    let spawned_at = Instant::now();
     let (rows, error) = collect(spawn_pg_run(run, &ctx), Duration::from_secs(30)).await;
     assert!(error.is_none(), "{error:?}");
     assert_eq!(rows, 3 * 10 * 10);
@@ -464,16 +465,24 @@ async fn paged_export_pages_run_under_set_local_from_the_remaining_deadline() {
             "not renewed per page: {begins:?}"
         );
     }
+    // The runner computes each value from the time left just before it
+    // records the `Begin` instant, so a millisecond boundary can fall between
+    // the two: the value lies between the time left at that instant and the
+    // time left at the previous `Begin` (the spawn, for the first), both
+    // rounded up like the value.
+    let mut earliest = spawned_at;
     for (at, timeout_ms) in &begins {
-        let left = statement_timeout_ms(deadline.saturating_duration_since(*at));
+        let at_least = statement_timeout_ms(deadline.saturating_duration_since(*at));
+        let at_most = statement_timeout_ms(deadline.saturating_duration_since(earliest));
         assert!(
-            *timeout_ms <= left,
-            "{timeout_ms} ms > {left} ms left at emission"
+            (at_least..=at_most).contains(timeout_ms),
+            "{timeout_ms} ms outside the time left between the previous and this BEGIN: [{at_least}, {at_most}] ms"
         );
         assert!(
             *timeout_ms > 25_000,
             "the deadline is the run's, not a page's"
         );
+        earliest = *at;
     }
     let sequence: Vec<&str> = events
         .iter()
