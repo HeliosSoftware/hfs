@@ -1009,7 +1009,7 @@ Click **Create New** again and paste:
   "select": [ { "column": [
       { "name": "id",         "path": "getResourceKey()", "type": "id" },
       { "name": "patient_id", "path": "subject.getReferenceKey(Patient)", "type": "id" },
-      { "name": "code",       "path": "code.coding.first().code" },
+      { "name": "code",       "path": "code.coding.first().code", "type": "code" },
       { "name": "value",      "path": "value.ofType(Quantity).value", "type": "decimal" },
       { "name": "effective",  "path": "effective.ofType(dateTime)", "type": "dateTime" } ] } ] }
 ```
@@ -1100,6 +1100,8 @@ full kind × format grid.
    filters, so they are applied while `observation_flat` is read: rows 7.b, 7.d,
    7.o and 7.p stay under the default
    `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` on the full corpus.
+   This relies on `observation_flat` declaring `type` on the filtered columns
+   (`code`, `value`): a column without a `type` is never filtered at the source.
 
 4. The live **Results** preview cannot supply parameter values, so it reports an error
    naming the unbound `min_height` parameter — record the exact message; this is

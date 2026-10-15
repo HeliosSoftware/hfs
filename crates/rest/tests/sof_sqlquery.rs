@@ -1467,6 +1467,94 @@ mod sof_sqlquery_tests {
         assert_eq!(rows[0]["patient_id"], json!("p1"));
     }
 
+    /// The issue's T7 shape (#1473): a `code`-typed column compared with `=`
+    /// plus a decimal `:param` range, over a view larger than the cap. Only
+    /// the matching observations are materialized.
+    #[tokio::test]
+    async fn code_equality_and_param_range_filter_run_past_the_cap() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_source_rows_per_vd = 3;
+        let (server, backend) = create_test_server_with_config(config).await;
+        for (i, (code, height)) in [
+            ("8302-2", 100),
+            ("8302-2", 160),
+            ("8302-2", 180),
+            ("29463-7", 170),
+            ("29463-7", 190),
+            ("8302-2", 120),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let obs = json!({
+                "resourceType": "Observation",
+                "id": format!("o{i}"),
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                "valueQuantity": {"value": height, "unit": "cm"}
+            });
+            backend
+                .create(&tenant(), "Observation", obs, FhirVersion::R4)
+                .await
+                .expect("seed observation");
+        }
+        let vd = json!({
+            "resourceType": "ViewDefinition",
+            "id": "obs-flat-code",
+            "url": "http://example.org/sof/ViewDefinition/obs-flat-code",
+            "name": "obs_flat_code",
+            "status": "active",
+            "resource": "Observation",
+            "select": [{
+                "column": [
+                    {"path": "id", "name": "id", "type": "string"},
+                    {"path": "code.coding.first().code", "name": "code", "type": "code"},
+                    {"path": "value.ofType(Quantity).value", "name": "value", "type": "decimal"}
+                ]
+            }]
+        });
+        backend
+            .create_or_update(
+                &tenant(),
+                "ViewDefinition",
+                "obs-flat-code",
+                vd,
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed observation view");
+
+        let lib = library_with_canonical_vd(
+            "SELECT id FROM obs WHERE code = '8302-2' AND value > :min_height ORDER BY id",
+            "ViewDefinition/obs-flat-code",
+            "obs",
+            vec![json!({"name": "min_height", "use": "in", "type": "decimal"})],
+        );
+        let inner = json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "min_height", "valueDecimal": 150}]
+        });
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&run_body_inline(lib, "json", Some(inner)))
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        let ids: Vec<&str> = rows
+            .as_array()
+            .expect("rows array")
+            .iter()
+            .filter_map(|r| r["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["o1", "o2"], "{rows}");
+    }
+
     /// The pushdown resolves a table alias back to the dependency label.
     #[tokio::test]
     async fn equality_filter_through_a_table_alias_runs_past_the_cap() {
