@@ -1812,23 +1812,11 @@ impl ServerConfig {
     /// single enabled version (for example R4B only) has nothing to choose
     /// between, and a build with R4 defaults to R4; neither returns an error.
     pub fn implicit_default_fhir_version_error(&self, version_is_implicit: bool) -> Option<String> {
-        let enabled = FhirVersion::enabled_versions();
-        let has_r4 = enabled.iter().any(|version| version.as_str() == "R4");
-        if !version_is_implicit || has_r4 || enabled.len() < 2 {
-            return None;
-        }
-
-        let enabled_list = enabled
+        let enabled: Vec<&str> = FhirVersion::enabled_versions()
             .iter()
             .map(|version| version.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!(
-            "HFS_DEFAULT_FHIR_VERSION is not set and this build does not include R4, so there is \
-             no default FHIR version to fall back to. This build enables: {enabled_list}. R4B is \
-             always enabled alongside R5 and R6 because helios-audit requires it. Set \
-             HFS_DEFAULT_FHIR_VERSION (or --default-fhir-version) to one of the enabled versions"
-        ))
+            .collect();
+        implicit_default_fhir_version_error_for(&enabled, version_is_implicit)
     }
 
     /// Returns why a loopback public base is unsafe for the configured listener.
@@ -2090,6 +2078,30 @@ impl ServerConfig {
     pub fn multitenancy(&self) -> &MultitenancyConfig {
         &self.multitenancy
     }
+}
+
+/// Decides whether an implicit default FHIR version is a startup error, given
+/// the names of the versions this build enables.
+///
+/// Takes plain names rather than reading [`FhirVersion::enabled_versions`] so
+/// the decision and its message can be unit-tested in any build, including the
+/// default R4 build where the error never fires.
+fn implicit_default_fhir_version_error_for(
+    enabled: &[&str],
+    version_is_implicit: bool,
+) -> Option<String> {
+    let has_r4 = enabled.contains(&"R4");
+    if !version_is_implicit || has_r4 || enabled.len() < 2 {
+        return None;
+    }
+
+    let enabled_list = enabled.join(", ");
+    Some(format!(
+        "HFS_DEFAULT_FHIR_VERSION is not set and this build does not include R4, so there is \
+         no default FHIR version to fall back to. This build enables: {enabled_list}. R4B is \
+         always enabled alongside R5 and R6 because helios-audit requires it. Set \
+         HFS_DEFAULT_FHIR_VERSION (or --default-fhir-version) to one of the enabled versions"
+    ))
 }
 
 #[cfg(test)]
@@ -2951,6 +2963,48 @@ mod tests {
         // This unit-test module needs `R4`, and a build with R4 never errors
         // (the build without R4 is covered by tests/fhir_version_coverage.rs).
         assert!(config.implicit_default_fhir_version_error(true).is_none());
+    }
+
+    // The decision helper takes plain version names, so these run in every
+    // build, including the default R4 build where the error never fires.
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4b_r5() {
+        let error = implicit_default_fhir_version_error_for(&["R4B", "R5"], true)
+            .expect("an implicit default without R4 is an error");
+        assert!(
+            error.contains("This build enables: R4B, R5."),
+            "message must list the enabled versions: {error}"
+        );
+        assert!(
+            error.contains("HFS_DEFAULT_FHIR_VERSION"),
+            "message must name the setting to choose: {error}"
+        );
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4b_r5_r6() {
+        let error = implicit_default_fhir_version_error_for(&["R4B", "R5", "R6"], true)
+            .expect("an implicit default without R4 is an error");
+        assert!(
+            error.contains("This build enables: R4B, R5, R6."),
+            "message must list every enabled version: {error}"
+        );
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_explicit_choice() {
+        assert!(implicit_default_fhir_version_error_for(&["R4B", "R5"], false).is_none());
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4_present() {
+        assert!(implicit_default_fhir_version_error_for(&["R4", "R5"], true).is_none());
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_single_version() {
+        assert!(implicit_default_fhir_version_error_for(&["R4B"], true).is_none());
     }
 
     // ── multitenancy() accessor ───────────────────────────────────
