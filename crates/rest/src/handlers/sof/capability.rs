@@ -19,8 +19,12 @@
 //!
 //! | Parameter | Why |
 //! |-----------|-----|
-//! | `context` | Supporting artifacts for a subject's transitive dependency graph are not yet resolved |
 //! | `source`  | External data sources are out of scope for a storage-backed server; use the stateless `sof-server` |
+//!
+//! `context` is supported: supporting artifacts the server cannot resolve on
+//! its own (ViewDefinitions, SQLView Libraries, ValueSets and ConceptMaps)
+//! are supplied inline and matched by canonical URL against the subject's
+//! transitive dependency graph (design #568, #1824).
 //!
 //! This replaces the pre-ballot `GET /$sql-on-fhir-capabilities` endpoint and
 //! its `Parameters` block of `supportsX` booleans. That endpoint was a
@@ -44,6 +48,17 @@ pub const SQL_RUN_DEFINITION_ID: &str = "hfs-sql-run";
 pub const SQL_EXPORT_DEFINITION_ID: &str = "hfs-sql-export";
 /// Path id for the `$reindex` definition this server publishes.
 pub const REINDEX_DEFINITION_ID: &str = "hfs-reindex";
+
+/// The artifact kinds a `context` entry may be, as `targetProfile`s on the
+/// parameter: the four kinds the dependency resolver accepts
+/// (`handlers::sof::graph`). ValueSet and ConceptMap carry the base
+/// StructureDefinition URLs, since the SQL on FHIR guide profiles neither.
+const CONTEXT_TARGET_PROFILES: [&str; 4] = [
+    helios_sof::canonical::VIEW_DEFINITION_STRUCTURE_DEFINITION,
+    helios_sof::canonical::SQL_VIEW_PROFILE,
+    "http://hl7.org/fhir/StructureDefinition/ValueSet",
+    "http://hl7.org/fhir/StructureDefinition/ConceptMap",
+];
 
 /// `GET [base]/OperationDefinition/{id}`
 ///
@@ -111,6 +126,17 @@ pub(crate) fn reindex_definition() -> Value {
     })
 }
 
+/// The `context` parameter both operations declare (#1824). Built outside
+/// the operation `json!` literals, which otherwise exceed the macro's
+/// recursion limit.
+fn context_parameter() -> Value {
+    json!({
+        "name": "context", "use": "in", "min": 0, "max": "*", "type": "CanonicalResource",
+        "targetProfile": CONTEXT_TARGET_PROFILES,
+        "documentation": "Supporting artifacts the server cannot itself resolve, supplied inline and matched by canonical URL against the subject's transitive relatedArtifact graph: ViewDefinitions, SQLView Libraries, ValueSets (with an expansion, or an enumerated compose) and ConceptMaps. Storage wins over a context entry for the same URL. Requires POST."
+    })
+}
+
 /// The `$sql-run` subset this server supports.
 ///
 /// All three subject-naming parameters are supported: canonical URLs and
@@ -147,6 +173,7 @@ pub(crate) fn sql_run_definition() -> Value {
                 "name": "parameters", "use": "in", "min": 0, "max": "1", "type": "Parameters",
                 "documentation": "Bindings for the parameters a Library declares. Rejected for a ViewDefinition subject."
             },
+            context_parameter(),
             {
                 "name": "resource", "use": "in", "min": 0, "max": "*", "type": "Resource",
                 "documentation": "FHIR resources to transform instead of using server data. Requires a ViewDefinition subject; a Bundle is unwrapped one level."
@@ -190,6 +217,7 @@ pub(crate) fn sql_export_definition() -> Value {
                     {"name": "parameters", "use": "in", "min": 0, "max": "1", "type": "Parameters"}
                 ]
             },
+            context_parameter(),
             {"name": "clientTrackingId", "use": "in", "min": 0, "max": "1", "type": "string"},
             {"name": "_format", "use": "in", "min": 0, "max": "1", "type": "code",
              "binding": {"strength": "extensible", "valueSet": helios_sof::canonical::EXPORT_OUTPUT_FORMAT_VALUE_SET}},
@@ -313,13 +341,48 @@ mod tests {
         assert_eq!(d["instance"], false);
 
         let names = param_names(&d);
-        for supported in ["subjectCanonical", "subjectReference", "subjectResource"] {
+        for supported in [
+            "subjectCanonical",
+            "subjectReference",
+            "subjectResource",
+            "context",
+        ] {
             assert!(names.contains(&supported), "{supported} missing: {names:?}");
         }
-        for unsupported in ["context", "source"] {
-            assert!(
-                !names.contains(&unsupported),
-                "{unsupported} is rejected and must not be declared: {names:?}"
+        assert!(
+            !names.contains(&"source"),
+            "source is rejected and must not be declared: {names:?}"
+        );
+    }
+
+    /// `context` was supported by the handlers long before it was declared
+    /// (#1824, PR 0): the resolver accepts the four artifact kinds, so the
+    /// parameter names each one as a `targetProfile` on both operations.
+    #[test]
+    fn context_is_declared_with_the_four_dependency_kinds_as_target_profiles() {
+        for definition in [sql_run_definition(), sql_export_definition()] {
+            let context = definition["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == "context" && p["use"] == "in")
+                .expect("an in `context` parameter");
+            assert_eq!(context["max"], "*");
+            assert_eq!(context["type"], "CanonicalResource");
+            let profiles: Vec<&str> = context["targetProfile"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect();
+            assert_eq!(
+                profiles,
+                vec![
+                    helios_sof::canonical::VIEW_DEFINITION_STRUCTURE_DEFINITION,
+                    helios_sof::canonical::SQL_VIEW_PROFILE,
+                    "http://hl7.org/fhir/StructureDefinition/ValueSet",
+                    "http://hl7.org/fhir/StructureDefinition/ConceptMap",
+                ]
             );
         }
     }
