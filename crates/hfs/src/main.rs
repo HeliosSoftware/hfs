@@ -3043,14 +3043,17 @@ async fn build_bulk_submit(
                     .ok()
                     .or_else(|| std::env::var("HFS_S3_REGION").ok());
                 let sdk_config = AwsS3Client::load_sdk_config(region.as_deref()).await;
+                let endpoint_url =
+                    non_blank_endpoint(std::env::var("HFS_BULK_SUBMIT_S3_ENDPOINT").ok());
+                // A custom endpoint forces path-style addressing, as for bulk
+                // export, the S3 storage backend and the `$sql-export` S3 sink.
+                let force_path_style = endpoint_url.is_some()
+                    || parse_env_bool("HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE", false);
                 let client = Arc::new(AwsS3Client::from_sdk_config_with_options(
                     &sdk_config,
                     AwsS3ClientOptions {
-                        endpoint_url: std::env::var("HFS_BULK_SUBMIT_S3_ENDPOINT").ok(),
-                        force_path_style: parse_env_bool(
-                            "HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE",
-                            false,
-                        ),
+                        endpoint_url,
+                        force_path_style,
                     },
                 ));
                 Arc::new(S3OutputStore::new(
