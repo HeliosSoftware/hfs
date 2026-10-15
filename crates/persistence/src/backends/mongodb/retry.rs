@@ -62,6 +62,17 @@ pub(super) const BUNDLE_TRANSACTION_RETRY: RetryPolicy = RetryPolicy {
     cap: Duration::from_secs(2),
 };
 
+/// Single-resource write policy: a write whose transaction the server aborted
+/// for a reason other than a conflicting writer runs again after 100, 200 and
+/// 400 ms. The common reason is a chunk migration holding the critical
+/// section of one of the write's collections (`StaleConfig`), which lasts a
+/// few hundred milliseconds.
+pub(super) const WRITE_ABORT_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 4,
+    base: Duration::from_millis(100),
+    cap: Duration::from_millis(400),
+};
+
 /// Default wall-clock budget for one transaction bundle, retries and pauses
 /// included: the value of `MongoBackendConfig::bundle_transaction_budget` when
 /// the embedder does not set one. A bundle's own runtime is unbounded by this
