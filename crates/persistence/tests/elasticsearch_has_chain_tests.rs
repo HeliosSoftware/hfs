@@ -43,6 +43,7 @@ use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 use testcontainers::ImageExt;
+use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::elastic_search::ElasticSearch;
 use tokio::sync::OnceCell;
@@ -65,7 +66,12 @@ use helios_persistence::types::{
 // Container and backend
 // ============================================================================
 
-const ES_IMAGE_TAG: &str = "7.17.29";
+const DEFAULT_ES_IMAGE_TAG: &str = "7.17.29";
+
+/// Elasticsearch image tag; override with `HFS_TEST_ES_IMAGE_TAG` (e.g. `8.15.0`).
+fn es_image_tag() -> String {
+    std::env::var("HFS_TEST_ES_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_ES_IMAGE_TAG.to_string())
+}
 const ES_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const ES_START_ATTEMPTS: usize = 2;
 
@@ -81,16 +87,19 @@ async fn start_es_container() -> testcontainers::ContainerAsync<ElasticSearch> {
     let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
     let mut last_err = None;
     for attempt in 1..=ES_START_ATTEMPTS {
-        match container_cleanup::with_cleanup_label(
-            ElasticSearch::default()
-                .with_tag(ES_IMAGE_TAG)
-                .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
-                .with_label("github.run_id", &run_id)
-                .with_startup_timeout(ES_STARTUP_TIMEOUT),
-        )
-        .start()
-        .await
-        {
+        let mut request = ElasticSearch::default()
+            .with_tag(es_image_tag())
+            .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
+            // 8.x enables security (HTTPS + auth) by default; the backend speaks plain HTTP.
+            .with_env_var("xpack.security.enabled", "false")
+            .with_label("github.run_id", &run_id)
+            .with_startup_timeout(ES_STARTUP_TIMEOUT);
+        if !es_image_tag().starts_with('7') {
+            // The module waits for "[YELLOW] to [GREEN]", which 8.x only logs when a
+            // system index is created; with security off none is, so wait for startup (`create_backend` then retries `initialize` until HTTP answers).
+            request = request.with_ready_conditions(vec![WaitFor::message_on_stdout("started")]);
+        }
+        match container_cleanup::with_cleanup_label(request).start().await {
             Ok(container) => return container,
             Err(err) => {
                 eprintln!(
@@ -163,12 +172,28 @@ fn es_config(es: &SharedEs) -> ElasticsearchConfig {
     }
 }
 
+/// 8.x logs "started" before the HTTP listener is up: retry until it answers.
+async fn initialize_when_ready(backend: &ElasticsearchBackend) {
+    let mut attempts = 0;
+    loop {
+        match backend.initialize().await {
+            Ok(()) => return,
+            Err(err) if attempts < 120 => {
+                attempts += 1;
+                eprintln!("ES not ready ({err}); retry {attempts}");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(err) => panic!("initialize ES backend: {err}"),
+        }
+    }
+}
+
 async fn create_backend() -> ElasticsearchBackend {
     let es = shared_es().await;
     let backend =
         ElasticsearchBackend::with_shared_registry(es_config(es), build_search_registry())
             .expect("create ElasticsearchBackend");
-    backend.initialize().await.expect("initialize ES backend");
+    initialize_when_ready(&backend).await;
     backend
 }
 
@@ -773,7 +798,7 @@ mod pg_es {
             )
             .expect("create ES backend"),
         );
-        es.initialize().await.expect("initialize ES backend");
+        initialize_when_ready(&es).await;
 
         let config = CompositeConfig::builder()
             .primary("postgres", BackendKind::Postgres)
