@@ -191,6 +191,18 @@ jobs:
           fi
           echo "All test subdirectories are wired into a top-level test binary."
 
+      # Make room before the build, not after it fails. On the Windows agents
+      # this build grows target/ by 130-150GB, and the end-of-job sweep below
+      # only caps what is left between jobs; a run that started with ~150GB
+      # free ran out mid-link (run 38627332199). 175 covers the largest growth
+      # seen plus margin, and is a no-op on the Linux agents (~230GB free, ~30GB
+      # growth). See "Pre-build headroom" in .github/actions/cargo-target-gc.
+      - name: Ensure build headroom
+        uses: ./.github/actions/cargo-target-gc
+        with:
+          mode: preflight
+          min-free-gb: "175"
+
       # `--all-features` enables R5, so this is the one job where the R5 FHIRPath
       # conformance suite is live rather than compiled to its `#[cfg(not(R5))]`
       # no-op twin. HFS_REQUIRE_R5 makes that a hard requirement here: if the
