@@ -468,6 +468,7 @@ where
         budget,
     )
     .await
+    .map_err(|failure| *failure)
     {
         Ok(plan) => Ok(plan),
         Err((partial, error)) => match mode {
@@ -502,14 +503,14 @@ async fn plan_inner<S>(
     source: &dyn DependencySource,
     allow_side_writes: bool,
     budget: &MaterializeBudget,
-) -> Result<MaterializationPlan, (MaterializationPlan, MaterializeError)>
+) -> Result<MaterializationPlan, Box<(MaterializationPlan, MaterializeError)>>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
     let mut plan = MaterializationPlan::default();
     let needs = match walk(state, tenant, identity, depends_on, source, &mut plan).await {
         Ok(needs) => needs,
-        Err(e) => return Err((plan, e)),
+        Err(e) => return Err(Box::new((plan, e))),
     };
     if needs.is_empty() {
         return Ok(plan);
@@ -520,13 +521,13 @@ where
     let needs_update = needs.iter().any(|n| matches!(n, Need::Expand { .. }));
     let needs_fetch = allow_side_writes && needs.iter().any(|n| matches!(n, Need::Fetch { .. }));
     if needs_update && let Err(e) = require_scope(principal, "ValueSet", SmartPermissions::UPDATE) {
-        return Err((plan, e));
+        return Err(Box::new((plan, e)));
     }
     if needs_fetch
         && !permits(principal, "ValueSet", SmartPermissions::CREATE)
         && !permits(principal, "ConceptMap", SmartPermissions::CREATE)
     {
-        return Err((
+        return Err(Box::new((
             plan,
             MaterializeError::Forbidden {
                 message: "materializing this Library would store a ValueSet or ConceptMap \
@@ -534,7 +535,7 @@ where
                           ValueSet or ConceptMap"
                     .to_string(),
             },
-        ));
+        )));
     }
 
     let config = state.config();
@@ -552,7 +553,7 @@ where
                 let (content, outcome) =
                     match expand(state, hts.as_ref(), current.content(), &url, budget).await {
                         Ok(v) => v,
-                        Err(e) => return Err((plan, e)),
+                        Err(e) => return Err(Box::new((plan, e))),
                     };
                 let content = match finish_for_storage(
                     state,
@@ -566,7 +567,7 @@ where
                 .await
                 {
                     Ok(c) => c,
-                    Err(e) => return Err((plan, e)),
+                    Err(e) => return Err(Box::new((plan, e))),
                 };
                 debug!(library = %identity, label = %label, url = %url, ?outcome, "expansion planned");
                 plan.outcomes.push((url.clone(), outcome));
@@ -586,7 +587,7 @@ where
                 };
                 let fetched = match fetch_definition(client, config, &url, budget).await {
                     Ok(f) => f,
-                    Err(e) => return Err((plan, e)),
+                    Err(e) => return Err(Box::new((plan, e))),
                 };
                 let Some((resource_type, definition)) = fetched else {
                     plan.outcomes.push((url, Outcome::NotResolvable));
@@ -595,7 +596,7 @@ where
                 // Inside a transaction the definition the server holds would
                 // have to be stored outside the bundle, which it never is.
                 if !allow_side_writes {
-                    return Err((
+                    return Err(Box::new((
                         plan,
                         MaterializeError::NeedsSideWrite {
                             url,
@@ -604,16 +605,16 @@ where
                                  in the transaction, or store it first"
                             ),
                         },
-                    ));
+                    )));
                 }
                 if let Err(e) = require_scope(principal, resource_type, SmartPermissions::CREATE) {
-                    return Err((plan, e));
+                    return Err(Box::new((plan, e)));
                 }
                 let (content, outcome) =
                     if resource_type == "ValueSet" && definition.get("expansion").is_none() {
                         match expand(state, Some(client), &definition, &url, budget).await {
                             Ok((c, _)) => (c, Outcome::FetchedAndExpanded),
-                            Err(e) => return Err((plan, e)),
+                            Err(e) => return Err(Box::new((plan, e))),
                         }
                     } else {
                         (definition, Outcome::FetchedDefinition)
@@ -630,7 +631,7 @@ where
                 .await
                 {
                     Ok(c) => c,
-                    Err(e) => return Err((plan, e)),
+                    Err(e) => return Err(Box::new((plan, e))),
                 };
                 debug!(library = %identity, label = %label, url = %url, ?outcome, "definition planned");
                 plan.outcomes.push((url.clone(), outcome));
@@ -1052,7 +1053,7 @@ pub(crate) async fn apply_materialization<S>(
     state: &AppState<S>,
     tenant: &TenantContext,
     plan: MaterializationPlan,
-) -> Result<Vec<(String, Outcome)>, ApplyFailure>
+) -> Result<Vec<(String, Outcome)>, Box<ApplyFailure>>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
@@ -1135,11 +1136,11 @@ where
             Err(error) => {
                 let mut remaining = vec![url];
                 remaining.extend(pending.iter().map(|w| w.url().to_string()));
-                return Err(ApplyFailure {
+                return Err(Box::new(ApplyFailure {
                     error,
                     written,
                     remaining,
-                });
+                }));
             }
         }
     }
@@ -1389,7 +1390,7 @@ where
     apply_materialization(state, tenant, plan)
         .await
         .map(|_| ())
-        .map_err(ApplyFailure::into_rest_error)
+        .map_err(|failure| failure.into_rest_error())
 }
 
 /// T2 for a direct write: a ValueSet candidate is transformed, anything else

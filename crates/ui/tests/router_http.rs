@@ -7482,7 +7482,7 @@ async fn sql_views_page_tables_card_renders_the_add_row_without_a_disclosure() {
     );
     assert!(
         tables_card
-            .contains("Search a view definition or SQL view; the alias defaults to its name."),
+            .contains("Search a view definition, SQL view, value set or concept map; the alias defaults to its name."),
         "{tables_card}"
     );
     assert!(
@@ -7764,10 +7764,18 @@ async fn document_add_table_rejects_a_missing_invalid_duplicate_or_sql_query_tar
         ],
     });
     let cases: [(&str, &str, &str); 4] = [
-        ("", "", "Pick a view definition or SQL view"),
+        (
+            "",
+            "",
+            "Pick a view definition, SQL view, value set or concept map",
+        ),
         ("ViewDefinition/vd1", "2bad", "must match"),
         ("ViewDefinition/vd1", "V", "already declared"),
-        ("Library/q1", "byward", "Pick a view definition or SQL view"),
+        (
+            "Library/q1",
+            "byward",
+            "Pick a view definition, SQL view, value set or concept map",
+        ),
     ];
     for (table, alias, expected) in cases {
         let source = helios_ui::StaticConformanceSource::empty()
@@ -7986,7 +7994,7 @@ async fn sql_query_run_unknown_table_never_calls_sql_run() {
     );
     assert!(
         unknown_row.contains(
-            "Used in the SQL but not declared. Pick a view definition or SQL view, or fix the name."
+            "Used in the SQL but not declared. Pick a view definition, SQL view, value set or concept map, or fix the name."
         ),
         "{unknown_row}"
     );
