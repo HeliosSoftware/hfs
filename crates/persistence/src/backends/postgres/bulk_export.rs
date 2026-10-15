@@ -1153,7 +1153,7 @@ impl ExportDataProvider for PostgresBackend {
         tenant: &TenantContext,
         request: &ExportRequest,
     ) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
+        let mut client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         if !request.resource_types.is_empty() {
@@ -1175,7 +1175,18 @@ impl ExportDataProvider for PostgresBackend {
             return Ok(valid_types);
         }
 
-        let rows = client
+        // The all-types listing reads every live row of the tenant to find a
+        // few dozen distinct types, so its cost follows the tenant's size.
+        // Lift the session `statement_timeout` for this one statement, as the
+        // reindex listing does (#2040); the session keeps it afterwards.
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin export type listing")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for export type listing")?;
+        let rows = tx
             .query(
                 "SELECT DISTINCT resource_type FROM resources
                  WHERE tenant_id = $1 AND is_deleted = FALSE
@@ -1184,6 +1195,9 @@ impl ExportDataProvider for PostgresBackend {
             )
             .await
             .or_query_error("Failed to query types")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish export type listing")?;
 
         let types: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
         Ok(types)
