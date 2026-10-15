@@ -31,6 +31,12 @@ mod sof_export_graph_tests {
     }
 
     async fn create_test_server_with_export() -> (TestServer, Arc<SqliteBackend>) {
+        create_test_server_with_export_config(ServerConfig::for_testing()).await
+    }
+
+    async fn create_test_server_with_export_config(
+        base: ServerConfig,
+    ) -> (TestServer, Arc<SqliteBackend>) {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -44,7 +50,7 @@ mod sof_export_graph_tests {
 
         let config = ServerConfig {
             base_url: "http://localhost".to_string(),
-            ..ServerConfig::for_testing()
+            ..base
         };
         let state = helios_rest::AppState::new(Arc::clone(&backend), config)
             .with_export_controller(Arc::new(controller));
@@ -243,6 +249,82 @@ mod sof_export_graph_tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0]["patient_id"], json!("p1"));
         assert_eq!(rows[1]["patient_id"], json!("p2"));
+    }
+
+    /// A `$sql-export` of a query with a pushable filter succeeds over a
+    /// dependency larger than the per-dependency cap (#1473): the filter is
+    /// applied while the dependency is materialized.
+    #[tokio::test]
+    async fn sql_export_with_a_pushable_filter_runs_past_the_source_row_cap() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_source_rows_per_vd = 1;
+        let (server, backend) = create_test_server_with_export_config(config).await;
+        seed_patients(&backend).await;
+        let leaf_url = seed_view_definition(&backend, "leaf", "http://example.org/leaf").await;
+
+        let subject = sql_lib(
+            "subject",
+            None,
+            "sql-query",
+            "SELECT patient_id, family FROM t WHERE family = 'Jones'",
+            &[("t", &leaf_url)],
+        );
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "subject", "part": [
+                {"name": "name", "valueString": "jones"},
+                {"name": "subjectResource", "resource": subject}
+            ]}]
+        });
+        let submit_resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(
+            submit_resp.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit_resp.text()
+        );
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let file_url = manifest["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"].as_str() == Some("output"))
+            .and_then(|o| o["part"].as_array())
+            .and_then(|parts| {
+                parts
+                    .iter()
+                    .find(|p| p["name"].as_str() == Some("location"))
+            })
+            .and_then(|p| p["valueUri"].as_str())
+            .expect("output must carry a location")
+            .to_string();
+        let path = file_url.strip_prefix("http://localhost").unwrap();
+        let download = server
+            .get(path)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(download.status_code(), StatusCode::OK);
+        let rows: Vec<Value> = download
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["patient_id"], json!("p2"));
     }
 
     /// `context` is a single list shared by the whole job (design #568): one

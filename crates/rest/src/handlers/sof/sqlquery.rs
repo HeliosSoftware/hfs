@@ -527,9 +527,10 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         SqlQueryError::RowCapExceeded { max } => RestError::UnprocessableEntity {
             message: format!("result exceeds {max}-row limit; add a WHERE/LIMIT clause"),
         },
-        // A WHERE or LIMIT in the query cannot bound a dependency: it is
-        // materialized in full before the query runs. Name the dependency,
-        // the cap and the setting instead (#1473).
+        // Only simple equality/range filters in the query's top-level WHERE
+        // bound a dependency (they are pushed into its ViewDefinition); a
+        // LIMIT or any other WHERE cannot. Name the dependency, the cap and
+        // the setting instead (#1473).
         SqlQueryError::DependencyRowCapExceeded {
             label,
             kind,
@@ -538,7 +539,8 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         } => RestError::UnprocessableEntity {
             message: format!(
                 "dependency '{label}' ({kind} {view}) exceeds {max}-row limit: SQL queries \
-                 materialize each dependency in full before the query's WHERE runs. Narrow the \
+                 materialize each dependency before the query runs, and only simple equality or \
+                 range filters in the query's top-level WHERE are applied at the source. Narrow the \
                  dependency with a ViewDefinition 'where', or raise \
                  HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
             ),

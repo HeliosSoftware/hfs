@@ -13,6 +13,7 @@ pub mod engine;
 pub mod library;
 pub mod output;
 pub mod params;
+pub mod pushdown;
 pub mod scan;
 
 pub use bind::{BINDABLE_PARAMETER_TYPES, BoundParam, bind_supplied_params};
@@ -78,7 +79,8 @@ pub enum SqlQueryError {
     /// when it has no name).
     #[error(
         "dependency '{label}' ({kind} {view}) produced more than {max} rows; SQL queries \
-         materialize each dependency in full before the query's WHERE runs. Narrow the \
+         materialize each dependency before the query runs, and only simple equality or range \
+         filters in the query's top-level WHERE are applied at the source. Narrow the \
          dependency with a ViewDefinition 'where', or raise \
          HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
     )]
@@ -144,8 +146,9 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "dependency 'obs' (ViewDefinition observation_flat) produced more than 1000000 \
-             rows; SQL queries materialize each dependency in full before the query's WHERE \
-             runs. Narrow the dependency with a ViewDefinition 'where', or raise \
+             rows; SQL queries materialize each dependency before the query runs, and only \
+             simple equality or range filters in the query's top-level WHERE are applied at \
+             the source. Narrow the dependency with a ViewDefinition 'where', or raise \
              HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
         );
     }

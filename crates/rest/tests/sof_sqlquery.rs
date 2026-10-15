@@ -1396,9 +1396,9 @@ mod sof_sqlquery_tests {
 
     /// A dependency with more rows than `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`
     /// fails with a 422 that names the dependency, the cap and the setting,
-    /// even when the query's own WHERE would have narrowed it to one row. The
-    /// message must not suggest a WHERE/LIMIT clause: the dependency is
-    /// materialized in full before the query's WHERE runs.
+    /// even when the query's own WHERE would have narrowed it. The `OR` keeps
+    /// the filter from being pushed into the dependency, so it is materialized
+    /// in full. The message must not suggest a WHERE/LIMIT clause.
     #[tokio::test]
     async fn dependency_over_the_source_row_cap_returns_422_naming_dependency_and_setting() {
         let mut config = ServerConfig::for_testing();
@@ -1410,7 +1410,7 @@ mod sof_sqlquery_tests {
         let vd_url = seed_patient_view(&backend).await;
 
         let lib = library_with_canonical_vd(
-            "SELECT patient_id FROM t WHERE patient_id = 'p1'",
+            "SELECT patient_id FROM t WHERE patient_id = 'p1' OR patient_id = 'p2'",
             &vd_url,
             "t",
             vec![],
@@ -1438,6 +1438,128 @@ mod sof_sqlquery_tests {
             !diagnostics.contains("add a WHERE/LIMIT clause"),
             "{diagnostics}"
         );
+    }
+
+    /// A selective string `=` in the top-level WHERE is applied to the
+    /// dependency before it is materialized, so a view larger than the cap
+    /// still runs (#1473).
+    #[tokio::test]
+    async fn selective_equality_filter_runs_over_a_view_past_the_cap() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_source_rows_per_vd = 3;
+        let (server, backend) = create_test_server_with_config(config).await;
+        for i in 0..5 {
+            seed_patient(&backend, &format!("p{i}"), "Smith", true).await;
+        }
+        let vd_url = seed_patient_view(&backend).await;
+
+        let lib = library_with_canonical_vd(
+            "SELECT patient_id FROM t WHERE patient_id = 'p1'",
+            &vd_url,
+            "t",
+            vec![],
+        );
+        let response = post_inline_json(&server, lib).await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows.as_array().map(|a| a.len()), Some(1), "{rows}");
+        assert_eq!(rows[0]["patient_id"], json!("p1"));
+    }
+
+    /// The pushdown resolves a table alias back to the dependency label.
+    #[tokio::test]
+    async fn equality_filter_through_a_table_alias_runs_past_the_cap() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_source_rows_per_vd = 3;
+        let (server, backend) = create_test_server_with_config(config).await;
+        for i in 0..5 {
+            seed_patient(&backend, &format!("p{i}"), "Smith", true).await;
+        }
+        let vd_url = seed_patient_view(&backend).await;
+
+        let lib = library_with_canonical_vd(
+            "SELECT x.patient_id FROM t x WHERE x.patient_id = 'p2'",
+            &vd_url,
+            "t",
+            vec![],
+        );
+        let response = post_inline_json(&server, lib).await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows.as_array().map(|a| a.len()), Some(1), "{rows}");
+        assert_eq!(rows[0]["patient_id"], json!("p2"));
+    }
+
+    /// A bound `:param` in a numeric range comparison is pushed down as well
+    /// (the issue's `obs.value > :min_height` shape).
+    #[tokio::test]
+    async fn bound_parameter_range_filter_runs_past_the_cap() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_source_rows_per_vd = 3;
+        let (server, backend) = create_test_server_with_config(config).await;
+        for (i, height) in [100, 120, 140, 160, 180].into_iter().enumerate() {
+            let obs = json!({
+                "resourceType": "Observation",
+                "id": format!("o{i}"),
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                "valueQuantity": {"value": height, "unit": "cm"}
+            });
+            backend
+                .create(&tenant(), "Observation", obs, FhirVersion::R4)
+                .await
+                .expect("seed observation");
+        }
+        let vd = json!({
+            "resourceType": "ViewDefinition",
+            "id": "obs-flat",
+            "url": "http://example.org/sof/ViewDefinition/obs-flat",
+            "name": "obs_flat",
+            "status": "active",
+            "resource": "Observation",
+            "select": [{
+                "column": [
+                    {"path": "id", "name": "id", "type": "string"},
+                    {"path": "value.ofType(Quantity).value", "name": "value", "type": "decimal"}
+                ]
+            }]
+        });
+        backend
+            .create_or_update(&tenant(), "ViewDefinition", "obs-flat", vd, FhirVersion::R4)
+            .await
+            .expect("seed observation view");
+
+        let lib = library_with_canonical_vd(
+            "SELECT id, value FROM obs WHERE value > :min_height ORDER BY id",
+            "ViewDefinition/obs-flat",
+            "obs",
+            vec![json!({"name": "min_height", "use": "in", "type": "decimal"})],
+        );
+        let inner = json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "min_height", "valueDecimal": 150}]
+        });
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&run_body_inline(lib, "json", Some(inner)))
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        let ids: Vec<&str> = rows
+            .as_array()
+            .expect("rows array")
+            .iter()
+            .filter_map(|r| r["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["o3", "o4"], "{rows}");
     }
 
     /// The cap is inclusive: a dependency of exactly the cap's size runs.

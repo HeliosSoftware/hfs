@@ -66,7 +66,11 @@ non-S3 backends. A SQL Query or SQL View subject is different: each of its
 dependencies is first materialized into an embedded per-request SQLite by this
 runner, and the query's joins and `WHERE` then run in that SQLite, on every
 backend. The per-dependency row cap (`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`)
-applies to that materialization.
+applies to that materialization, after the query's simple top-level `WHERE`
+filters on a dependency (for example `obs.code = '8302-2'` and
+`obs.value > :min_height`) have been pushed into the ViewDefinition; a query
+without such a filter still materializes the dependency in full. This is why
+the T7 SQL Query rows pass on the full corpus with the default cap.
 
 ³ Same expectations as the `s3` row, plus: the tenants named in
 `HFS_S3_TENANT_BUCKETS` appear on `/ui/tenants` and `GET /admin/tenants` after
@@ -1091,6 +1095,11 @@ full kind × format grid.
    WHERE obs.code = '8302-2' AND obs.value > :min_height
    GROUP BY fp.id, fp.city
    ```
+
+   `obs.code = '8302-2'` and `obs.value > :min_height` are simple top-level
+   filters, so they are applied while `observation_flat` is read: rows 7.b, 7.d,
+   7.o and 7.p stay under the default
+   `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` on the full corpus.
 
 4. The live **Results** preview cannot supply parameter values, so it reports an error
    naming the unbound `min_height` parameter — record the exact message; this is

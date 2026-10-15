@@ -728,6 +728,13 @@ ViewDefinitions: repeated branch column names contribute a single table column
 with the first declaration's position and type, and duplicate rows are retained.
 The SQL emitters still require matching branch column order.
 
+A SQL Query's simple top-level `WHERE` filters on a dependency
+(`label.col = 'x'` on string columns, `<`/`<=`/`>`/`>=` on typed numeric columns,
+literal or `:param`) are added as `where` entries to a copy of the dependency's
+ViewDefinition before it is materialized (`sqlquery::pushdown`), so the
+per-dependency row cap (`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`) counts
+filtered rows. Queries with no such filter materialize the dependency in full.
+
 For HFS stored-data row order, collection cells and preview limits, see the
 [stored-data ordering contract](../../book/src/ch06-sql-on-fhir.md#hfs-stored-data-ordering).
 

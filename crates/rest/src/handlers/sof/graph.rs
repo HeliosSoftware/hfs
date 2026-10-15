@@ -48,6 +48,9 @@ use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
+use helios_sof::sqlquery::pushdown::{
+    PushdownColumn, PushedPredicate, apply_pushdowns, extract_pushdowns, pushable_columns,
+};
 use helios_sof::sqlquery::{
     BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
     TableSchema,
@@ -715,6 +718,7 @@ pub(crate) async fn execute_plan(
     limits: ExecLimits,
 ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
     let labels_by_target = labels_by_target(plan);
+    let pushdowns = plan_pushdowns(plan, subject_sql, subject_bindings);
     let mut leaf_schemas: Vec<TableSchema> = Vec::new();
 
     for node in &plan.nodes {
@@ -727,8 +731,34 @@ pub(crate) async fn execute_plan(
                 engine.create_table(internal_name, &schema)?;
                 let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();
-                let row_stream = match runner.run_view(tenant, view.clone(), filters.clone()).await
-                {
+                // Simple predicates of the consuming SQL are applied at the
+                // source (#1473). The table schema above comes from the
+                // original view; if the runner refuses the rewritten one,
+                // the original runs exactly as it did before.
+                let pushed = pushdowns.get(internal_name).and_then(|(cols, preds)| {
+                    apply_pushdowns(view, cols, preds).map(|v| (v, preds.len()))
+                });
+                let mut pushed_count = 0usize;
+                let mut run = None;
+                if let Some((narrowed, count)) = pushed {
+                    match runner.run_view(tenant, narrowed, filters.clone()).await {
+                        Ok(s) => {
+                            pushed_count = count;
+                            run = Some(Ok(s));
+                        }
+                        Err(e) => debug!(
+                            table = %internal_name,
+                            view = %view_label,
+                            error = %e,
+                            "pushed-down dependency view was refused; running it unfiltered"
+                        ),
+                    }
+                }
+                let run = match run {
+                    Some(r) => r,
+                    None => runner.run_view(tenant, view.clone(), filters.clone()).await,
+                };
+                let row_stream = match run {
                     Ok(s) => s,
                     Err(e) => {
                         warn!(
@@ -787,6 +817,7 @@ pub(crate) async fn execute_plan(
                     table = %internal_name,
                     view = %view_label,
                     rows = inserted,
+                    pushed = pushed_count,
                     elapsed_ms,
                     "materialized SQL query dependency"
                 );
@@ -901,6 +932,71 @@ fn labels_by_target(plan: &GraphPlan) -> HashMap<String, Vec<String>> {
         .into_iter()
         .map(|(target, labels)| (target, labels.into_iter().collect()))
         .collect()
+}
+
+/// The predicates to apply at the source of each leaf, by internal name (#1473).
+///
+/// Analyses the subject SQL and the SQL of every SQL View node. Only a leaf
+/// with exactly one incoming edge in the whole plan qualifies: with two (a
+/// diamond, or two labels on one node) a filter that one consumer's `WHERE`
+/// implies would drop rows the other consumer needs.
+fn plan_pushdowns(
+    plan: &GraphPlan,
+    subject_sql: &str,
+    subject_bindings: &[BoundParam],
+) -> HashMap<String, (HashMap<String, PushdownColumn>, Vec<PushedPredicate>)> {
+    let mut incoming: HashMap<&str, usize> = HashMap::new();
+    let statements =
+        std::iter::once((subject_sql, plan.subject_edges.as_slice(), subject_bindings))
+            .chain(plan.nodes.iter().filter_map(|n| match n {
+                PlanNode::SqlView { sql, edges, .. } => {
+                    Some((sql.as_str(), edges.as_slice(), &[][..]))
+                }
+                PlanNode::Leaf { .. } => None,
+            }))
+            .collect::<Vec<_>>();
+    for (_, edges, _) in &statements {
+        for e in *edges {
+            *incoming.entry(e.target_internal_name.as_str()).or_default() += 1;
+        }
+    }
+    let leaves: HashMap<&str, &Value> = plan
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            PlanNode::Leaf {
+                internal_name,
+                view,
+            } if incoming.get(internal_name.as_str()) == Some(&1) => {
+                Some((internal_name.as_str(), view))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut out = HashMap::new();
+    for (sql, edges, bindings) in statements {
+        let mut columns: HashMap<String, HashMap<String, PushdownColumn>> = HashMap::new();
+        let mut target_of: HashMap<&str, &str> = HashMap::new();
+        for e in edges {
+            if let Some(view) = leaves.get(e.target_internal_name.as_str()) {
+                columns.insert(e.label.clone(), pushable_columns(view));
+                target_of.insert(e.label.as_str(), e.target_internal_name.as_str());
+            }
+        }
+        if columns.is_empty() {
+            continue;
+        }
+        let labels: Vec<String> = columns.keys().cloned().collect();
+        for (label, preds) in extract_pushdowns(sql, &labels, &columns, bindings) {
+            if let (Some(target), Some(cols)) =
+                (target_of.get(label.as_str()), columns.remove(&label))
+            {
+                out.insert((*target).to_string(), (cols, preds));
+            }
+        }
+    }
+    out
 }
 
 /// Exposes `internal_name` under every label that aliases it, so a
@@ -2018,6 +2114,174 @@ mod tests {
         assert_eq!(
             message,
             "only SELECT queries are allowed; INSERT statements are not permitted"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Predicate pushdown (#1473): simple WHERE predicates of the consuming
+    // SQL reach the leaf ViewDefinition as `where` + `constant` entries.
+    // ------------------------------------------------------------------
+
+    /// Yields `plain_rows` rows for a view without a `where` and
+    /// `filtered_rows` for one with it (as a filtering runner would), or
+    /// refuses a view with a `where` as `Uncompilable`. Records every view.
+    struct PushRunner {
+        plain_rows: usize,
+        filtered_rows: usize,
+        refuse_where: bool,
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    impl PushRunner {
+        fn new(plain_rows: usize, filtered_rows: usize, refuse_where: bool) -> Self {
+            Self {
+                plain_rows,
+                filtered_rows,
+                refuse_where,
+                seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SofRunner for PushRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let has_where = view_definition.get("where").is_some();
+            self.seen.lock().unwrap().push(view_definition);
+            if has_where && self.refuse_where {
+                return Err(SofError::Uncompilable {
+                    reason: "test refuses where".to_string(),
+                });
+            }
+            let n = if has_where {
+                self.filtered_rows
+            } else {
+                self.plain_rows
+            };
+            let rows = (0..n).map(|i| Ok(json!({"id": format!("p{i}")})));
+            Ok(Box::pin(futures::stream::iter(rows)))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "push-test-runner"
+        }
+    }
+
+    async fn run_with(
+        runner: &Arc<PushRunner>,
+        max_src: usize,
+        plan: &GraphPlan,
+        sql: &str,
+    ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+        let dyn_runner: Arc<dyn SofRunner> = runner.clone();
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &dyn_runner,
+            &tenant,
+            &ViewFilters::default(),
+            plan,
+            sql,
+            &[],
+            limits(max_src, 1000),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn selective_where_is_pushed_so_an_over_cap_dependency_runs() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let runner = Arc::new(PushRunner::new(10, 2, false));
+        let (result, schemas) = run_with(&runner, 3, &plan, "SELECT id FROM obs WHERE id = 'p1'")
+            .await
+            .expect("the pushed-down dependency fits the cap");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(schemas.len(), 1);
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["where"][0]["path"], "(id) = %__sof_pd_0");
+        assert_eq!(seen[0]["constant"][0]["valueString"], "p1");
+    }
+
+    #[tokio::test]
+    async fn refused_pushdown_falls_back_to_the_original_view() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let runner = Arc::new(PushRunner::new(2, 0, true));
+        let (result, _) = run_with(&runner, 3, &plan, "SELECT id FROM obs WHERE id = 'p1'")
+            .await
+            .expect("the fallback runs the original view");
+        assert_eq!(result.rows.len(), 1);
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].get("where").is_some());
+        assert!(seen[1].get("where").is_none());
+    }
+
+    #[tokio::test]
+    async fn unpushable_queries_still_hit_the_cap() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        for sql in [
+            "SELECT id FROM obs WHERE id = 'p1' OR id = 'p2'",
+            "SELECT * FROM obs LIMIT 5",
+            "SELECT a.id FROM obs a JOIN obs b ON a.id = b.id WHERE a.id = 'p1'",
+        ] {
+            let runner = Arc::new(PushRunner::new(10, 2, false));
+            let err = run_with(&runner, 3, &plan, sql)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{sql} must exceed the cap"));
+            assert!(
+                matches!(err, SqlQueryError::DependencyRowCapExceeded { .. }),
+                "{sql}: {err:?}"
+            );
+            assert!(
+                runner.seen.lock().unwrap()[0].get("where").is_none(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_leaf_with_two_incoming_edges_is_never_filtered() {
+        let plan = leaf_plan(vec![edge("a", "__sof_node_0"), edge("b", "__sof_node_0")]);
+        let runner = Arc::new(PushRunner::new(2, 0, false));
+        let (result, _) = run_with(&runner, 3, &plan, "SELECT a.id FROM a WHERE a.id = 'p1'")
+            .await
+            .expect("runs");
+        assert_eq!(result.rows.len(), 1);
+        assert!(runner.seen.lock().unwrap()[0].get("where").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_sql_views_inner_where_filters_its_leaf() {
+        let plan = GraphPlan {
+            nodes: vec![
+                PlanNode::Leaf {
+                    internal_name: "__sof_node_0".to_string(),
+                    view: named_view_definition("patients"),
+                },
+                PlanNode::SqlView {
+                    internal_name: "__sof_node_1".to_string(),
+                    sql: "SELECT id FROM base WHERE id = 'p1'".to_string(),
+                    edges: vec![edge("base", "__sof_node_0")],
+                    name: "only_p1".to_string(),
+                },
+            ],
+            subject_edges: vec![edge("v", "__sof_node_1")],
+        };
+        let runner = Arc::new(PushRunner::new(10, 2, false));
+        let (result, _) = run_with(&runner, 3, &plan, "SELECT id FROM v")
+            .await
+            .expect("the inner WHERE bounds the leaf");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            runner.seen.lock().unwrap()[0]["constant"][0]["valueString"],
+            "p1"
         );
     }
 }
