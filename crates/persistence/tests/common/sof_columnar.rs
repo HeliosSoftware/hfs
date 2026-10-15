@@ -468,3 +468,32 @@ pub async fn assert_strict_and_rejected(runner: &dyn SofRunner, tenant: &TenantC
         }
     }
 }
+
+/// Runs `view` on the row path and returns its rows, or the error text of
+/// the first failure (raised when starting the run or while streaming).
+pub async fn row_outcome(
+    runner: &dyn SofRunner,
+    tenant: &TenantContext,
+    view: &Value,
+) -> Result<Vec<Value>, String> {
+    let mut stream = runner
+        .run_view(tenant, view.clone(), ViewFilters::default())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        rows.push(item.map_err(|e| e.to_string())?);
+    }
+    Ok(rows)
+}
+
+/// A Patient view declaring `name.family` (text) with the given `type`.
+pub fn text_declared_as(ty: &str) -> Value {
+    serde_json::json!({
+        "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+        "select": [{"column": [
+            {"path": "id", "name": "id"},
+            {"path": "name.first().family", "name": "family", "type": ty}
+        ]}]
+    })
+}

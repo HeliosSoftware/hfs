@@ -829,3 +829,33 @@ fn test_cli_invalid_ansi_type_tag_fails_naming_the_column() {
         }
     }
 }
+
+#[test]
+fn test_cli_rejects_non_string_ansi_type_tag_value_naming_the_column() {
+    let temp_dir = TempDir::new().unwrap();
+    let view_path = temp_dir.path().join("view.json");
+    let bundle_path = temp_dir.path().join("bundle.json");
+    fs::write(
+        &view_path,
+        r#"{"resourceType":"ViewDefinition","status":"active","resource":"Patient",
+            "select":[{"column":[{"name":"birth_date","path":"birthDate",
+            "tag":[{"name":"ansi/type","value":42}]}]}]}"#,
+    )
+    .unwrap();
+    fs::write(&bundle_path, create_test_bundle()).unwrap();
+
+    for format in ["csv", "json", "ndjson", "parquet"] {
+        let output = Command::new(get_cli_binary_path())
+            .arg("-v")
+            .arg(&view_path)
+            .arg("-b")
+            .arg(&bundle_path)
+            .arg("-f")
+            .arg(format)
+            .output()
+            .expect("Failed to execute CLI");
+        assert!(!output.status.success(), "{format}: must exit non-zero");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("birth_date"), "{format}: stderr: {stderr}");
+    }
+}

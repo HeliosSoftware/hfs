@@ -440,8 +440,19 @@ fn render_output(
                 }
             })?;
             let body = helios_sof::format_output_with_schema(processed, ct, None, declared)
-                .map_err(|e| RestError::InternalError {
-                    message: format!("output formatter failed: {e}"),
+                .map_err(|e| match &e {
+                    // A value that does not fit its declared column type is
+                    // the caller's view/data mismatch: a 422 naming the column.
+                    helios_sof::SofError::ParquetConversionError(msg)
+                        if super::run::declared_misfit_detail(msg).is_some() =>
+                    {
+                        RestError::UnprocessableEntity {
+                            message: msg.clone(),
+                        }
+                    }
+                    _ => RestError::InternalError {
+                        message: format!("output formatter failed: {e}"),
+                    },
                 })?;
             let inner_ct = content_type_for(ct);
             if wrap_in_binary {

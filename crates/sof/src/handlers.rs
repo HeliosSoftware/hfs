@@ -881,6 +881,11 @@ fn find_inline_view_definition(json: &serde_json::Value) -> Option<&serde_json::
 /// `ServerError::InvalidViewDefinition`). Warnings never block `$sql-run` —
 /// the lint reports them for the UI's editor, not this endpoint.
 fn lint_inline_view_definition(json: &serde_json::Value) -> ServerResult<()> {
+    // A bad column tag (e.g. a non-string `ansi/type` value) is reported
+    // naming the column rather than as a bare lint path.
+    if json.is_object() {
+        crate::column_types::resolve_columns(json).map_err(ServerError::from)?;
+    }
     let errors: Vec<Diagnostic> = lint_view_definition(json)
         .into_iter()
         .filter(|diagnostic| diagnostic.severity == Severity::Error)

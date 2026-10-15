@@ -1813,4 +1813,46 @@ mod sof_sqlquery_tests {
             );
         }
     }
+
+    /// A dependency view column declared `integer` over a value beyond Int32
+    /// is the caller's view/data mismatch: a 422 naming the column, not a 500.
+    #[tokio::test]
+    async fn sqlquery_declared_misfit_in_a_dependency_view_is_a_422_naming_the_column() {
+        let (server, backend) = create_test_server().await;
+        seed_typed_observation_view(&backend).await;
+        backend
+            .create_or_update(
+                &tenant(),
+                "ViewDefinition",
+                "obs-misfit",
+                json!({
+                    "resourceType": "ViewDefinition",
+                    "id": "obs-misfit",
+                    "name": "obs_misfit",
+                    "resource": "Observation",
+                    "status": "active",
+                    "select": [{"column": [
+                        {"path": "id", "name": "obs_id", "type": "string"},
+                        {"path": "component.first().valueInteger", "name": "too_big",
+                         "type": "integer"}
+                    ]}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed view definition");
+        let response = run_sql_as_parquet(
+            &server,
+            "SELECT obs_id, too_big FROM t",
+            "ViewDefinition/obs-misfit",
+        )
+        .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            response.text()
+        );
+        assert!(response.text().contains("too_big"), "{}", response.text());
+    }
 }

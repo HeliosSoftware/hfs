@@ -302,39 +302,25 @@ mod sof_run_typed_tests {
 
     // ----- strict declared / lenient inferred -------------------------------
 
-    /// Drives a `$sql-run` whose declared column cannot hold a value. The
-    /// streaming path may answer with an error status or commit a 200 and abort
-    /// the body; either way the column must be named and no complete file
-    /// delivered.
+    /// A declared misfit surfaces while the first batch is built, before any
+    /// header is sent, so it is a 422 OperationOutcome naming the column (the
+    /// caller's data/view mismatch, not an internal fault).
     async fn assert_declared_misfit(format: &str, v: &Value, column: &str) {
         let (server, backend) = create_test_server().await;
         seed_typed_observation(&backend).await;
-        let response = run(&server, format, v).await;
-        let status = response.status_code();
-        if status.is_success() {
-            // A committed 200 must not carry a readable, complete file.
-            let bytes = response.as_bytes().to_vec();
-            let readable = std::panic::catch_unwind(|| {
-                let f = if format == "arrow" {
-                    "arrow"
-                } else {
-                    "parquet"
-                };
-                decode(f, bytes)
-            });
-            assert!(
-                readable.is_err(),
-                "{format}: misfit value must not produce a complete {format} file"
-            );
-        } else if status.is_client_error() {
-            assert!(
-                response.text().contains(column),
-                "{format}: {status}: {}",
-                response.text()
-            );
-        } else {
-            assert!(status.is_server_error(), "{format}: {status}");
-        }
+        assert_misfit_422(&server, format, v, column).await;
+    }
+
+    async fn assert_misfit_422(server: &TestServer, format: &str, v: &Value, column: &str) {
+        let response = run(server, format, v).await;
+        assert_eq!(response.status_code(), 422, "{format}: {}", response.text());
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome", "{format}");
+        assert!(
+            response.text().contains(column),
+            "{format}: body must name '{column}': {}",
+            response.text()
+        );
     }
 
     /// A declared `integer` value that does not fit in Int32 is an error on
@@ -366,22 +352,7 @@ mod sof_run_typed_tests {
             "DATE",
         )]);
         for format in ["parquet", "arrow"] {
-            let response = run(&server, format, &v).await;
-            let status = response.status_code();
-            if status.is_success() {
-                let bytes = response.as_bytes().to_vec();
-                let readable = std::panic::catch_unwind(|| decode(format, bytes));
-                assert!(readable.is_err(), "{format}: partial date must not decode");
-            } else if status.is_client_error() {
-                assert!(
-                    response.text().contains("partial_day"),
-                    "{format}: {status}: {}",
-                    response.text()
-                );
-            } else {
-                // A server error masks its detail from the client.
-                assert!(status.is_server_error(), "{format}: {status}");
-            }
+            assert_misfit_422(&server, format, &v, "partial_day").await;
         }
     }
 }

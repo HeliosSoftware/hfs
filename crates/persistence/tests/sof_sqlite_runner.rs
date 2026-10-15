@@ -1064,6 +1064,37 @@ mod sqlite_runner_tests {
         sc::assert_strict_and_rejected(runner.as_ref(), &tenant).await;
     }
 
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_sqlite_declared_numeric_over_text_documented_limitation() {
+        use super::sof_columnar as sc;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Garcia"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().expect("runner");
+        // Documented limitation: the declared type is applied by a SQL CAST,
+        // and SQLite's CAST turns non-numeric text into 0 instead of failing
+        // (changing it would also change the constant/row-index casts the
+        // golden SQL pins). The columnar builder cannot tell this 0 from data.
+        // If this starts failing the limitation was lifted: update the docs.
+        let out = sc::row_outcome(runner.as_ref(), &tenant, &sc::text_declared_as("integer"))
+            .await
+            .expect("sqlite casts text to 0");
+        assert_eq!(out[0]["family"], json!(0));
+        let out = sc::row_outcome(runner.as_ref(), &tenant, &sc::text_declared_as("decimal"))
+            .await
+            .expect("sqlite casts text to 0.0");
+        assert_eq!(out[0]["family"].as_f64(), Some(0.0));
+    }
+
     #[tokio::test]
     async fn test_invalid_ansi_type_tag_is_rejected() {
         let backend = make_backend().await;

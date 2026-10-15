@@ -124,6 +124,35 @@ mod tests {
     }
 
     #[test]
+    fn non_string_tag_value_is_rejected_naming_the_column_when_parsing_json() {
+        let view = view_with_tag("birthDate", "date", json!(42));
+        let err = match helios_sof::parse_view_definition(view.clone()) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-string tag value must be rejected at parse"),
+        };
+        assert!(matches!(err, SofError::InvalidViewDefinition(_)), "{err:?}");
+        assert!(err.to_string().contains("badcol"), "{err}");
+
+        // Parse then run, for every buffered format: the run is never reached.
+        for ct in [
+            ContentType::Csv,
+            ContentType::Json,
+            ContentType::NdJson,
+            ContentType::Parquet,
+            ContentType::ArrowIpc,
+        ] {
+            let err = helios_sof::parse_view_definition(view.clone())
+                .and_then(|v| run_view_definition(v, bnd(&patient_bundle()), ct))
+                .expect_err(&format!("{ct:?}"));
+            assert!(
+                matches!(err, SofError::InvalidViewDefinition(_))
+                    && err.to_string().contains("badcol"),
+                "{ct:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_tag_is_rejected_by_record_batches() {
         for (path, ty, tag) in invalid_cases() {
             let view = view_with_tag(path, ty, tag.clone());

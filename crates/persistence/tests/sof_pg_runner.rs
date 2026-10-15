@@ -1904,6 +1904,58 @@ mod sof_pg_runner_tests {
         sc::assert_strict_and_rejected(runner.as_ref(), &tenant).await;
     }
 
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_declared_numeric_over_text_documented_limitation() {
+        use super::sof_columnar as sc;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Garcia"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().expect("runner");
+        // Documented limitation: the declared type is applied by a SQL cast,
+        // so PostgreSQL fails the whole query on non-numeric text. The
+        // database error quotes the value, not the column; the runner adds the
+        // declared numeric columns so the user can find it.
+        for (ty, pg_ty) in [("integer", "bigint"), ("decimal", "numeric")] {
+            let err = sc::row_outcome(runner.as_ref(), &tenant, &sc::text_declared_as(ty))
+                .await
+                .expect_err("PostgreSQL rejects the cast");
+            assert!(err.contains("22P02"), "{ty}: {err}");
+            assert!(err.contains(pg_ty), "{ty}: {err}");
+            assert!(
+                err.contains("declared numeric columns: family"),
+                "{ty}: {err}"
+            );
+        }
+        // The columnar path reports it the same way.
+        let mut s = runner
+            .run_view_columnar(
+                &tenant,
+                sc::text_declared_as("integer"),
+                ViewFilters::default(),
+            )
+            .await
+            .expect("columnar start")
+            .expect("columnar path");
+        let mut err = None;
+        while let Some(item) = s.next().await {
+            if let Err(e) = item {
+                err = Some(e.to_string());
+                break;
+            }
+        }
+        let err = err.expect("columnar failure");
+        assert!(err.contains("declared numeric columns: family"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_pg_invalid_ansi_type_tag_is_rejected() {
         let backend = create_backend().await;

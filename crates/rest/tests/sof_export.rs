@@ -4080,6 +4080,90 @@ mod sof_export_tests {
         }
     }
 
+    /// Runs a typed-view export in a flat text format and returns the text of
+    /// every shard, concatenated.
+    async fn export_text(format: &str) -> String {
+        let (server, backend) = typed_export_server(None).await;
+        seed_typed_observations(&backend).await;
+        let status = kick_off(&server, format, &typed_export_view()).await;
+        let result = poll_to_result(&server, &status).await;
+        assert_eq!(result.status_code(), StatusCode::OK, "{}", result.text());
+        let manifest: Value = result.json();
+        let mut out = String::new();
+        for path in shard_paths(&manifest) {
+            let download = server
+                .get(&path)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            assert_eq!(download.status_code(), StatusCode::OK);
+            out.push_str(&download.text());
+            out.push('\n');
+        }
+        out
+    }
+
+    fn assert_typed_json_row(row: &Value) {
+        assert_eq!(row["small"], json!(7), "{row}");
+        assert_eq!(row["big"], json!(5_000_000_000i64), "{row}");
+        assert_eq!(row["day"], json!("2024-03-05"), "{row}");
+        assert_eq!(row["ints"], json!([7, 8]), "{row}");
+    }
+
+    #[tokio::test]
+    async fn test_export_ndjson_typed_view_keeps_json_types() {
+        let text = export_text("ndjson").await;
+        let rows: Vec<Value> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3, "{text}");
+        assert_typed_json_row(rows.iter().find(|r| r["obs_id"] == "o1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_export_json_typed_view_keeps_json_types() {
+        let text = export_text("json").await;
+        let rows: Vec<Value> = serde_json::from_str(text.trim()).expect("a JSON array");
+        assert_eq!(rows.len(), 3, "{text}");
+        assert_typed_json_row(rows.iter().find(|r| r["obs_id"] == "o1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_export_csv_typed_view_renders_values_as_text() {
+        let text = export_text("csv").await;
+        let header = text.lines().next().unwrap();
+        for name in ["obs_id", "small", "big", "day", "ints"] {
+            assert!(header.contains(name), "{header}");
+        }
+        let o1 = text.lines().find(|l| l.starts_with("o1")).expect("o1 row");
+        assert!(o1.contains("5000000000"), "{o1}");
+        assert!(o1.contains("2024-03-05"), "{o1}");
+    }
+
+    /// `arrow` is a `$sql-run` format only; export supports csv, ndjson, json
+    /// and parquet, so `_format=arrow` is refused at kick-off.
+    #[tokio::test]
+    async fn test_export_arrow_format_rejected() {
+        let (server, backend) = typed_export_server(None).await;
+        seed_typed_observations(&backend).await;
+        let resp = server
+            .post("/$sql-export?_format=arrow")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&typed_export_view())
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            resp.text()
+        );
+        let body: Value = resp.json();
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(diag.contains("arrow") && diag.contains("parquet"), "{diag}");
+    }
+
     /// An invalid `ansi/type` tag fails the job whatever the format and
     /// whether or not the view returns rows, naming the view and the column.
     #[tokio::test]
@@ -4090,6 +4174,8 @@ mod sof_export_tests {
             ("ndjson", true),
             ("ndjson", false),
             ("csv", true),
+            ("csv", false),
+            ("json", true),
             ("json", false),
         ] {
             let (server, backend) = typed_export_server(None).await;

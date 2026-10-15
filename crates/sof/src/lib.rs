@@ -1093,6 +1093,12 @@ pub fn parse_view_definition_for_version(
     json: serde_json::Value,
     version: helios_fhir::FhirVersion,
 ) -> Result<SofViewDefinition, SofError> {
+    // Validate column tags on the raw JSON first: the typed deserializer
+    // rejects e.g. a non-string tag `value` with a generic serde message that
+    // does not name the column.
+    if json.is_object() {
+        column_types::resolve_columns(&json)?;
+    }
     match version {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {

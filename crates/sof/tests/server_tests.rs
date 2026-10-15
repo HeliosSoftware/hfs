@@ -1713,3 +1713,30 @@ async fn test_sql_run_accepts_valid_date_and_double_ansi_type_tags_as_parquet() 
         assert!(response.as_bytes().starts_with(b"PAR1"), "{tag}");
     }
 }
+
+#[tokio::test]
+async fn test_sql_run_rejects_non_string_ansi_type_tag_value_naming_the_column() {
+    let server = common::test_server().await;
+    for format in ["json", "ndjson", "csv", "parquet", "arrow"] {
+        let mut body = ansi_tag_body(format, "birthDate", "date", "DATE");
+        *body
+            .pointer_mut("/parameter/1/resource/select/0/column/0/tag/0/value")
+            .unwrap() = json!(42);
+        let response = server
+            .post("/$sql-run")
+            .add_header("Content-Type", "application/json")
+            .json(&body)
+            .await;
+        let status = response.status_code();
+        assert!(
+            status.is_client_error(),
+            "{format}: expected 4xx, got {status}; body: {}",
+            response.text()
+        );
+        assert!(
+            response.text().contains("tagged_col"),
+            "{format}: body must name the column: {}",
+            response.text()
+        );
+    }
+}
