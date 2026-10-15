@@ -3,13 +3,20 @@
 //! Implements the FHIR [create interaction](https://hl7.org/fhir/http.html#create):
 //! `POST [base]/[type]`
 
+use axum::Extension;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use helios_auth::Principal;
 use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider, WriteKind};
 use tracing::debug;
+
+use super::sof::terminology_materialize::{
+    MaterializeBudget, apply_for_direct_write, apply_materialization,
+    created_unmaterialized_outcome, plan_for_direct_write, transform_for_direct_write,
+};
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirResource, FhirVersionExtractor, TenantExtractor};
@@ -64,11 +71,13 @@ pub async fn create_handler<S>(
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
+    principal: Option<Extension<Principal>>,
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
+    let principal = principal.map(|Extension(p)| p);
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
@@ -124,6 +133,14 @@ where
         obj.remove("id");
     }
 
+    // #1824 T2: a ValueSet some SQL Library depends on gains its expansion
+    // in the candidate, so the one write below persists the final content
+    // and validation sees it.
+    let budget = MaterializeBudget::start(state.config());
+    let resource =
+        transform_for_direct_write(&state, tenant.context(), &resource_type, resource, &budget)
+            .await?;
+
     // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
     state
         .validation()
@@ -137,6 +154,47 @@ where
     if let Some(search_params) = conditional.if_none_exist() {
         super::conditional_support::require_create(state.storage())?;
         debug!(search_params = %search_params, "Processing conditional create");
+
+        // #1824 T1 on a conditional create (D13 c, d): a pre-search decides
+        // whether phase A runs at all — a match returns the existing
+        // resource without touching the terminology server — then the
+        // atomic conditional create runs first and phase B only after
+        // `Created`, so a lost race never writes anything.
+        let plan = match state
+            .storage()
+            .resolve_conditional_matches(tenant.context(), &resource_type, search_params)
+            .await
+        {
+            Ok(matches) if matches.is_empty() => {
+                plan_for_direct_write(
+                    &state,
+                    tenant.context(),
+                    principal.as_ref(),
+                    &resource_type,
+                    &resource,
+                    &budget,
+                )
+                .await?
+            }
+            Ok(_) => None,
+            // A backend that cannot pre-search decides the match inside the
+            // create; phase A then runs before it, writes nothing, and is
+            // discarded on `Exists`.
+            Err(helios_persistence::error::StorageError::Backend(
+                helios_persistence::error::BackendError::UnsupportedCapability { .. },
+            )) => {
+                plan_for_direct_write(
+                    &state,
+                    tenant.context(),
+                    principal.as_ref(),
+                    &resource_type,
+                    &resource,
+                    &budget,
+                )
+                .await?
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         let result = state
             .storage()
@@ -161,6 +219,33 @@ where
                     1,
                     None,
                 );
+                // Phase B after the committed create. A failure here leaves
+                // the resource stored and unmaterialized: the 422 carries
+                // its Location and ETag and names the PUT that retries.
+                if let Some(plan) = plan
+                    && !plan.is_empty()
+                    && let Err(failure) =
+                        apply_materialization(&state, tenant.context(), plan).await
+                {
+                    let headers = ResourceHeaders::from_stored(&stored, &state);
+                    let location = state
+                        .public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
+                    let outcome = created_unmaterialized_outcome(
+                        &resource_type,
+                        stored.id(),
+                        stored.version_id(),
+                        &location,
+                        &failure,
+                    );
+                    let mut header_map = headers.to_header_map();
+                    header_map.insert(header::LOCATION, location.parse().unwrap());
+                    return format_resource_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        header_map,
+                        &outcome,
+                        negotiated.format,
+                    );
+                }
                 // Stored StructureDefinitions feed the tenant's profile
                 // registry.
                 if resource_type == "StructureDefinition" {
@@ -234,6 +319,19 @@ where
             }),
         };
     }
+
+    // #1824 T1: phase A (reads only), then phase B immediately before the
+    // outer write (D13 b).
+    let plan = plan_for_direct_write(
+        &state,
+        tenant.context(),
+        principal.as_ref(),
+        &resource_type,
+        &resource,
+        &budget,
+    )
+    .await?;
+    apply_for_direct_write(&state, tenant.context(), plan).await?;
 
     // Standard create
     let stored = state

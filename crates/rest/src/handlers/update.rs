@@ -66,11 +66,13 @@ pub async fn update_handler<S>(
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
@@ -145,6 +147,19 @@ where
         });
     }
 
+    // #1824 T2: a ValueSet some SQL Library depends on gains its expansion
+    // in the candidate, so the one write below persists the final content
+    // and validation sees it.
+    let budget = super::sof::terminology_materialize::MaterializeBudget::start(state.config());
+    let resource = super::sof::terminology_materialize::transform_for_direct_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        resource,
+        &budget,
+    )
+    .await?;
+
     // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
     state
         .validation()
@@ -153,6 +168,30 @@ where
 
     // #1014: an unknown ViewDefinition.resource is rejected on every write.
     super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
+    // #1824 T1 for a Library: phase A after the write-free preconditions
+    // (`If-Match` is evaluated below, before anything is written), phase B
+    // immediately before the outer write (D13).
+    let materialize = |resource: &serde_json::Value| {
+        let state = &state;
+        let tenant = tenant.context();
+        let principal = principal.as_ref();
+        let resource_type = resource_type.as_str();
+        let budget = &budget;
+        let resource = resource.clone();
+        async move {
+            let plan = super::sof::terminology_materialize::plan_for_direct_write(
+                state,
+                tenant,
+                principal,
+                resource_type,
+                &resource,
+                budget,
+            )
+            .await?;
+            super::sof::terminology_materialize::apply_for_direct_write(state, tenant, plan).await
+        }
+    };
 
     // Handle the If-Match precondition (RFC 9110 §13.1.1).
     //
@@ -255,6 +294,8 @@ where
             return Err(RestError::PreconditionFailed { message });
         }
 
+        // The precondition held: materialize, then write (#1824).
+        materialize(&resource).await?;
         match existing {
             Some(current) => (
                 state
@@ -277,6 +318,7 @@ where
             }
         }
     } else {
+        materialize(&resource).await?;
         state
             .storage()
             .create_or_update(

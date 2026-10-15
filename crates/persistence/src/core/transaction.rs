@@ -34,6 +34,23 @@ pub trait PatchCandidateValidator: Send + Sync {
         resource_type: &str,
         candidate: &Value,
     ) -> Result<(), Value>;
+
+    /// Prepares the content a Bundle PATCH will write: a validator may
+    /// transform the candidate before it is validated (the SQL-on-FHIR
+    /// terminology materializer adds an `expansion` to a ValueSet some SQL
+    /// Library depends on, #1824), and returns what the executor must
+    /// persist. The default transforms nothing and validates.
+    async fn prepare_patch_candidate(
+        &self,
+        tenant: &TenantContext,
+        version: helios_fhir::FhirVersion,
+        resource_type: &str,
+        candidate: Value,
+    ) -> Result<Value, Value> {
+        self.validate_patch_candidate(tenant, version, resource_type, &candidate)
+            .await
+            .map(|()| candidate)
+    }
 }
 
 /// Render an unapplied Bundle PATCH as a typed entry refusal. The transaction
@@ -88,9 +105,11 @@ pub(crate) fn patch_update_result(
     }
 }
 
-/// Decode, apply and validate the candidate while its transaction remains
-/// open. The wire format follows the Bundle version; path evaluation and
-/// resource validation follow the stored target's FHIR version.
+/// Decode, apply, prepare and validate the candidate while its transaction
+/// remains open. The wire format follows the Bundle version; path evaluation
+/// and resource validation follow the stored target's FHIR version. The
+/// validator's [`PatchCandidateValidator::prepare_patch_candidate`] may
+/// transform the candidate; what it returns is what the executor persists.
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 pub(crate) async fn prepare_bundle_patch(
     tenant: &TenantContext,
@@ -111,13 +130,13 @@ pub(crate) async fn prepare_bundle_patch(
     let candidate =
         super::apply_patch_for_version(current.content(), &patch, current.fhir_version())
             .map_err(patch_failure_entry)?;
-    if let Some(validator) = validator {
-        validator
-            .validate_patch_candidate(tenant, current.fhir_version(), resource_type, &candidate)
+    match validator {
+        Some(validator) => validator
+            .prepare_patch_candidate(tenant, current.fhir_version(), resource_type, candidate)
             .await
-            .map_err(|outcome| Box::new(BundleEntryResult::error(422, outcome)))?;
+            .map_err(|outcome| Box::new(BundleEntryResult::error(422, outcome))),
+        None => Ok(candidate),
     }
-    Ok(candidate)
 }
 
 /// Transaction isolation levels.

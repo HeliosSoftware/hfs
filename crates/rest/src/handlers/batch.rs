@@ -15,6 +15,14 @@ use axum::{
 use futures::stream::{self, StreamExt};
 use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
 use helios_auth::{AccessScope, FhirOperation, Principal, SmartScopePolicy};
+
+use super::sof::bundle_overlay::{BundleOverlay, OverlayThenStorage};
+use super::sof::terminology_materialize::{
+    MaterializeBudget, MaterializeMode, apply_for_direct_write, apply_materialization,
+    created_unmaterialized_outcome, materialize_value_set_candidate,
+    materialize_value_set_candidate_with, plan_for_direct_write, plan_library_materialization,
+    transform_for_direct_write,
+};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider,
@@ -23,9 +31,9 @@ use helios_persistence::core::{
     PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider, WriteKind,
     WriteNotice, apply_patch_for_version, bundle_if_match_gate, decode_bundle_patch_resource,
 };
-use helios_persistence::error::{ResourceError, StorageError, TransactionError};
+use helios_persistence::error::{BackendError, ResourceError, StorageError, TransactionError};
 use helios_persistence::types::SearchParameter;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::error::{RestError, RestResult, create_operation_outcome};
@@ -92,12 +100,127 @@ fn body_too_large(max_body_size: usize) -> RestError {
     }
 }
 
-struct RestPatchValidator<'a> {
-    validation: &'a crate::validation::ValidationService,
+struct RestPatchValidator<'a, S> {
+    state: &'a AppState<S>,
+    /// The caller, for the materializer's scope checks (#1824, D12).
+    principal: Option<&'a Principal>,
+    /// The transaction's overlay (#1824): a PATCH candidate is prepared
+    /// through it — T2 for a ValueSet, phase A for a Library — and recorded
+    /// into it for later entries. `None` outside a transaction.
+    overlay: Option<Arc<BundleOverlay>>,
+}
+
+impl<'a, S> RestPatchValidator<'a, S> {
+    /// The validator for a batch PATCH entry: validation only.
+    fn plain(state: &'a AppState<S>) -> Self {
+        Self {
+            state,
+            principal: None,
+            overlay: None,
+        }
+    }
+
+    /// The validator for a transaction: validation plus terminology
+    /// preparation through the bundle's overlay.
+    fn for_transaction(
+        state: &'a AppState<S>,
+        principal: Option<&'a Principal>,
+        overlay: Arc<BundleOverlay>,
+    ) -> Self {
+        Self {
+            state,
+            principal,
+            overlay: Some(overlay),
+        }
+    }
+}
+
+impl<S> RestPatchValidator<'_, S>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
+    /// #1824 inside the executor: T2 on a ValueSet candidate (dependants are
+    /// the overlay's in-bundle Libraries plus the stored ones the pre-pass
+    /// snapshotted, so nothing is read from storage here), phase A on a
+    /// Library candidate against the overlay and the pre-pass snapshot. A
+    /// Library whose actual candidate declares something the pre-pass did
+    /// not prepare needs a side write, which a transaction cannot do, so the
+    /// entry is refused and the transaction rolls back (`[R5-3]`).
+    async fn prepare_terminology(
+        &self,
+        overlay: &BundleOverlay,
+        tenant: &helios_persistence::tenant::TenantContext,
+        resource_type: &str,
+        candidate: Value,
+    ) -> Result<Value, RestError> {
+        let mode = MaterializeMode::from_config(self.state.config());
+        if mode == MaterializeMode::Off {
+            return Ok(candidate);
+        }
+        let budget = MaterializeBudget::start(self.state.config());
+        match resource_type {
+            "ValueSet" => {
+                let mut dependants = overlay.libraries();
+                dependants.extend(overlay.stored_libraries().unwrap_or_default());
+                materialize_value_set_candidate_with(
+                    self.state,
+                    tenant,
+                    candidate,
+                    &dependants,
+                    false,
+                    &budget,
+                )
+                .await
+                .map(|(candidate, _)| candidate)
+            }
+            "Library" => {
+                let source = OverlayThenStorage {
+                    state: self.state,
+                    tenant,
+                    overlay,
+                    live: false,
+                };
+                let plan = plan_library_materialization(
+                    self.state,
+                    tenant,
+                    self.principal,
+                    &candidate,
+                    &source,
+                    false,
+                    &budget,
+                )
+                .await?;
+                if !plan.is_empty() && mode == MaterializeMode::Strict {
+                    return Err(RestError::ValidationFailed {
+                        outcome: json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{
+                                "severity": "error",
+                                "code": "invalid",
+                                "diagnostics": format!(
+                                    "the patched Library declares terminology dependencies this \
+                                     transaction did not prepare ({}): a ValueSet without an \
+                                     expansion outside the bundle, or a change since the \
+                                     transaction was validated; include the ValueSet in the \
+                                     transaction, or store it first",
+                                    plan.pending_urls().join(", ")
+                                )
+                            }]
+                        }),
+                    });
+                }
+                Ok(candidate)
+            }
+            _ => Ok(candidate),
+        }
+    }
 }
 
 #[async_trait::async_trait]
-impl PatchCandidateValidator for RestPatchValidator<'_> {
+impl<S> PatchCandidateValidator for RestPatchValidator<'_, S>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
     async fn validate_patch_candidate(
         &self,
         tenant: &helios_persistence::tenant::TenantContext,
@@ -105,7 +228,8 @@ impl PatchCandidateValidator for RestPatchValidator<'_> {
         resource_type: &str,
         candidate: &Value,
     ) -> Result<(), Value> {
-        self.validation
+        self.state
+            .validation()
             .check_write(
                 tenant.tenant_id().as_str(),
                 version,
@@ -116,6 +240,28 @@ impl PatchCandidateValidator for RestPatchValidator<'_> {
             .map_err(|error| error.client_outcome().1)?;
         super::sof::reject_unknown_view_definition_resource(resource_type, candidate)
             .map_err(|error| error.client_outcome().1)
+    }
+
+    async fn prepare_patch_candidate(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        version: FhirVersion,
+        resource_type: &str,
+        candidate: Value,
+    ) -> Result<Value, Value> {
+        let candidate = match &self.overlay {
+            Some(overlay) => self
+                .prepare_terminology(overlay, tenant, resource_type, candidate)
+                .await
+                .map_err(|error| error.client_outcome().1)?,
+            None => candidate,
+        };
+        self.validate_patch_candidate(tenant, version, resource_type, &candidate)
+            .await?;
+        if let Some(overlay) = &self.overlay {
+            overlay.record_candidate(&candidate);
+        }
+        Ok(candidate)
     }
 }
 
@@ -156,7 +302,8 @@ where
         + BundleProvider
         + ConditionalStorage
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     // Extract the Principal from request extensions (set by auth middleware).
     // If present, per-entry scope checks will be enforced.
@@ -368,7 +515,8 @@ where
         + RevincludeProvider
         + ConditionalStorage
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     debug!(
         tenant = %tenant.tenant_id(),
@@ -506,7 +654,8 @@ where
         + BundleProvider
         + ConditionalStorage
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     debug!(
         tenant = %tenant.tenant_id(),
@@ -740,6 +889,19 @@ where
     // and their query strings are searches, not conditional references.
     resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
 
+    // #1824: terminology materialization pre-pass, in execution order over
+    // the bundle overlay — ValueSet candidates are transformed here, so the
+    // validation loop below validates the final content; nothing is written
+    // and no entry is injected.
+    let overlay = terminology_pre_pass(
+        state,
+        &tenant,
+        principal,
+        fhir_version,
+        &mut indexed_entries,
+    )
+    .await?;
+
     // Write-path validation: transactions are atomic, so any invalid write
     // entry rejects the whole bundle before anything executes.
     for (index, entry, _) in &indexed_entries {
@@ -773,9 +935,7 @@ where
         .collect();
 
     // Call the persistence layer
-    let patch_validator = RestPatchValidator {
-        validation: state.validation(),
-    };
+    let patch_validator = RestPatchValidator::for_transaction(state, principal, overlay);
     let result = state
         .storage()
         .process_transaction_with_patch_validator(
@@ -1138,7 +1298,8 @@ where
         + RevincludeProvider
         + ConditionalStorage
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     let request = match entry.get("request") {
         Some(r) => r,
@@ -1368,6 +1529,22 @@ where
                 return entry_failure(error);
             }
 
+            // #1824 T2: a ValueSet some SQL Library depends on gains its
+            // expansion in the candidate before validation sees it.
+            let budget = MaterializeBudget::start(state.config());
+            let resource = match transform_for_direct_write(
+                state,
+                tenant.context(),
+                &resource_type,
+                resource,
+                &budget,
+            )
+            .await
+            {
+                Ok(resource) => resource,
+                Err(e) => return entry_failure(e),
+            };
+
             // Write-path validation (per-entry outcome in batch semantics).
             //
             // The error carries the validator's own multi-issue outcome —
@@ -1392,6 +1569,33 @@ where
                 if let Err(e) = super::conditional_support::require_create(state.storage()) {
                     return entry_failure(e);
                 }
+                // #1824 T1 (D13 c, d), as the resource endpoint does it: a
+                // pre-search decides whether phase A runs, the atomic create
+                // runs first, phase B only after `Created`.
+                let plan = match state
+                    .storage()
+                    .resolve_conditional_matches(tenant.context(), &resource_type, criteria)
+                    .await
+                {
+                    Ok(matches) if !matches.is_empty() => None,
+                    Ok(_)
+                    | Err(StorageError::Backend(BackendError::UnsupportedCapability { .. })) => {
+                        match plan_for_direct_write(
+                            state,
+                            tenant.context(),
+                            principal,
+                            &resource_type,
+                            &resource,
+                            &budget,
+                        )
+                        .await
+                        {
+                            Ok(plan) => plan,
+                            Err(e) => return entry_failure(e),
+                        }
+                    }
+                    Err(e) => return entry_storage_failure(e),
+                };
                 return match state
                     .storage()
                     .conditional_create(
@@ -1414,6 +1618,28 @@ where
                             None,
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
+                        // Phase B after the committed create; a failure answers
+                        // the entry with the created-unmaterialized 422 that
+                        // carries the stored Library's location and etag.
+                        if let Some(plan) = plan
+                            && !plan.is_empty()
+                            && let Err(failure) =
+                                apply_materialization(state, tenant.context(), plan).await
+                        {
+                            let location = stored.versioned_url();
+                            let outcome = created_unmaterialized_outcome(
+                                &resource_type,
+                                stored.id(),
+                                stored.version_id(),
+                                &location,
+                                &failure,
+                            );
+                            let mut result = BundleEntryResult::created(stored);
+                            result.status = 422;
+                            result.resource = None;
+                            result.outcome = Some(outcome);
+                            return result;
+                        }
                         BundleEntryResult::created(stored)
                     }
                     // The match is answered as the resource endpoint answers
@@ -1431,6 +1657,25 @@ where
                     }
                     Err(e) => conditional_create_entry_failure(e),
                 };
+            }
+
+            // #1824 T1: phase A, then phase B immediately before the write.
+            match plan_for_direct_write(
+                state,
+                tenant.context(),
+                principal,
+                &resource_type,
+                &resource,
+                &budget,
+            )
+            .await
+            {
+                Ok(plan) => {
+                    if let Err(e) = apply_for_direct_write(state, tenant.context(), plan).await {
+                        return entry_failure(e);
+                    }
+                }
+                Err(e) => return entry_failure(e),
             }
 
             match state
@@ -1585,6 +1830,21 @@ where
                 return failure;
             }
 
+            // #1824 T2 before validation; T1 (phase A then B) before the write.
+            let budget = MaterializeBudget::start(state.config());
+            let resource = match transform_for_direct_write(
+                state,
+                tenant.context(),
+                &resource_type,
+                resource,
+                &budget,
+            )
+            .await
+            {
+                Ok(resource) => resource,
+                Err(e) => return entry_failure(e),
+            };
+
             // Write-path validation (per-entry outcome in batch semantics).
             if let Err(e) = state
                 .validation()
@@ -1592,6 +1852,24 @@ where
                 .await
             {
                 return entry_failure(e);
+            }
+
+            match plan_for_direct_write(
+                state,
+                tenant.context(),
+                principal,
+                &resource_type,
+                &resource,
+                &budget,
+            )
+            .await
+            {
+                Ok(plan) => {
+                    if let Err(e) = apply_for_direct_write(state, tenant.context(), plan).await {
+                        return entry_failure(e);
+                    }
+                }
+                Err(e) => return entry_failure(e),
             }
 
             match state
@@ -1731,6 +2009,7 @@ where
                 &id,
                 criteria,
                 if_match,
+                principal,
                 audit_target,
             )
             .await
@@ -1748,10 +2027,11 @@ async fn process_batch_patch<S>(
     id: &str,
     criteria: Option<&str>,
     if_match: Option<&str>,
+    principal: Option<&Principal>,
     audit_target: &mut Option<AuditTarget>,
 ) -> BundleEntryResult
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
     if let Err(error) = admit_bundle_mutation(
         &BundleMethod::Patch,
@@ -1833,9 +2113,21 @@ where
         (current, candidate)
     };
 
-    let validator = RestPatchValidator {
-        validation: state.validation(),
+    // #1824 T2 on the patched candidate, before validation sees it.
+    let budget = MaterializeBudget::start(state.config());
+    let candidate = match transform_for_direct_write(
+        state,
+        tenant.context(),
+        resource_type,
+        candidate,
+        &budget,
+    )
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(e) => return entry_failure(e),
     };
+    let validator = RestPatchValidator::plain(state);
     if let Err(outcome) = validator
         .validate_patch_candidate(
             tenant.context(),
@@ -1846,6 +2138,24 @@ where
         .await
     {
         return BundleEntryResult::error(422, outcome);
+    }
+    // #1824 T1 on the patched Library: phase A, then phase B before the write.
+    match plan_for_direct_write(
+        state,
+        tenant.context(),
+        principal,
+        resource_type,
+        &candidate,
+        &budget,
+    )
+    .await
+    {
+        Ok(plan) => {
+            if let Err(e) = apply_for_direct_write(state, tenant.context(), plan).await {
+                return entry_failure(e);
+            }
+        }
+        Err(e) => return entry_failure(e),
     }
     let stored = match state
         .storage()
@@ -3012,6 +3322,292 @@ fn bundle_method_to_fhir_operation(method: &BundleMethod) -> FhirOperation {
 
 /// Returns a processing order for bundle methods per FHIR spec.
 /// DELETE (0) -> POST (1) -> PUT/PATCH (2) -> GET (3)
+/// #1824: the transaction pre-pass (plan §5 PR 2c, §6.14). Runs before the
+/// per-entry validation loop and before persistence, walking the write
+/// entries in the executor's execution order (DELETE, POST, PUT/PATCH) and
+/// building the bundle's [`BundleOverlay`]:
+///
+/// 1. **Index.** A DELETE by id suppresses the stored resource's identity;
+///    a PUT by id suppresses the stored one and records the candidate; a POST
+///    records the candidate. A conditional PUT, DELETE or POST
+///    (`ifNoneExist`) on a ValueSet, ConceptMap or Library is undetermined:
+///    its outcome is decided only inside the executor, so when any
+///    materialization resolution is needed the bundle is refused up front in
+///    strict mode (`[R4-2]`, `[R6-1]`).
+/// 2. **Discover.** Every Library PATCH is provisionally applied to the
+///    Library as the overlay-then-storage view sees it, only to learn which
+///    dependencies it declares (`[R5-3]`); the result is never persisted.
+/// 3. **Transform.** Every in-bundle ValueSet POST/PUT candidate without an
+///    expansion that an in-bundle or stored SQL Library depends on gains its
+///    expansion (T2); the entry's resource is replaced.
+/// 4. **Plan.** Every in-bundle Library (POST/PUT body or provisional PATCH
+///    result) is planned against the overlay with no side writes allowed; a
+///    dependency that would need a write outside the bundle is a strict 422
+///    naming the remedy (D4, Q9).
+///
+/// Every storage lookup is snapshotted into the overlay, so the executor's
+/// own PATCH preparation reads nothing from storage.
+async fn terminology_pre_pass<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    principal: Option<&Principal>,
+    fhir_version: FhirVersion,
+    indexed_entries: &mut [(usize, BundleEntry, Option<String>)],
+) -> Result<Arc<BundleOverlay>, RestError>
+where
+    S: ResourceStorage + SearchProvider + ConditionalStorage + Send + Sync + 'static,
+{
+    use super::sof::bundle_overlay::is_overlay_type;
+    use super::sof::terminology_materialize::{DependencySource, Lookup, stored_sql_libraries};
+    use helios_sof::sqlquery::parse_sqlquery_library;
+
+    let overlay = Arc::new(BundleOverlay::new());
+    let mode = MaterializeMode::from_config(state.config());
+    if mode == MaterializeMode::Off {
+        return Ok(overlay);
+    }
+    let mut order: Vec<usize> = (0..indexed_entries.len()).collect();
+    order.sort_by_key(|&i| method_processing_order(&indexed_entries[i].1.method));
+
+    let read_stored = |resource_type: String, id: String| async move {
+        match state
+            .storage()
+            .read(tenant.context(), &resource_type, &id)
+            .await
+        {
+            Ok(stored) => Ok(stored),
+            Err(StorageError::Resource(_)) => Ok(None),
+            Err(e) => Err(RestError::from(e)),
+        }
+    };
+
+    let mut value_set_candidates: Vec<usize> = Vec::new();
+    let mut library_candidates: Vec<(usize, Value)> = Vec::new();
+    let mut library_patches: Vec<usize> = Vec::new();
+    let mut has_value_set_patch = false;
+
+    // 1. Index in execution order.
+    for &pos in &order {
+        let (index, entry, _) = &indexed_entries[pos];
+        let Ok((resource_type, id)) = parse_request_url(&entry.url) else {
+            continue;
+        };
+        if !is_overlay_type(&resource_type) {
+            continue;
+        }
+        let undetermined = |what: &str| {
+            format!(
+                "entry {index}: {what} {} is conditional on {resource_type}",
+                entry.url
+            )
+        };
+        match entry.method {
+            BundleMethod::Delete => {
+                if entry.criteria.is_some() {
+                    overlay.record_undetermined(undetermined("DELETE"));
+                    continue;
+                }
+                let stored = read_stored(resource_type.clone(), id.clone()).await?;
+                overlay.record_deleted(&resource_type, &id, stored.as_ref().map(|s| s.content()));
+            }
+            BundleMethod::Post => {
+                if entry.if_none_exist.is_some() {
+                    overlay.record_undetermined(undetermined("POST (ifNoneExist)"));
+                    continue;
+                }
+                let Some(resource) = &entry.resource else {
+                    continue;
+                };
+                overlay.record_candidate(resource);
+                match resource_type.as_str() {
+                    "Library" if parse_sqlquery_library(resource).is_ok() => {
+                        overlay.record_library(resource);
+                        library_candidates.push((*index, resource.clone()));
+                    }
+                    "ValueSet" if resource.get("expansion").is_none() => {
+                        value_set_candidates.push(pos);
+                    }
+                    _ => {}
+                }
+            }
+            BundleMethod::Put => {
+                if entry.criteria.is_some() {
+                    overlay.record_undetermined(undetermined("PUT"));
+                    continue;
+                }
+                let Some(resource) = &entry.resource else {
+                    continue;
+                };
+                if let Some(stored) = read_stored(resource_type.clone(), id.clone()).await? {
+                    overlay.record_replaced(stored.content());
+                }
+                // The URL names the identity; the body may omit the id.
+                let mut candidate = resource.clone();
+                candidate["id"] = json!(id);
+                overlay.record_candidate(&candidate);
+                match resource_type.as_str() {
+                    "Library" if parse_sqlquery_library(resource).is_ok() => {
+                        overlay.record_library(resource);
+                        library_candidates.push((*index, resource.clone()));
+                    }
+                    "ValueSet" if resource.get("expansion").is_none() => {
+                        value_set_candidates.push(pos);
+                    }
+                    _ => {}
+                }
+            }
+            BundleMethod::Patch => {
+                if entry.criteria.is_some() {
+                    overlay.record_undetermined(undetermined("PATCH"));
+                    continue;
+                }
+                match resource_type.as_str() {
+                    "Library" => library_patches.push(pos),
+                    "ValueSet" => has_value_set_patch = true,
+                    _ => {}
+                }
+            }
+            BundleMethod::Get => {}
+        }
+    }
+
+    let source = OverlayThenStorage {
+        state,
+        tenant: tenant.context(),
+        overlay: &overlay,
+        live: true,
+    };
+
+    // 2. Discover dependencies declared by Library PATCH entries.
+    let mut provisional: Vec<(usize, Value)> = Vec::new();
+    for &pos in &library_patches {
+        let (index, entry, _) = &indexed_entries[pos];
+        let Ok((_, id)) = parse_request_url(&entry.url) else {
+            continue;
+        };
+        let (base, version) = match source.lookup(&format!("Library/{id}")).await? {
+            Lookup::Candidate(candidate) => (candidate, fhir_version),
+            Lookup::Stored(stored) => (stored.content().clone(), stored.fhir_version()),
+            Lookup::NotFound => continue,
+        };
+        let Some(document) = &entry.resource else {
+            continue;
+        };
+        // A malformed patch is the executor's to report; here it simply
+        // declares nothing.
+        let Ok(patch) = decode_bundle_patch_resource(document, fhir_version) else {
+            continue;
+        };
+        let Ok(patched) = apply_patch_for_version(&base, &patch, version) else {
+            continue;
+        };
+        if parse_sqlquery_library(&patched).is_ok() {
+            overlay.record_library(&patched);
+            provisional.push((*index, patched));
+        }
+    }
+
+    let resolution_needed = !value_set_candidates.is_empty()
+        || !library_candidates.is_empty()
+        || !provisional.is_empty()
+        || has_value_set_patch;
+    let undetermined = overlay.undetermined();
+    if resolution_needed && !undetermined.is_empty() {
+        let message = format!(
+            "conditional operations on ValueSet, ConceptMap or Library cannot be combined with \
+             Library materialization in one transaction; use explicit ids ({})",
+            undetermined.join("; ")
+        );
+        match mode {
+            MaterializeMode::Strict => {
+                return Err(RestError::ValidationFailed {
+                    outcome: json!({
+                        "resourceType": "OperationOutcome",
+                        "issue": [{"severity": "error", "code": "invalid", "diagnostics": message}]
+                    }),
+                });
+            }
+            MaterializeMode::Lenient | MaterializeMode::Off => {
+                tracing::warn!(%message, "terminology materialization skipped for this transaction (lenient)");
+                return Ok(overlay);
+            }
+        }
+    }
+    if !resolution_needed {
+        return Ok(overlay);
+    }
+
+    let budget = MaterializeBudget::start(state.config());
+
+    // 3. Transform ValueSet candidates.
+    let libraries = overlay.libraries();
+    for &pos in &value_set_candidates {
+        let (_, entry, _) = &mut indexed_entries[pos];
+        let Ok((_, id)) = parse_request_url(&entry.url) else {
+            continue;
+        };
+        let Some(candidate) = entry.resource.take() else {
+            continue;
+        };
+        let (transformed, _) = materialize_value_set_candidate(
+            state,
+            tenant.context(),
+            candidate,
+            &libraries,
+            &budget,
+        )
+        .await?;
+        let mut keyed = transformed.clone();
+        if entry.method == BundleMethod::Put {
+            keyed["id"] = json!(id);
+        }
+        overlay.record_candidate(&keyed);
+        entry.resource = Some(transformed);
+    }
+
+    // 4. Plan every in-bundle Library with no side writes allowed.
+    for (index, library) in library_candidates.iter().chain(provisional.iter()) {
+        let plan = plan_library_materialization(
+            state,
+            tenant.context(),
+            principal,
+            library,
+            &source,
+            false,
+            &budget,
+        )
+        .await?;
+        if !plan.is_empty() {
+            let message = format!(
+                "entry {index}: the Library depends on terminology artifacts that need a write \
+                 outside this transaction ({}): a stored ValueSet without an expansion is not \
+                 materialized by a transaction; include the ValueSet in the transaction, or \
+                 store it first",
+                plan.pending_urls().join(", ")
+            );
+            match mode {
+                MaterializeMode::Strict => {
+                    return Err(RestError::ValidationFailed {
+                        outcome: json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "invalid", "diagnostics": message}]
+                        }),
+                    });
+                }
+                MaterializeMode::Lenient | MaterializeMode::Off => {
+                    tracing::warn!(%message, "terminology materialization skipped (lenient)");
+                }
+            }
+        }
+    }
+
+    // T2 inside the executor (a ValueSet PATCH) must not read storage.
+    if has_value_set_patch {
+        overlay.set_stored_libraries(stored_sql_libraries(state, tenant.context()).await?);
+    }
+    Ok(overlay)
+}
+
 fn method_processing_order(method: &BundleMethod) -> u8 {
     match method {
         BundleMethod::Delete => 0,
@@ -4404,7 +5000,8 @@ mod tests {
             + RevincludeProvider
             + ConditionalStorage
             + Send
-            + Sync,
+            + Sync
+            + 'static,
     {
         let tenant = TenantExtractor::new("test-tenant", crate::tenant::TenantSource::Default);
         let response = process_batch(

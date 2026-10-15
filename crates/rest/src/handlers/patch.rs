@@ -61,11 +61,13 @@ pub async fn patch_handler<S>(
     compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     body: Bytes,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {
@@ -147,6 +149,17 @@ where
         "patch",
     )?;
 
+    // #1824 T2 on the patched candidate, before validation sees it.
+    let budget = super::sof::terminology_materialize::MaterializeBudget::start(state.config());
+    let patched_content = super::sof::terminology_materialize::transform_for_direct_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        patched_content,
+        &budget,
+    )
+    .await?;
+
     state
         .validation()
         .check_write(
@@ -157,6 +170,20 @@ where
         )
         .await?;
     super::sof::reject_unknown_view_definition_resource(&resource_type, &patched_content)?;
+
+    // #1824 T1 on the patched Library: phase A, then phase B immediately
+    // before the write.
+    let plan = super::sof::terminology_materialize::plan_for_direct_write(
+        &state,
+        tenant.context(),
+        principal.as_ref(),
+        &resource_type,
+        &patched_content,
+        &budget,
+    )
+    .await?;
+    super::sof::terminology_materialize::apply_for_direct_write(&state, tenant.context(), plan)
+        .await?;
 
     // Update the resource
     let stored = state
@@ -254,11 +281,13 @@ pub async fn conditional_patch_handler<S>(
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     body: Bytes,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     super::conditional_support::require_patch(state.storage())?;
 
     // AuditEvent resources are immutable — block write operations
@@ -316,6 +345,17 @@ where
     use helios_persistence::core::ConditionalPatchPreparation;
     match prepared {
         ConditionalPatchPreparation::Ready { current, patched } => {
+            // #1824: T2 on the patched candidate, then T1 before the write.
+            let budget =
+                super::sof::terminology_materialize::MaterializeBudget::start(state.config());
+            let patched = super::sof::terminology_materialize::transform_for_direct_write(
+                &state,
+                tenant.context(),
+                &resource_type,
+                patched,
+                &budget,
+            )
+            .await?;
             state
                 .validation()
                 .check_write(
@@ -326,6 +366,21 @@ where
                 )
                 .await?;
             super::sof::reject_unknown_view_definition_resource(&resource_type, &patched)?;
+            let plan = super::sof::terminology_materialize::plan_for_direct_write(
+                &state,
+                tenant.context(),
+                principal.as_ref(),
+                &resource_type,
+                &patched,
+                &budget,
+            )
+            .await?;
+            super::sof::terminology_materialize::apply_for_direct_write(
+                &state,
+                tenant.context(),
+                plan,
+            )
+            .await?;
             let stored = state
                 .storage()
                 .update(tenant.context(), &current, patched)
