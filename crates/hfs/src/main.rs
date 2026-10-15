@@ -112,7 +112,12 @@ fn parse_env_bool(var: &str, default_value: bool) -> bool {
 /// An S3 endpoint override, or `None` when it is unset or blank — so an empty
 /// `HFS_*_S3_ENDPOINT=` neither replaces the AWS endpoint nor forces
 /// path-style addressing.
-#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+// Only bulk export's S3 output store calls it, and that is built only with a
+// SQL backend; the unit test keeps it exercised in every build.
+#[cfg_attr(
+    not(all(feature = "s3", any(feature = "sqlite", feature = "postgres"))),
+    allow(dead_code)
+)]
 fn non_blank_endpoint(endpoint: Option<String>) -> Option<String> {
     endpoint
         .map(|e| e.trim().to_string())
