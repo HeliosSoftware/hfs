@@ -921,6 +921,132 @@ mod sof_sqlquery_graph_tests {
         }
     }
 
+    /// The issue's shape (#1473): an unfiltered SQL View (`fp`) joined to a
+    /// large observation view (`obs`) whose filters sit in the top-level
+    /// WHERE. The observation leaf (6 rows) is past the cap of 3 and only
+    /// runs because `code = ... AND value > :min_height` is pushed into it;
+    /// the patient side (3 rows) fits under the cap on its own. A high cap
+    /// must give identical rows.
+    #[tokio::test]
+    async fn join_of_unfiltered_sqlview_and_filtered_leaf_runs_past_the_cap() {
+        let sql = "SELECT fp.id, fp.city, MAX(obs.value) AS height \
+                   FROM fp JOIN obs ON obs.patient_id = fp.id \
+                   WHERE obs.code = '8302-2' AND obs.value > :min_height \
+                   GROUP BY fp.id, fp.city ORDER BY fp.id";
+        let mut per_cap = Vec::new();
+        for cap in [3usize, 1_000] {
+            let mut config = ServerConfig::for_testing();
+            config.sof_sqlquery_max_source_rows_per_vd = cap;
+            let (server, backend) = create_test_server_with_config(config).await;
+            for (id, family) in [("p1", "Smith"), ("p2", "Jones"), ("p3", "Brown")] {
+                seed_patient(&backend, id, family).await;
+            }
+            seed_view_definition(&backend, "pt", "http://example.org/pt").await;
+            seed_library(
+                &backend,
+                "fp",
+                sql_lib(
+                    "fp",
+                    Some("http://example.org/fp"),
+                    "sql-view",
+                    "SELECT l.patient_id AS id, l.family AS city FROM l",
+                    &[("l", "http://example.org/pt")],
+                    vec![],
+                ),
+            )
+            .await;
+            for (i, (patient, code, value)) in [
+                ("p1", "8302-2", 180),
+                ("p1", "8302-2", 170),
+                ("p2", "8302-2", 160),
+                ("p3", "8302-2", 100),
+                ("p2", "29463-7", 200),
+                ("p3", "29463-7", 190),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let obs = json!({
+                    "resourceType": "Observation",
+                    "id": format!("o{i}"),
+                    "status": "final",
+                    "subject": {"reference": format!("Patient/{patient}")},
+                    "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                    "valueQuantity": {"value": value, "unit": "cm"}
+                });
+                backend
+                    .create(&tenant(), "Observation", obs, FhirVersion::R4)
+                    .await
+                    .expect("seed observation");
+            }
+            let vd = json!({
+                "resourceType": "ViewDefinition",
+                "id": "obs",
+                "url": "http://example.org/obs",
+                "name": "obs",
+                "status": "active",
+                "resource": "Observation",
+                "select": [{"column": [
+                    {"path": "id", "name": "id", "type": "string"},
+                    {"path": "subject.getReferenceKey(Patient)", "name": "patient_id", "type": "string"},
+                    {"path": "code.coding.first().code", "name": "code", "type": "code"},
+                    {"path": "value.ofType(Quantity).value", "name": "value", "type": "decimal"}
+                ]}]
+            });
+            backend
+                .create_or_update(&tenant(), "ViewDefinition", "obs", vd, FhirVersion::R4)
+                .await
+                .expect("seed observation view");
+
+            let subject = sql_lib(
+                "subject",
+                None,
+                "sql-query",
+                sql,
+                &[
+                    ("fp", "http://example.org/fp"),
+                    ("obs", "http://example.org/obs"),
+                ],
+                vec![json!({"name": "min_height", "use": "in", "type": "decimal"})],
+            );
+            let mut body = run_body_inline(subject, "json");
+            body["parameter"]
+                .as_array_mut()
+                .expect("parameter array")
+                .push(json!({
+                    "name": "parameters",
+                    "resource": {
+                        "resourceType": "Parameters",
+                        "parameter": [{"name": "min_height", "valueDecimal": 150}]
+                    }
+                }));
+            let response = post_sql_run(&server, &body).await;
+            response.assert_status(StatusCode::OK);
+            let rows: Value = response.json();
+            let rows: Vec<(String, String, f64)> = rows
+                .as_array()
+                .expect("rows array")
+                .iter()
+                .map(|r| {
+                    (
+                        r["id"].as_str().expect("id").to_string(),
+                        r["city"].as_str().expect("city").to_string(),
+                        r["height"].as_f64().expect("height"),
+                    )
+                })
+                .collect();
+            per_cap.push(rows);
+        }
+        assert_eq!(per_cap[0], per_cap[1]);
+        assert_eq!(
+            per_cap[0],
+            vec![
+                ("p1".to_string(), "Smith".to_string(), 180.0),
+                ("p2".to_string(), "Jones".to_string(), 160.0),
+            ]
+        );
+    }
+
     // =========================================================================
     // Bound on the number of `context` entries (#1705)
     // =========================================================================
