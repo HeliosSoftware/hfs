@@ -8335,3 +8335,379 @@ mod keyspace_layouts {
         assert_eq!(seen, expected);
     }
 }
+
+/// #2063: the S3 read fan-outs share one backend-wide `GetObject` budget
+/// (`HFS_S3_SCAN_CONCURRENCY`) instead of each fanning out on its own.
+mod scan_read_limit {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Decrements the in-flight gauge when dropped, so a GET that is aborted
+    /// mid-flight still leaves it.
+    struct InFlight<'a>(&'a AtomicUsize);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// An `S3Api` that counts the `GetObject`s in flight and keeps each one
+    /// open for `delay`, so overlapping GETs are observable. Everything else
+    /// delegates to the mock.
+    struct GaugedGetClient {
+        inner: Arc<MockS3Client>,
+        delay: Duration,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl S3Api for GaugedGetClient {
+        async fn head_bucket(&self, bucket: &str) -> Result<(), S3ClientError> {
+            self.inner.head_bucket(bucket).await
+        }
+        async fn head_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<Option<ObjectMetadata>, S3ClientError> {
+            self.inner.head_object(bucket, key).await
+        }
+        async fn get_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<Option<ObjectData>, S3ClientError> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let _leave = InFlight(&self.in_flight);
+            tokio::time::sleep(self.delay).await;
+            self.inner.get_object(bucket, key).await
+        }
+        async fn put_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            body: Vec<u8>,
+            content_type: Option<&str>,
+            if_match: Option<&str>,
+            if_none_match: Option<&str>,
+        ) -> Result<ObjectMetadata, S3ClientError> {
+            self.inner
+                .put_object(bucket, key, body, content_type, if_match, if_none_match)
+                .await
+        }
+        async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3ClientError> {
+            self.inner.delete_object(bucket, key).await
+        }
+        async fn list_objects(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            continuation: Option<&str>,
+            max_keys: Option<i32>,
+        ) -> Result<ListObjectsResult, S3ClientError> {
+            self.inner
+                .list_objects(bucket, prefix, continuation, max_keys)
+                .await
+        }
+        async fn list_objects_after(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            start_after: &str,
+            continuation: Option<&str>,
+            max_keys: Option<i32>,
+        ) -> Result<ListObjectsResult, S3ClientError> {
+            self.inner
+                .list_objects_after(bucket, prefix, start_after, continuation, max_keys)
+                .await
+        }
+        async fn list_common_prefixes(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            delimiter: &str,
+        ) -> Result<Vec<String>, S3ClientError> {
+            self.inner
+                .list_common_prefixes(bucket, prefix, delimiter)
+                .await
+        }
+        async fn list_common_prefixes_page(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            delimiter: &str,
+            start_after: Option<&str>,
+            max_keys: Option<i32>,
+        ) -> Result<DelimitedListPage, S3ClientError> {
+            self.inner
+                .list_common_prefixes_page(bucket, prefix, delimiter, start_after, max_keys)
+                .await
+        }
+        async fn presign_get(
+            &self,
+            bucket: &str,
+            key: &str,
+            ttl: Duration,
+        ) -> Result<String, S3ClientError> {
+            self.inner.presign_get(bucket, key, ttl).await
+        }
+    }
+
+    /// A `PrefixPerTenant` backend with `scan_concurrency = limit` over a
+    /// [`GaugedGetClient`] whose GETs each take 10 ms.
+    fn gauged_backend(limit: usize) -> (S3Backend, Arc<GaugedGetClient>) {
+        let client = Arc::new(GaugedGetClient {
+            inner: Arc::new(MockS3Client::with_buckets(&["test-bucket"])),
+            delay: Duration::from_millis(10),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let config = S3BackendConfig {
+            tenancy_mode: S3TenancyMode::PrefixPerTenant {
+                bucket: "test-bucket".to_string(),
+            },
+            validate_buckets_on_startup: false,
+            scan_concurrency: limit,
+            ..Default::default()
+        };
+        let backend = S3Backend::with_client(config, client.clone()).expect("backend");
+        (backend, client)
+    }
+
+    /// Creates `p00`, `p01`, ... and forgets the GETs the writes made.
+    async fn seed_patients(
+        backend: &S3Backend,
+        client: &GaugedGetClient,
+        t: &TenantContext,
+        n: usize,
+    ) {
+        for i in 0..n {
+            backend
+                .create(
+                    t,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i:02}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .expect("create Patient");
+        }
+        client.peak.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn backend_read_limit_defaults_to_32_and_is_shared_by_clones() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        assert_eq!(backend.scan_concurrency(), 32);
+        assert_eq!(backend.scan_limit.available_permits(), 32);
+        assert!(Arc::ptr_eq(
+            &backend.clone().scan_limit,
+            &backend.scan_limit
+        ));
+    }
+
+    /// Acceptance criterion 3: the read setting does not touch the write
+    /// fan-out that startup seeding and bulk writes use.
+    #[test]
+    fn write_concurrency_is_independent_of_scan_concurrency() {
+        let (backend, _client) = gauged_backend(4);
+        assert_eq!(backend.scan_concurrency(), 4);
+        assert_eq!(ResourceStorage::bulk_write_concurrency(&backend), 32);
+    }
+
+    /// Acceptance criterion 2: scans and a by-id read running at once never
+    /// have more GETs in flight than the limit. Without the shared budget each
+    /// of the four scans and the read would fan out to 3 on its own, 15 in all.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_scans_share_one_read_limit() {
+        let (backend, client) = gauged_backend(3);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 24).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let ids: Vec<String> = (0..10).map(|i| format!("p{i:02}")).collect();
+        let one_scan = || {
+            let scan = scan.clone();
+            let t = t.clone();
+            async move {
+                scan.scan_resources(&t, "Patient")
+                    .await
+                    .expect("scan")
+                    .collect::<Vec<_>>()
+                    .await
+            }
+        };
+
+        let (a, b, c, d, read) = tokio::join!(
+            one_scan(),
+            one_scan(),
+            one_scan(),
+            one_scan(),
+            scan.read_resources(&t, "Patient", &ids),
+        );
+        for scanned in [a, b, c, d] {
+            assert_eq!(scanned.len(), 24);
+            assert!(scanned.iter().all(|r| r.is_ok()), "{scanned:?}");
+        }
+        assert_eq!(read.expect("read by id").len(), 10);
+
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 3,
+            "peak {peak} GETs in flight exceeds the limit of 3"
+        );
+        assert!(peak >= 2, "peak {peak}: the test never overlapped any GETs");
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_limit.available_permits(), 3);
+    }
+
+    /// The setting really bounds a single call, and a limit of one still lets
+    /// the scan finish.
+    #[tokio::test(start_paused = true)]
+    async fn scan_concurrency_one_serialises_and_still_completes() {
+        let (backend, client) = gauged_backend(1);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 10).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let scanned = scan
+            .scan_resources(&t, "Patient")
+            .await
+            .expect("scan")
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(scanned.len(), 10);
+        assert!(scanned.iter().all(|r| r.is_ok()), "{scanned:?}");
+        assert_eq!(client.peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// Deadlock regression. The in-process SQL-on-FHIR runner stops polling its
+    /// scan stream while it resolves a batch's references and while it waits on
+    /// a full channel, and the resolve (or the compartment filter) reads by id
+    /// through the same backend. If the permit were taken in the fan-out's own
+    /// future, two paused scans would keep the whole budget while that nested
+    /// read queued for a permit that never frees (the semaphore hands released
+    /// permits to queued waiters even when nothing polls them), and this read
+    /// would end in `Elapsed`. Each GET runs on its own task, so it finishes and
+    /// returns its permit whatever the scan's consumer does.
+    #[tokio::test(start_paused = true)]
+    async fn paused_scans_do_not_hold_the_read_limit() {
+        let (backend, client) = gauged_backend(2);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 10).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let mut first = scan.scan_resources(&t, "Patient").await.expect("scan");
+        let mut second = scan.scan_resources(&t, "Patient").await.expect("scan");
+        first.next().await.expect("an item").expect("scanned");
+        second.next().await.expect("an item").expect("scanned");
+        // Both streams are now left unpolled, as the runner leaves them.
+
+        let ids = ["p00", "p01", "p02"].map(str::to_string);
+        let read = tokio::time::timeout(
+            Duration::from_secs(30),
+            scan.read_resources(&t, "Patient", &ids),
+        )
+        .await
+        .expect("a by-id read must not wait on permits that paused scans hold")
+        .expect("read by id");
+        assert_eq!(read.len(), 3);
+
+        for stream in [first, second] {
+            let rest = stream.collect::<Vec<_>>().await;
+            assert_eq!(rest.len(), 9, "the rest of the scan still arrives");
+            assert!(rest.iter().all(|r| r.is_ok()), "{rest:?}");
+        }
+    }
+
+    /// A scan that is dropped half-way aborts its GETs, and the permits come
+    /// back.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_scan_returns_its_permits() {
+        let (backend, client) = gauged_backend(2);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 10).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let mut stream = scan.scan_resources(&t, "Patient").await.expect("scan");
+        stream.next().await.expect("an item").expect("scanned");
+        drop(stream);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(backend.scan_limit.available_permits(), 2);
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// The other read fan-outs (type count, the live scan behind conditional
+    /// create and SearchParameter reloads, type and instance `_history`) draw
+    /// on the same budget as the SQL-on-FHIR scans.
+    #[tokio::test(start_paused = true)]
+    async fn other_read_fan_outs_share_the_scan_limit() {
+        let (backend, client) = gauged_backend(2);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 12).await;
+        for i in 0..3 {
+            backend
+                .create_or_update(
+                    &t,
+                    "Patient",
+                    "p00",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "p00",
+                        "name": [{"family": format!("v{i}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .expect("update Patient");
+        }
+        client.peak.store(0, Ordering::SeqCst);
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let type_params = HistoryParams {
+            pagination: Pagination {
+                count: 100,
+                mode: PaginationMode::Offset(0),
+            },
+            ..HistoryParams::new()
+        };
+        let instance_params = HistoryParams::new();
+        let (scanned, counted, live, type_history, instance_history) = tokio::join!(
+            async {
+                scan.scan_resources(&t, "Patient")
+                    .await
+                    .expect("scan")
+                    .collect::<Vec<_>>()
+                    .await
+            },
+            backend.count(&t, Some("Patient")),
+            backend.scan_live_resources(&t, "Patient"),
+            backend.history_type(&t, "Patient", &type_params),
+            backend.history_instance(&t, "Patient", "p00", &instance_params),
+        );
+
+        assert_eq!(scanned.len(), 12);
+        assert!(scanned.iter().all(|r| r.is_ok()), "{scanned:?}");
+        assert_eq!(counted.expect("count"), 12);
+        assert_eq!(live.expect("live scan").len(), 12);
+        // 12 creates and 3 updates; deletes are excluded, so every index body
+        // is read to find out.
+        assert_eq!(type_history.expect("type history").items.len(), 15);
+        // p00: the create and the three updates.
+        assert_eq!(instance_history.expect("instance history").items.len(), 4);
+
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 2,
+            "peak {peak} GETs in flight exceeds the limit of 2"
+        );
+        assert!(peak >= 2, "peak {peak}: the test never overlapped any GETs");
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_limit.available_permits(), 2);
+    }
+}

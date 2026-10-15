@@ -308,6 +308,23 @@ fn parse_s3_keyspace_layout(
     }
 }
 
+/// Parses `HFS_S3_SCAN_CONCURRENCY`: the most `GetObject` requests the S3 read
+/// fan-outs may have in flight at once. Unset or blank is the default (32); a
+/// value that is not a whole number of at least 1 is an error rather than a
+/// silent fall back, since `0` would stall every scan.
+#[cfg(feature = "s3")]
+fn parse_s3_scan_concurrency(raw: Option<&str>) -> anyhow::Result<usize> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(helios_persistence::backends::s3::DEFAULT_SCAN_CONCURRENCY),
+        Some(value) => match value.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => anyhow::bail!(
+                "HFS_S3_SCAN_CONCURRENCY '{value}' invalid (expected a whole number of at least 1)"
+            ),
+        },
+    }
+}
+
 /// Builds the primary S3 backend's configuration from the `HFS_S3_*`
 /// environment: the one reader for `start_s3`, `start_s3_elasticsearch` and
 /// the shared database audit sink, so the three cannot disagree about where
@@ -321,9 +338,12 @@ fn s3_backend_config_from_env(
     let tenancy_mode = S3TenancyEnv::from_env().resolve(default_tenant)?;
     let default_keyspace_layout =
         parse_s3_keyspace_layout(std::env::var("HFS_S3_KEYSPACE_LAYOUT").ok().as_deref())?;
+    let scan_concurrency =
+        parse_s3_scan_concurrency(std::env::var("HFS_S3_SCAN_CONCURRENCY").ok().as_deref())?;
     Ok(S3BackendConfig {
         tenancy_mode,
         default_keyspace_layout,
+        scan_concurrency,
         region: std::env::var("HFS_S3_REGION").ok(),
         prefix: std::env::var("HFS_S3_PREFIX").ok(),
         endpoint_url: std::env::var("HFS_S3_ENDPOINT")
@@ -4130,6 +4150,7 @@ async fn start_s3(
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
+        scan_concurrency = s3_config.scan_concurrency,
         "Initializing S3 backend"
     );
 
@@ -4298,6 +4319,7 @@ async fn start_s3_elasticsearch(
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
+        scan_concurrency = s3_config.scan_concurrency,
         "Initializing S3 backend (primary)"
     );
 
@@ -4827,6 +4849,34 @@ mod tests {
                 let err = parse_s3_keyspace_layout(Some(bad)).unwrap_err().to_string();
                 assert!(err.contains("HFS_S3_KEYSPACE_LAYOUT"), "{err}");
                 assert!(err.contains("expected v1|v2"), "{err}");
+            }
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    mod s3_scan_concurrency {
+        use super::*;
+
+        #[test]
+        fn unset_or_blank_is_the_default() {
+            assert_eq!(parse_s3_scan_concurrency(None).unwrap(), 32);
+            assert_eq!(parse_s3_scan_concurrency(Some("  ")).unwrap(), 32);
+        }
+
+        #[test]
+        fn whole_numbers_of_at_least_one_parse() {
+            assert_eq!(parse_s3_scan_concurrency(Some("1")).unwrap(), 1);
+            assert_eq!(parse_s3_scan_concurrency(Some(" 8 ")).unwrap(), 8);
+        }
+
+        #[test]
+        fn zero_negative_and_junk_are_refused() {
+            for bad in ["0", "-1", "abc", "1.5", "32x"] {
+                let err = parse_s3_scan_concurrency(Some(bad))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("HFS_S3_SCAN_CONCURRENCY"), "{err}");
+                assert!(err.contains("at least 1"), "{err}");
             }
         }
     }

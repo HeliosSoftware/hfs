@@ -2,6 +2,8 @@
 //! for the S3 backend, plus shared helper methods for JSON serialization,
 //! object I/O, and history index maintenance.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde::Serialize;
@@ -28,12 +30,22 @@ use crate::types::{
 };
 
 use super::backend::{ResourceLocation, S3Backend};
-use super::client::{ListObjectItem, ObjectMetadata, S3ClientError};
+use super::client::{ListObjectItem, ObjectData, ObjectMetadata, S3ClientError};
 use super::keyspace::KeyspaceLayout;
 use super::models::HistoryIndexEvent;
 
 /// Most per-shard listings a sharded-layout sweep keeps in flight.
 const SHARD_LIST_CONCURRENCY: usize = 16;
+
+/// Aborts the wrapped task when dropped, so a future that owns one is
+/// cancelled with it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// A loaded current resource together with its S3 ETag.
 ///
@@ -199,7 +211,18 @@ impl S3Backend {
         bucket: &str,
         key: &str,
     ) -> StorageResult<Option<(T, ObjectMetadata)>> {
-        match self.client.get_object(bucket, key).await {
+        let fetched = self.client.get_object(bucket, key).await;
+        self.decode_json_object(fetched)
+    }
+
+    /// Turns the result of a `GetObject` into the deserialised value and its
+    /// metadata; shared by [`Self::get_json_object`] and
+    /// [`Self::get_json_object_limited`].
+    fn decode_json_object<T: DeserializeOwned>(
+        &self,
+        fetched: Result<Option<ObjectData>, S3ClientError>,
+    ) -> StorageResult<Option<(T, ObjectMetadata)>> {
+        match fetched {
             Ok(Some(object)) => {
                 let value = self.deserialize_json::<T>(&object.bytes)?;
                 Ok(Some((value, object.metadata)))
@@ -207,6 +230,55 @@ impl S3Backend {
             Ok(None) => Ok(None),
             Err(err) => Err(self.map_client_error(err)),
         }
+    }
+
+    /// The most `GetObject`s the read fan-outs may have in flight at once
+    /// (`HFS_S3_SCAN_CONCURRENCY`, #2063). It is both the width of each
+    /// fan-out and the size of the backend-wide permit pool, so one scan alone
+    /// uses the whole budget and concurrent scans share it.
+    pub(crate) fn scan_concurrency(&self) -> usize {
+        self.config.scan_concurrency
+    }
+
+    /// Like [`Self::get_json_object`], but the `GetObject` runs under one
+    /// permit of the backend-wide read limit ([`S3Backend::scan_limit`]).
+    ///
+    /// - The permit covers this one `GetObject` only: never a LIST, a second
+    ///   GET, or the JSON decode, which happens afterwards in the caller.
+    /// - The GET runs on its own task, and the permit is taken and held inside
+    ///   it. So the GET finishes and returns its permit even when the caller
+    ///   stops polling: a scan whose consumer is resolving references or
+    ///   waiting on a full channel (the in-process SQL-on-FHIR runner does both)
+    ///   must not hold permits that its own nested reads are waiting for.
+    ///   Taking the permit in the caller's future instead would deadlock,
+    ///   because the semaphore hands released permits to queued waiters whether
+    ///   or not anything polls them.
+    /// - Dropping the returned future aborts the task, so a cancelled caller
+    ///   cancels its GET as an inline `GetObject` would have been.
+    pub(crate) async fn get_json_object_limited<T: DeserializeOwned>(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> StorageResult<Option<(T, ObjectMetadata)>> {
+        let client = Arc::clone(&self.client);
+        let limit = Arc::clone(&self.scan_limit);
+        let (bucket, key) = (bucket.to_owned(), key.to_owned());
+        let mut task = AbortOnDrop(tokio::spawn(async move {
+            let Ok(_permit) = limit.acquire().await else {
+                return Err(S3ClientError::Internal(
+                    "the S3 read limit was closed".to_string(),
+                ));
+            };
+            client.get_object(&bucket, &key).await
+        }));
+        let fetched = match (&mut task.0).await {
+            Ok(fetched) => fetched,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => Err(S3ClientError::Unavailable(
+                "the S3 read was cancelled before it finished".to_string(),
+            )),
+        };
+        self.decode_json_object(fetched)
     }
 
     /// Exhaustively lists all objects under `prefix`, auto-paginating through
@@ -321,6 +393,30 @@ impl S3Backend {
 
         let loaded = self
             .get_json_object::<StoredResource>(&location.bucket, &key)
+            .await?;
+
+        Ok(loaded.map(|(resource, metadata)| CurrentResourceWithMeta {
+            resource,
+            etag: metadata.etag,
+        }))
+    }
+
+    /// [`Self::load_current_with_meta`] with the `GetObject` under the
+    /// backend-wide read limit ([`Self::get_json_object_limited`]).
+    ///
+    /// For the by-id fan-out of `read_resources` only; the write paths keep the
+    /// unlimited variant. The tenant location is resolved outside any permit.
+    pub(crate) async fn load_current_with_meta_limited(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<CurrentResourceWithMeta>> {
+        let location = self.resource_location(tenant).await?;
+        let key = location.keyspace.current_resource_key(resource_type, id);
+
+        let loaded = self
+            .get_json_object_limited::<StoredResource>(&location.bucket, &key)
             .await?;
 
         Ok(loaded.map(|(resource, metadata)| CurrentResourceWithMeta {
@@ -544,12 +640,13 @@ impl S3Backend {
     /// runner to feed the `helios-sof` engine, and by the SearchParameter
     /// overlay reload (`reload_stored_cache_for_tenant`).
     ///
-    /// Fetches concurrently (same `bulk_write_concurrency` fan-out the seeder
-    /// uses for writes, `search/seeder.rs`) — a resource type can hold
-    /// thousands of objects (every seeded spec `SearchParameter` is a real,
-    /// individually-keyed object here, indistinguishable from a stored one),
-    /// and one GET per object sequentially turned a same-tenant SearchParameter
-    /// write into a ~30s stall that Inferno's client then timed out on (#787).
+    /// Fetches concurrently under the backend-wide read limit
+    /// (`scan_concurrency`, `HFS_S3_SCAN_CONCURRENCY`, #2063) — a resource type
+    /// can hold thousands of objects (every seeded spec `SearchParameter` is a
+    /// real, individually-keyed object here, indistinguishable from a stored
+    /// one), and one GET per object sequentially turned a same-tenant
+    /// SearchParameter write into a ~30s stall that Inferno's client then timed
+    /// out on (#787).
     pub(crate) async fn scan_live_resources(
         &self,
         tenant: &TenantContext,
@@ -580,10 +677,11 @@ impl S3Backend {
         let bucket = &location.bucket;
         let fetched: Vec<StorageResult<Option<(StoredResource, ObjectMetadata)>>> =
             stream::iter(keys)
-                .map(
-                    |key| async move { self.get_json_object::<StoredResource>(bucket, &key).await },
-                )
-                .buffer_unordered(self.bulk_write_concurrency())
+                .map(|key| async move {
+                    self.get_json_object_limited::<StoredResource>(bucket, &key)
+                        .await
+                })
+                .buffer_unordered(self.scan_concurrency())
                 .collect()
                 .await;
 
@@ -629,8 +727,11 @@ impl S3Backend {
         };
         let bucket = &location.bucket;
         let mut fetched = stream::iter(keys)
-            .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
-            .buffer_unordered(self.bulk_write_concurrency());
+            .map(|key| async move {
+                self.get_json_object_limited::<StoredResource>(bucket, &key)
+                    .await
+            })
+            .buffer_unordered(self.scan_concurrency());
         let mut matches = Vec::with_capacity(2);
         while let Some(result) = fetched.next().await {
             let Some((stored, _)) = result? else {
@@ -748,13 +849,17 @@ impl S3Backend {
 
     /// Reads one history entry from its index event key, or `None` when the
     /// event or its version snapshot is gone.
+    ///
+    /// Only called from the page fan-out of [`Self::history_page_for_events`],
+    /// so both GETs go through the backend-wide read limit (one permit each,
+    /// never held across the two).
     async fn load_history_entry(
         &self,
         location: &ResourceLocation,
         event_key: &str,
     ) -> StorageResult<Option<HistoryEntry>> {
         let Some((event, _)) = self
-            .get_json_object::<HistoryIndexEvent>(&location.bucket, event_key)
+            .get_json_object_limited::<HistoryIndexEvent>(&location.bucket, event_key)
             .await?
         else {
             return Ok(None);
@@ -764,6 +869,9 @@ impl S3Backend {
 
     /// Reads the version snapshot an already-loaded index event points at, or
     /// `None` when the snapshot is gone.
+    ///
+    /// Only called from the page fan-out of [`Self::history_page_for_events`];
+    /// the GET goes through the backend-wide read limit.
     async fn load_history_entry_for_event(
         &self,
         location: &ResourceLocation,
@@ -775,7 +883,7 @@ impl S3Backend {
             &event.version_id,
         );
         Ok(self
-            .get_json_object::<StoredResource>(&location.bucket, &history_key)
+            .get_json_object_limited::<StoredResource>(&location.bucket, &history_key)
             .await?
             .map(|(resource, _)| HistoryEntry {
                 resource,
@@ -870,11 +978,11 @@ impl S3Backend {
             .collect();
         let events = futures::stream::iter(undecided_keys)
             .map(|key| async move {
-                self.get_json_object::<HistoryIndexEvent>(bucket, &key)
+                self.get_json_object_limited::<HistoryIndexEvent>(bucket, &key)
                     .await
                     .map(|found| found.map(|(event, _)| event))
             })
-            .buffered(self.bulk_write_concurrency())
+            .buffered(self.scan_concurrency())
             .collect::<Vec<_>>()
             .await;
 
@@ -920,7 +1028,7 @@ impl S3Backend {
                         None => self.load_history_entry(location, &candidate.key).await,
                     }
                 })
-                .buffered(self.bulk_write_concurrency())
+                .buffered(self.scan_concurrency())
                 .collect::<Vec<_>>()
                 .await
                 .into_iter()
@@ -1382,8 +1490,11 @@ impl ResourceStorage for S3Backend {
         // on real S3.
         let bucket = &location.bucket;
         let mut reads = stream::iter(keys)
-            .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
-            .buffer_unordered(self.bulk_write_concurrency());
+            .map(|key| async move {
+                self.get_json_object_limited::<StoredResource>(bucket, &key)
+                    .await
+            })
+            .buffer_unordered(self.scan_concurrency());
         let mut count = 0u64;
         while let Some(read) = reads.next().await {
             if let Some((resource, _)) = read? {
@@ -1534,6 +1645,7 @@ impl ResourceStorage for S3Backend {
     fn bulk_write_concurrency(&self) -> usize {
         // One PUT per resource; S3 absorbs parallel writers trivially, and this
         // turns a ~1.4k-object conformance seed from minutes into seconds.
+        // Reads fan out under `scan_concurrency` instead (#2063).
         32
     }
 
@@ -2215,10 +2327,21 @@ impl InstanceHistoryProvider for S3Backend {
         use futures::StreamExt;
 
         // The snapshots are independent objects: read them concurrently
-        // (ordered, so the stable sort in `page_history` sees the same input).
+        // (ordered, so the stable sort in `page_history` sees the same input),
+        // each GET under the backend-wide read limit. This is `vread`, with the
+        // tenant location resolved once.
+        let location = self.resource_location(tenant).await?;
+        let location = &location;
         let resources = futures::stream::iter(versions)
-            .map(|version| async move { self.vread(tenant, resource_type, id, &version).await })
-            .buffered(self.bulk_write_concurrency())
+            .map(|version| async move {
+                let key = location
+                    .keyspace
+                    .history_version_key(resource_type, id, &version);
+                self.get_json_object_limited::<StoredResource>(&location.bucket, &key)
+                    .await
+                    .map(|found| found.map(|(resource, _)| resource))
+            })
+            .buffered(self.scan_concurrency())
             .collect::<Vec<_>>()
             .await;
 
@@ -2674,7 +2797,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         let prefix = location.keyspace.resource_type_prefix(resource_type);
         let backend = self.clone();
         let bucket = location.bucket.clone();
-        let concurrency = self.bulk_write_concurrency();
+        let concurrency = self.scan_concurrency();
 
         let list_backend = self.clone();
         let list_bucket = bucket.clone();
@@ -2725,7 +2848,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                         }
                     }
                     let read = backend
-                        .get_json_object::<StoredResource>(&bucket, &key)
+                        .get_json_object_limited::<StoredResource>(&bucket, &key)
                         .await
                         .map_err(|e| SofError::Storage(e.to_string()))?;
                     Ok(read.map(|(resource, meta)| {
@@ -2775,7 +2898,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                     let resource_type = resource_type.to_string();
                     async move {
                         backend
-                            .load_current_with_meta(&tenant, &resource_type, &id)
+                            .load_current_with_meta_limited(&tenant, &resource_type, &id)
                             .await
                             .map(|current| {
                                 current
@@ -2785,7 +2908,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                             .map_err(|e| SofError::Storage(e.to_string()))
                     }
                 })
-                .buffer_unordered(self.bulk_write_concurrency())
+                .buffer_unordered(self.scan_concurrency())
                 .collect()
                 .await;
 
