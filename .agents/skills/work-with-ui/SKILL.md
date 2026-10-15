@@ -44,7 +44,10 @@ HFS_UI_ENABLED=false cargo run -p helios-hfs
 The mount is `#[cfg(feature = "ui")]` plus the runtime `config.ui_enabled` check
 in `attach_ui` (`crates/hfs/src/main.rs`). FHIR version features forward through
 `helios-ui?/R4|R4B|R5|R6`, so the UI's viewers cover exactly the versions the
-server was built with.
+server was built with. helios-ui's own `R5`/`R6` also enable its `R4B`, and
+every version feature forwards to `helios-persistence`, mirroring helios-audit's
+BALP baseline, so the crate's total `FhirVersion` matches always have an arm for
+every variant helios-fhir is built with (#2051).
 
 ## Routes (`crates/ui/src/lib.rs`)
 

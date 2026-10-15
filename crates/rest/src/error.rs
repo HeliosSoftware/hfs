@@ -1144,7 +1144,9 @@ impl From<BackendError> for RestError {
             // Transient, retryable conditions: the backend is down or saturated,
             // not the request's fault. Surfaced as 503 (with Retry-After) so
             // clients, load balancers, and service meshes retry/route instead of
-            // treating it as a server bug.
+            // treating it as a server bug. Keep `BackendError::is_unavailable`
+            // (which the SQL-on-FHIR layers use for the same 503-vs-500
+            // decision) in step with these arms; a test checks they agree.
             BackendError::Unavailable { message, .. }
             | BackendError::ConnectionFailed { message, .. } => {
                 RestError::ServiceUnavailable { message }
@@ -1750,6 +1752,14 @@ mod tests {
             ),
         ];
         for (err, expected) in cases {
+            // `BackendError::is_unavailable` is what the SQL-on-FHIR layers
+            // use to answer 503 instead of 500 (#2048); it must name exactly
+            // the variants this exhaustive mapping answers 503 for.
+            assert_eq!(
+                err.is_unavailable(),
+                expected == StatusCode::SERVICE_UNAVAILABLE,
+                "is_unavailable() disagrees with the mapping for {err:?}"
+            );
             let (status, _, _) = RestError::from(err).client_response();
             assert_eq!(status, expected);
         }

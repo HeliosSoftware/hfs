@@ -1505,6 +1505,9 @@ impl S3Backend {
     /// holding the lease handle — `process_entries` — must therefore never
     /// write back a copy it read earlier: it goes through here, and `mutate`
     /// states its change relative to whatever is stored (#1229).
+    ///
+    /// A `409 ConditionalRequestConflict` from AWS is retried like a lost race,
+    /// with a jittered backoff between attempts (#2047).
     pub(super) async fn mutate_manifest_state<F>(
         &self,
         location: &TenantLocation,
@@ -1515,7 +1518,10 @@ impl S3Backend {
     where
         F: Fn(&mut SubmissionManifestState),
     {
-        for _ in 0..super::submit_worker::CAS_ATTEMPTS {
+        for attempt in 0..super::submit_worker::CAS_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(super::user_settings::retry_backoff(attempt - 1)).await;
+            }
             let Some((mut state, etag)) = self
                 .load_manifest_for_cas(location, submission_id, manifest_id)
                 .await?
