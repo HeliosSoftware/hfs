@@ -177,9 +177,7 @@ mod tests {
                 continue;
             }
             // PreparedViewDefinition::new validates.
-            let err = PreparedViewDefinition::new(vd(&view))
-                .err()
-                .expect("prepare");
+            let err = PreparedViewDefinition::new(vd(&view)).expect_err("prepare");
             assert!(err.to_string().contains("badcol"), "tag {tag}: {err}");
 
             // So does the iterator constructor...
