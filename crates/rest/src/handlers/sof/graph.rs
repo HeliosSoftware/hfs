@@ -2061,8 +2061,7 @@ mod tests {
         let deps = vec![depends_on("x", "http://example.org/nothing")];
         let errors = build_plan(&fetcher, &[], subject_node(&deps))
             .await
-            .err()
-            .expect("unresolvable");
+            .expect_err("unresolvable");
         assert!(matches!(errors.as_slice(), [RestError::NotFound { .. }]));
     }
 
