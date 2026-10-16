@@ -836,10 +836,13 @@ Bundles into smaller ones.
 A single Bundle can also be too large for the cache on its own, and the gate cannot help with
 that: a Bundle larger than the room already runs alone. When one transaction's write set does not
 fit in WiredTiger's cache, MongoDB rolls it back with error 388 (`TransactionTooLargeForCache`,
-"transaction is too large and will not fit in the storage engine cache"). HFS does not retry it,
-since every replay meets the same cache, and answers `500` with a `too-costly` OperationOutcome
-that names the WiredTiger cache and the Bundle's entry count. The driver's text stays in the
-server log (#1837). Size `--wiredTigerCacheSizeGB` for the largest transaction Bundle you import,
+"transaction is too large and will not fit in the storage engine cache"), on one of the Bundle's
+writes or on its commit. The commit also writes the transaction's oplog entry, which can push a
+Bundle just under the ceiling over it (#1991). HFS neither replays such a Bundle nor re-sends its
+commit, since every attempt meets the same cache, and answers `500` with a `too-costly`
+OperationOutcome that names the WiredTiger cache and the Bundle's entry count. The driver's text
+stays in the server log (#1837); a commit-time 388 is logged with the prefix `Commit failed:`.
+Size `--wiredTigerCacheSizeGB` for the largest transaction Bundle you import,
 or split such Bundles. A 2 GB cache is too small for the largest Bundles of the full Synthea
 corpus: in the HFS benchmark (MongoDB with `--wiredTigerCacheSizeGB 2`, 20 virtual users, 1,000
 Synthea transaction Bundles), 8 Bundles of 6,400-7,600 entries each failed this way. With the
