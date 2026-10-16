@@ -8766,6 +8766,10 @@ pub(crate) fn compare_equality(
                     if unit_l == unit_r {
                         // Same unit, direct comparison
                         EvaluationResult::boolean(val_l == val_r)
+                    } else if crate::ucum::is_calendar_vs_ucum_year_or_month(unit_l, unit_r) {
+                        // Calendar years/months are not comparable to UCUM 'a'/'mo'
+                        // for equality (they are for equivalence): `1 year = 1 'a'` is empty.
+                        EvaluationResult::Empty
                     } else if crate::ucum::units_are_comparable(unit_l, unit_r) {
                         // Different but comparable units, convert and compare
                         match crate::ucum::convert_units(*val_r, unit_r, unit_l) {
