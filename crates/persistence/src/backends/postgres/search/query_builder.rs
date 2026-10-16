@@ -254,6 +254,34 @@ pub(crate) fn quantity_predicate(
     raw_value: &str,
     next: &mut usize,
 ) -> Option<(String, Vec<SqlParam>)> {
+    let predicate = quantity_predicate_parts(table, prefix, raw_value, next)?;
+    Some((predicate.combined(), predicate.params))
+}
+
+/// Quantity alternatives share one parse and bind vector. Ordinary callers
+/// retain their OR predicate; the broad code/quantity path can scan each
+/// alternative independently without recovering structure from generated SQL.
+struct QuantityPredicate {
+    raw: String,
+    canonical: Option<String>,
+    params: Vec<SqlParam>,
+}
+
+impl QuantityPredicate {
+    fn combined(&self) -> String {
+        match &self.canonical {
+            Some(canonical) => format!("(({}) OR ({canonical}))", self.raw),
+            None => format!("({})", self.raw),
+        }
+    }
+}
+
+fn quantity_predicate_parts(
+    table: &str,
+    prefix: SearchPrefix,
+    raw_value: &str,
+    next: &mut usize,
+) -> Option<QuantityPredicate> {
     /// Binds one float and returns its placeholder number.
     fn bind(v: f64, params: &mut Vec<SqlParam>, next: &mut usize) -> usize {
         *next += 1;
@@ -291,7 +319,7 @@ pub(crate) fn quantity_predicate(
     // comparison. Skipped for non-convertible units; `ne` also uses this
     // branch (negated range) so it matches the raw-OR-canonical `eq`
     // semantics inverted, same as SQLite's `build_canonical_condition`.
-    let mut predicate = format!("({raw})");
+    let mut canonical = None;
     if let Some(c) = code {
         if let Some((_, cunit)) = helios_fhirpath::ucum::canonicalize_quantity(num, c) {
             let canon = |x: f64| helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v);
@@ -350,14 +378,18 @@ pub(crate) fn quantity_predicate(
             if let Some(range) = range {
                 *next += 1;
                 params.push(SqlParam::text(&cunit));
-                predicate = format!(
-                    "(({raw}) OR ({range} AND {table}value_quantity_canonical_unit = ${next}))"
-                );
+                canonical = Some(format!(
+                    "{range} AND {table}value_quantity_canonical_unit = ${next}"
+                ));
             }
         }
     }
 
-    Some((predicate, params))
+    Some(QuantityPredicate {
+        raw,
+        canonical,
+        params,
+    })
 }
 
 /// Returns the `[start, end)` timestamp range for a date search value at its
@@ -751,14 +783,40 @@ impl PostgresQueryBuilder {
                 // longer holds. Rebuilding in emission order is what keeps the
                 // placeholders ascending and `SqlFragment::params` in the order
                 // the caller binds them.
+                let adaptive_pair = members.len() == 2
+                    && query.parameters[members[0]].name == "code"
+                    && query.parameters[members[1]].name == "value-quantity";
+                let mut quantity_union = None;
                 let mut built: Vec<(usize, SqlFragment)> = Vec::with_capacity(members.len());
                 for &member in members {
-                    let fragment = Self::build_parameter_condition(
-                        &query.parameters[member],
-                        current_offset,
-                        layout,
-                    )
-                    .expect("a foldable occurrence builds: the plan pass built it");
+                    let parameter = &query.parameters[member];
+                    let fragment = if adaptive_pair && parameter.name == "value-quantity" {
+                        let value = &parameter.values[0];
+                        let mut next = current_offset;
+                        let predicate =
+                            quantity_predicate_parts("", value.prefix, &value.value, &mut next)
+                                .expect("an eligible quantity parsed in the plan pass");
+                        quantity_union = predicate.canonical.as_ref().map(|canonical| {
+                            format!(
+                                "({} UNION {})",
+                                Self::quantity_membership_arm(&parameter.name, &predicate.raw),
+                                Self::quantity_membership_arm(&parameter.name, canonical),
+                            )
+                        });
+                        SqlFragment::with_params(
+                            format!(
+                                "id IN ({})",
+                                Self::quantity_membership_arm(
+                                    &parameter.name,
+                                    &predicate.combined()
+                                )
+                            ),
+                            predicate.params,
+                        )
+                    } else {
+                        Self::build_parameter_condition(parameter, current_offset, layout)
+                            .expect("a foldable occurrence builds: the plan pass built it")
+                    };
                     current_offset += fragment.params.len();
                     built.push((member, fragment));
                 }
@@ -777,11 +835,13 @@ impl PostgresQueryBuilder {
 
                 match arms {
                     Some(arms) => {
-                        let sql = if members.len() == 2
-                            && query.parameters[members[0]].name == "code"
-                            && query.parameters[members[1]].name == "value-quantity"
-                        {
-                            Self::adaptive_code_quantity_membership(&built[0].1, &built[1].1, &arms)
+                        let sql = if adaptive_pair {
+                            Self::adaptive_code_quantity_membership(
+                                &built[0].1,
+                                &built[1].1,
+                                &arms,
+                                quantity_union.as_deref(),
+                            )
                         } else {
                             format!(
                                 "{}{})",
@@ -954,6 +1014,7 @@ impl PostgresQueryBuilder {
         code: &SqlFragment,
         quantity: &SqlFragment,
         arms: &[String],
+        quantity_union: Option<&str>,
     ) -> String {
         const BROAD_TOKEN_ROWS: usize = 1024;
         let quantity_guard = if quantity.params.len() == 1 {
@@ -966,13 +1027,17 @@ impl PostgresQueryBuilder {
             String::new()
         };
         let original = code.clone().and(quantity.clone());
+        // A single raw OR canonical access produced millions of bitmap
+        // rechecks on the issue corpus (#2077). Separate candidate streams
+        // preserve both alternatives and deduplicate their overlap before the
+        // code intersection. Rare codes retain the original OR conjunction.
         format!(
             "id IN (WITH policy AS MATERIALIZED (SELECT EXISTS({code_arm} OFFSET {BROAD_TOKEN_ROWS} LIMIT 1){quantity_guard} AS broad) \
              SELECT resource_id FROM ({code_arm} INTERSECT {quantity_arm}) AS intersection_ids WHERE (SELECT broad FROM policy) \
              UNION ALL SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE \
              AND ({original}) AND NOT (SELECT broad FROM policy))",
             code_arm = arms[0],
-            quantity_arm = arms[1],
+            quantity_arm = quantity_union.unwrap_or(&arms[1]),
             original = original.sql,
         )
     }
@@ -1030,7 +1095,7 @@ impl PostgresQueryBuilder {
         // Intersect broad independently scoped ID sets before joining resources,
         // retaining the original live-resource conjunction for rare codes.
         // Only this measured gt/lt pair is eligible; unrelated conjunctions retain
-        // their existing plans, and the quantity arm's raw/canonical OR survives.
+        // their existing plans, and both raw/canonical alternatives survive.
         if layout == IndexLayout::Denormalized
             && query.resource_type == "Observation"
             && query.parameters.len() == 2
@@ -3008,6 +3073,13 @@ impl PostgresQueryBuilder {
         Self::or_values(&param.name, conditions)
     }
 
+    fn quantity_membership_arm(name: &str, predicate: &str) -> String {
+        format!(
+            "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {predicate}",
+            sql_string_literal(name),
+        )
+    }
+
     fn build_quantity_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
         // Running placeholder counter: the outer builder advances by the
@@ -3025,9 +3097,8 @@ impl PostgresQueryBuilder {
 
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {})",
-                    sql_string_literal(&param.name),
-                    predicate
+                    "id IN ({})",
+                    Self::quantity_membership_arm(&param.name, &predicate)
                 ),
                 params,
             ));
@@ -3760,8 +3831,8 @@ mod tests {
                     (offset + 1..=offset + 7).collect::<Vec<_>>()
                 );
 
-                // Both original arms, including tenant/type and the raw OR
-                // canonical quantity comparison, are copied without rewriting.
+                // The rare-code fallback retains both original scoped arms,
+                // including the complete raw OR canonical quantity predicate.
                 let mut next = offset;
                 for param in [
                     query
@@ -3815,6 +3886,83 @@ mod tests {
                     matches!(&fragment.params[0], SqlParam::Text(value) if value == "other-code")
                 );
                 assert!(matches!(fragment.params[1], SqlParam::Float(value) if value == 75.0));
+            }
+        }
+    }
+
+    #[test]
+    fn observation_code_quantity_unit_alternatives_keep_bindings_and_fallback() {
+        for prefix in [SearchPrefix::Gt, SearchPrefix::Lt] {
+            for (value, converted, param_count) in [
+                ("150||cm", true, 5),
+                ("150|cm", true, 5),
+                ("150|http://unitsofmeasure.org|cm", true, 6),
+                ("150||widgets", false, 3),
+                ("150", false, 2),
+            ] {
+                for reversed in [false, true] {
+                    let mut query = observation_code_quantity_query();
+                    query.parameters[0].values = vec![SearchValue::eq("8302-2")];
+                    query.parameters[1].values = vec![SearchValue::new(prefix, value)];
+                    if reversed {
+                        query.parameters.reverse();
+                    }
+                    for offset in [2, 4] {
+                        let fragment =
+                            PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                        assert_eq!(fragment.params.len(), param_count, "{prefix:?} {value}");
+                        assert_eq!(
+                            bind_numbers(&fragment.sql, offset),
+                            (offset + 1..=offset + param_count).collect::<Vec<_>>()
+                        );
+                        assert_eq!(fragment.sql.contains(" INTERSECT (SELECT "), converted);
+                        assert_eq!(
+                            fragment.sql.matches(" UNION SELECT ").count(),
+                            usize::from(converted)
+                        );
+                        assert!(
+                            matches!(&fragment.params[0], SqlParam::Text(code) if code == "8302-2")
+                        );
+                        assert!(
+                            matches!(&fragment.params[1], SqlParam::Float(number) if *number == 150.0)
+                        );
+                        if converted {
+                            assert!(
+                                matches!(&fragment.params[2], SqlParam::Text(unit) if unit == "cm")
+                            );
+                            assert!(
+                                matches!(&fragment.params[param_count - 2], SqlParam::Float(number) if *number == 1.5)
+                            );
+                            assert!(
+                                matches!(&fragment.params[param_count - 1], SqlParam::Text(unit) if unit == "m")
+                            );
+                        }
+                        let code = PostgresQueryBuilder::build_parameter_condition(
+                            query
+                                .parameters
+                                .iter()
+                                .find(|param| param.name == "code")
+                                .unwrap(),
+                            offset,
+                            IndexLayout::Denormalized,
+                        )
+                        .unwrap();
+                        let quantity = PostgresQueryBuilder::build_parameter_condition(
+                            query
+                                .parameters
+                                .iter()
+                                .find(|param| param.name == "value-quantity")
+                                .unwrap(),
+                            offset + code.params.len(),
+                            IndexLayout::Denormalized,
+                        )
+                        .unwrap();
+                        assert!(fragment.sql.contains(&format!(
+                            "AND ({}) AND NOT (SELECT broad FROM policy)",
+                            code.and(quantity).sql
+                        )));
+                    }
+                }
             }
         }
     }

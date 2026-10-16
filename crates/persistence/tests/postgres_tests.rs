@@ -5553,6 +5553,10 @@ mod postgres_integration {
             (&other, "13-collision", "29463-7", 40.0, "cm", "cm"),
             (&tenant, "14-collision", "29463-7", 40.0, "cm", "cm"),
             (&other, "14-collision", "8302-2", 70.0, "cm", "cm"),
+            (&tenant, "16-historical-high", "8302-2", 190.0, "cm", "cm"),
+            (&tenant, "17-canonical-high", "8302-2", 1.9, "m", "m"),
+            (&tenant, "18-boundary-raw", "8302-2", 150.0, "cm", "cm"),
+            (&tenant, "19-boundary-canonical", "8302-2", 1.5, "m", "m"),
         ] {
             backend.create(target, "Observation", json!({
                 "resourceType": "Observation", "id": id, "status": "final",
@@ -5577,7 +5581,8 @@ mod postgres_integration {
         let client = backend.get_client().await.unwrap();
         client.execute(
             "UPDATE search_index SET value_quantity_canonical_value = NULL, value_quantity_canonical_unit = NULL
-             WHERE tenant_id = $1 AND resource_id = '03-historical' AND param_name = 'value-quantity'",
+             WHERE tenant_id = $1 AND resource_id IN ('03-historical', '16-historical-high')
+             AND param_name = 'value-quantity'",
             &[&tenant_id],
         ).await.unwrap();
         // Persisted multivalued/duplicate indexes, not invalid repeating JSON.
@@ -5606,6 +5611,17 @@ mod postgres_integration {
                 &[&tenant_id, &id],
             ).await.unwrap();
         }
+        client.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+             value_token_system, value_token_code, value_quantity_value, value_quantity_unit,
+             value_quantity_system, value_quantity_canonical_value, value_quantity_canonical_unit, last_updated)
+             SELECT tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code,
+                    value_quantity_value, value_quantity_unit, value_quantity_system,
+                    value_quantity_canonical_value, value_quantity_canonical_unit, last_updated
+             FROM search_index WHERE tenant_id = $1 AND resource_id = '08-high'
+             AND param_name IN ('code', 'value-quantity')",
+            &[&tenant_id],
+        ).await.unwrap();
         client
             .execute(
                 "UPDATE resources SET last_updated = '2020-01-01T00:00:00Z' WHERE tenant_id = $1",
@@ -5719,20 +5735,78 @@ mod postgres_integration {
             assert_eq!(backend.search_count(&other, &query).await.unwrap(), 0);
 
             let mut unit_range = query.clone();
-            unit_range.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150|cm")];
+            unit_range.parameters[0].values = vec![SearchValue::eq("8302-2")];
+            unit_range.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150||cm")];
+            let unit_expected = [
+                "04-display",
+                "05-multi",
+                "08-high",
+                "16-historical-high",
+                "17-canonical-high",
+            ];
             assert_eq!(
                 ids(&backend.search(&tenant, &unit_range).await.unwrap()),
-                ["04-display", "05-multi", "08-high"]
+                unit_expected
             );
-            assert_eq!(backend.search_count(&tenant, &unit_range).await.unwrap(), 3);
+            assert_eq!(backend.search_count(&tenant, &unit_range).await.unwrap(), 5);
+            // Both 150 cm and its canonical equivalent 1.5 m sit exactly on
+            // the strict boundary, and must be excluded in either direction.
+            let mut less = unit_range.clone();
+            less.parameters[1].values[0].prefix = SearchPrefix::Lt;
+            assert_eq!(
+                ids(&backend.search(&tenant, &less).await.unwrap()),
+                [
+                    "01-raw",
+                    "02-canonical",
+                    "03-historical",
+                    "04-display",
+                    "05-multi",
+                    "06-duplicate",
+                    "07-tie",
+                    "09-code-only",
+                    "11-boundary",
+                    "13-collision"
+                ]
+            );
+            assert_eq!(backend.search_count(&tenant, &less).await.unwrap(), 10);
+            let mut reversed_unit = unit_range.clone();
+            reversed_unit.parameters.reverse();
+            assert_eq!(
+                backend.search_count(&tenant, &reversed_unit).await.unwrap(),
+                5
+            );
+            assert_eq!(
+                ids(&backend.search(&tenant, &reversed_unit).await.unwrap()),
+                unit_expected
+            );
+
+            let mut literal_page = unit_range.clone().with_count(2);
+            literal_page.total = Some(TotalMode::Accurate);
+            let mut paged_ids = Vec::new();
+            loop {
+                let page = backend.search(&tenant, &literal_page).await.unwrap();
+                assert_eq!(page.total, Some(5));
+                assert_eq!(
+                    backend.search_count(&tenant, &literal_page).await.unwrap(),
+                    5
+                );
+                paged_ids.extend(ids(&page));
+                if let Some(next) = page.resources.page_info.next_cursor {
+                    literal_page = literal_page.with_cursor(next);
+                } else {
+                    break;
+                }
+                assert!(paged_ids.len() < unit_expected.len(), "cursor must advance");
+            }
+            assert_eq!(paged_ids, unit_expected);
             let mut bare_range = query.clone();
             bare_range.parameters[0].values = vec![SearchValue::eq("8302-2")];
             bare_range.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150")];
             assert_eq!(
                 ids(&backend.search(&tenant, &bare_range).await.unwrap()),
-                ["05-multi", "08-high"]
+                ["05-multi", "08-high", "16-historical-high"]
             );
-            assert_eq!(backend.search_count(&tenant, &bare_range).await.unwrap(), 2);
+            assert_eq!(backend.search_count(&tenant, &bare_range).await.unwrap(), 3);
 
             // These OR/repeated/extra-parameter shapes retain the old path while
             // testing that each parameter still ranges over independent rows.
@@ -5742,14 +5816,15 @@ mod postgres_integration {
                 "150|http://unitsofmeasure.org|cm",
             ));
             let mut union_expected = expected.clone();
-            union_expected.push("08-high".into());
+            union_expected
+                .extend(["08-high", "16-historical-high", "17-canonical-high"].map(str::to_string));
             assert_eq!(
                 ids(&backend.search(&tenant, &alternatives).await.unwrap()),
                 union_expected
             );
             assert_eq!(
                 backend.search_count(&tenant, &alternatives).await.unwrap(),
-                8
+                10
             );
             let mut repeated = query.clone();
             let mut quantity = repeated.parameters[1].clone();
@@ -5872,9 +5947,15 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_integration_code_quantity_intersection_plan_scans_arms_once() {
         use helios_persistence::core::SearchProvider;
-        use helios_persistence::types::{SearchPrefix, SearchValue};
+        use helios_persistence::types::{SearchPrefix, SearchValue, TotalMode};
 
-        fn inspect(plan: &serde_json::Value, intersections: &mut usize, index_scans: &mut usize) {
+        fn inspect(
+            plan: &serde_json::Value,
+            intersections: &mut usize,
+            index_scans: &mut usize,
+            quantity_scans: &mut [usize; 2],
+            converted: bool,
+        ) {
             if plan.get("Actual Loops").and_then(serde_json::Value::as_u64) == Some(0) {
                 return; // One-time guards must leave inactive expensive branches unexecuted.
             }
@@ -5897,11 +5978,26 @@ mod postgres_integration {
                         Some(1),
                         "candidate arm was rescanned: {plan}"
                     );
+                    let predicates = ["Index Cond", "Recheck Cond", "Filter"]
+                        .into_iter()
+                        .filter_map(|field| plan[field].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let raw = predicates.contains("value_quantity_value");
+                    let canonical = predicates.contains("value_quantity_canonical_value");
+                    if converted {
+                        assert!(
+                            !(raw && canonical),
+                            "raw and canonical alternatives share one candidate access: {plan}"
+                        );
+                    }
+                    quantity_scans[0] += usize::from(raw);
+                    quantity_scans[1] += usize::from(canonical);
                 }
             }
             if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
                 for child in children {
-                    inspect(child, intersections, index_scans);
+                    inspect(child, intersections, index_scans, quantity_scans, converted);
                 }
             }
         }
@@ -5931,9 +6027,15 @@ mod postgres_integration {
             &[&tenant_id],
         ).await.unwrap();
         client.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_quantity_value, last_updated)
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+             value_quantity_value, value_quantity_unit, value_quantity_canonical_value,
+             value_quantity_canonical_unit, last_updated)
              SELECT $1, 'Observation', 'plan-' || lpad(series::text, 5, '0'), 'value-quantity',
-                    CASE WHEN series > 6000 THEN 190 ELSE 40 END,
+                    CASE WHEN series > 6000 THEN CASE WHEN series % 3 = 1 THEN 1900 ELSE 190 END ELSE 40 END,
+                    CASE WHEN series % 3 = 1 THEN 'mm' ELSE 'cm' END,
+                    CASE WHEN series % 3 = 0 THEN NULL WHEN series > 6000 THEN 1.9
+                         WHEN series % 3 = 1 THEN 0.04 ELSE 0.4 END,
+                    CASE WHEN series % 3 = 0 THEN NULL ELSE 'm' END,
                     '2020-01-01T00:00:00Z' FROM generate_series(1, 20000) series",
             &[&tenant_id],
         ).await.unwrap();
@@ -5942,63 +6044,89 @@ mod postgres_integration {
             .await
             .unwrap();
         drop(client);
-        let mut query = observation_code_quantity_intersection_query().with_count(20);
-        query.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150")];
-        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 3000);
-        let result = backend.search(&tenant, &query).await.unwrap();
-        assert_eq!(
-            result
-                .resources
-                .items
-                .iter()
-                .map(|r| r.id().to_string())
-                .collect::<Vec<_>>(),
-            (6001..=6020)
-                .map(|n| format!("plan-{n:05}"))
-                .collect::<Vec<_>>()
-        );
+        // Each third supplies raw-only, canonical-only, or overlapping matches.
+        // The no-unit control deliberately keeps the original 3000-result oracle.
+        for converted in [false, true] {
+            let mut query = observation_code_quantity_intersection_query().with_count(20);
+            query.parameters[0].values = vec![SearchValue::eq("8302-2")];
+            query.parameters[1].values = vec![SearchValue::new(
+                SearchPrefix::Gt,
+                if converted { "150||cm" } else { "150" },
+            )];
+            query.total = Some(TotalMode::Accurate);
+            assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 3000);
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(result.total, Some(3000));
+            assert_eq!(
+                result
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect::<Vec<_>>(),
+                (6001..=6020)
+                    .map(|n| format!("plan-{n:05}"))
+                    .collect::<Vec<_>>()
+            );
 
-        let client = backend.get_client().await.unwrap();
-        // One available pooled connection preserves the session that prepared both
-        // statements; inspect those actual wrappers, rather than inventing SQL.
-        let statements = client
-            .query(
-                "SELECT statement FROM pg_prepared_statements
-             WHERE statement LIKE '% INTERSECT %' AND statement LIKE '%FROM resources%'
-             AND (statement LIKE 'SELECT COUNT(*) FROM resources%'
-                  OR statement LIKE 'SELECT id, version_id,%') ORDER BY statement",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            statements.len(),
-            2,
-            "one count and one page statement expected"
-        );
-        for statement in statements {
-            let sql: String = statement.get(0);
-            let plan: serde_json::Value = client
-                .query_one(
-                    &format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"),
-                    &[
-                        &tenant_id,
-                        &"Observation",
-                        &"http://loinc.org",
-                        &"8302-2",
-                        &150.0_f64,
-                    ],
+            let client = backend.get_client().await.unwrap();
+            // Inspect the actual named count/page statements on their pooled
+            // session, including generic plans, rather than preparing EXPLAIN's
+            // copy of the SQL. Argument counts distinguish the two query shapes.
+            let statements = client
+                .query(
+                    "SELECT name FROM pg_prepared_statements
+                 WHERE statement LIKE '% INTERSECT %' AND statement LIKE '%FROM resources%'
+                 AND (statement LIKE 'SELECT COUNT(*) FROM resources%'
+                      OR statement LIKE 'SELECT id, version_id,%')
+                 AND cardinality(parameter_types) = $1 ORDER BY statement",
+                    &[&if converted { 7_i32 } else { 4_i32 }],
                 )
                 .await
-                .unwrap()
-                .get(0);
-            let (mut intersections, mut index_scans) = (0, 0);
-            inspect(&plan[0]["Plan"], &mut intersections, &mut index_scans);
-            assert_eq!(intersections, 1, "{plan}");
-            assert!(
-                index_scans >= 2,
-                "both independent candidate arms execute: {plan}"
+                .unwrap();
+            assert_eq!(
+                statements.len(),
+                2,
+                "one count and one page statement expected"
             );
+            for mode in ["force_custom_plan", "force_generic_plan"] {
+                client
+                    .batch_execute(&format!("SET plan_cache_mode = {mode}"))
+                    .await
+                    .unwrap();
+                for statement in &statements {
+                    let name: String = statement.get(0);
+                    let extra = if converted { ", 'cm', 1.5, 'm'" } else { "" };
+                    let sql = format!(
+                        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" ('{tenant_id}', 'Observation', '8302-2', 150{extra})",
+                        name.replace('"', "\"\"")
+                    );
+                    let plan: serde_json::Value = client.query_one(&sql, &[]).await.unwrap().get(0);
+                    let (mut intersections, mut index_scans, mut quantity_scans) = (0, 0, [0; 2]);
+                    inspect(
+                        &plan[0]["Plan"],
+                        &mut intersections,
+                        &mut index_scans,
+                        &mut quantity_scans,
+                        converted,
+                    );
+                    assert_eq!(intersections, 1, "{mode}: {plan}");
+                    assert!(
+                        index_scans >= 2,
+                        "both independent candidate arms execute: {mode}: {plan}"
+                    );
+                    assert!(
+                        quantity_scans[0] > 0,
+                        "raw candidate access must execute: {mode}: {plan}"
+                    );
+                    assert_eq!(
+                        quantity_scans[1] > 0,
+                        converted,
+                        "canonical candidate access: {mode}: {plan}"
+                    );
+                }
+            }
+            client.batch_execute("RESET plan_cache_mode").await.unwrap();
         }
     }
 
