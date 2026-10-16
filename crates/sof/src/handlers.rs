@@ -9,8 +9,9 @@ use crate::{
     data_source::{DataSource, UniversalDataSource},
     fhir_format::{self, accept_requires_unsupported_fhir_xml},
     filter_resources_by_patient_and_group as sof_filter_resources_by_patient_and_group,
-    filter_resources_by_since as sof_filter_resources_by_since, format_parquet_multi_file,
-    get_fhir_version_string, get_newest_enabled_fhir_version,
+    filter_resources_by_since as sof_filter_resources_by_since,
+    format_parquet_multi_file_with_schema, get_fhir_version_string,
+    get_newest_enabled_fhir_version,
     lint::{Diagnostic, Severity, lint_view_definition},
     parse_view_definition_for_version as sof_parse_view_definition_for_version,
     process_view_definition, run_view_definition_with_options,
@@ -520,6 +521,7 @@ pub async fn sql_run_handler(
             .is_some()
     {
         // Use multi-file Parquet generation
+        let declared = view_definition.try_declared_columns()?;
         let processed_result = process_view_definition(view_definition, bundle)?;
 
         // Get max file size in bytes
@@ -530,10 +532,11 @@ pub async fn sql_run_handler(
             .map(|mb| mb as usize * 1024 * 1024)
             .unwrap_or(usize::MAX);
 
-        let file_buffers = format_parquet_multi_file(
+        let file_buffers = format_parquet_multi_file_with_schema(
             processed_result,
             validated_params.parquet_options.as_ref(),
             max_file_size_bytes,
+            &declared,
         )?;
 
         // Multi-file output is bundled into a ZIP archive; a single file is
@@ -878,6 +881,11 @@ fn find_inline_view_definition(json: &serde_json::Value) -> Option<&serde_json::
 /// `ServerError::InvalidViewDefinition`). Warnings never block `$sql-run` —
 /// the lint reports them for the UI's editor, not this endpoint.
 fn lint_inline_view_definition(json: &serde_json::Value) -> ServerResult<()> {
+    // A bad column tag (e.g. a non-string `ansi/type` value) is reported
+    // naming the column rather than as a bare lint path.
+    if json.is_object() {
+        crate::column_types::resolve_columns(json).map_err(ServerError::from)?;
+    }
     let errors: Vec<Diagnostic> = lint_view_definition(json)
         .into_iter()
         .filter(|diagnostic| diagnostic.severity == Severity::Error)

@@ -24,6 +24,7 @@ use super::backend::ElasticsearchBackend;
 use super::schema;
 use super::search::fts;
 use super::search::query_builder::{EsQueryBuilder, build_count_query};
+use super::storage::{aggregation_buckets, send_aggregation_search};
 
 fn internal_error(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(BackendError::Internal {
@@ -599,6 +600,113 @@ fn page_cursor_for(
     Some(cursor.encode())
 }
 
+/// Distinct reference values one `terms` partition is sized for. Well under
+/// Elasticsearch's default `search.max_buckets` (65,536), which a single
+/// answer must stay below.
+const REFERENCE_VALUES_PER_PARTITION: u64 = 10_000;
+/// Buckets one partition answer may carry; a partition fuller than this is
+/// reported as truncated and the read repartitions finer.
+const REFERENCE_PARTITION_BUCKET_LIMIT: u64 = 20_000;
+/// Upper bound on partitions (about 100M distinct values at the sizing above).
+const MAX_REFERENCE_PARTITIONS: u64 = 10_000;
+
+/// The `aggs` chain every reference-value read shares: the nested reference
+/// objects, narrowed to the named parameter, then `inner`.
+fn reference_aggs(reference_param: &str, inner: Value) -> Value {
+    json!({
+        "refs": {
+            "nested": { "path": "search_params.reference" },
+            "aggs": {
+                "by_name": {
+                    "filter": { "term": { "search_params.reference.name": reference_param } },
+                    "aggs": inner
+                }
+            }
+        }
+    })
+}
+
+/// Approximate count of distinct reference values of `reference_param` over
+/// the documents matching `base_query`.
+fn reference_cardinality_body(base_query: &Value, reference_param: &str) -> Value {
+    json!({
+        "size": 0,
+        "track_total_hits": false,
+        "query": base_query,
+        "aggs": reference_aggs(reference_param, json!({
+            "distinct": { "cardinality": {
+                "field": "search_params.reference.reference",
+                "precision_threshold": 40000
+            } }
+        }))
+    })
+}
+
+/// One partition of the distinct reference values: `terms` with `include`
+/// partitioning keeps each answer under `search.max_buckets` however many
+/// distinct values the parameter has.
+fn reference_values_body(
+    base_query: &Value,
+    reference_param: &str,
+    partition: u64,
+    num_partitions: u64,
+) -> Value {
+    json!({
+        "size": 0,
+        "track_total_hits": false,
+        "query": base_query,
+        "aggs": reference_aggs(reference_param, json!({
+            "values": { "terms": {
+                "field": "search_params.reference.reference",
+                "size": REFERENCE_PARTITION_BUCKET_LIMIT,
+                "include": { "partition": partition, "num_partitions": num_partitions }
+            } }
+        }))
+    })
+}
+
+fn reference_cardinality(answer: &Value) -> StorageResult<u64> {
+    answer
+        .pointer("/aggregations/refs/by_name/distinct/value")
+        .and_then(Value::as_f64)
+        .map(|v| v as u64)
+        .ok_or_else(|| {
+            internal_error(format!(
+                "Reference cardinality answer carries no value: {answer}"
+            ))
+        })
+}
+
+/// Partitions for an estimated `cardinality`, with 1.5x headroom for the
+/// estimate's error.
+fn reference_partitions(cardinality: u64) -> u64 {
+    (cardinality.saturating_mul(3) / 2)
+        .div_ceil(REFERENCE_VALUES_PER_PARTITION)
+        .clamp(1, MAX_REFERENCE_PARTITIONS)
+}
+
+/// The values of one partition answer, and whether the partition overflowed
+/// its bucket limit (`sum_other_doc_count > 0`), in which case the values are
+/// incomplete.
+fn reference_value_buckets(answer: &Value) -> StorageResult<(Vec<String>, bool)> {
+    let buckets = aggregation_buckets(answer, "refs/by_name/values")?;
+    let truncated = answer
+        .pointer("/aggregations/refs/by_name/values/sum_other_doc_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0;
+    let values = buckets
+        .iter()
+        .filter_map(|bucket| {
+            bucket
+                .get("key")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    Ok((values, truncated))
+}
+
 #[async_trait]
 impl SearchProvider for ElasticsearchBackend {
     /// Refreshes the tenant's index for each named type, so every document
@@ -659,6 +767,77 @@ impl SearchProvider for ElasticsearchBackend {
             )));
         }
         Ok(())
+    }
+
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        // Only the plain single-type filter the resolver builds; anything else
+        // keeps the paged path (same shape SQLite accepts).
+        if !query.sort.is_empty()
+            || query.offset.is_some()
+            || query.cursor.is_some()
+            || query.contained != crate::types::ContainedMode::Off
+            || !query.includes.is_empty()
+            || query.total.is_some()
+            || query.summary.is_some()
+            || !query.elements.is_empty()
+            || query.compartment.is_some()
+            || !query.list.is_empty()
+            || !query.reverse_chains.is_empty()
+        {
+            return Ok(None);
+        }
+        reject_unsupported_metadata_modifier(query)?;
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, &query.resource_type);
+        let mut es_query = EsQueryBuilder::new(tenant_id, &query.resource_type, index.clone())
+            .with_max_result_window(self.config().max_result_window)
+            .with_max_terms_count(self.config().max_terms_count)
+            .build(query);
+        let base_query = es_query.body["query"].take();
+
+        // How many distinct values: sizes the partitions below.
+        let body = reference_cardinality_body(&base_query, reference_param);
+        let Some(answer) = send_aggregation_search(self, &index, body).await? else {
+            return Ok(Some(Vec::new()));
+        };
+        let cardinality = reference_cardinality(&answer)?;
+
+        let mut partitions = reference_partitions(cardinality);
+        'attempt: loop {
+            let mut values = Vec::new();
+            // `partitions` is only doubled right before `continue 'attempt`, which
+            // rebuilds this range, so the bound is never stale mid-loop.
+            #[allow(clippy::mut_range_bound)]
+            for partition in 0..partitions {
+                let body =
+                    reference_values_body(&base_query, reference_param, partition, partitions);
+                let Some(answer) = send_aggregation_search(self, &index, body).await? else {
+                    return Ok(Some(Vec::new()));
+                };
+                let (page, truncated) = reference_value_buckets(&answer)?;
+                if truncated {
+                    // The cardinality estimate was low: a partition holds more
+                    // values than one answer carries. Repartition finer rather
+                    // than return a partial set.
+                    if partitions >= MAX_REFERENCE_PARTITIONS {
+                        return Err(internal_error(format!(
+                            "Reference parameter {reference_param} has more distinct values \
+                             than {MAX_REFERENCE_PARTITIONS} partitions can read"
+                        )));
+                    }
+                    partitions = (partitions * 2).min(MAX_REFERENCE_PARTITIONS);
+                    continue 'attempt;
+                }
+                values.extend(page);
+            }
+            return Ok(Some(values));
+        }
     }
 
     async fn search(
@@ -1846,5 +2025,64 @@ mod tests {
         assert_eq!(body["search_after"], json!(hit_sort));
         assert_eq!(body["size"], json!(1001));
         assert!(body.get("from").is_none());
+    }
+}
+
+#[cfg(test)]
+mod reference_values_tests {
+    use super::*;
+
+    #[test]
+    fn body_nests_the_partitioned_terms_under_the_named_parameter() {
+        let q = json!({ "match_all": {} });
+        let body = reference_values_body(&q, "subject", 2, 5);
+        assert_eq!(body["size"], 0);
+        assert_eq!(body["query"], q);
+        let agg = &body["aggs"]["refs"];
+        assert_eq!(agg["nested"]["path"], "search_params.reference");
+        let by_name = &agg["aggs"]["by_name"];
+        assert_eq!(
+            by_name["filter"]["term"]["search_params.reference.name"],
+            "subject"
+        );
+        let terms = &by_name["aggs"]["values"]["terms"];
+        assert_eq!(terms["field"], "search_params.reference.reference");
+        assert_eq!(terms["include"]["partition"], 2);
+        assert_eq!(terms["include"]["num_partitions"], 5);
+    }
+
+    #[test]
+    fn partitions_scale_with_cardinality() {
+        assert_eq!(reference_partitions(0), 1);
+        assert_eq!(reference_partitions(6_000), 1);
+        assert_eq!(reference_partitions(11_705), 2);
+        assert_eq!(reference_partitions(100_000), 15);
+    }
+
+    #[test]
+    fn buckets_are_read_and_overflow_is_flagged() {
+        let ok = json!({ "aggregations": { "refs": { "by_name": { "values": {
+            "sum_other_doc_count": 0,
+            "buckets": [ { "key": "Patient/1", "doc_count": 3 }, { "key": "Patient/2", "doc_count": 1 } ]
+        } } } } });
+        assert_eq!(
+            reference_value_buckets(&ok).unwrap(),
+            (
+                vec!["Patient/1".to_string(), "Patient/2".to_string()],
+                false
+            )
+        );
+        let over = json!({ "aggregations": { "refs": { "by_name": { "values": {
+            "sum_other_doc_count": 7, "buckets": []
+        } } } } });
+        assert!(reference_value_buckets(&over).unwrap().1);
+        assert!(reference_value_buckets(&json!({})).is_err());
+    }
+
+    #[test]
+    fn cardinality_is_read_from_the_answer() {
+        let a = json!({ "aggregations": { "refs": { "by_name": { "distinct": { "value": 11705.0 } } } } });
+        assert_eq!(reference_cardinality(&a).unwrap(), 11705);
+        assert!(reference_cardinality(&json!({})).is_err());
     }
 }

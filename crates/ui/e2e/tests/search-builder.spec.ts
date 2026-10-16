@@ -2400,6 +2400,11 @@ test.describe("query builder", () => {
       await page.reload({ waitUntil: "networkidle" });
       await search.showBuilder();
       await search.builder.recentToggle.click();
+      // #1759: a SAVED row sits in the same .recent-item wrapper as a RECENT
+      // row, so both sections share padding, row height and hover.
+      await expect(
+        search.builder.recentPanel.locator(".recent-item > [data-saved-load]", { hasText: savedName }),
+      ).toHaveCount(1);
       await search.builder.recentPanel.locator("[data-saved-load]", { hasText: savedName }).click();
       await expect(search.builder.url).toHaveValue(expected);
       const values = search.builder.conditionRows.first().locator(".builder-row__value");
@@ -3301,3 +3306,51 @@ for (const workspace of ["Resources", "Search"] as const) {
     }
   });
 }
+
+// #1759: SAVED rows share the RECENT rows' wrapper, so they align, are as tall
+// and highlight on hover the same way.
+test("issue1759 Saved rows match Recent rows in alignment, height and hover", async ({ page, request, resources }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "Saved1759Match" }] });
+  let saved: Awaited<ReturnType<typeof seedSavedQuery>> = null;
+  try {
+    saved = await seedSavedQuery(request, "Patient", `Saved1759 ${id}`, `_id=${id}`);
+    test.skip(!saved, "no per-user settings store on this backend");
+    await resources.goto("Patient");
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    await resources.builder.recentToggle.click();
+    await resources.builder.recentPanel.locator("[data-saved-load]", { hasText: saved!.entry.name }).click();
+    await resources.builder.runButton.click();
+    await resources.results.waitShown();
+    await expect.poll(async () => {
+      const document = await (await request.get("/_user/settings")).json();
+      return document.recentSearches?.some((entry: { query: string }) => entry.query === `/Patient?_id=${id}`);
+    }).toBe(true);
+
+    await page.reload({ waitUntil: "networkidle" });
+    if (await mode.count()) await mode.click();
+    await resources.builder.recentToggle.click();
+    const panel = resources.builder.recentPanel;
+    const savedRow = panel.locator(".recent-item", { has: page.locator("[data-saved-load]") }).first();
+    const recentRow = panel.locator(".recent-item", { has: page.locator("[data-recent-load]") }).first();
+    await expect(savedRow).toBeVisible();
+    await expect(recentRow).toBeVisible();
+
+    const savedBox = await savedRow.boundingBox();
+    const recentBox = await recentRow.boundingBox();
+    if (!savedBox || !recentBox) throw new Error("recent rows have no layout box");
+    expect(savedBox.x).toBe(recentBox.x);
+    expect(savedBox.height).toBe(recentBox.height);
+
+    const background = (row: typeof savedRow) => row.evaluate((el) => getComputedStyle(el).backgroundColor);
+    const idle = await background(savedRow);
+    await savedRow.hover();
+    const hovered = await background(savedRow);
+    expect(hovered).not.toBe(idle);
+    await recentRow.hover();
+    expect(await background(recentRow)).toBe(hovered);
+  } finally {
+    await saved?.remove();
+    await request.delete(`/Patient/${id}`);
+  }
+});

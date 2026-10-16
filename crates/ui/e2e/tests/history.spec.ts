@@ -134,3 +134,35 @@ test("the Type Feed and System Feed tabs list the history feeds", async ({
   await expect(history.versions).toHaveCount(2);
   await expect(history.tab("instance")).toHaveAttribute("aria-selected", "true");
 });
+
+// #1759: each version is a uniform row (version, date, operation) and the two
+// versions being compared carry the from/to marker.
+test("version rows show version, date and operation and mark the compared pair", async ({
+  history,
+  request,
+}) => {
+  const id = await seedTwoVersions(
+    request,
+    "Patient",
+    { name: [{ family: "RowOne" }] },
+    () => ({ name: [{ family: "RowTwo" }] }),
+  );
+
+  await history.goto({ type: "Patient", id });
+  await expect(history.versions).toHaveCount(2);
+
+  const [newest, oldest] = [history.versions.nth(0), history.versions.nth(1)];
+  await expect(newest.locator(".history-version__id")).toHaveText("v2");
+  await expect(newest.locator(".history-version__kind")).toHaveText("current");
+  await expect(oldest.locator(".history-version__id")).toHaveText("v1");
+  await expect(oldest.locator(".history-version__kind")).toHaveText("created");
+  for (const row of [newest, oldest]) {
+    const when = (await row.locator(".history-version__when").textContent()) ?? "";
+    expect(when.trim()).not.toBe("");
+    expect(when).not.toContain("Invalid");
+  }
+
+  // Default comparison: newest is "to", the one before it is "from".
+  await expect(newest).toHaveClass(/history-version--to/);
+  await expect(oldest).toHaveClass(/history-version--from/);
+});

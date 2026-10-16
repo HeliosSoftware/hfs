@@ -104,20 +104,21 @@ curl -X POST http://localhost:8080/\$sql-run \
   -d '{"_format": "parquet", "subjectResource": {...}, "resource": [...]}'
 ```
 
-Parquet type mapping follows Pathling conventions:
+Parquet / Arrow types follow the SQL-on-FHIR 3.0.0-ballot default mappings (shared resolver: `crates/sof/src/column_types.rs`):
 
 | SOF type | Parquet type |
 |---|---|
 | boolean | BOOLEAN |
-| string, code, uri | UTF8 |
 | integer, positiveInt, unsignedInt | INT32 |
 | integer64 | INT64 |
-| decimal | FLOAT64 |
-| dateTime, date | UTF8 |
+| decimal | UTF8 (digits preserved, trailing zeros stripped) |
+| instant | TIMESTAMP (µs, UTC) |
+| base64Binary | BINARY |
+| date, dateTime, time, string, code, uri, other | UTF8 |
 
-Declared column `type` wins; columns without one are inferred from the first 100 rows only, and a later value that does not fit (e.g. a non-integer or an integer above `i32::MAX` in an Int32 column) becomes null. `collection: true` and arrays map to `List<UTF8>`. All fields are OPTIONAL. Snappy compression is the default.
+A column `tag` named `ansi/type` (element `tag`, singular; the spec prose's `tags` is a typo and is not read) overrides the default; an unknown or incompatible value is rejected (error names the column). Columns without a `type` are inferred from values. JSON/NDJSON/CSV keep their shape (decimal stays a JSON number, deliberately). The per-emitter comparison is in `crates/sof/README.md` → "Column Type Mapping". Collection columns map to Arrow List of the element type. All fields are OPTIONAL. Snappy compression is the default.
 
-Parquet/Arrow are encoded incrementally (`helios_sof::columnar_stream`): schema fixed up front, 8,192-row batches, row groups cut by encoded bytes (`row_group_size_mb`), and the `$sql-run` response streams with an aborted body on a mid-stream error. File splitting by size is per batch, so a file can overshoot by one batch plus the footer. Streamed responses have no `Content-Length` (chunked), the timeout layer does not cover the body, Arrow stays compressible, and a client disconnect stops the encoder and drops the `RowStream` (test: `streaming_columnar_client_disconnect_drops_the_row_stream`). Values that do not fit a declared type become null; the Postgres runner's text cells are parsed by the builders (unit-tested, not run against a live Postgres). Peak-memory evidence: `docs/sof-parquet-streaming-benchmark.md` (`cargo run -p helios-sof --example parquet_peak_memory`). Row groups are cut at `row_group_size_mb` encoded bytes (REST/CLI minimum 64 MB), so per-request peak memory is about 3x that (~190 MB at the minimum). The first split file keeps the plain name and later files are `_002`, `_003` (no `_001`).
+Parquet/Arrow are encoded incrementally (`helios_sof::columnar_stream`): schema fixed up front, 8,192-row batches, row groups cut by encoded bytes (`row_group_size_mb`), and the `$sql-run` response streams with an aborted body on a mid-stream error. File splitting by size is per batch, so a file can overshoot by one batch plus the footer. Streamed responses have no `Content-Length` (chunked), the timeout layer does not cover the body, Arrow stays compressible, and a client disconnect stops the encoder and drops the `RowStream` (test: `streaming_columnar_client_disconnect_drops_the_row_stream`). A value that does not fit a declared type is an error naming the column (an out-of-range integer is not nulled or wrapped); the Postgres runner's text cells are parsed by the builders (unit-tested, not run against a live Postgres). Peak-memory evidence: `docs/sof-parquet-streaming-benchmark.md` (`cargo run -p helios-sof --example parquet_peak_memory`). Row groups are cut at `row_group_size_mb` encoded bytes (REST/CLI minimum 64 MB), so per-request peak memory is about 3x that (~190 MB at the minimum). The first split file keeps the plain name and later files are `_002`, `_003` (no `_001`).
 
 ## Async Export in the HFS Server
 

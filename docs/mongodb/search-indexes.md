@@ -166,10 +166,15 @@ scope. This does not guarantee that every search is covered or faster.
 
 Create, update, restore, transaction writes and non-deferred bulk ingestion
 carry metadata from the same extraction that produces value-index rows.
-Deferred or offloaded indexing leaves metadata unknown and removes any old
-array on update; a whole-resource extraction failure does the same. Reindex
-updates metadata only when the resource version still matches the version
-read for that page.
+Deferred bulk ingestion (`defer_indexing`) or offloaded indexing leaves
+metadata unknown and removes any old array on update; a whole-resource
+extraction failure does the same. A transaction Bundle that defers its
+value-index rows (#1975) still writes metadata in its transaction. Its
+post-commit step, or the deferred-index repair, rewrites the metadata
+together with the rows from one extraction (see
+[deferred search indexing for large transaction Bundles](../../crates/persistence/README.md#deferred-search-indexing-for-large-mongodb-transaction-bundles)).
+Reindex updates metadata only when the resource version still matches the
+version read for that page.
 
 Reindex can write metadata even when that resource's value-index insertion
 fails. The resource is reported as failed, but its index may remain incomplete

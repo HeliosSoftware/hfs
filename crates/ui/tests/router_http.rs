@@ -2990,6 +2990,14 @@ async fn history_page_renders_the_shell() {
     assert!(html.contains(r#"data-tab="instance""#));
     assert!(html.contains(r#"id="history-versions""#));
     assert!(html.contains("history.js"));
+    // #1759: the operation labels each version row shows are translated
+    // server-side and handed to the script as data attributes.
+    for op in ["create", "update", "patch", "delete", "version"] {
+        assert!(
+            html.contains(&format!("data-msg-op-{op}=")),
+            "missing data-msg-op-{op}"
+        );
+    }
 }
 
 async fn diff(form: &str) -> String {
@@ -10078,4 +10086,23 @@ async fn editor_render_publishes_empty_issue_list_when_valid() {
     let doc = serde_json::json!({ "resourceType": "Patient", "gender": "male" });
     let html = edit(&form_pane_body(&doc, &[("pane", "")])).await;
     assert!(html.contains(r#"data-issues="[]""#), "{html}");
+}
+
+/* #1759: the Resources modal's History tab builds the same operation labels
+ * as the History page, from data attributes on #resource-history. */
+#[tokio::test]
+async fn resources_page_hands_the_history_operation_labels_to_the_script() {
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    for op in ["create", "update", "patch", "delete", "version"] {
+        assert!(
+            html.contains(&format!("data-msg-op-{op}=")),
+            "missing data-msg-op-{op}"
+        );
+    }
 }

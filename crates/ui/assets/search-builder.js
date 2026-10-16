@@ -3328,7 +3328,12 @@
         btn.dataset.savedLoad = path;
         btn.textContent = row.name;
         btn.title = "GET " + path;
-        recentHost.appendChild(btn);
+        /* Same wrapper as the Recent rows, so both sections share padding,
+         * row height and the hover state. */
+        var wrap = document.createElement("div");
+        wrap.className = "recent-item";
+        wrap.appendChild(btn);
+        recentHost.appendChild(wrap);
       });
       var recentHeading = document.createElement("div");
       recentHeading.className = "recent-group";

@@ -182,6 +182,7 @@
 
 pub mod app;
 pub mod canonical;
+pub mod column_types;
 pub mod columnar;
 pub mod columnar_stream;
 pub mod compartment;
@@ -203,6 +204,10 @@ pub mod remote_resolver;
 pub mod sqlquery;
 pub mod traits;
 
+pub use column_types::{
+    ANSI_TYPE_TAG, AnsiType, ColumnTypeInfo, default_for_fhir_type, default_for_fhirpath_type,
+    resolve_columns,
+};
 pub use compartment::{resolve_group_members_to_patient_refs, resource_in_patient_compartment};
 pub use constants::{ConstantValue, parse_constant_from_json};
 pub use params::{
@@ -301,7 +306,26 @@ impl SofViewDefinition {
     /// `collection`), used to fix the Parquet / Arrow schema before any row is
     /// seen. Empty if the definition cannot be serialised.
     pub fn declared_columns(&self) -> Vec<sqlquery::engine::DeclaredColumn> {
-        let value = match self {
+        self.to_json()
+            .map(|v| sqlquery::engine::declared_columns(&v))
+            .unwrap_or_default()
+    }
+
+    /// Like [`Self::declared_columns`], but each column also carries its
+    /// resolved SQL type (default mapping or `ansi/type` tag), and an unknown,
+    /// non-string or incompatible `ansi/type` tag is an error naming the
+    /// column ([`SofError::InvalidViewDefinition`]) instead of being ignored.
+    pub fn try_declared_columns(&self) -> Result<Vec<sqlquery::engine::DeclaredColumn>, SofError> {
+        let json = self.to_json().map_err(|e| {
+            SofError::InvalidViewDefinition(format!(
+                "failed to serialize ViewDefinition to resolve column types: {e}"
+            ))
+        })?;
+        sqlquery::engine::try_declared_columns(&json)
+    }
+
+    fn to_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        match self {
             #[cfg(feature = "R4")]
             SofViewDefinition::R4(vd) => serde_json::to_value(vd),
             #[cfg(feature = "R4B")]
@@ -310,10 +334,7 @@ impl SofViewDefinition {
             SofViewDefinition::R5(vd) => serde_json::to_value(vd),
             #[cfg(feature = "R6")]
             SofViewDefinition::R6(vd) => serde_json::to_value(vd),
-        };
-        value
-            .map(|v| sqlquery::engine::declared_columns(&v))
-            .unwrap_or_default()
+        }
     }
 
     /// Returns the FHIR specification version of this ViewDefinition.
@@ -1072,6 +1093,12 @@ pub fn parse_view_definition_for_version(
     json: serde_json::Value,
     version: helios_fhir::FhirVersion,
 ) -> Result<SofViewDefinition, SofError> {
+    // Validate column tags on the raw JSON first: the typed deserializer
+    // rejects e.g. a non-string tag `value` with a generic serde message that
+    // does not name the column.
+    if json.is_object() {
+        column_types::resolve_columns(&json)?;
+    }
     match version {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {
@@ -1750,6 +1777,10 @@ impl PreparedViewDefinition {
     ///
     /// This performs all validation upfront so that chunk processing is efficient.
     pub fn new(view_definition: SofViewDefinition) -> Result<Self, SofError> {
+        // Reject an unknown or incompatible `ansi/type` column tag up front, so
+        // every path that prepares a view (chunked NDJSON, the in-process
+        // runner, ...) fails the same way as the buffered formatters.
+        view_definition.try_declared_columns()?;
         // Extract target resource type and column names based on version
         let (target_resource_type, variables, column_names) = match &view_definition {
             #[cfg(feature = "R4")]
@@ -2566,7 +2597,7 @@ fn run_view_definition_inner(
     external: Vec<helios_fhir::FhirResource>,
 ) -> Result<Vec<u8>, SofError> {
     // Declared column types fix the Parquet / Arrow schema, as on the REST path.
-    let declared = view_definition.declared_columns();
+    let declared = view_definition.try_declared_columns()?;
     // Process the ViewDefinition to generate tabular data
     let processed_result =
         process_view_definition_with_external(view_definition, bundle, external)?;
@@ -3146,6 +3177,9 @@ fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json:
         EvaluationResult::Integer(i, _, _) => {
             Some(serde_json::Value::Number(serde_json::Number::from(i)))
         }
+        EvaluationResult::Integer64(i, _, _) => {
+            Some(serde_json::Value::Number(serde_json::Number::from(i)))
+        }
         EvaluationResult::Decimal(d, _, _) => {
             // Check if this Decimal represents a whole number
             if d.fract().is_zero() {
@@ -3157,15 +3191,17 @@ fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json:
                     Some(serde_json::Value::String(d.to_string()))
                 }
             } else {
-                // Convert Decimal to a float for fractional numbers
-                if let Ok(f) = d.to_string().parse::<f64>() {
-                    if let Some(num) = serde_json::Number::from_f64(f) {
-                        Some(serde_json::Value::Number(num))
-                    } else {
-                        Some(serde_json::Value::String(d.to_string()))
-                    }
+                // Render the exact decimal rather than going through f64
+                // (serde_json is built with `arbitrary_precision`). Trailing zeros
+                // are stripped: evaluation artifacts such as `1.50` (from `3 / 2`
+                // scale) or `0.95000000` (boundary functions) must compare equal
+                // to the plain number in conformance output, so the source's
+                // trailing zeros are not preserved.
+                let text = d.normalize().to_string();
+                if let Ok(num) = text.parse::<serde_json::Number>() {
+                    Some(serde_json::Value::Number(num))
                 } else {
-                    Some(serde_json::Value::String(d.to_string()))
+                    Some(serde_json::Value::String(text))
                 }
             }
         }
@@ -4343,7 +4379,7 @@ pub fn run_view_definition_record_batches(
     ),
     SofError,
 > {
-    let declared = view_definition.declared_columns();
+    let declared = view_definition.try_declared_columns()?;
     let result = process_view_definition(view_definition, bundle)?;
     let schema = parquet_schema::resolve_arrow_schema(&result.columns, &declared, &result.rows)?;
     let schema_ref = std::sync::Arc::new(schema);

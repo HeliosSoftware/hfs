@@ -29,7 +29,9 @@ use crate::types::{
 
 use super::PostgresBackend;
 use super::cached::{query_dyn_cached, query_one_dyn_cached};
-use super::search::native_has::{native_patient_code_predicate, native_patient_code_token};
+use super::search::native_has::{
+    native_patient_code_count_predicate, native_patient_code_predicate, native_patient_code_token,
+};
 use super::search::query_builder::{
     KeysetKey, PostgresQueryBuilder, SortValueKind, SqlFragment, SqlParam,
 };
@@ -430,8 +432,9 @@ fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
 }
 
 impl PostgresBackend {
-    /// Page and count build precisely the same search predicate. Only cursor
-    /// bindings change the initial offset.
+    /// Page and `_id`-restricted count share this correlated predicate. A broad
+    /// native count adds a code prefilter before the same exact source guard.
+    /// Cursor bindings change the page's initial offset.
     fn search_filter(
         &self,
         tenant: &TenantContext,
@@ -953,7 +956,17 @@ impl SearchProvider for PostgresBackend {
             || query.compartment.is_some()
             || !query.reverse_chains.is_empty()
         {
-            let filter = self.search_filter(tenant, query, 2)?;
+            let filter = if query.parameters.is_empty()
+                && self.supports_native_reverse_chains(tenant, query)
+            {
+                let registry = self.search_param_registry(tenant);
+                let (system, code) = native_patient_code_token(query, &registry.read())
+                    .ok_or(StorageError::Search(SearchError::ReverseChainNotSupported))?;
+                // Count already binds tenant at $1 and resource type at $2.
+                Some(native_patient_code_count_predicate(&system, &code, 2, 1))
+            } else {
+                self.search_filter(tenant, query, 2)?
+            };
 
             let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
                 Box::new(tenant_id.to_string()),
@@ -996,9 +1009,9 @@ impl SearchProvider for PostgresBackend {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        // No `LIMIT`/`OFFSET` in this one at all: the text varies only by
+        // No pagination-dependent `LIMIT`/`OFFSET`: the text varies only by
         // predicate shape and inlined `param_name`, so it is unconditionally
-        // reusable.
+        // reusable (the broad native count's candidate cap is constant).
         let row = query_one_dyn_cached(&client, &sql, &param_refs)
             .await
             .or_query_error("Failed to count resources")?;

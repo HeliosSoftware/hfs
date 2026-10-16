@@ -576,6 +576,11 @@ impl<'a> EsQueryBuilder<'a> {
 /// sets — `sort`, `size`, `from`, `search_after`, `track_total_hits`,
 /// `track_scores` — is a `parsing_exception` there, which surfaced as a 500
 /// on every `_total=accurate` search served by Elasticsearch.
+///
+/// Known limitation: unlike `search()`, this builder is not given
+/// `with_max_terms_count`, so a very large resolved id set (for example a `_has`
+/// over a big reverse chain) is not chunked here and can exceed the cluster's
+/// `index.max_terms_count` on `_total=accurate`.
 pub fn build_count_query(tenant_id: &str, resource_type: &str, query: &SearchQuery) -> Value {
     let builder = EsQueryBuilder::new(tenant_id, resource_type, String::new());
     let mut es_query = builder.build(query);

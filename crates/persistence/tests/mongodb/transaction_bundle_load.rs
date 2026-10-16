@@ -32,6 +32,14 @@
 //! - `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES`: `transaction_bundle_weight_entries`,
 //!   the entry count of one standard Bundle (the backend default, 1000; `0`
 //!   counts each Bundle as one slot, the #1776 count-only gate).
+//! - `HFS_TEST_BUNDLE_LOAD_DEFERRED_INDEX_ENTRIES` ("off"):
+//!   `transaction_bundle_deferred_index_entries` (#1975), the entry count from
+//!   which a Bundle commits without its search rows and writes them after the
+//!   commit. `off` (or `0`) never defers, so the run keeps measuring the
+//!   in-transaction write set that #1776 and #1895 are about; `auto` is the
+//!   backend default (the admission room in entries, 4,000); a number is that
+//!   threshold. The `BUNDLE_LOAD` line reports the resolved threshold as
+//!   `deferred_index_min_entries` (`None`: no Bundle defers).
 //! - `HFS_TEST_BUNDLE_LOAD_MONGODB_URL`: an external replica-set URL; no
 //!   container is started and the cache size is whatever that server has.
 //! - `HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK` ("1"/"true"): assert `transient == 0` and
@@ -67,7 +75,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// fixture's fixed Location/Organization ids and the run would measure
 /// duplicate-key conflicts instead of cache pressure. The PUT gets a fresh id
 /// for the same reason.
-fn bundle_entries(fixture: &Value, copies: usize) -> Vec<BundleEntry> {
+pub(super) fn bundle_entries(fixture: &Value, copies: usize) -> Vec<BundleEntry> {
     let mut out = Vec::new();
     for _ in 0..copies {
         let mut text = serde_json::to_string(&fixture["entry"]).unwrap();
@@ -116,7 +124,7 @@ fn bundle_entries(fixture: &Value, copies: usize) -> Vec<BundleEntry> {
 
 /// The server's count of transactions rolled back because they pinned the
 /// oldest transaction ID under cache pressure — the root cause of #1776.
-async fn eviction_rollbacks(url: &str) -> i64 {
+pub(super) async fn eviction_rollbacks(url: &str) -> i64 {
     let client = raw_test_client(url).await.expect("raw client");
     let status = client
         .database("admin")
@@ -230,10 +238,28 @@ async fn bundle_load_reports_transient_failures() {
                 .expect("HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES must be an unsigned integer");
         }
     }
+    // Off unless asked for: the harness exists to measure the write set inside
+    // the transaction (#1975 would otherwise defer these Bundles' search rows).
+    config.transaction_bundle_deferred_index_entries = match env_or(
+        "HFS_TEST_BUNDLE_LOAD_DEFERRED_INDEX_ENTRIES",
+        "off",
+    )
+    .trim()
+    .to_ascii_lowercase()
+    .as_str()
+    {
+        "" | "off" | "0" => Some(0),
+        "auto" => None,
+        raw => Some(raw.parse().expect(
+            "HFS_TEST_BUNDLE_LOAD_DEFERRED_INDEX_ENTRIES must be off, auto or an unsigned integer",
+        )),
+    };
     let limit = config.max_concurrent_transaction_bundles;
     let weight_entries = config.transaction_bundle_weight_entries;
     let backend = Arc::new(MongoBackend::new(config).unwrap());
     backend.initialize().await.unwrap();
+    // The resolved threshold: `None` when no Bundle defers its search rows.
+    let deferred_index_min_entries = backend.deferred_search_index_min_entries();
 
     let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../hfs/tests/inferno/uscore_bundle_patient_85.json");
@@ -293,7 +319,7 @@ async fn bundle_load_reports_transient_failures() {
     println!(
         "BUNDLE_LOAD wt_cache_gb={cache_label} entries={per_bundle} concurrency={concurrency} \
          bundles={bundles} limit={limit} \
-         weight_entries={weight_entries} ok={ok} transient={transient} too_large={too_large} other={other} \
+         weight_entries={weight_entries} deferred_index_min_entries={deferred_index_min_entries:?} ok={ok} transient={transient} too_large={too_large} other={other} \
          wall_s={wall_s:.1} p50_s={:.1} p95_s={:.1} wt_rollbacks={rollbacks}",
         percentile(&latencies, 0.50),
         percentile(&latencies, 0.95),
