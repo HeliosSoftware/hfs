@@ -281,7 +281,7 @@ async fn configured_cursor_getmore_timeout_finishes_and_allows_followup_reads() 
 #[tokio::test]
 async fn nested_search_and_inline_include_keep_the_original_deadline() {
     use crate::types::{IncludeDirective, IncludeType};
-    let Some(fixture) = Fixture::with_search_timeout("deadline-include", 32, Some(5000)).await
+    let Some(fixture) = Fixture::with_search_timeout("deadline-include", 32, Some(60_000)).await
     else {
         return;
     };
@@ -305,7 +305,9 @@ async fn nested_search_and_inline_include_keep_the_original_deadline() {
     fixture.db.run_command(doc! { "profile": 2 }).await.unwrap();
     let backend = &fixture.backend;
     let tenant = fixture.tenant.clone();
-    let result = search_deadline::run(1000, async move {
+    // The outer budget is generous so a loaded runner never times the search
+    // out, yet far below the configured 60 s so a reset deadline is obvious.
+    let result = search_deadline::run(20_000, async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let mut query = SearchQuery::new("Observation").with_count(2);
         query.total = Some(TotalMode::None);
@@ -334,7 +336,7 @@ async fn nested_search_and_inline_include_keep_the_original_deadline() {
             .or_else(|_| command.get_i32("maxTimeMS").map(i64::from))
             .unwrap();
         assert!(
-            (1..=800).contains(&budget),
+            (1..=19_800).contains(&budget),
             "nested search reset its deadline: {command:?}"
         );
     }
