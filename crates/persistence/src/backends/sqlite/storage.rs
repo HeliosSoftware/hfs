@@ -242,6 +242,12 @@ impl ResourceStorage for SqliteBackend {
         false
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::sqlite::SqliteInDbRunner;
         let fhir_version = self.config().fhir_version;
@@ -1298,6 +1304,10 @@ impl ResourceStorage for SqliteBackend {
                         params![id],
                     )
                     .or_query_error("purge FTS mapping")?;
+                    // SQL-on-FHIR terminology relations (#1824): plain tables named
+                    // by registry id, so neither the cascade nor a tenant_id
+                    // filter on resources reaches them.
+                    super::sof_terminology::purge_tenant_in_txn(&tx, id)?;
                     // Per-user settings are keyed by user, not tenant, so they are not swept
                     // by the deletes above — but a client stores PHI-derived query strings in
                     // them, which belong to this tenant (issue #313). Same transaction: this

@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 39;
+pub const SCHEMA_VERSION: i32 = 40;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -481,6 +481,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             36 => migrate_v36_to_v37(conn)?,
             37 => migrate_v37_to_v38(conn)?,
             38 => migrate_v38_to_v39(conn)?,
+            39 => migrate_v39_to_v40(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2139,6 +2140,17 @@ fn migration_err(message: String) -> crate::error::StorageError {
 /// previously misfiled in the per-user `user_settings` document. One opaque
 /// JSON document per (tenant, submission), whole-document writes under a
 /// monotonic `version` for optimistic locking.
+/// Migrate from schema version 39 to version 40.
+///
+/// Adds the bookkeeping for SQL-on-FHIR terminology relations (#1824): the
+/// registry of per-(tenant, canonical) relation tables and the Library
+/// references that keep them alive. The relation tables themselves are created
+/// and dropped at runtime by the terminology store.
+fn migrate_v39_to_v40(conn: &Connection) -> StorageResult<()> {
+    super::sof_terminology::create_bookkeeping_tables(conn)
+        .map_err(|e| migration_err(format!("v40 terminology tables: {e}")))
+}
+
 fn migrate_v16_to_v17(conn: &Connection) -> StorageResult<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS bulk_provider_submissions (
