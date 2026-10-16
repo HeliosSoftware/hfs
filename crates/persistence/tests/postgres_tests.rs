@@ -10028,6 +10028,655 @@ mod postgres_integration {
         );
     }
 
+    fn postgres_2074_query() -> helios_persistence::types::SearchQuery {
+        let mut query = observation_reference_query("patient", &["2074-target"]).with_count(5);
+        query.total = Some(helios_persistence::types::TotalMode::Accurate);
+        query
+    }
+
+    /// Ties cross both page boundaries, while timestamp order differs from ID
+    /// order. Pin both timestamp copies: this is the denormalized invariant.
+    async fn postgres_2074_seed(backend: &PostgresBackend, tenant: &TenantContext) {
+        for n in 1..=12 {
+            let reference = if n % 2 == 0 {
+                "Patient/2074-target"
+            } else {
+                "2074-target"
+            };
+            create_subject_observation(backend, tenant, &format!("obs-{n:02}"), reference).await;
+        }
+        create_subject_observation(backend, tenant, "wrong-patient", "Patient/other-target").await;
+        let other_tenant = create_tenant("2074-other");
+        create_subject_observation(
+            backend,
+            &other_tenant,
+            "wrong-tenant",
+            "Patient/2074-target",
+        )
+        .await;
+        backend
+            .create(
+                tenant,
+                "Condition",
+                json!({"resourceType":"Condition", "id":"wrong-type", "subject":{"reference":"Patient/2074-target"}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        create_subject_observation(backend, tenant, "normally-deleted", "Patient/2074-target")
+            .await;
+        backend
+            .delete(tenant, "Observation", "normally-deleted")
+            .await
+            .unwrap();
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "UPDATE resources SET last_updated = \
+                 TIMESTAMPTZ '2024-01-01 00:00:00+00' + \
+                 ((substring(id from 5)::int - 1) / 3) * INTERVAL '1 day' \
+                 WHERE tenant_id=$1 AND resource_type='Observation' AND id ~ '^obs-[0-9]+$'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE search_index si SET last_updated=r.last_updated FROM resources r \
+                 WHERE si.tenant_id=$1 AND si.resource_type='Observation' \
+                 AND r.tenant_id=si.tenant_id AND r.resource_type=si.resource_type AND r.id=si.resource_id",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        // One resource can have several matching index memberships. A page is
+        // a set of resource identities, not a LIMIT over index rows.
+        client
+            .execute(
+                "INSERT INTO search_index \
+                 (tenant_id,resource_type,resource_id,param_name,value_reference,last_updated) \
+                 SELECT tenant_id,resource_type,resource_id,param_name,value_reference,last_updated \
+                 FROM search_index WHERE tenant_id=$1 AND resource_type='Observation' \
+                 AND resource_id='obs-10' AND param_name='patient'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    fn postgres_2074_expected() -> Vec<String> {
+        [10, 11, 12, 7, 8, 9, 4, 5, 6, 1, 2, 3]
+            .into_iter()
+            .map(|n| format!("obs-{n:02}"))
+            .collect()
+    }
+
+    async fn postgres_2074_create_contained(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        id: &str,
+        parent_patient: &str,
+        child_type: &str,
+        child_patient: &str,
+    ) {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType":"Observation", "id":id, "status":"final",
+                    "code":{"coding":[{"code":"8867-4"}]},
+                    "subject":{"reference":format!("Patient/{parent_patient}")},
+                    "contained":[{
+                        "resourceType":child_type,"id":"child","status":"final",
+                        "code":{"coding":[{"code":"8867-4"}]},
+                        "subject":{"reference":format!("Patient/{child_patient}")}
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn postgres_2074_assert_same_page(
+        left: &helios_persistence::core::SearchResult,
+        right: &helios_persistence::core::SearchResult,
+    ) {
+        assert_eq!(page_ids(left), page_ids(right));
+        assert_eq!(left.total, right.total);
+        assert_eq!(
+            left.resources
+                .items
+                .iter()
+                .map(|r| r.last_modified())
+                .collect::<Vec<_>>(),
+            right
+                .resources
+                .items
+                .iter()
+                .map(|r| r.last_modified())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_value(&left.resources.page_info).unwrap(),
+            serde_json::to_value(&right.resources.page_info).unwrap()
+        );
+    }
+
+    /// Synthetic stale memberships are deliberately newer than the first page
+    /// and its lookahead. They must be removed before consuming either budget.
+    #[tokio::test]
+    async fn postgres_2074_live_pages_deduplicate_and_preserve_pagination() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirective;
+
+        let backend = create_backend().await;
+        backend.init_schema().await.unwrap();
+        let tenant = create_tenant("2074-pages");
+        postgres_2074_seed(&backend, &tenant).await;
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index \
+                 (tenant_id,resource_type,resource_id,param_name,value_reference,last_updated) \
+                 VALUES ($1,'Observation','normally-deleted','patient','Patient/2074-target',TIMESTAMPTZ '2025-01-01'), \
+                        ($1,'Observation','orphan-first','patient','Patient/2074-target',TIMESTAMPTZ '2025-01-02'), \
+                        ($1,'Observation','orphan-lookahead','patient','Patient/2074-target',TIMESTAMPTZ '2024-01-03')",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        drop(client);
+
+        let expected = postgres_2074_expected();
+        let default = postgres_2074_query();
+        let explicit = default
+            .clone()
+            .with_sort(SortDirective::parse("-_lastUpdated"));
+        let mut queries = [default.clone(), explicit.clone()];
+        let mut pages = Vec::new();
+        for page_number in 0..3 {
+            let a = backend.search(&tenant, &queries[0]).await.unwrap();
+            let b = backend.search(&tenant, &queries[1]).await.unwrap();
+            assert_eq!(a.total, Some(12));
+            assert_eq!(
+                page_ids(&a),
+                expected[page_number * 5..((page_number + 1) * 5).min(12)],
+                "live matches must fill the page before lookahead is decided"
+            );
+            assert_eq!(a.resources.page_info.has_next, page_number < 2);
+            postgres_2074_assert_same_page(&a, &b);
+            if let Some(cursor) = a.resources.page_info.next_cursor.clone() {
+                queries = [
+                    default.clone().with_cursor(cursor.clone()),
+                    explicit.clone().with_cursor(cursor),
+                ];
+            }
+            pages.push(a);
+        }
+        let all = pages.iter().flat_map(page_ids).collect::<Vec<_>>();
+        assert_eq!(
+            all, expected,
+            "complete traversal must return each match exactly once"
+        );
+
+        for current in (1..3).rev() {
+            let cursor = pages[current]
+                .resources
+                .page_info
+                .previous_cursor
+                .clone()
+                .unwrap();
+            let a = backend
+                .search(&tenant, &default.clone().with_cursor(cursor.clone()))
+                .await
+                .unwrap();
+            let b = backend
+                .search(&tenant, &explicit.clone().with_cursor(cursor))
+                .await
+                .unwrap();
+            postgres_2074_assert_same_page(&a, &b);
+            postgres_2074_assert_same_page(&a, &pages[current - 1]);
+        }
+        let mut offset = explicit.clone();
+        offset.offset = Some(5);
+        let offset_page = backend.search(&tenant, &offset).await.unwrap();
+        postgres_2074_assert_same_page(&offset_page, &pages[1]);
+        let mut default_offset = default.clone();
+        default_offset.offset = Some(5);
+        postgres_2074_assert_same_page(
+            &backend.search(&tenant, &default_offset).await.unwrap(),
+            &offset_page,
+        );
+        offset.offset = Some(0);
+        postgres_2074_assert_same_page(&backend.search(&tenant, &offset).await.unwrap(), &pages[0]);
+        offset.offset = Some(999);
+        offset.cursor = pages[0].resources.page_info.next_cursor.clone();
+        postgres_2074_assert_same_page(&backend.search(&tenant, &offset).await.unwrap(), &pages[1]);
+
+        // Ascending and multi-parameter searches retain their existing fallback
+        // semantics; neither can inherit a descending single-membership page.
+        let ascending = default
+            .clone()
+            .with_sort(SortDirective::parse("_lastUpdated"));
+        let asc = backend.search(&tenant, &ascending).await.unwrap();
+        assert_eq!(
+            page_ids(&asc),
+            vec!["obs-01", "obs-02", "obs-03", "obs-04", "obs-05"]
+        );
+        let repeated = explicit.with_parameter(default.parameters[0].clone());
+        assert_eq!(
+            page_ids(&backend.search(&tenant, &repeated).await.unwrap()),
+            expected[..5]
+        );
+        let mut typed = observation_reference_query("patient", &["Patient/2074-target"])
+            .with_count(5)
+            .with_sort(SortDirective::parse("-_lastUpdated"));
+        typed.total = default.total;
+        let typed_page = backend.search(&tenant, &typed).await.unwrap();
+        assert_eq!(typed_page.total, Some(6));
+        assert_eq!(
+            page_ids(&typed_page),
+            vec!["obs-10", "obs-12", "obs-08", "obs-04", "obs-06"],
+            "a typed reference retains exact-reference membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_2074_contained_memberships_preserve_parent_identity_and_order() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirective;
+
+        let backend = create_backend().await;
+        backend.init_schema().await.unwrap();
+        let tenant = create_tenant("2074-contained");
+        postgres_2074_seed(&backend, &tenant).await;
+        for (id, parent_patient, child_type) in [
+            ("parent-both", "2074-target", "Observation"),
+            ("parent-child-only", "other-target", "Condition"),
+        ] {
+            postgres_2074_create_contained(
+                &backend,
+                &tenant,
+                id,
+                parent_patient,
+                child_type,
+                "2074-target",
+            )
+            .await;
+        }
+        let client = backend.get_client().await.unwrap();
+        client.execute(
+            "UPDATE resources SET last_updated=CASE id \
+             WHEN 'parent-both' THEN TIMESTAMPTZ '2024-01-06' ELSE TIMESTAMPTZ '2024-01-05' END \
+             WHERE tenant_id=$1 AND resource_type='Observation' AND id IN ('parent-both','parent-child-only')",
+            &[&tenant.tenant_id().as_str()],
+        ).await.unwrap();
+        client.execute(
+            "UPDATE search_index si SET last_updated=r.last_updated FROM resources r \
+             WHERE si.tenant_id=$1 AND si.resource_type='Observation' AND NOT si.is_contained \
+             AND r.tenant_id=si.tenant_id AND r.resource_type=si.resource_type AND r.id=si.resource_id",
+            &[&tenant.tenant_id().as_str()],
+        ).await.unwrap();
+        let contained_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index WHERE tenant_id=$1 AND param_name='patient' \
+             AND is_contained AND last_updated IS NULL",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            contained_rows, 2,
+            "normal CRUD must exercise both NULL contained memberships"
+        );
+        drop(client);
+
+        let mut expected = vec!["parent-both".to_string(), "parent-child-only".to_string()];
+        expected.extend(postgres_2074_expected());
+        let default = postgres_2074_query();
+        let explicit = default
+            .clone()
+            .with_sort(SortDirective::parse("-_lastUpdated"));
+        let mut queries = [default.clone(), explicit.clone()];
+        let mut pages = Vec::new();
+        for page_number in 0..3 {
+            let a = backend.search(&tenant, &queries[0]).await.unwrap();
+            let b = backend.search(&tenant, &queries[1]).await.unwrap();
+            assert_eq!(a.total, Some(14));
+            assert_eq!(
+                page_ids(&a),
+                expected[page_number * 5..((page_number + 1) * 5).min(14)]
+            );
+            postgres_2074_assert_same_page(&a, &b);
+            if let Some(cursor) = a.resources.page_info.next_cursor.clone() {
+                queries = [
+                    default.clone().with_cursor(cursor.clone()),
+                    explicit.clone().with_cursor(cursor),
+                ];
+            }
+            pages.push(a);
+        }
+        assert_eq!(
+            pages.iter().flat_map(page_ids).collect::<Vec<_>>(),
+            expected
+        );
+        for current in (1..3).rev() {
+            let cursor = pages[current]
+                .resources
+                .page_info
+                .previous_cursor
+                .clone()
+                .unwrap();
+            let a = backend
+                .search(&tenant, &default.clone().with_cursor(cursor.clone()))
+                .await
+                .unwrap();
+            let b = backend
+                .search(&tenant, &explicit.clone().with_cursor(cursor))
+                .await
+                .unwrap();
+            postgres_2074_assert_same_page(&a, &b);
+            postgres_2074_assert_same_page(&a, &pages[current - 1]);
+        }
+        for mut query in [default, explicit] {
+            query.offset = Some(5);
+            postgres_2074_assert_same_page(
+                &backend.search(&tenant, &query).await.unwrap(),
+                &pages[1],
+            );
+            query.cursor = pages[0].resources.page_info.next_cursor.clone();
+            query.offset = Some(999);
+            postgres_2074_assert_same_page(
+                &backend.search(&tenant, &query).await.unwrap(),
+                &pages[1],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_2074_null_index_timestamp_uses_authoritative_parent_order() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirective;
+
+        let backend = create_backend().await;
+        backend.init_schema().await.unwrap();
+        let tenant = create_tenant("2074-null-timestamp");
+        postgres_2074_seed(&backend, &tenant).await;
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "UPDATE search_index SET last_updated=NULL WHERE tenant_id=$1 \
+                 AND resource_type='Observation' AND resource_id='obs-01' AND param_name='patient'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        drop(client);
+
+        let default = postgres_2074_query();
+        for query in [
+            default.clone(),
+            default.with_sort(SortDirective::parse("-_lastUpdated")),
+        ] {
+            let first = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(first.total, Some(12));
+            assert_eq!(page_ids(&first), postgres_2074_expected()[..5]);
+            let next = backend
+                .search(
+                    &tenant,
+                    &query
+                        .clone()
+                        .with_cursor(first.resources.page_info.next_cursor.clone().unwrap()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page_ids(&next), postgres_2074_expected()[5..10]);
+            let previous = backend
+                .search(
+                    &tenant,
+                    &query.with_cursor(next.resources.page_info.previous_cursor.clone().unwrap()),
+                )
+                .await
+                .unwrap();
+            postgres_2074_assert_same_page(&previous, &first);
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_2074_legacy_timestamp_fallback() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirective;
+
+        let backend = hfs1407_backend(true).await;
+        let tenant = create_tenant("2074-legacy");
+        postgres_2074_seed(&backend, &tenant).await;
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "UPDATE search_index SET last_updated=NULL WHERE tenant_id=$1",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let query = postgres_2074_query().with_sort(SortDirective::parse("-_lastUpdated"));
+        let first = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page_ids(&first), postgres_2074_expected()[..5]);
+        assert_eq!(first.total, Some(12));
+        let second = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(first.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&second), postgres_2074_expected()[5..10]);
+        let previous = backend
+            .search(
+                &tenant,
+                &query.with_cursor(second.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        postgres_2074_assert_same_page(&first, &previous);
+    }
+
+    /// Inspect statements prepared by actual searches on one connection. The
+    /// offset page must produce the same results without retaining its SQL.
+    #[tokio::test]
+    async fn postgres_2074_emitted_page_sql_and_offset_cache() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{PageCursor, SortDirective};
+
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let client = backend.get_client().await.unwrap();
+        // Startup loads registries on a second connection. Shrink only after
+        // that completes, retaining this connection for SQL inspection.
+        deadpool_postgres::Client::pool(&client).unwrap().resize(1);
+        drop(client);
+        let tenant = create_tenant("2074-emitted");
+        postgres_2074_seed(&backend, &tenant).await;
+        postgres_2074_create_contained(
+            &backend,
+            &tenant,
+            "unrelated-contained",
+            "other-target",
+            "Observation",
+            "other-target",
+        )
+        .await;
+        let query = postgres_2074_query().with_sort(SortDirective::parse("-_lastUpdated"));
+        let first = backend.search(&tenant, &query).await.unwrap();
+        let next_cursor = first.resources.page_info.next_cursor.clone().unwrap();
+        let next = backend
+            .search(&tenant, &query.clone().with_cursor(next_cursor.clone()))
+            .await
+            .unwrap();
+        let previous_cursor = next.resources.page_info.previous_cursor.clone().unwrap();
+        let previous = backend
+            .search(&tenant, &query.clone().with_cursor(previous_cursor.clone()))
+            .await
+            .unwrap();
+        postgres_2074_assert_same_page(&first, &previous);
+
+        let client = backend.get_client().await.unwrap();
+        let cached_before: i64 = client
+            .query_one("SELECT COUNT(*) FROM pg_prepared_statements", &[])
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        let mut offset_query = query.clone();
+        offset_query.offset = Some(5);
+        let offset = backend.search(&tenant, &offset_query).await.unwrap();
+        postgres_2074_assert_same_page(&offset, &next);
+        let client = backend.get_client().await.unwrap();
+        let cached_after: i64 = client
+            .query_one("SELECT COUNT(*) FROM pg_prepared_statements", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            cached_before, cached_after,
+            "offset pages must not accumulate cached SQL"
+        );
+        let offset_cached: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_prepared_statements WHERE statement LIKE $1",
+                &[&"%OFFSET 5%"],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            offset_cached, 0,
+            "the nonzero-offset statement must be transient"
+        );
+
+        let statements = client
+            .query(
+                "SELECT name,statement,cardinality(parameter_types) FROM pg_prepared_statements \
+             WHERE statement LIKE 'WITH index_eligible AS MATERIALIZED%' AND statement LIKE '%LIMIT 6%' \
+             AND statement LIKE '%param_name = ''patient''%' ORDER BY name",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            statements.len(),
+            3,
+            "first, Next and Previous must each have an actual prepared page statement"
+        );
+        for row in statements {
+            let name: String = row.get(0);
+            let sql: String = row.get(1);
+            let parameter_count: i32 = row.get(2);
+            let eligibility = sql.split_once(") SELECT r.id").unwrap().0;
+            assert!(
+                eligibility.contains("last_updated IS NULL AND param_name = 'patient'")
+                    && !eligibility.contains("is_contained")
+                    && !eligibility.contains("contained_type = $2")
+                    && !eligibility.contains("resource_id > $4")
+                    && !eligibility.contains("resource_id < $4")
+                    && sql.contains("FALSE AS needs_fallback")
+                    && sql.contains("TRUE AS needs_fallback"),
+                "representation eligibility must cover matching NULL timestamps in the same snapshot, before any page boundary: {sql}"
+            );
+            let candidate_page = sql
+                .split_once("FROM ( ")
+                .and_then(|(_, tail)| tail.split_once(") c JOIN resources r"))
+                .map(|(page, _)| page)
+                .expect("the production page must select index identities before loading bodies");
+            assert!(
+                candidate_page
+                    .starts_with("SELECT DISTINCT resource_id, last_updated FROM search_index"),
+                "duplicate memberships must be eliminated in the candidate page: {sql}"
+            );
+            let live_check = candidate_page
+                .find("EXISTS (SELECT 1 FROM resources live")
+                .expect("page selection must check live identities");
+            let page_limit = candidate_page.find("LIMIT 6").unwrap();
+            assert!(
+                live_check < page_limit,
+                "dead candidates must be excluded before LIMIT: {sql}"
+            );
+            assert!(
+                candidate_page.contains("live.tenant_id = $1 AND live.resource_type = $2")
+                    && candidate_page
+                        .contains("live.id = search_index.resource_id AND live.is_deleted = FALSE")
+                    && !candidate_page.contains(".data"),
+                "the pre-limit check must be scoped to a live identity without loading bodies: {sql}"
+            );
+            let mut args = vec![
+                format!("'{}'", tenant.tenant_id().as_str()),
+                "'Observation'".to_string(),
+            ];
+            if parameter_count == 5 {
+                let cursor = PageCursor::decode(if sql.contains("id > $4") {
+                    &next_cursor
+                } else {
+                    &previous_cursor
+                })
+                .unwrap();
+                let timestamp = serde_json::to_value(&cursor.sort_values()[0]).unwrap();
+                args.push(format!("'{}'", timestamp.as_str().unwrap()));
+                args.push(format!("'{}'", cursor.resource_id()));
+            } else {
+                assert_eq!(
+                    parameter_count, 3,
+                    "unexpected production parameter layout: {sql}"
+                );
+            }
+            args.push("'2074-target'".to_string());
+            let quoted_name = format!("\"{}\"", name.replace('"', "\"\""));
+            println!(
+                "HFS_2074_ACTUAL_SQL={}",
+                json!({"sql":sql,"arguments":args})
+            );
+            for mode in ["force_custom_plan", "force_generic_plan"] {
+                client
+                    .batch_execute(&format!("SET plan_cache_mode={mode}"))
+                    .await
+                    .unwrap();
+                let plan: serde_json::Value = client
+                    .query_one(
+                        &format!(
+                            "EXPLAIN (FORMAT JSON) EXECUTE {quoted_name} ({})",
+                            args.join(",")
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                let text = plan.to_string();
+                assert!(
+                    text.contains("resources") && text.contains("search_index"),
+                    "the production page must plan its identity and membership reads: {plan}"
+                );
+                println!("HFS_2074_{mode}={plan}");
+                let emitted_rows = client
+                    .query(&format!("EXECUTE {quoted_name} ({})", args.join(",")), &[])
+                    .await
+                    .unwrap();
+                assert!(
+                    emitted_rows.len() > 1 && emitted_rows.iter().all(|row| !row.get::<_, bool>(6)),
+                    "unrelated contained memberships must retain real index-selected rows, without a fallback sentinel"
+                );
+            }
+        }
+        client.batch_execute("RESET plan_cache_mode").await.unwrap();
+    }
+
     /// The bare-id reference predicate must remain a four-column expression-index
     /// seek when PostgreSQL plans the complete count query with or without bind
     /// values available.

@@ -55,23 +55,30 @@ fn cursor_value_is_null(cursor: &PageCursor) -> bool {
 ///
 /// `NULLS LAST`/`NULLS FIRST` are only emitted for a nullable key: on
 /// `last_updated` they would stop the planner from walking its index.
-fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (String, String) {
+/// `id_column` is an internal column name: resource pages use `id`, while
+/// index-selected pages use `resource_id` for the identical tie boundary.
+fn keyset_page_clauses(
+    k: &KeysetKey,
+    id_column: &str,
+    cursor_is_null: bool,
+    backward: bool,
+) -> (String, String) {
     let e = &k.expr;
     let asc = k.direction == crate::types::SortDirection::Ascending;
     let at_missing = k.nullable && cursor_is_null;
     if backward {
         let condition = if at_missing {
-            format!("({e} IS NOT NULL OR ({e} IS NOT DISTINCT FROM $3 AND id < $4))")
+            format!("({e} IS NOT NULL OR ({e} IS NOT DISTINCT FROM $3 AND {id_column} < $4))")
         } else {
             let op = if asc { "<" } else { ">" };
-            format!("({e} {op} $3 OR ({e} = $3 AND id < $4))")
+            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} < $4))")
         };
         let nulls = if k.nullable { " NULLS FIRST" } else { "" };
         let dir = if asc { "DESC" } else { "ASC" };
-        (condition, format!("{e} {dir}{nulls}, id DESC"))
+        (condition, format!("{e} {dir}{nulls}, {id_column} DESC"))
     } else {
         let condition = if at_missing {
-            format!("({e} IS NOT DISTINCT FROM $3 AND id > $4)")
+            format!("({e} IS NOT DISTINCT FROM $3 AND {id_column} > $4)")
         } else {
             let op = if asc { ">" } else { "<" };
             let or_missing = if k.nullable {
@@ -79,11 +86,11 @@ fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (
             } else {
                 String::new()
             };
-            format!("({e} {op} $3 OR ({e} = $3 AND id > $4){or_missing})")
+            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} > $4){or_missing})")
         };
         let nulls = if k.nullable { " NULLS LAST" } else { "" };
         let dir = if asc { "ASC" } else { "DESC" };
-        (condition, format!("{e} {dir}{nulls}, id ASC"))
+        (condition, format!("{e} {dir}{nulls}, {id_column} ASC"))
     }
 }
 
@@ -301,26 +308,27 @@ async fn reject_legacy_composites(
     Ok(())
 }
 
-/// Decides whether a page can be resolved from `search_index` alone, returning
-/// the predicate to resolve it with.
+/// Decides whether page identities can be selected from `search_index` before
+/// loading resource bodies, returning the predicate to resolve them with.
 ///
 /// Gates, and why each one is load-bearing:
 /// - `Denormalized` layout: on a legacy database the rows carry no sort key, so
 ///   the fast path would order by NULL and return an arbitrary page.
-/// - no cursor, no offset: both paginate against `resources`.
-/// - default sort: any other sort key is not on the index row.
+/// - default or one descending `_lastUpdated` sort: these share the timestamp
+///   carried by the index row, including their cursor and offset pages.
 /// - exactly one membership test: a conjunction needs rows that jointly satisfy
 ///   it, which a single-row predicate cannot express.
 fn fast_index_pred(
     query: &SearchQuery,
     filter_sql: Option<&str>,
     layout: super::schema::IndexLayout,
-    has_cursor: bool,
 ) -> Option<String> {
+    let descending_timestamp = query.sort.is_empty()
+        || matches!(query.sort.as_slice(), [sort]
+            if sort.parameter == "_lastUpdated"
+                && sort.direction == crate::types::SortDirection::Descending);
     if !query.reverse_chains.is_empty()
-        || has_cursor
-        || query.offset.is_some()
-        || !query.sort.is_empty()
+        || !descending_timestamp
         || layout != super::schema::IndexLayout::Denormalized
     {
         return None;
@@ -514,11 +522,11 @@ impl PostgresBackend {
         } else {
             None
         };
-        // v18 fast path: resolve the page from `search_index` alone.
+        // v18 fast path: choose page identities before loading resource bodies.
         //
         // The sort key lives on every index row (see `migrate_v16_to_v17`), so a
-        // single-parameter search can take its top-n before touching `resources`
-        // and then fetch only the rows it returns. The general form below has to
+        // single-parameter search can take its top-n after checking live resource
+        // identities and then fetch only the bodies it returns. The general form has to
         // join every match first — 42,927 whole resources for a 21-row page on
         // the benchmark dataset — because the planner cannot estimate a range
         // predicate whose selectivity is conditional on `param_name`.
@@ -526,7 +534,6 @@ impl PostgresBackend {
             query,
             search_filter.as_ref().map(|f| f.sql.as_str()),
             self.index_layout(),
-            cursor.is_some(),
         );
 
         let filter_clause = search_filter
@@ -551,10 +558,80 @@ impl PostgresBackend {
             PostgresQueryBuilder::build_order_by(query)
         };
 
-        // Build query based on pagination mode.
+        let general_page_sql = || {
+            if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+                let backward = cursor.direction() == CursorDirection::Previous;
+                let (condition, order) =
+                    keyset_page_clauses(k, "id", cursor_value_is_null(cursor), backward);
+                let sql = format!(
+                    "SELECT {cols} FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                 AND {condition} \
+                 ORDER BY {order} LIMIT {lim}",
+                    cols = select_cols,
+                    filter = filter_clause,
+                    lim = count + 1,
+                );
+                // Backward: the placeholder is replaced by the extra-row check below.
+                (sql, !backward)
+            } else if let Some(offset) = query.offset {
+                let sql = format!(
+                    "SELECT {cols} FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                 {order} LIMIT {lim} OFFSET {off}",
+                    cols = select_cols,
+                    filter = filter_clause,
+                    order = order_by,
+                    lim = count + 1,
+                    off = offset,
+                );
+                (sql, offset > 0)
+            } else {
+                let sql = format!(
+                    "SELECT {cols} FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                 {order} LIMIT {lim}",
+                    cols = select_cols,
+                    filter = filter_clause,
+                    order = order_by,
+                    lim = count + 1,
+                );
+                (sql, false)
+            }
+        };
+
+        // Index eligibility and candidate selection share one database snapshot.
         let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
-            // `keyset` is always `Some` here: the fast path requires the default
-            // sort, which yields the `last_updated` keyset.
+            // Eligible sorts share the non-null `last_updated` keyset. Apply
+            // the same boundary to index identities, retaining the bind layout.
+            let backward = cursor
+                .as_ref()
+                .is_some_and(|c| c.direction() == CursorDirection::Previous);
+            let (boundary, order) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
+                let (condition, order) =
+                    keyset_page_clauses(k, "resource_id", cursor_value_is_null(cursor), backward);
+                (format!(" AND {condition}"), order)
+            } else {
+                (
+                    String::new(),
+                    "last_updated DESC, resource_id ASC".to_string(),
+                )
+            };
+            // A valid cursor takes precedence over an offset, as on the general
+            // path. Nonzero offsets still bypass the statement cache below.
+            let offset = if cursor.is_none() {
+                query
+                    .offset
+                    .map(|n| format!(" OFFSET {n}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let outer_order = if backward {
+                "sort_key ASC, id DESC"
+            } else {
+                "sort_key DESC, id ASC"
+            };
             // Gate the ordered scan on the predicate matching anything at all;
             // see `open_range_needs_empty_guard`. The subquery is uncorrelated,
             // so it is an InitPlan run once against the value-first index, and
@@ -567,60 +644,46 @@ impl PostgresBackend {
             } else {
                 String::new()
             };
+            // NULL timestamps are outside the denormalized ordering invariant
+            // (normal contained memberships carry NULL). Probe that timestamp
+            // range using the same predicate, rather than scanning all contained
+            // rows of the tenant, and materialize only the eligibility boolean.
             let sql = format!(
-                "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
-                        r.last_updated AS sort_key \
+                "WITH index_eligible AS MATERIALIZED ( \
+                   SELECT NOT EXISTS (SELECT 1 FROM search_index \
+                                      WHERE tenant_id = $1 AND resource_type = $2 \
+                                        AND last_updated IS NULL AND {pred}) AS usable \
+                 ) \
+                 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+                        r.last_updated AS sort_key, FALSE AS needs_fallback \
                  FROM ( \
                    SELECT DISTINCT resource_id, last_updated FROM search_index \
-                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard} \
-                   ORDER BY last_updated DESC, resource_id ASC LIMIT {lim} \
+                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard}{boundary} \
+                     AND EXISTS (SELECT 1 FROM resources live \
+                                 WHERE live.tenant_id = $1 AND live.resource_type = $2 \
+                                   AND live.id = search_index.resource_id AND live.is_deleted = FALSE) \
+                   ORDER BY {order} LIMIT {lim}{offset} \
                  ) c \
                  JOIN resources r \
                    ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
-                 WHERE r.is_deleted = FALSE \
-                 ORDER BY c.last_updated DESC, c.resource_id ASC",
+                 WHERE r.is_deleted = FALSE AND (SELECT usable FROM index_eligible) \
+                 UNION ALL \
+                 SELECT NULL::text, NULL::text, NULL::jsonb, NULL::timestamptz, \
+                        NULL::text, NULL::timestamptz, TRUE AS needs_fallback \
+                 WHERE NOT (SELECT usable FROM index_eligible) \
+                 ORDER BY {outer_order}",
                 pred = pred,
                 guard = guard,
                 lim = count + 1,
             );
-            (sql, false)
-        } else if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
-            let backward = cursor.direction() == CursorDirection::Previous;
-            let (condition, order) = keyset_page_clauses(k, cursor_value_is_null(cursor), backward);
-            let sql = format!(
-                "SELECT {cols} FROM resources \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
-                 AND {condition} \
-                 ORDER BY {order} LIMIT {lim}",
-                cols = select_cols,
-                filter = filter_clause,
-                lim = count + 1,
-            );
-            // Backward: the placeholder is replaced by the extra-row check below.
-            (sql, !backward)
-        } else if let Some(offset) = query.offset {
-            let sql = format!(
-                "SELECT {cols} FROM resources \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
-                 {order} LIMIT {lim} OFFSET {off}",
-                cols = select_cols,
-                filter = filter_clause,
-                order = order_by,
-                lim = count + 1,
-                off = offset,
-            );
-            (sql, offset > 0)
+            let has_previous = if cursor.is_some() {
+                !backward
+            } else {
+                query.offset.unwrap_or(0) > 0
+            };
+            (sql, has_previous)
         } else {
-            let sql = format!(
-                "SELECT {cols} FROM resources \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
-                 {order} LIMIT {lim}",
-                cols = select_cols,
-                filter = filter_clause,
-                order = order_by,
-                lim = count + 1,
-            );
-            (sql, false)
+            general_page_sql()
         };
 
         // Build parameter list for binding.
@@ -647,12 +710,25 @@ impl PostgresBackend {
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-        let rows = if statement_is_reusable(query) {
+        let mut rows = if statement_is_reusable(query) {
             query_dyn_cached(client, &sql, &param_refs).await
         } else {
             client.query(&sql, &param_refs).await
         }
         .or_query_error("Failed to execute search")?;
+        // Matching NULL timestamps cannot safely participate in index ordering.
+        // Contained memberships normally carry NULL under their parent's identity.
+        // The same-statement sentinel preserves unique parent identities and
+        // contained-only matches even when CRUD changes the representation.
+        if fast_index_pred.is_some() && rows.first().is_some_and(|row| row.get::<_, bool>(6)) {
+            let (sql, _) = general_page_sql();
+            rows = if statement_is_reusable(query) {
+                query_dyn_cached(client, &sql, &param_refs).await
+            } else {
+                client.query(&sql, &param_refs).await
+            }
+            .or_query_error("Failed to execute search fallback")?;
+        }
 
         // Parse rows, capturing the sort key for cursor construction.
         let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
@@ -1733,12 +1809,12 @@ mod keyset_page_clause_tests {
     #[test]
     fn a_present_cursor_places_missing_values_last() {
         let (next, next_order) =
-            keyset_page_clauses(&key(true, SortDirection::Descending), false, false);
+            keyset_page_clauses(&key(true, SortDirection::Descending), "id", false, false);
         assert_eq!(next, "(k < $3 OR (k = $3 AND id > $4) OR k IS NULL)");
         assert_eq!(next_order, "k DESC NULLS LAST, id ASC");
 
         let (prev, prev_order) =
-            keyset_page_clauses(&key(true, SortDirection::Descending), false, true);
+            keyset_page_clauses(&key(true, SortDirection::Descending), "id", false, true);
         assert_eq!(prev, "(k > $3 OR (k = $3 AND id < $4))");
         assert_eq!(prev_order, "k ASC NULLS FIRST, id DESC");
     }
@@ -1747,10 +1823,11 @@ mod keyset_page_clause_tests {
     /// by id; backward reaches every present value as well.
     #[test]
     fn a_missing_cursor_pages_within_and_out_of_the_missing_values() {
-        let (next, _) = keyset_page_clauses(&key(true, SortDirection::Ascending), true, false);
+        let (next, _) =
+            keyset_page_clauses(&key(true, SortDirection::Ascending), "id", true, false);
         assert_eq!(next, "(k IS NOT DISTINCT FROM $3 AND id > $4)");
 
-        let (prev, _) = keyset_page_clauses(&key(true, SortDirection::Ascending), true, true);
+        let (prev, _) = keyset_page_clauses(&key(true, SortDirection::Ascending), "id", true, true);
         assert_eq!(
             prev,
             "(k IS NOT NULL OR (k IS NOT DISTINCT FROM $3 AND id < $4))"
@@ -1761,9 +1838,20 @@ mod keyset_page_clause_tests {
     #[test]
     fn a_non_nullable_key_is_unchanged() {
         let (next, order) =
-            keyset_page_clauses(&key(false, SortDirection::Descending), false, false);
+            keyset_page_clauses(&key(false, SortDirection::Descending), "id", false, false);
         assert_eq!(next, "(k < $3 OR (k = $3 AND id > $4))");
         assert_eq!(order, "k DESC, id ASC");
+    }
+
+    #[test]
+    fn postgres_2074_index_identity_uses_the_same_forward_and_backward_boundaries() {
+        let k = key(false, SortDirection::Descending);
+        let (next, order) = keyset_page_clauses(&k, "resource_id", false, false);
+        assert_eq!(next, "(k < $3 OR (k = $3 AND resource_id > $4))");
+        assert_eq!(order, "k DESC, resource_id ASC");
+        let (previous, order) = keyset_page_clauses(&k, "resource_id", false, true);
+        assert_eq!(previous, "(k > $3 OR (k = $3 AND resource_id < $4))");
+        assert_eq!(order, "k ASC, resource_id DESC");
     }
 }
 
@@ -1826,7 +1914,7 @@ mod fast_path_tests {
     #[test]
     fn taken_for_a_default_sorted_single_parameter_page() {
         let q = date_query();
-        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
+        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized);
         assert_eq!(
             pred.as_deref(),
             Some("param_name = 'date' AND value_date_end > $3")
@@ -1848,7 +1936,7 @@ mod fast_path_tests {
             chain: vec![],
             components: vec![],
         });
-        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized, false);
+        let pred = fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Denormalized);
         assert_eq!(
             pred.as_deref(),
             Some(
@@ -1864,18 +1952,39 @@ mod fast_path_tests {
         // The decisive gate: legacy rows have no `last_updated`, so ordering by
         // it would return an arbitrary page rather than the first one.
         let q = date_query();
-        assert!(fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Legacy, false).is_none());
+        assert!(fast_index_pred(&q, Some(&filter_of(&q)), IndexLayout::Legacy).is_none());
     }
 
     #[test]
-    fn refused_with_a_cursor_or_offset() {
-        let q = date_query();
+    fn postgres_2074_taken_with_a_cursor_or_offset() {
+        let mut q = date_query();
+        q.cursor =
+            Some(PageCursor::new(vec![CursorValue::from("2024-01-01T00:00:00Z")], "obs").encode());
         let filter = filter_of(&q);
-        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, true).is_none());
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_some());
 
         let mut q2 = date_query();
         q2.offset = Some(40);
-        assert!(fast_index_pred(&q2, Some(&filter), IndexLayout::Denormalized, false).is_none());
+        assert!(fast_index_pred(&q2, Some(&filter), IndexLayout::Denormalized).is_some());
+    }
+
+    #[test]
+    fn postgres_2074_taken_for_exactly_one_descending_last_updated_sort() {
+        let mut q = date_query();
+        q.sort = vec![SortDirective::parse("-_lastUpdated")];
+        let filter = filter_of(&q);
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_some());
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Legacy).is_none());
+
+        for sort in ["_lastUpdated", "-date"] {
+            q.sort = vec![SortDirective::parse(sort)];
+            assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_none());
+        }
+        q.sort = vec![
+            SortDirective::parse("-_lastUpdated"),
+            SortDirective::parse("_id"),
+        ];
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_none());
     }
 
     #[test]
@@ -1887,13 +1996,13 @@ mod fast_path_tests {
             param_type: Some(SearchParamType::Token),
         }];
         let filter = filter_of(&q);
-        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, false).is_none());
+        assert!(fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_none());
     }
 
     #[test]
     fn refused_without_a_filter() {
         let q = SearchQuery::new("Encounter");
-        assert!(fast_index_pred(&q, None, IndexLayout::Denormalized, false).is_none());
+        assert!(fast_index_pred(&q, None, IndexLayout::Denormalized).is_none());
     }
 
     /// A repeated parameter is now one membership test over the occurrences'
@@ -1914,7 +2023,7 @@ mod fast_path_tests {
 
         assert!(filter.contains(" INTERSECT "), "{filter}");
         assert!(
-            fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized, false).is_none(),
+            fast_index_pred(&q, Some(&filter), IndexLayout::Denormalized).is_none(),
             "{filter}"
         );
     }
