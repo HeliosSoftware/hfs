@@ -1,4 +1,4 @@
-//! PostgreSQL patient + composite search through the HTTP parser and pagination.
+//! PostgreSQL selective searches through the HTTP parser and pagination.
 #![cfg(feature = "postgres")]
 
 use std::path::PathBuf;
@@ -165,4 +165,105 @@ async fn postgres_1579_patient_composite_http_literal_total_and_pagination() {
         .await
         .json();
     assert_eq!(ids(&offset), ids(&second));
+}
+
+#[tokio::test]
+async fn postgres_2077_independent_quantity_http_literal_total_and_pagination() {
+    let server = server().await;
+    for (id, code, value, unit) in [
+        ("a", "8302-2", 190.0, "cm"),
+        ("b", "8302-2", 1.9, "m"),
+        ("c", "8302-2", 185.0, "cm"),
+        ("boundary-raw", "8302-2", 150.0, "cm"),
+        ("boundary-canonical", "8302-2", 1.5, "m"),
+        ("below", "8302-2", 149.0, "cm"),
+        ("wrong-code", "29463-7", 190.0, "cm"),
+        ("deleted", "8302-2", 190.0, "cm"),
+    ] {
+        let resource = json!({"resourceType": "Observation", "id": id, "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+            "valueQuantity": {"value": value, "unit": unit, "system": "http://unitsofmeasure.org", "code": unit}});
+        let response = server
+            .put(&format!("/Observation/{id}"))
+            .json(&resource)
+            .await;
+        assert!(response.status_code().is_success(), "{}", response.text());
+    }
+    assert!(
+        server
+            .delete("/Observation/deleted")
+            .await
+            .status_code()
+            .is_success()
+    );
+
+    // Without a unit, the raw numeric comparison excludes the 1.9 m match.
+    let response = server
+        .get("/Observation")
+        .add_query_param("code", "8302-2")
+        .add_query_param("value-quantity", "gt150")
+        .add_query_param("_total", "accurate")
+        .await;
+    assert_eq!(
+        response.status_code(),
+        axum::http::StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    let control: Value = response.json();
+    let mut found = ids(&control);
+    found.sort();
+    assert_eq!(found, ["a", "c"]);
+    assert_eq!(control["total"], 2);
+
+    let response = server
+        .get("/Observation")
+        .add_query_param("code", "8302-2")
+        .add_query_param("value-quantity", "gt150||cm")
+        .add_query_param("_total", "accurate")
+        .add_query_param("_count", "1")
+        .await;
+    assert_eq!(
+        response.status_code(),
+        axum::http::StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    let mut pages: Vec<Value> = vec![response.json()];
+    for _ in 0..2 {
+        let response = server.get(&link_path(pages.last().unwrap(), "next")).await;
+        assert_eq!(
+            response.status_code(),
+            axum::http::StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        pages.push(response.json());
+    }
+    for page in &pages {
+        assert_eq!(page["total"], 3);
+        assert_eq!(ids(page).len(), 1);
+    }
+    let mut found: Vec<_> = pages.iter().flat_map(ids).collect();
+    found.sort();
+    assert_eq!(found, ["a", "b", "c"]);
+    assert!(
+        !pages[2]["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["relation"] == "next")
+    );
+    for index in 1..pages.len() {
+        let response = server.get(&link_path(&pages[index], "previous")).await;
+        assert_eq!(
+            response.status_code(),
+            axum::http::StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let previous: Value = response.json();
+        assert_eq!(previous["total"], 3);
+        assert_eq!(ids(&previous), ids(&pages[index - 1]));
+    }
 }

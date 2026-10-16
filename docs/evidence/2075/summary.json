@@ -1,0 +1,220 @@
+{
+  "issue": 2075,
+  "source_base": "8aada62303380100c530083c1889425f0178d020",
+  "validation_kind": "actual Rust/HTTP prepared SQL replay, not full-corpus HTTP",
+  "corpus": {
+    "postgres": "16.15",
+    "schema": 49,
+    "layout": "denormalized",
+    "fhir_version": "R4",
+    "tenant": "default",
+    "patients": 11705,
+    "observations": 7699987
+  },
+  "settings": {
+    "statement_timeout_ms": 30000,
+    "shared_buffers_bytes": 134217728,
+    "effective_cache_size_bytes": 4294967296,
+    "work_mem_bytes": 4194304,
+    "normal_plan_cache_mode": "force_custom_plan"
+  },
+  "cache_condition": "uncontrolled; planning probes warmed database/filesystem caches; no reset or restart",
+  "first_planning_baseline": "Exact count canceled after30.001seconds; page SQL executor69.260ms. Not controlled cold-cache.",
+  "records": [
+    {
+      "round": 1,
+      "arm": "before",
+      "total": 11705,
+      "returned_matches": 5,
+      "pagination_sentinel": true,
+      "none_page_seconds": 0.064116,
+      "accurate_count_seconds": 3.242192,
+      "accurate_page_seconds": 0.063136,
+      "accurate_sequence_seconds": 3.305328
+    },
+    {
+      "round": 1,
+      "arm": "after",
+      "total": 11705,
+      "returned_matches": 5,
+      "pagination_sentinel": true,
+      "none_page_seconds": 0.054162,
+      "accurate_count_seconds": 1.529845,
+      "accurate_page_seconds": 0.061531,
+      "accurate_sequence_seconds": 1.591376
+    },
+    {
+      "round": 2,
+      "arm": "before",
+      "total": 11705,
+      "returned_matches": 5,
+      "pagination_sentinel": true,
+      "none_page_seconds": 0.054605,
+      "accurate_count_seconds": 2.787406,
+      "accurate_page_seconds": 0.053705,
+      "accurate_sequence_seconds": 2.841111
+    },
+    {
+      "round": 2,
+      "arm": "after",
+      "total": 11705,
+      "returned_matches": 5,
+      "pagination_sentinel": true,
+      "none_page_seconds": 0.053291,
+      "accurate_count_seconds": 1.321788,
+      "accurate_page_seconds": 0.054303,
+      "accurate_sequence_seconds": 1.376091
+    },
+    {
+      "round": 3,
+      "arm": "before",
+      "total": 11705,
+      "returned_matches": 5,
+      "pagination_sentinel": true,
+      "none_page_seconds": 0.053319,
+      "accurate_count_seconds": 2.34781,
+      "accurate_page_seconds": 0.054124,
+      "accurate_sequence_seconds": 2.401934
+    },
+    {
+      "round": 3,
+      "arm": "after",
+      "total": 11705,
+      "returned_matches": 5,
+      "pagination_sentinel": true,
+      "none_page_seconds": 0.053292,
+      "accurate_count_seconds": 1.415029,
+      "accurate_page_seconds": 0.063167,
+      "accurate_sequence_seconds": 1.478196
+    }
+  ],
+  "ordered_first_five_ids_sha256": "7ce9e7bf469fc0f206fd91a2bcb90005e7e7846af4f6e07abd4e2f9c63e9c226",
+  "plans": [
+    {
+      "arm": "after",
+      "plan_mode": "force_custom_plan",
+      "work_mem": "4MB",
+      "execution_ms": 1253.669,
+      "exact_code_probes": 11709,
+      "candidate_scan_loops": 1,
+      "candidate_rows": 175355,
+      "buffers": {
+        "Shared Hit Blocks": 139662,
+        "Shared Read Blocks": 205096,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 0
+      },
+      "evidence": "qa-after-force_custom_plan-4MB.json"
+    },
+    {
+      "arm": "after",
+      "plan_mode": "force_custom_plan",
+      "work_mem": "64kB",
+      "execution_ms": 1198.581,
+      "exact_code_probes": 11709,
+      "candidate_scan_loops": 1,
+      "candidate_rows": 175355,
+      "buffers": {
+        "Shared Hit Blocks": 139299,
+        "Shared Read Blocks": 205459,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 10
+      },
+      "evidence": "qa-after-force_custom_plan-64kB.json"
+    },
+    {
+      "arm": "after",
+      "plan_mode": "force_generic_plan",
+      "work_mem": "4MB",
+      "execution_ms": 1297.905,
+      "exact_code_probes": 11709,
+      "candidate_scan_loops": 1,
+      "candidate_rows": 175355,
+      "buffers": {
+        "Shared Hit Blocks": 139296,
+        "Shared Read Blocks": 205462,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 0
+      },
+      "evidence": "qa-after-force_generic_plan-4MB.json"
+    },
+    {
+      "arm": "before",
+      "plan_mode": "force_custom_plan",
+      "work_mem": "4MB",
+      "execution_ms": 2489.371,
+      "exact_code_probes": 151430,
+      "candidate_scan_loops": 0,
+      "candidate_rows": 0,
+      "buffers": {
+        "Shared Hit Blocks": 838808,
+        "Shared Read Blocks": 412047,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 0
+      },
+      "evidence": "qa-before-force_custom_plan-4MB.json"
+    }
+  ],
+  "prepared_sql_sha256": {
+    "before": "6b9b8ec746ed770e2c3816dd52666ac37ae1fc63402a99954ebebf2f7ca61edc",
+    "after": "3462ee9c55cf4de7226b59d1eeda4ff39879fb3dac076e73fa10a0f7aa34c1d7",
+    "page": "42ad2e5029d32a1b22b64b6d854a65460ca057770f753aa5acdc0878927bf89f"
+  },
+  "checks": {
+    "unit_native_2075": 2,
+    "unit_native_1579": 4,
+    "persistence_2075": 2,
+    "persistence_1579": 1,
+    "persistence_1625": 1,
+    "http_chained_search_resolution": 6,
+    "physical_plan_cases": 32,
+    "r4b_only_check": "pass",
+    "format_and_diff": "pass"
+  },
+  "candidate_membership": {
+    "input_row_cap": 262144,
+    "scan_limit": 262145,
+    "hash_keys": "hashtext(resource_id)::text",
+    "serialized_map_bytes_on_corpus": 3153504,
+    "memory_note": "Serialized size only; peak aggregate memory was not measured. Overflow disables the prefilter; collisions are checked by the exact guard."
+  },
+  "qa_state": {
+    "other_active_client_sessions_at_start": 0,
+    "owned_active_statements_after": 0,
+    "owned_builds_during_qa": 0
+  },
+  "medians_seconds": {
+    "before": {
+      "count": 2.787406,
+      "count_plus_page": 2.841111
+    },
+    "after": {
+      "count": 1.415029,
+      "count_plus_page": 1.478196
+    }
+  }
+}
