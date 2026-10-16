@@ -55,10 +55,11 @@ use axum::{
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_sof::sqlquery::SqlQueryError;
+use helios_sof::sqlquery::engine::DeclaredColumn;
 use helios_sof::{
-    ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef, bind_supplied_params,
-    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library, scan_sql,
-    undeclared_tables,
+    AnsiType, ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef,
+    bind_supplied_params, default_for_fhir_type, extract_sqlquery_params_from_json,
+    format_fhir_parameters, parse_sqlquery_library, scan_sql, undeclared_tables,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -241,20 +242,38 @@ where
     // we materialized from a leaf ViewDefinition anywhere in the dependency
     // graph, prefer the VD-declared FHIR type. Walk leaves in plan order so
     // the lookup is deterministic when two VDs declare the same column name.
-    let mut name_to_type: std::collections::HashMap<String, ColumnFhirType> =
+    let mut name_to_type: std::collections::HashMap<String, (ColumnFhirType, Option<AnsiType>)> =
         std::collections::HashMap::new();
     for schema in &schemas_in_order {
         for col in &schema.columns {
             name_to_type
                 .entry(col.name.clone())
-                .or_insert_with(|| col.fhir_type.clone());
+                .or_insert_with(|| (col.fhir_type.clone(), col.ansi));
         }
     }
     for (i, col) in result.columns.iter().enumerate() {
-        if let Some(t) = name_to_type.get(col) {
+        if let Some((t, _)) = name_to_type.get(col) {
             result.column_types[i] = t.clone();
         }
     }
+
+    // Typed Parquet/Arrow schema: only columns that match a declared leaf
+    // column by name are typed (by the leaf's resolved SQL type, so an
+    // `ansi/type` tag is honoured); the rest keep value-based inference, since
+    // an arbitrary SQL result has no declared types of its own.
+    let declared: Vec<DeclaredColumn> = result
+        .columns
+        .iter()
+        .filter_map(|col| {
+            let (t, ansi) = name_to_type.get(col)?;
+            Some(DeclaredColumn {
+                name: col.clone(),
+                fhir_type: Some(t.clone()),
+                collection: false,
+                ansi: Some(ansi.unwrap_or_else(|| default_for_fhir_type(t.code()))),
+            })
+        })
+        .collect();
 
     // Format output. `header` precedence mirrors `_format`: body > query.
     let include_header = params
@@ -262,7 +281,8 @@ where
         .or_else(|| parse_header_str(query.header.as_deref()))
         .unwrap_or(true);
     let wrap_in_binary = wants_fhir_binary(&format, headers);
-    let (content_type, body) = render_output(&format, include_header, &result, wrap_in_binary)?;
+    let (content_type, body) =
+        render_output(&format, include_header, &result, wrap_in_binary, &declared)?;
     Ok(build_response(content_type, body))
 }
 
@@ -393,6 +413,7 @@ fn render_output(
     include_header: bool,
     result: &QueryResult,
     wrap_in_binary: bool,
+    declared: &[helios_sof::sqlquery::engine::DeclaredColumn],
 ) -> Result<(&'static str, Vec<u8>), RestError> {
     match format {
         "fhir" | "application/fhir+json" => {
@@ -418,13 +439,20 @@ fn render_output(
                     ),
                 }
             })?;
-            let declared = helios_sof::sqlquery::engine::declared_from_query_types(
-                &result.columns,
-                &result.column_types,
-            );
-            let body = helios_sof::format_output_with_schema(processed, ct, None, &declared)
-                .map_err(|e| RestError::InternalError {
-                    message: format!("output formatter failed: {e}"),
+            let body = helios_sof::format_output_with_schema(processed, ct, None, declared)
+                .map_err(|e| match &e {
+                    // A value that does not fit its declared column type is
+                    // the caller's view/data mismatch: a 422 naming the column.
+                    helios_sof::SofError::ParquetConversionError(msg)
+                        if super::run::declared_misfit_detail(msg).is_some() =>
+                    {
+                        RestError::UnprocessableEntity {
+                            message: msg.clone(),
+                        }
+                    }
+                    _ => RestError::InternalError {
+                        message: format!("output formatter failed: {e}"),
+                    },
                 })?;
             let inner_ct = content_type_for(ct);
             if wrap_in_binary {
@@ -567,6 +595,15 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         SqlQueryError::SourceStream(msg) => RestError::InternalError {
             message: format!("dependency source failed: {msg}"),
         },
+        // The store could not serve a dependency (an object read out of
+        // attempts, a dropped connection, throttling): transient, so a 503
+        // with `Retry-After` rather than a 500 (#2048).
+        SqlQueryError::SourceUnavailable(msg) => {
+            warn!(error = %msg, "dependency source unavailable during $sql-run");
+            RestError::ServiceUnavailable {
+                message: format!("dependency source unavailable: {msg}"),
+            }
+        }
     }
 }
 
@@ -596,6 +633,36 @@ mod tests {
         assert_eq!(
             row_cap.client_response().0,
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// #2048: a dependency the store could not serve (an object read that ran
+    /// out of attempts) is a retryable 503 with `Retry-After`, not a 500.
+    #[test]
+    fn an_unavailable_store_is_a_503() {
+        let rest = sqlquery_err_to_rest(SqlQueryError::SourceUnavailable(
+            "dependency failed to materialize: failed to read object body after 3 attempts".into(),
+        ));
+        assert!(
+            matches!(rest, RestError::ServiceUnavailable { .. }),
+            "got {rest:?}"
+        );
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert!(
+            message.contains("after 3 attempts"),
+            "the client needs the reason: {message}"
+        );
+
+        let response =
+            sqlquery_err_to_rest(SqlQueryError::SourceUnavailable("x".into())).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a 503 must carry Retry-After"
         );
     }
 

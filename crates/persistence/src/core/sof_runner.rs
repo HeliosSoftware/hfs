@@ -13,8 +13,8 @@
 //!
 //! If the configured backend provides no runner at all, the
 //! `$viewdefinition-run` handler returns `501 Not Implemented`. Inline
-//! `resource:` parameters are materialised into a transient in-memory SQLite
-//! backend so they reuse the same in-DB pipeline.
+//! `resource:` parameters bypass the runner: the REST layer evaluates them
+//! with the in-process `helios-sof` FHIRPath engine.
 //!
 //! The handler layer streams the result rows directly into the HTTP response.
 //!
@@ -104,6 +104,13 @@ pub enum SofError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// The storage backend is unreachable or failing transiently (throttling, a
+    /// dropped connection, an object body that could not be read after
+    /// retries). The handler layer maps this variant to `503 Service Unavailable`
+    /// (#2048).
+    #[error("storage unavailable: {0}")]
+    Unavailable(String),
+
     /// A backend-level SQL or driver error.
     #[error("backend error: {0}")]
     Backend(String),
@@ -117,6 +124,28 @@ pub enum SofError {
     /// The view run was cancelled (e.g. client disconnected, export job cancelled).
     #[error("view run cancelled")]
     Cancelled,
+}
+
+impl SofError {
+    /// Converts a storage error from a resource read or scan.
+    ///
+    /// A transient backend failure (`Unavailable`, `ConnectionFailed`,
+    /// `PoolExhausted`) becomes [`SofError::Unavailable`], so the handler can
+    /// answer `503` rather than `500`. Every other error becomes
+    /// [`SofError::Storage`] with the error's text, as before.
+    ///
+    /// This is the same classification the CRUD path applies
+    /// (`BackendError::Unavailable` answers `503` there too), so it also covers
+    /// what a backend reports as unavailable besides an exhausted retry: a
+    /// dispatch failure or timeout, throttling, and an S3 misconfiguration
+    /// (access denied, a bucket that is missing or not accessible).
+    pub fn from_storage(err: crate::error::StorageError) -> Self {
+        if err.is_unavailable() {
+            SofError::Unavailable(err.to_string())
+        } else {
+            SofError::Storage(err.to_string())
+        }
+    }
 }
 
 /// Sender half of a runner's row channel.
@@ -355,5 +384,45 @@ mod tests {
         })
         .await
         .expect("stream consumption must not hang");
+    }
+
+    /// A transient backend failure keeps its unavailability so the handler can
+    /// answer 503; every other storage error stays a `Storage` error with the
+    /// same text as before (#2048).
+    #[test]
+    fn storage_errors_keep_their_unavailability() {
+        use crate::error::{BackendError, StorageError};
+
+        let transient = [
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name: "s3".to_string(),
+                message: "x".to_string(),
+            }),
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: "s3".to_string(),
+                message: "x".to_string(),
+            }),
+            StorageError::Backend(BackendError::PoolExhausted {
+                backend_name: "s3".to_string(),
+            }),
+        ];
+        for err in transient {
+            let text = err.to_string();
+            match SofError::from_storage(err) {
+                SofError::Unavailable(m) => assert!(m.contains(&text), "lost the text: {m}"),
+                other => panic!("expected SofError::Unavailable, got {other:?}"),
+            }
+        }
+
+        let internal = StorageError::Backend(BackendError::Internal {
+            backend_name: "s3".to_string(),
+            message: "boom".to_string(),
+            source: None,
+        });
+        let text = internal.to_string();
+        match SofError::from_storage(internal) {
+            SofError::Storage(m) => assert_eq!(m, text),
+            other => panic!("expected SofError::Storage, got {other:?}"),
+        }
     }
 }

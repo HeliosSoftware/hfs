@@ -1483,7 +1483,9 @@ mod tests {
         assert!(backend.supports(BackendCapability::Sorting));
         assert!(!backend.supports(BackendCapability::Transactions));
         // Chained/`_has` search resolves via the backend-agnostic resolver over
-        // ES's `search()` (which honours `_id`), so ES declares it.
+        // ES's `search()` (which honours `_id`), so ES declares it. A `_has`
+        // hop reads its reference values in one aggregation
+        // (`search_reference_values`) instead of paging every source document.
         assert!(backend.supports(BackendCapability::ChainedSearch));
         assert!(backend.supports(BackendCapability::ReverseChaining));
         // No history/versioning on ES, and never a tenancy topology beyond

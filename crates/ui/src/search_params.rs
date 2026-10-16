@@ -156,7 +156,7 @@ impl SpQuery {
         self.version
             .as_deref()
             .and_then(version_from_str)
-            .unwrap_or_default()
+            .unwrap_or_else(FhirVersion::default_enabled)
     }
 
     /// Serializes the state to an href, with `page` and `sel` reset unless
@@ -803,6 +803,16 @@ mod tests {
     /// group, no stored `base`).
     fn no_rail() -> rail_state::RailState {
         rail_state::RailState::default()
+    }
+
+    /// #2051: the UI offers exactly the FHIR releases this build's helios-fhir
+    /// carries -- the set the server's `$versions` reports. Feature unification
+    /// can switch a helios-fhir version on that this crate did not ask for
+    /// (helios-audit's R5/R6 enable R4B); this crate's features follow it
+    /// instead of a catch-all arm hiding it.
+    #[test]
+    fn enabled_versions_match_the_helios_fhir_build() {
+        assert_eq!(enabled_versions(), FhirVersion::enabled_versions().to_vec());
     }
 
     /// A source whose first fetch is empty and later fetches carry data, the

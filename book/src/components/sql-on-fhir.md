@@ -68,19 +68,22 @@ Parameter precedence: request body > query params > `Accept` header.
 | CSV | Default |
 | JSON | Array of row objects |
 | NDJSON | One row object per line |
-| Parquet | Snappy compression; follows Pathling type conventions |
+| Parquet | Snappy compression; types follow the SQL-on-FHIR 3.0.0-ballot default mappings |
 
 ### Parquet Type Mapping
 
 | FHIR type | Arrow / Parquet type |
 |-----------|----------------------|
 | boolean | BOOLEAN |
-| string, code, uri | UTF8 |
 | integer, positiveInt, unsignedInt | INT32 |
 | integer64 | INT64 |
-| integer (no declared `type`) | INT32, or INT64 when any value in the column lies outside the 32-bit range |
-| decimal | FLOAT64 |
-| dateTime, date | UTF8 |
-| `collection: true` columns, arrays | List<UTF8> |
+| decimal | UTF8 (digits preserved, trailing zeros stripped) |
+| instant | TIMESTAMP (µs, UTC) |
+| base64Binary | BINARY |
+| date, dateTime, time | UTF8 |
+| string, code, uri, other | UTF8 |
+| collection columns | Arrow List of the element type |
+
+A column `tag` named `ansi/type` overrides the default (for example `DATE` on a `date` column gives a native date); an unknown or incompatible value is rejected. Columns with no declared `type` are inferred from the values. See the [`helios-sof` README](https://github.com/HeliosSoftware/hfs/blob/main/crates/sof/README.md#column-type-mapping) for the accepted values and the per-emitter comparison. Decimal columns were previously FLOAT64; add `ansi/type: DOUBLE PRECISION` to keep that.
 
 All fields are OPTIONAL. Parquet and Arrow IPC are encoded incrementally with the schema fixed from the declared column types before the first row, so memory stays bounded rather than growing with the result.

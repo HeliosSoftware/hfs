@@ -5455,16 +5455,31 @@ impl ReindexSource for PostgresBackend {
     }
 
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
+        // The listing yields a few dozen types, but it has to read every live
+        // row of the tenant to find them, so its cost follows the tenant's
+        // size. A system-level `$reindex` lists first, and a failed listing
+        // fails the whole job before it counts or indexes anything (#2040).
+        // Lift the timeout for this one statement, as `count_resources` does;
+        // the session keeps it afterwards.
         let tenant_id = tenant.tenant_id().as_str();
-
-        let rows = client
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin resource type listing")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for resource type listing")?;
+        let rows = tx
             .query(
                 "SELECT DISTINCT resource_type FROM resources WHERE tenant_id = $1 AND is_deleted = FALSE",
                 &[&tenant_id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to query resource types: {}", e)))?;
+            .or_query_error("Failed to query resource types")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish resource type listing")?;
 
         let types: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
         Ok(types)

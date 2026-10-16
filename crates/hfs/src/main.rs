@@ -112,7 +112,12 @@ fn parse_env_bool(var: &str, default_value: bool) -> bool {
 /// An S3 endpoint override, or `None` when it is unset or blank — so an empty
 /// `HFS_*_S3_ENDPOINT=` neither replaces the AWS endpoint nor forces
 /// path-style addressing.
-#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+// Only bulk export's S3 output store calls it, and that is built only with a
+// SQL backend; the unit test keeps it exercised in every build.
+#[cfg_attr(
+    not(all(feature = "s3", any(feature = "sqlite", feature = "postgres"))),
+    allow(dead_code)
+)]
 fn non_blank_endpoint(endpoint: Option<String>) -> Option<String> {
     endpoint
         .map(|e| e.trim().to_string())
@@ -318,6 +323,23 @@ fn parse_s3_keyspace_layout(
     }
 }
 
+/// Parses `HFS_S3_SCAN_CONCURRENCY`: the most `GetObject` requests the S3 read
+/// fan-outs may have in flight at once. Unset or blank is the default (32); a
+/// value that is not a whole number of at least 1 is an error rather than a
+/// silent fall back, since `0` would stall every scan.
+#[cfg(feature = "s3")]
+fn parse_s3_scan_concurrency(raw: Option<&str>) -> anyhow::Result<usize> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(helios_persistence::backends::s3::DEFAULT_SCAN_CONCURRENCY),
+        Some(value) => match value.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => anyhow::bail!(
+                "HFS_S3_SCAN_CONCURRENCY '{value}' invalid (expected a whole number of at least 1)"
+            ),
+        },
+    }
+}
+
 /// Builds the primary S3 backend's configuration from the `HFS_S3_*`
 /// environment: the one reader for `start_s3`, `start_s3_elasticsearch` and
 /// the shared database audit sink, so the three cannot disagree about where
@@ -331,9 +353,12 @@ fn s3_backend_config_from_env(
     let tenancy_mode = S3TenancyEnv::from_env().resolve(default_tenant)?;
     let default_keyspace_layout =
         parse_s3_keyspace_layout(std::env::var("HFS_S3_KEYSPACE_LAYOUT").ok().as_deref())?;
+    let scan_concurrency =
+        parse_s3_scan_concurrency(std::env::var("HFS_S3_SCAN_CONCURRENCY").ok().as_deref())?;
     Ok(S3BackendConfig {
         tenancy_mode,
         default_keyspace_layout,
+        scan_concurrency,
         region: std::env::var("HFS_S3_REGION").ok(),
         prefix: std::env::var("HFS_S3_PREFIX").ok(),
         endpoint_url: std::env::var("HFS_S3_ENDPOINT")
@@ -471,7 +496,7 @@ impl helios_persistence::composite::SecondarySyncObserver for CompositeSyncMetri
 }
 
 /// Reads a non-negative integer setting, falling back on anything else.
-#[cfg(feature = "elasticsearch")]
+#[cfg(any(feature = "elasticsearch", feature = "mongodb"))]
 fn env_u64(var: &str, default_value: u64) -> u64 {
     match std::env::var(var) {
         Ok(v) => v.trim().parse().unwrap_or_else(|_| {
@@ -1356,6 +1381,10 @@ async fn start_mongodb(
         "Initializing MongoDB backend"
     );
     let backend = MongoBackend::new(backend_config)?;
+    info!(
+        deferred_index_min_entries = ?backend.deferred_search_index_min_entries(),
+        "MongoDB transaction Bundles of at least this many entries write their search rows after the commit (None: never)"
+    );
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
@@ -1363,6 +1392,10 @@ async fn start_mongodb(
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_mongodb_search_param_refresh(backend.clone(), &config);
+    spawn_mongodb_deferred_index_repair(
+        backend.clone(),
+        deferred_index_repair_min_age(config.request_timeout),
+    );
     let serve_audit_state = audit_state.clone();
 
     // MongoDB is a full standalone primary, so it also hosts the per-user
@@ -1951,7 +1984,8 @@ async fn main() -> anyhow::Result<()> {
     // Keep the skipped sub-configs populated while surfacing invalid CLI and
     // environment values instead of silently replacing the whole config with
     // defaults.
-    let mut config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
+    let (mut config, default_fhir_version_is_implicit) =
+        ServerConfig::try_from_env_with_provenance().unwrap_or_else(|error| error.exit());
     // The REST builder uses this same flag to start the dashboard's background
     // work. A binary without the UI must not seed or reconcile unseen figures.
     config.ui_enabled = effective_ui_enabled(config.ui_enabled);
@@ -1969,6 +2003,18 @@ async fn main() -> anyhow::Result<()> {
             bind_address = %config.socket_addr(),
             "{message}. Set HFS_BASE_URL to the public HTTP(S) origin clients can reach"
         );
+    }
+
+    // A build without R4 that enables several versions has no default FHIR
+    // version to fall back to (#2064): every R5 or R6 build also enables R4B,
+    // and serving R4B because nobody chose a version is hard to undo. Refuse to
+    // start, in the same form and with the same exit code as the
+    // `config.validate()` failure below.
+    if let Some(message) =
+        config.implicit_default_fhir_version_error(default_fhir_version_is_implicit)
+    {
+        eprintln!("Configuration error: {}", message);
+        std::process::exit(1);
     }
 
     if let Err(errors) = config.validate() {
@@ -2263,6 +2309,104 @@ fn spawn_mongodb_search_param_refresh(backend: Arc<MongoBackend>, config: &Serve
                     "SearchParameter registry refresh failed; serving the stale cache: {e}"
                 ),
             }
+        }
+    });
+}
+
+/// The youngest ledger document a deferred-index repair pass takes (#1975): at
+/// least a minute, and at least the Bundle deadline
+/// ([`bundle_transaction_deadline`]).
+///
+/// The request that wrote a ledger document starts no post-commit batch after
+/// its Bundle deadline, counted from its call, and the call precedes the
+/// document's `not_before`; an attempt still running at the deadline is cut. A
+/// document older than the deadline therefore has no live writer, and one
+/// instance's repair never duplicates a post-commit step that is still running.
+/// (A pass that did race one would only repeat work: the rewrite is gated on a
+/// per-resource marker.) The lag after a crash or a deadline cut is this age
+/// plus up to one repair interval.
+#[cfg(feature = "mongodb")]
+fn deferred_index_repair_min_age(request_timeout_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(60).max(bundle_transaction_deadline(request_timeout_secs))
+}
+
+/// Ledger documents (up to 5,000 resources each) one repair pass takes, so a
+/// pass over a large backlog stays bounded and the rest waits for the next.
+#[cfg(feature = "mongodb")]
+const DEFERRED_INDEX_REPAIR_CHUNKS_PER_PASS: usize = 20;
+
+/// Finishes the search rows of large transaction Bundles that were committed
+/// without them (#1975). Each pass re-runs the post-commit rewrite for ledger
+/// documents at least `min_age` ([`deferred_index_repair_min_age`]) old, up to
+/// [`DEFERRED_INDEX_REPAIR_CHUNKS_PER_PASS`] of them, so rows left by a crash,
+/// a cancelled request or the Bundle deadline are picked up. Runs right away
+/// (startup) and then every `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL`
+/// seconds (default 60; `0` disables the task, the ledger is still written).
+///
+/// Only spawned for the native MongoDB backend: with Elasticsearch serving
+/// search nothing is deferred, so there is nothing to repair.
+#[cfg(feature = "mongodb")]
+fn spawn_mongodb_deferred_index_repair(backend: Arc<MongoBackend>, min_age: std::time::Duration) {
+    let interval = env_u64("HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL", 60);
+    if interval == 0 {
+        info!(
+            "HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL=0: repair of deferred MongoDB search rows is off; large transaction Bundles still write their ledger"
+        );
+        return;
+    }
+    info!(
+        min_age_secs = min_age.as_secs(),
+        interval_secs = interval,
+        "Repair of deferred MongoDB search rows is on"
+    );
+    let interval = std::time::Duration::from_secs(interval);
+    tokio::spawn(async move {
+        let mut first_pass = true;
+        loop {
+            let started = std::time::Instant::now();
+            match backend
+                .repair_deferred_search_index(min_age, DEFERRED_INDEX_REPAIR_CHUNKS_PER_PASS)
+                .await
+            {
+                Ok(report) if report.examined > 0 => {
+                    let pass_ms = started.elapsed().as_millis() as u64;
+                    if report.failed > 0 {
+                        warn!(
+                            examined = report.examined,
+                            skipped = report.skipped,
+                            resources = report.resources,
+                            reindexed = report.reindexed,
+                            rows = report.rows,
+                            cleared = report.cleared,
+                            failed = report.failed,
+                            remaining = report.remaining,
+                            pass_ms,
+                            "Deferred search index repair pass finished"
+                        );
+                    } else {
+                        info!(
+                            examined = report.examined,
+                            skipped = report.skipped,
+                            resources = report.resources,
+                            reindexed = report.reindexed,
+                            rows = report.rows,
+                            cleared = report.cleared,
+                            failed = report.failed,
+                            remaining = report.remaining,
+                            pass_ms,
+                            "Deferred search index repair pass finished"
+                        );
+                    }
+                }
+                Ok(report) if first_pass && report.remaining > 0 => info!(
+                    remaining = report.remaining,
+                    "Deferred search index ledger holds chunks younger than the repair's minimum age; the next pass takes them"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!("Repair of deferred MongoDB search rows could not run: {e}"),
+            }
+            first_pass = false;
+            tokio::time::sleep(interval).await;
         }
     });
 }
@@ -3018,14 +3162,17 @@ async fn build_bulk_submit(
                     .ok()
                     .or_else(|| std::env::var("HFS_S3_REGION").ok());
                 let sdk_config = AwsS3Client::load_sdk_config(region.as_deref()).await;
+                let endpoint_url =
+                    non_blank_endpoint(std::env::var("HFS_BULK_SUBMIT_S3_ENDPOINT").ok());
+                // A custom endpoint forces path-style addressing, as for bulk
+                // export, the S3 storage backend and the `$sql-export` S3 sink.
+                let force_path_style = endpoint_url.is_some()
+                    || parse_env_bool("HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE", false);
                 let client = Arc::new(AwsS3Client::from_sdk_config_with_options(
                     &sdk_config,
                     AwsS3ClientOptions {
-                        endpoint_url: std::env::var("HFS_BULK_SUBMIT_S3_ENDPOINT").ok(),
-                        force_path_style: parse_env_bool(
-                            "HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE",
-                            false,
-                        ),
+                        endpoint_url,
+                        force_path_style,
                     },
                 ));
                 Arc::new(S3OutputStore::new(
@@ -4143,6 +4290,7 @@ async fn start_s3(
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
+        scan_concurrency = s3_config.scan_concurrency,
         "Initializing S3 backend"
     );
 
@@ -4311,6 +4459,7 @@ async fn start_s3_elasticsearch(
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
+        scan_concurrency = s3_config.scan_concurrency,
         "Initializing S3 backend (primary)"
     );
 
@@ -4855,6 +5004,34 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "s3")]
+    mod s3_scan_concurrency {
+        use super::*;
+
+        #[test]
+        fn unset_or_blank_is_the_default() {
+            assert_eq!(parse_s3_scan_concurrency(None).unwrap(), 32);
+            assert_eq!(parse_s3_scan_concurrency(Some("  ")).unwrap(), 32);
+        }
+
+        #[test]
+        fn whole_numbers_of_at_least_one_parse() {
+            assert_eq!(parse_s3_scan_concurrency(Some("1")).unwrap(), 1);
+            assert_eq!(parse_s3_scan_concurrency(Some(" 8 ")).unwrap(), 8);
+        }
+
+        #[test]
+        fn zero_negative_and_junk_are_refused() {
+            for bad in ["0", "-1", "abc", "1.5", "32x"] {
+                let err = parse_s3_scan_concurrency(Some(bad))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("HFS_S3_SCAN_CONCURRENCY"), "{err}");
+                assert!(err.contains("at least 1"), "{err}");
+            }
+        }
+    }
+
     // ── PostgreSQL pool gauges (#1907) ────────────────────────────
 
     /// Each pool field lands in its own gauge; distinct values catch a swap.
@@ -5373,6 +5550,65 @@ mod tests {
         );
         let err = weight(Some("lots")).expect_err("invalid value must fail startup");
         assert!(format!("{err}").contains("HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_deferred_index_entries_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+        let entries = |value: Option<&'static str>| {
+            build_mongodb_config_with_env(&config, false, |name| match name {
+                "HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES" => {
+                    value.map(str::to_string)
+                }
+                _ => None,
+            })
+        };
+
+        assert_eq!(
+            entries(None)
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            None
+        );
+        assert_eq!(
+            entries(Some("off"))
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            Some(0)
+        );
+        assert_eq!(
+            entries(Some("0"))
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            Some(0)
+        );
+        assert_eq!(
+            entries(Some("auto"))
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            None
+        );
+        assert_eq!(
+            entries(Some("6000"))
+                .unwrap()
+                .transaction_bundle_deferred_index_entries,
+            Some(6000)
+        );
+        let err = entries(Some("lots")).expect_err("invalid value must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_deferred_index_repair_min_age_covers_the_bundle_deadline() {
+        use std::time::Duration;
+        // A short timeout leaves the one-minute floor.
+        assert_eq!(deferred_index_repair_min_age(30), Duration::from_secs(60));
+        assert_eq!(deferred_index_repair_min_age(0), Duration::from_secs(60));
+        // A long one is the Bundle deadline, `HFS_REQUEST_TIMEOUT` - 2 s.
+        assert_eq!(deferred_index_repair_min_age(600), Duration::from_secs(598));
+        assert_eq!(deferred_index_repair_min_age(900), Duration::from_secs(898));
     }
 
     #[cfg(feature = "mongodb")]

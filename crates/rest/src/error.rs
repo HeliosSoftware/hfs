@@ -1114,10 +1114,12 @@ impl From<TransactionError> for RestError {
             },
             // A transaction too large for the backend's cache (#1837) is a
             // server capacity limit, so it answers 500 with the generic wording
-            // and never the retryable 503; `err.to_string()`, which carries the
-            // driver `reason`, reaches only the log. The Bundle path,
+            // and never the retryable 503, whatever its `cause` (#1993);
+            // `err.to_string()`, which carries the cause and the driver
+            // `reason`, reaches only the log. The Bundle path,
             // `transaction_error_response_parts` in `handlers/batch.rs`, carries
-            // the message that names the cache and the entry count.
+            // the message that names the cache and the entry count and words
+            // the resubmit advice per cause.
             TransactionError::RolledBack { .. }
             | TransactionError::CommitOutcomeUnknown { .. }
             | TransactionError::TooLargeForCache { .. }
@@ -1144,7 +1146,9 @@ impl From<BackendError> for RestError {
             // Transient, retryable conditions: the backend is down or saturated,
             // not the request's fault. Surfaced as 503 (with Retry-After) so
             // clients, load balancers, and service meshes retry/route instead of
-            // treating it as a server bug.
+            // treating it as a server bug. Keep `BackendError::is_unavailable`
+            // (which the SQL-on-FHIR layers use for the same 503-vs-500
+            // decision) in step with these arms; a test checks they agree.
             BackendError::Unavailable { message, .. }
             | BackendError::ConnectionFailed { message, .. } => {
                 RestError::ServiceUnavailable { message }
@@ -1750,6 +1754,14 @@ mod tests {
             ),
         ];
         for (err, expected) in cases {
+            // `BackendError::is_unavailable` is what the SQL-on-FHIR layers
+            // use to answer 503 instead of 500 (#2048); it must name exactly
+            // the variants this exhaustive mapping answers 503 for.
+            assert_eq!(
+                err.is_unavailable(),
+                expected == StatusCode::SERVICE_UNAVAILABLE,
+                "is_unavailable() disagrees with the mapping for {err:?}"
+            );
             let (status, _, _) = RestError::from(err).client_response();
             assert_eq!(status, expected);
         }
@@ -1932,34 +1944,67 @@ mod tests {
 
     /// #1837: a transaction too large for the backend's cache is a server
     /// capacity limit: 500 with the generic wording, never the retryable 503,
-    /// and none of the driver text carried in `reason`.
+    /// and none of the driver text carried in `reason`, whatever its cause
+    /// (#1993). The cause reaches the log through the `Display`, not the client.
     #[tokio::test]
     async fn test_transaction_too_large_for_cache_maps_to_500_without_driver_text() {
-        let make = || TransactionError::TooLargeForCache {
-            entries: 7412,
-            reason: "insert_many failed: code: 388, WiredTigerRecordStore::insertRecord \
-                     -31800: transaction is too large; InsertManyError"
-                .to_string(),
-        };
-        let err = RestError::from(make());
-        assert!(matches!(err, RestError::InternalError { .. }), "{err:?}");
+        use helios_persistence::error::TooLargeForCacheCause;
 
-        let (status, code, message) = err.client_response();
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(code, "exception");
-        for leak in ["388", "-31800", "insertRecord", "InsertMany"] {
-            assert!(!message.contains(leak), "leaked {leak:?}: {message}");
+        for (cause, reason) in [
+            (
+                TooLargeForCacheCause::WriteSetTooLarge,
+                "insert_many failed: code: 388, WiredTigerRecordStore::insertRecord \
+                 -31800: transaction is too large; InsertManyError",
+            ),
+            (
+                TooLargeForCacheCause::LoneEviction,
+                "Entry 6959 rolled back for eviction while the Bundle ran alone; not \
+                 replayed: Error code 112 (WriteConflict): oldest pinned transaction ID \
+                 rolled back for eviction",
+            ),
+        ] {
+            let make = || TransactionError::TooLargeForCache {
+                cause,
+                entries: 7412,
+                reason: reason.to_string(),
+            };
+            let source = make();
+            assert!(
+                source.to_string().contains(&cause.to_string()),
+                "the log text names the cause {cause:?}: {source}"
+            );
+
+            let err = RestError::from(source);
+            assert!(matches!(err, RestError::InternalError { .. }), "{err:?}");
+
+            let (status, code, message) = err.client_response();
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{cause:?}");
+            assert_eq!(code, "exception", "{cause:?}");
+            for leak in [
+                "388",
+                "-31800",
+                "insertRecord",
+                "InsertMany",
+                "112",
+                "WriteConflict",
+                "eviction",
+            ] {
+                assert!(
+                    !message.contains(leak),
+                    "{cause:?} leaked {leak:?}: {message}"
+                );
+            }
+
+            let response = RestError::from(make()).into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "a capacity limit must not advise a retry deadline ({cause:?})"
+            );
         }
-
-        let response = RestError::from(make()).into_response();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            response
-                .headers()
-                .get(axum::http::header::RETRY_AFTER)
-                .is_none(),
-            "a capacity limit must not advise a retry deadline"
-        );
     }
 
     /// The 504 deliberately carries no `Retry-After`: a cancelled query is

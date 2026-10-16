@@ -1001,22 +1001,14 @@ let parquet = run_view_definition(view, bundle, ContentType::Parquet)?;
 
 The SOF implementation supports Apache Parquet format for efficient columnar data storage and analytics:
 
-- **Schema**: Column types come from the ViewDefinition's declared `type` when present; columns without a `type` are inferred from the first 100 rows
-- **FHIR Type Mapping**:
-  - `boolean` → BOOLEAN
-  - `string`/`code`/`uri` → UTF8
-  - `integer`/`positiveInt`/`unsignedInt` → INT32
-  - `integer64` → INT64
-  - undeclared integer columns → INT32, or INT64 when any value in the column lies outside the 32-bit range
-  - `decimal` → FLOAT64
-  - `dateTime`/`date` → UTF8
-  - `collection: true` columns and arrays → `List<UTF8>`
+- **Declared-Type Schema**: Column types follow the `type` (and optional `ansi/type` tag) declared in the ViewDefinition, using the SQL-on-FHIR 3.0.0-ballot default mappings (see [Column Type Mapping](#column-type-mapping)). Columns that declare no `type` fall back to inference from the data
+- **Type Mapping**: see the tables below; `collection: true` columns become `List<element type>`
 - **In-database runners (`$viewdefinition-run` on HFS)**: for Parquet and Arrow IPC output
   the SQLite and PostgreSQL runners append database values straight to typed Arrow builders
   (`helios_sof::columnar`), skipping the JSON row step, and the batches are streamed through the
-  same encoder as the row path. Column types follow the declared mapping above, so an `integer`
-  column that is entirely null is `Int32` (not `Utf8`), and a value that does not parse as its
-  declared type is written as null. Undeclared columns are inferred from the first batch. Runners
+  same encoder as the row path. Column types follow the declared mapping above (including the `ansi/type` tag), so an `integer`
+  column that is entirely null is `Int32` (not `Utf8`); an integer value outside the 32-bit range
+  of an `Int32` column is an error naming the column, not null. Undeclared columns are inferred from the first batch. Runners
   without a columnar path fall back to the row path.
 - **Optimized for Large Datasets**:
   - Incremental encoding in batches of 8,192 rows; the schema is fixed before the first row
@@ -1111,6 +1103,73 @@ curl -X POST "http://localhost:8080/$sql-run?_format=application/parquet&compres
     - `Content-Type: application/vnd.apache.parquet` or `application/zip` - Based on single or multi-file output
     - `Content-Disposition: attachment; filename="data.parquet"` or `filename="data.zip"` - For convenient file downloads
   - Chunked responses use 64KB chunks for optimal network efficiency
+
+### Column Type Mapping
+
+SQL-on-FHIR 3.0.0-ballot defines default mappings from FHIR and FHIRPath types to ISO/IEC 9075 SQL types (`viewdef-6`, `viewdef-7`), and an `ansi/type` column tag to override them. Where a path has both a FHIR type and a FHIRPath type, the FHIR type wins. The resolver lives in `column_types` (`helios_sof::resolve_columns`) and is shared by every emitter, so they all agree on what a column's SQL type is; each emitter then maps that SQL type to the closest equivalent in its output format, as the specification asks for implementations without native SQL types.
+
+**FHIR type → SQL type (defaults)**
+
+| FHIR type | ISO/IEC 9075 type |
+|---|---|
+| `boolean` | `BOOLEAN` |
+| `integer`, `positiveInt`, `unsignedInt` | `INT` |
+| `integer64` | `BIGINT` |
+| `decimal` | `CHARACTER VARYING` (not a float; the digits are preserved, trailing zeros are not: `1.50` becomes `1.5`) |
+| `instant` | `TIMESTAMP WITH TIME ZONE` |
+| `base64Binary` | `BINARY` |
+| `date`, `dateTime`, `time` | `CHARACTER VARYING` |
+| every other type (`string`, `code`, `uri`, ...) | `CHARACTER VARYING` |
+
+FHIRPath types (columns without a declared `type`): `Boolean` → `BOOLEAN`, `Integer` → `INT`, `String`/`Decimal`/`Date`/`Time`/`DateTime` → `CHARACTER VARYING`.
+
+**Comparison with each emitter**
+
+"Status" is *conforms*, *fixed* (diverged before this change, now follows the table) or *deliberate* (diverges on purpose, reason given).
+
+| Emitter | `decimal` | `instant` | `integer64` | `base64Binary` | `integer*` / `boolean` | Status |
+|---|---|---|---|---|---|---|
+| Parquet / Arrow IPC (`sof-cli`, `sof-server`, pysof, `$sql-run`, `$sql-export`) | `Utf8` (was `Float64`) | `Timestamp(µs, UTC)`, offsets normalised (was `Utf8`) | `Int64` (was truncated to `Int32`) | `Binary` (was `Utf8`) | `Int32` with a checked conversion / `Boolean` | fixed |
+| JSON / NDJSON / CSV | JSON number, exact decimal digits, trailing zeros stripped | string as evaluated | JSON number (was the Rust debug string `Integer64(5, None, None)`) | string | number / boolean | `integer64` fixed; `decimal` **deliberate** |
+| `$sqlquery-run` / `$sql-run` in-memory SQLite (`sqlquery`) | `REAL` | `TEXT` | `INTEGER` (64-bit) | `TEXT` | `INTEGER` | `decimal` and `base64Binary` **deliberate** |
+| In-DB compilers (SQLite, PostgreSQL) | PostgreSQL `numeric`; SQLite `REAL` | text | `integer64` now decoded as a number (was text) | text | `bigint` / `INTEGER`; boolean | `integer64` fixed; `decimal`, `instant`, `base64Binary` **deliberate** |
+| In-DB MongoDB compiler | declared types are not applied (BSON is dynamically typed) | same | same | same | same | **deliberate** (limitation); an invalid `ansi/type` is still rejected |
+| `_format=fhir` (`value[x]`) | `valueDecimal` | `valueInstant` | `valueInteger64` | `valueBase64Binary` | `valueInteger` / `valueBoolean` | conforms (the FHIR type picks the `value[x]` part) |
+
+Reasons for the deliberate choices:
+
+- **`decimal` as a JSON number (JSON, NDJSON, CSV).** The upstream conformance suite's `expect` rows compare decimals as JSON numbers. The digits are exact (no `f64` round trip), but trailing zeros are stripped (`1.50` is emitted as `1.5`), because evaluation artefacts such as `3 / 2` or boundary functions would otherwise not compare equal. Parquet and Arrow carry the same digits as a string, which satisfies `viewdef-23`.
+- **`decimal` as `REAL` in SQLite.** With `TEXT` affinity `WHERE dec > 5` would compare as text and return wrong rows. SQLite has no exact decimal type either. Use `ansi/type: CHARACTER VARYING` if you want text. PostgreSQL keeps `numeric`.
+- **`instant` and `base64Binary` as text in SQLite and the in-DB runners.** The values travel as JSON text; only Parquet and Arrow have native timestamp and binary types.
+- **Columns without a `type`** are inferred from the values, passed through the FHIRPath table (a number with a fractional part is a `Decimal` and so `Utf8`; integers are `Int32`, widened to `Int64` if a value does not fit). An undeclared `instant` therefore stays `Utf8`; declare `type: instant` to get a timestamp.
+
+**`ansi/type` tag**
+
+A column may carry a `tag` with `name` `ansi/type` and a `value` naming the desired ISO/IEC 9075 type:
+
+```json
+{ "name": "birth_date", "path": "birthDate", "type": "date",
+  "tag": [{ "name": "ansi/type", "value": "DATE" }] }
+```
+
+The value is case-insensitive. Accepted values, the FHIR types each may be applied to, and the resulting Parquet / Arrow type:
+
+| `ansi/type` value (aliases) | Applies to FHIR type | Parquet / Arrow type |
+|---|---|---|
+| `CHARACTER VARYING` (`VARCHAR`, `CHAR VARYING`) | any | `Utf8` |
+| `BOOLEAN` | `boolean` | `Boolean` |
+| `INT` (`INTEGER`) | `integer`, `positiveInt`, `unsignedInt` | `Int32` |
+| `BIGINT` | the `INT` types, `integer64` | `Int64` |
+| `DOUBLE PRECISION` (`DOUBLE`) | `decimal`, the `INT` types, `integer64` | `Float64` |
+| `DATE` | `date` | `Date32` |
+| `TIME` | `time` | `Time64(µs)` |
+| `TIMESTAMP` (`TIMESTAMP WITHOUT TIME ZONE`) | `dateTime`, `instant` | `Timestamp(µs)` |
+| `TIMESTAMP WITH TIME ZONE` (`TIMESTAMPTZ`) | `dateTime`, `instant` | `Timestamp(µs, UTC)` |
+| `BINARY` (`VARBINARY`, `BINARY VARYING`) | `base64Binary` | `Binary` |
+
+A column with no declared `type` accepts any value and is checked per value. The specification leaves an unknown or incompatible value undefined; **we reject it** with an invalid-ViewDefinition error naming the column, in every emitter, rather than silently producing a column different from the one requested. This includes a tag whose `value` is not a string (for example `42`): the raw JSON is checked before the typed ViewDefinition is built, so the error names the column instead of being a generic deserialization failure. Likewise, a value that does not fit the requested type (a partial date such as `1980` with `DATE`, invalid base64, an integer outside the `INT` range) is an error naming the column, never `NULL`. Only the Parquet / Arrow and `sqlquery` SQLite emitters change the stored type; JSON, NDJSON and CSV keep their shape.
+
+**Breaking change (Parquet / Arrow IPC).** `decimal` columns change from `FLOAT64` to `UTF8`, `instant` from `UTF8` to `TIMESTAMP(µs, UTC)`, `integer64` from a truncated `INT32` to `INT64` and `base64Binary` from `UTF8` to `BINARY`. Collection columns of non-string types previously declared one type and built another. To keep a numeric decimal column, add `"tag": [{ "name": "ansi/type", "value": "DOUBLE PRECISION" }]`.
 
 ## Performance
 

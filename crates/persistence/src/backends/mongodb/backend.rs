@@ -124,6 +124,11 @@ pub struct MongoBackend {
     reindex_mode_logged: std::sync::atomic::AtomicBool,
     /// Bounds how many transaction Bundles run at once (#1776).
     transaction_bundle_gate: super::transaction_bundle_gate::TransactionBundleGate,
+    /// The resolved [`MongoBackendConfig::transaction_bundle_deferred_index_entries`]:
+    /// a Bundle of at least this many entries writes its search rows after the
+    /// commit; `None` never defers (#1975). Read through
+    /// [`MongoBackend::deferred_search_index_min_entries`].
+    deferred_index_min_entries: Option<usize>,
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
     reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
@@ -377,12 +382,36 @@ pub struct MongoBackendConfig {
     /// entry and at most the whole room, so a Bundle larger than the room is
     /// admitted alone. `0` counts every Bundle as one slot (the #1776
     /// behaviour). A Bundle that takes the whole room runs alone and is not
-    /// replayed after an eviction rollback; it answers like
-    /// `TransactionTooLargeForCache` (388) does (#1895).
+    /// replayed after an eviction rollback; it ends as `TooLargeForCache` like
+    /// `TransactionTooLargeForCache` (388) does (#1895), with a text that does not
+    /// promise a resubmit fails (#1993).
     ///
     /// Default 1000.
     #[serde(default = "default_transaction_bundle_weight_entries")]
     pub transaction_bundle_weight_entries: usize,
+
+    /// Bundles with at least this many entries write their `search_index` /
+    /// `search_index_contained` rows after the commit instead of inside the
+    /// transaction (#1975;
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES`).
+    ///
+    /// The rows are about 18.6 per entry and dominate what a Bundle holds in
+    /// the WiredTiger cache until it commits, so writing them afterwards lifts
+    /// the size at which the server rolls the Bundle back for eviction. The
+    /// transaction records the affected resources in a durable ledger instead,
+    /// and a repair pass finishes any Bundle whose post-commit write did not.
+    ///
+    /// An embedder other than `hfs` must call
+    /// [`MongoBackend::repair_deferred_search_index`] periodically (`hfs` does
+    /// so at startup and every interval), or set this to `Some(0)`. Otherwise
+    /// the rows a crash or a deadline cut left unwritten are never written.
+    ///
+    /// `None` (default) follows the admission room
+    /// (`max_concurrent_transaction_bundles` × `transaction_bundle_weight_entries`,
+    /// 4,000 by default), or 4,000 when the gate is off or counts Bundles.
+    /// `Some(0)` never defers. Ignored while search is offloaded.
+    #[serde(default)]
+    pub transaction_bundle_deferred_index_entries: Option<usize>,
 
     /// Server execution budget, in milliseconds, sent as `maxTimeMS` on the
     /// cross-tenant `count_by_tenant` aggregate and on no other command (#1828;
@@ -444,11 +473,14 @@ fn check_count_by_tenant_max_time_ms(ms: u64) -> Result<Duration, String> {
 }
 
 impl MongoBackendConfig {
-    /// Applies `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (#1776) and
-    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (#1806) from `env`. Each
-    /// value is trimmed; an unset variable, or one empty after trimming, leaves
-    /// its field unchanged; anything but a non-negative integer is an `Err`
-    /// naming the variable.
+    /// Applies `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (#1776),
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (#1806) and
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (#1975) from
+    /// `env`. Each value is trimmed; an unset variable, or one empty after
+    /// trimming, leaves its field unchanged; anything but a non-negative
+    /// integer is an `Err` naming the variable. The deferred-index variable
+    /// also takes `off` (any case, the same as `0`: never defer) and `auto`
+    /// (follow the admission room).
     pub fn apply_transaction_bundle_env(
         &mut self,
         env: impl Fn(&str) -> Option<String>,
@@ -471,6 +503,21 @@ impl MongoBackendConfig {
                         "HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES must be a non-negative integer; got {raw:?}"
                     )
                 })?;
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES") {
+            let raw = raw.trim();
+            if raw.eq_ignore_ascii_case("off") {
+                self.transaction_bundle_deferred_index_entries = Some(0);
+            } else if raw.eq_ignore_ascii_case("auto") {
+                self.transaction_bundle_deferred_index_entries = None;
+            } else if !raw.is_empty() {
+                self.transaction_bundle_deferred_index_entries =
+                    Some(raw.parse::<usize>().map_err(|_| {
+                        format!(
+                            "HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES must be a non-negative integer, \"auto\" or \"off\"; got {raw:?}"
+                        )
+                    })?);
             }
         }
         Ok(())
@@ -694,6 +741,7 @@ impl Default for MongoBackendConfig {
             max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
             broad_search_concurrency: None,
             transaction_bundle_weight_entries: default_transaction_bundle_weight_entries(),
+            transaction_bundle_deferred_index_entries: None,
             count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
         }
     }
@@ -833,6 +881,10 @@ impl MongoBackend {
             config.max_concurrent_transaction_bundles,
             config.transaction_bundle_weight_entries,
         );
+        let deferred_index_min_entries = super::deferred_index::resolve_deferred_index_min_entries(
+            config.transaction_bundle_deferred_index_entries,
+            transaction_bundle_gate.entry_capacity(),
+        );
 
         Ok(Self {
             probe_cache: super::probe_cache::ProbeCache::default(),
@@ -847,6 +899,7 @@ impl MongoBackend {
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
             transaction_bundle_gate,
+            deferred_index_min_entries,
             broad_search_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -877,6 +930,9 @@ impl MongoBackend {
     /// - `HFS_MONGODB_REINDEX_PREPARE_THREADS` (default: `0` = cores − 1, 1–4)
     /// - `HFS_MONGODB_REINDEX_PREFETCH` (default: `true`)
     /// - `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (default: 4; 0 = no limit)
+    /// - `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (default: auto = the
+    ///   admission room, 4000; off/0 = never). A caller other than `hfs` that leaves
+    ///   this on must call `MongoBackend::repair_deferred_search_index` periodically.
     /// - `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (default: unset, no limit)
     /// - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` (default: `25000`)
     pub fn from_env() -> StorageResult<Self> {
@@ -1437,6 +1493,21 @@ impl MongoBackend {
     /// Sets the search-offloaded flag.
     pub fn set_search_offloaded(&mut self, offloaded: bool) {
         self.config.search_offloaded = offloaded;
+    }
+
+    /// The entry count from which a transaction Bundle writes its search rows
+    /// after the commit (#1975), or `None` when no Bundle does.
+    ///
+    /// Resolved once from
+    /// [`MongoBackendConfig::transaction_bundle_deferred_index_entries`] and
+    /// the admission room. `None` while search is offloaded, because the
+    /// offloaded backend writes no rows in the transaction to defer; that is
+    /// checked on every call, as the composite sets the flag after construction.
+    pub fn deferred_search_index_min_entries(&self) -> Option<usize> {
+        if self.is_search_offloaded() {
+            return None;
+        }
+        self.deferred_index_min_entries
     }
 }
 
@@ -2760,5 +2831,126 @@ mod tests {
                 .expect_err("a non-negative integer is required");
             assert!(err.contains(VAR), "{err}");
         }
+    }
+
+    #[test]
+    fn config_transaction_bundle_deferred_index_entries_defaults_to_auto_and_round_trips() {
+        assert_eq!(
+            MongoBackendConfig::default().transaction_bundle_deferred_index_entries,
+            None
+        );
+        let from_empty: MongoBackendConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty.transaction_bundle_deferred_index_entries, None);
+
+        let set = MongoBackendConfig {
+            transaction_bundle_deferred_index_entries: Some(5),
+            ..Default::default()
+        };
+        let back: MongoBackendConfig =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.transaction_bundle_deferred_index_entries, Some(5));
+    }
+
+    #[test]
+    fn apply_transaction_bundle_env_reads_the_deferred_index_entries() {
+        const VAR: &str = "HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES";
+        let with = |value: &'static str| move |name: &str| (name == VAR).then(|| value.to_string());
+
+        let mut config = MongoBackendConfig {
+            transaction_bundle_deferred_index_entries: Some(7),
+            ..Default::default()
+        };
+        config.apply_transaction_bundle_env(|_| None).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(7));
+        config.apply_transaction_bundle_env(with("  ")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(7));
+
+        // `auto` goes back to following the admission room.
+        config.apply_transaction_bundle_env(with("auto")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, None);
+
+        // `off` and `0` both mean never defer.
+        config.apply_transaction_bundle_env(with("off")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(0));
+        config.transaction_bundle_deferred_index_entries = None;
+        config.apply_transaction_bundle_env(with("OFF")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(0));
+        config.transaction_bundle_deferred_index_entries = None;
+        config.apply_transaction_bundle_env(with("0")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(0));
+
+        config.apply_transaction_bundle_env(with(" 5000 ")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(5000));
+
+        let err = config
+            .apply_transaction_bundle_env(with("many"))
+            .expect_err("a non-integer must be rejected");
+        assert!(err.contains(VAR), "{err}");
+        // A rejected value leaves the field as it was.
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(5000));
+
+        // The other two variables are not touched by it.
+        assert_eq!(config.max_concurrent_transaction_bundles, 4);
+        assert_eq!(config.transaction_bundle_weight_entries, 1000);
+    }
+
+    #[test]
+    fn deferred_search_index_min_entries_follows_the_room_and_offload() {
+        let min_entries = |config: MongoBackendConfig| {
+            MongoBackend::new(config)
+                .expect("a lazy backend needs no connection")
+                .deferred_search_index_min_entries()
+        };
+
+        // Default gate: 4 x 1,000.
+        assert_eq!(min_entries(MongoBackendConfig::default()), Some(4000));
+        // Follows the room of a small entry-weighted gate.
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                max_concurrent_transaction_bundles: 1,
+                transaction_bundle_weight_entries: 2,
+                ..Default::default()
+            }),
+            Some(2)
+        );
+        // A gate that is off or counts Bundles has no entry room: the default.
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                max_concurrent_transaction_bundles: 0,
+                ..Default::default()
+            }),
+            Some(4000)
+        );
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                transaction_bundle_weight_entries: 0,
+                ..Default::default()
+            }),
+            Some(4000)
+        );
+        // `Some(0)` never defers; any other value is taken as is.
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                transaction_bundle_deferred_index_entries: Some(0),
+                ..Default::default()
+            }),
+            None
+        );
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                transaction_bundle_deferred_index_entries: Some(9),
+                ..Default::default()
+            }),
+            Some(9)
+        );
+
+        // Offloaded search writes no rows in the transaction to defer; the
+        // composite sets the flag after construction, so it is read live.
+        let mut backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        assert_eq!(backend.deferred_search_index_min_entries(), Some(4000));
+        backend.set_search_offloaded(true);
+        assert_eq!(backend.deferred_search_index_min_entries(), None);
+        backend.set_search_offloaded(false);
+        assert_eq!(backend.deferred_search_index_min_entries(), Some(4000));
     }
 }

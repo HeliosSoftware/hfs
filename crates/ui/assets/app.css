@@ -163,8 +163,8 @@
   --bg-content: #fafafa;
   /* Raised surfaces (cards, active nav, controls) */
   --surface: linear-gradient(180deg, #fafafa 0%, #f8f8f8 100%);
-  --surface-border: #eaeaea;
-  --surface-shadow: 0 4px 4px rgb(0 0 0 / 3%);
+  --surface-border: #d4d4d4;
+  --surface-shadow: 0 1px 2px rgb(0 0 0 / 8%), 0 4px 10px rgb(0 0 0 / 6%);
   /* Floating panels that open over a card: one step above --surface. */
   --popover: #ffffff;
   --popover-border: #d6d6d6;
@@ -293,6 +293,7 @@
   --bg-content: #1d1d1d;
   --surface: linear-gradient(180deg, #222222 0%, #242424 100%);
   --surface-border: rgb(255 255 255 / 8%);
+  --surface-shadow: 0 4px 4px rgb(0 0 0 / 30%);
   /* Floating panels that open over a card: one step above --surface. */
   --popover: #2e2e2e;
   --popover-border: rgb(255 255 255 / 16%);
@@ -2233,11 +2234,13 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
 
 .history-version {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   width: 100%;
+  min-height: 34px;
   padding: 7px 9px;
   font: inherit;
+  color: var(--text);
   text-align: left;
   background: transparent;
   border: 1px solid transparent;
@@ -2246,6 +2249,7 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
 }
 
 .history-version:hover { background: var(--input-bg); }
+.history-version:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .history-version--current .history-version__id { color: var(--accent); }
 
@@ -2257,6 +2261,7 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
 }
 
 .history-version__id {
+  min-width: 2.5em;
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
@@ -2591,6 +2596,7 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
+  min-height: 34px;
   border-radius: 8px;
 }
 
@@ -3098,10 +3104,10 @@ details.json-fold[open] > summary .icon {
   z-index: 1000;
   max-width: min(320px, calc(100vw - 16px));
   padding: 6px 9px;
-  border: 1px solid var(--surface-border);
+  border: 1px solid var(--popover-border);
   border-radius: 8px;
-  background: var(--surface);
-  box-shadow: var(--surface-shadow);
+  background: var(--popover);
+  box-shadow: var(--popover-shadow);
   color: var(--text-strong);
   font-size: 12px;
   font-weight: 600;
@@ -6110,8 +6116,6 @@ details.card > summary.card-head::-webkit-details-marker {
 }
 .recent-group:first-child { margin-top: 0; }
 .recent-item__saved {
-  display: block;
-  width: 100%;
   text-align: left;
   font-weight: 500;
 }
