@@ -23890,6 +23890,9 @@ async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
     );
 }
 
+#[path = "mongodb/covered_membership.rs"]
+mod covered_membership;
+
 #[path = "mongodb/transaction_regressions.rs"]
 mod transaction_regressions;
 
