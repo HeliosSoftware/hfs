@@ -2643,7 +2643,7 @@
     if (value.reference) return value.reference;
     if (value.value !== undefined && value.unit)
       return value.value + " " + value.unit;
-    if (value.code) return value.code;
+    if (value.code) return fmt(value.code);
     var json = JSON.stringify(value);
     return json.length > 60 ? json.slice(0, 60) + "…" : json;
   }
