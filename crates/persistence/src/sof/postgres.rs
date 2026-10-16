@@ -438,7 +438,7 @@ async fn stream_pg_rows_inner(
                 let _ = tx
                     .send(Err(SofError::Backend(format!(
                         "row error: {}",
-                        pg_error_text(&e)
+                        pg_row_error_text(&e, &columns, &decodes)
                     ))))
                     .await;
                 break;
@@ -494,6 +494,43 @@ fn pg_error_text(e: &tokio_postgres::Error) -> String {
             db.message()
         ),
         None => e.to_string(),
+    }
+}
+
+/// [`pg_error_text`] for a failure while reading rows. The declared column
+/// type is applied by a SQL cast, so a declared `integer` / `decimal` column
+/// over a value that is not a number fails the whole query with a message that
+/// quotes the value but not the column (`invalid input syntax for type
+/// bigint: "Garcia"`). PostgreSQL does not say which expression failed, so for
+/// those data-exception errors the declared numeric columns are listed.
+fn pg_row_error_text(
+    e: &tokio_postgres::Error,
+    columns: &[String],
+    decodes: &[ColumnDecode],
+) -> String {
+    let text = pg_error_text(e);
+    let is_cast_failure = e.as_db_error().is_some_and(|db| {
+        matches!(
+            db.code().code(),
+            "22P02" /* invalid_text_representation */ | "22003" /* numeric_value_out_of_range */
+        )
+    });
+    if !is_cast_failure {
+        return text;
+    }
+    let numeric: Vec<&str> = columns
+        .iter()
+        .zip(decodes)
+        .filter(|(_, d)| matches!(d, ColumnDecode::Integer | ColumnDecode::Decimal))
+        .map(|(c, _)| c.as_str())
+        .collect();
+    if numeric.is_empty() {
+        text
+    } else {
+        format!(
+            "{text} (a declared integer/decimal column received a value that is not a number or is out of range; declared numeric columns: {})",
+            numeric.join(", ")
+        )
     }
 }
 
@@ -608,7 +645,10 @@ async fn stream_pg_pages_inner(
             if std::env::var("PG_SOF_DEBUG").is_ok() {
                 eprintln!("[PG_SOF_DEBUG] page error: {e}\n--- SQL ---\n{sql}\n---");
             }
-            SofError::Backend(format!("row error: {}", pg_error_text(&e)))
+            SofError::Backend(format!(
+                "row error: {}",
+                pg_row_error_text(&e, &columns, &decodes)
+            ))
         })?;
         drop(param_refs);
         drop(boxed);
@@ -711,7 +751,10 @@ async fn stream_pg_batches_inner(
             Ok(r) => r,
             Err(e) => {
                 let _ = tx
-                    .send(Err(SofError::Backend(format!("row error: {e}"))))
+                    .send(Err(SofError::Backend(format!(
+                        "row error: {}",
+                        pg_row_error_text(&e, &columns, &decodes)
+                    ))))
                     .await;
                 completed = false;
                 break;

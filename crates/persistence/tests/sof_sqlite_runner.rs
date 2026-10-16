@@ -969,6 +969,152 @@ mod sqlite_runner_tests {
     }
 
     #[tokio::test]
+    async fn test_declared_integer64_instant_decimal_types() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "issued": "2024-01-02T03:04:05.123+01:00",
+                    "valueInteger": 5_000_000_000_i64,
+                    "valueQuantity": {"value": 42.5}
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed o1");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{"column": [
+                {"path": "value.ofType(integer)", "name": "big", "type": "integer64"},
+                {"path": "issued", "name": "at", "type": "instant"},
+                {"path": "value.ofType(Quantity).value", "name": "dec", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        // integer64 is a JSON number beyond the i32 range, not a string.
+        assert_eq!(rows[0]["big"].as_i64(), Some(5_000_000_000));
+        // instant keeps its lexical form.
+        assert_eq!(rows[0]["at"], json!("2024-01-02T03:04:05.123+01:00"));
+        assert_eq!(rows[0]["dec"].as_f64(), Some(42.5));
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_sqlite_typed_columnar_values_and_parity() {
+        use super::sof_columnar as sc;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().expect("runner");
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::patient_typed_view(),
+            "patient",
+        )
+        .await;
+        sc::assert_patient_typed(&b);
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::observation_typed_view(),
+            "observation",
+        )
+        .await;
+        sc::assert_observation_typed(&b);
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_sqlite_typed_columnar_strict_and_invalid_tags() {
+        use super::sof_columnar as sc;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "tp2", "birthDate": "1980"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed tp2");
+        let runner = backend.sof_runner().expect("runner");
+        sc::assert_strict_and_rejected(runner.as_ref(), &tenant).await;
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_sqlite_declared_numeric_over_text_documented_limitation() {
+        use super::sof_columnar as sc;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Garcia"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().expect("runner");
+        // Documented limitation: the declared type is applied by a SQL CAST,
+        // and SQLite's CAST turns non-numeric text into 0 instead of failing
+        // (changing it would also change the constant/row-index casts the
+        // golden SQL pins). The columnar builder cannot tell this 0 from data.
+        // If this starts failing the limitation was lifted: update the docs.
+        let out = sc::row_outcome(runner.as_ref(), &tenant, &sc::text_declared_as("integer"))
+            .await
+            .expect("sqlite casts text to 0");
+        assert_eq!(out[0]["family"], json!(0));
+        let out = sc::row_outcome(runner.as_ref(), &tenant, &sc::text_declared_as("decimal"))
+            .await
+            .expect("sqlite casts text to 0.0");
+        assert_eq!(out[0]["family"].as_f64(), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_ansi_type_tag_is_rejected() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        for (ty, tag) in [("string", "NOT_A_TYPE"), ("decimal", "INT")] {
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "select": [{"column": [
+                    {"path": "id", "name": "id", "type": ty,
+                     "tag": [{"name": "ansi/type", "value": tag}]}
+                ]}]
+            });
+            let result = runner.run_view(&tenant, view, ViewFilters::default()).await;
+            assert!(result.is_err(), "tag {tag} on {ty} must be rejected");
+        }
+    }
+
+    #[tokio::test]
     async fn test_decimal_low_high_boundary() {
         let backend = make_backend().await;
         let runner = backend.sof_runner().expect("must have runner");

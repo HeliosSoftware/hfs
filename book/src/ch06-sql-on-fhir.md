@@ -261,21 +261,36 @@ In CSV output, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carri
 
 ### Parquet Type Mapping
 
+Column types follow the `type` declared in the ViewDefinition, using the SQL-on-FHIR 3.0.0-ballot default mappings to ISO/IEC 9075 types:
+
 | FHIR type | Arrow / Parquet type |
 |-----------|----------------------|
 | `boolean` | `BOOLEAN` |
-| `string`, `code`, `uri` | `UTF8` |
 | `integer`, `positiveInt`, `unsignedInt` | `INT32` |
 | `integer64` | `INT64` |
-| `decimal` | `FLOAT64` |
-| `dateTime`, `date` | `UTF8` |
-| `collection: true` columns, arrays | Arrow `List` of `UTF8` |
+| `decimal` | `UTF8` (digits preserved, trailing zeros stripped; not a float) |
+| `instant` | `TIMESTAMP(µs, UTC)` |
+| `base64Binary` | `BINARY` |
+| `date`, `dateTime`, `time` | `UTF8` |
+| `string`, `code`, `uri` and other types | `UTF8` |
+| `collection: true` | Arrow `List` of the element type |
 
-Types come from the `type` declared on each ViewDefinition column; a column with no declared `type` is inferred from the first 100 rows only. An inferred integer column is `INT64` instead of `INT32` when an integer outside the 32-bit range appears in the rows available when the schema is fixed (every row for buffered output, only the leading rows for streamed output). A later value that does not fit the inferred type (for example a non-integer in an `INT32` column, or a large integer past the leading rows of a streamed result) becomes null; declare the `type` to avoid this. All fields are `OPTIONAL`. Snappy compression is the default.
+Columns that declare no `type` are inferred from the values (a number with a fractional part becomes `UTF8`; integers become `INT32`, widened to `INT64` when needed). A column can override its default with a `tag` named `ansi/type`, for example `DATE` on a `birthDate` column to get a native date:
+
+```json
+{ "name": "birth_date", "path": "birthDate", "type": "date",
+  "tag": [{ "name": "ansi/type", "value": "DATE" }] }
+```
+
+An unknown or incompatible `ansi/type` value is rejected with an error naming the column, and so is a value that does not fit the requested type. The accepted values and the emitter-by-emitter comparison with the specification are in the [`helios-sof` README](https://github.com/HeliosSoftware/hfs/blob/main/crates/sof/README.md#column-type-mapping).
+
+**Upgrading:** `decimal` columns were `FLOAT64`, `instant` columns `UTF8`, `integer64` was truncated to `INT32` and `base64Binary` was `UTF8`. To keep a numeric decimal column, add the tag `ansi/type: DOUBLE PRECISION`. The tag element is `tag` (singular, as in the specification's StructureDefinition); the `tags` spelling in the specification's prose example is a typo and is not read.
+
+Types come from the `type` declared on each ViewDefinition column (a value that does not fit a declared `integer`-family type is an error naming the column); a column with no declared `type` is inferred from the first 100 rows only. An inferred integer column is `INT64` instead of `INT32` when an integer outside the 32-bit range appears in the rows available when the schema is fixed (every row for buffered output, only the leading rows for streamed output). For an inferred column, a later value that does not fit the inferred type (for example a non-integer in an `INT32` column, or a large integer past the leading rows of a streamed result) becomes null; declare the `type` to avoid this. All fields are `OPTIONAL`. Snappy compression is the default.
 
 Parquet and Arrow IPC are encoded incrementally: the schema is fixed before the first row, rows are encoded in batches, and a Parquet row group is written each time its encoded size reaches the configured row group size. Memory therefore stays bounded by about one row group rather than the whole result, and `$sql-run` sends the response as the row groups are written. If a row fails after the response has started, the body is aborted instead of ending in a truncated file with a clean `200`. When a maximum file size is set, splitting happens between batches, so a file can exceed the limit by one batch plus the footer. The first file keeps the plain name and later files are numbered `_002`, `_003` (there is no `_001`).
 
-On the HTTP side, a streamed Parquet or Arrow response has no `Content-Length` and uses chunked transfer encoding. The request timeout covers only the handler, not the body, so a slow client is bounded by backpressure rather than by a timeout. Arrow responses are still subject to response compression. If the client disconnects, encoding stops and the row stream is dropped. Typed columns accept numeric and boolean text (some runners return text); a value that does not fit its declared type becomes null. The Binary envelope, `_format=fhir`, inline resources and SQLQuery/Library subjects are still built in memory.
+On the HTTP side, a streamed Parquet or Arrow response has no `Content-Length` and uses chunked transfer encoding. The request timeout covers only the handler, not the body, so a slow client is bounded by backpressure rather than by a timeout. Arrow responses are still subject to response compression. If the client disconnects, encoding stops and the row stream is dropped. Typed columns accept numeric and boolean text (some runners return text); a value that does not fit its declared type is an error naming the column (the response is then aborted, as for any mid-stream error), while a misfit in an inferred column becomes null. The Binary envelope, `_format=fhir`, inline resources and SQLQuery/Library subjects are still built in memory.
 
 ---
 

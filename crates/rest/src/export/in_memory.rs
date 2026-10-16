@@ -27,7 +27,7 @@ use futures::StreamExt;
 use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
 use helios_sof::columnar_stream::{ParquetStreamWriter, STREAM_BATCH_ROWS};
 use helios_sof::parquet_schema::{SCHEMA_SAMPLE_ROWS, resolve_arrow_schema};
-use helios_sof::sqlquery::engine::declared_columns;
+use helios_sof::sqlquery::engine::try_declared_columns;
 use helios_sof::sqlquery::{InMemorySqlEngine, QueryResult};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -1152,7 +1152,8 @@ impl ParquetShardState {
             .iter()
             .map(|r| to_processed_row(&columns, r))
             .collect();
-        let declared = declared_columns(view);
+        let declared =
+            try_declared_columns(view).map_err(|e| ExportError::Serialization(e.to_string()))?;
         let schema = Arc::new(
             resolve_arrow_schema(&columns, &declared, &sample)
                 .map_err(|e| ExportError::Serialization(e.to_string()))?,
@@ -1318,6 +1319,18 @@ async fn run_views_job<Sink: ExportSink>(
             total_subjects,
             &named.name,
         );
+
+        // Reject an invalid `ansi/type` tag before running the view, whatever
+        // the format and whether or not the view returns rows.
+        try_declared_columns(&named.view).map_err(|e| match e {
+            // A bad tag is the request's own fault: keep the 4xx and the
+            // column name in the job's stored result.
+            helios_sof::SofError::InvalidViewDefinition(msg) => JobFailure::from_sof(
+                &format!("view '{}'", named.name),
+                SofError::InvalidViewDefinition(msg),
+            ),
+            other => JobFailure::server(format!("view '{}': {other}", named.name)),
+        })?;
 
         let stream = runner
             .run_view(&task.tenant, named.view.clone(), task.filters.clone())

@@ -83,7 +83,7 @@ pub fn format_view_fhir_parameters(
     result: &ProcessedResult,
     view_json: &Value,
 ) -> Result<Vec<u8>, SofError> {
-    let schema = TableSchema::from_view_definition(view_json);
+    let schema = TableSchema::try_from_view_definition(view_json)?;
     let column_types: Vec<ColumnFhirType> = result
         .columns
         .iter()
@@ -237,6 +237,22 @@ mod tests {
         let v = view(json!([{"name": "name", "path": "name"}]));
         let err = format_view_fhir_parameters(&result, &v).unwrap_err();
         assert!(matches!(err, SofError::InvalidViewDefinition(_)));
+    }
+
+    #[test]
+    fn invalid_ansi_type_tag_is_rejected() {
+        let result = ProcessedResult {
+            columns: vec!["c".into()],
+            rows: vec![ProcessedRow {
+                values: vec![Some(json!("1.5"))],
+            }],
+        };
+        let v = view(json!([{
+            "name": "c", "path": "x", "type": "decimal",
+            "tag": [{"name": "ansi/type", "value": "GEOMETRY"}]
+        }]));
+        let err = format_view_fhir_parameters(&result, &v).unwrap_err();
+        assert!(matches!(err, SofError::InvalidViewDefinition(m) if m.contains("'c'")));
     }
 
     #[test]

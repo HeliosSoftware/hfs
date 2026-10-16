@@ -72,7 +72,7 @@ use helios_sof::fhir_format::{
     format_view_fhir_parameters, wrap_in_binary_envelope,
 };
 use helios_sof::parquet_schema::{SCHEMA_SAMPLE_ROWS, resolve_arrow_schema};
-use helios_sof::sqlquery::engine::{DeclaredColumn, declared_columns};
+use helios_sof::sqlquery::engine::{DeclaredColumn, try_declared_columns};
 use helios_sof::{
     ContentType, ExtractedRunParams, ParquetOptions, ProcessedRow, RunOptions,
     create_bundle_from_resources_for_version, extract_run_params_checked,
@@ -616,7 +616,7 @@ async fn open_columnar(
     let schema = match &first {
         Some(batch) => batch.schema(),
         None => {
-            let declared = declared_columns(view_json);
+            let declared = try_declared_columns(view_json).map_err(map_sof_lib_error_to_rest)?;
             let columns: Vec<String> = declared.iter().map(|d| d.name.clone()).collect();
             std::sync::Arc::new(
                 resolve_arrow_schema(&columns, &declared, &[])
@@ -970,6 +970,17 @@ pub(crate) fn reject_unknown_view_definition_resource(
     }
 }
 
+/// The `column 'x': ...` part of a declared-column misfit error, if `msg`
+/// carries one. A value that does not fit a declared (or `ansi/type`-tagged)
+/// column is the caller's data/view mismatch, not an internal fault, so it is
+/// reported to the client with the column name (a 422). Runners may wrap the
+/// lib error in their own text, hence the search rather than a prefix match.
+pub(crate) fn declared_misfit_detail(msg: &str) -> Option<&str> {
+    let start = msg.find("column '")?;
+    let detail = &msg[start..];
+    (detail.contains("cannot be represented")).then_some(detail)
+}
+
 /// Maps a `helios_sof::SofError` to a `RestError`. Distinct from
 /// [`map_sof_error_to_rest`] which handles the `helios_persistence` `SofError`
 /// variants emitted by storage-backed runners.
@@ -986,6 +997,11 @@ fn map_sof_lib_error_to_rest(e: helios_sof::SofError) -> RestError {
         // exists, so the OperationOutcome's `code = invalid`; the
         // 400/spec-status is what matters.)
         LibErr::ReferencedResourceNotFound(msg) => RestError::BadRequest { message: msg },
+        LibErr::ParquetConversionError(msg) if declared_misfit_detail(&msg).is_some() => {
+            RestError::UnprocessableEntity {
+                message: declared_misfit_detail(&msg).unwrap_or_default().to_string(),
+            }
+        }
         other => {
             warn!(error = %other, "in-process SOF evaluator error");
             RestError::InternalError {
@@ -1203,7 +1219,8 @@ async fn streaming_columnar_response(
         }
     }
 
-    let declared: Vec<DeclaredColumn> = declared_columns(view_json);
+    let declared: Vec<DeclaredColumn> =
+        try_declared_columns(view_json).map_err(map_sof_lib_error_to_rest)?;
     // Column order follows the first row; a key that only shows up later in the
     // prefix is appended, so it is not dropped once the schema is fixed.
     let columns: Vec<String> = match prefix.first() {
@@ -1424,7 +1441,7 @@ async fn format_stream(
 ) -> Result<(&'static str, Vec<u8>), RestError> {
     let rows = drain_stream(stream).await?;
     let result = helios_sof::rows_to_processed_result(rows);
-    let declared = declared_columns(view_json);
+    let declared = try_declared_columns(view_json).map_err(map_sof_lib_error_to_rest)?;
     let body =
         helios_sof::format_output_with_schema(result, content_type, parquet_options, &declared)
             .map_err(map_sof_lib_error_to_rest)?;
@@ -1530,6 +1547,12 @@ pub(crate) fn map_sof_error_to_rest(e: SofError) -> RestError {
         SofError::Cancelled => RestError::InternalError {
             message: "View execution was cancelled".to_string(),
         },
+        // A declared-column misfit surfaced by a runner's columnar builder.
+        SofError::Backend(ref msg) if declared_misfit_detail(msg).is_some() => {
+            RestError::UnprocessableEntity {
+                message: declared_misfit_detail(msg).unwrap_or_default().to_string(),
+            }
+        }
         SofError::Unavailable(message) => {
             warn!(error = %message, "SofRunner storage unavailable");
             RestError::ServiceUnavailable { message }
@@ -1738,7 +1761,7 @@ mod tests {
             },
             ContentType::Parquet,
             None,
-            &declared_columns(&typed_view()),
+            &try_declared_columns(&typed_view()).unwrap(),
         )
         .unwrap();
 
@@ -1755,6 +1778,129 @@ mod tests {
         let (b_schema, b_rows) = read(buffered);
         assert_eq!(s_schema, b_schema);
         assert_eq!(s_rows, b_rows);
+    }
+
+    // ----- declared (strict) vs inferred (lenient) misfits ------------------
+    //
+    // Layer covered: the row-stream -> streaming Parquet/Arrow encoder, with
+    // synthetic rows (the SQLite runner is columnar and cannot yield a mixed
+    // type in an untyped column, so the REST-level tests cannot reach this).
+
+    fn untyped_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{ "column": [
+                { "path": "id", "name": "id", "type": "string" },
+                { "path": "v", "name": "v" }
+            ]}]
+        })
+    }
+
+    async fn columnar_with(
+        view: &Value,
+        rows: Vec<Result<Value, SofError>>,
+        ct: ContentType,
+    ) -> Result<Response, RestError> {
+        streaming_columnar_response(row_stream(rows), ct, view, None, None, "parquet").await
+    }
+
+    /// An inferred column's schema is fixed from the first 100 rows (integers
+    /// here); a later text value does not fit it and becomes NULL.
+    #[tokio::test]
+    async fn streaming_inferred_column_misfit_after_the_prefix_becomes_null() {
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let mut rows: Vec<Result<Value, SofError>> = (0..150)
+            .map(|i| Ok(json!({ "id": format!("p{i}"), "v": i })))
+            .collect();
+        rows.push(Ok(json!({ "id": "late", "v": "not a number" })));
+        let response = columnar_with(&untyped_view(), rows, ContentType::Parquet)
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("an inferred misfit must not abort the stream");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.to_vec()))
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.map(|b| b.unwrap()).collect();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 151);
+        let last = batches.last().unwrap();
+        let v = last.column_by_name("v").unwrap();
+        assert!(arrow::array::Array::is_null(v, last.num_rows() - 1));
+        let id = last.column_by_name("id").unwrap();
+        assert!(!arrow::array::Array::is_null(id, last.num_rows() - 1));
+    }
+
+    /// A declared column's misfit inside the schema prefix is a real status
+    /// (nothing has been sent yet) and names the column.
+    #[tokio::test]
+    async fn streaming_declared_misfit_inside_the_prefix_is_an_error_status() {
+        // 2^40 does not fit the declared `integer` (Int32); the exact error is
+        // raised when the prefix is turned into a schema/rows or at encode time.
+        let rows = vec![Ok(json!({ "id": "a", "n": 1i64 << 40 }))];
+        match columnar(rows, ContentType::Parquet, None).await {
+            Err(e) => assert!(e.to_string().contains("'n'"), "{e}"),
+            Ok(response) => {
+                // The encoder rejects the value after the 200 is committed.
+                let collected = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+                assert!(collected.is_err(), "a misfit must not yield a clean file");
+            }
+        }
+    }
+
+    /// After the 200 is committed (row 151 onwards) a declared misfit cannot
+    /// change the status: the chunked body is aborted so no truncated file
+    /// looks complete.
+    #[tokio::test]
+    async fn streaming_declared_misfit_after_the_prefix_aborts_the_body() {
+        let mut rows = numbered_rows(150);
+        rows.push(Ok(json!({ "id": "late", "n": 1i64 << 40 })));
+        for ct in [ContentType::Parquet, ContentType::ArrowIpc] {
+            let response = columnar(
+                rows.iter()
+                    .map(|r| r.as_ref().cloned().map_err(|_| SofError::Cancelled))
+                    .collect(),
+                ct,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let collected = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+            assert!(collected.is_err(), "{ct:?}: expected an aborted body");
+        }
+    }
+
+    #[test]
+    fn declared_misfit_maps_to_unprocessable_entity_naming_the_column() {
+        let lib = helios_sof::SofError::ParquetConversionError(
+            "column 'n': value 1 cannot be represented as integer".to_string(),
+        );
+        assert!(matches!(
+            map_sof_lib_error_to_rest(lib),
+            RestError::UnprocessableEntity { message } if message.contains("'n'")
+        ));
+        let wrapped = SofError::Backend(
+            "failed to build record batch: Parquet conversion error: column 'n': a text value \
+             cannot be represented in its declared type Int32"
+                .to_string(),
+        );
+        assert!(matches!(
+            map_sof_error_to_rest(wrapped),
+            RestError::UnprocessableEntity { message } if message.starts_with("column 'n'")
+        ));
+        // Other conversion failures stay internal.
+        let other = helios_sof::SofError::ParquetConversionError("Failed to flush".to_string());
+        assert!(matches!(
+            map_sof_lib_error_to_rest(other),
+            RestError::InternalError { .. }
+        ));
     }
 
     #[tokio::test]
