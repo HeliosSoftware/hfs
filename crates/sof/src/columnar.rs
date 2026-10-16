@@ -32,13 +32,15 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{Number, Value};
 use tracing::warn;
 
 use crate::SofError;
-use crate::parquet_schema::{build_array_from_values, infer_arrow_type, resolve_arrow_schema};
+use crate::parquet_schema::{
+    build_array_from_values, build_named_array, infer_arrow_type, resolve_arrow_schema,
+};
 use crate::sqlquery::engine::DeclaredColumn;
 
 /// Rows per batch used by the in-DB runners.
@@ -75,6 +77,11 @@ enum ColumnBuf {
     Deferred {
         values: Vec<Option<Value>>,
         data_type: Option<DataType>,
+        /// `true` when the type comes from the ViewDefinition (a declared
+        /// `type` or `ansi/type` tag): a value that does not fit is an error
+        /// naming the column. An inferred type is only a guess from earlier
+        /// data, so a misfit becomes null there.
+        declared: bool,
     },
 }
 
@@ -88,6 +95,7 @@ impl ColumnBuf {
             ColumnKind::Deferred => Self::Deferred {
                 values: Vec::new(),
                 data_type: None,
+                declared: false,
             },
         }
     }
@@ -104,6 +112,14 @@ pub struct ColumnarBatchBuilder {
     kinds: Vec<ColumnKind>,
     cols: Vec<ColumnBuf>,
     warned: Vec<bool>,
+    /// Columns whose type comes from the ViewDefinition (see
+    /// [`pin_declared_types`](Self::pin_declared_types)); their schema field
+    /// carries the declared marker, as on the row path.
+    declared_cols: Vec<bool>,
+    /// The first value that did not fit a declared column's type; reported by
+    /// the next [`flush`](Self::flush) (a declared column never writes null for
+    /// a misfit).
+    strict_error: Option<String>,
     batch_rows: usize,
     rows: usize,
     schema: Option<Arc<Schema>>,
@@ -125,6 +141,7 @@ impl ColumnarBatchBuilder {
                 kinds.len()
             )));
         }
+        let kinds_len = kinds.len();
         let cols = kinds.iter().map(|k| ColumnBuf::new(*k)).collect();
         let warned = vec![false; columns.len()];
         Ok(Self {
@@ -132,6 +149,8 @@ impl ColumnarBatchBuilder {
             kinds,
             cols,
             warned,
+            declared_cols: vec![false; kinds_len],
+            strict_error: None,
             batch_rows: batch_rows.max(1),
             rows: 0,
             schema: None,
@@ -153,10 +172,11 @@ impl ColumnarBatchBuilder {
             let is_declared = declared
                 .iter()
                 .find(|d| &d.name == name)
-                .is_some_and(|d| d.fhir_type.is_some() || d.collection);
+                .is_some_and(|d| d.fhir_type.is_some() || d.ansi.is_some() || d.collection);
             if !is_declared {
                 continue;
             }
+            self.declared_cols[i] = true;
             let target = resolved.field(i).data_type();
             let natural = match self.kinds[i] {
                 ColumnKind::Text => Some(DataType::Utf8),
@@ -169,6 +189,7 @@ impl ColumnarBatchBuilder {
                 self.cols[i] = ColumnBuf::Deferred {
                     values: Vec::new(),
                     data_type: Some(target.clone()),
+                    declared: true,
                 };
             }
         }
@@ -398,29 +419,45 @@ impl ColumnarBatchBuilder {
     /// Emits the pending rows as a [`RecordBatch`], or `None` when there are
     /// none. Builders are reset for the next batch.
     pub fn flush(&mut self) -> Result<Option<RecordBatch>, SofError> {
+        if let Some(message) = self.strict_error.take() {
+            return Err(SofError::ParquetConversionError(message));
+        }
         if self.rows == 0 {
             return Ok(None);
         }
         let mut fields = Vec::with_capacity(self.cols.len());
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.cols.len());
-        for (name, buf) in self.names.iter().zip(self.cols.iter_mut()) {
+        let declared_cols = &self.declared_cols;
+        for (col_idx, (name, buf)) in self.names.iter().zip(self.cols.iter_mut()).enumerate() {
             let (data_type, array): (DataType, ArrayRef) = match buf {
                 ColumnBuf::Text(b) => (DataType::Utf8, Arc::new(b.finish())),
                 ColumnBuf::Boolean(b) => (DataType::Boolean, Arc::new(b.finish())),
                 ColumnBuf::Integer(b) => (DataType::Int32, Arc::new(b.finish())),
                 ColumnBuf::Decimal(b) => (DataType::Float64, Arc::new(b.finish())),
-                ColumnBuf::Deferred { values, data_type } => {
+                ColumnBuf::Deferred {
+                    values,
+                    data_type,
+                    declared,
+                } => {
                     let values = std::mem::take(values);
                     let dt = data_type
                         .get_or_insert_with(|| {
                             infer_arrow_type(&values[..values.len().min(INFER_SAMPLE)])
                         })
                         .clone();
-                    let array = build_array_from_values(values, &dt)?;
+                    let array = if *declared {
+                        build_named_array(&values, &dt, name)?
+                    } else {
+                        build_array_from_values(values, &dt)?
+                    };
                     (dt, array)
                 }
             };
-            fields.push(Field::new(name, data_type, true));
+            fields.push(crate::parquet_schema::schema_field(
+                name,
+                data_type,
+                declared_cols[col_idx],
+            ));
             arrays.push(array);
         }
         self.rows = 0;
@@ -435,6 +472,15 @@ impl ColumnarBatchBuilder {
     }
 
     fn warn_once(&mut self, col: usize, got: &str) {
+        if self.declared_cols[col] {
+            if self.strict_error.is_none() {
+                self.strict_error = Some(format!(
+                    "column '{}': a {got} value cannot be represented in its declared type {:?}",
+                    self.names[col], self.kinds[col]
+                ));
+            }
+            return;
+        }
         if !self.warned[col] {
             self.warned[col] = true;
             warn!(
@@ -455,6 +501,7 @@ fn parse_number(s: &str) -> Option<Number> {
 mod tests {
     use super::*;
     use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, ListArray, StringArray};
+    use arrow::datatypes::Field;
     use serde_json::json;
 
     fn builder(kinds: &[ColumnKind], batch_rows: usize) -> ColumnarBatchBuilder {
@@ -467,6 +514,7 @@ mod tests {
             name: name.to_string(),
             fhir_type: fhir_type.map(crate::sqlquery::ColumnFhirType::from_code),
             collection,
+            ansi: fhir_type.map(crate::column_types::default_for_fhir_type),
         }
     }
 
@@ -902,5 +950,26 @@ mod tests {
             .downcast_ref::<BooleanArray>()
             .unwrap();
         assert_eq!((t.value(0), t.value(1)), (true, false));
+    }
+
+    #[test]
+    fn declared_column_misfit_is_an_error_but_undeclared_is_null() {
+        // Declared `integer` on an Integer-kind column: its natural type
+        // already matches, but a value outside the i32 range is an error.
+        let mut b = builder(&[ColumnKind::Integer, ColumnKind::Integer], 10);
+        b.pin_declared_types(&[declared("c0", Some("integer"), false)])
+            .unwrap();
+        b.append_i64(0, 3_000_000_000);
+        b.append_i64(1, 3_000_000_000);
+        b.end_row();
+        let err = b.flush().unwrap_err().to_string();
+        assert!(err.contains("column 'c0'"), "{err}");
+
+        // The undeclared column only warns and writes null.
+        let mut b = builder(&[ColumnKind::Integer], 10);
+        b.append_i64(0, 3_000_000_000);
+        b.end_row();
+        let batch = b.flush().unwrap().unwrap();
+        assert_eq!(batch.column(0).null_count(), 1);
     }
 }

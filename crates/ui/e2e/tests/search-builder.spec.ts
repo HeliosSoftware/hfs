@@ -2408,6 +2408,11 @@ test.describe("query builder", () => {
       await page.reload({ waitUntil: "networkidle" });
       await search.showBuilder();
       await search.builder.recentToggle.click();
+      // #1759: a SAVED row sits in the same .recent-item wrapper as a RECENT
+      // row, so both sections share padding, row height and hover.
+      await expect(
+        search.builder.recentPanel.locator(".recent-item > [data-saved-load]", { hasText: savedName }),
+      ).toHaveCount(1);
       await search.builder.recentPanel.locator("[data-saved-load]", { hasText: savedName }).click();
       await expect(search.builder.url).toHaveValue(expected);
       const values = search.builder.conditionRows.first().locator(".builder-row__value");
@@ -3365,3 +3370,129 @@ for (const path of ["/ui/resources", "/ui/search"]) {
     await builder.sortTrigger.press("Escape");
   });
 }
+
+for (const workspace of ["Resources", "Search"] as const) {
+  test(`issue2079 ${workspace} summarizes Observation components as text`, async ({ page, request, resources, search }) => {
+    const systolic = {
+      code: { coding: [{ system: "http://loinc.org", code: "8480-6", display: "Systolic blood pressure" }] },
+      valueQuantity: { value: 120, unit: "mmHg", system: "http://unitsofmeasure.org", code: "mm[Hg]" },
+    };
+    const fixtures = [
+      {
+        component: [systolic],
+        effectivePeriod: { start: "2026-10-15" },
+        expected: "Systolic blood pressure",
+        period: '{"start":"2026-10-15"}',
+      },
+      {
+        component: [systolic, {
+          code: { coding: [{ system: "http://loinc.org", code: "8462-4", display: "Diastolic blood pressure" }] },
+          valueQuantity: { value: 80, unit: "mmHg", system: "http://unitsofmeasure.org", code: "mm[Hg]" },
+        }],
+        expected: "Systolic blood pressure +1",
+      },
+      {
+        component: [{ ...systolic, code: { ...systolic.code, text: "Systolic reading" } }],
+        effectivePeriod: { start: "2026-10-15T09:00:00Z", end: "2026-10-15T09:01:00Z" },
+        expected: "Systolic reading",
+        period: '{"start":"2026-10-15T09:00:00Z","end":"2026-10-15T09:01:00Z"…',
+      },
+      {
+        component: [{ ...systolic, code: { coding: [{ system: "http://loinc.org", code: "8480-6" }] } }],
+        expected: "8480-6",
+      },
+    ];
+    const ids: string[] = [];
+    try {
+      for (const { component, effectivePeriod } of fixtures) {
+        ids.push(await createResource(request, "Observation", {
+          status: "final",
+          code: { coding: [{ system: "http://loinc.org", code: "85354-9", display: "Blood pressure panel" }] },
+          component,
+          ...(effectivePeriod ? { effectivePeriod } : {}),
+        }));
+      }
+      for (const id of ids) await waitSearchable(request, "Observation", id);
+      const active = workspace === "Resources" ? resources : search;
+      if (workspace === "Resources") await resources.goto("Observation");
+      else await search.gotoBuilder("Observation");
+      const mode = page.locator("[data-mode-btn=builder]");
+      if (await mode.count()) await mode.click();
+
+      for (const projection of ["", "&_elements=id,code,component,effectivePeriod"]) {
+        await active.builder.run(`Observation?_id=${ids.join(",")}&_count=5${projection}`);
+        await active.results.waitDone();
+        await expect(active.results.rows).toHaveCount(fixtures.length);
+        const headers = await page.locator("#query-results-head th").allTextContents();
+        const componentIndex = headers.indexOf("component");
+        const periodIndex = headers.indexOf("effectivePeriod");
+        expect(componentIndex).toBeGreaterThan(0);
+        expect(periodIndex).toBeGreaterThan(0);
+        for (const [i, { expected, period }] of fixtures.entries()) {
+          const row = active.results.rows.filter({ has: page.locator(`[data-resource-id="${ids[i]}"]`) });
+          const componentCell = row.locator("td").nth(componentIndex);
+          await expect(componentCell).toBeVisible();
+          await expect(componentCell).toHaveText(expected);
+          await expect(componentCell).toHaveAttribute("data-full-name", expected);
+          if (period) {
+            const periodCell = row.locator("td").nth(periodIndex);
+            await expect(periodCell).toHaveText(period);
+            await expect(periodCell).toHaveAttribute("data-full-name", period);
+          }
+        }
+        await expect(active.results.card).not.toContainText("[object Object]");
+        await expect(active.results.error).toBeHidden();
+      }
+    } finally {
+      await deleteResources(request, "Observation", ids);
+    }
+  });
+}
+
+// #1759: SAVED rows share the RECENT rows' wrapper, so they align, are as tall
+// and highlight on hover the same way.
+test("issue1759 Saved rows match Recent rows in alignment, height and hover", async ({ page, request, resources }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "Saved1759Match" }] });
+  let saved: Awaited<ReturnType<typeof seedSavedQuery>> = null;
+  try {
+    saved = await seedSavedQuery(request, "Patient", `Saved1759 ${id}`, `_id=${id}`);
+    test.skip(!saved, "no per-user settings store on this backend");
+    await resources.goto("Patient");
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    await resources.builder.recentToggle.click();
+    await resources.builder.recentPanel.locator("[data-saved-load]", { hasText: saved!.entry.name }).click();
+    await resources.builder.runButton.click();
+    await resources.results.waitShown();
+    await expect.poll(async () => {
+      const document = await (await request.get("/_user/settings")).json();
+      return document.recentSearches?.some((entry: { query: string }) => entry.query === `/Patient?_id=${id}`);
+    }).toBe(true);
+
+    await page.reload({ waitUntil: "networkidle" });
+    if (await mode.count()) await mode.click();
+    await resources.builder.recentToggle.click();
+    const panel = resources.builder.recentPanel;
+    const savedRow = panel.locator(".recent-item", { has: page.locator("[data-saved-load]") }).first();
+    const recentRow = panel.locator(".recent-item", { has: page.locator("[data-recent-load]") }).first();
+    await expect(savedRow).toBeVisible();
+    await expect(recentRow).toBeVisible();
+
+    const savedBox = await savedRow.boundingBox();
+    const recentBox = await recentRow.boundingBox();
+    if (!savedBox || !recentBox) throw new Error("recent rows have no layout box");
+    expect(savedBox.x).toBe(recentBox.x);
+    expect(savedBox.height).toBe(recentBox.height);
+
+    const background = (row: typeof savedRow) => row.evaluate((el) => getComputedStyle(el).backgroundColor);
+    const idle = await background(savedRow);
+    await savedRow.hover();
+    const hovered = await background(savedRow);
+    expect(hovered).not.toBe(idle);
+    await recentRow.hover();
+    expect(await background(recentRow)).toBe(hovered);
+  } finally {
+    await saved?.remove();
+    await request.delete(`/Patient/${id}`);
+  }
+});

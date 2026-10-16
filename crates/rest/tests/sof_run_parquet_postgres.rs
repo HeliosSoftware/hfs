@@ -155,7 +155,7 @@ mod sof_run_parquet_postgres_tests {
 
     #[tokio::test]
     async fn typed_view_streams_declared_parquet_types() {
-        use arrow::array::{Array, BooleanArray, Float64Array, Int32Array};
+        use arrow::array::{Array, BooleanArray, Int32Array, StringArray};
         use arrow::datatypes::DataType;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -175,7 +175,7 @@ mod sof_run_parquet_postgres_tests {
         let schema = builder.schema().clone();
         for (name, ty) in [
             ("n", DataType::Int32),
-            ("d", DataType::Float64),
+            ("d", DataType::Utf8), // decimal is character data (#569)
             ("b", DataType::Boolean),
         ] {
             assert_eq!(
@@ -197,7 +197,7 @@ mod sof_run_parquet_postgres_tests {
                 .column_by_name("d")
                 .unwrap()
                 .as_any()
-                .downcast_ref::<Float64Array>()
+                .downcast_ref::<StringArray>()
                 .unwrap();
             let b = batch
                 .column_by_name("b")
@@ -208,14 +208,14 @@ mod sof_run_parquet_postgres_tests {
             for i in 0..batch.num_rows() {
                 assert!(!n.is_null(i) && !d.is_null(i) && !b.is_null(i), "null cell");
                 ns.push(n.value(i));
-                ds.push(d.value(i));
+                ds.push(d.value(i).to_string());
                 bs.push(b.value(i));
             }
         }
         ns.sort();
-        ds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ds.sort();
         assert_eq!(ns, vec![0, 10, 20, 30, 40]);
-        assert_eq!(ds, vec![0.5, 1.5, 2.5, 3.5, 4.5]);
+        assert_eq!(ds, vec!["0.5", "1.5", "2.5", "3.5", "4.5"]);
         assert_eq!(bs.iter().filter(|b| **b).count(), 3);
     }
 }

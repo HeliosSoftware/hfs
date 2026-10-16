@@ -2931,7 +2931,10 @@ fn stored_documents_of(tenant_id: &str) -> Value {
     }})
 }
 
-fn aggregation_buckets<'a>(body: &'a Value, name: &str) -> StorageResult<&'a Vec<Value>> {
+pub(super) fn aggregation_buckets<'a>(
+    body: &'a Value,
+    name: &str,
+) -> StorageResult<&'a Vec<Value>> {
     body.pointer(&format!("/aggregations/{name}/buckets"))
         .and_then(Value::as_array)
         .ok_or_else(|| {
@@ -2978,7 +2981,7 @@ fn searched_no_shards(body: &Value) -> bool {
 /// zero-shard answer read as "no index" (`None`) like the 404 it stands for
 /// (#1906). The count reads use this; the shared classifier, and the FHIR
 /// search paths that already read `hits` from such an answer, are untouched.
-async fn send_aggregation_search(
+pub(super) async fn send_aggregation_search(
     backend: &ElasticsearchBackend,
     index: &str,
     body: Value,

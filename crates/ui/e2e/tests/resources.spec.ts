@@ -3,6 +3,7 @@ import { test, expect, acceptConfirm } from "../pages/fixtures";
 import {
   createResource,
   updateResource,
+  seedTwoVersions,
   waitSearchable,
   deleteResources,
   seedTwoVersions,
@@ -1557,4 +1558,71 @@ test("a read by id in the query box opens that resource", async ({ resources, re
   // Back to a search: the builder returns.
   await resources.builder.setUrl("GET /Patient?_count=5");
   await expect(resources.builder.sections).toBeVisible();
+});
+
+// #1759: the truncated-cell tooltip goes below (or above) the cell instead of
+// beside it, where it would cover the neighbouring columns.
+test("a result cell's tooltip does not sit beside the cell", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "CellTooltipPlacement" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const cell = link.locator("xpath=ancestor::td");
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  await link.hover();
+  await expect(tooltip).toBeVisible();
+  const cellBox = await cell.boundingBox();
+  const tipBox = await tooltip.boundingBox();
+  if (!cellBox || !tipBox) throw new Error("cell or tooltip has no layout box");
+  const below = tipBox.y >= cellBox.y + cellBox.height - 1;
+  const above = tipBox.y + tipBox.height <= cellBox.y + 1;
+  expect(below || above).toBe(true);
+});
+
+// #1759: the modal's History tab lists versions as rows (version, date,
+// operation) and marks the compared pair; a bad date never renders as
+// "Invalid Date".
+test("the modal History tab lists versions as rows with date and operation", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = await seedTwoVersions(
+    request,
+    "Patient",
+    { name: [{ family: "ModalRowOne" }] },
+    () => ({ name: [{ family: "ModalRowTwo" }] }),
+  );
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await page.locator("#query-results-body a.result-id").first().click();
+  await resources.modal.waitOpen();
+  await page.locator('[data-modal-tab="history"]').click();
+
+  const rows = page.locator("#resource-history-versions .history-version");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0).locator(".history-version__id")).toHaveText("v2");
+  await expect(rows.nth(0).locator(".history-version__kind")).toHaveText("current");
+  await expect(rows.nth(1).locator(".history-version__kind")).toHaveText("created");
+  await expect(rows.nth(0)).toHaveClass(/history-version--to/);
+  await expect(rows.nth(1)).toHaveClass(/history-version--from/);
+  for (const i of [0, 1]) {
+    const when = (await rows.nth(i).locator(".history-version__when").textContent()) ?? "";
+    expect(when.trim()).not.toBe("");
+    expect(when).not.toContain("Invalid");
+  }
 });

@@ -28,7 +28,7 @@ use crate::core::{
 };
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
-    StorageResult, TransactionError,
+    StorageResult, TooLargeForCacheCause, TransactionError,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
@@ -42,6 +42,10 @@ use crate::types::{
 };
 
 use super::MongoBackend;
+use super::deferred_index::{
+    BundleDeferral, DeferredCommit, DeferredIndexSet, SEARCH_INDEX_PENDING_COLLECTION,
+    SEARCH_ROWS_PENDING_FIELD, inline_index_types, ledger_documents,
+};
 use super::retry::{BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, jitter_fraction};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
@@ -78,6 +82,42 @@ enum PendingSearchParameterChange {
     Create,
     Update,
     Delete,
+}
+
+/// What one attempt at a Bundle transaction has staged for after its commit:
+/// the SearchParameter changes, and, for a Bundle that defers its search rows
+/// (#1975), the resources it left without them. Every attempt starts with its
+/// own, so an aborted attempt leaves nothing behind.
+struct BundleWrites {
+    search_parameter_changes: Vec<PendingSearchParameterChange>,
+    deferred: Option<DeferredIndexSet>,
+}
+
+impl BundleWrites {
+    fn new(deferral: Option<&BundleDeferral>) -> Self {
+        Self {
+            search_parameter_changes: Vec::new(),
+            deferred: deferral.map(DeferredIndexSet::new),
+        }
+    }
+
+    /// The marker to stamp on a `resources` document written in this attempt,
+    /// when its search rows are deferred: the id of the Bundle.
+    fn pending_marker(&self, resource_type: &str) -> Option<String> {
+        self.deferred
+            .as_ref()
+            .filter(|deferred| deferred.defers(resource_type))
+            .map(|deferred| deferred.bundle_id().to_string())
+    }
+}
+
+/// What a committed attempt at a Bundle transaction hands back: the entry
+/// results, the staged SearchParameter changes, and, for a Bundle that deferred
+/// its search rows, the ledger it committed with (#1975).
+struct CommittedAttempt {
+    results: Vec<BundleEntryResult>,
+    search_parameter_changes: Vec<PendingSearchParameterChange>,
+    deferred: Option<DeferredCommit>,
 }
 
 /// Request context shared by every entry in one MongoDB Bundle transaction.
@@ -164,7 +204,9 @@ const EVICTION_ROLLBACK_REASON: &str = "rolled back for eviction";
 /// WiredTiger `-31800`). Sent with no `TransientTransactionError` label. mongod
 /// sends it instead of 365/112 only when the transaction holds more than
 /// `transactionTooLargeForCacheThreshold` (0.75) of the cache's dirty bytes. A
-/// replay cannot help: the same writes meet the same cache (#1837).
+/// replay cannot help: the same writes meet the same cache (#1837). It can
+/// arrive on `commitTransaction` too: the commit writes the transaction's oplog
+/// entry, which can push a write set just under the ceiling over it (#1991).
 const TRANSACTION_TOO_LARGE_FOR_CACHE_CODE: i32 = 388;
 
 /// Pause before the single retry of an unconditional delete that hit a write
@@ -392,8 +434,9 @@ fn is_eviction_rollback(err: &MongoError) -> bool {
             .is_some_and(|message| message.contains(EVICTION_ROLLBACK_REASON))
 }
 
-/// True when `err` is `TransactionTooLargeForCache` (388): as a failed command,
-/// a per-write error, or any per-document error of an `insert_many`, the shape
+/// True when `err` is `TransactionTooLargeForCache` (388): as a failed command
+/// (an entry's write, or `commitTransaction` itself, #1991), a per-write error,
+/// or any per-document error of an `insert_many`, the shape
 /// the search-index insert reports it in (#1837). Decided by the code, never by
 /// the message text.
 fn is_too_large_for_cache(err: &MongoError) -> bool {
@@ -483,6 +526,29 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
     None
 }
 
+/// The [`TransactionError::TooLargeForCache`] for a `TransactionTooLargeForCache`
+/// (388), wherever the Bundle met it: an entry's write ([`entry_attempt_error`]),
+/// the deferred-search-index ledger ([`ledger_attempt_error`], #1975) or the
+/// commit ([`CommitAttempts::after_failure`], #1991). They are one cause: the
+/// Bundle's own write set does not fit WiredTiger's cache, so neither a replay
+/// nor a re-sent commit can help (#1837). A lone Bundle's eviction rollback is
+/// another cause and is built in [`lone_eviction_failure`] (#1895).
+///
+/// `entries` is the Bundle's entry count. `reason` is the raw driver detail
+/// behind a prefix that says where it happened (`Entry N processing failed: `
+/// or `Commit failed: `). It is for the log only.
+///
+/// It carries [`TooLargeForCacheCause::WriteSetTooLarge`];
+/// [`lone_eviction_failure`] carries [`TooLargeForCacheCause::LoneEviction`]
+/// (#1993).
+fn write_set_too_large_for_cache(entries: usize, reason: String) -> TransactionError {
+    TransactionError::TooLargeForCache {
+        cause: TooLargeForCacheCause::WriteSetTooLarge,
+        entries,
+        reason,
+    }
+}
+
 /// Why a bundle attempt failed, given the error entry `index` raised in a
 /// transaction of `entries` entries (#1586, #1837).
 ///
@@ -496,10 +562,10 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
 /// - Anything else is a [`TransactionError::BundleError`] at the entry.
 fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> BundleAttemptError {
     if kept_driver_error(err).is_some_and(is_too_large_for_cache) {
-        return BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+        return BundleAttemptError::Failed(write_set_too_large_for_cache(
             entries,
-            reason: format!("Entry {index} processing failed: {err}"),
-        });
+            format!("Entry {index} processing failed: {err}"),
+        ));
     }
     if let Some(abort) = transient_entry_abort(err) {
         return BundleAttemptError::TransientAbort {
@@ -515,15 +581,50 @@ fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> Bund
     })
 }
 
+/// Why a bundle attempt failed when its deferred-search-index ledger could not
+/// be written, given a transaction of `entries` entries (#1975).
+///
+/// The ledger belongs to no entry, so no entry is blamed for it. A cache
+/// failure (388) is [`TransactionError::TooLargeForCache`] and a transient abort
+/// is handed back as [`entry_attempt_error`] does, with no entry named, so the
+/// bundle loop's rules for a replay and for a lone eviction (#1895) apply to it
+/// unchanged. Anything else rolled the Bundle back on the server's side, a
+/// [`TransactionError::RolledBack`] (HTTP 500). A [`TransactionError::BundleError`]
+/// would answer 400 about an entry the client never sent.
+fn ledger_attempt_error(entries: usize, err: &StorageError) -> BundleAttemptError {
+    match entry_attempt_error(entries, entries, err) {
+        BundleAttemptError::TransientAbort {
+            code,
+            eviction,
+            reason,
+            ..
+        } => BundleAttemptError::TransientAbort {
+            entry: None,
+            code,
+            eviction,
+            reason,
+        },
+        too_large @ BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. }) => {
+            too_large
+        }
+        BundleAttemptError::Failed(_) => BundleAttemptError::Failed(TransactionError::RolledBack {
+            reason: format!("Failed to write the deferred search index ledger: {err}"),
+        }),
+    }
+}
+
 /// #1895: the error a transient abort ends the Bundle with instead of a replay,
 /// or `None` to replay.
 ///
 /// A Bundle that held the whole admission room ran alone: no other Bundle of
-/// this backend was open. Its cache-pressure rollback is its own write set
+/// this backend was open. Its cache-pressure rollback is mostly its own write set
 /// meeting the cache, and a replay is rolled back again at about the same entry
 /// (benchmark: 49 of 50 such replays failed again while holding the whole
-/// room). So it ends as the outcome 388 already has (#1837). A Bundle that
-/// shared the room, or a plain `WriteConflict`, is replayed as before.
+/// room). So it ends as the outcome 388 already has (#1837), with
+/// [`TooLargeForCacheCause::LoneEviction`]: the room bounds only this backend's
+/// transaction Bundles and other writes share the cache, so the client is not
+/// told that a resubmit must fail (#1993). A Bundle that shared the room, or a
+/// plain `WriteConflict`, is replayed as before.
 fn lone_eviction_failure(
     holds_whole_room: bool,
     eviction: bool,
@@ -532,6 +633,7 @@ fn lone_eviction_failure(
     reason: &str,
 ) -> Option<TransactionError> {
     (holds_whole_room && eviction).then(|| TransactionError::TooLargeForCache {
+        cause: TooLargeForCacheCause::LoneEviction,
         entries,
         reason: match entry {
             Some(index) => format!(
@@ -561,6 +663,11 @@ enum CommitFailure {
     StillUnknown,
     /// The commit failed in a way that leaves nothing applied.
     RolledBack,
+    /// The server refused the commit with `TransactionTooLargeForCache` (388):
+    /// WiredTiger rolled the transaction back because its own write set, with
+    /// the oplog entry the commit writes, does not fit the cache. Nothing
+    /// committed, and neither a replay nor a re-sent commit can fit it (#1991).
+    TooLargeForCache,
 }
 
 /// The decision behind [`classify_commit_failure`], taken on the facts it reads
@@ -605,10 +712,38 @@ fn classify_commit_signals(
     }
 }
 
+/// The verdict for a commit refused with `TransactionTooLargeForCache` (388),
+/// given the one [`classify_commit_signals`] reached on its other signals
+/// (#1991).
+///
+/// 388 decides only a verdict that already says nothing was applied: a plain
+/// [`CommitFailure::RolledBack`], or a [`CommitFailure::TransientAbort`] when a
+/// `TransientTransactionError` label rides on it. Both become
+/// [`CommitFailure::TooLargeForCache`], as 388 outranks that label on an entry
+/// write ([`entry_attempt_error`]). It never overrides a verdict that says the
+/// commit may have applied: with a write-concern error or an
+/// `UnknownTransactionCommitResult` label the commit is re-sent as before, and
+/// after an earlier unknown commit the outcome stays unknown. The driver adds
+/// that label only to network and server-selection errors, retryable-write
+/// errors and codes 50, 64 and 91, never to 388, so the server's own 388
+/// always takes the first branch.
+fn too_large_for_cache_at_commit(verdict: CommitFailure) -> CommitFailure {
+    match verdict {
+        CommitFailure::RolledBack
+        | CommitFailure::TransientAbort
+        | CommitFailure::TooLargeForCache => CommitFailure::TooLargeForCache,
+        CommitFailure::UnknownResult | CommitFailure::StillUnknown => verdict,
+    }
+}
+
 /// Classifies a failed commit; `earlier_unknown` says a previous commit of the
 /// same transaction already failed with an unknown result.
+///
+/// A commit refused with 388 is settled by [`too_large_for_cache_at_commit`]
+/// (#1991). The commit's error is the driver's own, so [`is_too_large_for_cache`]
+/// reads it directly, with no [`kept_driver_error`] walk.
 fn classify_commit_failure(err: &MongoError, earlier_unknown: bool) -> CommitFailure {
-    classify_commit_signals(
+    let verdict = classify_commit_signals(
         err.contains_label(TRANSIENT_TRANSACTION_ERROR),
         err.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT),
         is_temporarily_unavailable(err),
@@ -617,7 +752,12 @@ fn classify_commit_failure(err: &MongoError, earlier_unknown: bool) -> CommitFai
             MongoErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(_))
         ),
         earlier_unknown,
-    )
+    );
+    if is_too_large_for_cache(err) {
+        too_large_for_cache_at_commit(verdict)
+    } else {
+        verdict
+    }
 }
 
 /// What to do after a commit failed.
@@ -634,13 +774,16 @@ struct CommitAttempts {
     sent: u32,
     /// True once any commit failed with an unknown result.
     outcome_unknown: bool,
+    /// The Bundle's entry count, which a commit refused with 388 reports (#1991).
+    entries: usize,
 }
 
 impl CommitAttempts {
-    fn new() -> Self {
+    fn new(entries: usize) -> Self {
         Self {
             sent: 1,
             outcome_unknown: false,
+            entries,
         }
     }
 
@@ -652,6 +795,12 @@ impl CommitAttempts {
     /// [`TransactionError::CommitOutcomeUnknown`]: not a replay of the entries,
     /// and not `RolledBack`, which would tell the client nothing was applied
     /// when the earlier commit may have applied it.
+    ///
+    /// A commit refused with `TransactionTooLargeForCache` (388) stops at once as
+    /// [`TransactionError::TooLargeForCache`] with the Bundle's entry count: the
+    /// commit is not re-sent and, being `Failed`, the Bundle is not replayed
+    /// (#1991). This holds only while nothing says the commit may have applied
+    /// ([`too_large_for_cache_at_commit`]).
     fn after_failure(&mut self, err: &MongoError) -> CommitStep {
         match classify_commit_failure(err, self.outcome_unknown) {
             CommitFailure::TransientAbort => CommitStep::Stop(BundleAttemptError::TransientAbort {
@@ -692,6 +841,9 @@ impl CommitAttempts {
                     reason: format!("Commit failed: {err}"),
                 }))
             }
+            CommitFailure::TooLargeForCache => CommitStep::Stop(BundleAttemptError::Failed(
+                write_set_too_large_for_cache(self.entries, format!("Commit failed: {err}")),
+            )),
         }
     }
 }
@@ -2193,6 +2345,7 @@ impl ResourceStorage for MongoBackend {
             MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
             MongoBackend::RESOURCE_HISTORY_COLLECTION,
             MongoBackend::RESOURCES_COLLECTION,
+            super::deferred_index::SEARCH_INDEX_PENDING_COLLECTION,
         ] {
             db.collection::<Document>(collection)
                 .delete_many(doc! { "tenant_id": id })
@@ -4224,8 +4377,9 @@ impl BundleProvider for MongoBackend {
     /// losing ends as [`TransactionError::Transient`] (a retryable 503), not as
     /// a `BundleError` blaming the entry it happened to be on. A Bundle whose own
     /// write set does not fit WiredTiger's cache (`TransactionTooLargeForCache`,
-    /// 388) is not run again: it ends at once as
-    /// [`TransactionError::TooLargeForCache`] (#1837). A Bundle that held the
+    /// 388), whether on an entry's write or on the commit, is not run again and
+    /// its commit is not re-sent: it ends at once as
+    /// [`TransactionError::TooLargeForCache`] (#1837, #1991). A Bundle that held the
     /// whole admission room ran alone, and when WiredTiger rolls it back for
     /// cache pressure (112 "rolled back for eviction", or 365) it is not run
     /// again either; it ends at once as `TooLargeForCache` (#1895).
@@ -4248,6 +4402,13 @@ impl BundleProvider for MongoBackend {
     /// is taken before the session starts, so a queued Bundle holds no session
     /// and no transaction, and it is kept across replays until the commit.
     /// Dropping a queued request gives up its place.
+    ///
+    /// Search rows (#1975): a Bundle of at least
+    /// [`Self::deferred_search_index_min_entries`] entries commits without its
+    /// `search_index` rows, writes a bounded ledger of the resources owed rows
+    /// in the same transaction, keeps its admission through the commit and
+    /// writes the rows after it. Smaller Bundles write their rows in the
+    /// transaction, as before.
     ///
     /// Dropping this future — the request timed out, the client went away —
     /// drops the session, which aborts the transaction server-side. The slot
@@ -4273,6 +4434,28 @@ impl BundleProvider for MongoBackend {
         // past either (#1641, #1806). It also holds the room until the drop
         // after the commit.
         let gate = self.transaction_bundle_gate();
+
+        // A Bundle of at least `deferred_search_index_min_entries()` entries
+        // commits without its search rows and writes them after the commit
+        // (#1975). Decided once: every attempt of the Bundle shares it.
+        let deferral = self
+            .deferred_search_index_min_entries()
+            .filter(|min| entries.len() >= *min)
+            .map(|min| {
+                let deferral = BundleDeferral {
+                    bundle_id: uuid::Uuid::new_v4().to_string(),
+                    inline_types: inline_index_types(&entries),
+                };
+                tracing::debug!(
+                    entries = entries.len(),
+                    min_entries = min,
+                    bundle_id = %deferral.bundle_id,
+                    inline_types = ?deferral.inline_types,
+                    "transaction bundle defers its search rows until after the commit"
+                );
+                deferral
+            });
+
         let admission = gate.admit(entries.len()).await;
         let queued = admission.queued();
         if let Some(limit) = gate.limit() {
@@ -4290,7 +4473,7 @@ impl BundleProvider for MongoBackend {
         let mut session = begin_required_bundle_transaction_session(&db).await?;
 
         let mut attempts: u32 = 1;
-        let (results, pending_search_parameter_changes) = loop {
+        let committed = loop {
             let attempt_started = std::time::Instant::now();
             let attempt = self
                 .bundle_transaction_attempt(
@@ -4300,6 +4483,7 @@ impl BundleProvider for MongoBackend {
                     fhir_version,
                     validator,
                     &entries,
+                    deferral.as_ref(),
                 )
                 .await;
             let attempt_duration = attempt_started.elapsed();
@@ -4378,18 +4562,43 @@ impl BundleProvider for MongoBackend {
             );
         }
 
-        drop(admission);
+        let CommittedAttempt {
+            results,
+            search_parameter_changes,
+            deferred,
+        } = committed;
 
-        // Any SearchParameter change in this transaction alters a tenant's
-        // overlay — refresh the stored-param cache and drop the cached
-        // registries so the next access reflects the committed writes. Once,
-        // after the commit that counted, never after an aborted attempt.
-        if !pending_search_parameter_changes.is_empty() {
-            if let Err(e) = self
-                .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
-                .await
-            {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
+        match deferred {
+            None => {
+                drop(admission);
+                self.reload_after_search_parameter_changes(tenant, &search_parameter_changes)
+                    .await;
+            }
+            // The room is kept through the post-commit rows, so the next large
+            // Bundle does not compete with their inserts for cache (#1975).
+            Some(deferred) => {
+                // The rows are built with the committed registry.
+                self.reload_after_search_parameter_changes(tenant, &search_parameter_changes)
+                    .await;
+                // The rows stop being started at the Bundle's own deadline, so
+                // a committed Bundle is answered rather than timed out and
+                // resubmitted; the repair finishes what is left (#1975).
+                let stop_at = self.config().bundle_transaction_deadline.map(|deadline| {
+                    tokio::time::Instant::now()
+                        + deadline.saturating_sub(admission.elapsed().since_call)
+                });
+                // On the Bundle's own session, which is causally consistent: the
+                // first batch reads at or after the commit above.
+                self.write_deferred_search_rows(
+                    &db,
+                    &mut session,
+                    tenant.tenant_id().as_str(),
+                    &deferred,
+                    entries.len(),
+                    stop_at,
+                )
+                .await;
+                drop(admission);
             }
         }
 
@@ -4401,16 +4610,42 @@ impl BundleProvider for MongoBackend {
 }
 
 impl MongoBackend {
+    /// Any SearchParameter change in a Bundle transaction alters a tenant's
+    /// overlay — refresh the stored-param cache and drop the cached registries
+    /// so the next access reflects the committed writes. Once, after the commit
+    /// that counted, never after an aborted attempt.
+    async fn reload_after_search_parameter_changes(
+        &self,
+        tenant: &TenantContext,
+        changes: &[PendingSearchParameterChange],
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
+            .await
+        {
+            tracing::warn!("SearchParameter cache reload failed: {e}");
+        }
+    }
+
     /// One attempt at a bundle transaction: every entry in order, then commit.
     ///
-    /// Returns the entry results and the staged SearchParameter changes when
-    /// the transaction committed. Otherwise it returns why it did not, with the
-    /// server-side transaction already aborted (or failed at commit), so the
-    /// caller may begin another on the same session.
+    /// Returns the entry results, the staged SearchParameter changes and the
+    /// deferred-rows ledger (if any) when the transaction committed. Otherwise
+    /// it returns why it did not, with the server-side transaction already
+    /// aborted (or failed at commit), so the caller may begin another on the
+    /// same session.
     ///
     /// Each attempt clones the original entries before pinning references.
     /// Pins and payload rewrites stay in that attempt: a replay resolves its
     /// own targets and cannot retain identities from an aborted transaction.
+    ///
+    /// An attempt of a Bundle that defers its search rows (`deferral`, #1975)
+    /// writes its ledger last, inside the transaction, so the ledger commits or
+    /// aborts with the Bundle and an aborted attempt leaves no trace of it.
+    #[allow(clippy::too_many_arguments)]
     async fn bundle_transaction_attempt(
         &self,
         db: &mongodb::Database,
@@ -4419,8 +4654,8 @@ impl MongoBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
         entries: &[BundleEntry],
-    ) -> Result<(Vec<BundleEntryResult>, Vec<PendingSearchParameterChange>), BundleAttemptError>
-    {
+        deferral: Option<&BundleDeferral>,
+    ) -> Result<CommittedAttempt, BundleAttemptError> {
         let mut entries = entries.to_vec();
         // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
         // resolve against the transaction's starting view before any entry is
@@ -4460,7 +4695,7 @@ impl MongoBackend {
             }
         };
         let mut bundle_state = BundleTransactionState::new(references);
-        let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
+        let mut writes = BundleWrites::new(deferral);
 
         let entry_count = entries.len();
         for (idx, entry) in entries.iter_mut().enumerate() {
@@ -4493,7 +4728,7 @@ impl MongoBackend {
                     },
                     entry,
                     resource,
-                    &mut pending_search_parameter_changes,
+                    &mut writes,
                     targets.get(&idx),
                 )
                 .await;
@@ -4538,13 +4773,49 @@ impl MongoBackend {
             ));
         }
 
+        // The ledger goes in after the last entry and before the commit: the
+        // Bundle's writes and the record of the rows still owed commit together
+        // or not at all (#1975). A failure here is classified by `ledger_attempt_error`.
+        let mut deferred = None;
+        if let Some(set) = writes.deferred.as_ref().filter(|set| !set.is_empty()) {
+            let (documents, chunks) = ledger_documents(
+                tenant.tenant_id().as_str(),
+                set.bundle_id(),
+                entry_count,
+                set.refs(),
+                Utc::now(),
+            );
+            if let Err(e) = db
+                .collection::<Document>(SEARCH_INDEX_PENDING_COLLECTION)
+                .insert_many(documents)
+                .session(&mut *session)
+                .await
+            {
+                let _ = session.abort_transaction().await;
+                return Err(ledger_attempt_error(
+                    entry_count,
+                    &internal_driver_error(
+                        "Failed to write the deferred search index ledger in transaction",
+                        e,
+                    ),
+                ));
+            }
+            deferred = Some(DeferredCommit {
+                bundle_id: set.bundle_id().to_string(),
+                chunks,
+                resources: set.refs().len(),
+            });
+        }
+
         // A commit whose outcome is unknown may have applied. Sending the
         // commit again is safe (the driver's own documented recovery);
         // re-running the entries is not, since every POST would be stored a
         // second time under a new id. `CommitAttempts` keeps the verdicts
         // straight: once any commit has been unknown, no later failure may
-        // read as "rolled back" or as grounds for a replay.
-        let mut commit = CommitAttempts::new();
+        // read as "rolled back" or as grounds for a replay. A commit refused
+        // with 388 ends the attempt as `TooLargeForCache` at once: no re-sent
+        // commit and no replay (#1991).
+        let mut commit = CommitAttempts::new(entry_count);
         while let Err(e) = session.commit_transaction().await {
             match commit.after_failure(&e) {
                 CommitStep::RetryCommit => continue,
@@ -4552,7 +4823,11 @@ impl MongoBackend {
             }
         }
 
-        Ok((results, pending_search_parameter_changes))
+        Ok(CommittedAttempt {
+            results,
+            search_parameter_changes: writes.search_parameter_changes,
+            deferred,
+        })
     }
 
     /// Resolves every URL-borne conditional entry inside the session, before
@@ -4623,7 +4898,7 @@ impl MongoBackend {
         context: BundleEntryContext<'_>,
         entry: &BundleEntry,
         resource: Option<Value>,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
         target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
         let BundleEntryContext {
@@ -4694,7 +4969,7 @@ impl MongoBackend {
                         &resource_type,
                         resource,
                         fhir_version,
-                        pending_search_parameter_changes,
+                        writes,
                     )
                     .await?;
                 Ok(BundleEntryResult::created(created))
@@ -4710,12 +4985,7 @@ impl MongoBackend {
                     return Ok(match &target.resolved {
                         Some(existing) => crate::core::conditional_update_entry(
                             self.update_resource_in_bundle_transaction(
-                                db,
-                                session,
-                                tenant,
-                                existing,
-                                resource,
-                                pending_search_parameter_changes,
+                                db, session, tenant, existing, resource, writes,
                             )
                             .await?,
                         ),
@@ -4727,7 +4997,7 @@ impl MongoBackend {
                                 &target.resource_type,
                                 resource,
                                 fhir_version,
-                                pending_search_parameter_changes,
+                                writes,
                             )
                             .await?,
                         ),
@@ -4754,12 +5024,7 @@ impl MongoBackend {
 
                         let updated = self
                             .update_resource_in_bundle_transaction(
-                                db,
-                                session,
-                                tenant,
-                                &existing,
-                                resource,
-                                pending_search_parameter_changes,
+                                db, session, tenant, &existing, resource, writes,
                             )
                             .await?;
                         Ok(BundleEntryResult::updated(updated))
@@ -4784,7 +5049,7 @@ impl MongoBackend {
                                 &resource_type,
                                 resource_with_id,
                                 fhir_version,
-                                pending_search_parameter_changes,
+                                writes,
                             )
                             .await?;
                         Ok(BundleEntryResult::created(created))
@@ -4801,7 +5066,7 @@ impl MongoBackend {
                                 tenant,
                                 &target.resource_type,
                                 existing.id(),
-                                pending_search_parameter_changes,
+                                writes,
                             )
                             .await?;
                             crate::core::conditional_delete_entry(existing)
@@ -4821,7 +5086,7 @@ impl MongoBackend {
                             &resource_type,
                             &id,
                             if_match,
-                            pending_search_parameter_changes,
+                            writes,
                         )
                         .await
                     {
@@ -4845,7 +5110,7 @@ impl MongoBackend {
                             tenant,
                             &resource_type,
                             &id,
-                            pending_search_parameter_changes,
+                            writes,
                         )
                         .await
                     {
@@ -4923,12 +5188,7 @@ impl MongoBackend {
                 };
                 let update_result = self
                     .update_resource_in_bundle_transaction(
-                        db,
-                        session,
-                        tenant,
-                        &existing,
-                        candidate,
-                        pending_search_parameter_changes,
+                        db, session, tenant, &existing, candidate, writes,
                     )
                     .await;
                 crate::core::transaction::patch_update_result(update_result)
@@ -4945,7 +5205,7 @@ impl MongoBackend {
         resource_type: &str,
         resource: Value,
         fhir_version: helios_fhir::FhirVersion,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<StoredResource> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -4987,19 +5247,26 @@ impl MongoBackend {
         let version_id = "1".to_string();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
+        let mut current = search_documents.resource_document(doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": &id,
+            "version_id": &version_id,
+            "data": Bson::Document(payload.clone()),
+            "created_at": now_bson,
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        });
+        // A Bundle that defers its search rows marks the resource until they
+        // are written (#1975). The history document carries no marker.
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            current.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
+
         resources
-            .insert_one(search_documents.resource_document(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": &id,
-                "version_id": &version_id,
-                "data": Bson::Document(payload.clone()),
-                "created_at": now_bson,
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            }))
+            .insert_one(current)
             .session(&mut *session)
             .await
             .map_err(|e| {
@@ -5037,11 +5304,14 @@ impl MongoBackend {
             resource_type,
             &id,
             search_documents,
+            writes,
         )
         .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Create);
+            writes
+                .search_parameter_changes
+                .push(PendingSearchParameterChange::Create);
         }
 
         Ok(StoredResource::from_storage(
@@ -5064,7 +5334,7 @@ impl MongoBackend {
         tenant: &TenantContext,
         current: &StoredResource,
         resource: Value,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<StoredResource> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -5118,6 +5388,18 @@ impl MongoBackend {
         let fhir_version = current.fhir_version();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
+        let mut set = doc! {
+            "version_id": &new_version,
+            "data": Bson::Document(payload.clone()),
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        };
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            set.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
+
         let update_result = resources
             .update_one(
                 doc! {
@@ -5127,16 +5409,7 @@ impl MongoBackend {
                     "version_id": current.version_id(),
                     "is_deleted": false,
                 },
-                search_documents.resource_update(doc! {
-                    "$set": {
-                        "version_id": &new_version,
-                        "data": Bson::Document(payload.clone()),
-                        "last_updated": now_bson,
-                        "is_deleted": false,
-                        "deleted_at": Bson::Null,
-                        "fhir_version": &fhir_version_str,
-                    }
-                }),
+                search_documents.resource_update(doc! { "$set": set }),
             )
             .session(&mut *session)
             .await
@@ -5179,11 +5452,14 @@ impl MongoBackend {
             resource_type,
             id,
             search_documents,
+            writes,
         )
         .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Update);
+            writes
+                .search_parameter_changes
+                .push(PendingSearchParameterChange::Update);
         }
 
         Ok(StoredResource::from_storage(
@@ -5206,7 +5482,7 @@ impl MongoBackend {
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -5260,6 +5536,17 @@ impl MongoBackend {
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
 
+        let mut set = doc! {
+            "version_id": &new_version,
+            "is_deleted": true,
+            "missing_params": Bson::Array(Vec::new()),
+            "deleted_at": now_bson,
+            "last_updated": now_bson,
+        };
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            set.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
+
         let update_result = resources
             .update_one(
                 doc! {
@@ -5269,15 +5556,7 @@ impl MongoBackend {
                     "version_id": &current_version,
                     "is_deleted": false,
                 },
-                doc! {
-                    "$set": {
-                        "version_id": &new_version,
-                        "is_deleted": true,
-                        "missing_params": Bson::Array(Vec::new()),
-                        "deleted_at": now_bson,
-                        "last_updated": now_bson,
-                    }
-                },
+                doc! { "$set": set },
             )
             .session(&mut *session)
             .await
@@ -5311,11 +5590,20 @@ impl MongoBackend {
                 internal_driver_error("Failed to insert delete history in transaction", e)
             })?;
 
-        self.delete_search_index_in_bundle_transaction(db, session, tenant_id, resource_type, id)
-            .await?;
+        self.delete_search_index_in_bundle_transaction(
+            db,
+            session,
+            tenant_id,
+            resource_type,
+            id,
+            writes,
+        )
+        .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Delete);
+            writes
+                .search_parameter_changes
+                .push(PendingSearchParameterChange::Delete);
         }
 
         Ok(())
@@ -5330,7 +5618,7 @@ impl MongoBackend {
         resource_type: &str,
         id: &str,
         expected_version: &str,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         let existing = self
             .read_resource_in_bundle_transaction(db, session, tenant, resource_type, id)
@@ -5354,15 +5642,8 @@ impl MongoBackend {
             ));
         }
 
-        self.delete_resource_in_bundle_transaction(
-            db,
-            session,
-            tenant,
-            resource_type,
-            id,
-            pending_search_parameter_changes,
-        )
-        .await
+        self.delete_resource_in_bundle_transaction(db, session, tenant, resource_type, id, writes)
+            .await
     }
 
     async fn read_resource_in_bundle_transaction(
@@ -5933,6 +6214,15 @@ impl MongoBackend {
         Ok(())
     }
 
+    /// Writes a resource's search rows inside the Bundle's transaction, or, when
+    /// the Bundle defers them for this type (#1975), only notes the resource for
+    /// the post-commit step: neither the two deletes nor the inserts run.
+    ///
+    /// The rows come from `docs`, which the caller built from the same
+    /// extraction as the resource's `missing_params`. A deferred type drops
+    /// `docs`: its `missing_params` are already on the resource document and
+    /// its rows are rebuilt after commit.
+    #[allow(clippy::too_many_arguments)]
     async fn index_resource_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
@@ -5941,17 +6231,27 @@ impl MongoBackend {
         resource_type: &str,
         resource_id: &str,
         docs: SearchIndexDocuments,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
             return Ok(());
         }
 
-        self.delete_search_index_in_bundle_transaction(
+        if let Some(deferred) = writes
+            .deferred
+            .as_mut()
+            .filter(|deferred| deferred.defers(resource_type))
+        {
+            deferred.record(resource_type, resource_id);
+            return Ok(());
+        }
+
+        self.delete_search_index_rows_for(
             db,
-            session,
             tenant_id,
             resource_type,
-            resource_id,
+            Bson::String(resource_id.to_string()),
+            Some(&mut *session),
         )
         .await?;
 
@@ -5959,6 +6259,9 @@ impl MongoBackend {
             .await
     }
 
+    /// Deletes a resource's search rows inside the Bundle's transaction, or,
+    /// when the Bundle defers them for this type (#1975), only notes the
+    /// resource: the post-commit step finds it deleted and leaves it no rows.
     async fn delete_search_index_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
@@ -5966,8 +6269,18 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
+            return Ok(());
+        }
+
+        if let Some(deferred) = writes
+            .deferred
+            .as_mut()
+            .filter(|deferred| deferred.defers(resource_type))
+        {
+            deferred.record(resource_type, resource_id);
             return Ok(());
         }
 
@@ -8880,9 +9193,11 @@ mod transient_abort_tests {
             match entry_attempt_error(6959, 7412, &err) {
                 BundleAttemptError::Failed(TransactionError::TooLargeForCache {
                     entries,
+                    cause,
                     reason,
                 }) => {
                     assert_eq!(entries, 7412);
+                    assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
                     assert!(reason.contains("388"), "{reason}");
                     assert!(reason.contains("6959"), "{reason}");
                 }
@@ -8893,7 +9208,11 @@ mod transient_abort_tests {
         let err = StorageError::from(command_error(388, "TransactionTooLargeForCache"));
         assert!(matches!(
             entry_attempt_error(0, 2, &err),
-            BundleAttemptError::Failed(TransactionError::TooLargeForCache { entries: 2, .. })
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                entries: 2,
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
+                ..
+            })
         ));
     }
 
@@ -9005,7 +9324,10 @@ mod transient_abort_tests {
         );
         assert!(matches!(
             entry_attempt_error(3, 10, &err),
-            BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. })
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
+                ..
+            })
         ));
     }
 
@@ -9018,9 +9340,11 @@ mod transient_abort_tests {
         match lone_eviction_failure(true, true, 7412, Some(6959), &reason) {
             Some(TransactionError::TooLargeForCache {
                 entries,
+                cause,
                 reason: actual,
             }) => {
                 assert_eq!(entries, 7412);
+                assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
                 assert_eq!(
                     actual,
                     format!(
@@ -9033,8 +9357,13 @@ mod transient_abort_tests {
         }
         // At commit there is no failing entry to name.
         match lone_eviction_failure(true, true, 7412, None, "Commit failed: boom") {
-            Some(TransactionError::TooLargeForCache { entries, reason }) => {
+            Some(TransactionError::TooLargeForCache {
+                entries,
+                cause,
+                reason,
+            }) => {
                 assert_eq!(entries, 7412);
+                assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
                 assert_eq!(
                     reason,
                     "Commit rolled back for eviction while the Bundle ran alone; \
@@ -9107,6 +9436,84 @@ mod transient_abort_tests {
             entry_attempt_error(3, 10, &classified_io_error()),
             BundleAttemptError::TransientAbort { .. }
         ));
+    }
+
+    #[test]
+    fn a_ledger_write_that_overflows_the_cache_is_too_large_for_cache() {
+        for driver in [
+            command_error(388, "TransactionTooLargeForCache"),
+            insert_many_write_error(388),
+        ] {
+            let err = internal_driver_error(
+                "Failed to write the deferred search index ledger in transaction",
+                driver,
+            );
+            match ledger_attempt_error(7412, &err) {
+                BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                    entries,
+                    cause,
+                    ..
+                }) => {
+                    assert_eq!(entries, 7412);
+                    assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
+                }
+                other => panic!("expected TooLargeForCache, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_ledger_write_aborted_transiently_is_a_transient_abort_with_no_entry() {
+        let eviction = internal_driver_error(
+            "Failed to write the deferred search index ledger in transaction",
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+        );
+        match ledger_attempt_error(7412, &eviction) {
+            BundleAttemptError::TransientAbort {
+                entry: None,
+                code: Some(WRITE_CONFLICT_CODE),
+                eviction: true,
+                ..
+            } => {}
+            other => panic!("expected a transient abort, got {other:?}"),
+        }
+        let plain = internal_driver_error(
+            "Failed to write the deferred search index ledger in transaction",
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+        );
+        assert!(matches!(
+            ledger_attempt_error(7412, &plain),
+            BundleAttemptError::TransientAbort {
+                entry: None,
+                eviction: false,
+                ..
+            }
+        ));
+        // A dropped connection reaches the loop as `Unavailable`.
+        assert!(matches!(
+            ledger_attempt_error(7412, &classified_io_error()),
+            BundleAttemptError::TransientAbort { entry: None, .. }
+        ));
+    }
+
+    #[test]
+    fn any_other_ledger_write_failure_is_a_server_side_rollback_not_an_entry_error() {
+        for driver in [
+            command_error(2, "BadValue"),
+            command_error(121, "DocumentValidationFailure"),
+            insert_many_write_error(11000),
+        ] {
+            let err = internal_driver_error(
+                "Failed to write the deferred search index ledger in transaction",
+                driver,
+            );
+            match ledger_attempt_error(7412, &err) {
+                BundleAttemptError::Failed(TransactionError::RolledBack { reason }) => {
+                    assert!(reason.contains("deferred search index ledger"), "{reason}");
+                }
+                other => panic!("expected RolledBack, got {other:?}"),
+            }
+        }
     }
 
     /// A commit that failed with a write-concern error of `code`, as the driver
@@ -9239,6 +9646,20 @@ mod transient_abort_tests {
         err
     }
 
+    /// #1991: the commit failure of the issue's log, `Error code 388
+    /// (TransactionTooLargeForCache) ... labels: {}`: code 388 with no label.
+    /// The literal is deliberate; it pins the number the server sends.
+    fn commit_too_large_for_cache() -> MongoError {
+        let err = command_error_with_message(
+            388,
+            "TransactionTooLargeForCache",
+            "WiredTigerRecordStore::insertRecord -31800: transaction is too large and will \
+             not fit in the storage engine cache",
+        );
+        assert!(err.labels().is_empty(), "the server sent no label");
+        err
+    }
+
     #[test]
     fn an_unlabelled_commit_failure_with_code_365_is_a_transient_abort() {
         let err = temporarily_unavailable();
@@ -9283,10 +9704,122 @@ mod transient_abort_tests {
         }
     }
 
+    #[test]
+    fn an_unlabelled_code_388_commit_failure_is_too_large_for_cache_while_no_commit_is_unknown() {
+        assert_eq!(
+            classify_commit_failure(&commit_too_large_for_cache(), false),
+            CommitFailure::TooLargeForCache
+        );
+        // An earlier commit may have applied, so the outcome stays unknown
+        // rather than reading as a rollback.
+        assert_eq!(
+            classify_commit_failure(&commit_too_large_for_cache(), true),
+            CommitFailure::StillUnknown
+        );
+        // A write-concern error is reported after the commit applied, whatever
+        // its code.
+        let applied = write_concern_error(388, "TransactionTooLargeForCache");
+        for earlier in [false, true] {
+            assert_eq!(
+                classify_commit_failure(&applied, earlier),
+                CommitFailure::UnknownResult
+            );
+        }
+    }
+
+    #[test]
+    fn code_388_at_commit_decides_only_verdicts_that_say_nothing_was_applied() {
+        use CommitFailure::*;
+        // (transient label, unknown-result label, write concern, earlier unknown)
+        let table = [
+            ((false, false, false, false), TooLargeForCache),
+            ((true, false, false, false), TooLargeForCache),
+            ((true, true, false, false), TooLargeForCache),
+            ((false, true, false, false), UnknownResult),
+            ((false, true, false, true), UnknownResult),
+            ((false, false, false, true), StillUnknown),
+            ((true, false, false, true), StillUnknown),
+            ((true, true, false, true), StillUnknown),
+        ];
+        for ((t, u, wc, e), expected) in table {
+            assert_eq!(
+                too_large_for_cache_at_commit(classify_commit_signals(t, u, false, wc, e)),
+                expected,
+                "transient={t} unknown={u} write_concern={wc} earlier={e}"
+            );
+        }
+        for t in [false, true] {
+            for u in [false, true] {
+                for e in [false, true] {
+                    assert_eq!(
+                        too_large_for_cache_at_commit(classify_commit_signals(
+                            t, u, false, true, e
+                        )),
+                        UnknownResult,
+                        "a write-concern error is unknown: transient={t} unknown={u} earlier={e}"
+                    );
+                }
+            }
+        }
+        assert_eq!(too_large_for_cache_at_commit(RolledBack), TooLargeForCache);
+        assert_eq!(
+            too_large_for_cache_at_commit(TransientAbort),
+            TooLargeForCache
+        );
+        assert_eq!(too_large_for_cache_at_commit(UnknownResult), UnknownResult);
+        assert_eq!(too_large_for_cache_at_commit(StillUnknown), StillUnknown);
+    }
+
+    #[test]
+    fn the_commit_loop_ends_a_code_388_commit_failure_at_once_as_too_large_for_cache() {
+        let steps = drive_commit(vec![
+            commit_too_large_for_cache(),
+            commit_too_large_for_cache(),
+            commit_too_large_for_cache(),
+        ]);
+        assert_eq!(steps.len(), 1, "the commit is not re-sent");
+        match stopped_with(&steps[0]) {
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                cause,
+                entries,
+                reason,
+            }) => {
+                assert_eq!(
+                    *cause,
+                    TooLargeForCacheCause::WriteSetTooLarge,
+                    "a commit-time 388 is the write-set cause"
+                );
+                assert_eq!(*entries, DRIVEN_BUNDLE_ENTRIES);
+                assert!(reason.starts_with("Commit failed: "), "{reason}");
+                assert!(reason.contains("388"), "{reason}");
+                assert!(reason.contains("TransactionTooLargeForCache"), "{reason}");
+            }
+            other => panic!("expected TooLargeForCache, got {other:?}"),
+        }
+
+        // After an earlier unknown commit the 388 does not read as a rollback.
+        let steps = drive_commit(vec![
+            write_concern_error(79, "UnknownReplWriteConcern"),
+            commit_too_large_for_cache(),
+        ]);
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(steps[0], CommitStep::RetryCommit));
+        match stopped_with(&steps[1]) {
+            BundleAttemptError::Failed(TransactionError::CommitOutcomeUnknown { reason }) => {
+                assert!(reason.contains("unknown"), "{reason}");
+            }
+            other => panic!("expected CommitOutcomeUnknown, got {other:?}"),
+        }
+    }
+
+    /// The entry count [`drive_commit`] runs its commits for: the 6,135-entry
+    /// Synthea Bundle of #1991.
+    const DRIVEN_BUNDLE_ENTRIES: usize = 6135;
+
     /// Runs `failures` through a fresh [`CommitAttempts`], as the commit loop
     /// does, and returns what it decided at each one.
     fn drive_commit(failures: Vec<MongoError>) -> Vec<CommitStep> {
-        let mut attempts = CommitAttempts::new();
+        let mut attempts = CommitAttempts::new(DRIVEN_BUNDLE_ENTRIES);
         let mut steps = Vec::new();
         for failure in failures {
             let step = attempts.after_failure(&failure);

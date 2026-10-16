@@ -1637,3 +1637,106 @@ async fn reference_parameters_server_normalizes_repeated_patient_and_group_entri
         assert_eq!(ids, ["p1", "p2"]);
     }
 }
+
+/// A `$sql-run` body whose single column carries an `ansi/type` tag.
+fn ansi_tag_body(format: &str, path: &str, ty: &str, tag: &str) -> serde_json::Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": format},
+            {
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{
+                        "name": "tagged_col", "path": path, "type": ty,
+                        "tag": [{"name": "ansi/type", "value": tag}]
+                    }]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {"resourceType": "Patient", "id": "p1", "birthDate": "1990-01-01"}
+            }
+        ]
+    })
+}
+
+#[tokio::test]
+async fn test_sql_run_rejects_invalid_ansi_type_tag_naming_the_column() {
+    let server = common::test_server().await;
+    for format in ["json", "ndjson", "csv", "parquet", "arrow"] {
+        for (path, ty, tag) in [
+            ("birthDate", "date", "GEOMETRY"),
+            ("birthDate", "date", "INT"),
+        ] {
+            let response = server
+                .post("/$sql-run")
+                .add_header("Content-Type", "application/json")
+                .json(&ansi_tag_body(format, path, ty, tag))
+                .await;
+            let status = response.status_code();
+            assert!(
+                status.is_client_error(),
+                "{format}/{tag}: expected 4xx, got {status}; body: {}",
+                response.text()
+            );
+            assert!(
+                response.text().contains("tagged_col"),
+                "{format}/{tag}: body must name the column: {}",
+                response.text()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_sql_run_accepts_valid_date_and_double_ansi_type_tags_as_parquet() {
+    let server = common::test_server().await;
+    for (path, ty, tag) in [
+        ("birthDate", "date", "DATE"),
+        ("id.length()", "integer", "DOUBLE PRECISION"),
+    ] {
+        let response = server
+            .post("/$sql-run")
+            .add_header("Content-Type", "application/json")
+            .json(&ansi_tag_body("parquet", path, ty, tag))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{tag}: {}",
+            response.text()
+        );
+        assert!(response.as_bytes().starts_with(b"PAR1"), "{tag}");
+    }
+}
+
+#[tokio::test]
+async fn test_sql_run_rejects_non_string_ansi_type_tag_value_naming_the_column() {
+    let server = common::test_server().await;
+    for format in ["json", "ndjson", "csv", "parquet", "arrow"] {
+        let mut body = ansi_tag_body(format, "birthDate", "date", "DATE");
+        *body
+            .pointer_mut("/parameter/1/resource/select/0/column/0/tag/0/value")
+            .unwrap() = json!(42);
+        let response = server
+            .post("/$sql-run")
+            .add_header("Content-Type", "application/json")
+            .json(&body)
+            .await;
+        let status = response.status_code();
+        assert!(
+            status.is_client_error(),
+            "{format}: expected 4xx, got {status}; body: {}",
+            response.text()
+        );
+        assert!(
+            response.text().contains("tagged_col"),
+            "{format}: body must name the column: {}",
+            response.text()
+        );
+    }
+}

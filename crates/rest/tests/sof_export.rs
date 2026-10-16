@@ -3883,4 +3883,444 @@ mod sof_export_tests {
         )
         .await;
     }
+
+    // =========================================================================
+    // Typed Parquet shards and `ansi/type` validation (#569)
+    // =========================================================================
+
+    async fn typed_export_server(shard_rows: Option<usize>) -> (TestServer, Arc<SqliteBackend>) {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+        let runner: Arc<dyn SofRunner> = backend.sof_runner().expect("sof_runner");
+        let sink = InMemorySink::new("http://localhost");
+        let controller = InMemoryController::with_shard_rows(runner, sink, None, shard_rows);
+        let config = ServerConfig {
+            base_url: "http://localhost".to_string(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let app = helios_rest::routing::fhir_routes::create_routes(state);
+        (TestServer::new(app).expect("test server"), backend)
+    }
+
+    async fn seed_typed_observations(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        // o1 carries every typed value; o2 and o3 carry none, so with one row
+        // per shard some shards hold only nulls.
+        let resources = [
+            json!({
+                "resourceType": "Observation", "id": "o1", "status": "final",
+                "code": {"text": "t"},
+                "effectiveInstant": "2024-03-05T10:20:30+02:00",
+                "valueAttachment": {"data": "AQID", "size": 5000000000i64,
+                                    "creation": "2024-03-05"},
+                "component": [
+                    {"code": {"text": "a"}, "valueInteger": 7},
+                    {"code": {"text": "b"}, "valueInteger": 8}
+                ]
+            }),
+            json!({"resourceType": "Observation", "id": "o2", "status": "final",
+                   "code": {"text": "t"}}),
+            json!({"resourceType": "Observation", "id": "o3", "status": "final",
+                   "code": {"text": "t"}}),
+        ];
+        for r in resources {
+            backend
+                .create(&tenant, "Observation", r, FhirVersion::R4)
+                .await
+                .expect("seed observation");
+        }
+    }
+
+    fn typed_export_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "obs_id", "type": "string"},
+                {"path": "component.first().valueInteger", "name": "small", "type": "integer"},
+                {"path": "valueAttachment.size", "name": "big", "type": "integer64"},
+                {"path": "component.first().valueInteger", "name": "dec", "type": "decimal"},
+                {"path": "effectiveInstant", "name": "inst", "type": "instant"},
+                {"path": "valueAttachment.data", "name": "bin", "type": "base64Binary"},
+                {"path": "valueAttachment.creation", "name": "day", "type": "date",
+                 "tag": [{"name": "ansi/type", "value": "DATE"}]},
+                {"path": "component.valueInteger", "name": "ints", "type": "integer",
+                 "collection": true}
+            ]}]
+        })
+    }
+
+    /// Kicks off an export and returns the status URL.
+    async fn kick_off(server: &TestServer, format: &str, view: &Value) -> String {
+        let submit = server
+            .post(&format!("/$sql-export?_format={format}"))
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(view)
+            .await;
+        assert_eq!(
+            submit.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit.text()
+        );
+        submit
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Follows the finished job's redirect and returns the result fetch.
+    async fn poll_to_result(server: &TestServer, status_url: &str) -> axum_test::TestResponse {
+        for _ in 0..80 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let poll = server
+                .get(status_url)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            match poll.status_code() {
+                StatusCode::SEE_OTHER => {
+                    let url = poll
+                        .headers()
+                        .get(axum::http::header::LOCATION)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    return server
+                        .get(&url)
+                        .add_header(X_TENANT_ID, "test-tenant")
+                        .await;
+                }
+                StatusCode::ACCEPTED => continue,
+                other => panic!("unexpected poll status {other}: {}", poll.text()),
+            }
+        }
+        panic!("export did not finish for {status_url}");
+    }
+
+    fn shard_paths(manifest: &Value) -> Vec<String> {
+        manifest["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["name"].as_str() == Some("output"))
+            .flat_map(|p| p["part"].as_array().unwrap().iter())
+            .filter(|p| p["name"].as_str() == Some("location"))
+            .filter_map(|p| p["valueUri"].as_str())
+            .map(|u| u.trim_start_matches("http://localhost").to_string())
+            .collect()
+    }
+
+    /// Parquet shards of a typed view carry the spec types and values, and the
+    /// schema is the same in every shard, including shards of only nulls.
+    #[tokio::test]
+    async fn test_export_parquet_typed_view_has_identical_typed_schema_across_shards() {
+        use arrow::array::{Array, Date32Array, Int32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, TimeUnit};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let (server, backend) = typed_export_server(Some(1)).await;
+        seed_typed_observations(&backend).await;
+        let status = kick_off(&server, "parquet", &typed_export_view()).await;
+        let result = poll_to_result(&server, &status).await;
+        assert_eq!(result.status_code(), StatusCode::OK, "{}", result.text());
+        let manifest: Value = result.json();
+        let paths = shard_paths(&manifest);
+        assert_eq!(paths.len(), 3, "one shard per row: {manifest}");
+
+        let mut schemas = Vec::new();
+        let mut full_rows = 0;
+        for path in &paths {
+            let download = server
+                .get(path)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            assert_eq!(download.status_code(), StatusCode::OK);
+            let builder = ParquetRecordBatchReaderBuilder::try_new(download.into_bytes())
+                .expect("valid parquet shard");
+            let schema = builder.schema().clone();
+            let reader = builder.build().unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let ids = batch
+                    .column_by_name("obs_id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    if ids.value(row) != "o1" {
+                        for name in ["small", "big", "dec", "inst", "bin", "day", "ints"] {
+                            assert!(
+                                // An empty collection is an empty list or null.
+                                batch.column_by_name(name).unwrap().is_null(row)
+                                    || (name == "ints"
+                                        && batch
+                                            .column_by_name(name)
+                                            .unwrap()
+                                            .as_any()
+                                            .downcast_ref::<arrow::array::ListArray>()
+                                            .unwrap()
+                                            .value(row)
+                                            .is_empty()),
+                                "{name} of {}",
+                                ids.value(row)
+                            );
+                        }
+                        continue;
+                    }
+                    full_rows += 1;
+                    let get = |n: &str| batch.column_by_name(n).unwrap().clone();
+                    let small = get("small");
+                    assert_eq!(
+                        small
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .value(row),
+                        7
+                    );
+                    let big = get("big");
+                    assert_eq!(
+                        big.as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(row),
+                        5_000_000_000
+                    );
+                    let dec = get("dec");
+                    let dec = dec.as_any().downcast_ref::<StringArray>().unwrap();
+                    assert!(matches!(dec.value(row), "7" | "7.0"), "{}", dec.value(row));
+                    let inst = get("inst");
+                    let inst = inst
+                        .as_any()
+                        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                        .unwrap();
+                    assert_eq!(inst.value(row), 1_709_626_830_000_000);
+                    let bin = get("bin");
+                    let bin = bin
+                        .as_any()
+                        .downcast_ref::<arrow::array::BinaryArray>()
+                        .unwrap();
+                    assert_eq!(bin.value(row), &[1u8, 2, 3]);
+                    let day = get("day");
+                    assert_eq!(
+                        day.as_any()
+                            .downcast_ref::<Date32Array>()
+                            .unwrap()
+                            .value(row),
+                        19_787
+                    );
+                    let ints = get("ints");
+                    let list = ints
+                        .as_any()
+                        .downcast_ref::<arrow::array::ListArray>()
+                        .unwrap();
+                    let values = list.value(row);
+                    let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+                    assert_eq!(values.values().to_vec(), vec![7, 8]);
+                }
+            }
+            schemas.push(schema);
+        }
+        assert_eq!(full_rows, 1);
+
+        let first = &schemas[0];
+        for other in &schemas[1..] {
+            assert_eq!(
+                first.fields(),
+                other.fields(),
+                "every shard has the same schema"
+            );
+        }
+        let ty = |n: &str| first.field_with_name(n).unwrap().data_type().clone();
+        assert_eq!(ty("obs_id"), DataType::Utf8);
+        assert_eq!(ty("small"), DataType::Int32);
+        assert_eq!(ty("big"), DataType::Int64);
+        assert_eq!(ty("dec"), DataType::Utf8);
+        assert_eq!(
+            ty("inst"),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(ty("bin"), DataType::Binary);
+        assert_eq!(ty("day"), DataType::Date32);
+        match ty("ints") {
+            DataType::List(f) => assert_eq!(f.data_type(), &DataType::Int32),
+            other => panic!("expected List<Int32>, got {other:?}"),
+        }
+    }
+
+    /// Runs a typed-view export in a flat text format and returns the text of
+    /// every shard, concatenated.
+    async fn export_text(format: &str) -> String {
+        let (server, backend) = typed_export_server(None).await;
+        seed_typed_observations(&backend).await;
+        let status = kick_off(&server, format, &typed_export_view()).await;
+        let result = poll_to_result(&server, &status).await;
+        assert_eq!(result.status_code(), StatusCode::OK, "{}", result.text());
+        let manifest: Value = result.json();
+        let mut out = String::new();
+        for path in shard_paths(&manifest) {
+            let download = server
+                .get(&path)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            assert_eq!(download.status_code(), StatusCode::OK);
+            out.push_str(&download.text());
+            out.push('\n');
+        }
+        out
+    }
+
+    fn assert_typed_json_row(row: &Value) {
+        assert_eq!(row["small"], json!(7), "{row}");
+        assert_eq!(row["big"], json!(5_000_000_000i64), "{row}");
+        assert_eq!(row["day"], json!("2024-03-05"), "{row}");
+        assert_eq!(row["ints"], json!([7, 8]), "{row}");
+    }
+
+    #[tokio::test]
+    async fn test_export_ndjson_typed_view_keeps_json_types() {
+        let text = export_text("ndjson").await;
+        let rows: Vec<Value> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3, "{text}");
+        assert_typed_json_row(rows.iter().find(|r| r["obs_id"] == "o1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_export_json_typed_view_keeps_json_types() {
+        let text = export_text("json").await;
+        let rows: Vec<Value> = serde_json::from_str(text.trim()).expect("a JSON array");
+        assert_eq!(rows.len(), 3, "{text}");
+        assert_typed_json_row(rows.iter().find(|r| r["obs_id"] == "o1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_export_csv_typed_view_renders_values_as_text() {
+        let text = export_text("csv").await;
+        let header = text.lines().next().unwrap();
+        for name in ["obs_id", "small", "big", "day", "ints"] {
+            assert!(header.contains(name), "{header}");
+        }
+        let o1 = text.lines().find(|l| l.starts_with("o1")).expect("o1 row");
+        assert!(o1.contains("5000000000"), "{o1}");
+        assert!(o1.contains("2024-03-05"), "{o1}");
+    }
+
+    /// `arrow` is a `$sql-run` format only; export supports csv, ndjson, json
+    /// and parquet, so `_format=arrow` is refused at kick-off.
+    #[tokio::test]
+    async fn test_export_arrow_format_rejected() {
+        let (server, backend) = typed_export_server(None).await;
+        seed_typed_observations(&backend).await;
+        let resp = server
+            .post("/$sql-export?_format=arrow")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&typed_export_view())
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            resp.text()
+        );
+        let body: Value = resp.json();
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(diag.contains("arrow") && diag.contains("parquet"), "{diag}");
+    }
+
+    /// An invalid `ansi/type` tag fails the job whatever the format and
+    /// whether or not the view returns rows, naming the view and the column.
+    #[tokio::test]
+    async fn test_export_invalid_ansi_type_tag_fails_the_job_naming_view_and_column() {
+        for (format, seed) in [
+            ("parquet", true),
+            ("parquet", false),
+            ("ndjson", true),
+            ("ndjson", false),
+            ("csv", true),
+            ("csv", false),
+            ("json", true),
+            ("json", false),
+        ] {
+            let (server, backend) = typed_export_server(None).await;
+            if seed {
+                seed_typed_observations(&backend).await;
+            }
+            for (view_name, column, ty, tag) in [
+                ("badview", "weird_col", "string", "NOT A TYPE"),
+                ("badview", "dec_col", "decimal", "INT"),
+            ] {
+                let view = json!({
+                    "resourceType": "ViewDefinition",
+                    "resource": "Observation",
+                    "status": "active",
+                    "select": [{"column": [
+                        {"path": "id", "name": "obs_id", "type": "string"},
+                        {"path": "id", "name": column, "type": ty,
+                         "tag": [{"name": "ansi/type", "value": tag}]}
+                    ]}]
+                });
+                let body = json!({
+                    "resourceType": "Parameters",
+                    "parameter": [{"name": "subject", "part": [
+                        {"name": "name", "valueString": view_name},
+                        {"name": "subjectResource", "resource": view}
+                    ]}]
+                });
+                let submit = server
+                    .post(&format!("/$sql-export?_format={format}"))
+                    .add_header(PREFER, "respond-async")
+                    .add_header(X_TENANT_ID, "test-tenant")
+                    .json(&body)
+                    .await;
+                let text = if submit.status_code() == StatusCode::ACCEPTED {
+                    let location = submit
+                        .headers()
+                        .get("content-location")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    let result = poll_to_result(&server, &location).await;
+                    assert!(
+                        !result.status_code().is_success(),
+                        "{format} seed={seed}: job must fail, got {}",
+                        result.text()
+                    );
+                    result.text()
+                } else {
+                    // Rejected at kick-off is also a valid way to refuse it.
+                    assert!(
+                        submit.status_code().is_client_error(),
+                        "{format}: {}",
+                        submit.text()
+                    );
+                    submit.text()
+                };
+                assert!(
+                    text.contains(column),
+                    "{format} seed={seed}: message must name '{column}': {text}"
+                );
+                assert!(
+                    text.contains(view_name) || submit.status_code().is_client_error(),
+                    "{format} seed={seed}: message must name the view: {text}"
+                );
+            }
+        }
+    }
 }

@@ -102,6 +102,12 @@
     return match ? match[1] : "";
   }
 
+  /* Translated operation name; the English key still drives the CSS modifier. */
+  function opLabel(method) {
+    var key = "msgOp" + method.charAt(0).toUpperCase() + method.slice(1);
+    return messages[key] || method;
+  }
+
   function labelFor(method) {
     if (method === "POST") return "create";
     if (method === "PUT") return "update";
@@ -131,7 +137,7 @@
       when.textContent = shortTime(version.lastUpdated);
       var kind = document.createElement("span");
       kind.className = "history-version__kind history-version__kind--" + version.method;
-      kind.textContent = index === 0 ? messages.msgCurrent : version.method;
+      kind.textContent = index === 0 ? messages.msgCurrent : opLabel(version.method);
 
       row.appendChild(id);
       row.appendChild(when);
