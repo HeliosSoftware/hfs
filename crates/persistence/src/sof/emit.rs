@@ -408,7 +408,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         "rid, node".to_string()
     };
     let sql = format!(
-        "WITH RECURSIVE {out_alias}({cte_cols}) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}\nORDER BY 1",
+        "WITH RECURSIVE {out_alias}({cte_cols}) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}",
         select_parts.join(",\n  ")
     );
 
@@ -1009,7 +1009,7 @@ fn emit_recurse_general(
     }
 
     let sql = format!(
-        "WITH RECURSIVE {}\nSELECT\n  {}\nFROM {from_clause}\nWHERE {}\nORDER BY 1",
+        "WITH RECURSIVE {}\nSELECT\n  {}\nFROM {from_clause}\nWHERE {}",
         ctes.join(",\n"),
         select_parts.join(",\n  "),
         where_parts.join("\n  AND "),
@@ -1061,8 +1061,9 @@ fn column_refers_to_resource(expr: &SqlExpr) -> bool {
 }
 
 /// Emit a `UNION ALL` query — each branch is emitted as a standalone SELECT,
-/// trailing `ORDER BY` is stripped from each, and a single `ORDER BY 1` is
-/// appended at the end of the compound query.
+/// and trailing `ORDER BY` is stripped from each. The compound query is left
+/// unordered: row order is not part of the SoF contract, and a sort would hold
+/// back every row until the whole result is built.
 fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql, SofError> {
     if branches.is_empty() {
         return Err(SofError::InvalidViewDefinition(
@@ -1117,7 +1118,7 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
         }
     }
 
-    let sql = format!("{}\nORDER BY 1", branch_sqls.join("\nUNION ALL\n"));
+    let sql = branch_sqls.join("\nUNION ALL\n");
     Ok(EmittedSql {
         sql,
         columns: columns.unwrap_or_default(),
@@ -2534,17 +2535,16 @@ fn lower_boundary(
     }
 }
 
-/// Strips a trailing `ORDER BY …` clause (case-insensitive). Used when
+/// Strips a trailing `ORDER BY …` line (case-insensitive). Used when
 /// assembling UNION ALL branches — `ORDER BY` inside an individual compound
-/// SELECT term is not portable.
+/// SELECT term is not portable. Only a final line counts: recursive branches
+/// end without one and carry `ORDER BY` inside window functions and
+/// subqueries, which must stay.
 fn strip_trailing_order_by(sql: &str) -> &str {
     let upper = sql.to_ascii_uppercase();
-    if let Some(pos) = upper.rfind("\nORDER BY") {
-        &sql[..pos]
-    } else if let Some(pos) = upper.rfind(" ORDER BY") {
-        &sql[..pos]
-    } else {
-        sql
+    match upper.rfind("\nORDER BY") {
+        Some(pos) if !sql[pos + 1..].contains('\n') => &sql[..pos],
+        _ => sql,
     }
 }
 

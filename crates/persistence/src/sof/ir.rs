@@ -528,8 +528,7 @@ pub enum PlanNode {
     },
 
     /// `UNION ALL` of N row-compatible plans. Output schemas must align;
-    /// the emitter validates this and emits a single `ORDER BY 1` outside the
-    /// compound query.
+    /// the emitter validates this and leaves the compound query unordered.
     Union(Vec<PlanNode>),
 
     /// Recursive-CTE descent — used for SoF `repeat:` clauses.

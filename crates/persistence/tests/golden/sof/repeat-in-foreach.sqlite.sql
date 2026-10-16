@@ -20,7 +20,6 @@ JOIN rec_1 ON rec_1.rid = r.id AND rec_1.pkey = '' || '/' || printf('%010d', COA
 WHERE r.tenant_id = ?1
   AND r.resource_type = ?2
   AND r.is_deleted = 0
-ORDER BY 1
 
 /* Runner bindings and output metadata:
 {
