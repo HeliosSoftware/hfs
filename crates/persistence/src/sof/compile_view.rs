@@ -281,6 +281,8 @@ struct UnnestStep {
     /// flattened collection. Used for forEach paths ending in `[N]` —
     /// FHIRPath indexes the flattened result, not each array crossing.
     flat_index: Option<i64>,
+    /// See [`PlanNode::LateralUnnest`]'s `array_source`.
+    array_source: bool,
 }
 
 /// One `repeat:` recursive descent — produces a recursive-CTE row source
@@ -627,6 +629,7 @@ fn read_clause_columns_and_iter(
                     left_join: is_left_join,
                     on_filter: None,
                     flat_index: None,
+                    array_source: false,
                 }],
                 focus,
             )
@@ -656,6 +659,7 @@ fn read_clause_columns_and_iter(
                     left_join: is_left_join,
                     on_filter,
                     flat_index: Some(n),
+                    array_source: false,
                 }],
                 focus,
             )
@@ -713,6 +717,10 @@ fn read_clause_columns_and_iter(
                     }
                     _ => None,
                 };
+                let seg_type = walk_fhir_type(&focus, &super::ir::JsonPath(seg_steps.clone()), env);
+                let array_source = !flatten
+                    && matches!(seg_steps.as_slice(), [PathStep::Field(_)])
+                    && matches!(seg_type, Some((_, true)));
                 unnests.push(UnnestStep {
                     source,
                     out_alias: alias.clone(),
@@ -721,9 +729,9 @@ fn read_clause_columns_and_iter(
                     left_join: is_left_join && i == last_idx,
                     on_filter,
                     flat_index: None,
+                    array_source,
                 });
-                if let Some((ty, _)) = walk_fhir_type(&focus, &super::ir::JsonPath(seg_steps), env)
-                {
+                if let Some((ty, _)) = seg_type {
                     env.focus_types.insert(format!("{alias}.value"), ty);
                 }
                 focus = format!("{alias}.value");
@@ -980,6 +988,7 @@ fn infer_decode(expr: &SqlExpr, env: &CompileEnv) -> ColumnDecode {
     }
     match expr {
         SqlExpr::Lit(LitValue::Str(_))
+        | SqlExpr::ColRef(_)
         | SqlExpr::ReferenceKey { .. }
         | SqlExpr::JoinAggregate { .. } => ColumnDecode::Text,
         SqlExpr::Lit(LitValue::Int(_)) | SqlExpr::RowIndex(_) => ColumnDecode::Integer,
@@ -1163,6 +1172,7 @@ fn apply_steps(parent: PlanNode, steps: Vec<IterStep>) -> PlanNode {
             left_join: u.left_join,
             on_filter: u.on_filter,
             flat_index: u.flat_index,
+            array_source: u.array_source,
         },
         IterStep::Recurse(r) => PlanNode::Recurse {
             parent: Box::new(p),

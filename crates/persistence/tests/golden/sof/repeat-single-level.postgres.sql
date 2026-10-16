@@ -1,5 +1,5 @@
 SELECT
-  r.data->>'id' AS "observation_id",
+  (r.id)::text AS "observation_id",
   coalesce(fe.value#>>'{code,0,text}', fe.value#>>'{code,text}') AS "component_name",
   fe.value#>>'{code,coding,0,code}' AS "component_code"
 FROM resources r

@@ -508,6 +508,11 @@ pub enum PlanNode {
         on_filter: Option<SqlExpr>,
         /// When set, restrict the unnest to the Nth element of the flattened collection.
         flat_index: Option<i64>,
+        /// True when the schema says `source` is one field holding a FHIR
+        /// array (`max = *`), which FHIR JSON always serializes as an array.
+        /// SQLite then iterates it with two-argument `json_each` instead of
+        /// the guard that wraps singleton objects.
+        array_source: bool,
     },
 
     /// `WHERE` filter applied to `parent`. Multiple `Filter` nodes compose
