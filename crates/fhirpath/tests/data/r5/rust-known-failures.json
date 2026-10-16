@@ -41,16 +41,6 @@
       "groupName": "testInheritance",
       "testName": "testFHIRPathAsFunction16",
       "reason": "Contested upstream: same cause as testFHIRPathAsFunction11 but via ofType(string). Was previously counted as a PASS by the in-body `contested_tests` allowlist (#307)."
-    },
-    {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityMonthLiteralToQuantity",
-      "reason": "Our defect, previously mislabelled 'test is wrong' and counted as a PASS (#307). '1 \\'mo\\''.toQuantity() = 1 month must be empty because UCUM 'mo' and the calendar month are not comparable; we return true, conflating UCUM units with calendar durations. Removable when Quantity comparison distinguishes calendar from UCUM duration units."
-    },
-    {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityYearLiteralToQuantity",
-      "reason": "Our defect, previously mislabelled 'test is wrong' and counted as a PASS (#307). Same cause as testStringQuantityMonthLiteralToQuantity, for UCUM 'a' versus the calendar year."
     }
   ]
 }
