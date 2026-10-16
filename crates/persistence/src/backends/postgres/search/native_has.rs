@@ -122,6 +122,55 @@ pub(crate) fn native_patient_code_predicate(
     code: &str,
     offset: usize,
 ) -> SqlFragment {
+    native_patient_code_predicate_with_guard(system, code, native_patient_code_source_guard(offset))
+}
+
+/// A broad exact count visits every Patient's references, unlike a limited page
+/// or an `_id` intersection. Reject code-negative sources before opening their
+/// exact code slices. An uncorrelated scalar subquery becomes one InitPlan;
+/// unlike `IN`, it cannot fall back to rescanning candidates at low work_mem.
+///
+/// The map is only a prefilter. Hash collisions and contained/stale index rows
+/// can admit extra sources, which the shared exact guard must still recheck.
+/// Limit input rows, including duplicates, and use bounded-length hash keys so
+/// neither ID length nor token density makes the aggregate grow without bound.
+/// Overflow returns NULL and disables only the prefilter; an empty map rejects
+/// every source. `tenant_param` names an existing bound tenant, adding no value.
+pub(crate) fn native_patient_code_count_predicate(
+    system: &str,
+    code: &str,
+    offset: usize,
+    tenant_param: usize,
+) -> SqlFragment {
+    const MAX_CANDIDATES: usize = 262_144;
+    let guard = native_patient_code_source_guard(offset);
+    let membership = format!(
+        "(SELECT CASE WHEN count(*) > {MAX_CANDIDATES} THEN NULL::jsonb \
+         ELSE COALESCE(jsonb_object_agg(candidate.key, TRUE), '{{}}'::jsonb) END \
+         FROM (SELECT hashtext(resource_id)::text AS key FROM search_index code_candidates \
+         WHERE code_candidates.tenant_id = ${tenant_param} AND code_candidates.resource_type = 'Observation' \
+         AND code_candidates.param_name = 'code' \
+         AND code_candidates.value_token_system IN (${}, '{IMPLICIT_TOKEN_SYSTEM}') \
+         AND code_candidates.value_token_code = ${} LIMIT {}) candidate)",
+        offset + 1,
+        offset + 2,
+        MAX_CANDIDATES + 1,
+    );
+    native_patient_code_predicate_with_guard(
+        system,
+        code,
+        format!(
+            "CASE WHEN COALESCE({membership} ? hashtext(source.id)::text, TRUE) \
+             THEN {guard} ELSE FALSE END"
+        ),
+    )
+}
+
+fn native_patient_code_predicate_with_guard(
+    system: &str,
+    code: &str,
+    guard: String,
+) -> SqlFragment {
     SqlFragment::with_params(
         format!(
             "EXISTS (WITH referenced_observations AS MATERIALIZED \
@@ -129,21 +178,26 @@ pub(crate) fn native_patient_code_predicate(
              WHERE patient.tenant_id = resources.tenant_id AND patient.resource_type = 'Observation' \
              AND patient.param_name = 'patient' AND patient.is_contained = FALSE \
              AND patient.value_reference = 'Patient/' || resources.id) \
-             SELECT 1 FROM referenced_observations source WHERE EXISTS \
-             (WITH scoped_code AS MATERIALIZED \
-             (SELECT resource_id, value_token_system, value_token_code FROM search_index \
-             WHERE tenant_id = resources.tenant_id AND resource_type = 'Observation' \
-             AND resource_id = source.id AND param_name = 'code' AND is_contained = FALSE) \
-             SELECT 1 FROM (SELECT resource_id FROM scoped_code \
-             WHERE value_token_system IN (${}, '{IMPLICIT_TOKEN_SYSTEM}') AND value_token_code = ${} LIMIT 1) matched \
-             JOIN resources observation ON observation.tenant_id = resources.tenant_id \
-             AND observation.resource_type = 'Observation' AND observation.id = matched.resource_id \
-             WHERE observation.is_deleted = FALSE \
-             AND observation.data #>> '{{subject,reference}}' = 'Patient/' || resources.id))",
-            offset + 1,
-            offset + 2,
+             SELECT 1 FROM referenced_observations source WHERE {guard})",
         ),
         vec![SqlParam::text(system), SqlParam::text(code)],
+    )
+}
+
+fn native_patient_code_source_guard(offset: usize) -> String {
+    format!(
+        "EXISTS (WITH scoped_code AS MATERIALIZED \
+         (SELECT resource_id, value_token_system, value_token_code FROM search_index \
+         WHERE tenant_id = resources.tenant_id AND resource_type = 'Observation' \
+         AND resource_id = source.id AND param_name = 'code' AND is_contained = FALSE) \
+         SELECT 1 FROM (SELECT resource_id FROM scoped_code \
+         WHERE value_token_system IN (${}, '{IMPLICIT_TOKEN_SYSTEM}') AND value_token_code = ${} LIMIT 1) matched \
+         JOIN resources observation ON observation.tenant_id = resources.tenant_id \
+         AND observation.resource_type = 'Observation' AND observation.id = matched.resource_id \
+         WHERE observation.is_deleted = FALSE \
+         AND observation.data #>> '{{subject,reference}}' = 'Patient/' || resources.id)",
+        offset + 1,
+        offset + 2,
     )
 }
 
@@ -341,6 +395,53 @@ mod tests {
             ));
             assert!(!fragment.sql.contains("http://loinc.org"));
         }
+    }
+
+    #[test]
+    fn native_2075_count_reuses_tenant_and_token_binds_with_exact_guard() {
+        for (tenant_param, offset) in [(1, 2), (3, 4), (1, 7)] {
+            let page = native_patient_code_predicate("a'|$9", "b'|$8", offset);
+            let count = native_patient_code_count_predicate("a'|$9", "b'|$8", offset, tenant_param);
+            assert_eq!(
+                placeholders(&count.sql),
+                [tenant_param, offset + 1, offset + 2]
+            );
+            assert_eq!(format!("{:?}", page.params), format!("{:?}", count.params));
+            assert!(!count.sql.contains("a'|$9") && !count.sql.contains("b'|$8"));
+            let exact_guard = native_patient_code_source_guard(offset);
+            assert!(page.sql.contains(&exact_guard));
+            assert!(
+                count
+                    .sql
+                    .contains(&format!("THEN {exact_guard} ELSE FALSE END"))
+            );
+            assert!(!page.sql.contains("code_candidates"));
+        }
+    }
+
+    #[test]
+    fn native_2075_count_bounds_input_and_keeps_prefilter_a_superset() {
+        let fragment = native_patient_code_count_predicate("system", "code", 2, 1);
+        assert!(fragment.sql.contains("count(*) > 262144 THEN NULL::jsonb"));
+        assert!(fragment.sql.contains("LIMIT 262145"));
+        assert!(fragment.sql.contains("hashtext(resource_id)::text AS key"));
+        assert!(
+            fragment
+                .sql
+                .contains("jsonb_object_agg(candidate.key, TRUE), '{}'::jsonb")
+        );
+        assert!(fragment.sql.contains("? hashtext(source.id)::text, TRUE)"));
+        let candidate_sql = fragment
+            .sql
+            .split("FROM search_index code_candidates")
+            .nth(1)
+            .unwrap()
+            .split(") candidate")
+            .next()
+            .unwrap();
+        assert!(candidate_sql.contains("code_candidates.tenant_id = $1"));
+        assert!(!candidate_sql.contains("is_contained"));
+        assert!(!candidate_sql.contains("DISTINCT"));
     }
 
     /// The `$N` placeholders a fragment uses, in order of first appearance.

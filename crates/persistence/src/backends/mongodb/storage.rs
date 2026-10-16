@@ -28,7 +28,7 @@ use crate::core::{
 };
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
-    StorageResult, TransactionError,
+    StorageResult, TooLargeForCacheCause, TransactionError,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
@@ -204,7 +204,9 @@ const EVICTION_ROLLBACK_REASON: &str = "rolled back for eviction";
 /// WiredTiger `-31800`). Sent with no `TransientTransactionError` label. mongod
 /// sends it instead of 365/112 only when the transaction holds more than
 /// `transactionTooLargeForCacheThreshold` (0.75) of the cache's dirty bytes. A
-/// replay cannot help: the same writes meet the same cache (#1837).
+/// replay cannot help: the same writes meet the same cache (#1837). It can
+/// arrive on `commitTransaction` too: the commit writes the transaction's oplog
+/// entry, which can push a write set just under the ceiling over it (#1991).
 const TRANSACTION_TOO_LARGE_FOR_CACHE_CODE: i32 = 388;
 
 /// Pause before the single retry of an unconditional delete that hit a write
@@ -432,8 +434,9 @@ fn is_eviction_rollback(err: &MongoError) -> bool {
             .is_some_and(|message| message.contains(EVICTION_ROLLBACK_REASON))
 }
 
-/// True when `err` is `TransactionTooLargeForCache` (388): as a failed command,
-/// a per-write error, or any per-document error of an `insert_many`, the shape
+/// True when `err` is `TransactionTooLargeForCache` (388): as a failed command
+/// (an entry's write, or `commitTransaction` itself, #1991), a per-write error,
+/// or any per-document error of an `insert_many`, the shape
 /// the search-index insert reports it in (#1837). Decided by the code, never by
 /// the message text.
 fn is_too_large_for_cache(err: &MongoError) -> bool {
@@ -523,6 +526,29 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
     None
 }
 
+/// The [`TransactionError::TooLargeForCache`] for a `TransactionTooLargeForCache`
+/// (388), wherever the Bundle met it: an entry's write ([`entry_attempt_error`]),
+/// the deferred-search-index ledger ([`ledger_attempt_error`], #1975) or the
+/// commit ([`CommitAttempts::after_failure`], #1991). They are one cause: the
+/// Bundle's own write set does not fit WiredTiger's cache, so neither a replay
+/// nor a re-sent commit can help (#1837). A lone Bundle's eviction rollback is
+/// another cause and is built in [`lone_eviction_failure`] (#1895).
+///
+/// `entries` is the Bundle's entry count. `reason` is the raw driver detail
+/// behind a prefix that says where it happened (`Entry N processing failed: `
+/// or `Commit failed: `). It is for the log only.
+///
+/// It carries [`TooLargeForCacheCause::WriteSetTooLarge`];
+/// [`lone_eviction_failure`] carries [`TooLargeForCacheCause::LoneEviction`]
+/// (#1993).
+fn write_set_too_large_for_cache(entries: usize, reason: String) -> TransactionError {
+    TransactionError::TooLargeForCache {
+        cause: TooLargeForCacheCause::WriteSetTooLarge,
+        entries,
+        reason,
+    }
+}
+
 /// Why a bundle attempt failed, given the error entry `index` raised in a
 /// transaction of `entries` entries (#1586, #1837).
 ///
@@ -536,10 +562,10 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
 /// - Anything else is a [`TransactionError::BundleError`] at the entry.
 fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> BundleAttemptError {
     if kept_driver_error(err).is_some_and(is_too_large_for_cache) {
-        return BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+        return BundleAttemptError::Failed(write_set_too_large_for_cache(
             entries,
-            reason: format!("Entry {index} processing failed: {err}"),
-        });
+            format!("Entry {index} processing failed: {err}"),
+        ));
     }
     if let Some(abort) = transient_entry_abort(err) {
         return BundleAttemptError::TransientAbort {
@@ -591,11 +617,14 @@ fn ledger_attempt_error(entries: usize, err: &StorageError) -> BundleAttemptErro
 /// or `None` to replay.
 ///
 /// A Bundle that held the whole admission room ran alone: no other Bundle of
-/// this backend was open. Its cache-pressure rollback is its own write set
+/// this backend was open. Its cache-pressure rollback is mostly its own write set
 /// meeting the cache, and a replay is rolled back again at about the same entry
 /// (benchmark: 49 of 50 such replays failed again while holding the whole
-/// room). So it ends as the outcome 388 already has (#1837). A Bundle that
-/// shared the room, or a plain `WriteConflict`, is replayed as before.
+/// room). So it ends as the outcome 388 already has (#1837), with
+/// [`TooLargeForCacheCause::LoneEviction`]: the room bounds only this backend's
+/// transaction Bundles and other writes share the cache, so the client is not
+/// told that a resubmit must fail (#1993). A Bundle that shared the room, or a
+/// plain `WriteConflict`, is replayed as before.
 fn lone_eviction_failure(
     holds_whole_room: bool,
     eviction: bool,
@@ -604,6 +633,7 @@ fn lone_eviction_failure(
     reason: &str,
 ) -> Option<TransactionError> {
     (holds_whole_room && eviction).then(|| TransactionError::TooLargeForCache {
+        cause: TooLargeForCacheCause::LoneEviction,
         entries,
         reason: match entry {
             Some(index) => format!(
@@ -633,6 +663,11 @@ enum CommitFailure {
     StillUnknown,
     /// The commit failed in a way that leaves nothing applied.
     RolledBack,
+    /// The server refused the commit with `TransactionTooLargeForCache` (388):
+    /// WiredTiger rolled the transaction back because its own write set, with
+    /// the oplog entry the commit writes, does not fit the cache. Nothing
+    /// committed, and neither a replay nor a re-sent commit can fit it (#1991).
+    TooLargeForCache,
 }
 
 /// The decision behind [`classify_commit_failure`], taken on the facts it reads
@@ -677,10 +712,38 @@ fn classify_commit_signals(
     }
 }
 
+/// The verdict for a commit refused with `TransactionTooLargeForCache` (388),
+/// given the one [`classify_commit_signals`] reached on its other signals
+/// (#1991).
+///
+/// 388 decides only a verdict that already says nothing was applied: a plain
+/// [`CommitFailure::RolledBack`], or a [`CommitFailure::TransientAbort`] when a
+/// `TransientTransactionError` label rides on it. Both become
+/// [`CommitFailure::TooLargeForCache`], as 388 outranks that label on an entry
+/// write ([`entry_attempt_error`]). It never overrides a verdict that says the
+/// commit may have applied: with a write-concern error or an
+/// `UnknownTransactionCommitResult` label the commit is re-sent as before, and
+/// after an earlier unknown commit the outcome stays unknown. The driver adds
+/// that label only to network and server-selection errors, retryable-write
+/// errors and codes 50, 64 and 91, never to 388, so the server's own 388
+/// always takes the first branch.
+fn too_large_for_cache_at_commit(verdict: CommitFailure) -> CommitFailure {
+    match verdict {
+        CommitFailure::RolledBack
+        | CommitFailure::TransientAbort
+        | CommitFailure::TooLargeForCache => CommitFailure::TooLargeForCache,
+        CommitFailure::UnknownResult | CommitFailure::StillUnknown => verdict,
+    }
+}
+
 /// Classifies a failed commit; `earlier_unknown` says a previous commit of the
 /// same transaction already failed with an unknown result.
+///
+/// A commit refused with 388 is settled by [`too_large_for_cache_at_commit`]
+/// (#1991). The commit's error is the driver's own, so [`is_too_large_for_cache`]
+/// reads it directly, with no [`kept_driver_error`] walk.
 fn classify_commit_failure(err: &MongoError, earlier_unknown: bool) -> CommitFailure {
-    classify_commit_signals(
+    let verdict = classify_commit_signals(
         err.contains_label(TRANSIENT_TRANSACTION_ERROR),
         err.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT),
         is_temporarily_unavailable(err),
@@ -689,7 +752,12 @@ fn classify_commit_failure(err: &MongoError, earlier_unknown: bool) -> CommitFai
             MongoErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(_))
         ),
         earlier_unknown,
-    )
+    );
+    if is_too_large_for_cache(err) {
+        too_large_for_cache_at_commit(verdict)
+    } else {
+        verdict
+    }
 }
 
 /// What to do after a commit failed.
@@ -706,13 +774,16 @@ struct CommitAttempts {
     sent: u32,
     /// True once any commit failed with an unknown result.
     outcome_unknown: bool,
+    /// The Bundle's entry count, which a commit refused with 388 reports (#1991).
+    entries: usize,
 }
 
 impl CommitAttempts {
-    fn new() -> Self {
+    fn new(entries: usize) -> Self {
         Self {
             sent: 1,
             outcome_unknown: false,
+            entries,
         }
     }
 
@@ -724,6 +795,12 @@ impl CommitAttempts {
     /// [`TransactionError::CommitOutcomeUnknown`]: not a replay of the entries,
     /// and not `RolledBack`, which would tell the client nothing was applied
     /// when the earlier commit may have applied it.
+    ///
+    /// A commit refused with `TransactionTooLargeForCache` (388) stops at once as
+    /// [`TransactionError::TooLargeForCache`] with the Bundle's entry count: the
+    /// commit is not re-sent and, being `Failed`, the Bundle is not replayed
+    /// (#1991). This holds only while nothing says the commit may have applied
+    /// ([`too_large_for_cache_at_commit`]).
     fn after_failure(&mut self, err: &MongoError) -> CommitStep {
         match classify_commit_failure(err, self.outcome_unknown) {
             CommitFailure::TransientAbort => CommitStep::Stop(BundleAttemptError::TransientAbort {
@@ -764,6 +841,9 @@ impl CommitAttempts {
                     reason: format!("Commit failed: {err}"),
                 }))
             }
+            CommitFailure::TooLargeForCache => CommitStep::Stop(BundleAttemptError::Failed(
+                write_set_too_large_for_cache(self.entries, format!("Commit failed: {err}")),
+            )),
         }
     }
 }
@@ -4297,8 +4377,9 @@ impl BundleProvider for MongoBackend {
     /// losing ends as [`TransactionError::Transient`] (a retryable 503), not as
     /// a `BundleError` blaming the entry it happened to be on. A Bundle whose own
     /// write set does not fit WiredTiger's cache (`TransactionTooLargeForCache`,
-    /// 388) is not run again: it ends at once as
-    /// [`TransactionError::TooLargeForCache`] (#1837). A Bundle that held the
+    /// 388), whether on an entry's write or on the commit, is not run again and
+    /// its commit is not re-sent: it ends at once as
+    /// [`TransactionError::TooLargeForCache`] (#1837, #1991). A Bundle that held the
     /// whole admission room ran alone, and when WiredTiger rolls it back for
     /// cache pressure (112 "rolled back for eviction", or 365) it is not run
     /// again either; it ends at once as `TooLargeForCache` (#1895).
@@ -4731,8 +4812,10 @@ impl MongoBackend {
         // re-running the entries is not, since every POST would be stored a
         // second time under a new id. `CommitAttempts` keeps the verdicts
         // straight: once any commit has been unknown, no later failure may
-        // read as "rolled back" or as grounds for a replay.
-        let mut commit = CommitAttempts::new();
+        // read as "rolled back" or as grounds for a replay. A commit refused
+        // with 388 ends the attempt as `TooLargeForCache` at once: no re-sent
+        // commit and no replay (#1991).
+        let mut commit = CommitAttempts::new(entry_count);
         while let Err(e) = session.commit_transaction().await {
             match commit.after_failure(&e) {
                 CommitStep::RetryCommit => continue,
@@ -9110,9 +9193,11 @@ mod transient_abort_tests {
             match entry_attempt_error(6959, 7412, &err) {
                 BundleAttemptError::Failed(TransactionError::TooLargeForCache {
                     entries,
+                    cause,
                     reason,
                 }) => {
                     assert_eq!(entries, 7412);
+                    assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
                     assert!(reason.contains("388"), "{reason}");
                     assert!(reason.contains("6959"), "{reason}");
                 }
@@ -9123,7 +9208,11 @@ mod transient_abort_tests {
         let err = StorageError::from(command_error(388, "TransactionTooLargeForCache"));
         assert!(matches!(
             entry_attempt_error(0, 2, &err),
-            BundleAttemptError::Failed(TransactionError::TooLargeForCache { entries: 2, .. })
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                entries: 2,
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
+                ..
+            })
         ));
     }
 
@@ -9235,7 +9324,10 @@ mod transient_abort_tests {
         );
         assert!(matches!(
             entry_attempt_error(3, 10, &err),
-            BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. })
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
+                ..
+            })
         ));
     }
 
@@ -9248,9 +9340,11 @@ mod transient_abort_tests {
         match lone_eviction_failure(true, true, 7412, Some(6959), &reason) {
             Some(TransactionError::TooLargeForCache {
                 entries,
+                cause,
                 reason: actual,
             }) => {
                 assert_eq!(entries, 7412);
+                assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
                 assert_eq!(
                     actual,
                     format!(
@@ -9263,8 +9357,13 @@ mod transient_abort_tests {
         }
         // At commit there is no failing entry to name.
         match lone_eviction_failure(true, true, 7412, None, "Commit failed: boom") {
-            Some(TransactionError::TooLargeForCache { entries, reason }) => {
+            Some(TransactionError::TooLargeForCache {
+                entries,
+                cause,
+                reason,
+            }) => {
                 assert_eq!(entries, 7412);
+                assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
                 assert_eq!(
                     reason,
                     "Commit rolled back for eviction while the Bundle ran alone; \
@@ -9351,8 +9450,13 @@ mod transient_abort_tests {
             );
             match ledger_attempt_error(7412, &err) {
                 BundleAttemptError::Failed(TransactionError::TooLargeForCache {
-                    entries, ..
-                }) => assert_eq!(entries, 7412),
+                    entries,
+                    cause,
+                    ..
+                }) => {
+                    assert_eq!(entries, 7412);
+                    assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
+                }
                 other => panic!("expected TooLargeForCache, got {other:?}"),
             }
         }
@@ -9542,6 +9646,20 @@ mod transient_abort_tests {
         err
     }
 
+    /// #1991: the commit failure of the issue's log, `Error code 388
+    /// (TransactionTooLargeForCache) ... labels: {}`: code 388 with no label.
+    /// The literal is deliberate; it pins the number the server sends.
+    fn commit_too_large_for_cache() -> MongoError {
+        let err = command_error_with_message(
+            388,
+            "TransactionTooLargeForCache",
+            "WiredTigerRecordStore::insertRecord -31800: transaction is too large and will \
+             not fit in the storage engine cache",
+        );
+        assert!(err.labels().is_empty(), "the server sent no label");
+        err
+    }
+
     #[test]
     fn an_unlabelled_commit_failure_with_code_365_is_a_transient_abort() {
         let err = temporarily_unavailable();
@@ -9586,10 +9704,122 @@ mod transient_abort_tests {
         }
     }
 
+    #[test]
+    fn an_unlabelled_code_388_commit_failure_is_too_large_for_cache_while_no_commit_is_unknown() {
+        assert_eq!(
+            classify_commit_failure(&commit_too_large_for_cache(), false),
+            CommitFailure::TooLargeForCache
+        );
+        // An earlier commit may have applied, so the outcome stays unknown
+        // rather than reading as a rollback.
+        assert_eq!(
+            classify_commit_failure(&commit_too_large_for_cache(), true),
+            CommitFailure::StillUnknown
+        );
+        // A write-concern error is reported after the commit applied, whatever
+        // its code.
+        let applied = write_concern_error(388, "TransactionTooLargeForCache");
+        for earlier in [false, true] {
+            assert_eq!(
+                classify_commit_failure(&applied, earlier),
+                CommitFailure::UnknownResult
+            );
+        }
+    }
+
+    #[test]
+    fn code_388_at_commit_decides_only_verdicts_that_say_nothing_was_applied() {
+        use CommitFailure::*;
+        // (transient label, unknown-result label, write concern, earlier unknown)
+        let table = [
+            ((false, false, false, false), TooLargeForCache),
+            ((true, false, false, false), TooLargeForCache),
+            ((true, true, false, false), TooLargeForCache),
+            ((false, true, false, false), UnknownResult),
+            ((false, true, false, true), UnknownResult),
+            ((false, false, false, true), StillUnknown),
+            ((true, false, false, true), StillUnknown),
+            ((true, true, false, true), StillUnknown),
+        ];
+        for ((t, u, wc, e), expected) in table {
+            assert_eq!(
+                too_large_for_cache_at_commit(classify_commit_signals(t, u, false, wc, e)),
+                expected,
+                "transient={t} unknown={u} write_concern={wc} earlier={e}"
+            );
+        }
+        for t in [false, true] {
+            for u in [false, true] {
+                for e in [false, true] {
+                    assert_eq!(
+                        too_large_for_cache_at_commit(classify_commit_signals(
+                            t, u, false, true, e
+                        )),
+                        UnknownResult,
+                        "a write-concern error is unknown: transient={t} unknown={u} earlier={e}"
+                    );
+                }
+            }
+        }
+        assert_eq!(too_large_for_cache_at_commit(RolledBack), TooLargeForCache);
+        assert_eq!(
+            too_large_for_cache_at_commit(TransientAbort),
+            TooLargeForCache
+        );
+        assert_eq!(too_large_for_cache_at_commit(UnknownResult), UnknownResult);
+        assert_eq!(too_large_for_cache_at_commit(StillUnknown), StillUnknown);
+    }
+
+    #[test]
+    fn the_commit_loop_ends_a_code_388_commit_failure_at_once_as_too_large_for_cache() {
+        let steps = drive_commit(vec![
+            commit_too_large_for_cache(),
+            commit_too_large_for_cache(),
+            commit_too_large_for_cache(),
+        ]);
+        assert_eq!(steps.len(), 1, "the commit is not re-sent");
+        match stopped_with(&steps[0]) {
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                cause,
+                entries,
+                reason,
+            }) => {
+                assert_eq!(
+                    *cause,
+                    TooLargeForCacheCause::WriteSetTooLarge,
+                    "a commit-time 388 is the write-set cause"
+                );
+                assert_eq!(*entries, DRIVEN_BUNDLE_ENTRIES);
+                assert!(reason.starts_with("Commit failed: "), "{reason}");
+                assert!(reason.contains("388"), "{reason}");
+                assert!(reason.contains("TransactionTooLargeForCache"), "{reason}");
+            }
+            other => panic!("expected TooLargeForCache, got {other:?}"),
+        }
+
+        // After an earlier unknown commit the 388 does not read as a rollback.
+        let steps = drive_commit(vec![
+            write_concern_error(79, "UnknownReplWriteConcern"),
+            commit_too_large_for_cache(),
+        ]);
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(steps[0], CommitStep::RetryCommit));
+        match stopped_with(&steps[1]) {
+            BundleAttemptError::Failed(TransactionError::CommitOutcomeUnknown { reason }) => {
+                assert!(reason.contains("unknown"), "{reason}");
+            }
+            other => panic!("expected CommitOutcomeUnknown, got {other:?}"),
+        }
+    }
+
+    /// The entry count [`drive_commit`] runs its commits for: the 6,135-entry
+    /// Synthea Bundle of #1991.
+    const DRIVEN_BUNDLE_ENTRIES: usize = 6135;
+
     /// Runs `failures` through a fresh [`CommitAttempts`], as the commit loop
     /// does, and returns what it decided at each one.
     fn drive_commit(failures: Vec<MongoError>) -> Vec<CommitStep> {
-        let mut attempts = CommitAttempts::new();
+        let mut attempts = CommitAttempts::new(DRIVEN_BUNDLE_ENTRIES);
         let mut steps = Vec::new();
         for failure in failures {
             let step = attempts.after_failure(&failure);

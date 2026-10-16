@@ -77,10 +77,10 @@ impl ColumnDecode {
     pub fn from_fhir_type(name: &str) -> Self {
         match name {
             "string" | "code" | "id" | "uri" | "url" | "canonical" | "oid" | "uuid"
-            | "markdown" | "date" | "dateTime" | "instant" | "time" | "base64Binary"
-            | "integer64" | "xhtml" | "String" => Self::Text,
+            | "markdown" | "date" | "dateTime" | "instant" | "time" | "base64Binary" | "xhtml"
+            | "String" => Self::Text,
             "boolean" | "Boolean" => Self::Boolean,
-            "integer" | "positiveInt" | "unsignedInt" | "Integer" => Self::Integer,
+            "integer" | "positiveInt" | "unsignedInt" | "integer64" | "Integer" => Self::Integer,
             "decimal" | "Decimal" => Self::Decimal,
             // Remaining System names: leave them as they were.
             "Date" | "DateTime" | "Time" | "Quantity" => Self::Auto,
@@ -189,10 +189,12 @@ mod tests {
             "uri",
             "date",
             "dateTime",
-            "integer64",
+            "instant",
+            "base64Binary",
         ] {
             assert_eq!(d(t), ColumnDecode::Text, "{t}");
         }
+        assert_eq!(d("integer64"), ColumnDecode::Integer);
         assert_eq!(d("boolean"), ColumnDecode::Boolean);
         assert_eq!(d("integer"), ColumnDecode::Integer);
         assert_eq!(d("positiveInt"), ColumnDecode::Integer);

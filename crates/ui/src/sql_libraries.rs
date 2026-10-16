@@ -886,11 +886,15 @@ pub(crate) fn analyze_columns(
 ) -> Vec<ColumnInfo> {
     let schemas: Vec<(&str, helios_sof::sqlquery::TableSchema)> = view_definitions
         .iter()
-        .map(|(label, vd)| {
-            (
-                label.as_str(),
-                helios_sof::sqlquery::TableSchema::from_view_definition(vd),
-            )
+        .filter_map(|(label, vd)| {
+            // A ViewDefinition with an invalid `ansi/type` tag cannot be
+            // resolved to a schema (the server rejects it the same way), so
+            // it is treated like any other dependency that fails to
+            // resolve: absent, with no origin and the type inferred from
+            // the row values — never silently ignoring the bad tag.
+            helios_sof::sqlquery::TableSchema::try_from_view_definition(vd)
+                .ok()
+                .map(|schema| (label.as_str(), schema))
         })
         .collect();
 
@@ -1817,6 +1821,20 @@ mod tests {
                 origin: None,
             }
         );
+    }
+
+    #[test]
+    fn analyze_columns_skips_a_dependency_with_an_invalid_ansi_type_tag() {
+        let mut vd = view_definition_with_columns(&[("id", "string")]);
+        vd["select"][0]["column"][0]["tag"] = json!([
+            {"name": "ansi/type", "value": "NOT_A_TYPE"}
+        ]);
+        assert!(helios_sof::sqlquery::TableSchema::try_from_view_definition(&vd).is_err());
+        let rows = vec![json!({"id": "p1"})];
+        let info = analyze_columns(&["id".to_string()], &rows, &[("v".to_string(), vd)]);
+        // Unresolvable dependency: no origin, type inferred from the rows.
+        assert_eq!(info[0].origin, None);
+        assert_eq!(info[0].type_code.as_deref(), Some("string"));
     }
 
     #[test]
