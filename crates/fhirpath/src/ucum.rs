@@ -78,6 +78,29 @@ pub fn units_are_comparable(unit1: &str, unit2: &str) -> bool {
     is_comparable(&ucum_unit1, &ucum_unit2).unwrap_or(false)
 }
 
+/// Whether one unit is a calendar year/month keyword and the other is a
+/// UCUM time unit. The FHIRPath spec makes such pairs not comparable for
+/// equality (`1 year = 1 'a'` is empty), though they are equivalent
+/// (`1 year ~ 1 'a'` is true). Calendar durations of a week or less are
+/// comparable to their UCUM counterparts and are not matched here.
+pub fn is_calendar_vs_ucum_year_or_month(unit1: &str, unit2: &str) -> bool {
+    fn is_calendar_keyword(unit: &str) -> bool {
+        calendar_to_ucum_unit(unit) != unit
+    }
+    fn is_calendar_year_or_month(unit: &str) -> bool {
+        matches!(
+            unit.to_lowercase().as_str(),
+            "year" | "years" | "month" | "months"
+        )
+    }
+    let mixed = |cal: &str, other: &str| {
+        is_calendar_year_or_month(cal)
+            && !is_calendar_keyword(other)
+            && units_are_comparable(cal, other)
+    };
+    mixed(unit1, unit2) || mixed(unit2, unit1)
+}
+
 /// Checks if two quantities are equivalent (same value when converted to common units)
 pub fn quantities_are_equivalent(
     value1: Decimal,
