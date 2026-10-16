@@ -6,7 +6,6 @@ import {
   seedTwoVersions,
   waitSearchable,
   deleteResources,
-  seedTwoVersions,
 } from "../pages/api";
 import type { ResourcesPage } from "../pages/resources";
 
