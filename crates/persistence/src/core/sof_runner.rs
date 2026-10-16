@@ -13,8 +13,8 @@
 //!
 //! If the configured backend provides no runner at all, the
 //! `$viewdefinition-run` handler returns `501 Not Implemented`. Inline
-//! `resource:` parameters are materialised into a transient in-memory SQLite
-//! backend so they reuse the same in-DB pipeline.
+//! `resource:` parameters bypass the runner: the REST layer evaluates them
+//! with the in-process `helios-sof` FHIRPath engine.
 //!
 //! The handler layer streams the result rows directly into the HTTP response.
 //!

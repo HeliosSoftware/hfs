@@ -51,7 +51,8 @@ use helios_persistence::core::{
     SearchProvider, SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
-    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TransactionError,
+    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError,
+    TooLargeForCacheCause, TransactionError,
 };
 use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -127,6 +128,9 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.transaction_bundle_weight_entries, 1000);
     // #1806: no separate deadline unless the embedder sets one.
     assert_eq!(config.bundle_transaction_deadline, None);
+    // #1975: the deferred-index threshold follows the gate's entry room unless
+    // the embedder sets it.
+    assert_eq!(config.transaction_bundle_deferred_index_entries, None);
 }
 
 #[test]
@@ -1264,6 +1268,11 @@ mod transaction_bundle_admission;
 /// (entries per standard Bundle) the gate's room is counted in.
 #[path = "mongodb/transaction_bundle_load.rs"]
 mod transaction_bundle_load;
+
+/// #1975: transaction Bundles of N+ entries write their search rows after the
+/// commit; ledger, repair, conditional rule, ceiling.
+#[path = "mongodb/deferred_search_index.rs"]
+mod deferred_search_index;
 
 /// #1748: potentially broad searches wait for a permit, so a read can still get
 /// a pooled connection while they run.

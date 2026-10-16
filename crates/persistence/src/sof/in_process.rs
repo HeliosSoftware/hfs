@@ -1176,4 +1176,35 @@ mod tests {
             assert_eq!(ids.len(), cap, "limit {cap}");
         }
     }
+
+    /// An invalid `ansi/type` tag is rejected up front, naming the column.
+    #[tokio::test]
+    async fn invalid_ansi_type_tag_is_rejected_naming_the_column() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![patient()]), FhirVersion::R4, "test");
+        for (col, ty, tag) in [
+            ("unknown_tag", "string", json!("NOT_A_TYPE")),
+            ("incompat_tag", "decimal", json!("INT")),
+            ("nonstring_tag", "string", json!(42)),
+        ] {
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "status": "active",
+                "select": [{"column": [{"name": col, "path": "id", "type": ty,
+                    "tag": [{"name": "ansi/type", "value": tag}]}]}]
+            });
+            let err = match runner
+                .run_view(&tenant(), view, ViewFilters::default())
+                .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("{col}: invalid tag accepted"),
+            };
+            // A non-string tag value fails in serde before the column is known.
+            if col != "nonstring_tag" {
+                assert!(err.to_string().contains(col), "{col}: {err}");
+            }
+        }
+    }
 }

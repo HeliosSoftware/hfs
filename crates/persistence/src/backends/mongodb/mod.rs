@@ -22,6 +22,7 @@ mod bulk_ingest;
 pub(crate) mod bulk_provider;
 mod bulk_submit;
 mod composite_search;
+mod deferred_index;
 mod login_sessions;
 mod missing_index_builder;
 mod probe_cache;
@@ -40,4 +41,5 @@ mod transaction_bundle_gate;
 mod user_settings;
 
 pub use backend::{MongoBackend, MongoBackendConfig};
+pub use deferred_index::DeferredIndexRepairReport;
 pub use search_index_builder::{BuildOutcome, IndexBuildMode};

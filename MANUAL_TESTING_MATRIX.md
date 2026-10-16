@@ -1138,9 +1138,9 @@ kind is exported in every format.
 | # | Name | Subjects | Format | Expect |
 |---|---|---|---|---|
 | 7.m | `vd-csv` | `patient_demographics` | **CSV**, header on | header `id,gender,birth_date,family,city` plus **11,705** data lines; `PID`'s line reads `…,female,2015-12-29,Parker433,Everett` |
-| 7.n | `vd-parquet` | `patient_demographics` | **Parquet** | schema `id, gender, birth_date, family, city`; **11,705** rows; `birth_date` is a **string** column, which is correct — the SQL on FHIR 3.0.0-ballot default mapping (see #569) renders FHIR `date`, `dateTime` and `time` as `CHARACTER VARYING` |
+| 7.n | `vd-parquet` | `patient_demographics` | **Parquet** | schema `id, gender, birth_date, family, city`; **11,705** rows; `birth_date` is a **string** column, which is correct — the SQL on FHIR 3.0.0-ballot default mapping (see #569) renders FHIR `date`, `dateTime` and `time` as `CHARACTER VARYING` (UTF8 in Parquet); an `ansi/type: DATE` tag on the column would make it a native date |
 | 7.o | `query-ndjson` | `tall_female_patients`, `min_height` = `150` | **NDJSON** | one JSON object per line with `id`, `city`, `height`; line count equals the data-line count of 7.b |
-| 7.p | `query-parquet` | `tall_female_patients`, `min_height` = `150` | **Parquet** | schema `id, city, height` with `height` numeric; row count equals 7.o |
+| 7.p | `query-parquet` | `tall_female_patients`, `min_height` = `150` | **Parquet** | schema `id, city, height`; `height` is a computed column, so its type is inferred from the values (integer values `INT32`, a fractional value `UTF8`, since FHIRPath `Decimal` maps to `CHARACTER VARYING`); row count equals 7.o |
 | 7.q | `view-ndjson` | `female_patients` | **NDJSON** | **5,814** lines, each with `id`, `birth_date`, `city` and no `gender` key |
 
 Coverage after 7.a–7.q:

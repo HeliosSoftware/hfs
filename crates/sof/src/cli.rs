@@ -400,6 +400,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Validate column tags on the raw JSON first so a bad `ansi/type` tag
+    // (including a non-string value) is reported naming the column rather than
+    // as a generic serde error. Malformed JSON falls through to the typed parse.
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&view_content)
+        && raw.is_object()
+    {
+        helios_sof::column_types::resolve_columns(&raw)?;
+    }
+
     // Parse ViewDefinition based on specified FHIR version
     let view_definition: SofViewDefinition = match args.fhir_version {
         #[cfg(feature = "R4")]
@@ -827,7 +836,7 @@ fn write_parquet_with_splitting(
         .map(|mb| mb as usize * 1024 * 1024)
         .unwrap_or(usize::MAX); // No limit if not specified
 
-    let declared = view_definition.declared_columns();
+    let declared = view_definition.try_declared_columns()?;
     let processed_result = helios_sof::process_view_definition(view_definition, bundle)?;
     let schema = std::sync::Arc::new(resolve_arrow_schema(
         &processed_result.columns,

@@ -5553,6 +5553,10 @@ mod postgres_integration {
             (&other, "13-collision", "29463-7", 40.0, "cm", "cm"),
             (&tenant, "14-collision", "29463-7", 40.0, "cm", "cm"),
             (&other, "14-collision", "8302-2", 70.0, "cm", "cm"),
+            (&tenant, "16-historical-high", "8302-2", 190.0, "cm", "cm"),
+            (&tenant, "17-canonical-high", "8302-2", 1.9, "m", "m"),
+            (&tenant, "18-boundary-raw", "8302-2", 150.0, "cm", "cm"),
+            (&tenant, "19-boundary-canonical", "8302-2", 1.5, "m", "m"),
         ] {
             backend.create(target, "Observation", json!({
                 "resourceType": "Observation", "id": id, "status": "final",
@@ -5577,7 +5581,8 @@ mod postgres_integration {
         let client = backend.get_client().await.unwrap();
         client.execute(
             "UPDATE search_index SET value_quantity_canonical_value = NULL, value_quantity_canonical_unit = NULL
-             WHERE tenant_id = $1 AND resource_id = '03-historical' AND param_name = 'value-quantity'",
+             WHERE tenant_id = $1 AND resource_id IN ('03-historical', '16-historical-high')
+             AND param_name = 'value-quantity'",
             &[&tenant_id],
         ).await.unwrap();
         // Persisted multivalued/duplicate indexes, not invalid repeating JSON.
@@ -5606,6 +5611,17 @@ mod postgres_integration {
                 &[&tenant_id, &id],
             ).await.unwrap();
         }
+        client.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+             value_token_system, value_token_code, value_quantity_value, value_quantity_unit,
+             value_quantity_system, value_quantity_canonical_value, value_quantity_canonical_unit, last_updated)
+             SELECT tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code,
+                    value_quantity_value, value_quantity_unit, value_quantity_system,
+                    value_quantity_canonical_value, value_quantity_canonical_unit, last_updated
+             FROM search_index WHERE tenant_id = $1 AND resource_id = '08-high'
+             AND param_name IN ('code', 'value-quantity')",
+            &[&tenant_id],
+        ).await.unwrap();
         client
             .execute(
                 "UPDATE resources SET last_updated = '2020-01-01T00:00:00Z' WHERE tenant_id = $1",
@@ -5719,20 +5735,78 @@ mod postgres_integration {
             assert_eq!(backend.search_count(&other, &query).await.unwrap(), 0);
 
             let mut unit_range = query.clone();
-            unit_range.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150|cm")];
+            unit_range.parameters[0].values = vec![SearchValue::eq("8302-2")];
+            unit_range.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150||cm")];
+            let unit_expected = [
+                "04-display",
+                "05-multi",
+                "08-high",
+                "16-historical-high",
+                "17-canonical-high",
+            ];
             assert_eq!(
                 ids(&backend.search(&tenant, &unit_range).await.unwrap()),
-                ["04-display", "05-multi", "08-high"]
+                unit_expected
             );
-            assert_eq!(backend.search_count(&tenant, &unit_range).await.unwrap(), 3);
+            assert_eq!(backend.search_count(&tenant, &unit_range).await.unwrap(), 5);
+            // Both 150 cm and its canonical equivalent 1.5 m sit exactly on
+            // the strict boundary, and must be excluded in either direction.
+            let mut less = unit_range.clone();
+            less.parameters[1].values[0].prefix = SearchPrefix::Lt;
+            assert_eq!(
+                ids(&backend.search(&tenant, &less).await.unwrap()),
+                [
+                    "01-raw",
+                    "02-canonical",
+                    "03-historical",
+                    "04-display",
+                    "05-multi",
+                    "06-duplicate",
+                    "07-tie",
+                    "09-code-only",
+                    "11-boundary",
+                    "13-collision"
+                ]
+            );
+            assert_eq!(backend.search_count(&tenant, &less).await.unwrap(), 10);
+            let mut reversed_unit = unit_range.clone();
+            reversed_unit.parameters.reverse();
+            assert_eq!(
+                backend.search_count(&tenant, &reversed_unit).await.unwrap(),
+                5
+            );
+            assert_eq!(
+                ids(&backend.search(&tenant, &reversed_unit).await.unwrap()),
+                unit_expected
+            );
+
+            let mut literal_page = unit_range.clone().with_count(2);
+            literal_page.total = Some(TotalMode::Accurate);
+            let mut paged_ids = Vec::new();
+            loop {
+                let page = backend.search(&tenant, &literal_page).await.unwrap();
+                assert_eq!(page.total, Some(5));
+                assert_eq!(
+                    backend.search_count(&tenant, &literal_page).await.unwrap(),
+                    5
+                );
+                paged_ids.extend(ids(&page));
+                if let Some(next) = page.resources.page_info.next_cursor {
+                    literal_page = literal_page.with_cursor(next);
+                } else {
+                    break;
+                }
+                assert!(paged_ids.len() < unit_expected.len(), "cursor must advance");
+            }
+            assert_eq!(paged_ids, unit_expected);
             let mut bare_range = query.clone();
             bare_range.parameters[0].values = vec![SearchValue::eq("8302-2")];
             bare_range.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150")];
             assert_eq!(
                 ids(&backend.search(&tenant, &bare_range).await.unwrap()),
-                ["05-multi", "08-high"]
+                ["05-multi", "08-high", "16-historical-high"]
             );
-            assert_eq!(backend.search_count(&tenant, &bare_range).await.unwrap(), 2);
+            assert_eq!(backend.search_count(&tenant, &bare_range).await.unwrap(), 3);
 
             // These OR/repeated/extra-parameter shapes retain the old path while
             // testing that each parameter still ranges over independent rows.
@@ -5742,14 +5816,15 @@ mod postgres_integration {
                 "150|http://unitsofmeasure.org|cm",
             ));
             let mut union_expected = expected.clone();
-            union_expected.push("08-high".into());
+            union_expected
+                .extend(["08-high", "16-historical-high", "17-canonical-high"].map(str::to_string));
             assert_eq!(
                 ids(&backend.search(&tenant, &alternatives).await.unwrap()),
                 union_expected
             );
             assert_eq!(
                 backend.search_count(&tenant, &alternatives).await.unwrap(),
-                8
+                10
             );
             let mut repeated = query.clone();
             let mut quantity = repeated.parameters[1].clone();
@@ -5872,9 +5947,15 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_integration_code_quantity_intersection_plan_scans_arms_once() {
         use helios_persistence::core::SearchProvider;
-        use helios_persistence::types::{SearchPrefix, SearchValue};
+        use helios_persistence::types::{SearchPrefix, SearchValue, TotalMode};
 
-        fn inspect(plan: &serde_json::Value, intersections: &mut usize, index_scans: &mut usize) {
+        fn inspect(
+            plan: &serde_json::Value,
+            intersections: &mut usize,
+            index_scans: &mut usize,
+            quantity_scans: &mut [usize; 2],
+            converted: bool,
+        ) {
             if plan.get("Actual Loops").and_then(serde_json::Value::as_u64) == Some(0) {
                 return; // One-time guards must leave inactive expensive branches unexecuted.
             }
@@ -5897,11 +5978,26 @@ mod postgres_integration {
                         Some(1),
                         "candidate arm was rescanned: {plan}"
                     );
+                    let predicates = ["Index Cond", "Recheck Cond", "Filter"]
+                        .into_iter()
+                        .filter_map(|field| plan[field].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let raw = predicates.contains("value_quantity_value");
+                    let canonical = predicates.contains("value_quantity_canonical_value");
+                    if converted {
+                        assert!(
+                            !(raw && canonical),
+                            "raw and canonical alternatives share one candidate access: {plan}"
+                        );
+                    }
+                    quantity_scans[0] += usize::from(raw);
+                    quantity_scans[1] += usize::from(canonical);
                 }
             }
             if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
                 for child in children {
-                    inspect(child, intersections, index_scans);
+                    inspect(child, intersections, index_scans, quantity_scans, converted);
                 }
             }
         }
@@ -5931,9 +6027,15 @@ mod postgres_integration {
             &[&tenant_id],
         ).await.unwrap();
         client.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_quantity_value, last_updated)
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+             value_quantity_value, value_quantity_unit, value_quantity_canonical_value,
+             value_quantity_canonical_unit, last_updated)
              SELECT $1, 'Observation', 'plan-' || lpad(series::text, 5, '0'), 'value-quantity',
-                    CASE WHEN series > 6000 THEN 190 ELSE 40 END,
+                    CASE WHEN series > 6000 THEN CASE WHEN series % 3 = 1 THEN 1900 ELSE 190 END ELSE 40 END,
+                    CASE WHEN series % 3 = 1 THEN 'mm' ELSE 'cm' END,
+                    CASE WHEN series % 3 = 0 THEN NULL WHEN series > 6000 THEN 1.9
+                         WHEN series % 3 = 1 THEN 0.04 ELSE 0.4 END,
+                    CASE WHEN series % 3 = 0 THEN NULL ELSE 'm' END,
                     '2020-01-01T00:00:00Z' FROM generate_series(1, 20000) series",
             &[&tenant_id],
         ).await.unwrap();
@@ -5942,63 +6044,89 @@ mod postgres_integration {
             .await
             .unwrap();
         drop(client);
-        let mut query = observation_code_quantity_intersection_query().with_count(20);
-        query.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150")];
-        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 3000);
-        let result = backend.search(&tenant, &query).await.unwrap();
-        assert_eq!(
-            result
-                .resources
-                .items
-                .iter()
-                .map(|r| r.id().to_string())
-                .collect::<Vec<_>>(),
-            (6001..=6020)
-                .map(|n| format!("plan-{n:05}"))
-                .collect::<Vec<_>>()
-        );
+        // Each third supplies raw-only, canonical-only, or overlapping matches.
+        // The no-unit control deliberately keeps the original 3000-result oracle.
+        for converted in [false, true] {
+            let mut query = observation_code_quantity_intersection_query().with_count(20);
+            query.parameters[0].values = vec![SearchValue::eq("8302-2")];
+            query.parameters[1].values = vec![SearchValue::new(
+                SearchPrefix::Gt,
+                if converted { "150||cm" } else { "150" },
+            )];
+            query.total = Some(TotalMode::Accurate);
+            assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 3000);
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(result.total, Some(3000));
+            assert_eq!(
+                result
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect::<Vec<_>>(),
+                (6001..=6020)
+                    .map(|n| format!("plan-{n:05}"))
+                    .collect::<Vec<_>>()
+            );
 
-        let client = backend.get_client().await.unwrap();
-        // One available pooled connection preserves the session that prepared both
-        // statements; inspect those actual wrappers, rather than inventing SQL.
-        let statements = client
-            .query(
-                "SELECT statement FROM pg_prepared_statements
-             WHERE statement LIKE '% INTERSECT %' AND statement LIKE '%FROM resources%'
-             AND (statement LIKE 'SELECT COUNT(*) FROM resources%'
-                  OR statement LIKE 'SELECT id, version_id,%') ORDER BY statement",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            statements.len(),
-            2,
-            "one count and one page statement expected"
-        );
-        for statement in statements {
-            let sql: String = statement.get(0);
-            let plan: serde_json::Value = client
-                .query_one(
-                    &format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"),
-                    &[
-                        &tenant_id,
-                        &"Observation",
-                        &"http://loinc.org",
-                        &"8302-2",
-                        &150.0_f64,
-                    ],
+            let client = backend.get_client().await.unwrap();
+            // Inspect the actual named count/page statements on their pooled
+            // session, including generic plans, rather than preparing EXPLAIN's
+            // copy of the SQL. Argument counts distinguish the two query shapes.
+            let statements = client
+                .query(
+                    "SELECT name FROM pg_prepared_statements
+                 WHERE statement LIKE '% INTERSECT %' AND statement LIKE '%FROM resources%'
+                 AND (statement LIKE 'SELECT COUNT(*) FROM resources%'
+                      OR statement LIKE 'SELECT id, version_id,%')
+                 AND cardinality(parameter_types) = $1 ORDER BY statement",
+                    &[&if converted { 7_i32 } else { 4_i32 }],
                 )
                 .await
-                .unwrap()
-                .get(0);
-            let (mut intersections, mut index_scans) = (0, 0);
-            inspect(&plan[0]["Plan"], &mut intersections, &mut index_scans);
-            assert_eq!(intersections, 1, "{plan}");
-            assert!(
-                index_scans >= 2,
-                "both independent candidate arms execute: {plan}"
+                .unwrap();
+            assert_eq!(
+                statements.len(),
+                2,
+                "one count and one page statement expected"
             );
+            for mode in ["force_custom_plan", "force_generic_plan"] {
+                client
+                    .batch_execute(&format!("SET plan_cache_mode = {mode}"))
+                    .await
+                    .unwrap();
+                for statement in &statements {
+                    let name: String = statement.get(0);
+                    let extra = if converted { ", 'cm', 1.5, 'm'" } else { "" };
+                    let sql = format!(
+                        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" ('{tenant_id}', 'Observation', '8302-2', 150{extra})",
+                        name.replace('"', "\"\"")
+                    );
+                    let plan: serde_json::Value = client.query_one(&sql, &[]).await.unwrap().get(0);
+                    let (mut intersections, mut index_scans, mut quantity_scans) = (0, 0, [0; 2]);
+                    inspect(
+                        &plan[0]["Plan"],
+                        &mut intersections,
+                        &mut index_scans,
+                        &mut quantity_scans,
+                        converted,
+                    );
+                    assert_eq!(intersections, 1, "{mode}: {plan}");
+                    assert!(
+                        index_scans >= 2,
+                        "both independent candidate arms execute: {mode}: {plan}"
+                    );
+                    assert!(
+                        quantity_scans[0] > 0,
+                        "raw candidate access must execute: {mode}: {plan}"
+                    );
+                    assert_eq!(
+                        quantity_scans[1] > 0,
+                        converted,
+                        "canonical candidate access: {mode}: {plan}"
+                    );
+                }
+            }
+            client.batch_execute("RESET plan_cache_mode").await.unwrap();
         }
     }
 
@@ -7452,6 +7580,411 @@ mod postgres_integration {
                 client.batch_execute("RESET plan_cache_mode").await.unwrap();
             }
         }
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn postgres_2075_broad_count_preserves_exact_membership_and_reused_bindings() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::IMPLICIT_TOKEN_SYSTEM;
+        use helios_persistence::types::{SearchValue, TotalMode};
+
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let _reserved = backend.get_client().await.unwrap();
+        let tenant = create_tenant("broad-membership-2075");
+        let other = create_tenant("broad-membership-other-2075");
+        let observation = |id: &str, patient: &str, coding: serde_json::Value| {
+            json!({"resourceType":"Observation", "id":id, "status":"final",
+                   "subject":{"reference":format!("Patient/{patient}")},
+                   "code":{"coding":[coding]}})
+        };
+        let loinc = || json!({"system":"http://loinc.org","code":"8302-2"});
+        for id in [
+            "explicit",
+            "implicit",
+            "no-system",
+            "wrong-system",
+            "split",
+            "contained",
+            "other",
+            "collision-only",
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":id}),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        for (id, patient, coding) in [
+            ("explicit-ob", "explicit", loinc()),
+            ("implicit-ob", "implicit", json!({"code":"8302-2"})),
+            ("no-system-ob", "no-system", json!({"code":"8302-2"})),
+            (
+                "wrong-system-ob",
+                "wrong-system",
+                json!({"system":"http://example.org","code":"8302-2"}),
+            ),
+            (
+                "split-ref",
+                "split",
+                json!({"system":"http://loinc.org","code":"wrong"}),
+            ),
+            ("split-code", "explicit", loinc()),
+            ("hash-ob-47973", "explicit", loinc()),
+            (
+                "hash-ob-226852",
+                "collision-only",
+                json!({"system":"http://loinc.org","code":"wrong"}),
+            ),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    observation(id, patient, coding),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        // The prefilter is allowed to see this contained token, but the exact
+        // guard must reject it even with a valid top-level patient index row.
+        let mut contained = observation(
+            "contained-ob",
+            "contained",
+            json!({"system":"http://loinc.org","code":"wrong"}),
+        );
+        contained["contained"] = json!([observation("child", "contained", loinc())]);
+        backend
+            .create(&tenant, "Observation", contained, FhirVersion::R4)
+            .await
+            .unwrap();
+        backend
+            .create(
+                &other,
+                "Patient",
+                json!({"resourceType":"Patient","id":"other"}),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &other,
+                "Observation",
+                observation("explicit-ob", "other", loinc()),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        let client = backend.get_client().await.unwrap();
+        let hash_collision: bool = client
+            .query_one(
+                "SELECT hashtext('hash-ob-47973') = hashtext('hash-ob-226852')",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            hash_collision,
+            "exercise a real PostgreSQL 16 hash collision"
+        );
+        // Exercise the supported implicit-system index marker separately from
+        // a Coding that genuinely omits system (stored as NULL by the writer).
+        assert_eq!(client.execute(
+            "UPDATE search_index SET value_token_system=$2 WHERE tenant_id=$1 AND resource_id='implicit-ob' AND param_name='code'",
+            &[&tenant.tenant_id().as_str(), &IMPLICIT_TOKEN_SYSTEM]).await.unwrap(), 1);
+        let contained_code_rows: i64 = client.query_one(
+            "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_id='contained-ob' AND param_name='code' AND is_contained=TRUE AND value_token_code='8302-2'",
+            &[&tenant.tenant_id().as_str()]).await.unwrap().get(0);
+        let top_level_patient_rows: i64 = client.query_one(
+            "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_id='contained-ob' AND param_name='patient' AND is_contained=FALSE AND value_reference='Patient/contained'",
+            &[&tenant.tenant_id().as_str()]).await.unwrap().get(0);
+        assert!(contained_code_rows > 0);
+        assert_eq!(top_level_patient_rows, 1);
+        client
+            .batch_execute("SET plan_cache_mode=auto")
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut query = native_has_1579_query();
+        query.total = Some(TotalMode::Accurate);
+        query.count = Some(1);
+        let first = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(first.total, Some(2));
+        assert_eq!(first.resources.items.len(), 1);
+        query.cursor = first.next_cursor().cloned();
+        assert!(query.cursor.is_some());
+        let second = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(second.total, Some(2));
+        assert_ne!(
+            first.resources.items[0].id(),
+            second.resources.items[0].id()
+        );
+        let mut ids = vec![
+            first.resources.items[0].id(),
+            second.resources.items[0].id(),
+        ];
+        ids.sort();
+        assert_eq!(ids, ["explicit", "implicit"]);
+        assert_eq!(
+            backend.search_count(&tenant, &query).await.unwrap(),
+            2,
+            "count ignores cursor and limit"
+        );
+        query.cursor = None;
+        query.offset = Some(99);
+        assert_eq!(
+            backend.search_count(&tenant, &query).await.unwrap(),
+            2,
+            "count ignores offset"
+        );
+        // Reuse one cached statement across tenants and different token values.
+        for _ in 0..6 {
+            assert_eq!(backend.search_count(&other, &query).await.unwrap(), 1);
+            query.reverse_chains[0].value = Some(SearchValue::eq("http://example.org|8302-2"));
+            assert_eq!(
+                backend.search_count(&tenant, &query).await.unwrap(),
+                2,
+                "requested or implicit system"
+            );
+            query.reverse_chains[0].value = Some(SearchValue::eq("http://loinc.org|absent"));
+            assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 0);
+            query.reverse_chains[0].value = Some(SearchValue::eq("http://loinc.org|8302-2"));
+            assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 2);
+        }
+        let client = backend.get_client().await.unwrap();
+        let uses: i64 = client.query_one(
+            "SELECT custom_plans + generic_plans FROM pg_prepared_statements WHERE statement LIKE 'SELECT COUNT(*) FROM resources%' AND statement LIKE '%WITH referenced_observations AS MATERIALIZED%'", &[]).await.unwrap().get(0);
+        assert!(
+            uses >= 24,
+            "reuse the prepared count past PostgreSQL's automatic-plan threshold"
+        );
+        let mode: String = client
+            .query_one("SHOW plan_cache_mode", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(mode, "auto");
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn postgres_2075_broad_prepared_count_skips_negative_source_probes() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchValue, TotalMode};
+
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let _reserved = backend.get_client().await.unwrap();
+        let tenant = create_tenant("broad-plan-2075");
+        let tenant_id = tenant.tenant_id().as_str();
+        // Multiple outer targets are essential: an _id-scoped plan does not
+        // expose the repeated exact code probes of a broad accurate count.
+        let client = backend.get_client().await.unwrap();
+        client.execute(
+            "INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) \
+             SELECT $1,'Patient','negative-'||n,'1',jsonb_build_object('resourceType','Patient','id','negative-'||n),statement_timestamp(),FALSE FROM generate_series(1,32) n", &[&tenant_id]).await.unwrap();
+        client.execute(
+            "INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) \
+             SELECT $1,'Observation','negative-ob-'||n,'1',jsonb_build_object('resourceType','Observation','id','negative-ob-'||n, \
+             'subject',jsonb_build_object('reference','Patient/negative-'||n)),statement_timestamp(),FALSE FROM generate_series(1,32) n", &[&tenant_id]).await.unwrap();
+        client.execute(
+            "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_reference) \
+             SELECT $1,'Observation','negative-ob-'||n,'patient','Patient/negative-'||n FROM generate_series(1,32) n", &[&tenant_id]).await.unwrap();
+        client.execute(
+            "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) \
+             SELECT $1,'Observation','negative-ob-'||n,'code','http://loinc.org','negative-code-'||c \
+             FROM generate_series(1,32) n CROSS JOIN generate_series(1,32) c", &[&tenant_id]).await.unwrap();
+        drop(client);
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"positive"}),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        backend.create(&tenant, "Observation", json!({"resourceType":"Observation","id":"positive-ob","status":"final", "subject":{"reference":"Patient/positive"},"code":{"coding":[{"system":"http://loinc.org","code":"8302-2"}]}}), FhirVersion::R4).await.unwrap();
+        let mut query = native_has_1579_query();
+        query.total = Some(TotalMode::Accurate);
+        query.count = Some(5);
+        assert_eq!(
+            backend.search(&tenant, &query).await.unwrap().total,
+            Some(1)
+        );
+        let client = backend.get_client().await.unwrap();
+        let rows = client.query(
+            "SELECT name,statement,parameter_types::text FROM pg_prepared_statements \
+             WHERE statement LIKE 'SELECT COUNT(*) FROM resources%' AND statement LIKE '%WITH referenced_observations AS MATERIALIZED%'", &[]).await.unwrap();
+        assert_eq!(rows.len(), 1, "capture the actual cached broad count");
+        let name: String = rows[0].get(0);
+        let sql: String = rows[0].get(1);
+        assert_eq!(rows[0].get::<_, String>(2), "{text,text,text,text}");
+        println!("2075 actual count SQL: {sql}");
+
+        fn nodes<'a>(node: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            out.push(node);
+            if let Some(children) = node["Plans"].as_array() {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+        let mut violations = vec![];
+        for density in ["sparse", "dense", "overflow-distinct", "overflow-duplicate"] {
+            if density == "dense" {
+                // Index-only candidates deliberately include stale sources.
+                // They stress membership size without changing exact matches.
+                client.execute(
+                    "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) \
+                     SELECT $1,'Observation','dense-'||n,'code','http://loinc.org','8302-2' FROM generate_series(1,8192) n", &[&tenant_id]).await.unwrap();
+            }
+            let overflow = density.starts_with("overflow-");
+            if overflow {
+                client.execute("DELETE FROM search_index WHERE tenant_id=$1 AND (resource_id LIKE 'dense-%' OR resource_id LIKE 'overflow-%')", &[&tenant_id]).await.unwrap();
+                // Exceed the cap in input rows, both with distinct keys and with
+                // one repeated key. A partial map could lose real sources;
+                // overflow must disable the prefilter for this statement.
+                let duplicate = density == "overflow-duplicate";
+                client.execute(
+                    "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) \
+                     SELECT $1,'Observation',CASE WHEN $2 THEN 'overflow-duplicate' ELSE 'overflow-'||n END, \
+                     'code','http://loinc.org','8302-2' FROM generate_series(1,262145) n", &[&tenant_id, &duplicate]).await.unwrap();
+            }
+            client
+                .batch_execute("ANALYZE resources; ANALYZE search_index")
+                .await
+                .unwrap();
+            for code in ["8302-2", "absent"] {
+                let execute = format!(
+                    "EXECUTE \"{name}\" ('{tenant_id}','Patient','http://loinc.org','{code}')"
+                );
+                let total: i64 = client.query_one(&execute, &[]).await.unwrap().get(0);
+                assert_eq!(total, i64::from(code == "8302-2"));
+                for work_mem in ["4MB", "64kB"] {
+                    for mode in ["force_custom_plan", "force_generic_plan"] {
+                        client.batch_execute(&format!("SET plan_cache_mode={mode}; SET work_mem='{work_mem}'; DISCARD PLANS")).await.unwrap();
+                        let explain = format!(
+                            "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) EXECUTE \"{name}\" ('{tenant_id}','Patient','http://loinc.org','{code}')"
+                        );
+                        let plan: serde_json::Value =
+                            client.query_one(&explain, &[]).await.unwrap().get(0);
+                        let mut all = vec![];
+                        nodes(&plan[0]["Plan"], &mut all);
+                        let slice = all
+                            .iter()
+                            .find(|node| node["Subplan Name"] == "CTE scoped_code")
+                            .expect("unchanged exact resource-scoped guard");
+                        let probes = slice["Actual Loops"].as_u64().unwrap();
+                        let body_loops: u64 = all
+                            .iter()
+                            .filter(|node| node["Alias"] == "observation")
+                            .map(|node| node["Actual Loops"].as_u64().unwrap())
+                            .sum();
+                        let expected = u64::from(code == "8302-2");
+                        let expected_probes = if overflow && expected == 1 {
+                            33
+                        } else {
+                            expected
+                        };
+                        println!(
+                            "2075 {density} {code} {work_mem} {mode}: exact code probes={probes}, body guard loops={body_loops}; plan={plan}"
+                        );
+                        if probes != expected_probes {
+                            violations.push(format!("{density} {code} {work_mem} {mode}: {probes} exact code probes, expected {expected_probes}; negative sources skip the exact code guard unless the candidate cap disables prefiltering"));
+                        }
+                        assert_eq!(body_loops, expected, "{plan}");
+                        let candidate = all
+                            .iter()
+                            .find(|node| node["Alias"] == "code_candidates")
+                            .expect("token-only candidate scan");
+                        assert_eq!(
+                            candidate["Actual Loops"], 1,
+                            "candidate scan must run once: {plan}"
+                        );
+                        let initplans = all
+                            .iter()
+                            .filter(|node| {
+                                node["Parent Relationship"] == "InitPlan"
+                                    && node["Node Type"] == "Aggregate"
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(initplans.len(), 1, "one scalar membership InitPlan: {plan}");
+                        assert_eq!(initplans[0]["Actual Loops"], 1, "{plan}");
+                        let mut membership_nodes = vec![];
+                        nodes(initplans[0], &mut membership_nodes);
+                        let cap = membership_nodes
+                            .iter()
+                            .find(|node| node["Node Type"] == "Limit")
+                            .expect("bounded aggregate input");
+                        assert_eq!(cap["Actual Loops"], 1, "{plan}");
+                        if overflow && expected == 1 {
+                            assert_eq!(
+                                cap["Actual Rows"], 262145,
+                                "overflow reads only cap plus one rows: {plan}"
+                            );
+                        } else {
+                            assert!(cap["Actual Rows"].as_u64().unwrap() < 262145, "{plan}");
+                        }
+                        for candidate in all.iter().filter(|node| {
+                            node["Relation Name"] == "search_index"
+                                && ["Index Cond", "Filter", "Recheck Cond"]
+                                    .iter()
+                                    .any(|field| {
+                                        node[*field].as_str().is_some_and(|condition| {
+                                            condition.contains("value_token_code")
+                                                && !condition.contains("source.id")
+                                        })
+                                    })
+                        }) {
+                            if candidate["Actual Loops"].as_u64().unwrap() > 1 {
+                                violations.push(format!("{density} {work_mem} {mode}: candidate index rescanned: {candidate}"));
+                            }
+                        }
+                        // An uncorrelated candidate relation must be built once.
+                        // A materialize rescanned per source is the low-memory
+                        // failure mode this fixture is intended to expose.
+                        for candidate in
+                            all.iter().filter(|node| node["Node Type"] == "Materialize")
+                        {
+                            let conditions = candidate.to_string();
+                            if candidate["Actual Loops"].as_u64().unwrap() > 1
+                                && conditions.contains("value_token_code")
+                                && !conditions.contains("resource_id = source.id")
+                            {
+                                violations.push(format!("{density} {work_mem} {mode}: candidate materialization rescanned: {candidate}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        client
+            .batch_execute("RESET plan_cache_mode; RESET work_mem")
+            .await
+            .unwrap();
+        client.execute("DELETE FROM search_index WHERE tenant_id=$1 AND (resource_id LIKE 'dense-%' OR resource_id LIKE 'overflow-%')", &[&tenant_id]).await.unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+        drop(client);
+        query.reverse_chains[0].value = Some(SearchValue::eq("http://loinc.org|absent"));
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 0);
+        assert!(
+            violations.is_empty(),
+            "broad count physical regression:\n{}",
+            violations.join("\n")
+        );
     }
 
     #[cfg(feature = "R4")]
@@ -27203,6 +27736,110 @@ mod postgres_integration {
             .unwrap();
         release.await.unwrap();
         assert_eq!(count, 1);
+
+        let pooled = backend.get_client().await.unwrap();
+        let timeout: String = pooled
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(timeout, "300ms");
+    }
+
+    /// #2040: a system-level `$reindex` lists the tenant's resource types
+    /// first, and that scan followed the session `statement_timeout`; a cut-off
+    /// listing failed the job before it counted anything. The listing lifts the
+    /// timeout for itself only; the session keeps it.
+    #[tokio::test]
+    async fn postgres_reindex_list_types_outlives_statement_timeout() {
+        use helios_persistence::search::ReindexSource;
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-list-types-timeout");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"listed"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let pooled = backend.get_client().await.unwrap();
+        pooled
+            .batch_execute("SET statement_timeout = '300ms'")
+            .await
+            .unwrap();
+        drop(pooled);
+
+        // Hold the listing past the timeout, then let it through.
+        let locker = reindex_test_client_for(&dbname).await;
+        locker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            locker.batch_execute("ROLLBACK").await.unwrap();
+        });
+
+        let types = ReindexSource::list_resource_types(&backend, &tenant)
+            .await
+            .unwrap();
+        release.await.unwrap();
+        assert_eq!(types, vec!["Patient".to_string()]);
+
+        let pooled = backend.get_client().await.unwrap();
+        let timeout: String = pooled
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(timeout, "300ms");
+    }
+
+    /// #2040: an all-types `$export` lists the tenant's resource types with a
+    /// scan that followed the session `statement_timeout`. It lifts the timeout
+    /// for itself only; the session keeps it.
+    #[tokio::test]
+    async fn postgres_export_list_types_outlives_statement_timeout() {
+        use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("export-list-types-timeout");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"listed"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let pooled = backend.get_client().await.unwrap();
+        pooled
+            .batch_execute("SET statement_timeout = '300ms'")
+            .await
+            .unwrap();
+        drop(pooled);
+
+        // Hold the listing past the timeout, then let it through.
+        let locker = reindex_test_client_for(&dbname).await;
+        locker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            locker.batch_execute("ROLLBACK").await.unwrap();
+        });
+
+        let types =
+            ExportDataProvider::list_export_types(&backend, &tenant, &ExportRequest::system())
+                .await
+                .unwrap();
+        release.await.unwrap();
+        assert_eq!(types, vec!["Patient".to_string()]);
 
         let pooled = backend.get_client().await.unwrap();
         let timeout: String = pooled
