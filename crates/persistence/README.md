@@ -833,40 +833,44 @@ Otherwise, size `--wiredTigerCacheSizeGB` for the entries the gate admits at onc
 Bundle when that is bigger, since a Bundle larger than the room runs alone. Or split very large
 Bundles into smaller ones.
 
-A single Bundle can also be too large for the cache on its own, and the gate cannot help with
-that: a Bundle larger than the room already runs alone. When one transaction's write set does not
-fit in WiredTiger's cache, MongoDB rolls it back with error 388 (`TransactionTooLargeForCache`,
+A single Bundle can also be too large for the cache on its own, and the gate cannot help with that:
+a Bundle larger than the room already runs alone. When one transaction's write set does not fit in
+WiredTiger's cache, MongoDB rolls it back with error 388 (`TransactionTooLargeForCache`,
 "transaction is too large and will not fit in the storage engine cache"), on one of the Bundle's
 writes or on its commit. The commit also writes the transaction's oplog entry, which can push a
 Bundle just under the ceiling over it (#1991). HFS neither replays such a Bundle nor re-sends its
 commit, since every attempt meets the same cache, and answers `500` with a `too-costly`
-OperationOutcome that names the WiredTiger cache and the Bundle's entry count. The driver's text
-stays in the server log (#1837); a commit-time 388 is logged with the prefix `Commit failed:`.
-Size `--wiredTigerCacheSizeGB` for the largest transaction Bundle you import,
-or split such Bundles. A 2 GB cache is too small for the largest Bundles of the full Synthea
-corpus: in the HFS benchmark (MongoDB with `--wiredTigerCacheSizeGB 2`, 20 virtual users, 1,000
-Synthea transaction Bundles), 8 Bundles of 6,400-7,600 entries each failed this way. With the
-search-index rows deferred, a lone Bundle's ceiling is expected to rise toward that of the
-`mongodb-elasticsearch` leg (about 30,000 entries at 2 GB). It will likely land somewhat below
-that leg, because a deferred Bundle's transaction still writes each resource's `missing_params`
-and its `idx_resources_missing_params` entries, which an offloaded backend does not write. The
-2 GB figure is predicted from the `mongodb-elasticsearch` leg and has not been measured with this
-change at 2 GB; the ignored ceiling test in the deferred-indexing section was run at a 0.5 GB
-cache, with `idx_resources_missing_params` built.
+OperationOutcome that names the WiredTiger cache and the Bundle's entry count and says that
+resubmitting it unchanged will fail the same way. The driver's text stays in the server log (#1837);
+a commit-time 388 is logged with the prefix `Commit failed:`. Size `--wiredTigerCacheSizeGB` for the
+largest transaction Bundle you import, or split such Bundles. A 2 GB cache is too small for the
+largest Bundles of the full Synthea corpus: in the HFS benchmark (MongoDB with
+`--wiredTigerCacheSizeGB 2`, 20 virtual users, 1,000 Synthea transaction Bundles), 8 Bundles of
+6,400-7,600 entries each failed this way. With the search-index rows deferred, a lone Bundle's
+ceiling is expected to rise toward that of the `mongodb-elasticsearch` leg (about 30,000 entries at
+2 GB). It will likely land somewhat below that leg, because a deferred Bundle's transaction still
+writes each resource's `missing_params` and its `idx_resources_missing_params` entries, which an
+offloaded backend does not write. The 2 GB figure is predicted from the `mongodb-elasticsearch` leg
+and has not been measured with this change at 2 GB; the ignored ceiling test in the
+deferred-indexing section was run at a 0.5 GB cache, with `idx_resources_missing_params` built.
 
 MongoDB sends 388 only when the transaction holds more than 75% of the cache's dirty bytes
-(`transactionTooLargeForCacheThreshold`). When other dirty data shares the cache, the same
-rollback arrives as `WriteConflict` (112, labelled `TransientTransactionError`, "oldest pinned
-transaction ID rolled back for eviction"), or as `TemporarilyUnavailable` (365) at commit. A
-Bundle that takes the whole room (its entries are at least the limit x the weight, 4,000 by
-default) runs alone, so that rollback is its own write set meeting the cache; in the benchmark 49
-of 50 such replays failed again at nearly the same entry while holding the whole room. HFS does
-not replay it. It answers the same `500` `too-costly` as for 388 and logs one `WARN`,
-"transaction bundle rolled back for eviction while running alone; not retrying", with
-`lone=true`, `entries`, `failed_entry` (absent at commit), `error_code` and `attempt` (#1895).
-Bundles that shared the room, and plain write conflicts, are still replayed. With a weight of `0` or no limit no
-Bundle counts as alone. Raising the limit x the weight above the largest Bundle restores the
-replays, at the cost of sharing the cache. The room is per backend instance: Bundles sent to
+(`transactionTooLargeForCacheThreshold`). When other dirty data shares the cache, the same rollback
+arrives as `WriteConflict` (112, labelled `TransientTransactionError`, "oldest pinned transaction ID
+rolled back for eviction"), or as `TemporarilyUnavailable` (365) at commit. A Bundle that takes the
+whole room (its entries are at least the limit x the weight, 4,000 by default) runs alone, so that
+rollback is mostly its own write set meeting the cache; in the benchmark 49 of 50 such replays
+failed again at nearly the same entry while holding the whole room. HFS does not replay it. It
+answers `500` `too-costly` as for 388, with the entry count and the same advice, but without saying
+that an unchanged resubmit will fail: the room bounds only this instance's transaction Bundles,
+while single-resource writes, batch Bundles, other HFS instances and other clients share the same
+cache, so a resubmit is unlikely to succeed but can (#1993). It logs one `WARN`, "transaction bundle
+rolled back for eviction while running alone; not retrying", with `lone=true`, `entries`,
+`failed_entry` (absent at commit), `error_code` and `attempt` (#1895). The `Transaction failed`
+`ERROR` line names the cause: `write set too large` for 388, `lone eviction rollback` here. Bundles
+that shared the room, and plain write conflicts, are still replayed. With a weight of `0` or no
+limit no Bundle counts as alone. Raising the limit x the weight above the largest Bundle restores
+the replays, at the cost of sharing the cache. The room is per backend instance: Bundles sent to
 another HFS instance on the same MongoDB are not seen.
 
 Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less

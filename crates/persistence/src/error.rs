@@ -512,9 +512,21 @@ pub enum TransactionError {
     /// should surface it as a `5xx` without `Retry-After`, naming the Bundle's
     /// size rather than the backend detail.
     ///
+    /// [`cause`](TooLargeForCacheCause) says which of the two ended it, because
+    /// they differ in what an unchanged resubmit can expect (#1993): 388 is the
+    /// backend's verdict on the write set itself, while a lone Bundle's eviction
+    /// rollback also depends on what else fills the cache. Tell a client that a
+    /// resubmit will fail only for
+    /// [`WriteSetTooLarge`](TooLargeForCacheCause::WriteSetTooLarge).
+    ///
     /// `reason` is raw backend detail: for logs, never for a client response.
-    #[error("transaction too large for the storage engine cache ({entries} entries): {reason}")]
+    #[error(
+        "transaction too large for the storage engine cache ({entries} entries, {cause}): {reason}"
+    )]
     TooLargeForCache {
+        /// Which signal ended the transaction; it decides what a client is
+        /// told about an unchanged resubmit (#1993). Shown in the log line.
+        cause: TooLargeForCacheCause,
         /// Entries the transaction ran, so an operator can size the cache from
         /// the log.
         entries: usize,
@@ -596,6 +608,41 @@ pub enum TransactionError {
         /// Backend identifier (e.g., `s3`).
         backend_name: String,
     },
+}
+
+/// Why a transaction ended as [`TransactionError::TooLargeForCache`] (#1993).
+///
+/// The two causes differ in what an unchanged resubmit can expect, so a caller
+/// that answers a client words each on its own. Every constructor must name
+/// one. Deliberately not `#[non_exhaustive]`: a caller's `match` (the
+/// `too-costly` text in `helios-rest`) then has to word a new cause on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TooLargeForCacheCause {
+    /// The backend reported that the transaction's own write set does not fit
+    /// its cache. For MongoDB, `TransactionTooLargeForCache` (388), which
+    /// mongod sends only when the transaction holds more than
+    /// `transactionTooLargeForCacheThreshold` (0.75) of the cache's dirty
+    /// bytes. An unchanged resubmit brings the same write set to the same
+    /// cache and fails again.
+    WriteSetTooLarge,
+    /// The backend rolled the transaction back under cache pressure while it
+    /// ran alone: it held the whole admission room, so no other transaction
+    /// Bundle of this backend instance was open (#1895). For MongoDB, a
+    /// `WriteConflict` (112) "rolled back for eviction" or a
+    /// `TemporarilyUnavailable` (365). A replay usually fails again (49 of 50
+    /// in the benchmark) but not always: the room bounds only this backend
+    /// instance's transaction Bundles, and single-resource writes, batch
+    /// Bundles, other HFS instances and other clients share the same cache.
+    LoneEviction,
+}
+
+impl fmt::Display for TooLargeForCacheCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TooLargeForCacheCause::WriteSetTooLarge => write!(f, "write set too large"),
+            TooLargeForCacheCause::LoneEviction => write!(f, "lone eviction rollback"),
+        }
+    }
 }
 
 /// Errors originating from the database backend.
@@ -1653,5 +1700,28 @@ mod tests {
 
         assert_eq!(error.to_string(), expected);
         assert_eq!(StorageError::Backend(error).to_string(), expected);
+    }
+
+    /// #1993: the log line names the cause, keeping the prefix and the count.
+    #[test]
+    fn test_too_large_for_cache_display_names_the_cause() {
+        let err = TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::WriteSetTooLarge,
+            entries: 7412,
+            reason: "raw".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transaction too large for the storage engine cache (7412 entries, write set too large): raw"
+        );
+        let err = TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::LoneEviction,
+            entries: 1502,
+            reason: "raw".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transaction too large for the storage engine cache (1502 entries, lone eviction rollback): raw"
+        );
     }
 }

@@ -51,7 +51,8 @@ use helios_persistence::core::{
     SearchProvider, SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
-    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TransactionError,
+    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError,
+    TooLargeForCacheCause, TransactionError,
 };
 use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
