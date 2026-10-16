@@ -736,6 +736,15 @@ MongoDB runtime configuration also supports:
   Bundles run at once per server (default: `4`; `0` means no limit). See the sizing section below.
 - `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` for the entry count of one standard Bundle
   (default: `1000`; `0` counts every Bundle as one slot).
+- `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` for the entry count from which a
+  transaction Bundle writes its search-index entries after its commit instead of inside the
+  transaction (default: `auto`, the admission room, 4,000 entries; `off` or `0` never defers).
+  Ignored on `mongodb-elasticsearch`. See
+  [Deferred search indexing](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
+- `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` (`hfs` binary) for the seconds between passes of
+  the task that finishes search-index entries a large Bundle left unwritten (default: `60`; `0`
+  turns the task off). It also runs once at startup. A pass takes only ledger documents older
+  than the larger of 60 s and the Bundle deadline (`HFS_REQUEST_TIMEOUT` less 2 s).
 - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` for the server execution budget (`maxTimeMS`) of
   the cross-tenant `count_by_tenant` aggregate, and of no other command (default: `25000`; must
   be 1 to 2147483647). Past it the call fails with `BackendError::Timeout`. It does not bound
@@ -746,7 +755,12 @@ MongoDB runtime configuration also supports:
 A FHIR transaction Bundle is one MongoDB multi-document transaction, so it needs a replica set
 or a sharded cluster, not a standalone server. The Bundle's whole write set (its resources, their
 history rows and their search-index entries) must fit in WiredTiger's cache while the
-transaction runs, and each Bundle running at the same time needs room of its own.
+transaction runs, and each Bundle running at the same time needs room of its own. Since #1975 a
+Bundle of at least `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` entries (4,000 by
+default) does not write its search-index entries inside the transaction, which is most of its
+write set; see
+[Deferred search indexing for large MongoDB transaction Bundles](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
+The measurements below predate that change and describe Bundles under the threshold.
 
 Past what the cache can hold, MongoDB aborts the oldest transaction ("oldest pinned transaction
 ID rolled back for eviction"). HFS replays such aborts (#1641, #1700), except for a Bundle that
@@ -828,7 +842,14 @@ that names the WiredTiger cache and the Bundle's entry count. The driver's text 
 server log (#1837). Size `--wiredTigerCacheSizeGB` for the largest transaction Bundle you import,
 or split such Bundles. A 2 GB cache is too small for the largest Bundles of the full Synthea
 corpus: in the HFS benchmark (MongoDB with `--wiredTigerCacheSizeGB 2`, 20 virtual users, 1,000
-Synthea transaction Bundles), 8 Bundles of 6,400-7,600 entries each failed this way.
+Synthea transaction Bundles), 8 Bundles of 6,400-7,600 entries each failed this way. With the
+search-index rows deferred, a lone Bundle's ceiling is expected to rise toward that of the
+`mongodb-elasticsearch` leg (about 30,000 entries at 2 GB). It will likely land somewhat below
+that leg, because a deferred Bundle's transaction still writes each resource's `missing_params`
+and its `idx_resources_missing_params` entries, which an offloaded backend does not write. The
+2 GB figure is predicted from the `mongodb-elasticsearch` leg and has not been measured with this
+change at 2 GB; the ignored ceiling test in the deferred-indexing section was run at a 0.5 GB
+cache, with `idx_resources_missing_params` built.
 
 MongoDB sends 388 only when the transaction holds more than 75% of the cache's dirty bytes
 (`transactionTooLargeForCacheThreshold`). When other dirty data shares the cache, the same
@@ -858,7 +879,10 @@ To re-measure on your own hardware, run the ignored harness (it starts its own M
 container; `HFS_TEST_BUNDLE_LOAD_LIMIT`, `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES`,
 `HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB` and `HFS_TEST_BUNDLE_LOAD_BUNDLES` vary the run;
 `HFS_TEST_BUNDLE_LOAD_LIMIT=0` reproduces the pre-#1776 behaviour,
-`HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES=0` the count-based gate of #1776, and
+`HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES=0` the count-based gate of #1776,
+`HFS_TEST_BUNDLE_LOAD_DEFERRED_INDEX_ENTRIES` sets the threshold for writing a Bundle's search
+rows after its commit (#1975; the harness default is `off`, so it keeps measuring the write set
+inside the transaction, and `auto` or a number turns the deferral on), and
 `HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK=1` fails the run if any Bundle ends transient or too-costly):
 
 ```bash
@@ -1023,6 +1047,200 @@ When `HFS_STORAGE_BACKEND` is set to `sqlite-elasticsearch`, `postgres-elasticse
    - All **search** operations → Elasticsearch
 
 This is controlled by the `search_offloaded` flag on the primary backend, which the composite layer sets automatically when a search secondary is configured.
+
+### Deferred search indexing for large MongoDB transaction Bundles
+
+On the native `mongodb` backend a transaction Bundle normally writes the search-index entries of
+every resource (about 18.6 `search_index` rows per entry) inside its transaction, and those rows
+are most of what WiredTiger holds in its cache until the commit. A Bundle of at least
+`HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` entries (#1975) therefore writes only its
+resources and their history inside the transaction, and writes the search-index entries right
+after the commit, before the response. This is the same ordering the Elasticsearch composites
+use, where the search index is written after the primary commits. It lifts the Bundle size at
+which MongoDB rolls a lone Bundle back for cache eviction (see
+[Sizing the WiredTiger cache for transaction Bundles](#sizing-the-wiredtiger-cache-for-transaction-bundles)).
+
+**When it applies.**
+
+- Only on the native `mongodb` backend, and only for transaction Bundles. Never while search is
+  offloaded (`mongodb-elasticsearch`): the variable is ignored there, nothing is deferred, no
+  ledger is written and `hfs` starts no repair task.
+- The rule is `entries >= N`. `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` sets `N`
+  (`MongoBackendConfig::transaction_bundle_deferred_index_entries`). The default, `auto`, is the
+  admission room in entries, the limit x the weight (4 x 1,000 = 4,000), which is also the size
+  from which a Bundle runs alone. With the gate off (limit `0`) or counting Bundles (weight `0`)
+  `auto` is 4,000. `off` or `0` never defers, and a plain integer sets `N` directly. Anything else
+  fails startup with an error that names the variable.
+- `auto` follows the admission room, so shrinking the room shrinks `N`: a limit of `1` with the
+  default weight defers every Bundle of 1,000 entries or more. Set the variable explicitly to keep
+  a threshold you chose.
+- Bundles below `N`, and every Bundle when the deferral is off, run exactly as before.
+- `hfs` logs `N` at startup (the `deferred_index_min_entries` field of "MongoDB transaction
+  Bundles of at least this many entries write their search rows after the commit"; `None` means
+  never).
+
+**What the transaction writes.** The `resources` documents and the history rows, as always. Each
+`resources` document whose rows are deferred also carries a transient field,
+`search_rows_pending: <bundle id>`, until its rows are written. The transaction adds a ledger,
+the `search_index_pending` collection, with one document per 5,000 resources (50,000 resources
+write ten), each naming its resources as `Type/id` together with `tenant_id`, `bundle_id`,
+`chunk`, `chunks`, `entries`, `created_at`, `not_before` and `attempts`. The ledger commits or
+aborts with the Bundle, so an aborted or replayed attempt leaves neither a ledger nor markers. A
+failure to write the ledger is a server-side failure of the Bundle and answers `500`, with nothing
+applied (a cache failure still ends as `500` `too-costly`, and a transient abort is replayed as
+before); no entry is blamed for it. The transaction does not insert `search_index` or
+`search_index_contained` rows, and it skips the two deletes of old rows per entry. It still runs
+the search extraction, and each `resources` document still gets its `missing_params`
+([missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata))
+inside the transaction. That array and its `idx_resources_missing_params` entries are part of the
+transaction's write set; only the rows are deferred. The collection and its `not_before` index
+(`idx_search_index_pending_due`) are created at schema initialisation (schema version 13).
+
+**The step after the commit.** While it still holds its admission (so the next large Bundle does
+not compete with these inserts for cache), the request reloads the SearchParameter cache if the
+Bundle changed SearchParameters, and then rewrites the rows:
+
+- The rows and `missing_params` are rebuilt from the resources' current stored state, with the
+  builder inline writes and `$reindex` use, not from the request. A resource deleted by the Bundle
+  gets no rows.
+- The batches run on the Bundle's own session, which is causally consistent: the first batch reads
+  at or after the Bundle's commit, so a marker cannot be missed because the commit is not yet
+  visible to it (for example under `readConcernLevel=majority` with `w:1`). A batch that finds no
+  marker was finished by another rewriter.
+- Resources are taken in batches of up to 256 of one type. Each batch is its own small
+  transaction (about 5,000 rows) that selects the resources still carrying the marker, deletes
+  their old rows and inserts the new ones. It then makes one update per resource that removes the
+  marker and rewrites `missing_params` from the same extraction as the rows: `[]` for a deleted
+  resource, and removed when the extraction failed, as on every other write path. A batch that
+  fails is tried up to five times (25 ms x the attempt number between tries). When all batches of
+  a ledger document are done, the document is deleted.
+- A batch that runs out of its five attempts stops the step: the rest of that ledger document and
+  every later one are left to the repair, so a stalled MongoDB costs one batch's attempts, not
+  one per document.
+- The step starts no new attempt after the Bundle's own deadline (`bundle_transaction_deadline`:
+  `HFS_REQUEST_TIMEOUT` less 2 s, counted from the call), and an attempt still running at the
+  deadline is cut, so a committed Bundle is answered instead of timing out with `408` and being
+  resubmitted. The cut attempt's transaction is aborted by dropping the session, not awaited.
+- It never turns a committed Bundle into an error. Whatever it did not finish stays in the ledger
+  for the repair, and cancelling the request mid-step aborts only the batch in flight, since the
+  batches before it have committed.
+- It logs one `INFO` line per Bundle, "transaction bundle search rows written after commit", with
+  `tenant`, `bundle_id`, `entries`, `resources`, `indexed`, `rows`, `batches`, `retries` and `ms`.
+  If anything is left it also logs a `WARN`, "transaction bundle search rows not all written after
+  commit; the deferred index repair will finish them", with `left_chunks`, `stopped_at_deadline`
+  and `last_error`.
+
+The rows are written in small transactions rather than outside any transaction, because they must
+not end up stale or duplicated next to a concurrent write. The marker is removed, and
+`missing_params` rewritten, in the same transaction that rewrites the rows, so each rewriter (this
+step, a repair, another instance) writes the resource document, and MongoDB's write conflict on
+that document serializes them: a loser starts again from the state the winner committed.
+
+**Consistency.**
+
+- The client that submitted the Bundle can search it once it has the response, unless the `WARN`
+  above reports rows left to the repair (a deadline cut, a failed batch): the response is still the
+  committed Bundle, and the missing rows follow within the repair's lag.
+- Other clients can read the resources at once, by id, version and history, and a search that uses
+  only `_id` and `_lastUpdated` finds them at once, since those are resolved on the resource
+  documents. A search on any other parameter can miss them until their rows are written. For an
+  updated or deleted resource the old rows stay until its batch runs, so such a search can briefly
+  match its previous content. The lag is inferred, not measured with this change: about 2 s for
+  a 6,000-entry Bundle and about 10 s for a 30,000-entry one, from the 57,346 rows/s the
+  `$reindex` writer reached in a benchmark run and 18.6 rows per entry. After a crash or a
+  deadline cut it is the repair's lag: in `hfs`, its minimum age (the larger of 60 s and the
+  Bundle deadline) plus up to one repair interval plus the time to write the rows.
+- A supported `:missing=true` search resolves on the resource document's `missing_params`, which
+  the Bundle's transaction wrote, so it is right at once. `:missing=false` checks the rows, so like
+  any other parameter it can miss the resources until their rows are written, and for an updated
+  resource it sees the old rows. `:missing=true` reads rows too, and lags the same way, until
+  `idx_resources_missing_params` is built, for a parameter the metadata route does not support,
+  and for a resource whose extraction failed (it has no `missing_params`).
+- Conditional operations and conditional references from other clients resolve through the search
+  rows, so during that lag they can miss a resource of a just-committed Bundle and, for example,
+  create a duplicate. The Elasticsearch composites have the same exposure.
+- A client write to a resource of a just-committed Bundle can lose the write conflict with the
+  step's batch and answer `409` (`VersionConflict`); sending it again once the batch has
+  committed succeeds. Its rows never end stale or duplicated.
+- SearchParameters created or changed in the same Bundle apply to its deferred rows and to the
+  `missing_params` the step rewrites, because the cache is reloaded after the commit and before the
+  step. Rows and `missing_params` written inside a transaction are built before that reload: those
+  of an inline Bundle, of the `ifNoneExist` types of a deferred Bundle, and, until its batch
+  rewrites them, a deferred resource's `missing_params`.
+
+**Conditional entries.** A POST entry with `ifNoneExist` is matched inside the Bundle's own
+transaction through the search rows, so it must see an earlier entry of the same Bundle. A
+deferred Bundle therefore still writes the rows of every resource whose type is the target of one
+of its own `ifNoneExist` entries inside the transaction (no marker, no ledger entry), and defers
+the other types. Matching is exactly what an inline Bundle does, no criterion is refused that an
+inline Bundle accepts, and a Bundle whose resources are all of such types writes no ledger. URL
+conditionals (`PUT Patient?identifier=...`) and conditional references are resolved before the
+Bundle's first write, against rows that are already committed, so the deferral does not change
+them.
+
+**Repair.** `hfs` runs `MongoBackend::repair_deferred_search_index(min_age, max_chunks)` once at
+startup and then every `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` seconds (default `60`; `0`
+turns the task off, and the ledger is still written). Each pass takes up to 20 ledger documents
+(100,000 resources) whose `not_before` is at least `min_age` old, oldest first, across tenants.
+In `hfs` `min_age` is the larger of 60 s and the Bundle deadline (`HFS_REQUEST_TIMEOUT` less 2 s,
+898 s with a 900 s timeout), logged at startup as `min_age_secs`. A live request starts nothing
+after that deadline, counted from its call, and the call precedes the document's `not_before`, so
+a document older than `min_age` has no live writer and one instance's repair never duplicates a
+step that is still running.
+
+- The repair claims each document before working on it, by moving its `not_before` to now only
+  while it still holds the value the pass read. A second repair (another instance, or an
+  overlapping call) that read the same document finds the claim taken and skips it: that is the
+  `skipped` field of `DeferredIndexRepairReport`, which is not counted in `examined`. A claimer
+  that crashes leaves a document that is due again after `min_age`.
+- It runs the same marker-gated batches with no deadline. A batch that runs out of attempts does
+  not stop the document: the healthy batches are still written (up to three failed batches in a
+  row, so a MongoDB that is down does not cost every attempt of every batch), and the document is
+  kept, with `not_before` set to now, `last_error` (at most 1,024 characters) and `attempts`
+  increased, and is retried after another `min_age`.
+- A document with no `refs` array, or with refs that cannot be read, is kept the same way, after
+  its readable refs are indexed. Documents are never dropped before all of their resources are
+  indexed. Every instance may run the repair.
+- Correctness does not depend on the claim or on `min_age`: the rewrite is gated on the marker and
+  serialized by the write conflict on the resource document, so a repair that raced a live step
+  would only repeat work.
+
+An application that embeds `MongoBackend` without the `hfs` binary must call
+`MongoBackend::repair_deferred_search_index` periodically itself (`hfs` does so at startup and
+every interval), or set the threshold to `off`. Otherwise the rows a crash or a deadline cut left
+unwritten are never written.
+
+- A pass that found work logs "Deferred search index repair pass finished" at `INFO` (at `WARN` if
+  any document failed) with `examined`, `skipped`, `resources`, `reindexed`, `rows`, `cleared`,
+  `failed`, `remaining` and `pass_ms`. Each failing document logs a `WARN`, "deferred search index
+  repair could not finish a ledger chunk", with `tenant`, `bundle_id`, `chunk`, `attempts` and
+  `error`. A pass that could not run at all logs "Repair of deferred MongoDB search rows could not
+  run".
+- At startup, if nothing was due but the ledger is not empty, it logs "Deferred search index
+  ledger holds chunks younger than the repair's minimum age; the next pass takes them".
+- To see what is owed, run `db.search_index_pending.countDocuments()` (or call
+  `MongoBackend::count_deferred_search_index_chunks()`). It is `0` when every deferred Bundle is
+  fully indexed. `purge_tenant_data` also deletes the tenant's ledger documents.
+
+**Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` are
+unchanged. A Bundle whose resources and history alone do not fit in the cache still fails with
+`500` `too-costly`, as described above.
+
+**Ceiling test.** An ignored test starts its own `mongo:7.0` replica set with a small WiredTiger
+cache and sends one lone Bundle of 4,005 entries, first with the deferral off (expected: too
+large for the cache) and then with the default threshold (expected: committed, rows written after
+the commit). It prints one `DEFERRED_CEILING` line:
+
+```bash
+cargo test -p helios-persistence --features mongodb --test mongodb_tests \
+  deferred_indexing_raises_the_lone_bundle_ceiling -- --ignored --nocapture
+```
+
+`HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB` (default `0.5`), `HFS_TEST_DEFERRED_CEILING_COPIES`
+(fixture copies of 267 entries, default `15`), `HFS_TEST_DEFERRED_CEILING_MONGODB_URL` (an
+external replica set; no container is started) and `HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT`
+(`false` accepts any inline outcome) vary the run. One run at the defaults on the development host
+gave `inline=too_large`, `deferred=ok`, `rows=63990`, `ledger=0` and `markers=0` after the commit.
 
 ### Composite Usage
 

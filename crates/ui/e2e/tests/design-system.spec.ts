@@ -671,3 +671,37 @@ for (const viewport of [
     }
   });
 }
+
+// #1759: in the light theme a card must be told apart from the page by its
+// border (and carry a shadow), not rely on white-on-near-white.
+test("light theme: a card's border contrasts with the page background and it has a shadow", async ({
+  page,
+}) => {
+  await page.goto("/ui");
+  await page.evaluate(() => localStorage.setItem("hfs-theme", "light"));
+  await page.goto("/ui/resources", { waitUntil: "networkidle" });
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+
+  const { border, page_bg, shadow } = await page.evaluate(() => {
+    const card = document.querySelector(".card") as HTMLElement;
+    const style = getComputedStyle(card);
+    const probe = document.createElement("span");
+    probe.style.color = getComputedStyle(document.documentElement).getPropertyValue("--bg-content").trim();
+    document.body.appendChild(probe);
+    const bg = getComputedStyle(probe).color;
+    probe.remove();
+    return { border: style.borderTopColor, page_bg: bg, shadow: style.boxShadow };
+  });
+
+  const channels = (css: string) => (css.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number);
+  const luminance = (css: string) => {
+    const [r, g, b] = channels(css).map((v) => {
+      const c = v / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const [hi, lo] = [luminance(page_bg), luminance(border)].sort((a, b) => b - a);
+  expect((hi + 0.05) / (lo + 0.05)).toBeGreaterThan(1.3);
+  expect(shadow).not.toBe("none");
+});

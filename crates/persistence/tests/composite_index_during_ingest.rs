@@ -632,12 +632,14 @@ mod es_integration {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use helios_persistence::core::DeferredReindexHook;
     #[cfg(feature = "postgres")]
+    use helios_persistence::core::SubmissionId;
+    #[cfg(feature = "postgres")]
     use helios_persistence::core::SubmitWorkerStorage;
     #[cfg(feature = "postgres")]
     use helios_persistence::core::history::InstanceHistoryProvider;
     use helios_persistence::core::{
         Backend, BackendKind, BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker,
-        ManifestStatus, ResourceStorage, SubmissionId, SubmitInputFetcher, WorkerId,
+        ManifestStatus, ResourceStorage, SubmitInputFetcher, WorkerId,
     };
     #[cfg(feature = "postgres")]
     use helios_persistence::error::StorageResult;
