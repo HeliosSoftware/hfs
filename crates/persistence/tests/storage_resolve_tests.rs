@@ -175,18 +175,33 @@ async fn over_the_cap_is_an_error_not_a_silent_drop() {
     assert!(matches!(err, SofError::ResolutionLimit(_)), "got {err:?}");
 }
 
-/// A storage whose `read_batch` fails its first `failures` calls.
+/// A storage whose `read_batch` fails its first `failures` calls, with a
+/// transient `BackendError::Unavailable` or, for [`FlakyStorage::broken`], a
+/// non-transient `BackendError::Internal`.
 struct FlakyStorage {
     inner: Arc<SqliteBackend>,
     failures: usize,
+    transient: bool,
     calls: AtomicUsize,
 }
 
 impl FlakyStorage {
+    /// Fails with a transient `Unavailable`.
     fn new(inner: Arc<SqliteBackend>, failures: usize) -> Arc<Self> {
         Arc::new(Self {
             inner,
             failures,
+            transient: true,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    /// Fails with an `Internal` error, which is not transient.
+    fn broken(inner: Arc<SqliteBackend>, failures: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            failures,
+            transient: false,
             calls: AtomicUsize::new(0),
         })
     }
@@ -265,9 +280,17 @@ impl ResourceStorage for FlakyStorage {
         ids: &[&str],
     ) -> StorageResult<Vec<StoredResource>> {
         if self.calls.fetch_add(1, Ordering::SeqCst) < self.failures {
-            return Err(StorageError::Backend(BackendError::Unavailable {
-                backend_name: "flaky".to_string(),
-                message: "connection reset".to_string(),
+            return Err(StorageError::Backend(if self.transient {
+                BackendError::Unavailable {
+                    backend_name: "flaky".to_string(),
+                    message: "connection reset".to_string(),
+                }
+            } else {
+                BackendError::Internal {
+                    backend_name: "flaky".to_string(),
+                    message: "corrupt page".to_string(),
+                    source: None,
+                }
             }));
         }
         self.inner.read_batch(tenant, resource_type, ids).await
@@ -306,7 +329,9 @@ async fn a_failed_read_is_retried_once() {
     assert_eq!(storage.calls.load(Ordering::SeqCst), 2);
 }
 
-/// #1870: a read that fails twice fails the resolution, naming the type.
+/// #1870, #2048: a read that fails twice on a transient backend error fails the
+/// resolution, naming the type, and stays `Unavailable` so the run answers 503
+/// rather than 500.
 #[tokio::test]
 async fn a_read_that_fails_twice_is_an_error() {
     let (backend, t) = seeded_patient().await;
@@ -320,7 +345,28 @@ async fn a_read_that_fails_twice_is_an_error() {
         .await
         .expect_err("both reads fail");
     assert!(
-        matches!(&err, SofError::Storage(m) if m.contains("Patient")),
+        matches!(&err, SofError::Unavailable { message } if message.contains("Patient")),
+        "got {err:?}"
+    );
+    assert_eq!(storage.calls.load(Ordering::SeqCst), 2);
+}
+
+/// #1870, #2048: a read that fails twice on a non-transient backend error is
+/// still a `Storage` error (a server fault, 500), not `Unavailable`.
+#[tokio::test]
+async fn a_non_transient_read_failure_stays_a_storage_error() {
+    let (backend, t) = seeded_patient().await;
+    let storage = FlakyStorage::broken(backend, 2);
+    let err = StorageBackedResolver::new(storage.clone(), 10)
+        .resolve(
+            &t,
+            FhirVersion::R4,
+            &[("Patient".to_string(), "123".to_string())],
+        )
+        .await
+        .expect_err("both reads fail");
+    assert!(
+        matches!(&err, SofError::Storage(m) if m.contains("Patient") && m.contains("corrupt page")),
         "got {err:?}"
     );
     assert_eq!(storage.calls.load(Ordering::SeqCst), 2);

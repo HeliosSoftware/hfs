@@ -97,7 +97,6 @@ use crate::core::sof_runner::{
     BatchStream, RowStream, RunCapabilities, RunContext, RunOutput, RunRequest, SofError,
     SofRunner, StopReason, ViewRow,
 };
-use crate::error::StorageError;
 use crate::tenant::TenantContext;
 
 use super::decode::{ColumnDecode, decode_text};
@@ -386,15 +385,6 @@ async fn race_setup<T>(
     }
 }
 
-/// The run error for a failed connection checkout: an exhausted pool or an
-/// unreachable server keeps its retryable kind ([`SofError::Unavailable`]).
-fn sof_error_from_storage(e: StorageError) -> SofError {
-    match e {
-        StorageError::Backend(backend) => SofError::from_backend_error(backend),
-        other => SofError::Storage(other.to_string()),
-    }
-}
-
 /// Backend-only tenant-scoped Group document loading. Shared runtime
 /// preparation interprets and merges the membership of these documents.
 ///
@@ -421,7 +411,7 @@ async fn load_group_documents(
     let session = Session::new(
         PostgresBackend::checkout(pool)
             .await
-            .map_err(sof_error_from_storage)?,
+            .map_err(SofError::from_storage)?,
     );
     let timeout_ms = timeout_for_next_transaction(stop)
         .map_err(|reason| stop.error_for(reason).unwrap_or(SofError::Cancelled))?;
@@ -844,7 +834,7 @@ async fn produce(run: PgRun, stop: RunStop, mut out: PgSink) {
         reason = stop.stopped() => return out.end_after_stop(&stop, reason).await,
         client = PostgresBackend::checkout(&run.pool) => match client {
             Ok(client) => Session::new(client),
-            Err(e) => return end_run(out, &stop, RunEnd::Failed(sof_error_from_storage(e))).await,
+            Err(e) => return end_run(out, &stop, RunEnd::Failed(SofError::from_storage(e))).await,
         },
     };
     let (result, fate) = match run.page_size {

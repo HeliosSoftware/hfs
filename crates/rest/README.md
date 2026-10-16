@@ -444,6 +444,9 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Status-artifact store: `local-fs` or `s3`. |
 | `HFS_BULK_SUBMIT_OUTPUT_DIR` | `${HFS_DATA_DIR}/submit` | Local-FS artifact root. |
 | `HFS_BULK_SUBMIT_S3_BUCKET` | *(none)* | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
+| `HFS_BULK_SUBMIT_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO). Blank is treated as unset. |
+| `HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers; forced on when `HFS_BULK_SUBMIT_S3_ENDPOINT` is set. |
+| `HFS_BULK_SUBMIT_S3_REGION` | *(falls back to `HFS_S3_REGION`, then AWS chain)* | AWS region override for submit artifacts. |
 | `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`.** |
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact-URL lifetime, seconds. |
 | `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention after completion, seconds. |

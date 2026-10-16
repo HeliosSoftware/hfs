@@ -719,6 +719,45 @@ mod tests {
         );
     }
 
+    /// #2048: a dependency the store could not serve (an object read that ran
+    /// out of attempts) is a retryable 503 with `Retry-After`, not a 500. The
+    /// dependency's typed kind ([`SourceFailure::Unavailable`]) is answered by
+    /// the one run-error mapping (#1864), which logs the store's reason and
+    /// keeps it out of the client's diagnostics like every other server-side
+    /// detail.
+    #[test]
+    fn an_unavailable_store_is_a_503() {
+        let unavailable = |message: &str| {
+            SqlQueryError::SourceStream(SourceError::new(
+                SourceFailure::Unavailable,
+                message.to_string(),
+            ))
+        };
+        let rest = sqlquery_err_to_rest(unavailable(
+            "dependency failed to materialize: failed to read object body after 3 attempts",
+        ));
+        assert!(
+            matches!(rest, RestError::ServiceUnavailable { .. }),
+            "got {rest:?}"
+        );
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert!(
+            !message.contains("after 3 attempts"),
+            "the store's reason is logged, not sent: {message}"
+        );
+
+        let response = sqlquery_err_to_rest(unavailable("x")).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a 503 must carry Retry-After"
+        );
+    }
+
     /// #1473: a dependency over the per-dependency cap is a 422 whose
     /// message names the dependency, the cap and the setting, and does not
     /// advise a WHERE/LIMIT clause (that cannot bound a dependency).

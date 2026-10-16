@@ -2063,6 +2063,134 @@ mod tests {
         assert_eq!(result.rows.len(), 3);
     }
 
+    /// How a [`FailingStoreRunner`]'s store fails.
+    #[derive(Clone, Copy)]
+    enum StoreFailure {
+        /// `run_view` itself returns `SofError::Unavailable`.
+        UnavailableAtStart,
+        /// One good row, then an `Unavailable` row error.
+        UnavailableMidStream,
+        /// One good row, then a `Storage` row error (a server fault).
+        StorageMidStream,
+        /// `run_view` itself returns `SofError::Backend` (a server fault).
+        BackendAtStart,
+    }
+
+    /// A `SofRunner` whose store fails the way `failure` says.
+    struct FailingStoreRunner {
+        failure: StoreFailure,
+    }
+
+    const UNAVAILABLE_TEXT: &str = "failed to read object body after 3 attempts: connection reset";
+
+    #[async_trait]
+    impl SofRunner for FailingStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _request: RunRequest,
+            _ctx: RunContext,
+        ) -> Result<RunOutput, SofError> {
+            let unavailable = || SofError::Unavailable {
+                message: UNAVAILABLE_TEXT.to_string(),
+            };
+            let rows = match self.failure {
+                StoreFailure::UnavailableAtStart => return Err(unavailable()),
+                StoreFailure::BackendAtStart => {
+                    return Err(SofError::backend("connection refused"));
+                }
+                StoreFailure::UnavailableMidStream => {
+                    vec![Ok(json!({"id": "p0"})), Err(unavailable())]
+                }
+                StoreFailure::StorageMidStream => vec![
+                    Ok(json!({"id": "p0"})),
+                    Err(SofError::Storage("bucket unreachable".to_string())),
+                ],
+            };
+            Ok(RunOutput::from_rows(Box::pin(futures::stream::iter(rows))))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "failing-store-test-runner"
+        }
+    }
+
+    async fn run_plan_over_failing_store(failure: StoreFailure) -> SqlQueryError {
+        let runner: Arc<dyn SofRunner> = Arc::new(FailingStoreRunner { failure });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            &plan,
+            "SELECT * FROM obs",
+            &[],
+            &RunContext::detached(RunKind::SqlQueryDependency),
+            limits(1000, 1000),
+        )
+        .await
+        .err()
+        .expect("a failing store must fail the plan")
+    }
+
+    /// #2048: a store that is unavailable keeps that fact through the plan, so
+    /// a SQL Query run answers 503 like a ViewDefinition run, whether the store
+    /// fails when the dependency starts or partway through its rows. The fact
+    /// travels as #1864's typed [`SourceFailure::Unavailable`] kind and is
+    /// answered by the one run-error mapping.
+    #[tokio::test]
+    async fn an_unavailable_store_is_a_503() {
+        use axum::response::IntoResponse;
+
+        for failure in [
+            StoreFailure::UnavailableAtStart,
+            StoreFailure::UnavailableMidStream,
+        ] {
+            let err = run_plan_over_failing_store(failure).await;
+            let SqlQueryError::SourceStream(source) = &err else {
+                panic!("expected SourceStream, got {err:?}");
+            };
+            assert_eq!(source.kind, SourceFailure::Unavailable, "{err:?}");
+            assert!(source.message.contains(UNAVAILABLE_TEXT), "{err:?}");
+
+            let rest = sqlquery_err_to_rest(err);
+            assert!(
+                matches!(rest, RestError::ServiceUnavailable { .. }),
+                "got {rest:?}"
+            );
+            assert_eq!(
+                rest.client_response().0,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(
+                rest.into_response()
+                    .headers()
+                    .contains_key(axum::http::header::RETRY_AFTER),
+                "a 503 must carry Retry-After"
+            );
+        }
+    }
+
+    /// Only an unavailable store is a 503: any other source failure is still a
+    /// server fault (500), at the start of the dependency or partway through.
+    #[tokio::test]
+    async fn other_store_failures_stay_source_stream() {
+        for failure in [StoreFailure::StorageMidStream, StoreFailure::BackendAtStart] {
+            let err = run_plan_over_failing_store(failure).await;
+            assert!(
+                matches!(&err, SqlQueryError::SourceStream(source)
+                    if source.kind == SourceFailure::Backend),
+                "expected a Backend SourceStream, got {err:?}"
+            );
+            assert_eq!(
+                sqlquery_err_to_rest(err).client_response().0,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+    }
+
     /// A node reached under two labels is named by the alphabetically first,
     /// so the message does not depend on hash order.
     #[tokio::test]

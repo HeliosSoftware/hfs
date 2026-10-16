@@ -56,7 +56,9 @@ async-trait = "0.1"
 # other dependencies; declare the feature we actually use rather than rely on that.
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
 tokio-stream = "0.1"
-tokio-util = "0.7"
+# `rt` for `TaskTracker`: an in-process SQL-on-FHIR run tracks the storage reads
+# it spawns so a stopped run reports its end only once they are gone (#1864).
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 base64 = "0.22"

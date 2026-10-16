@@ -168,14 +168,21 @@ pub enum JobStatus {
     },
     /// Job failed with an error.
     Failed {
-        /// The message the result endpoint returns: the specific wording when
-        /// `status` is a 4xx (the request's own failure); for a server fault,
-        /// a generic message that names the job, with the underlying error
-        /// logged instead (#1703).
+        /// The message the result endpoint returns: the specific wording only
+        /// when `status` is a 4xx (the request's own failure). For a `503` (the
+        /// store was unavailable) it is fixed wording that names the subject
+        /// and tells the client to submit the export again, and for a server
+        /// fault a generic message that names the job. Neither carries the
+        /// underlying error's text, which is logged instead (#1703, #2048).
         message: String,
         /// What the result endpoint answers: the 4xx `$sql-run` gives the
         /// same failure when it is the request's own (a documented limit, a
-        /// subject the runner refuses), `500` for a fault of the server.
+        /// subject the runner refuses), `503` when the store was unavailable
+        /// (#2048), `504` for a job past its budget (#1864), `500` for a fault
+        /// of the server. A `503` here is terminal for this job, unlike a
+        /// `503` on a status poll: the result URL keeps answering it (with the
+        /// `Retry-After` every `503` carries, #1864), and the stored `message`
+        /// tells the client to submit the export again.
         status: StatusCode,
         /// The `OperationOutcome.issue.code` that goes with `status`.
         code: &'static str,
@@ -421,6 +428,15 @@ pub enum ExportError {
         /// The wording `$sql-run` gives the same failure.
         message: String,
     },
+    /// The store a subject reads from was unavailable (it could not be
+    /// reached, was throttling, or could not read an object after retries).
+    /// Transient rather than the request's fault: the result endpoint answers
+    /// `503`, the status `$sql-run` gives the same failure (#2048). The text
+    /// is the store's own, so it goes to the job log only: the stored wording
+    /// is fixed, and since the job itself still fails for good it asks the
+    /// client to submit the export again.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 /// Why a controller refused to accept an export job.

@@ -15,7 +15,9 @@ use helios_persistence::types::{
     SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
 };
 use serde_json::Value;
+use tracing::warn;
 
+use super::run::map_sof_error_to_rest;
 use crate::error::RestError;
 use crate::state::AppState;
 
@@ -55,9 +57,7 @@ where
             .storage()
             .read(tenant, resource_type, id)
             .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("failed to read {resource_type}: {e}"),
-            })?
+            .map_err(|e| storage_lookup_error(format!("failed to read {resource_type}/{id}"), e))?
             .ok_or_else(|| RestError::NotFound {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
@@ -110,9 +110,10 @@ where
             return resolve_by_scan(state, tenant, resource_type, url).await;
         }
         Err(e) => {
-            return Err(RestError::InternalError {
-                message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-            });
+            return Err(storage_lookup_error(
+                format!("canonical lookup failed for {resource_type} url={url}"),
+                e,
+            ));
         }
     };
 
@@ -172,18 +173,52 @@ where
     let resources = scan
         .scan_resources(tenant, resource_type)
         .await
-        .map_err(|e| RestError::InternalError {
-            message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-        })?;
+        .map_err(|e| canonical_scan_error(resource_type, url, e))?;
     newest_canonical_match(resources, url)
         .await
-        .map_err(|e| RestError::InternalError {
-            message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-        })?
+        .map_err(|e| canonical_scan_error(resource_type, url, e))?
         .ok_or_else(|| RestError::NotFound {
             resource_type: resource_type.to_string(),
             id: url.to_string(),
         })
+}
+
+/// The error for a failed storage read made while resolving a definition (by
+/// id, or by canonical through a search): the read's kind is classified once
+/// by [`SofError::from_storage`] and answered by the one SQL-on-FHIR mapping;
+/// see [`lookup_error`].
+fn storage_lookup_error(context: String, e: StorageError) -> RestError {
+    lookup_error(context, SofError::from_storage(e))
+}
+
+/// The error for a canonical lookup whose scan failed; see [`lookup_error`].
+fn canonical_scan_error(resource_type: &str, url: &str, e: SofError) -> RestError {
+    lookup_error(
+        format!("canonical lookup failed for {resource_type} url={url}"),
+        e,
+    )
+}
+
+/// Answers a failed definition lookup through the one SQL-on-FHIR error
+/// mapping ([`map_sof_error_to_rest`], #1864), so a lookup gets the status a
+/// run would for the same kind: an unavailable store `503` with `Retry-After`
+/// and generic wording (#2048), a storage time limit `504`, any other fault
+/// `500`. A definition that does not exist never reaches here: it is the
+/// caller's `404`.
+///
+/// `context` (what was being looked up) is logged with the error. A `500`
+/// also carries it in its message, as before, since it names only the
+/// client's own reference; a `503` keeps the store's reason in the log only.
+fn lookup_error(context: String, e: SofError) -> RestError {
+    warn!(lookup = %context, error = %e, "SQL-on-FHIR definition lookup failed");
+    map_sof_error_to_rest(match e {
+        SofError::Storage(message) => SofError::Storage(format!("{context}: {message}")),
+        SofError::Backend { sqlstate, message } => SofError::Backend {
+            sqlstate,
+            message: format!("{context}: {message}"),
+        },
+        other => other,
+    })
 }
 
 /// Picks, among the scanned resources, the one [`canonical_matches`] selects
@@ -386,6 +421,11 @@ mod tests {
     enum Search {
         Unsupported,
         Broken,
+        /// The store is down: searches and reads both fail as unavailable.
+        Unavailable,
+        /// The store hit its own time limit: searches and reads both fail
+        /// with a backend timeout.
+        TimedOut,
     }
 
     /// A storage that cannot search — the standalone S3 shape from #1228 —
@@ -400,6 +440,50 @@ mod tests {
     enum Scan {
         Of(Vec<Value>),
         Broken,
+        /// The store is unavailable when the scan starts.
+        Unavailable,
+        /// The store becomes unavailable partway through the scan's stream.
+        UnavailableInStream,
+        /// The scan hits a time limit when it starts.
+        TimedOut,
+        /// The scan hits a time limit partway through its stream.
+        TimedOutInStream,
+    }
+
+    const UNAVAILABLE_TEXT: &str = "failed to read object body after 3 attempts";
+
+    /// What a scan reports once its store has run out of attempts at an
+    /// object read.
+    fn unavailable_scan() -> SofError {
+        SofError::Unavailable {
+            message: UNAVAILABLE_TEXT.to_string(),
+        }
+    }
+
+    const TIMEOUT_TEXT: &str = "statement_timeout after 30s";
+
+    /// What a scan reports when it hits a time limit.
+    fn timed_out_scan() -> SofError {
+        SofError::Timeout {
+            budget: None,
+            message: TIMEOUT_TEXT.to_string(),
+        }
+    }
+
+    /// What a store answers when a read hits its time limit.
+    fn timed_out_store() -> StorageError {
+        StorageError::Backend(BackendError::Timeout {
+            backend_name: "scan-only".to_string(),
+            message: TIMEOUT_TEXT.to_string(),
+        })
+    }
+
+    /// What a store answers once it has run out of attempts at an object read.
+    fn unavailable_store() -> StorageError {
+        StorageError::Backend(BackendError::Unavailable {
+            backend_name: "scan-only".to_string(),
+            message: UNAVAILABLE_TEXT.to_string(),
+        })
     }
 
     #[async_trait]
@@ -435,7 +519,11 @@ mod tests {
             _resource_type: &str,
             _id: &str,
         ) -> StorageResult<Option<StoredResource>> {
-            unimplemented!()
+            match self.search {
+                Search::Unavailable => Err(unavailable_store()),
+                Search::TimedOut => Err(timed_out_store()),
+                Search::Unsupported | Search::Broken => unimplemented!(),
+            }
         }
 
         async fn update(
@@ -478,17 +566,19 @@ mod tests {
             _tenant: &TenantContext,
             _query: &SearchQuery,
         ) -> StorageResult<SearchResult> {
-            Err(StorageError::Backend(match self.search {
-                Search::Unsupported => BackendError::UnsupportedCapability {
+            Err(match self.search {
+                Search::Unsupported => StorageError::Backend(BackendError::UnsupportedCapability {
                     backend_name: "scan-only".to_string(),
                     capability: "search".to_string(),
-                },
-                Search::Broken => BackendError::Internal {
+                }),
+                Search::Broken => StorageError::Backend(BackendError::Internal {
                     backend_name: "scan-only".to_string(),
                     message: "index offline".to_string(),
                     source: None,
-                },
-            }))
+                }),
+                Search::Unavailable => unavailable_store(),
+                Search::TimedOut => timed_out_store(),
+            })
         }
 
         async fn search_count(
@@ -526,6 +616,16 @@ mod tests {
                     Ok(Box::pin(futures::stream::iter(matched.into_iter().map(Ok))))
                 }
                 Scan::Broken => Err(SofError::Storage("bucket unreachable".to_string())),
+                Scan::Unavailable => Err(unavailable_scan()),
+                Scan::UnavailableInStream => Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(json!({"resourceType": resource_type, "id": "first"})),
+                    Err(unavailable_scan()),
+                ]))),
+                Scan::TimedOut => Err(timed_out_scan()),
+                Scan::TimedOutInStream => Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(json!({"resourceType": resource_type, "id": "first"})),
+                    Err(timed_out_scan()),
+                ]))),
             }
         }
 
@@ -547,6 +647,8 @@ mod tests {
                     .cloned()
                     .collect()),
                 Scan::Broken => Err(SofError::Storage("bucket unreachable".to_string())),
+                Scan::Unavailable | Scan::UnavailableInStream => Err(unavailable_scan()),
+                Scan::TimedOut | Scan::TimedOutInStream => Err(timed_out_scan()),
             }
         }
     }
@@ -654,6 +756,107 @@ mod tests {
                 assert!(message.contains("url=http://example.org/vd"), "{message}");
             }
             other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    /// Asserts that `result` is the 503 the one SoF mapping gives an
+    /// unavailable store: `Retry-After`, and the store's reason kept out of
+    /// the client's diagnostics (#1864, A4).
+    fn assert_unavailable_503(what: &str, result: Result<Value, RestError>) {
+        match result {
+            Err(rest @ RestError::ServiceUnavailable { .. }) => {
+                let RestError::ServiceUnavailable { message } = &rest else {
+                    unreachable!()
+                };
+                assert!(!message.contains(UNAVAILABLE_TEXT), "{what}: {message}");
+                let response = axum::response::IntoResponse::into_response(rest);
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "{what}"
+                );
+                assert!(
+                    response
+                        .headers()
+                        .contains_key(axum::http::header::RETRY_AFTER),
+                    "{what}: a 503 must carry Retry-After"
+                );
+            }
+            other => panic!("{what}: expected ServiceUnavailable, got {other:?}"),
+        }
+    }
+
+    /// Asserts that `result` is the 504 the one SoF mapping gives a storage
+    /// time limit, never a 500.
+    fn assert_timeout_504(what: &str, result: Result<Value, RestError>) {
+        match result {
+            Err(rest @ RestError::SofTimeout { .. }) => {
+                let response = axum::response::IntoResponse::into_response(rest);
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    "{what}"
+                );
+            }
+            other => panic!("{what}: expected SofTimeout, got {other:?}"),
+        }
+    }
+
+    /// #2048: a scan whose store is unavailable, at its start or partway
+    /// through its stream, is a retryable 503, answered by the one SoF mapping
+    /// (#1864): `Retry-After`, the store's reason logged rather than sent.
+    #[tokio::test]
+    async fn an_unavailable_scan_is_a_503() {
+        for scan in [Scan::Unavailable, Scan::UnavailableInStream] {
+            let storage = ScanOnly {
+                search: Search::Unsupported,
+                scan: Some(scan),
+            };
+            let result = resolve(storage, "ViewDefinition", "http://example.org/vd").await;
+            assert_unavailable_503("scan", result);
+        }
+    }
+
+    /// #2048: a definition read, by id or by canonical, from a store that is
+    /// unavailable is a retryable 503, not a 500, answered by the one SoF
+    /// mapping (#1864).
+    #[tokio::test]
+    async fn an_unavailable_store_is_a_503_for_a_definition_lookup() {
+        for reference in ["ViewDefinition/abc", "http://example.org/vd"] {
+            let storage = ScanOnly {
+                search: Search::Unavailable,
+                scan: None,
+            };
+            let result = resolve(storage, "ViewDefinition", reference).await;
+            assert_unavailable_503(reference, result);
+        }
+    }
+
+    /// #1864: a definition read, by id or by canonical, that hits the store's
+    /// time limit is the 504 a run gets for the same kind, not a 500.
+    #[tokio::test]
+    async fn a_timed_out_store_is_a_504_for_a_definition_lookup() {
+        for reference in ["ViewDefinition/abc", "http://example.org/vd"] {
+            let storage = ScanOnly {
+                search: Search::TimedOut,
+                scan: None,
+            };
+            let result = resolve(storage, "ViewDefinition", reference).await;
+            assert_timeout_504(reference, result);
+        }
+    }
+
+    /// #1864: a canonical scan that hits a time limit, at its start or partway
+    /// through its stream, is a 504, not a 500.
+    #[tokio::test]
+    async fn a_timed_out_scan_is_a_504() {
+        for scan in [Scan::TimedOut, Scan::TimedOutInStream] {
+            let storage = ScanOnly {
+                search: Search::Unsupported,
+                scan: Some(scan),
+            };
+            let result = resolve(storage, "ViewDefinition", "http://example.org/vd").await;
+            assert_timeout_504("scan", result);
         }
     }
 

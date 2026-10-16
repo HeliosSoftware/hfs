@@ -131,6 +131,25 @@ async fn stored_counts(backend: &MongoBackend, tenant_id: &str) -> (u64, u64) {
     )
 }
 
+/// The lone-Bundle tests below run on a 1 x 2 gate, where the default
+/// threshold for deferring a Bundle's search rows (#1975) is the gate's room of
+/// two entries, so their 2-entry Bundle takes the deferred path. Whatever the
+/// outcome, nothing deferred may be left behind: an aborted attempt takes its
+/// ledger document and its `search_rows_pending` markers with it, and a
+/// committed Bundle clears both after writing its rows.
+async fn assert_nothing_deferred_left(backend: &MongoBackend, tenant_id: &str) {
+    assert_eq!(
+        super::deferred_search_index::ledger_count(backend).await,
+        0,
+        "no search_index_pending ledger document is left"
+    );
+    assert_eq!(
+        super::deferred_search_index::marker_count(backend, tenant_id).await,
+        0,
+        "no resource carries search_rows_pending"
+    );
+}
+
 /// The `Patient` and `Observation` rows the bundle left behind, read straight
 /// from the resources collection (not through the backend, so no failpoint and
 /// no cache can colour the answer).
@@ -840,6 +859,7 @@ async fn a_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
         (0, 0),
         "a rolled-back transaction leaves nothing behind"
     );
+    assert_nothing_deferred_left(&backend, "txn-lone-evict-commit").await;
 }
 
 /// #1895, entry side: the same, with the rollback arriving on an entry's write.
@@ -910,6 +930,7 @@ async fn a_lone_bundle_rolled_back_for_eviction_on_an_entry_write_is_not_replaye
         (0, 0),
         "a rolled-back transaction leaves nothing behind"
     );
+    assert_nothing_deferred_left(&backend, "txn-lone-evict-insert").await;
 }
 
 /// #1895: only the eviction rollback is not replayed. A lone Bundle that keeps
@@ -963,6 +984,7 @@ async fn a_lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed
         (0, 0),
         "an exhausted transaction leaves nothing behind"
     );
+    assert_nothing_deferred_left(&backend, "txn-lone-conflict").await;
 }
 
 /// #1895: the lone check runs before `next_attempt_delay`, so a lone eviction
@@ -1009,4 +1031,5 @@ async fn a_lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_
         (0, 0),
         "a rolled-back transaction leaves nothing behind"
     );
+    assert_nothing_deferred_left(&backend, "txn-lone-evict-nobudget").await;
 }

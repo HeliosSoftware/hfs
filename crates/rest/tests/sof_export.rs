@@ -1960,21 +1960,16 @@ mod sof_export_tests {
         }
     }
 
-    /// #1703: a server-side failure must not leak the backend's error text to
-    /// the client. The failed result names the job (so an operator can find the
-    /// log line) and points at the server log instead.
-    #[tokio::test]
-    async fn test_export_server_fault_result_does_not_echo_backend_text() {
+    /// Kicks off a `$sql-export` of the bare Patient view over `runner`, waits
+    /// for the job to fail, and returns its id with its result response.
+    async fn failed_export_result(runner: Arc<dyn SofRunner>) -> (String, axum_test::TestResponse) {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
         let backend = Arc::new(backend);
 
-        let controller = InMemoryController::new(
-            Arc::new(BackendDownRunner),
-            InMemorySink::new("http://localhost"),
-            None,
-        );
+        let controller =
+            InMemoryController::new(runner, InMemorySink::new("http://localhost"), None);
         let config = ServerConfig {
             base_url: "http://localhost".to_string(),
             ..ServerConfig::for_testing()
@@ -2038,6 +2033,15 @@ mod sof_export_tests {
             .get(&result_url)
             .add_header(X_TENANT_ID, "test-tenant")
             .await;
+        (job_id, result)
+    }
+
+    /// #1703: a server-side failure must not leak the backend's error text to
+    /// the client. The failed result names the job (so an operator can find the
+    /// log line) and points at the server log instead.
+    #[tokio::test]
+    async fn test_export_server_fault_result_does_not_echo_backend_text() {
+        let (job_id, result) = failed_export_result(Arc::new(BackendDownRunner)).await;
         assert_eq!(
             result.status_code(),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2064,6 +2068,81 @@ mod sof_export_tests {
         // #1800: the generic message names no subject, so the subject that
         // failed travels in `issue[0].expression`, by its output name (the
         // unnamed bare ViewDefinition kicked off above is `output-0`).
+        assert_eq!(
+            body["issue"][0]["expression"],
+            json!(["output-0"]),
+            "{body}"
+        );
+    }
+
+    /// A runner whose store is unavailable, with infrastructure detail in the
+    /// error text the way an S3 or database client reports it.
+    struct UnavailableStoreRunner;
+
+    #[async_trait::async_trait]
+    impl SofRunner for UnavailableStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _request: RunRequest,
+            _ctx: RunContext,
+        ) -> Result<RunOutput, SofError> {
+            Err(SofError::Unavailable {
+                message: "s3: AccessDenied for bucket phi-exports (s3.internal:9000)".to_string(),
+            })
+        }
+        fn runner_name(&self) -> &'static str {
+            "unavailable-store-test-runner"
+        }
+    }
+
+    /// #2048: a job whose store was unavailable fails as a `503` with the
+    /// `transient` issue code, but its stored result must not leak the store's
+    /// error text any more than a server fault's does (#1703): it carries
+    /// fixed wording that names the subject and tells the client to submit the
+    /// export again.
+    #[tokio::test]
+    async fn test_export_unavailable_store_result_does_not_echo_backend_text() {
+        let (job_id, result) = failed_export_result(Arc::new(UnavailableStoreRunner)).await;
+        assert_eq!(
+            result.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unavailable store should 503, got: {}",
+            result.text()
+        );
+        let body: Value = result.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        assert_eq!(
+            body["issue"][0]["code"].as_str(),
+            Some("transient"),
+            "{body}"
+        );
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(
+            diag.contains(&job_id),
+            "diagnostics must name the job '{job_id}': {diag}"
+        );
+        assert!(
+            diag.contains("view 'output-0'"),
+            "diagnostics must name the subject: {diag}"
+        );
+        assert!(
+            diag.contains("submit it again"),
+            "diagnostics must say to submit the export again: {diag}"
+        );
+        for leaked in [
+            "AccessDenied",
+            "phi-exports",
+            "s3.internal",
+            "9000",
+            "s3",
+            "storage unavailable",
+        ] {
+            assert!(
+                !diag.contains(leaked),
+                "diagnostics must not echo backend text ({leaked:?}): {body}"
+            );
+        }
         assert_eq!(
             body["issue"][0]["expression"],
             json!(["output-0"]),

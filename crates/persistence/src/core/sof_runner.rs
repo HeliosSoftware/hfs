@@ -350,6 +350,25 @@ impl SofError {
             other => Self::backend(other.to_string()),
         }
     }
+
+    /// Converts a storage error from a resource read or scan (#2048).
+    ///
+    /// A [`StorageError::Backend`](crate::error::StorageError::Backend) keeps
+    /// its run kind through [`Self::from_backend_error`]: a transient failure
+    /// (`Unavailable`, `ConnectionFailed`, `PoolExhausted`; see
+    /// [`StorageError::is_unavailable`](crate::error::StorageError::is_unavailable))
+    /// becomes [`SofError::Unavailable`], so the one REST mapping answers `503`
+    /// with `Retry-After` rather than `500`. This covers what a backend reports
+    /// as unavailable besides an exhausted retry: a dispatch failure or
+    /// timeout, throttling, and an S3 misconfiguration (access denied, a bucket
+    /// that is missing or not accessible). Every other storage error becomes
+    /// [`SofError::Storage`] with the error's text.
+    pub fn from_storage(err: crate::error::StorageError) -> Self {
+        match err {
+            crate::error::StorageError::Backend(backend) => Self::from_backend_error(backend),
+            other => Self::Storage(other.to_string()),
+        }
+    }
 }
 
 /// Why a run stopped before its natural end.
@@ -740,5 +759,60 @@ mod tests {
             matches!(lowered, SofError::Backend { sqlstate: None, ref message } if message.contains("boom")),
             "{lowered:?}"
         );
+    }
+
+    /// A transient backend failure keeps its unavailability so the handler can
+    /// answer 503; every other storage error stays a 500 kind with the same
+    /// text as before (#2048, expressed through #1864's typed kinds).
+    #[test]
+    fn storage_errors_keep_their_unavailability() {
+        use crate::error::{BackendError, StorageError, TenantError};
+
+        let transient = [
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name: "s3".to_string(),
+                message: "x".to_string(),
+            }),
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: "s3".to_string(),
+                message: "x".to_string(),
+            }),
+            StorageError::Backend(BackendError::PoolExhausted {
+                backend_name: "s3".to_string(),
+            }),
+        ];
+        for err in transient {
+            assert!(err.is_unavailable());
+            let text = err.to_string();
+            match SofError::from_storage(err) {
+                SofError::Unavailable { message } => {
+                    assert!(message.contains(&text), "lost the text: {message}")
+                }
+                other => panic!("expected SofError::Unavailable, got {other:?}"),
+            }
+        }
+
+        let internal = StorageError::Backend(BackendError::Internal {
+            backend_name: "s3".to_string(),
+            message: "boom".to_string(),
+            source: None,
+        });
+        let text = internal.to_string();
+        match SofError::from_storage(internal) {
+            SofError::Backend {
+                sqlstate: None,
+                message,
+            } => assert_eq!(message, text),
+            other => panic!("expected SofError::Backend, got {other:?}"),
+        }
+
+        let tenant = StorageError::Tenant(TenantError::InvalidTenant {
+            tenant_id: crate::tenant::TenantId::new("t"),
+        });
+        let text = tenant.to_string();
+        match SofError::from_storage(tenant) {
+            SofError::Storage(m) => assert_eq!(m, text),
+            other => panic!("expected SofError::Storage, got {other:?}"),
+        }
     }
 }

@@ -111,6 +111,10 @@ struct MockState {
     /// LIST calls on exactly these prefixes fail with the given error, simulating
     /// a permission or transport failure on one listing.
     failing_list_prefixes: HashMap<String, S3ClientError>,
+    /// `get_object` calls on exactly these keys fail with the given error,
+    /// simulating a GET whose body could not be read (#2048). Opt-in: a key not
+    /// listed here reads as before.
+    failing_get_keys: HashMap<String, S3ClientError>,
     /// `list_objects` on exactly these prefixes first returns this many empty
     /// pages that are still truncated, as S3 can over a run of delete markers
     /// on a versioned bucket, before the real listing.
@@ -120,6 +124,10 @@ struct MockState {
     /// When true, every `put_object` fails its precondition, simulating a writer
     /// that loses the compare-and-swap race on every attempt.
     fail_all_puts_with_precondition: bool,
+    /// Conditional `put_object` calls on exactly these keys fail with
+    /// `ConditionalConflict` (AWS 409) this many more times, without writing
+    /// (#2047).
+    conflicting_puts: HashMap<String, usize>,
     /// Preconditions carried by each `put_object` call, in order.
     recorded_puts: Vec<RecordedPut>,
     /// A [`StealHook`] to run before the next `put_object` evaluates its
@@ -222,6 +230,16 @@ impl MockS3Client {
             .insert(prefix.to_string(), error);
     }
 
+    /// Makes every subsequent `get_object` call on exactly `key` fail with
+    /// `error`.
+    fn fail_gets_at(&self, key: &str, error: S3ClientError) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_get_keys
+            .insert(key.to_string(), error);
+    }
+
     /// Makes every subsequent `list_objects` call on exactly `prefix` return
     /// `pages` empty, truncated pages before the real listing.
     fn empty_truncated_pages_at(&self, prefix: &str, pages: usize) {
@@ -275,6 +293,19 @@ impl MockS3Client {
     /// writer that loses the compare-and-swap race on every single attempt.
     fn fail_all_puts_with_precondition(&self) {
         self.state.lock().unwrap().fail_all_puts_with_precondition = true;
+    }
+
+    /// Makes the next `times` *conditional* `put_object` calls on exactly `key`
+    /// fail with `ConditionalConflict` (AWS `409 ConditionalRequestConflict`)
+    /// without writing; `usize::MAX` means always (#2047). Unconditional puts
+    /// never consume the count. The conflicting calls are still counted and
+    /// recorded.
+    fn conflict_puts_at(&self, key: &str, times: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .conflicting_puts
+            .insert(key.to_string(), times);
     }
 
     /// Arranges for a concurrent writer to overwrite `key` with `body` exactly
@@ -355,6 +386,9 @@ impl S3Api for MockS3Client {
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
         }
+        if let Some(error) = state.failing_get_keys.get(key).cloned() {
+            return Err(error);
+        }
         Ok(state
             .objects
             .get(&(bucket.to_string(), key.to_string()))
@@ -396,6 +430,21 @@ impl S3Api for MockS3Client {
         // ETag is now stale correctly sees `PreconditionFailed`.
         if let Some(steal) = state.steal_hook.take() {
             steal(&mut state);
+        }
+
+        // A conflicting conditional write in flight on this key (#2047): S3
+        // answers 409 and writes nothing. Only conditional puts are refused.
+        let conditional = if_match.is_some() || if_none_match.is_some();
+        if conditional
+            && let Some(remaining) = state.conflicting_puts.get_mut(key)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Err(S3ClientError::ConditionalConflict(
+                "A conflicting conditional operation is currently in progress against this \
+                 resource. Try again."
+                    .to_string(),
+            ));
         }
 
         let entry_key = (bucket.to_string(), key.to_string());
@@ -3856,6 +3905,119 @@ async fn the_resource_scan_lists_one_page_at_a_time() {
     );
 }
 
+/// Creates Patients `p1` and `p2` and returns the backend, the mock, the tenant
+/// and the S3 key of `p1`'s `current.json`, for the object-read failure tests.
+async fn two_patients_for_scan() -> (S3Backend, Arc<MockS3Client>, TenantContext, String) {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    for id in ["p1", "p2"] {
+        backend
+            .create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Patient");
+    }
+    let p1_key = mock
+        .keys("test-bucket")
+        .into_iter()
+        .find(|key| key.ends_with("/Patient/p1/current.json"))
+        .expect("p1's current.json key");
+    (backend, mock, t, p1_key)
+}
+
+/// #2048: an object whose read is unavailable (the S3 client has already retried
+/// a failed body read) ends the scan with an `Unavailable` error, so the REST
+/// layer answers 503 rather than 500.
+#[tokio::test]
+async fn a_scan_whose_object_read_is_unavailable_fails_as_unavailable() {
+    use crate::core::sof_runner::SofError;
+
+    let (backend, mock, t, p1_key) = two_patients_for_scan().await;
+    mock.fail_gets_at(
+        &p1_key,
+        S3ClientError::Unavailable(
+            "failed to read object body after 3 attempts: streaming error".to_string(),
+        ),
+    );
+
+    let results: Vec<Result<Value, SofError>> = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan")
+        .scan_resources(&t, "Patient")
+        .await
+        .expect("scan")
+        .collect()
+        .await;
+
+    let error = results
+        .into_iter()
+        .find_map(Result::err)
+        .expect("the unreadable object fails the scan");
+    match error {
+        SofError::Unavailable { message } => {
+            assert!(message.contains("after 3 attempts"), "message: {message}")
+        }
+        other => panic!("expected SofError::Unavailable, got {other:?}"),
+    }
+}
+
+/// #2048: an object read that fails for any other reason is still a server fault
+/// (500), not a retryable 503. Under #1864's typed kinds a classified backend
+/// fault lowers to `SofError::Backend` ([`SofError::from_storage`]).
+#[tokio::test]
+async fn a_scan_whose_object_read_fails_internally_stays_a_storage_error() {
+    use crate::core::sof_runner::SofError;
+
+    let (backend, mock, t, p1_key) = two_patients_for_scan().await;
+    mock.fail_gets_at(&p1_key, S3ClientError::Internal("boom".to_string()));
+
+    let results: Vec<Result<Value, SofError>> = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan")
+        .scan_resources(&t, "Patient")
+        .await
+        .expect("scan")
+        .collect()
+        .await;
+
+    let error = results
+        .into_iter()
+        .find_map(Result::err)
+        .expect("the failing object fails the scan");
+    assert!(
+        matches!(error, SofError::Backend { ref message, .. } if message.contains("boom")),
+        "expected SofError::Backend, got {error:?}"
+    );
+}
+
+/// #2048: the by-id read reports an unavailable object as unavailable too.
+#[tokio::test]
+async fn read_resources_reports_an_unavailable_object_as_unavailable() {
+    use crate::core::sof_runner::SofError;
+
+    let (backend, mock, t, p1_key) = two_patients_for_scan().await;
+    mock.fail_gets_at(
+        &p1_key,
+        S3ClientError::Unavailable("failed to read object body".to_string()),
+    );
+
+    let error = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan")
+        .read_resources(&t, "Patient", &["p1".to_string()])
+        .await
+        .expect_err("the unreadable object fails the read");
+    assert!(
+        matches!(error, SofError::Unavailable { .. }),
+        "expected SofError::Unavailable, got {error:?}"
+    );
+}
+
 /// #1453: the by-id half of the scan hook. The in-process SoF runner uses it
 /// to build a compartment filter without draining the Patient/Group
 /// collections, so it must fetch exactly the ids asked for, skip deleted and
@@ -6837,6 +6999,85 @@ async fn transaction_bundle_is_refused_without_writing_anything() {
 }
 
 // ===========================================================================
+// HTTP 409 ConditionalRequestConflict (#2047)
+//
+// AWS answers a conditional write that collides with another conditional write
+// in flight on the same key with a 409, not a 412. It is transient and says
+// nothing about the stored state, so it must never be reported as a lost
+// precondition (AlreadyExists / VersionConflict).
+// ===========================================================================
+
+#[test]
+fn conditional_conflict_maps_to_unavailable_not_query_error() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    match backend.map_client_error(S3ClientError::ConditionalConflict("busy".to_string())) {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            assert!(message.contains("409"), "message was: {message}");
+            assert!(message.contains("busy"), "message was: {message}");
+        }
+        other => panic!("expected Unavailable (503), got {other:?}"),
+    }
+}
+
+/// A 409 on a resource write is a retryable 503, not a conflict: the resource
+/// paths turn `PreconditionFailed` into `AlreadyExists`/`VersionConflict`, and
+/// a 409 must never be reported as one (nothing is known about stored state).
+#[tokio::test]
+async fn a_409_on_a_resource_write_is_unavailable_not_a_conflict() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    create_patient(&backend, "tenant-a", "p1").await;
+
+    // The current pointer, whichever key layout the backend writes.
+    let current_keys: Vec<String> = mock
+        .keys("test-bucket")
+        .into_iter()
+        .filter(|k| k.contains("/resources/Patient/") && k.ends_with("/p1/current.json"))
+        .collect();
+    assert_eq!(current_keys.len(), 1, "keys were: {current_keys:?}");
+    let current_key = &current_keys[0];
+
+    let read = backend
+        .read(&t, "Patient", "p1")
+        .await
+        .expect("read")
+        .expect("p1 exists");
+
+    mock.conflict_puts_at(current_key, 1);
+    let err = backend
+        .update(
+            &t,
+            &read,
+            json!({"resourceType":"Patient","id":"p1","active":false}),
+        )
+        .await
+        .expect_err("a 409 must fail the update");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "an update meeting a 409 must be Unavailable, not a version conflict: {err:?}"
+    );
+
+    mock.conflict_puts_at(current_key, 1);
+    let err = backend
+        .delete(&t, "Patient", "p1")
+        .await
+        .expect_err("a 409 must fail the delete");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "a delete meeting a 409 must be Unavailable, not an optimistic-lock failure: {err:?}"
+    );
+
+    // Neither refused write landed.
+    let after = backend
+        .read(&t, "Patient", "p1")
+        .await
+        .expect("read")
+        .expect("p1 still exists");
+    assert_eq!(after.version_id(), "1");
+}
+
+// ===========================================================================
 // $bulk-submit job store
 //
 // S3 hosts the REST worker's job state itself — leases compare-and-swapped
@@ -7966,6 +8207,407 @@ mod bulk_submit_worker {
             "the malformed line must surface in the error artifact, got {artifacts:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // HTTP 409 ConditionalRequestConflict on the compare-and-swap writes (#2047)
+    //
+    // AWS refuses a conditional PUT that collides with another write in flight
+    // on the same key with a 409. Nothing was written, so every loop below must
+    // re-read and retry it exactly as it does a lost race (412).
+    // -----------------------------------------------------------------------
+
+    /// How many puts the mock has received for exactly `key` so far.
+    fn puts_on(mock: &MockS3Client, key: &str) -> usize {
+        mock.recorded_puts()
+            .iter()
+            .filter(|put| put.key == key)
+            .count()
+    }
+
+    /// A seeded submission with one manifest, the mock behind it, and the S3
+    /// key of that manifest's state object.
+    struct Seeded {
+        mock: Arc<MockS3Client>,
+        backend: S3Backend,
+        id: SubmissionId,
+        manifest_id: String,
+        manifest_key: String,
+        location: crate::backends::s3::backend::TenantLocation,
+    }
+
+    async fn seeded_with_manifest_key(t: &TenantContext) -> Seeded {
+        let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+        let backend = make_prefix_backend(mock.clone());
+        let (id, manifest_id) = seed(&backend, t).await;
+        let location = backend.tenant_location(t).expect("location");
+        let manifest_key =
+            location
+                .keyspace
+                .submit_manifest_key(&id.submitter, &id.submission_id, &manifest_id);
+        Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key,
+            location,
+        }
+    }
+
+    #[tokio::test]
+    async fn mutate_manifest_state_retries_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+        let before = puts_on(&mock, &key);
+
+        mock.conflict_puts_at(&key, 2);
+        backend
+            .mutate_manifest_state(&location, &id, &manifest_id, |state| {
+                state.manifest.processed_entries += 1;
+            })
+            .await
+            .expect("two 409s are retried and the third attempt lands");
+
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(
+            manifest.processed_entries, 1,
+            "the change must be applied exactly once"
+        );
+        let attempts: Vec<_> = mock
+            .recorded_puts()
+            .into_iter()
+            .filter(|put| put.key == key)
+            .skip(before)
+            .collect();
+        assert_eq!(attempts.len(), 3, "two conflicts and the write that landed");
+        assert!(
+            attempts.iter().all(|put| put.if_match.is_some()),
+            "every attempt is a compare-and-swap: {attempts:?}"
+        );
+    }
+
+    /// The #2047 scenario: a leased manifest ingesting a batch while AWS answers
+    /// 409 to the status write that opens the batch and to the counter write
+    /// that closes it. Before the fix the first 409 failed the whole batch.
+    #[tokio::test]
+    async fn process_entries_completes_through_409s_on_the_manifest_state() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+        let before = puts_on(&mock, &key);
+
+        // The pre-batch status write meets one 409 ...
+        mock.conflict_puts_at(&key, 1);
+        // ... and so does the post-batch counter write, armed once the batch's
+        // entries are stored.
+        let arming = Arc::clone(&mock);
+        let armed_key = key.clone();
+        let options =
+            BulkProcessingOptions::new().with_batch_observer(Arc::new(MidBatch(move || {
+                arming.conflict_puts_at(&armed_key, 1);
+                Box::pin(async {}) as futures::future::BoxFuture<'static, ()>
+            })));
+
+        let results = backend
+            .process_entries(&t, &id, &manifest_id, one_patient(1, "p1"), &options)
+            .await
+            .expect("ingest must ride out the 409s");
+        assert!(results[0].is_success());
+
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.total_entries, 1);
+        assert_eq!(
+            manifest.processed_entries, 1,
+            "the retried counter write must not double-count"
+        );
+        assert_eq!(
+            manifest.status,
+            ManifestStatus::Processing,
+            "a leased manifest's terminal status belongs to the worker"
+        );
+        assert_eq!(
+            puts_on(&mock, &key) - before,
+            4,
+            "status write + its 409, counter write + its 409"
+        );
+        // The holder still holds the lease.
+        backend.heartbeat(&lease).await.expect("lease intact");
+    }
+
+    #[tokio::test]
+    async fn fenced_writes_retry_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .heartbeat(&lease)
+            .await
+            .expect("heartbeat rides out a 409");
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .add_manifest_progress(&lease, 3, 1, 4)
+            .await
+            .expect("progress rides out a 409");
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.processed_entries, 3);
+        assert_eq!(manifest.failed_entries, 1);
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .finish_manifest(&lease)
+            .await
+            .expect("finish rides out a 409");
+        assert_eq!(
+            backend.list_manifests(&t, &id).await.expect("manifests")[0].status,
+            ManifestStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_cas_retries_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            location,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+        let state_key = location
+            .keyspace
+            .submit_state_key(&id.submitter, &id.submission_id);
+        let before = puts_on(&mock, &state_key);
+
+        mock.conflict_puts_at(&state_key, 1);
+        backend
+            .set_submission_kickoff_meta(
+                &t,
+                &id,
+                Some("client-subject"),
+                "https://hfs.example/$bulk-submit",
+                true,
+            )
+            .await
+            .expect("kickoff meta rides out a 409");
+
+        let attempts: Vec<_> = mock
+            .recorded_puts()
+            .into_iter()
+            .filter(|put| put.key == state_key)
+            .skip(before)
+            .collect();
+        assert_eq!(attempts.len(), 2, "one conflict and the write that landed");
+        assert!(
+            attempts.iter().all(|put| put.if_match.is_some()),
+            "every attempt is a compare-and-swap: {attempts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_params_retry_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .set_manifest_fetch_params(
+                &t,
+                &id,
+                &manifest_id,
+                ManifestFetchParams {
+                    fhir_base_url: Some("https://provider.example/fhir"),
+                    output_format: None,
+                    file_request_headers: &[],
+                    oauth_metadata_urls: &[],
+                    file_encryption_key: None,
+                    import_directives: &[],
+                    metadata: &[],
+                },
+            )
+            .await
+            .expect("fetch params ride out a 409");
+
+        let (state, _) = backend
+            .load_manifest_for_cas(&location, &id, &manifest_id)
+            .await
+            .expect("load")
+            .expect("manifest exists");
+        assert_eq!(
+            state.fhir_base_url.as_deref(),
+            Some("https://provider.example/fhir")
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_manifest_by_url_retries_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+        backend
+            .set_manifest_fetch_params(
+                &t,
+                &id,
+                &manifest_id,
+                ManifestFetchParams {
+                    fhir_base_url: Some("https://provider.example/fhir"),
+                    output_format: None,
+                    file_request_headers: &[],
+                    oauth_metadata_urls: &[],
+                    file_encryption_key: None,
+                    import_directives: &[],
+                    metadata: &[],
+                },
+            )
+            .await
+            .expect("fetch params");
+
+        mock.conflict_puts_at(&key, 1);
+        let superseded = backend
+            .replace_manifest_by_url(&t, &id, "https://provider.example/manifest.json")
+            .await
+            .expect("replace rides out a 409");
+        assert_eq!(superseded, vec![manifest_id.clone()]);
+
+        assert_eq!(
+            backend.list_manifests(&t, &id).await.expect("manifests")[0].status,
+            ManifestStatus::Replaced,
+            "the Replaced write must land, not be silently dropped"
+        );
+        let (state, _) = backend
+            .load_manifest_for_cas(&location, &id, &manifest_id)
+            .await
+            .expect("load")
+            .expect("manifest exists");
+        assert_eq!(
+            state.fhir_base_url.as_deref(),
+            Some("https://provider.example/fhir"),
+            "the retry re-reads, so it keeps what the manifest already carried"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_moves_past_a_409_on_its_claim_write() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            manifest_key: key,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+
+        mock.conflict_puts_at(&key, 1);
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+                .await
+                .expect("a 409 on the claim write is a lost claim, not an error")
+                .is_none()
+        );
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("the manifest stayed queued and is claimable on the next poll");
+        assert_eq!(lease.fencing_token, 1);
+    }
+
+    /// A conflict that never clears gives up after a bounded number of attempts
+    /// with the usual diagnosable error. Time is paused so the backoffs
+    /// auto-advance instead of really sleeping.
+    #[tokio::test(start_paused = true)]
+    async fn a_persistent_409_gives_up_after_bounded_attempts() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+        let before = puts_on(&mock, &key);
+
+        mock.conflict_puts_at(&key, usize::MAX);
+        let err = backend
+            .mutate_manifest_state(&location, &id, &manifest_id, |state| {
+                state.manifest.processed_entries += 1;
+            })
+            .await
+            .expect_err("a conflict that never clears must fail");
+        match err {
+            StorageError::Backend(BackendError::Internal { message, .. }) => {
+                assert!(
+                    message.contains("compare-and-swap attempts"),
+                    "message was: {message}"
+                );
+            }
+            other => panic!("expected the exhaustion error, got {other:?}"),
+        }
+        assert_eq!(
+            puts_on(&mock, &key) - before,
+            crate::backends::s3::submit_worker::CAS_ATTEMPTS,
+            "the loop must be bounded"
+        );
+    }
 }
 
 /// #1250: on `s3-es` the next page is fetched while the current one is sent
@@ -8767,5 +9409,588 @@ async fn exists_is_false_for_a_deleted_resource() {
             exists,
             "{resource_type}/{id}"
         );
+    }
+}
+
+/// #2063: the S3 read fan-outs share one backend-wide `GetObject` budget
+/// (`HFS_S3_SCAN_CONCURRENCY`) instead of each fanning out on its own.
+mod scan_read_limit {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Decrements the in-flight gauge when dropped, so a GET that is aborted
+    /// mid-flight still leaves it. With a release delay the drop first blocks
+    /// for that long, like a GET whose teardown takes time, so a GET that is
+    /// still being torn down is visible to a test.
+    struct InFlight<'a>(&'a AtomicUsize, Option<Duration>);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            if let Some(delay) = self.1 {
+                std::thread::sleep(delay);
+            }
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// An `S3Api` that counts the `GetObject`s in flight and keeps each one
+    /// open for `delay`, so overlapping GETs are observable. Everything else
+    /// delegates to the mock.
+    ///
+    /// [`Self::stall_all_but`] makes every GET except those for one resource
+    /// hang until it is dropped, so a test can hold GETs open at a chosen
+    /// moment.
+    struct GaugedGetClient {
+        inner: Arc<MockS3Client>,
+        delay: Duration,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        /// `Some(id)`: a GET for any key without `/{id}/` never completes.
+        stall_all_but: std::sync::Mutex<Option<String>>,
+        /// How long a GET takes to be dropped; see [`InFlight`].
+        release_delay: std::sync::Mutex<Option<Duration>>,
+    }
+
+    impl GaugedGetClient {
+        /// From now on, GETs for every resource but `id` block until the GET
+        /// is dropped (they are never released otherwise).
+        fn stall_all_but(&self, id: &str) {
+            *self.stall_all_but.lock().unwrap() = Some(id.to_string());
+        }
+
+        /// From now on, dropping a GET blocks for `delay` before it leaves the
+        /// in-flight gauge.
+        fn slow_release(&self, delay: Duration) {
+            *self.release_delay.lock().unwrap() = Some(delay);
+        }
+
+        fn is_stalled(&self, key: &str) -> bool {
+            self.stall_all_but
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|id| !key.contains(&format!("/{id}/")))
+        }
+    }
+
+    #[async_trait]
+    impl S3Api for GaugedGetClient {
+        async fn head_bucket(&self, bucket: &str) -> Result<(), S3ClientError> {
+            self.inner.head_bucket(bucket).await
+        }
+        async fn head_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<Option<ObjectMetadata>, S3ClientError> {
+            self.inner.head_object(bucket, key).await
+        }
+        async fn get_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<Option<ObjectData>, S3ClientError> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let _leave = InFlight(&self.in_flight, *self.release_delay.lock().unwrap());
+            if self.is_stalled(key) {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(self.delay).await;
+            self.inner.get_object(bucket, key).await
+        }
+        async fn put_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            body: Vec<u8>,
+            content_type: Option<&str>,
+            if_match: Option<&str>,
+            if_none_match: Option<&str>,
+        ) -> Result<ObjectMetadata, S3ClientError> {
+            self.inner
+                .put_object(bucket, key, body, content_type, if_match, if_none_match)
+                .await
+        }
+        async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3ClientError> {
+            self.inner.delete_object(bucket, key).await
+        }
+        async fn list_objects(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            continuation: Option<&str>,
+            max_keys: Option<i32>,
+        ) -> Result<ListObjectsResult, S3ClientError> {
+            self.inner
+                .list_objects(bucket, prefix, continuation, max_keys)
+                .await
+        }
+        async fn list_objects_after(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            start_after: &str,
+            continuation: Option<&str>,
+            max_keys: Option<i32>,
+        ) -> Result<ListObjectsResult, S3ClientError> {
+            self.inner
+                .list_objects_after(bucket, prefix, start_after, continuation, max_keys)
+                .await
+        }
+        async fn list_common_prefixes(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            delimiter: &str,
+        ) -> Result<Vec<String>, S3ClientError> {
+            self.inner
+                .list_common_prefixes(bucket, prefix, delimiter)
+                .await
+        }
+        async fn list_common_prefixes_page(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            delimiter: &str,
+            start_after: Option<&str>,
+            max_keys: Option<i32>,
+        ) -> Result<DelimitedListPage, S3ClientError> {
+            self.inner
+                .list_common_prefixes_page(bucket, prefix, delimiter, start_after, max_keys)
+                .await
+        }
+        async fn presign_get(
+            &self,
+            bucket: &str,
+            key: &str,
+            ttl: Duration,
+        ) -> Result<String, S3ClientError> {
+            self.inner.presign_get(bucket, key, ttl).await
+        }
+    }
+
+    /// A `PrefixPerTenant` backend with `scan_concurrency = limit` over a
+    /// [`GaugedGetClient`] whose GETs each take 10 ms.
+    fn gauged_backend(limit: usize) -> (S3Backend, Arc<GaugedGetClient>) {
+        let client = Arc::new(GaugedGetClient {
+            inner: Arc::new(MockS3Client::with_buckets(&["test-bucket"])),
+            delay: Duration::from_millis(10),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            stall_all_but: std::sync::Mutex::new(None),
+            release_delay: std::sync::Mutex::new(None),
+        });
+        let config = S3BackendConfig {
+            tenancy_mode: S3TenancyMode::PrefixPerTenant {
+                bucket: "test-bucket".to_string(),
+            },
+            validate_buckets_on_startup: false,
+            scan_concurrency: limit,
+            ..Default::default()
+        };
+        let backend = S3Backend::with_client(config, client.clone()).expect("backend");
+        (backend, client)
+    }
+
+    /// Creates `p00`, `p01`, ... and forgets the GETs the writes made.
+    async fn seed_patients(
+        backend: &S3Backend,
+        client: &GaugedGetClient,
+        t: &TenantContext,
+        n: usize,
+    ) {
+        for i in 0..n {
+            backend
+                .create(
+                    t,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i:02}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .expect("create Patient");
+        }
+        client.peak.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn backend_read_limit_defaults_to_32_and_is_shared_by_clones() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        assert_eq!(backend.scan_concurrency(), 32);
+        assert_eq!(backend.scan_limit.available_permits(), 32);
+        assert!(Arc::ptr_eq(
+            &backend.clone().scan_limit,
+            &backend.scan_limit
+        ));
+    }
+
+    /// Acceptance criterion 3: the read setting does not touch the write
+    /// fan-out that startup seeding and bulk writes use.
+    #[test]
+    fn write_concurrency_is_independent_of_scan_concurrency() {
+        let (backend, _client) = gauged_backend(4);
+        assert_eq!(backend.scan_concurrency(), 4);
+        assert_eq!(ResourceStorage::bulk_write_concurrency(&backend), 32);
+    }
+
+    /// Acceptance criterion 2: scans and a by-id read running at once never
+    /// have more GETs in flight than the limit. Without the shared budget each
+    /// of the four scans and the read would fan out to 3 on its own, 15 in all.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_scans_share_one_read_limit() {
+        let (backend, client) = gauged_backend(3);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 24).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let ids: Vec<String> = (0..10).map(|i| format!("p{i:02}")).collect();
+        let one_scan = || {
+            let scan = scan.clone();
+            let t = t.clone();
+            async move {
+                scan.scan_resources(&t, "Patient")
+                    .await
+                    .expect("scan")
+                    .collect::<Vec<_>>()
+                    .await
+            }
+        };
+
+        let (a, b, c, d, read) = tokio::join!(
+            one_scan(),
+            one_scan(),
+            one_scan(),
+            one_scan(),
+            scan.read_resources(&t, "Patient", &ids),
+        );
+        for scanned in [a, b, c, d] {
+            assert_eq!(scanned.len(), 24);
+            assert!(scanned.iter().all(|r| r.is_ok()), "{scanned:?}");
+        }
+        assert_eq!(read.expect("read by id").len(), 10);
+
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 3,
+            "peak {peak} GETs in flight exceeds the limit of 3"
+        );
+        assert!(peak >= 2, "peak {peak}: the test never overlapped any GETs");
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_limit.available_permits(), 3);
+    }
+
+    /// The setting really bounds a single call, and a limit of one still lets
+    /// the scan finish.
+    #[tokio::test(start_paused = true)]
+    async fn scan_concurrency_one_serialises_and_still_completes() {
+        let (backend, client) = gauged_backend(1);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 10).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let scanned = scan
+            .scan_resources(&t, "Patient")
+            .await
+            .expect("scan")
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(scanned.len(), 10);
+        assert!(scanned.iter().all(|r| r.is_ok()), "{scanned:?}");
+        assert_eq!(client.peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// Deadlock regression. The in-process SQL-on-FHIR runner stops polling its
+    /// scan stream while it resolves a batch's references and while it waits on
+    /// a full channel, and the resolve (or the compartment filter) reads by id
+    /// through the same backend. If the permit were taken in the fan-out's own
+    /// future, two paused scans would keep the whole budget while that nested
+    /// read queued for a permit that never frees (the semaphore hands released
+    /// permits to queued waiters even when nothing polls them), and this read
+    /// would end in `Elapsed`. Each GET runs on its own task, so it finishes and
+    /// returns its permit whatever the scan's consumer does.
+    #[tokio::test(start_paused = true)]
+    async fn paused_scans_do_not_hold_the_read_limit() {
+        let (backend, client) = gauged_backend(2);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 10).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let mut first = scan.scan_resources(&t, "Patient").await.expect("scan");
+        let mut second = scan.scan_resources(&t, "Patient").await.expect("scan");
+        first.next().await.expect("an item").expect("scanned");
+        second.next().await.expect("an item").expect("scanned");
+        // Both streams are now left unpolled, as the runner leaves them.
+
+        let ids = ["p00", "p01", "p02"].map(str::to_string);
+        let read = tokio::time::timeout(
+            Duration::from_secs(30),
+            scan.read_resources(&t, "Patient", &ids),
+        )
+        .await
+        .expect("a by-id read must not wait on permits that paused scans hold")
+        .expect("read by id");
+        assert_eq!(read.len(), 3);
+
+        for stream in [first, second] {
+            let rest = stream.collect::<Vec<_>>().await;
+            assert_eq!(rest.len(), 9, "the rest of the scan still arrives");
+            assert!(rest.iter().all(|r| r.is_ok()), "{rest:?}");
+        }
+    }
+
+    /// A scan that is dropped half-way aborts the GETs it has in flight, and
+    /// the permits come back.
+    ///
+    /// Every GET except the first resource's hangs forever (the gauged client's
+    /// `stall_all_but`), so when the stream is dropped at least one GET is
+    /// still blocked, holding a permit. Each GET runs on its own task: only
+    /// the abort-on-drop guard stops that task, so without it the blocked GET
+    /// and its permit would never be given back, however long we wait.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_scan_returns_its_permits() {
+        let (backend, client) = gauged_backend(2);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 10).await;
+        client.stall_all_but("p00");
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let mut stream = scan.scan_resources(&t, "Patient").await.expect("scan");
+        stream.next().await.expect("an item").expect("scanned");
+
+        // The setup holds: a stalled GET is open and owns a permit.
+        assert!(
+            client.in_flight.load(Ordering::SeqCst) >= 1,
+            "no GET was blocked when the stream was dropped"
+        );
+        assert!(backend.scan_limit.available_permits() < 2);
+
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_limit.available_permits(), 2);
+    }
+
+    /// How a stalled-GET run test stops its run.
+    #[cfg(feature = "R4")]
+    #[derive(Clone, Copy, Debug)]
+    enum Stop {
+        Cancel,
+        Deadline,
+    }
+
+    /// Waits (bounded) until at least one GET is blocked in the gauged client,
+    /// so the stop below lands while a GET holds a permit. This is setup, not
+    /// a settling delay: the assertions after the stop do not wait.
+    #[cfg(feature = "R4")]
+    async fn until_a_get_is_stalled(client: &GaugedGetClient) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while client.in_flight.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("no GET stalled");
+    }
+
+    /// The run context for `stop`: a cancel token fired by the test, or a
+    /// deadline that passes while the GETs are stalled.
+    #[cfg(feature = "R4")]
+    fn stopping_context(
+        stop: Stop,
+    ) -> (
+        crate::core::sof_runner::RunContext,
+        tokio_util::sync::CancellationToken,
+    ) {
+        use crate::core::sof_runner::{RunContext, RunKind};
+        let mut ctx = RunContext::detached(RunKind::Preview);
+        if let Stop::Deadline = stop {
+            ctx.deadline = Some(tokio::time::Instant::now() + Duration::from_millis(300));
+        }
+        let cancel = ctx.cancel.clone();
+        (ctx, cancel)
+    }
+
+    /// #1864 over #2063: an in-process run whose scan has GETs stalled under
+    /// the read limit reports `Cancelled` or `Timeout` only once those GETs are
+    /// gone. Each GET runs on its own task, which the dropped scan merely
+    /// aborts; the run waits for the aborted tasks, so at the moment the
+    /// terminal item is seen no GET is in flight and every permit is back,
+    /// with no settling delay.
+    #[cfg(feature = "R4")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_run_reports_its_end_only_after_its_gets_are_gone() {
+        use crate::core::sof_runner::{RunRequest, SofError, ViewFilters};
+
+        for stop in [Stop::Cancel, Stop::Deadline] {
+            let (backend, client) = gauged_backend(2);
+            client.slow_release(Duration::from_millis(50));
+            let t = tenant("tenant-a");
+            seed_patients(&backend, &client, &t, 10).await;
+            client.stall_all_but("p00");
+
+            let runner = backend.sof_runner().expect("runner");
+            let view = json!({"resourceType": "ViewDefinition", "resource": "Patient",
+                "status": "active", "select": [{"column": [{"name": "id", "path": "id"}]}]});
+            let (ctx, cancel) = stopping_context(stop);
+            let mut rows = runner
+                .run_view(&t, RunRequest::new(view, ViewFilters::default()), ctx)
+                .await
+                .expect("run_view")
+                .rows;
+            until_a_get_is_stalled(&client).await;
+            assert!(backend.scan_limit.available_permits() < 2);
+            if let Stop::Cancel = stop {
+                cancel.cancel();
+            }
+            let last = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut last = None;
+                while let Some(item) = rows.next().await {
+                    if let Err(e) = item {
+                        last = Some(e);
+                    }
+                }
+                last
+            })
+            .await
+            .expect("the run ends after the stop");
+            // Checked at once: no sleep between the terminal item and these.
+            let in_flight = client.in_flight.load(Ordering::SeqCst);
+            let permits = backend.scan_limit.available_permits();
+            match stop {
+                Stop::Cancel => assert!(matches!(last, Some(SofError::Cancelled)), "{last:?}"),
+                Stop::Deadline => {
+                    assert!(matches!(last, Some(SofError::Timeout { .. })), "{last:?}")
+                }
+            }
+            assert_eq!(in_flight, 0, "{stop:?}: a GET outlived the run's end");
+            assert_eq!(permits, 2, "{stop:?}: a permit outlived the run's end");
+        }
+    }
+
+    /// The same for the setup reads: a run stopped while the compartment
+    /// filter's documents are being read by id returns its error only once
+    /// the aborted GETs are gone.
+    #[cfg(feature = "R4")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_stopped_in_its_setup_reads_returns_after_its_gets_are_gone() {
+        use crate::core::sof_runner::{RunRequest, SofError, ViewFilters};
+
+        for stop in [Stop::Cancel, Stop::Deadline] {
+            let (backend, client) = gauged_backend(2);
+            client.slow_release(Duration::from_millis(50));
+            let t = tenant("tenant-a");
+            seed_patients(&backend, &client, &t, 4).await;
+            client.stall_all_but("p00");
+
+            let runner = backend.sof_runner().expect("runner");
+            let view = json!({"resourceType": "ViewDefinition", "resource": "Patient",
+                "status": "active", "select": [{"column": [{"name": "id", "path": "id"}]}]});
+            let filters = ViewFilters {
+                patient: vec!["Patient/p01".to_string(), "Patient/p02".to_string()],
+                ..ViewFilters::default()
+            };
+            let (ctx, cancel) = stopping_context(stop);
+            let run = tokio::spawn({
+                let t = t.clone();
+                async move {
+                    runner
+                        .run_view(&t, RunRequest::new(view, filters), ctx)
+                        .await
+                        .map(|_| ())
+                }
+            });
+            until_a_get_is_stalled(&client).await;
+            if let Stop::Cancel = stop {
+                cancel.cancel();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(10), run)
+                .await
+                .expect("the setup ends after the stop")
+                .expect("run task");
+            let in_flight = client.in_flight.load(Ordering::SeqCst);
+            let permits = backend.scan_limit.available_permits();
+            match stop {
+                Stop::Cancel => assert!(matches!(result, Err(SofError::Cancelled)), "{result:?}"),
+                Stop::Deadline => {
+                    assert!(
+                        matches!(result, Err(SofError::Timeout { .. })),
+                        "{result:?}"
+                    )
+                }
+            }
+            assert_eq!(in_flight, 0, "{stop:?}: a setup GET outlived the error");
+            assert_eq!(permits, 2, "{stop:?}: a permit outlived the error");
+        }
+    }
+
+    /// The other read fan-outs (type count, the live scan behind conditional
+    /// create and SearchParameter reloads, type and instance `_history`) draw
+    /// on the same budget as the SQL-on-FHIR scans.
+    #[tokio::test(start_paused = true)]
+    async fn other_read_fan_outs_share_the_scan_limit() {
+        let (backend, client) = gauged_backend(2);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 12).await;
+        for i in 0..3 {
+            backend
+                .create_or_update(
+                    &t,
+                    "Patient",
+                    "p00",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "p00",
+                        "name": [{"family": format!("v{i}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .expect("update Patient");
+        }
+        client.peak.store(0, Ordering::SeqCst);
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let type_params = HistoryParams {
+            pagination: Pagination {
+                count: 100,
+                mode: PaginationMode::Offset(0),
+            },
+            ..HistoryParams::new()
+        };
+        let instance_params = HistoryParams::new();
+        let (scanned, counted, live, type_history, instance_history) = tokio::join!(
+            async {
+                scan.scan_resources(&t, "Patient")
+                    .await
+                    .expect("scan")
+                    .collect::<Vec<_>>()
+                    .await
+            },
+            backend.count(&t, Some("Patient")),
+            backend.scan_live_resources(&t, "Patient"),
+            backend.history_type(&t, "Patient", &type_params),
+            backend.history_instance(&t, "Patient", "p00", &instance_params),
+        );
+
+        assert_eq!(scanned.len(), 12);
+        assert!(scanned.iter().all(|r| r.is_ok()), "{scanned:?}");
+        assert_eq!(counted.expect("count"), 12);
+        assert_eq!(live.expect("live scan").len(), 12);
+        // 12 creates and 3 updates; deletes are excluded, so every index body
+        // is read to find out.
+        assert_eq!(type_history.expect("type history").items.len(), 15);
+        // p00: the create and the three updates.
+        assert_eq!(instance_history.expect("instance history").items.len(), 4);
+
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 2,
+            "peak {peak} GETs in flight exceeds the limit of 2"
+        );
+        assert!(peak >= 2, "peak {peak}: the test never overlapped any GETs");
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_limit.available_permits(), 2);
     }
 }

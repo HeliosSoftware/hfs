@@ -985,9 +985,12 @@ where
         // with an OperationOutcome body explaining it. `issue[0].expression`
         // names the subject that failed by its output name (#1800); that is
         // the client's own input, so it is there even when a server fault's
-        // `diagnostics` are generic. A 503 carries the same `Retry-After`
-        // every other 503 does (#1864), since a transient failure is worth
-        // retrying.
+        // `diagnostics` are generic. A 503's `diagnostics` tell the client to
+        // submit the export again, in fixed wording like a server fault's
+        // (#2048). The 503 is stored, so re-reading the result URL returns it
+        // again; it still carries the same `Retry-After` every other 503 does
+        // (#1864, council S10), since a transient failure is worth retrying
+        // with a new kick-off.
         Some(JobStatus::Failed {
             message,
             status,

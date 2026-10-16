@@ -36,6 +36,11 @@
 //!   is not a drop) only after the engine's evaluation has returned and the
 //!   scan task has been joined, so no storage read of the run (an S3 GET the
 //!   scan's stream would still start, say) follows the end the consumer sees.
+//!   A read that runs on its own task ([`spawn_run_read`], the S3 GETs under
+//!   the backend-wide read limit) is tracked by the run: the setup reads and
+//!   the scan task wait until every such task is gone, aborted ones included,
+//!   before the run reports its end, so none is still in flight or holds a
+//!   permit once the consumer sees `Cancelled`, `Timeout` or a failure.
 //! - **Bound.** The scan stops within the stop bound; the evaluation stops
 //!   within one resource evaluation per Rayon worker. A FHIRPath terminology
 //!   call in flight inside that evaluation is bounded by its own timeout
@@ -64,6 +69,7 @@ use helios_sof::{
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, warn};
 
 use crate::core::sof_producer::{
@@ -118,6 +124,43 @@ const RESOURCE_CHANNEL_BUFFER: usize = 3;
 ///
 /// Returned by [`ResourceScan::scan_resources`]; consumed by [`InProcessSofRunner`].
 pub type ResourceStream = BoxStream<'static, Result<Value, SofError>>;
+
+tokio::task_local! {
+    /// The storage-read tasks of the in-process run whose setup reads or scan
+    /// task is running on this task; see [`spawn_run_read`].
+    static RUN_READS: TaskTracker;
+}
+
+/// Spawns `read`, a storage read that has to run on its own task (the S3 GET
+/// under the backend-wide read limit, #2063: it must finish and return its
+/// permit even while its caller is not polled).
+///
+/// Called from an in-process run's setup reads or scan task, the read is
+/// tracked by that run (#1864): when the caller's future is dropped its owner
+/// aborts the task, and the run waits until every tracked task is gone before
+/// it reports its end. So a stopped run has no such read in flight, and holds
+/// no permit, once its terminal result is seen. Anywhere else this is
+/// [`tokio::spawn`].
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+pub(crate) fn spawn_run_read<F>(read: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match RUN_READS.try_with(TaskTracker::clone) {
+        Ok(reads) => reads.spawn(read),
+        Err(_) => tokio::spawn(read),
+    }
+}
+
+/// Waits until every read task `reads` tracks is gone: finished, or aborted
+/// and dropped (tokio drops an aborted task's future, and with it its permit,
+/// before the tracker counts it gone). The tracker stays usable afterwards.
+async fn run_reads_gone(reads: &TaskTracker) {
+    reads.close();
+    reads.wait().await;
+    reads.reopen();
+}
 
 /// Streams the live resources of a single resource type for a tenant.
 ///
@@ -490,6 +533,8 @@ impl SofRunner for InProcessSofRunner {
         // those reads are raced against the cancel and the deadline, and the
         // budget a timeout reports counts from here.
         let (out, stop, rows) = row_batch_channel(self.runner_name, &ctx);
+        // The read tasks the setup reads and the scan spawn (`spawn_run_read`).
+        let reads = TaskTracker::new();
 
         // Fetch the Patient/Group documents the compartment filter needs, by id.
         // `build` only ever looks at the resources its own references name —
@@ -507,7 +552,7 @@ impl SofRunner for InProcessSofRunner {
                     let ids = compartment_reference_ids(refs, supporting_type);
                     if !ids.is_empty() {
                         let read = self.scan.read_resources(tenant, supporting_type, &ids);
-                        supporting.extend(race_setup(&stop, read).await?);
+                        supporting.extend(race_setup(&stop, &reads, read).await?);
                     }
                 }
                 // A target that does not exist, or was deleted, is the typed
@@ -539,9 +584,12 @@ impl SofRunner for InProcessSofRunner {
                 let scan = self
                     .scan
                     .scan_resources_since(tenant, &resource_type, cutoff);
-                race_setup(&stop, scan).await?
+                race_setup(&stop, &reads, scan).await?
             }
-            None => race_setup(&stop, self.scan.scan_resources(tenant, &resource_type)).await?,
+            None => {
+                let scan = self.scan.scan_resources(tenant, &resource_type);
+                race_setup(&stop, &reads, scan).await?
+            }
         };
 
         // Resource channel: batches of (resources, pre-resolved external refs)
@@ -559,10 +607,16 @@ impl SofRunner for InProcessSofRunner {
             tenant: tenant.clone(),
             version: self.fhir_version,
         };
-        let scan_handle = tokio::spawn(scan.run(res_tx.clone(), stop.clone()));
+        let scan_handle =
+            tokio::spawn(RUN_READS.scope(reads.clone(), scan.run(res_tx.clone(), stop.clone())));
         let scan_stopped = CancellationToken::new();
-        let scan_watcher =
-            supervise_scan(self.runner_name, scan_handle, res_tx, scan_stopped.clone());
+        let scan_watcher = supervise_scan(
+            self.runner_name,
+            scan_handle,
+            reads,
+            res_tx,
+            scan_stopped.clone(),
+        );
 
         // Blocking engine task (CPU-bound FHIRPath evaluation), with the
         // bridge that turns a stop into the evaluation's stop flag.
@@ -618,15 +672,24 @@ impl SofRunner for InProcessSofRunner {
 
 /// Runs a setup read of a run (the compartment filter's documents, the start
 /// of the scan) unless the run is cancelled or its deadline passes first.
+///
+/// The read tasks the setup spawns are tracked in `reads`; whatever the
+/// outcome, this returns only once they are gone. A stop (or a failed read
+/// among several in flight) drops the setup with GETs still running, which
+/// aborts them, and the run's error must not be reported before those aborted
+/// reads, and the permits they hold, are released (#1864).
 async fn race_setup<T>(
     stop: &RunStop,
+    reads: &TaskTracker,
     setup: impl std::future::Future<Output = Result<T, SofError>>,
 ) -> Result<T, SofError> {
-    tokio::select! {
+    let result = tokio::select! {
         biased;
         reason = stop.stopped() => Err(stop.error_for(reason).unwrap_or(SofError::Cancelled)),
-        result = setup => result,
-    }
+        result = RUN_READS.scope(reads.clone(), setup) => result,
+    };
+    run_reads_gone(reads).await;
+    result
 }
 
 /// What the scan task sends to the engine.
@@ -748,19 +811,25 @@ impl ScanTask {
 /// in place of the end marker, so the rows read before the failure cannot
 /// end the run as if they were complete.
 ///
-/// Fires `stopped` once the scan task has been joined, however it ended (and
-/// if the watcher itself is dropped). Tokio drops a task's future before its
-/// `JoinHandle` resolves, so by then the scan's stream, and every storage read
-/// it had in flight, is gone. Returns the watcher's handle.
+/// Fires `stopped` once the scan task has been joined and every read task it
+/// spawned (tracked in `reads`) is gone, however it ended (and if the watcher
+/// itself is dropped). Tokio drops a task's future before its `JoinHandle`
+/// resolves, so by then the scan's stream, and every storage read it polled
+/// inline, is gone; dropping the stream aborts the read tasks it spawned
+/// ([`spawn_run_read`]), and waiting on `reads` covers the time until tokio has
+/// dropped them too. Returns the watcher's handle.
 fn supervise_scan(
     runner: &'static str,
     scan: tokio::task::JoinHandle<()>,
+    reads: TaskTracker,
     res_tx: mpsc::Sender<ScanFrame>,
     stopped: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let _stopped = stopped.drop_guard();
-        if let Err(e) = scan.await {
+        let joined = scan.await;
+        run_reads_gone(&reads).await;
+        if let Err(e) = joined {
             warn!(runner, error = %e, "SoF resource scan ended before finishing");
             let _ = res_tx
                 .send(ScanFrame::Failed(SofError::backend(format!(
@@ -791,7 +860,8 @@ struct Engine {
     flag: StopFlag,
     /// Read by the evaluation before each resource.
     evaluation_stop: Arc<AtomicBool>,
-    /// Fired by [`supervise_scan`] once the scan task has been joined.
+    /// Fired by [`supervise_scan`] once the scan task has been joined and its
+    /// read tasks are gone.
     scan_stopped: CancellationToken,
     handle: tokio::runtime::Handle,
 }
