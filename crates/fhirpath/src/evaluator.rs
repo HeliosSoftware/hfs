@@ -8763,7 +8763,16 @@ pub(crate) fn compare_equality(
                     EvaluationResult::Quantity(val_l, unit_l, _, _),
                     EvaluationResult::Quantity(val_r, unit_r, _, _),
                 ) => {
-                    if unit_l == unit_r {
+                    // Calendar years/months and UCUM definite years/months are
+                    // equivalent, but cannot be compared for strict equality.
+                    // Check before UCUM conversion erases that distinction.
+                    if matches!(
+                        (unit_l.as_str(), unit_r.as_str()),
+                        ("year" | "years" | "month" | "months", "a" | "mo")
+                            | ("a" | "mo", "year" | "years" | "month" | "months")
+                    ) {
+                        EvaluationResult::Empty
+                    } else if unit_l == unit_r {
                         // Same unit, direct comparison
                         EvaluationResult::boolean(val_l == val_r)
                     } else if crate::ucum::units_are_comparable(unit_l, unit_r) {
