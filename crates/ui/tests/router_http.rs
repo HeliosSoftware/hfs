@@ -7542,6 +7542,142 @@ async fn sql_view_page_resolves_reads_from_and_lists_used_by() {
     assert!(html.contains("Nightly extract"), "{html}");
 }
 
+/// A loopback terminology server for #1824's *Reads from* rows: `POST
+/// ValueSet/$expand` expands only `http://example.org/ValueSet/cardio`
+/// (404 otherwise), and `GET ConceptMap?url=` holds only
+/// `http://example.org/ConceptMap/ids-to-icd`.
+async fn mock_terminology_tables() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/ValueSet/$expand",
+            axum::routing::post(|body: String| async move {
+                let params: Value = serde_json::from_str(&body).unwrap_or_default();
+                let url = params["parameter"][0]["valueUri"].as_str().unwrap_or("");
+                if url == "http://example.org/ValueSet/cardio" {
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "resourceType": "ValueSet", "url": url,
+                            "name": "Cardio", "title": "Cardiology codes",
+                            "expansion": {"total": 2}
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (StatusCode::NOT_FOUND, String::new())
+                }
+            }),
+        )
+        .route(
+            "/ConceptMap",
+            axum::routing::get(
+                |axum::extract::Query(query): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    let url = query.get("url").map(String::as_str).unwrap_or("");
+                    let entry = if url == "http://example.org/ConceptMap/ids-to-icd" {
+                        serde_json::json!([{"resource": {
+                            "resourceType": "ConceptMap", "url": url, "name": "IdsToIcd"
+                        }}])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    serde_json::json!({"resourceType": "Bundle", "entry": entry}).to_string()
+                },
+            ),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// #1824: a dependency storage has no ViewDefinition or Library for is
+/// resolved on the terminology server — a value set it expands and a
+/// concept map it holds each render as a resolved row with their own chip
+/// and name, never as *Not found*; a canonical it knows neither of still
+/// does.
+#[tokio::test]
+async fn reads_from_resolves_value_set_and_concept_map_dependencies_on_the_terminology_server() {
+    let library = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "cardio_patients", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+            {"type": "depends-on", "label": "cardio", "resource": "http://example.org/ValueSet/cardio"},
+            {"type": "depends-on", "label": "icd", "resource": "http://example.org/ConceptMap/ids-to-icd"},
+            {"type": "depends-on", "label": "missing", "resource": "http://example.org/ValueSet/nope"},
+        ],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with("Library", helios_fhir::FhirVersion::R4, vec![library]);
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        Some(mock_terminology_tables().await),
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let reads_from = text_between(&html, r#"id="lib-tables""#, r#"id="lib-tables-add-table""#);
+    let row = |alias: &str| {
+        let start = reads_from
+            .find(&format!(
+                r#"<code class="lib-tables__alias">{alias}</code>"#
+            ))
+            .unwrap_or_else(|| panic!("no row for {alias}: {reads_from}"));
+        let head = &reads_from[..start];
+        let row_start = head.rfind("<li").unwrap();
+        let row_end = start + reads_from[start..].find("</li>").unwrap();
+        reads_from[row_start..row_end].to_string()
+    };
+
+    let cardio = row("cardio");
+    assert!(
+        cardio.contains(r#"<span class="tag tag--type">ValueSet</span>"#),
+        "{cardio}"
+    );
+    assert!(cardio.contains("Cardiology codes"), "{cardio}");
+    assert!(!cardio.contains("row--alert"), "{cardio}");
+
+    let icd = row("icd");
+    assert!(
+        icd.contains(r#"<span class="tag tag--type">ConceptMap</span>"#),
+        "{icd}"
+    );
+    assert!(icd.contains("IdsToIcd"), "{icd}");
+    assert!(!icd.contains("row--alert"), "{icd}");
+
+    let missing = row("missing");
+    assert!(missing.contains("row--alert"), "{missing}");
+    assert!(missing.contains("Not found"), "{missing}");
+
+    assert!(!row("v").contains("row--alert"));
+}
+
 /// #1238: the Tables card's own add row — search, alias, *Add* — is
 /// always visible, right after *Reads from*'s own list, never behind a
 /// disclosure the way the guided-form editor's own "+ Add" panels still

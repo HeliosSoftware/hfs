@@ -515,7 +515,7 @@ pub(crate) fn tables_signature_with_unknown(
 /// written by this UI's own [`add_table`] and is out of scope for #842's own
 /// "imitates, does not replace" resolution — a document that used it would
 /// simply not resolve here, exactly as an unversioned typo would not.
-fn split_canonical_version(reference: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_canonical_version(reference: &str) -> (&str, Option<&str>) {
     match reference.split_once('|') {
         Some((canonical, version)) => (canonical, Some(version)),
         None => (reference, None),
@@ -620,10 +620,50 @@ pub(crate) enum TableTarget {
     /// answering to the dependency's own `resource` (the starter
     /// document's own `change-me` canonical, for instance).
     NotFound,
+    /// Resolved on the terminology server (`HFS_TERMINOLOGY_SERVER`) to a
+    /// ValueSet it can expand or a ConceptMap it holds (#1824) — the same
+    /// fallback `$sql-run`'s own graph walk takes once storage has no
+    /// ViewDefinition or Library at the canonical. `name` is the artifact's
+    /// own `title`, else `name`, else the canonical itself.
+    Terminology {
+        kind: helios_sof::sqlquery::TerminologyKind,
+        name: String,
+    },
     /// Resolved to something storage holds, but not a ViewDefinition or a
     /// `sql-view` Library — a `sql-query` Library, most commonly, which
     /// `$sql-run`'s own graph walk would reject the same way.
     NotATable,
+}
+
+/// Classifies a terminology `artifact` of `kind` — the expanded ValueSet or
+/// the ConceptMap the terminology server returned for `reference` — into a
+/// [`TableTarget::Terminology`] (#1824).
+pub(crate) fn classify_terminology_artifact(
+    kind: helios_sof::sqlquery::TerminologyKind,
+    artifact: &Value,
+    reference: &str,
+) -> TableTarget {
+    let name = ["title", "name"]
+        .iter()
+        .find_map(|key| artifact.get(key).and_then(Value::as_str))
+        .filter(|name| !name.is_empty())
+        .unwrap_or(reference)
+        .to_string();
+    TableTarget::Terminology { kind, name }
+}
+
+/// The first ConceptMap in a terminology server's `ConceptMap?url=` search
+/// `bundle` that `reference` identifies ([`matches_reference`]), or `None`.
+pub(crate) fn concept_map_in_bundle<'a>(bundle: &'a Value, reference: &str) -> Option<&'a Value> {
+    bundle
+        .get("entry")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|entry| entry.get("resource"))
+        .find(|resource| {
+            resource.get("resourceType").and_then(Value::as_str) == Some("ConceptMap")
+                && matches_reference(reference, "ConceptMap", resource)
+        })
 }
 
 /// Classifies an already-fetched `artifact` of `resource_type` into a
@@ -1562,6 +1602,69 @@ mod tests {
         assert_eq!(
             classify_table_artifact("Library", &sql_query),
             TableTarget::NotATable
+        );
+    }
+
+    #[test]
+    fn classify_terminology_artifact_prefers_title_then_name_then_reference() {
+        use helios_sof::sqlquery::TerminologyKind;
+        let reference = "http://hl7.org/fhir/ValueSet/administrative-gender";
+        assert_eq!(
+            classify_terminology_artifact(
+                TerminologyKind::ValueSet,
+                &json!({"name": "AdministrativeGender", "title": "Administrative Gender"}),
+                reference
+            ),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ValueSet,
+                name: "Administrative Gender".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_terminology_artifact(
+                TerminologyKind::ConceptMap,
+                &json!({"name": "ids_to_icd"}),
+                reference
+            ),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ConceptMap,
+                name: "ids_to_icd".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_terminology_artifact(TerminologyKind::ValueSet, &json!({}), reference),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ValueSet,
+                name: reference.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn concept_map_in_bundle_matches_canonical_and_pinned_version() {
+        let bundle = json!({"resourceType": "Bundle", "entry": [
+            {"resource": {"resourceType": "OperationOutcome"}},
+            {"resource": {"resourceType": "ConceptMap", "id": "a",
+                          "url": "http://example.org/cm", "version": "1"}},
+            {"resource": {"resourceType": "ConceptMap", "id": "b",
+                          "url": "http://example.org/cm", "version": "2"}},
+        ]});
+        let id = |r: Option<&Value>| r.and_then(|r| r["id"].as_str()).map(str::to_string);
+        assert_eq!(
+            id(concept_map_in_bundle(&bundle, "http://example.org/cm")),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            id(concept_map_in_bundle(&bundle, "http://example.org/cm|2")),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            concept_map_in_bundle(&bundle, "http://example.org/cm|3"),
+            None
+        );
+        assert_eq!(
+            concept_map_in_bundle(&json!({"resourceType": "Bundle"}), "http://example.org/cm"),
+            None
         );
     }
 

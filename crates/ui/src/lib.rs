@@ -5040,10 +5040,82 @@ async fn resolve_table_reference(
                     let target = sql_libraries::classify_table_artifact("Library", lib);
                     (target, Some(lib.clone()))
                 }
-                None => (TableTarget::NotFound, None),
+                None => match resolve_terminology_reference(state, reference).await {
+                    Some((target, artifact)) => (target, Some(artifact)),
+                    None => (TableTarget::NotFound, None),
+                },
             }
         }
     }
+}
+
+/// Resolves a canonical `reference` that names no stored ViewDefinition or
+/// Library on the terminology server (`HFS_TERMINOLOGY_SERVER`), mirroring
+/// `crates/rest/.../sof/terminology.rs`'s own `fetch_relation` (#1824): first
+/// as a value set to expand (`POST ValueSet/$expand`, `count=0` — only
+/// whether it expands matters here, never its rows), then as a concept map
+/// (`GET ConceptMap?url=[&version=]`). `None` when no terminology server is
+/// configured, it knows neither, or it cannot be reached within the same
+/// 2500ms budget the editor's own `$expand` picker uses — the row then shows
+/// as not found, which is what `$sql-run` would report too.
+async fn resolve_terminology_reference(
+    state: &WebState,
+    reference: &str,
+) -> Option<(sql_libraries::TableTarget, serde_json::Value)> {
+    use helios_sof::sqlquery::TerminologyKind;
+    let base = state.terminology.as_deref()?.trim_end_matches('/');
+    let client = editor::terminology_client();
+    let timeout = std::time::Duration::from_millis(2500);
+
+    let expand = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": reference},
+            {"name": "count", "valueInteger": 0}
+        ]
+    });
+    if let Ok(response) = client
+        .post(format!("{base}/ValueSet/$expand"))
+        .header("Content-Type", "application/fhir+json")
+        .header("Accept", "application/fhir+json")
+        .json(&expand)
+        .timeout(timeout)
+        .send()
+        .await
+        && response.status().is_success()
+        && let Ok(value_set) = response.json::<serde_json::Value>().await
+        && value_set.get("resourceType").and_then(|t| t.as_str()) == Some("ValueSet")
+    {
+        let target = sql_libraries::classify_terminology_artifact(
+            TerminologyKind::ValueSet,
+            &value_set,
+            reference,
+        );
+        return Some((target, value_set));
+    }
+
+    let (canonical, version) = sql_libraries::split_canonical_version(reference);
+    let mut query = vec![("url", canonical)];
+    if let Some(version) = version {
+        query.push(("version", version));
+    }
+    let response = client
+        .get(format!("{base}/ConceptMap"))
+        .query(&query)
+        .header("Accept", "application/fhir+json")
+        .timeout(timeout)
+        .send()
+        .await
+        .ok()
+        .filter(|response| response.status().is_success())?;
+    let bundle = response.json::<serde_json::Value>().await.ok()?;
+    let concept_map = sql_libraries::concept_map_in_bundle(&bundle, reference)?.clone();
+    let target = sql_libraries::classify_terminology_artifact(
+        TerminologyKind::ConceptMap,
+        &concept_map,
+        reference,
+    );
+    Some((target, concept_map))
 }
 
 /// Resolves every dependency in `deps` via [`resolve_table_reference`],
@@ -5279,6 +5351,19 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> Ta
                 &format!("/ui/sql/views?lib={id}"),
                 Some(origin),
             )),
+            link_label: Some(name),
+            detail: None,
+        },
+        sql_libraries::TableTarget::Terminology { kind, name } => TableRowView {
+            label: row.label,
+            chip: i18n.t(match kind {
+                helios_sof::sqlquery::TerminologyKind::ValueSet => "lib-tables-kind-value-set",
+                helios_sof::sqlquery::TerminologyKind::ConceptMap => "lib-tables-kind-concept-map",
+            }),
+            chip_class: "type",
+            // The artifact lives on the terminology server, which has no
+            // page of its own on this UI to link to.
+            link_href: None,
             link_label: Some(name),
             detail: None,
         },
