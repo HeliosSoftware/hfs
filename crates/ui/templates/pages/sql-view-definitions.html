@@ -128,11 +128,15 @@
 
   <div class="filter-center">
     {% if let Some(sel) = selected %}
-    <!-- The Figma title row: the view's name left; Duplicate / Delete /
+    <!-- The Figma title row: the ViewDefinition icon (the sidebar's grid,
+         matching SQL Queries / SQL Views) and the view's name left; Duplicate / Delete /
          Create New right. Duplicate submits the form below with its own
          intent, so it stays inside the form via the `form` attribute. -->
     <section class="page-head page-head--row">
-      <h2 class="page-head__title">{% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}</h2>
+      <h2 class="page-head__title page-head__title--kind">
+        <span class="icon" aria-hidden="true">{% include "icons/grid.svg" %}</span>
+        {% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}
+      </h2>
       <div class="page-head__actions">
         {#- Implicit-submission guard (#1754). Enter in a one-line field of the
             editor form clicks the form's *default button*: its first submit
