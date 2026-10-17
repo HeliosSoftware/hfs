@@ -637,7 +637,9 @@ pub(crate) enum TableTarget {
 
 /// Classifies a terminology `artifact` of `kind` — the expanded ValueSet or
 /// the ConceptMap the terminology server returned for `reference` — into a
-/// [`TableTarget::Terminology`] (#1824).
+/// [`TableTarget::Terminology`] (#1824). With no `title` or `name`, a VCL
+/// implicit value set reads as its decoded expression ([`vcl_expression`])
+/// rather than its percent-encoded URL; any other reference reads verbatim.
 pub(crate) fn classify_terminology_artifact(
     kind: helios_sof::sqlquery::TerminologyKind,
     artifact: &Value,
@@ -647,9 +649,23 @@ pub(crate) fn classify_terminology_artifact(
         .iter()
         .find_map(|key| artifact.get(key).and_then(Value::as_str))
         .filter(|name| !name.is_empty())
-        .unwrap_or(reference)
-        .to_string();
+        .map(str::to_string)
+        .or_else(|| vcl_expression(reference).map(|expr| format!("VCL: {expr}")))
+        .unwrap_or_else(|| reference.to_string());
     TableTarget::Terminology { kind, name }
+}
+
+/// The decoded VCL expression of a VCL implicit value set URL
+/// (`http://fhir.org/VCL?v1=<percent-encoded expression>`, either scheme),
+/// or `None` for any other reference, or one with no non-empty `v1`.
+pub(crate) fn vcl_expression(reference: &str) -> Option<String> {
+    let query = reference
+        .strip_prefix("http://fhir.org/VCL?")
+        .or_else(|| reference.strip_prefix("https://fhir.org/VCL?"))?;
+    form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "v1")
+        .map(|(_, expr)| expr.into_owned())
+        .filter(|expr| !expr.is_empty())
 }
 
 /// The first ConceptMap in a terminology server's `ConceptMap?url=` search
@@ -1648,6 +1664,43 @@ mod tests {
             TableTarget::Terminology {
                 kind: TerminologyKind::ValueSet,
                 name: reference.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn vcl_value_sets_without_a_title_read_as_their_decoded_expression() {
+        use helios_sof::sqlquery::TerminologyKind;
+        let vcl = "http://fhir.org/VCL?v1=%28http%3A%2F%2Fhl7.org%2Ffhir%2Fsid%2Ficd-10-cm%29concept%3C%3CE11";
+        assert_eq!(
+            vcl_expression(vcl).as_deref(),
+            Some("(http://hl7.org/fhir/sid/icd-10-cm)concept<<E11")
+        );
+        assert_eq!(
+            vcl_expression("https://fhir.org/VCL?v1=%28http%3A%2F%2Fs%29%22E11.9%22").as_deref(),
+            Some(r#"(http://s)"E11.9""#)
+        );
+        assert_eq!(vcl_expression("http://fhir.org/VCL?v1="), None);
+        assert_eq!(vcl_expression("http://fhir.org/VCL?v2=A"), None);
+        assert_eq!(vcl_expression("http://hl7.org/fhir/ValueSet/x"), None);
+
+        assert_eq!(
+            classify_terminology_artifact(TerminologyKind::ValueSet, &json!({}), vcl),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ValueSet,
+                name: "VCL: (http://hl7.org/fhir/sid/icd-10-cm)concept<<E11".to_string(),
+            }
+        );
+        // A title the terminology server does send still wins.
+        assert_eq!(
+            classify_terminology_artifact(
+                TerminologyKind::ValueSet,
+                &json!({"title": "T2DM"}),
+                vcl
+            ),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ValueSet,
+                name: "T2DM".to_string(),
             }
         );
     }
