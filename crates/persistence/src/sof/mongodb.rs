@@ -11,6 +11,11 @@
 //! are layered onto the compiled pipeline here: a leading `$match` constrains
 //! the tenant (and `last_updated` for `since`), and a trailing `$limit` caps the
 //! output.
+//!
+//! The cursor loop runs in a `tokio::spawn` task whose `JoinHandle` is watched
+//! by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer) so a
+//! panic or cancellation reaches the consumer as an `Err` item instead of a
+//! silent end of stream.
 
 use std::sync::Arc;
 
@@ -21,7 +26,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use crate::backends::mongodb::backend::{MongoBackend, MongoBackendConfig, connect_client};
-use crate::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
+use crate::core::sof_runner::{
+    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+};
 use crate::tenant::TenantContext;
 
 use super::compiler::compile_view_definition_mongo;
@@ -132,8 +139,9 @@ impl SofRunner for MongoInDbRunner {
 
         let collection = self.resources().await?;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let guard_tx = tx.clone();
 
-        tokio::spawn(async move {
+        let producer = tokio::spawn(async move {
             let mut cursor = match collection.aggregate(pipeline).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -190,6 +198,7 @@ impl SofRunner for MongoInDbRunner {
                 "in-DB view run complete"
             );
         });
+        watch_row_producer(self.runner_name(), guard_tx, producer);
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }

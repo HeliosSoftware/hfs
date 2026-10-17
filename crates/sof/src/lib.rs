@@ -182,6 +182,9 @@
 
 pub mod app;
 pub mod canonical;
+pub mod column_types;
+pub mod columnar;
+pub mod columnar_stream;
 pub mod compartment;
 pub mod constants;
 pub mod data_source;
@@ -201,10 +204,15 @@ pub mod remote_resolver;
 pub mod sqlquery;
 pub mod traits;
 
+pub use column_types::{
+    ANSI_TYPE_TAG, AnsiType, ColumnTypeInfo, default_for_fhir_type, default_for_fhirpath_type,
+    resolve_columns,
+};
 pub use compartment::{resolve_group_members_to_patient_refs, resource_in_patient_compartment};
 pub use constants::{ConstantValue, parse_constant_from_json};
 pub use params::{
-    ExtractedRunParams, body_has_subject, extract_run_params_from_json, split_csv_refs,
+    ExtractedRunParams, ReferenceParameterError, body_has_subject, extract_run_params_checked,
+    extract_run_params_from_json, split_csv_refs,
 };
 pub use remote_fetch::{RemoteResolver, prefetch_external_resources};
 pub use remote_resolver::{
@@ -220,7 +228,10 @@ pub use sqlquery::{
 };
 
 use chrono::{DateTime, Utc};
-use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
+use helios_fhirpath::{
+    EvaluationContext, EvaluationResult, TerminologySession, UnresolvedIdentifierPolicy,
+    evaluate_expression, evaluate_expression_typed,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -229,7 +240,11 @@ use thiserror::Error;
 use traits::*;
 
 // Re-export commonly used types and traits for easier access
+/// Arrow and Parquet as built against by this crate, so dependents that
+/// handle record batches need no matching dependency of their own.
+pub use arrow;
 pub use helios_fhir::FhirVersion;
+pub use parquet;
 pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 
 /// Multi-version ViewDefinition container supporting version-agnostic operations.
@@ -287,6 +302,41 @@ pub enum SofViewDefinition {
 }
 
 impl SofViewDefinition {
+    /// The columns declared by this ViewDefinition (name, optional FHIR `type`,
+    /// `collection`), used to fix the Parquet / Arrow schema before any row is
+    /// seen. Empty if the definition cannot be serialised.
+    pub fn declared_columns(&self) -> Vec<sqlquery::engine::DeclaredColumn> {
+        self.to_json()
+            .map(|v| sqlquery::engine::declared_columns(&v))
+            .unwrap_or_default()
+    }
+
+    /// Like [`Self::declared_columns`], but each column also carries its
+    /// resolved SQL type (default mapping or `ansi/type` tag), and an unknown,
+    /// non-string or incompatible `ansi/type` tag is an error naming the
+    /// column ([`SofError::InvalidViewDefinition`]) instead of being ignored.
+    pub fn try_declared_columns(&self) -> Result<Vec<sqlquery::engine::DeclaredColumn>, SofError> {
+        let json = self.to_json().map_err(|e| {
+            SofError::InvalidViewDefinition(format!(
+                "failed to serialize ViewDefinition to resolve column types: {e}"
+            ))
+        })?;
+        sqlquery::engine::try_declared_columns(&json)
+    }
+
+    fn to_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        match self {
+            #[cfg(feature = "R4")]
+            SofViewDefinition::R4(vd) => serde_json::to_value(vd),
+            #[cfg(feature = "R4B")]
+            SofViewDefinition::R4B(vd) => serde_json::to_value(vd),
+            #[cfg(feature = "R5")]
+            SofViewDefinition::R5(vd) => serde_json::to_value(vd),
+            #[cfg(feature = "R6")]
+            SofViewDefinition::R6(vd) => serde_json::to_value(vd),
+        }
+    }
+
     /// Returns the FHIR specification version of this ViewDefinition.
     ///
     /// This method provides version detection for multi-version applications,
@@ -1043,6 +1093,12 @@ pub fn parse_view_definition_for_version(
     json: serde_json::Value,
     version: helios_fhir::FhirVersion,
 ) -> Result<SofViewDefinition, SofError> {
+    // Validate column tags on the raw JSON first: the typed deserializer
+    // rejects e.g. a non-string tag `value` with a generic serde message that
+    // does not name the column.
+    if json.is_object() {
+        column_types::resolve_columns(&json)?;
+    }
     match version {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {
@@ -1152,6 +1208,168 @@ pub fn create_bundle_from_resources_for_version(
     }
 }
 
+/// Precomputed compartment filter built from patient and group references.
+///
+/// Separates the one-time setup (absent-target validation, group member
+/// resolution, patient-set construction) from the per-resource membership
+/// test so the streaming path can validate once — against just the
+/// Patient/Group documents the references name — then apply the filter one
+/// document at a time without materialising the full corpus.
+pub struct CompartmentFilter {
+    targets: std::collections::HashSet<String>,
+    group_refs: Vec<String>,
+    fhir_version: FhirVersion,
+}
+
+/// Splits a compartment `patient=` / `group=` reference into its canonical
+/// `Type/id` form and the bare resource id it names.
+///
+/// References arrive either fully qualified (`Patient/p1`) or as a bare id
+/// (`p1`); a versioned reference (`Patient/p1/_history/2`) names the same
+/// resource. The id is `None` only for a reference that names no id at all
+/// (`""` / `"Patient/"`), which cannot resolve and is reported as absent.
+fn canonical_compartment_ref(reference: &str, resource_type: &str) -> (String, Option<String>) {
+    let prefix = format!("{}/", resource_type);
+    let canonical = if reference.starts_with(&prefix) {
+        reference.to_string()
+    } else {
+        format!("{}{}", prefix, reference)
+    };
+    let id = canonical
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.split('/').next())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    (canonical, id)
+}
+
+/// Returns the distinct resource ids named by a set of compartment references,
+/// in first-seen order.
+///
+/// Lets a caller fetch exactly the `resource_type` documents that
+/// [`CompartmentFilter::build`] needs — by id, rather than by scanning the
+/// type — so filter setup stays proportional to the number of references
+/// instead of to the corpus.
+pub fn compartment_reference_ids(refs: &[String], resource_type: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for reference in refs {
+        if let (_, Some(id)) = canonical_compartment_ref(reference, resource_type)
+            && seen.insert(id.clone())
+        {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+impl CompartmentFilter {
+    /// Builds the filter from the supporting Patient/Group resources.
+    ///
+    /// Validates that every patient and group reference resolves to a resource
+    /// in `supporting`, then constructs the effective `Patient/{id}` target set.
+    /// Errors identically to [`filter_resources_by_patient_and_group`].
+    ///
+    /// `supporting` need only contain the Patient and Group documents that
+    /// `patient_refs` / `group_refs` actually name — validation is a point
+    /// lookup per reference and a Group's members are read off that Group, so
+    /// nothing here consumes the rest of either collection. Callers that can
+    /// fetch by id should use [`compartment_reference_ids`] and pass just those
+    /// documents; the whole-collection slice that
+    /// [`filter_resources_by_patient_and_group`] passes is a superset, not a
+    /// requirement.
+    pub fn build(
+        patient_refs: &[String],
+        group_refs: &[String],
+        supporting: &[serde_json::Value],
+        fhir_version: FhirVersion,
+    ) -> Result<Self, SofError> {
+        use std::collections::HashSet;
+
+        let mut absent: Vec<String> = Vec::new();
+        for (refs, resource_type) in [(patient_refs, "Patient"), (group_refs, "Group")] {
+            for reference in refs {
+                let (canonical, id) = canonical_compartment_ref(reference, resource_type);
+                let found = id
+                    .map(|id| {
+                        supporting.iter().any(|res| {
+                            res.get("resourceType").and_then(|v| v.as_str()) == Some(resource_type)
+                                && res.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                        })
+                    })
+                    .unwrap_or(false);
+                if !found {
+                    absent.push(canonical);
+                }
+            }
+        }
+        if !absent.is_empty() {
+            return Err(SofError::ReferencedResourceNotFound(format!(
+                "{} not found in supplied resources",
+                absent.join(", ")
+            )));
+        }
+
+        let mut targets: HashSet<String> = patient_refs
+            .iter()
+            .map(|r| canonical_compartment_ref(r, "Patient").0)
+            .collect();
+
+        if !group_refs.is_empty() {
+            targets.extend(compartment::resolve_group_members_to_patient_refs(
+                group_refs, supporting,
+            ));
+        }
+
+        Ok(Self {
+            targets,
+            group_refs: group_refs.to_vec(),
+            fhir_version,
+        })
+    }
+
+    /// Returns `true` when the filter has no effective patient targets.
+    ///
+    /// This happens when all supplied groups resolved to zero Patient members.
+    /// The targets themselves were present (they passed absent-target validation),
+    /// so this is an empty-but-valid result: every resource fails the filter.
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    /// Tests whether `resource` is in the effective patient compartment.
+    ///
+    /// A Group whose `Group/{id}` was requested directly is a first-class
+    /// compartment member and skips the FHIRPath scan. Every other resource —
+    /// *including* a Group that was not requested directly — goes through
+    /// [`compartment::resource_in_patient_compartment`]. That fall-through
+    /// matters for Group specifically: `Group` is in the patient
+    /// CompartmentDefinition via `member`, so a Group listing a target patient
+    /// as a member is in that patient's compartment even though it was never
+    /// named in `group_refs`.
+    pub fn apply(&self, resource: &serde_json::Value) -> Result<bool, SofError> {
+        if self.targets.is_empty() {
+            return Ok(false);
+        }
+
+        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
+            && resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| {
+                    self.group_refs
+                        .iter()
+                        .any(|g| g == &format!("Group/{}", id) || g == id)
+                })
+                .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+
+        compartment::resource_in_patient_compartment(resource, &self.targets, self.fhir_version)
+    }
+}
+
 /// Filters raw FHIR resource JSON by patient and/or group references using
 /// the FHIR `CompartmentDefinition-patient` spec data.
 ///
@@ -1184,124 +1402,28 @@ pub fn filter_resources_by_patient_and_group(
     group_refs: &[String],
     fhir_version: FhirVersion,
 ) -> Result<Vec<serde_json::Value>, SofError> {
-    use std::collections::HashSet;
-
     if patient_refs.is_empty() && group_refs.is_empty() {
         return Ok(resources);
     }
-
-    // Absent-target detection: any `patient` / `group` reference that
-    // isn't represented by a resource in the supplied bundle is a hard
-    // error per the SoF v2 spec error table.
-    let mut absent: Vec<String> = Vec::new();
-    for r in patient_refs {
-        let canonical = if r.starts_with("Patient/") {
-            r.clone()
-        } else {
-            format!("Patient/{}", r)
-        };
-        let id = canonical
-            .strip_prefix("Patient/")
-            .and_then(|s| s.split('/').next());
-        let found = id
-            .map(|id| {
-                resources.iter().any(|res| {
-                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Patient")
-                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
-                })
-            })
-            .unwrap_or(false);
-        if !found {
-            absent.push(canonical);
-        }
-    }
-    for g in group_refs {
-        let canonical = if g.starts_with("Group/") {
-            g.clone()
-        } else {
-            format!("Group/{}", g)
-        };
-        let id = canonical
-            .strip_prefix("Group/")
-            .and_then(|s| s.split('/').next());
-        let found = id
-            .map(|id| {
-                resources.iter().any(|res| {
-                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
-                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
-                })
-            })
-            .unwrap_or(false);
-        if !found {
-            absent.push(canonical);
-        }
-    }
-    if !absent.is_empty() {
-        return Err(SofError::ReferencedResourceNotFound(format!(
-            "{} not found in supplied resources",
-            absent.join(", ")
-        )));
-    }
-
-    // Build the effective patient-compartment set: explicit patient refs +
-    // patient refs resolved from supplied groups. Both forms are
-    // canonicalised to `Patient/{id}` so downstream comparisons don't
-    // double-handle the prefix.
-    let mut targets: HashSet<String> = patient_refs
-        .iter()
-        .map(|r| {
-            if r.starts_with("Patient/") {
-                r.clone()
-            } else {
-                format!("Patient/{}", r)
-            }
-        })
-        .collect();
-
-    if !group_refs.is_empty() {
-        targets.extend(compartment::resolve_group_members_to_patient_refs(
-            group_refs, &resources,
-        ));
-    }
-
-    // No effective patient targets (e.g. supplied Group resolved to zero
-    // Patient members). The targets themselves are present (they got past
-    // the absent-target check above), so this is an empty-but-valid result.
-    if targets.is_empty() {
+    let filter = CompartmentFilter::build(patient_refs, group_refs, &resources, fhir_version)?;
+    if filter.is_empty() {
         return Ok(Vec::new());
     }
-
-    let mut filtered = Vec::with_capacity(resources.len());
-    for resource in resources.into_iter() {
-        // Group resources are first-class compartment members when their
-        // `Group/{id}` was requested directly (i.e. not via member
-        // resolution). Skip the FHIRPath scan for Group itself.
-        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
-            && resource
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|id| {
-                    group_refs
-                        .iter()
-                        .any(|g| g == &format!("Group/{}", id) || g == id)
-                })
-                .unwrap_or(false)
-        {
-            filtered.push(resource);
-            continue;
-        }
-
-        if compartment::resource_in_patient_compartment(&resource, &targets, fhir_version)? {
-            filtered.push(resource);
-        }
-    }
-
-    Ok(filtered)
+    resources
+        .into_iter()
+        .filter_map(|r| match filter.apply(&r) {
+            Ok(true) => Some(Ok(r)),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect()
 }
 
 /// Filters raw FHIR resource JSON by their `meta.lastUpdated` timestamp,
-/// returning only resources whose `lastUpdated` is strictly after `since`.
-/// Resources without `meta.lastUpdated` are excluded.
+/// returning only resources whose `lastUpdated` is at or after `since`: the
+/// same inclusive boundary as `_lastUpdated=ge` and the SQLite, PostgreSQL and
+/// MongoDB SQL-on-FHIR runners (#1803). Resources whose `meta.lastUpdated` is
+/// missing or not RFC 3339 are excluded.
 pub fn filter_resources_by_since(
     resources: Vec<serde_json::Value>,
     since: DateTime<Utc>,
@@ -1314,7 +1436,7 @@ pub fn filter_resources_by_since(
                 .and_then(|m| m.get("lastUpdated"))
                 .and_then(|lu| lu.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.with_timezone(&Utc) > since)
+                .map(|t| t.with_timezone(&Utc) >= since)
                 .unwrap_or(false)
         })
         .collect())
@@ -1347,7 +1469,7 @@ impl Default for ParquetOptions {
 /// Options for filtering and controlling ViewDefinition execution
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
-    /// Filter resources modified after this time
+    /// Keep only resources whose `meta.lastUpdated` is at or after this instant
     pub since: Option<DateTime<Utc>>,
     /// Limit the number of results
     pub limit: Option<usize>,
@@ -1607,6 +1729,14 @@ impl<R: BufRead> Iterator for NdjsonChunkReader<R> {
 /// This struct caches the validation and constant extraction from a ViewDefinition,
 /// allowing efficient processing of multiple chunks without re-validating each time.
 ///
+/// One prepared view is one run: terminology lookups (`memberOf()`, `%terminologies`) made
+/// while processing its chunks share one cache and one `FHIRPATH_TERMINOLOGY_MAX_CALLS`
+/// budget. That state lives as long as the prepared view and its clones, so build a new
+/// one per run. A lookup that failed for a lasting reason (a 4xx answer, an invalid body) is
+/// answered from that cache too; a transient failure (timeout, connection error,
+/// 408/429/5xx) is retried by the next identical lookup, which counts against the budget
+/// again.
+///
 /// # Examples
 ///
 /// ```rust,no_run
@@ -1638,6 +1768,8 @@ pub struct PreparedViewDefinition {
     target_resource_type: String,
     variables: HashMap<String, EvaluationResult>,
     column_names: Vec<String>,
+    /// Terminology session shared by every chunk this prepared view processes (#1802).
+    terminology_session: std::sync::Arc<TerminologySession>,
 }
 
 impl PreparedViewDefinition {
@@ -1645,6 +1777,10 @@ impl PreparedViewDefinition {
     ///
     /// This performs all validation upfront so that chunk processing is efficient.
     pub fn new(view_definition: SofViewDefinition) -> Result<Self, SofError> {
+        // Reject an unknown or incompatible `ansi/type` column tag up front, so
+        // every path that prepares a view (chunked NDJSON, the in-process
+        // runner, ...) fails the same way as the buffered formatters.
+        view_definition.try_declared_columns()?;
         // Extract target resource type and column names based on version
         let (target_resource_type, variables, column_names) = match &view_definition {
             #[cfg(feature = "R4")]
@@ -1718,6 +1854,7 @@ impl PreparedViewDefinition {
             target_resource_type,
             variables,
             column_names,
+            terminology_session: std::sync::Arc::new(TerminologySession::default()),
         })
     }
 
@@ -1839,8 +1976,11 @@ impl PreparedViewDefinition {
         let fhir_resource =
             parse_json_to_fhir_resource(resource_json.clone(), self.view_definition.version())?;
         let mut context = EvaluationContext::new(vec![fhir_resource]);
+        // ViewDefinition paths are user-authored: report a typo'd leading identifier.
+        context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
         // Expose the chunk-wide pool so `resolve()` can reach sibling resources.
         context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+        context.set_terminology_session(std::sync::Arc::clone(&self.terminology_session));
 
         // Add variables to the context
         for (name, value) in &self.variables {
@@ -1997,20 +2137,7 @@ fn write_csv_chunk<W: Write>(result: &ChunkedResult, writer: &mut W) -> Result<(
     let mut wtr = csv::Writer::from_writer(writer);
 
     for row in &result.rows {
-        let record: Vec<String> = row
-            .values
-            .iter()
-            .map(|v| match v {
-                Some(val) => {
-                    if let serde_json::Value::String(s) = val {
-                        s.clone()
-                    } else {
-                        serde_json::to_string(val).unwrap_or_default()
-                    }
-                }
-                None => String::new(),
-            })
-            .collect();
+        let record: Vec<String> = row.values.iter().map(csv_field).collect();
         wtr.write_record(&record)?;
     }
 
@@ -2469,6 +2596,8 @@ fn run_view_definition_inner(
     options: RunOptions,
     external: Vec<helios_fhir::FhirResource>,
 ) -> Result<Vec<u8>, SofError> {
+    // Declared column types fix the Parquet / Arrow schema, as on the REST path.
+    let declared = view_definition.try_declared_columns()?;
     // Process the ViewDefinition to generate tabular data
     let processed_result =
         process_view_definition_with_external(view_definition, bundle, external)?;
@@ -2481,10 +2610,11 @@ fn run_view_definition_inner(
     };
 
     // Format the result according to the requested content type
-    format_output(
+    format_output_with_schema(
         processed_result,
         content_type,
         options.parquet_options.as_ref(),
+        &declared,
     )
 }
 
@@ -2588,6 +2718,11 @@ where
     // Step 1: Extract constants/variables from ViewDefinition
     let variables = extract_view_definition_constants(&view_definition)?;
 
+    // One terminology session for the whole run, so every row and forEach/repeat
+    // context shares its cache and `FHIRPATH_TERMINOLOGY_MAX_CALLS` budget (#1802).
+    // It is dropped when the run returns.
+    let terminology = std::sync::Arc::new(TerminologySession::default());
+
     // Step 2: Filter resources by type and profile
     let target_resource_type = view_definition
         .resource()
@@ -2609,6 +2744,7 @@ where
         view_definition.where_clauses(),
         &variables,
         &resolution_scope,
+        &terminology,
     )?;
 
     // Step 4: Process all select clauses to generate rows with forEach support
@@ -2622,6 +2758,7 @@ where
         select_clauses,
         &variables,
         &resolution_scope,
+        &terminology,
     )?;
 
     Ok(ProcessedResult {
@@ -2928,6 +3065,7 @@ fn apply_where_clauses<'a, R, W>(
     where_clauses: Option<&[W]>,
     variables: &HashMap<String, EvaluationResult>,
     resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    terminology: &std::sync::Arc<TerminologySession>,
 ) -> Result<Vec<&'a R>, SofError>
 where
     R: ResourceTrait,
@@ -2943,8 +3081,11 @@ where
             for where_clause in wheres {
                 let fhir_resource = resource.to_fhir_resource();
                 let mut context = EvaluationContext::new(vec![fhir_resource]);
+                // ViewDefinition paths are user-authored: report a typo'd leading identifier.
+                context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
                 // Expose the whole bundle so `where` clauses can use `resolve()`.
                 context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+                context.set_terminology_session(std::sync::Arc::clone(terminology));
 
                 // Add variables to the context
                 for (name, value) in variables {
@@ -3036,6 +3177,9 @@ fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json:
         EvaluationResult::Integer(i, _, _) => {
             Some(serde_json::Value::Number(serde_json::Number::from(i)))
         }
+        EvaluationResult::Integer64(i, _, _) => {
+            Some(serde_json::Value::Number(serde_json::Number::from(i)))
+        }
         EvaluationResult::Decimal(d, _, _) => {
             // Check if this Decimal represents a whole number
             if d.fract().is_zero() {
@@ -3047,15 +3191,17 @@ fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json:
                     Some(serde_json::Value::String(d.to_string()))
                 }
             } else {
-                // Convert Decimal to a float for fractional numbers
-                if let Ok(f) = d.to_string().parse::<f64>() {
-                    if let Some(num) = serde_json::Number::from_f64(f) {
-                        Some(serde_json::Value::Number(num))
-                    } else {
-                        Some(serde_json::Value::String(d.to_string()))
-                    }
+                // Render the exact decimal rather than going through f64
+                // (serde_json is built with `arbitrary_precision`). Trailing zeros
+                // are stripped: evaluation artifacts such as `1.50` (from `3 / 2`
+                // scale) or `0.95000000` (boundary functions) must compare equal
+                // to the plain number in conformance output, so the source's
+                // trailing zeros are not preserved.
+                let text = d.normalize().to_string();
+                if let Ok(num) = text.parse::<serde_json::Number>() {
+                    Some(serde_json::Value::Number(num))
                 } else {
-                    Some(serde_json::Value::String(d.to_string()))
+                    Some(serde_json::Value::String(text))
                 }
             }
         }
@@ -3115,6 +3261,7 @@ fn generate_rows_from_selects<R, S>(
     selects: &[S],
     variables: &HashMap<String, EvaluationResult>,
     resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    terminology: &std::sync::Arc<TerminologySession>,
 ) -> Result<(Vec<String>, Vec<ProcessedRow>), SofError>
 where
     R: ResourceTrait + Sync,
@@ -3133,6 +3280,7 @@ where
                 &mut local_columns,
                 variables,
                 resolution_scope,
+                terminology,
             )?;
             Ok::<(Vec<String>, Vec<ProcessedRow>), SofError>((local_columns, resource_rows))
         })
@@ -3164,6 +3312,7 @@ fn generate_rows_for_resource<R, S>(
     all_columns: &mut Vec<String>,
     variables: &HashMap<String, EvaluationResult>,
     resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    terminology: &std::sync::Arc<TerminologySession>,
 ) -> Result<Vec<ProcessedRow>, SofError>
 where
     R: ResourceTrait,
@@ -3172,9 +3321,12 @@ where
 {
     let fhir_resource = resource.to_fhir_resource();
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    // ViewDefinition paths are user-authored: report a typo'd leading identifier.
+    context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
     // Expose the whole bundle so column/forEach paths can use `resolve()`. `this`
     // stays the current resource, so `%resource`/root semantics are unchanged.
     context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+    context.set_terminology_session(std::sync::Arc::clone(terminology));
 
     // Add variables to the context
     for (name, value) in variables {
@@ -3449,12 +3601,7 @@ where
                                 let result = if path == "$this" {
                                     empty_node.clone()
                                 } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        &empty_node,
-                                        &item_vars,
-                                        &context.resources,
-                                    )?
+                                    evaluate_path_on_item(path, &empty_node, &item_vars, context)?
                                 };
 
                                 let is_collection = col.collection().unwrap_or(false);
@@ -3506,7 +3653,7 @@ where
                                 item.clone()
                             } else {
                                 // Evaluate the path on the iteration item
-                                evaluate_path_on_item(path, item, &item_vars, &context.resources)?
+                                evaluate_path_on_item(path, item, &item_vars, context)?
                             };
 
                             // Check if this column is marked as a collection
@@ -3533,7 +3680,7 @@ where
         for (idx, item) in iteration_items.iter().enumerate() {
             // `%rowIndex` for this element scopes its own columns and any nested selects.
             let item_vars = vars_with_row_index(variables, idx);
-            let item_context = create_iteration_context(item, &item_vars, &context.resources);
+            let item_context = create_iteration_context(item, &item_vars, context);
 
             // For each iteration item, we need to start with the combinations that have
             // the correct column values for this forEach scope
@@ -3558,12 +3705,7 @@ where
                                 let result = if path == "$this" {
                                     item.clone()
                                 } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        item,
-                                        &item_vars,
-                                        &context.resources,
-                                    )?
+                                    evaluate_path_on_item(path, item, &item_vars, context)?
                                 };
 
                                 // Check if this column is marked as a collection
@@ -3608,7 +3750,7 @@ where
             // `%rowIndex` for this element is inherited by every unionAll branch that does not
             // introduce its own `forEach`.
             let item_vars = vars_with_row_index(variables, idx);
-            let item_context = create_iteration_context(item, &item_vars, &context.resources);
+            let item_context = create_iteration_context(item, &item_vars, context);
 
             // For each iteration item, process all unionAll selects
             for existing_combo in existing_combinations {
@@ -3630,12 +3772,7 @@ where
                                 let result = if path == "$this" {
                                     item.clone()
                                 } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        item,
-                                        &item_vars,
-                                        &context.resources,
-                                    )?
+                                    evaluate_path_on_item(path, item, &item_vars, context)?
                                 };
 
                                 // Check if this column is marked as a collection
@@ -3669,12 +3806,7 @@ where
                                         let result = if path == "$this" {
                                             item.clone()
                                         } else {
-                                            evaluate_path_on_item(
-                                                path,
-                                                item,
-                                                &item_vars,
-                                                &context.resources,
-                                            )?
+                                            evaluate_path_on_item(path, item, &item_vars, context)?
                                         };
 
                                         // Check if this column is marked as a collection
@@ -3726,7 +3858,6 @@ fn collect_repeat_nodes(
     context: &EvaluationContext,
     repeat_paths: &[&str],
     variables: &HashMap<String, EvaluationResult>,
-    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
     out: &mut Vec<EvaluationResult>,
 ) -> Result<(), SofError> {
     for repeat_path in repeat_paths {
@@ -3742,15 +3873,9 @@ fn collect_repeat_nodes(
             if !matches!(child_item, EvaluationResult::Object { .. }) {
                 continue;
             }
-            let child_context = create_iteration_context(&child_item, variables, resolution_scope);
+            let child_context = create_iteration_context(&child_item, variables, context);
             out.push(child_item);
-            collect_repeat_nodes(
-                &child_context,
-                repeat_paths,
-                variables,
-                resolution_scope,
-                out,
-            )?;
+            collect_repeat_nodes(&child_context, repeat_paths, variables, out)?;
         }
     }
     Ok(())
@@ -3777,13 +3902,7 @@ where
     // Note: Unlike forEach, repeat does NOT process the current level's columns
     // - it ONLY processes elements found via the repeat paths
     let mut nodes = Vec::new();
-    collect_repeat_nodes(
-        context,
-        repeat_paths,
-        variables,
-        &context.resources,
-        &mut nodes,
-    )?;
+    collect_repeat_nodes(context, repeat_paths, variables, &mut nodes)?;
 
     let mut all_combinations = Vec::new();
 
@@ -3792,7 +3911,7 @@ where
         for (idx, node) in nodes.iter().enumerate() {
             // Each traversed node gets its own `%rowIndex` (its position in the flattened list).
             let item_vars = vars_with_row_index(variables, idx);
-            let node_context = create_iteration_context(node, &item_vars, &context.resources);
+            let node_context = create_iteration_context(node, &item_vars, context);
 
             // Create a combination for this node with the repeat level's columns
             let mut node_combo = existing_combo.clone();
@@ -3813,7 +3932,7 @@ where
                             let result = if path == "$this" {
                                 node.clone()
                             } else {
-                                evaluate_path_on_item(path, node, &item_vars, &context.resources)?
+                                evaluate_path_on_item(path, node, &item_vars, context)?
                             };
 
                             let is_collection = col.collection().unwrap_or(false);
@@ -3871,11 +3990,12 @@ where
 }
 
 // Generic helper functions
+
 fn evaluate_path_on_item(
     path: &str,
     item: &EvaluationResult,
     variables: &HashMap<String, EvaluationResult>,
-    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    parent: &EvaluationContext,
 ) -> Result<EvaluationResult, SofError> {
     // Create a temporary context with the iteration item as the root resource
     let mut temp_context = match item {
@@ -3888,10 +4008,12 @@ fn evaluate_path_on_item(
         }
         _ => EvaluationContext::new(vec![]),
     };
-    // Carry the bundle-wide resolution pool so chained `resolve()` calls (e.g.
-    // `forEach: list.resolve()` then a column that resolves a nested reference)
-    // can still reach sibling resources from this fresh, item-rooted context.
-    temp_context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+    // Carry the run's resolution pool and terminology session from the context the
+    // item came from, so chained `resolve()` calls (e.g. `forEach: list.resolve()`
+    // then a column that resolves a nested reference) can still reach sibling
+    // resources, and terminology lookups share the run's cache and call budget.
+    temp_context.set_resolution_scope(std::sync::Arc::clone(&parent.resources));
+    temp_context.set_terminology_session(parent.terminology_session());
 
     // Add variables to the temporary context
     for (name, value) in variables {
@@ -3899,9 +4021,17 @@ fn evaluate_path_on_item(
     }
 
     // Evaluate the FHIRPath expression in the context of the iteration item
-    match evaluate_expression(path, &temp_context) {
+    match evaluate_expression_typed(path, &temp_context) {
         Ok(result) => Ok(result),
-        Err(_e) => {
+        // A terminology error (the run-wide call cap, no server configured, a failed
+        // request) fails the run as it does in top-level columns and where clauses; the
+        // session spans the run, so swallowing it would null this column with no message
+        // (#1847). Other errors keep the property-access fallback.
+        Err(e) if e.is_terminology_error() => Err(SofError::FhirPathError(format!(
+            "Error evaluating path '{}' on a forEach/repeat item: {}",
+            path, e
+        ))),
+        Err(_) => {
             // If FHIRPath evaluation fails, try simple property access as fallback
             match item {
                 EvaluationResult::Object { map, .. } => {
@@ -3920,14 +4050,16 @@ fn evaluate_path_on_item(
 fn create_iteration_context(
     item: &EvaluationResult,
     variables: &HashMap<String, EvaluationResult>,
-    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    parent: &EvaluationContext,
 ) -> EvaluationContext {
     // Create a new context with the iteration item as the root
     let mut context = EvaluationContext::new(vec![]);
     context.this = Some(item.clone());
-    // Keep the bundle-wide resolution pool available to nested selects/columns
-    // evaluated against this iteration item, so `resolve()` still works here.
-    context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+    // Keep the run's resolution pool available to nested selects/columns evaluated
+    // against this iteration item, so `resolve()` still works here, and share the
+    // run's terminology session so lookups use one cache and call budget.
+    context.set_resolution_scope(std::sync::Arc::clone(&parent.resources));
+    context.set_terminology_session(parent.terminology_session());
 
     // Preserve variables from the parent context
     for (name, value) in variables {
@@ -3937,7 +4069,9 @@ fn create_iteration_context(
     context
 }
 
-/// Filter a bundle's resources by their lastUpdated metadata
+/// Filter a bundle's resources by their lastUpdated metadata, keeping those at
+/// or after `since` (inclusive, like [`filter_resources_by_since`]). Entries
+/// without a resource or without `meta.lastUpdated` are dropped.
 fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<SofBundle, SofError> {
     match bundle {
         #[cfg(feature = "R4")]
@@ -3948,7 +4082,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -3962,7 +4096,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -3976,7 +4110,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -3990,7 +4124,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -4037,14 +4171,27 @@ pub fn format_output(
     content_type: ContentType,
     parquet_options: Option<&ParquetOptions>,
 ) -> Result<Vec<u8>, SofError> {
+    format_output_with_schema(result, content_type, parquet_options, &[])
+}
+
+/// Like [`format_output`], but Parquet and Arrow IPC columns found in
+/// `declared` (see [`sqlquery::engine::declared_columns`]) take their Arrow
+/// type from the declared FHIR type instead of being inferred from the data.
+/// Other formats ignore `declared`.
+pub fn format_output_with_schema(
+    result: ProcessedResult,
+    content_type: ContentType,
+    parquet_options: Option<&ParquetOptions>,
+    declared: &[sqlquery::engine::DeclaredColumn],
+) -> Result<Vec<u8>, SofError> {
     match content_type {
         ContentType::Csv | ContentType::CsvWithHeader => {
             format_csv(result, content_type == ContentType::CsvWithHeader)
         }
         ContentType::Json => format_json(result),
         ContentType::NdJson => format_ndjson(result),
-        ContentType::Parquet => format_parquet(result, parquet_options),
-        ContentType::ArrowIpc => format_arrow_ipc(result),
+        ContentType::Parquet => format_parquet_with_schema(result, parquet_options, declared),
+        ContentType::ArrowIpc => format_arrow_ipc_with_schema(result, declared),
     }
 }
 
@@ -4078,9 +4225,45 @@ pub fn rows_to_processed_result(rows: Vec<serde_json::Value>) -> ProcessedResult
     }
 }
 
+/// Neutralizes a CSV text cell that a spreadsheet would run as a formula.
+///
+/// A cell whose first character is `=`, `+`, `-`, `@`, TAB or CR (the OWASP
+/// "CSV injection" set) gets a leading `'`, so a spreadsheet shows it as text.
+/// A cell that is wholly a finite number is left alone: `-5`, `+3.5` and
+/// `-1e3` are unchanged, while `-inf`, `-2+3` and `-` are prefixed.
+///
+/// Only JSON string values go through this; JSON numbers, booleans and nested
+/// values are written as before. Quoting stays the writer's job: neutralize
+/// first, then quote. [`format_csv`], the streaming chunk writer and HFS's
+/// `$sql-export` view writer all apply it, so the same value is written the
+/// same way on every path.
+pub fn neutralize_csv_formula(cell: &str) -> std::borrow::Cow<'_, str> {
+    if cell.starts_with(['=', '+', '-', '@', '\t', '\r'])
+        && !cell.parse::<f64>().is_ok_and(f64::is_finite)
+    {
+        std::borrow::Cow::Owned(format!("'{cell}"))
+    } else {
+        std::borrow::Cow::Borrowed(cell)
+    }
+}
+
+/// Renders one CSV cell from a row value (shared by the buffered and chunk writers).
+fn csv_field(v: &Option<serde_json::Value>) -> String {
+    match v {
+        // A missing value is an empty cell whether the row carried
+        // the key as JSON null or not at all (#1569).
+        None | Some(serde_json::Value::Null) => String::new(),
+        // For string values, extract the raw string instead of JSON serializing
+        Some(serde_json::Value::String(s)) => neutralize_csv_formula(s).into_owned(),
+        // For non-string values, use JSON serialization
+        Some(val) => serde_json::to_string(val).unwrap_or_default(),
+    }
+}
+
 /// Encodes a [`ProcessedResult`] as CSV bytes via the `csv` crate (RFC 4180).
 ///
-/// String values are emitted raw; non-string values are JSON-serialised. The
+/// String values are emitted raw (with formula-like text neutralized, see
+/// [`neutralize_csv_formula`]); non-string values are JSON-serialised. The
 /// underlying writer handles quoting for fields containing `,`, `"`, or
 /// newlines, so callers do not need to escape.
 pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, SofError> {
@@ -4091,22 +4274,7 @@ pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u
     }
 
     for row in result.rows {
-        let record: Vec<String> = row
-            .values
-            .iter()
-            .map(|v| match v {
-                Some(val) => {
-                    // For string values, extract the raw string instead of JSON serializing
-                    if let serde_json::Value::String(s) = val {
-                        s.clone()
-                    } else {
-                        // For non-string values, use JSON serialization
-                        serde_json::to_string(val).unwrap_or_default()
-                    }
-                }
-                None => String::new(),
-            })
-            .collect();
+        let record: Vec<String> = row.values.iter().map(csv_field).collect();
         wtr.write_record(&record)?;
     }
 
@@ -4160,34 +4328,6 @@ pub fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     Ok(output)
 }
 
-/// Rows-per-batch for the columnar writers, estimated from sampled row sizes
-/// and clamped to keep memory bounded. Shared by Parquet and Arrow IPC so the
-/// two outputs batch identically.
-fn estimate_rows_per_batch(rows: &[ProcessedRow], target_batch_size_bytes: usize) -> usize {
-    const TARGET_ROWS_PER_BATCH: usize = 100_000; // Default batch size
-    const MAX_ROWS_PER_BATCH: usize = 500_000; // Maximum to prevent memory issues
-
-    // Estimate average row size from first 100 rows
-    let sample_size = std::cmp::min(100, rows.len());
-    let mut estimated_row_size = 100; // Default estimate in bytes
-
-    if sample_size > 0 {
-        let sample_json_size: usize = rows[..sample_size]
-            .iter()
-            .map(|row| {
-                row.values
-                    .iter()
-                    .filter_map(|v| v.as_ref())
-                    .map(|v| v.to_string().len())
-                    .sum::<usize>()
-            })
-            .sum();
-        estimated_row_size = (sample_json_size / sample_size).max(50);
-    }
-
-    (target_batch_size_bytes / estimated_row_size).clamp(TARGET_ROWS_PER_BATCH, MAX_ROWS_PER_BATCH)
-}
-
 /// Streams `result`'s rows to `write` as Arrow [`RecordBatch`]es of at most
 /// `batch_size` rows. The shared batch builder behind every columnar output
 /// (Parquet, Arrow IPC) and [`run_view_definition_record_batches`].
@@ -4227,7 +4367,7 @@ where
 /// their schema — the engine-side seam for columnar consumers (Parquet, Arrow
 /// IPC, and external bindings such as pysof).
 ///
-/// Schema inference and type mapping are identical to the Parquet output, so
+/// Declared column types and inference are identical to the Parquet output, so
 /// every columnar representation of the same result agrees.
 pub fn run_view_definition_record_batches(
     view_definition: SofViewDefinition,
@@ -4239,13 +4379,11 @@ pub fn run_view_definition_record_batches(
     ),
     SofError,
 > {
+    let declared = view_definition.try_declared_columns()?;
     let result = process_view_definition(view_definition, bundle)?;
-    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    let schema = parquet_schema::resolve_arrow_schema(&result.columns, &declared, &result.rows)?;
     let schema_ref = std::sync::Arc::new(schema);
-    let batch_size = estimate_rows_per_batch(
-        &result.rows,
-        (ParquetOptions::default().row_group_size_mb as usize) * 1024 * 1024,
-    );
+    let batch_size = columnar_stream::STREAM_BATCH_ROWS;
     let mut batches = Vec::new();
     for_each_record_batch(&schema_ref, &result, batch_size, |batch| {
         batches.push(batch);
@@ -4258,259 +4396,122 @@ pub fn run_view_definition_record_batches(
 /// (`application/vnd.apache.arrow.stream`).
 ///
 /// Schema inference and type mapping match [`format_parquet`] exactly, so the
-/// columnar outputs always agree. Batches are written incrementally and the
-/// stream carries its schema in-band, so consumers (DuckDB, pyarrow, polars,
-/// pandas) ingest live query results without any client-side parsing.
+/// columnar outputs always agree. The stream carries its schema in-band, so
+/// consumers (DuckDB, pyarrow, polars, pandas) ingest live query results
+/// without any client-side parsing. For output that is produced while rows
+/// are still arriving use [`columnar_stream::ArrowIpcStreamWriter`].
 pub fn format_arrow_ipc(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
-    use arrow::ipc::writer::StreamWriter;
+    format_arrow_ipc_with_schema(result, &[])
+}
 
-    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
-    let schema_ref = std::sync::Arc::new(schema);
-    let batch_size = estimate_rows_per_batch(
+fn format_arrow_ipc_with_schema(
+    result: ProcessedResult,
+    declared: &[sqlquery::engine::DeclaredColumn],
+) -> Result<Vec<u8>, SofError> {
+    let schema = std::sync::Arc::new(parquet_schema::resolve_arrow_schema(
+        &result.columns,
+        declared,
         &result.rows,
-        (ParquetOptions::default().row_group_size_mb as usize) * 1024 * 1024,
-    );
-
-    let mut buffer = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buffer, schema_ref.as_ref()).map_err(|e| {
-            SofError::ArrowConversionError(format!("Failed to create Arrow IPC writer: {}", e))
-        })?;
-        for_each_record_batch(&schema_ref, &result, batch_size, |batch| {
-            writer.write(&batch).map_err(|e| {
-                SofError::ArrowConversionError(format!("Failed to write Arrow IPC batch: {}", e))
-            })
-        })?;
-        writer.finish().map_err(|e| {
-            SofError::ArrowConversionError(format!("Failed to finish Arrow IPC stream: {}", e))
-        })?;
-    }
-
-    Ok(buffer)
+    )?);
+    let mut writer = columnar_stream::ArrowIpcStreamWriter::new(Vec::new(), schema)?;
+    writer.write_rows(&result.rows)?;
+    writer.finish()
 }
 
 /// Encodes a [`ProcessedResult`] as a single Parquet file in memory.
 ///
-/// Schema is inferred from `result.columns` and the row values; type mapping
-/// follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
-/// integer→INT32, decimal→FLOAT64, dateTime/date→UTF8). Use
-/// [`format_parquet_multi_file`] when the output needs to be split across
-/// files by size.
+/// The schema is inferred from `result.columns` and the row values (see
+/// [`format_output_with_schema`] to fix it from declared column types). Type
+/// mapping follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
+/// integer/positiveInt/unsignedInt→INT32, integer64→INT64, decimal→FLOAT64,
+/// dateTime/date→UTF8, `collection: true`→List<UTF8>); an inferred integer
+/// column is widened to INT64 when a value exceeds 32 bits. Row groups are cut
+/// by encoded size (`row_group_size_mb`). Use [`format_parquet_multi_file`]
+/// when the output needs to be split across files by size.
 pub fn format_parquet(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
 ) -> Result<Vec<u8>, SofError> {
-    use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
-    use parquet::file::properties::WriterProperties;
-    use std::io::Cursor;
-
-    // Create Arrow schema from columns and sample data
-    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
-    let schema_ref = std::sync::Arc::new(schema.clone());
-
-    // Get configuration from options or use defaults
-    let parquet_opts = options.cloned().unwrap_or_default();
-
-    // Calculate optimal batch size based on row count and estimated row size
-    let target_row_group_size_bytes = (parquet_opts.row_group_size_mb as usize) * 1024 * 1024;
-    let target_page_size_bytes = (parquet_opts.page_size_kb as usize) * 1024;
-    let optimal_batch_size = estimate_rows_per_batch(&result.rows, target_row_group_size_bytes);
-
-    // Parse compression algorithm
-    use parquet::basic::BrotliLevel;
-    use parquet::basic::GzipLevel;
-    use parquet::basic::ZstdLevel;
-
-    let compression = match parquet_opts.compression.as_str() {
-        "none" => Compression::UNCOMPRESSED,
-        "gzip" => Compression::GZIP(GzipLevel::default()),
-        "lz4" => Compression::LZ4,
-        "brotli" => Compression::BROTLI(BrotliLevel::default()),
-        "zstd" => Compression::ZSTD(ZstdLevel::default()),
-        _ => Compression::SNAPPY, // Default to snappy
-    };
-
-    // Set up writer properties with optimized settings
-    let props = WriterProperties::builder()
-        .set_compression(compression)
-        .set_max_row_group_size(target_row_group_size_bytes)
-        .set_data_page_row_count_limit(20_000) // Optimal for predicate pushdown
-        .set_data_page_size_limit(target_page_size_bytes)
-        .set_write_batch_size(8192) // Control write granularity
-        .build();
-
-    // Write to memory buffer
-    let mut buffer = Vec::new();
-    let mut cursor = Cursor::new(&mut buffer);
-    let mut writer =
-        ArrowWriter::try_new(&mut cursor, schema_ref.clone(), Some(props)).map_err(|e| {
-            SofError::ParquetConversionError(format!("Failed to create Parquet writer: {}", e))
-        })?;
-
-    // Process data in batches to handle large datasets efficiently
-    for_each_record_batch(&schema_ref, &result, optimal_batch_size, |batch| {
-        writer.write(&batch).map_err(|e| {
-            SofError::ParquetConversionError(format!("Failed to write RecordBatch: {}", e))
-        })
-    })?;
-
-    writer.close().map_err(|e| {
-        SofError::ParquetConversionError(format!("Failed to close Parquet writer: {}", e))
-    })?;
-
-    Ok(buffer)
+    format_parquet_with_schema(result, options, &[])
 }
 
-/// Format Parquet data with automatic file splitting when size exceeds limit
+fn format_parquet_with_schema(
+    result: ProcessedResult,
+    options: Option<&ParquetOptions>,
+    declared: &[sqlquery::engine::DeclaredColumn],
+) -> Result<Vec<u8>, SofError> {
+    let schema = std::sync::Arc::new(parquet_schema::resolve_arrow_schema(
+        &result.columns,
+        declared,
+        &result.rows,
+    )?);
+    let opts = options.cloned().unwrap_or_default();
+    let mut writer = columnar_stream::ParquetStreamWriter::new(Vec::new(), schema, &opts)?;
+    writer.write_rows(&result.rows)?;
+    writer.finish()
+}
+
+/// Format Parquet data with automatic file splitting when size exceeds limit.
+///
+/// A file is closed once its estimated encoded size (flushed bytes plus the
+/// open row group) reaches `max_file_size_bytes`, so files can overshoot the
+/// limit by up to one batch plus the footer. Always returns at least one file.
 pub fn format_parquet_multi_file(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
     max_file_size_bytes: usize,
 ) -> Result<Vec<Vec<u8>>, SofError> {
-    use arrow::record_batch::RecordBatch;
-    use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
-    use parquet::file::properties::WriterProperties;
-    use std::io::Cursor;
+    format_parquet_multi_file_with_schema(result, options, max_file_size_bytes, &[])
+}
 
-    // Create Arrow schema from columns and sample data
-    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
-    let schema_ref = std::sync::Arc::new(schema.clone());
-
-    // Get configuration from options or use defaults
-    let parquet_opts = options.cloned().unwrap_or_default();
-
-    // Calculate optimal batch size
-    let target_row_group_size_bytes = (parquet_opts.row_group_size_mb as usize) * 1024 * 1024;
-    let target_page_size_bytes = (parquet_opts.page_size_kb as usize) * 1024;
-    const TARGET_ROWS_PER_BATCH: usize = 100_000;
-    const MAX_ROWS_PER_BATCH: usize = 500_000;
-
-    // Estimate average row size
-    let sample_size = std::cmp::min(100, result.rows.len());
-    let mut estimated_row_size = 100;
-
-    if sample_size > 0 {
-        let sample_json_size: usize = result.rows[..sample_size]
-            .iter()
-            .map(|row| {
-                row.values
-                    .iter()
-                    .filter_map(|v| v.as_ref())
-                    .map(|v| v.to_string().len())
-                    .sum::<usize>()
-            })
-            .sum();
-        estimated_row_size = (sample_json_size / sample_size).max(50);
-    }
-
-    let optimal_batch_size = (target_row_group_size_bytes / estimated_row_size)
-        .clamp(TARGET_ROWS_PER_BATCH, MAX_ROWS_PER_BATCH);
-
-    // Parse compression algorithm
-    use parquet::basic::BrotliLevel;
-    use parquet::basic::GzipLevel;
-    use parquet::basic::ZstdLevel;
-
-    let compression = match parquet_opts.compression.as_str() {
-        "none" => Compression::UNCOMPRESSED,
-        "gzip" => Compression::GZIP(GzipLevel::default()),
-        "lz4" => Compression::LZ4,
-        "brotli" => Compression::BROTLI(BrotliLevel::default()),
-        "zstd" => Compression::ZSTD(ZstdLevel::default()),
-        _ => Compression::SNAPPY,
-    };
-
-    // Set up writer properties
-    let props = WriterProperties::builder()
-        .set_compression(compression)
-        .set_max_row_group_size(target_row_group_size_bytes)
-        .set_data_page_row_count_limit(20_000)
-        .set_data_page_size_limit(target_page_size_bytes)
-        .set_write_batch_size(8192)
-        .build();
-
-    let mut file_buffers = Vec::new();
-    let mut current_buffer = Vec::new();
-    let mut current_cursor = Cursor::new(&mut current_buffer);
-    let mut current_writer =
-        ArrowWriter::try_new(&mut current_cursor, schema_ref.clone(), Some(props.clone()))
-            .map_err(|e| {
-                SofError::ParquetConversionError(format!("Failed to create Parquet writer: {}", e))
-            })?;
-
-    let mut row_offset = 0;
-    let mut _current_file_rows = 0;
-
-    while row_offset < result.rows.len() {
-        let batch_end = (row_offset + optimal_batch_size).min(result.rows.len());
-        let batch_rows = &result.rows[row_offset..batch_end];
-
-        // Convert batch to Arrow arrays
-        let batch_arrays =
-            parquet_schema::process_to_arrow_arrays(&schema, &result.columns, batch_rows)?;
-
-        // Create RecordBatch
-        let batch = RecordBatch::try_new(schema_ref.clone(), batch_arrays).map_err(|e| {
-            SofError::ParquetConversionError(format!(
-                "Failed to create RecordBatch for rows {}-{}: {}",
-                row_offset, batch_end, e
-            ))
-        })?;
-
-        // Write batch
-        current_writer.write(&batch).map_err(|e| {
-            SofError::ParquetConversionError(format!(
-                "Failed to write RecordBatch for rows {}-{}: {}",
-                row_offset, batch_end, e
-            ))
-        })?;
-
-        _current_file_rows += batch_end - row_offset;
-        row_offset = batch_end;
-
-        // Check if we should start a new file
-        // Get actual size of current buffer by flushing the writer
-        let current_size = current_writer.bytes_written();
-
-        if current_size >= max_file_size_bytes && row_offset < result.rows.len() {
-            // Close current file
-            current_writer.close().map_err(|e| {
-                SofError::ParquetConversionError(format!("Failed to close Parquet writer: {}", e))
-            })?;
-
-            // Save the buffer
-            file_buffers.push(current_buffer);
-
-            // Start new file
-            current_buffer = Vec::new();
-            current_cursor = Cursor::new(&mut current_buffer);
-            current_writer =
-                ArrowWriter::try_new(&mut current_cursor, schema_ref.clone(), Some(props.clone()))
-                    .map_err(|e| {
-                        SofError::ParquetConversionError(format!(
-                            "Failed to create new Parquet writer: {}",
-                            e
-                        ))
-                    })?;
-            _current_file_rows = 0;
-        }
-    }
-
-    // Close the final writer
-    current_writer.close().map_err(|e| {
-        SofError::ParquetConversionError(format!("Failed to close final Parquet writer: {}", e))
-    })?;
-
-    file_buffers.push(current_buffer);
-
-    Ok(file_buffers)
+/// [`format_parquet_multi_file`] with declared column types (see
+/// [`format_output_with_schema`]).
+pub fn format_parquet_multi_file_with_schema(
+    result: ProcessedResult,
+    options: Option<&ParquetOptions>,
+    max_file_size_bytes: usize,
+    declared: &[sqlquery::engine::DeclaredColumn],
+) -> Result<Vec<Vec<u8>>, SofError> {
+    let schema = std::sync::Arc::new(parquet_schema::resolve_arrow_schema(
+        &result.columns,
+        declared,
+        &result.rows,
+    )?);
+    let opts = options.cloned().unwrap_or_default();
+    let mut writer = columnar_stream::RollingParquetWriter::new(
+        |_| Ok(Vec::new()),
+        schema,
+        &opts,
+        max_file_size_bytes,
+    );
+    writer.write_rows(&result.rows)?;
+    writer.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `compartment_reference_ids` accepts both reference forms the SoF spec
+    /// allows, ignores a version suffix, drops an id-less reference, and
+    /// de-duplicates — so a caller can turn the filter's references straight
+    /// into a by-id fetch (#1453).
+    #[test]
+    fn compartment_reference_ids_normalises_and_dedups() {
+        let refs = [
+            "Patient/p1",
+            "p2",
+            "Patient/p1/_history/2",
+            "p1",
+            "Patient/",
+            "",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            compartment_reference_ids(&refs, "Patient"),
+            vec!["p1".to_string(), "p2".to_string()]
+        );
+    }
 
     /// A typed R4 ViewDefinition built from `json`, for exercising
     /// `validate_view_definition` (#821) the same way a real caller of this
@@ -4558,6 +4559,23 @@ mod tests {
         // The document root's own pointer is empty, which the library-facing
         // message renders as `/` rather than a blank suffix.
         assert!(message.ends_with("at /"), "got: {message}");
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_reports_unknown_resource_type() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Nope",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }]
+        }));
+        let message = invalid_view_definition_message(
+            validate_view_definition(&vd).expect_err("unknown `resource` type must fail"),
+        );
+        assert!(
+            message.contains("unknown resource type \"Nope\""),
+            "got: {message}"
+        );
     }
 
     #[cfg(feature = "R4")]
@@ -4727,5 +4745,149 @@ mod tests {
             validate_view_definition(&vd).is_ok(),
             "validate_view_definition must add resourceType back before linting a valid document"
         );
+    }
+
+    /// The cutoff the `_since` tests below filter at (#1803).
+    fn since_cutoff() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .expect("valid RFC 3339")
+            .with_timezone(&Utc)
+    }
+
+    /// A Patient with `id` and, when given, `meta.lastUpdated`.
+    fn patient_last_updated(id: &str, last_updated: Option<&str>) -> serde_json::Value {
+        match last_updated {
+            Some(ts) => serde_json::json!({
+                "resourceType": "Patient",
+                "id": id,
+                "meta": { "lastUpdated": ts }
+            }),
+            None => serde_json::json!({ "resourceType": "Patient", "id": id }),
+        }
+    }
+
+    /// Patients straddling `since_cutoff()`: just before it, exactly at it in
+    /// UTC, the same instant written with a `+05:00` offset, just after it, and
+    /// two with no `meta.lastUpdated` at all.
+    fn since_boundary_patients() -> Vec<serde_json::Value> {
+        vec![
+            patient_last_updated("before", Some("2023-12-31T23:59:59.999Z")),
+            patient_last_updated("at-utc", Some("2024-01-01T00:00:00Z")),
+            patient_last_updated("at-offset", Some("2024-01-01T05:00:00+05:00")),
+            patient_last_updated("after", Some("2024-01-01T00:00:00.001Z")),
+            patient_last_updated("no-meta", None),
+            serde_json::json!({
+                "resourceType": "Patient",
+                "id": "no-last-updated",
+                "meta": { "versionId": "1" }
+            }),
+        ]
+    }
+
+    /// `filter_resources_by_since` keeps a resource whose `lastUpdated` equals
+    /// `since` (in any offset), like `_lastUpdated=ge` and the storage runners,
+    /// and still drops older, missing and unparseable stamps (#1803).
+    #[test]
+    fn filter_resources_by_since_keeps_resources_at_or_after_since() {
+        let mut resources = since_boundary_patients();
+        resources.push(patient_last_updated("unparseable", Some("not-a-date")));
+
+        let kept = filter_resources_by_since(resources, since_cutoff()).expect("filter succeeds");
+        let ids: Vec<&str> = kept.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(ids, ["at-utc", "at-offset", "after"]);
+    }
+
+    /// The typed-bundle filter behind `RunOptions.since` (used by `sof-cli` and
+    /// `pysof`) is inclusive too, so a resource modified exactly at `since`
+    /// reaches the view (#1803).
+    #[cfg(feature = "R4")]
+    #[test]
+    fn run_view_definition_with_options_since_keeps_resources_at_or_after_since() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }]
+        }));
+        let bundle = create_bundle_from_resources_for_version(
+            since_boundary_patients(),
+            helios_fhir::FhirVersion::R4,
+        )
+        .expect("bundle builds");
+        let options = RunOptions {
+            since: Some(since_cutoff()),
+            ..Default::default()
+        };
+
+        let out = run_view_definition_with_options(
+            SofViewDefinition::R4(vd),
+            bundle,
+            ContentType::Json,
+            options,
+        )
+        .expect("view runs");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&out).expect("JSON rows");
+        let mut ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["after", "at-offset", "at-utc"]);
+    }
+
+    #[test]
+    fn neutralize_csv_formula_prefixes_formula_text_but_not_numbers() {
+        let prefixed = [
+            ("=1+2", "'=1+2"),
+            ("+cmd", "'+cmd"),
+            ("-2+3", "'-2+3"),
+            ("@SUM(A1)", "'@SUM(A1)"),
+            ("\t=1", "'\t=1"),
+            ("\r=1", "'\r=1"),
+            ("-", "'-"),
+            ("-inf", "'-inf"),
+            ("-NaN", "'-NaN"),
+        ];
+        for (input, expected) in prefixed {
+            assert_eq!(neutralize_csv_formula(input), expected, "input {input:?}");
+        }
+        for input in ["-5", "+3.5", "-1e3", "-0.25", "plain", "", "a=b"] {
+            assert_eq!(neutralize_csv_formula(input), input, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn format_csv_neutralizes_formula_cells_but_not_numbers() {
+        let result = ProcessedResult {
+            columns: vec!["a".to_string(), "b".to_string()],
+            rows: vec![
+                ProcessedRow {
+                    values: vec![
+                        Some(serde_json::json!("=HYPERLINK(\"x\")")),
+                        Some(serde_json::json!(-5)),
+                    ],
+                },
+                ProcessedRow {
+                    values: vec![Some(serde_json::json!("-5")), Some(serde_json::json!("@x"))],
+                },
+            ],
+        };
+        let csv = String::from_utf8(format_csv(result, true).unwrap()).unwrap();
+        assert_eq!(csv, "a,b\n\"'=HYPERLINK(\"\"x\"\")\",-5\n-5,'@x\n");
+    }
+
+    #[test]
+    fn write_csv_chunk_neutralizes_formula_cells() {
+        let chunk = ChunkedResult {
+            columns: vec!["a".to_string(), "b".to_string()],
+            rows: vec![ProcessedRow {
+                values: vec![
+                    Some(serde_json::json!("=1+2")),
+                    Some(serde_json::json!("-5")),
+                ],
+            }],
+            chunk_index: 0,
+            is_last: true,
+            resources_in_chunk: 1,
+        };
+        let mut out = Vec::new();
+        write_csv_chunk(&chunk, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "'=1+2,-5\n");
     }
 }

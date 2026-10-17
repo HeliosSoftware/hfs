@@ -24,7 +24,7 @@
       {{ i18n.t_arg("history-diff-heading", "from", from_label.clone()) }} → {{ to_label }}
     </h3>
     {% if !show_metadata && diff.metadata_hidden > 0 %}
-    <span class="diff__meta-note">{{ i18n.t_arg("history-metadata-hidden", "count", diff.metadata_hidden.to_string()) }}</span>
+    <span class="diff__meta-note">{{ i18n.t_arg("history-metadata-hidden", "count", diff.metadata_hidden) }}</span>
     {% endif %}
   </div>
 

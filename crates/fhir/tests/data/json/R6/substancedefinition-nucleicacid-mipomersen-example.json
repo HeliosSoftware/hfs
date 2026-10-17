@@ -87,6 +87,37 @@
       ]
     }
   ],
+  "relationship": [
+    {
+      "substanceDefinitionCodeableConcept": {
+        "coding": [
+          {
+            "system": "https://www.uniprot.org",
+            "code": "P04114",
+            "display": "apolipoprotein B-100"
+          }
+        ]
+      },
+      "type": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/substance-relationship-type",
+            "code": "TherapeuticTarget",
+            "display": "Therapeutic target"
+          }
+        ]
+      },
+      "interaction": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/substance-interaction-type",
+            "code": "inhibition",
+            "display": "Inhibition"
+          }
+        ]
+      }
+    }
+  ],
   "nucleicAcid": {
     "sequenceType": {
       "coding": [
@@ -132,6 +163,7 @@
         },
         "linkage": [
           {
+            "connectivity": "phosphorothioate",
             "substance": {
               "concept": {
                 "coding": [
@@ -203,37 +235,6 @@
       }
     ]
   },
-  "relationship": [
-    {
-      "substanceDefinitionCodeableConcept": {
-        "coding": [
-          {
-            "system": "https://www.uniprot.org",
-            "code": "P04114",
-            "display": "apolipoprotein B-100"
-          }
-        ]
-      },
-      "type": {
-        "coding": [
-          {
-            "system": "http://hl7.org/fhir/substance-relationship-type",
-            "code": "TherapeuticTarget",
-            "display": "Therapeutic target"
-          }
-        ]
-      },
-      "interaction": {
-        "coding": [
-          {
-            "system": "http://hl7.org/fhir/substance-interaction-type",
-            "code": "inhibition",
-            "display": "Inhibition"
-          }
-        ]
-      }
-    }
-  ],
   "meta": {
     "tag": [
       {

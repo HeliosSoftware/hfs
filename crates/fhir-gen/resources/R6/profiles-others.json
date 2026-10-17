@@ -2,7 +2,7 @@
   "resourceType" : "Bundle",
   "id" : "profiles-others",
   "meta" : {
-    "lastUpdated" : "2026-07-17T03:44:13.245+00:00"
+    "lastUpdated" : "2026-09-14T16:43:45.341+00:00"
   },
   "type" : "collection",
   "entry" : [{
@@ -31,7 +31,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1229"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "FamilyMemberHistoryForGeneticsAnalysis",
       "title" : "Family member history for genetics analysis",
       "status" : "draft",
@@ -45,7 +45,7 @@
         }]
       }],
       "description" : "Adds additional information to a family member history supporting both the capture of mother/father relationships as well as additional observations necessary to enable genetics-based risk analysis for patients",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -74,7 +74,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "FamilyMemberHistory",
@@ -123,7 +123,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -276,7 +276,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -603,7 +603,7 @@
             }],
             "strength" : "required",
             "description" : "A code that identifies the status of the family history record.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/history-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -1857,7 +1857,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1318"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "ProvenanceRelevantHistory",
       "title" : "Provenance  Relevant  History",
       "status" : "active",
@@ -1871,7 +1871,7 @@
         }]
       }],
       "description" : "This profile is provided for guidance purposes only.  There is no expectation that implementers must adhere to this profile.  It is included in the specification to help implementers understand how they might use Provenance to satisfy the typical needs envisioned by the 'relevantHistory' elements found in various Event and Request resources.\r\n\r\nThis profile identifies the data elements most likely to be relevant to implementers who are using Provenance to convey the `relevant history` of a resource, as discussed in the [request pattern](request.html#history).  For the purposes of this profile, mustSupport should be interpreted as 'SHOULD be considered for population and SHOULD be understood by consumers.'  Implementers are not obligated to handle all of these element and are not prohibited from also making use of additional data elements",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -1905,7 +1905,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Provenance",
@@ -1958,7 +1958,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -2097,7 +2097,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -3702,7 +3702,7 @@
             }],
             "strength" : "required",
             "description" : "How an entity was used in an activity.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -3977,7 +3977,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1461"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationvitalsignsbase",
       "title" : "Vital Signs Base Profile",
       "status" : "draft",
@@ -3991,7 +3991,7 @@
         }]
       }],
       "description" : "FHIR Vital Signs Base Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -4030,7 +4030,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -4088,7 +4088,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -4280,7 +4280,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -4734,7 +4734,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -4856,7 +4856,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -7133,7 +7133,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1458"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationvitalspanel",
       "title" : "Observation Vital Signs Panel Profile",
       "status" : "draft",
@@ -7147,7 +7147,7 @@
         }]
       }],
       "description" : "FHIR Vital Signs Panel Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -7186,7 +7186,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -7244,7 +7244,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -7436,7 +7436,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -7890,7 +7890,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -8012,7 +8012,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -10147,7 +10147,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1466"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationresprate",
       "title" : "Observation Respiratory Rate Profile",
       "status" : "draft",
@@ -10161,7 +10161,7 @@
         }]
       }],
       "description" : "FHIR Respiratory Rate Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -10200,7 +10200,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -10258,7 +10258,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -10456,7 +10456,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -10910,7 +10910,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -11032,7 +11032,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -13248,7 +13248,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1457"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationoxygensat",
       "title" : "Observation Oxygen Saturation Profile",
       "status" : "draft",
@@ -13262,7 +13262,7 @@
         }]
       }],
       "description" : "FHIR Oxygen Saturation Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -13301,7 +13301,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -13359,7 +13359,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -13557,7 +13557,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -14011,7 +14011,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -14133,7 +14133,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -16349,7 +16349,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1454"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationheartrate",
       "title" : "Observation Heart Rate Profile",
       "status" : "draft",
@@ -16363,7 +16363,7 @@
         }]
       }],
       "description" : "FHIR Heart Rate Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -16402,7 +16402,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -16460,7 +16460,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -16658,7 +16658,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -17112,7 +17112,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -17234,7 +17234,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -19450,7 +19450,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1467"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationheadcircum",
       "title" : "Observation Head Circumference Profile",
       "status" : "draft",
@@ -19464,7 +19464,7 @@
         }]
       }],
       "description" : "FHIR Head Circumference Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -19503,7 +19503,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -19561,7 +19561,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -19759,7 +19759,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -20213,7 +20213,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -20335,7 +20335,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -22551,7 +22551,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1459"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationbp",
       "title" : "Observation Blood Pressure Profile",
       "status" : "draft",
@@ -22565,7 +22565,7 @@
         }]
       }],
       "description" : "FHIR Blood Pressure Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -22604,7 +22604,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -22662,7 +22662,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -22854,7 +22854,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -23308,7 +23308,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -23430,7 +23430,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -26651,7 +26651,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1465"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationbodyweight",
       "title" : "Observation Body Weight Profile",
       "status" : "draft",
@@ -26665,7 +26665,7 @@
         }]
       }],
       "description" : "FHIR Body Weight Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -26704,7 +26704,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -26762,7 +26762,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -26960,7 +26960,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -27414,7 +27414,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -27536,7 +27536,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -29752,7 +29752,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1455"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationbodytemp",
       "title" : "Observation Body Temperature Profile",
       "status" : "draft",
@@ -29766,7 +29766,7 @@
         }]
       }],
       "description" : "FHIR Body Temperature Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -29805,7 +29805,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -29863,7 +29863,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -30061,7 +30061,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -30515,7 +30515,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -30637,7 +30637,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -32853,7 +32853,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1463"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationbodyheight",
       "title" : "Observation Body Height Profile",
       "status" : "draft",
@@ -32867,7 +32867,7 @@
         }]
       }],
       "description" : "FHIR Body Height Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -32906,7 +32906,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -32964,7 +32964,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -33162,7 +33162,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -33616,7 +33616,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -33738,7 +33738,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -35954,7 +35954,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1464"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "Observationbmi",
       "title" : "Observation Body Mass Index Profile",
       "status" : "draft",
@@ -35968,7 +35968,7 @@
         }]
       }],
       "description" : "FHIR Body Mass Index (BMI) Profile",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -36007,7 +36007,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Observation",
@@ -36065,7 +36065,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -36263,7 +36263,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -36717,7 +36717,7 @@
             }],
             "strength" : "required",
             "description" : "The type of TriggeredBy Observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "rim",
@@ -36839,7 +36839,7 @@
             }],
             "strength" : "required",
             "description" : "Codes providing the status of an observation.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -39051,7 +39051,7 @@
         "system" : "urn:ietf:rfc:3986",
         "value" : "urn:oid:2.16.840.1.113883.4.642.5.1175"
       }],
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "ProfileForCatalog",
       "title" : "Profile for  Catalog",
       "status" : "draft",
@@ -39065,7 +39065,7 @@
         }]
       }],
       "description" : "A set of resources composed into a single coherent clinical statement with clinical attestation",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "workflow",
         "uri" : "http://hl7.org/fhir/workflow",
@@ -39099,7 +39099,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Composition",
@@ -39149,7 +39149,7 @@
             },
             {
               "url" : "http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation",
-              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."
+              "valueMarkdown" : "When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."
             }],
             "key" : "dom-6",
             "severity" : "warning",
@@ -39292,7 +39292,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -39715,7 +39715,7 @@
             }],
             "strength" : "required",
             "description" : "The workflow status of the composition.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/composition-status|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/composition-status|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "workflow",
@@ -42118,14 +42118,14 @@
         "valueString" : "#### Complete Summary of the Mandatory Requirements\r\r1.  One code in `Observation.code` which must have\r    -   a fixed `Observation.code.coding.system`=**'http ://loinc.org'**\r    -   a fixed  `Observation.code.coding.code`= **'29463-7'**\r    -   Other additional Codings are allowed in `Observation.code`- e.g. more specific LOINC\r        Codes, SNOMED CT concepts, system specific codes. All codes\r        SHALL have an system value\r1. Either one Observation.valueQuantity or, if there is no value, one code in Observation.DataAbsentReason\r   - Each Observation.valueQuantity must have:\r     - One numeric value in Observation.valueQuantity.value\r     - a fixed Observation.valueQuantity.system=\"http://unitsofmeasure.org\"\r     - a UCUM unit code in Observation.valueQuantity.code = **'kg', 'g', or '[lb_av]'**"
       }],
       "url" : "http://hl7.org/fhir/StructureDefinition/history-bundle",
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "HistoryBundle",
       "title" : "History bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-07-17T03:44:13+00:00",
+      "date" : "2026-09-14T16:43:45+00:00",
       "description" : "This profile holds all the requirements and constraints related to a FHIR history bundle.",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "v2",
         "uri" : "http://hl7.org/v2",
@@ -42154,7 +42154,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Bundle",
@@ -42419,7 +42419,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -42512,7 +42512,7 @@
             }],
             "strength" : "required",
             "description" : "Indicates the purpose of a bundle - how it is intended to be used.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "w5",
@@ -42750,7 +42750,7 @@
           "isSummary" : true,
           "binding" : {
             "strength" : "required",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"
           }
         },
         {
@@ -43200,7 +43200,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -43406,7 +43406,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -44220,7 +44220,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -44427,7 +44427,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -45241,7 +45241,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -45448,7 +45448,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -46262,7 +46262,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -46469,7 +46469,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -47283,7 +47283,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -47490,7 +47490,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -48304,7 +48304,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -48510,7 +48510,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -49127,12 +49127,12 @@
         "valueCode" : "fhir"
       }],
       "url" : "http://hl7.org/fhir/StructureDefinition/search-set-bundle",
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "SearchSetBundle",
       "title" : "Search Set Bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-07-17T03:44:13+00:00",
+      "date" : "2026-09-14T16:43:45+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -49141,7 +49141,7 @@
         }]
       }],
       "description" : "This profile holds all the requirements and constraints related to a FHIR search bundle.",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "v2",
         "uri" : "http://hl7.org/v2",
@@ -49170,7 +49170,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Bundle",
@@ -49435,7 +49435,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -49528,7 +49528,7 @@
             }],
             "strength" : "required",
             "description" : "Indicates the purpose of a bundle - how it is intended to be used.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "w5",
@@ -49766,7 +49766,7 @@
           "isSummary" : true,
           "binding" : {
             "strength" : "required",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"
           }
         },
         {
@@ -50216,7 +50216,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -50422,7 +50422,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -51237,7 +51237,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -51443,7 +51443,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -52257,7 +52257,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -52463,7 +52463,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -52993,12 +52993,12 @@
         "valueCode" : "fhir"
       }],
       "url" : "http://hl7.org/fhir/StructureDefinition/subscription-notification-bundle",
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "SubscriptionNotificationBundle",
       "title" : "Subscription Notification bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-07-17T03:44:13+00:00",
+      "date" : "2026-09-14T16:43:45+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -53007,7 +53007,7 @@
         }]
       }],
       "description" : "This profile holds all the requirements and constraints related to a Subscription Notification Bundle.",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "v2",
         "uri" : "http://hl7.org/v2",
@@ -53036,7 +53036,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Bundle",
@@ -53301,7 +53301,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -53394,7 +53394,7 @@
             }],
             "strength" : "required",
             "description" : "Indicates the purpose of a bundle - how it is intended to be used.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "w5",
@@ -53632,7 +53632,7 @@
           "isSummary" : true,
           "binding" : {
             "strength" : "required",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"
           }
         },
         {
@@ -54082,7 +54082,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -54288,7 +54288,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -55102,7 +55102,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -55308,7 +55308,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -56122,7 +56122,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -56328,7 +56328,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -56850,12 +56850,12 @@
         "valueCode" : "fhir"
       }],
       "url" : "http://hl7.org/fhir/StructureDefinition/batch-bundle",
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "BatchBundle",
       "title" : "Batch bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-07-17T03:44:13+00:00",
+      "date" : "2026-09-14T16:43:45+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -56864,7 +56864,7 @@
         }]
       }],
       "description" : "This profile holds all the requirements and constraints related to a FHIR batch bundle.",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "v2",
         "uri" : "http://hl7.org/v2",
@@ -56893,7 +56893,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Bundle",
@@ -57158,7 +57158,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -57251,7 +57251,7 @@
             }],
             "strength" : "required",
             "description" : "Indicates the purpose of a bundle - how it is intended to be used.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "w5",
@@ -57489,7 +57489,7 @@
           "isSummary" : true,
           "binding" : {
             "strength" : "required",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"
           }
         },
         {
@@ -57939,7 +57939,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -58145,7 +58145,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -58959,7 +58959,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -59166,7 +59166,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -59980,7 +59980,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -60187,7 +60187,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -61001,7 +61001,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -61208,7 +61208,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -62022,7 +62022,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -62229,7 +62229,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -63043,7 +63043,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -63250,7 +63250,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -64064,7 +64064,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -64271,7 +64271,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -64951,12 +64951,12 @@
         "valueCode" : "fhir"
       }],
       "url" : "http://hl7.org/fhir/StructureDefinition/batch-response-bundle",
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "BatchResponseBundle",
       "title" : "Batch response bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-07-17T03:44:13+00:00",
+      "date" : "2026-09-14T16:43:45+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -64965,7 +64965,7 @@
         }]
       }],
       "description" : "This profile holds all the requirements and constraints related to a FHIR batch response.",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "v2",
         "uri" : "http://hl7.org/v2",
@@ -64994,7 +64994,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Bundle",
@@ -65259,7 +65259,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -65352,7 +65352,7 @@
             }],
             "strength" : "required",
             "description" : "Indicates the purpose of a bundle - how it is intended to be used.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "w5",
@@ -65590,7 +65590,7 @@
           "isSummary" : true,
           "binding" : {
             "strength" : "required",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"
           }
         },
         {
@@ -66031,7 +66031,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -66237,7 +66237,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -66714,12 +66714,12 @@
         "valueCode" : "fhir"
       }],
       "url" : "http://hl7.org/fhir/StructureDefinition/transaction-bundle",
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "TransactionBundle",
       "title" : "Transaction bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-07-17T03:44:13+00:00",
+      "date" : "2026-09-14T16:43:45+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -66728,7 +66728,7 @@
         }]
       }],
       "description" : "This profile holds all the requirements and constraints related to a FHIR transaction.",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "v2",
         "uri" : "http://hl7.org/v2",
@@ -66757,7 +66757,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Bundle",
@@ -67022,7 +67022,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -67115,7 +67115,7 @@
             }],
             "strength" : "required",
             "description" : "Indicates the purpose of a bundle - how it is intended to be used.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "w5",
@@ -67353,7 +67353,7 @@
           "isSummary" : true,
           "binding" : {
             "strength" : "required",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"
           }
         },
         {
@@ -67803,7 +67803,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -68009,7 +68009,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -68823,7 +68823,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -69030,7 +69030,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -69844,7 +69844,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -70051,7 +70051,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -70865,7 +70865,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -71072,7 +71072,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -71886,7 +71886,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -72093,7 +72093,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -72907,7 +72907,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -73114,7 +73114,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -73928,7 +73928,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -74135,7 +74135,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -74815,12 +74815,12 @@
         "valueCode" : "fhir"
       }],
       "url" : "http://hl7.org/fhir/StructureDefinition/transaction-response-bundle",
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "TransactionResponseBundle",
       "title" : "Transaction response bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-07-17T03:44:13+00:00",
+      "date" : "2026-09-14T16:43:45+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -74829,7 +74829,7 @@
         }]
       }],
       "description" : "This profile holds all the requirements and constraints related to a FHIR transaction response.",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "v2",
         "uri" : "http://hl7.org/v2",
@@ -74858,7 +74858,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Bundle",
@@ -75123,7 +75123,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -75216,7 +75216,7 @@
             }],
             "strength" : "required",
             "description" : "Indicates the purpose of a bundle - how it is intended to be used.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "w5",
@@ -75454,7 +75454,7 @@
           "isSummary" : true,
           "binding" : {
             "strength" : "required",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"
           }
         },
         {
@@ -75895,7 +75895,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -76101,7 +76101,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {
@@ -76578,12 +76578,12 @@
         "valueCode" : "fhir"
       }],
       "url" : "http://hl7.org/fhir/StructureDefinition/document-bundle",
-      "version" : "6.0.0-ballot4",
+      "version" : "6.0.0-snapshot1",
       "name" : "DocumentBundle",
       "title" : "Document bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-07-17T03:44:13+00:00",
+      "date" : "2026-09-14T16:43:45+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -76592,7 +76592,7 @@
         }]
       }],
       "description" : "This profile holds all the requirements and constraints related to a FHIR document.",
-      "fhirVersion" : "6.0.0-ballot4",
+      "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
         "identity" : "v2",
         "uri" : "http://hl7.org/v2",
@@ -76621,7 +76621,7 @@
       "snapshot" : {
         "extension" : [{
           "url" : "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-          "valueString" : "6.0.0-ballot4"
+          "valueString" : "6.0.0-snapshot1"
         }],
         "element" : [{
           "id" : "Bundle",
@@ -76886,7 +76886,7 @@
             }],
             "strength" : "required",
             "description" : "IETF language tag for a human language",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
+            "valueSet" : "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1",
             "additional" : [{
               "purpose" : "starter",
               "valueSet" : "http://hl7.org/fhir/ValueSet/languages"
@@ -77032,7 +77032,7 @@
             }],
             "strength" : "required",
             "description" : "Identifies the purpose for this identifier, if known .",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "v2",
@@ -77300,7 +77300,7 @@
             }],
             "strength" : "required",
             "description" : "Indicates the purpose of a bundle - how it is intended to be used.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"
           },
           "mapping" : [{
             "identity" : "w5",
@@ -77539,7 +77539,7 @@
           "isSummary" : true,
           "binding" : {
             "strength" : "required",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"
           }
         },
         {
@@ -77980,7 +77980,7 @@
             }],
             "strength" : "required",
             "description" : "Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"
           }
         },
         {
@@ -78186,7 +78186,7 @@
             }],
             "strength" : "required",
             "description" : "HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.",
-            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"
+            "valueSet" : "http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"
           }
         },
         {

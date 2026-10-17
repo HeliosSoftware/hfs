@@ -27,7 +27,7 @@ destructive operations emit their own lifecycle events through helpers in
 |---|---|---|---|
 | `bulk-export` | REST kick-off, and the worker's terminal transition (complete / cancel / fail) | `0` / `4` / `8` | `bulk-export-operation` (the phase), `job-id`, `export-level`, `resource-types` |
 | `purge` | handler, on success **and** on failure | `0` / `8` | `count`, `resource-type` |
-| `reindex` | job start, and its terminal state (complete / cancel / fail) | `0` / `4` / `8` | `phase`, `job-id`, `resources-processed`, `resource-types` |
+| `reindex` | job start, and its terminal state (complete / cancel / fail) | `0` / `4` / `8`; `complete` is `4` when the job recorded resource errors | `phase`, `job-id`, `resources-processed`, `resource-types` |
 
 Note the phase detail is keyed `bulk-export-operation` for export but `phase`
 for reindex — the former predates the shared helper and is kept for consumers

@@ -12,6 +12,9 @@ All server behavior is controlled through environment variables. No configuratio
 | `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base for Location headers and Bundle links |
 | `HFS_DATA_DIR` | `./data` | Path to FHIR data directory (search parameters) |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage. In a cluster, a SearchParameter POSTed to one node becomes visible to the others within this interval. `0` disables the periodic refresh. |
+| `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes against storage (CLI `--dashboard-reconcile-interval-secs`). Whole seconds, must be `> 0`; `0` or a non-numeric value is a startup error. A tenant's full recount is additionally spaced to at most every max(interval, 10 × its last recount duration); also how soon a failed background seed is retried. |
+| `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (approximate, or an import running) (CLI `--dashboard-refresh-secs`). Re-reads in-memory counters only, never storage. Whole seconds, must be `> 0` and `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise a startup error. |
+| `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a Home dashboard whose figures are settled (exact, no import running), so an open tab notices an import starting (CLI `--dashboard-idle-refresh-secs`). Whole seconds, must be `> 0` and `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise a startup error. |
 
 `HFS_BASE_URL` must be an absolute `http` or `https` URL with a host. It may
 include a deployment path prefix, such as `https://example.com/fhir`, but it
@@ -24,10 +27,11 @@ public address explicitly behind a proxy. Request `Host`, `Forwarded`, and
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size (bytes; applies to the decompressed body for compressed requests) |
+| `HFS_MAX_BODY_SIZE` | `134217728` | Max request body size (bytes; applies to the decompressed body for compressed requests). The 128 MiB default covers the largest per-patient Synthea Bundle (#1662); a batch or transaction body is parsed whole in memory, so lower it on small hosts. A bundle that size takes minutes to process (the largest, 27,056 entries, took about 2 minutes on a release build with SQLite), and `HFS_REQUEST_TIMEOUT` can answer 408 before it finishes: raise that too when posting large bundles. |
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 
 Request bodies may be sent compressed (`Content-Encoding: gzip`, `deflate`,
 `br`, or `zstd`); unsupported encodings are rejected with `415`. Responses
@@ -52,12 +56,26 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | Elasticsearch index name prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | *(none)* | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | Elasticsearch basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name |
+| `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
+| `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | Timeout of every Elasticsearch request, including `_bulk`, in milliseconds. A `_bulk` request that times out is split in half and resent |
+| `HFS_ELASTICSEARCH_BULK_MAX_BYTES` | `10485760` | Byte cap per `_bulk` request body (10 MiB), applied together with the 500-operation cap |
+| `HFS_ELASTICSEARCH_BULK_CONCURRENCY` | `1` | `_bulk` requests of one page in flight at once; splitting and back-off stay sequential per request |
+| `HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS` | `0` | Extraction threads for `$reindex` pages on the Elasticsearch writer: `0` = cores − 1 (1–4), `1` = none beyond the page's own thread |
+| `HFS_REINDEX_BATCH_BYTES` | `33554432` (32 MiB) | Byte cap on one page of the automatic rebuild (`0` = count only). Honoured by the SQLite source (a page may exceed the cap by one resource) and by the PostgreSQL and MongoDB sources (a page never exceeds the cap unless it holds a single resource); the Elasticsearch and S3 sources page by count only |
+| `HFS_REINDEX_PREFETCH` | `true` | Fetch the next `$reindex` page from the primary while the current one is written, for `POST $reindex` and the automatic rebuild alike, wherever the source allows it: standalone MongoDB and `mongo-es` (id phase), and `sqlite-es`, `postgres-es`, `s3-es`, where search is offloaded so the page read and the Elasticsearch write touch disjoint stores. `false` restores the serial fetch → write loop on every backend (#1250) |
+| `HFS_ELASTICSEARCH_REINDEX_REFRESH` | *(unset)* | `refresh` parameter for `$reindex` and deferred-rebuild writes: `false`, `wait_for`, or `true`. Unset follows `HFS_ELASTICSEARCH_WRITE_REFRESH` |
+| `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild after a bulk import (all backends). `POST $reindex` keeps its own `batchSize`, capped at 10,000 |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | `prefix-per-tenant` (one shared bucket, tenant key prefixes) or `bucket-per-tenant` (a dedicated bucket per mapped tenant) |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket (prefix-per-tenant only) |
+| `HFS_S3_TENANT_BUCKETS` | *(none)* | Bucket-per-tenant: `tenant=bucket,…`, required; must include `HFS_DEFAULT_TENANT` |
+| `HFS_S3_SYSTEM_BUCKET` | *(none)* | Bucket-per-tenant: optional tenant-independent bucket for the tenant registry, user settings, login sessions, the bulk-submit worker index and AuditEvents |
 | `HFS_S3_REGION` | *(AWS chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix for all S3 object keys |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
 
 ## Multi-Tenancy
 
@@ -72,7 +90,7 @@ are compressed when the client sends `Accept-Encoding`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` | Default FHIR version: `R4`, `R4B`, `R5`, `R6` |
+| `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version: `R4`, `R4B`, `R5`, `R6` |
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources (vs 404) |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |

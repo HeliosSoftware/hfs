@@ -162,5 +162,13 @@ GE LUNAR PRODIGY DENSITOMETER
     <reference value="Observation/bmd"/>
   </result>
   <!-- the imaging service marks this to help find categories of patient -->
-  <conclusionCode/>
+  <conclusionCode>
+    <concept>
+      <coding>
+        <system value="http://snomed.info/sct"/>
+        <code value="391040000"/>
+        <display value="At risk of osteoporotic fracture"/>
+      </coding>
+    </concept>
+  </conclusionCode>
 </DiagnosticReport>

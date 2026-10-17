@@ -114,5 +114,66 @@ async fn transaction_bundles_can_repeat_shared_post_entries() {
             .unwrap_or_default()
             .to_string();
         assert!(status.starts_with("201"), "entry status: {status}");
+        // #1223: the client id is ignored — the created location must not carry it.
+        let location = body["entry"][0]["response"]["location"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !location.contains("shared-org"),
+            "transaction POST must get a server id, not the client id; location: {location}"
+        );
     }
+
+    // Nothing was ever stored under the client-supplied id.
+    server
+        .get("/Organization/shared-org")
+        .add_header(X_TENANT_ID, "test-tenant")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+}
+
+/// #1223: a POST entry inside a **batch** bundle must get a server-assigned id,
+/// exactly as a standalone POST and a transaction entry do. The batch executor
+/// reads the raw entry resource, so a regression here silently created the
+/// resource under the client id — and a later import of the same id overwrote
+/// it as v2 instead of creating a second copy.
+#[tokio::test]
+async fn batch_post_entries_get_a_server_id_not_the_client_id() {
+    let server = create_test_server().await;
+    let bundle = json!({
+        "resourceType": "Bundle",
+        "type": "batch",
+        "entry": [{
+            "fullUrl": "urn:uuid:00000000-0000-4000-8000-0000000000aa",
+            "resource": org("client-batch-id"),
+            "request": { "method": "POST", "url": "Organization" },
+        }],
+    });
+
+    let response = server
+        .post("/")
+        .add_header(X_TENANT_ID, "test-tenant")
+        .json(&bundle)
+        .await;
+    response.assert_status(StatusCode::OK);
+    let body = response.json::<Value>();
+    let status = body["entry"][0]["response"]["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(status.starts_with("201"), "entry status: {status}");
+    let location = body["entry"][0]["response"]["location"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !location.contains("client-batch-id"),
+        "batch POST must get a server id, not the client id; location: {location}"
+    );
+
+    // Nothing was ever stored under the client-supplied id.
+    server
+        .get("/Organization/client-batch-id")
+        .add_header(X_TENANT_ID, "test-tenant")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
 }

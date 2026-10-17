@@ -28,6 +28,9 @@ R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-audit/R6", "helios-ui?/R6"]
 # Build options
 skip-r6-download = []
 ui = ["dep:helios-ui"]
+# FHIR XML on the wire (`_format=xml`, `Accept: application/fhir+xml`).
+# Without it every XML request answers 406 and /metadata advertises JSON only.
+xml = ["helios-rest/xml"]
 # NOTE: headless operation is a *runtime* switch (`HFS_UI_ENABLED=false`), not a
 # feature. The former `headless` feature was gated as `not(feature = "headless")`
 # and so was enabled — turning the UI off — by `--all-features`, the selection
@@ -57,15 +60,15 @@ otel = ["helios-observability/otel"]
 reqwest = { version = "0.12", features = ["blocking"] }
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
-helios-rest = { path = "../rest", version = "0.2.1", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false }
-helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
-helios-auth = { path = "../auth", version = "0.2.1" }
-helios-audit = { path = "../audit", version = "0.2.1", default-features = false }
-helios-subscriptions = { path = "../subscriptions", version = "0.2.1", optional = true, default-features = false }
-helios-ui = { path = "../ui", version = "0.2.1", optional = true, default-features = false }
-helios-observability = { path = "../observability", version = "0.2.1" }
+helios-fhir = { path = "../fhir", version = "0.2.4", default-features = false }
+helios-rest = { path = "../rest", version = "0.2.4", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.2.4", default-features = false }
+helios-sof = { path = "../sof", version = "0.2.4", default-features = false }
+helios-auth = { path = "../auth", version = "0.2.4" }
+helios-audit = { path = "../audit", version = "0.2.4", default-features = false }
+helios-subscriptions = { path = "../subscriptions", version = "0.2.4", optional = true, default-features = false }
+helios-ui = { path = "../ui", version = "0.2.4", optional = true, default-features = false }
+helios-observability = { path = "../observability", version = "0.2.4" }
 
 # Export job controller
 dashmap = "6"
@@ -78,6 +81,7 @@ axum = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # CLI and configuration
 clap = { version = "4.0", features = ["derive", "env"] }
@@ -101,6 +105,18 @@ serde_json = "1"
 # assert what the binary actually serves, not what a `cfg` says.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# `tests/elasticsearch_startup.rs` talks HTTP to the `hfs` binary it starts
+# and to the Elasticsearch cluster under it.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# The Elasticsearch container `tests/elasticsearch_startup.rs` runs `hfs` on.
+# `watchdog` (removes it on SIGINT/SIGTERM) pulls in `signal_hook::iterator`,
+# which only compiles on Unix.
+[target.'cfg(not(windows))'.dev-dependencies]
+testcontainers = { version = "0.27", features = ["watchdog"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+testcontainers = { version = "0.27" }
 
 # Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner
 # doesn't have target-platform OpenSSL dev libs).  Cargo feature unification

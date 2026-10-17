@@ -24,6 +24,46 @@ test("deduplicates exact fallback values", () => {
   );
 });
 
+test("parses CR and CRLF lists without losing order or duplicate handling", () => {
+  assert.deepEqual(
+    combobox.parseValues(" Patient/p-104\rPatient/p-205\r\nPatient/p-104\r\nPatient/p-306 "),
+    ["Patient/p-104", "Patient/p-205", "Patient/p-306"],
+  );
+});
+
+test("single pasted searches discard surrounding separators without validating references", () => {
+  for (const value of ["p-1831", "Patient/p-1831", "Ana Rivera", "invalid/id/path"]) {
+    for (const separator of ["\n", "\r", "\r\n", ",", ",\n,\r\n"]) {
+      assert.deepEqual(combobox.preparePaste("", ` ${separator} ${value} ${separator} `, 0, 0),
+        { count: 1, value, caret: value.length });
+    }
+  }
+});
+
+test("pasted lists are classified before deduplication and preserve the composed selection", () => {
+  assert.deepEqual(combobox.preparePaste("", "one,one", 0, 0), { count: 2, value: "one,one" });
+  assert.deepEqual(combobox.preparePaste("prefix-REPLACE-suffix", "one,two", 7, 14),
+    { count: 2, value: "prefix-one,two-suffix" });
+  assert.deepEqual(combobox.preparePaste("prefix-REPLACE-suffix", "\none", 7, 14),
+    { count: 2, value: "prefix-\none-suffix" });
+});
+
+test("a normalized search keeps the insertion caret before the unselected suffix", () => {
+  assert.deepEqual(combobox.preparePaste("REPLACE-suffix", "\n one", 0, 7),
+    { count: 1, value: "one-suffix", caret: 3 });
+  assert.deepEqual(combobox.preparePaste("prefix-REPLACE", "one \r\n", 7, 14),
+    { count: 1, value: "prefix-one", caret: 10 });
+  assert.deepEqual(combobox.preparePaste("prefix-", "one\n", null, null),
+    { count: 1, value: "prefix-one", caret: 10 });
+});
+
+test("separator-only paste replaces only the selected range without changing exterior text", () => {
+  assert.deepEqual(combobox.preparePaste(" prefix-REPLACE-suffix ", " ,\r\n, ", 8, 15),
+    { count: 0, value: " prefix--suffix ", caret: 8 });
+  assert.deepEqual(combobox.preparePaste("", "\r\n,, ", 0, 0),
+    { count: 0, value: "", caret: 0 });
+});
+
 // #842: single-value mode (`data-combobox-max="1"`, the *Add table*
 // combobox) — `atCapacity` is the pure decision `add()` uses to know
 // whether choosing one more option must first clear the field instead of
@@ -41,4 +81,64 @@ test("max=1 is at capacity once one value is already selected, not before", () =
 test("a max above 1 only trips once that many are already selected", () => {
   assert.equal(combobox.atCapacity(1, 3), false);
   assert.equal(combobox.atCapacity(3, 3), true);
+});
+
+for (const resourceType of ["Patient", "Group"]) {
+  test(`${resourceType} manual references use the server logical ID grammar`, () => {
+    for (const id of ["one", "A-1.2", "x".repeat(64)]) {
+      assert.equal(combobox.validReference(id, resourceType), true);
+      assert.equal(combobox.validReference(`${resourceType}/${id}`, resourceType), true);
+    }
+    for (const value of ["", "a b", "a_b", "é", "x".repeat(65), `${resourceType}/`,
+      `${resourceType}/a/b`, "Observation/one", "https://example.test/Patient/one",
+      "Andreshttp://example.test/ui/editor?resource=Patient", "patient/one"]) {
+      assert.equal(combobox.validReference(value, resourceType), false, value);
+    }
+  });
+}
+
+test("nearBottom is true exactly at the end of the list", () => {
+  assert.equal(combobox.nearBottom(200, 300, 500, 48), true);
+});
+
+test("nearBottom is true within the threshold of the end", () => {
+  assert.equal(combobox.nearBottom(160, 300, 500, 48), true);
+});
+
+test("nearBottom is false far from the end", () => {
+  assert.equal(combobox.nearBottom(0, 300, 500, 48), false);
+});
+
+test("nearBottom is true for a list that does not overflow", () => {
+  assert.equal(combobox.nearBottom(0, 300, 200, 48), true);
+});
+
+test("remainingLoadingMs is what is left of the minimum, never negative", () => {
+  assert.equal(combobox.remainingLoadingMs(1000, 1100, 400), 300);
+  assert.equal(combobox.remainingLoadingMs(1000, 1000, 400), 400);
+  assert.equal(combobox.remainingLoadingMs(1000, 1400, 400), 0);
+  assert.equal(combobox.remainingLoadingMs(1000, 2000, 400), 0);
+});
+
+test("fixed popup opens below when it fits and flips above near the viewport bottom", () => {
+  const below = combobox.fixedPlacement({ left: 30, top: 20, bottom: 52, width: 100 }, 180, 800, 600);
+  assert.equal(below.top, 56);
+  assert.equal(below.width, 160);
+  const above = combobox.fixedPlacement({ left: 30, top: 550, bottom: 582, width: 100 }, 180, 800, 600);
+  assert.equal(above.top, 366);
+  assert.equal(above.maxHeight, 280);
+});
+
+test("fixed popup caps long lists to the larger available side without leaving the viewport", () => {
+  const placement = combobox.fixedPlacement({ left: 450, top: 180, bottom: 212, width: 230 }, 900, 500, 400);
+  assert.equal(placement.left, 262);
+  assert.equal(placement.top, 216);
+  assert.equal(placement.maxHeight, 176);
+  assert.ok(placement.top + placement.maxHeight <= 392);
+});
+
+test("fixed popup width respects a narrow viewport and its horizontal margins", () => {
+  const placement = combobox.fixedPlacement({ left: 90, top: 50, bottom: 82, width: 250 }, 100, 140, 300);
+  assert.equal(placement.left, 8);
+  assert.equal(placement.width, 124);
 });

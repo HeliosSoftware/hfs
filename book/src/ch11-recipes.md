@@ -78,7 +78,7 @@ sof-cli \
 
 ### Incremental loads with `--since`
 
-Re-run the pipeline for only records modified after the last run:
+Re-run the pipeline for only records modified at or after the last run:
 
 ```bash
 sof-cli \

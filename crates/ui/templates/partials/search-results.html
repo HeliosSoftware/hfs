@@ -5,27 +5,29 @@
 -->
 <section class="card query-results" id="query-results" hidden
          data-msg-total="{{ i18n.t_arg("queries-results-total", "count", "{count}".to_string()) }}"
+         data-msg-total-partial="{{ i18n.t_arg("queries-results-total-partial", "count", "{count}".to_string()) }}"
          data-msg-included="{{ i18n.t_arg("queries-results-included", "count", "{count}".to_string()) }}"
          data-msg-empty="{{ i18n.t("queries-results-empty") }}"
          data-msg-updated="{{ i18n.t("queries-col-updated") }}"
+         data-msg-copy-id="{{ i18n.t("queries-copy-id") }}"
+         data-msg-copied="{{ i18n.t("queries-copied") }}"
          data-msg-fetch-error="{{ i18n.t_arg("queries-results-fetch-error", "origin", "{origin}".to_string()) }}">
   <div class="query-results__head">
     <h2 class="query-group__type">{{ i18n.t("queries-results") }}</h2>
     <span class="query-results__meta" id="query-results-meta"></span>
-    <span class="query-results__busy" id="query-results-busy" hidden
-          role="status">{{ i18n.t("queries-searching") }}</span>
-    <label class="query-results__sort">
-      <span>{{ i18n.t("queries-sort-label") }}</span>
-      <select id="query-results-sort">
+    <span class="tag" id="query-results-previous" hidden>{{ i18n.t("queries-results-previous") }}</span>
+    <div class="query-results__sort">
+      <span id="query-results-sort-label">{{ i18n.t("queries-sort-label") }}</span>
+      <select id="query-results-sort" aria-labelledby="query-results-sort-label" data-combobox-select>
         <option value="">{{ i18n.t("queries-sort-default") }}</option>
         <option value="-_lastUpdated">{{ i18n.t("queries-sort-recent") }}</option>
         <option value="_lastUpdated">{{ i18n.t("queries-sort-oldest") }}</option>
         <option value="_id">{{ i18n.t("queries-sort-id") }}</option>
       </select>
-    </label>
+    </div>
   </div>
-  <div class="table-wrap">
-    <table class="data-table">
+  <div class="table-wrap" tabindex="0" role="region" aria-label="{{ i18n.t("queries-results") }}">
+    <table class="data-table query-results__table" data-row-navigation>
       <thead id="query-results-head"></thead>
       <tbody id="query-results-body"></tbody>
     </table>

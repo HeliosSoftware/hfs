@@ -20,7 +20,7 @@
 //! -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet, arrow) [default: csv]
 //!     --no-headers               Exclude CSV headers (only for CSV format)
 //! -o, --output <OUTPUT>          Output file path (defaults to stdout)
-//!     --since <SINCE>            Filter resources modified after this time (RFC3339 format)
+//!     --since <SINCE>            Filter resources modified at or after this time (RFC3339 format)
 //!     --limit <LIMIT>            Limit the number of results (1-10000)
 //! -t, --threads <THREADS>        Number of threads to use for parallel processing
 //!     --fhir-version <VERSION>   FHIR version to use [default: R4]
@@ -142,7 +142,7 @@ use std::io::{self, BufReader, BufWriter, Read};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "sof-cli")]
+#[command(name = "sof-cli", version)]
 #[command(about = "SQL-on-FHIR CLI tool for running ViewDefinition transformations")]
 struct Args {
     /// Path to ViewDefinition JSON file (or use stdin if not provided)
@@ -182,7 +182,7 @@ struct Args {
     #[arg(long, short = 'o')]
     output: Option<PathBuf>,
 
-    /// Filter resources modified after this time (RFC3339 format, e.g., 2024-01-01T00:00:00Z)
+    /// Filter resources modified at or after this time (RFC3339 format, e.g., 2024-01-01T00:00:00Z)
     #[arg(long)]
     since: Option<String>,
 
@@ -203,7 +203,7 @@ struct Args {
         long,
         value_parser = clap::value_parser!(u32).range(64..=1024),
         default_value = "256",
-        help = "Target row group size in MB for Parquet files. Larger values improve compression and columnar efficiency but require more memory."
+        help = "Target row group size in MB for Parquet files. Row groups are cut once their encoded size reaches this value; larger values improve compression but peak memory is about three times this value."
     )]
     parquet_row_group_size: u32,
 
@@ -229,7 +229,7 @@ struct Args {
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(10..=10000),
-        help = "Maximum file size in MB for Parquet files. When exceeded, creates multiple numbered files (e.g., output_001.parquet, output_002.parquet). Range: 10-10000MB"
+        help = "Maximum file size in MB for Parquet files. When exceeded, keeps writing to numbered files (output.parquet, output_002.parquet, ...). The size is checked after each batch, so a file can exceed it by one batch plus the footer. Range: 10-10000MB"
     )]
     max_file_size: Option<u32>,
 
@@ -399,6 +399,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             buffer
         }
     };
+
+    // Validate column tags on the raw JSON first so a bad `ansi/type` tag
+    // (including a non-string value) is reported naming the column rather than
+    // as a generic serde error. Malformed JSON falls through to the typed parse.
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&view_content)
+        && raw.is_object()
+    {
+        helios_sof::column_types::resolve_columns(&raw)?;
+    }
 
     // Parse ViewDefinition based on specified FHIR version
     let view_definition: SofViewDefinition = match args.fhir_version {
@@ -806,61 +815,78 @@ fn merge_bundles(
     }
 }
 
-/// Write Parquet files with splitting when max_file_size is exceeded
+/// Write Parquet files with splitting when max_file_size is exceeded.
+///
+/// Files are encoded incrementally and written straight to disk. The first
+/// file keeps the requested name; later ones get `_002`, `_003`, ... before
+/// the extension. The size is checked after each 8,192-row batch, so a file can
+/// overshoot the limit by up to one batch plus its footer.
 fn write_parquet_with_splitting(
     view_definition: SofViewDefinition,
     bundle: SofBundle,
-    output_path: &PathBuf,
+    output_path: &std::path::Path,
     options: RunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use helios_sof::format_parquet_multi_file;
+    use helios_sof::columnar_stream::RollingParquetWriter;
+    use helios_sof::parquet_schema::resolve_arrow_schema;
 
-    // Get the max file size in bytes
-    let max_file_size_bytes = options
-        .parquet_options
-        .as_ref()
-        .and_then(|opts| opts.max_file_size_mb)
+    let parquet_options = options.parquet_options.clone().unwrap_or_default();
+    let max_file_size_bytes = parquet_options
+        .max_file_size_mb
         .map(|mb| mb as usize * 1024 * 1024)
         .unwrap_or(usize::MAX); // No limit if not specified
 
-    // Process the ViewDefinition to get the result
+    let declared = view_definition.try_declared_columns()?;
     let processed_result = helios_sof::process_view_definition(view_definition, bundle)?;
+    let schema = std::sync::Arc::new(resolve_arrow_schema(
+        &processed_result.columns,
+        &declared,
+        &processed_result.rows,
+    )?);
 
-    // Generate Parquet files
-    let file_buffers = format_parquet_multi_file(
-        processed_result,
-        options.parquet_options.as_ref(),
-        max_file_size_bytes,
-    )?;
-
-    // Determine file naming pattern
     let (base_path, extension) = if let Some(ext) = output_path.extension() {
-        let base = output_path.with_extension("");
-        (base, format!(".{}", ext.to_string_lossy()))
+        (
+            output_path.with_extension(""),
+            format!(".{}", ext.to_string_lossy()),
+        )
     } else {
-        (output_path.clone(), ".parquet".to_string())
+        (output_path.to_path_buf(), ".parquet".to_string())
+    };
+    let path_for = |index: usize| -> PathBuf {
+        if index == 0 {
+            output_path.to_path_buf()
+        } else {
+            PathBuf::from(format!(
+                "{}_{:03}{}",
+                base_path.display(),
+                index + 1,
+                extension
+            ))
+        }
     };
 
-    // Write files
-    if file_buffers.len() == 1 {
-        // Single file - use the original name
-        fs::write(output_path, &file_buffers[0])?;
-        println!("Wrote {} bytes to {:?}", file_buffers[0].len(), output_path);
-    } else {
-        // Multiple files - use numbered naming
-        for (i, buffer) in file_buffers.iter().enumerate() {
-            let file_path = if i == 0 {
-                // First file keeps the base name
-                PathBuf::from(format!("{}{}", base_path.display(), extension))
-            } else {
-                // Subsequent files get numbered
-                PathBuf::from(format!("{}_{:03}{}", base_path.display(), i + 1, extension))
-            };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut writer = RollingParquetWriter::new(
+        |index| {
+            let path = path_for(index);
+            let file = File::create(&path)?;
+            paths.push(path);
+            Ok(BufWriter::new(file))
+        },
+        schema,
+        &parquet_options,
+        max_file_size_bytes,
+    );
+    writer.write_rows(&processed_result.rows)?;
+    let sinks = writer.finish()?;
 
-            fs::write(&file_path, buffer)?;
-            println!("Wrote {} bytes to {:?}", buffer.len(), file_path);
-        }
-        println!("Created {} Parquet files", file_buffers.len());
+    for (path, mut sink) in paths.iter().zip(sinks) {
+        io::Write::flush(&mut sink)?;
+        let len = fs::metadata(path)?.len();
+        println!("Wrote {} bytes to {:?}", len, path);
+    }
+    if paths.len() > 1 {
+        println!("Created {} Parquet files", paths.len());
     }
 
     Ok(())

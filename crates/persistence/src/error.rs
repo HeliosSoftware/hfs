@@ -168,6 +168,25 @@ pub enum TenantError {
         tenant_id: TenantId,
     },
 
+    /// The tenant is well-formed but this deployment has nowhere to store it.
+    ///
+    /// Raised by the S3 backend in bucket-per-tenant mode for a tenant absent
+    /// from its tenant→bucket map, both when a request names such a tenant and
+    /// when `register_tenant` is asked to provision one: registering it would
+    /// succeed and then every request for it would fail, so the mint point is
+    /// refused instead. Distinct from [`InvalidTenant`](Self::InvalidTenant)
+    /// because the fix is operational (map the tenant to a bucket and restart),
+    /// not a malformed id, and the message has to say so.
+    // One line on purpose: thiserror re-emits the literal, and a `\`-continued
+    // literal reached the wire with its indentation intact.
+    #[error(
+        "tenant '{tenant_id}' has no bucket assigned: bucket-per-tenant storage serves only the tenants in its tenant-to-bucket map; add the tenant and its bucket to the map and restart"
+    )]
+    UnmappedTenant {
+        /// The tenant that has no bucket.
+        tenant_id: TenantId,
+    },
+
     /// A tenant id offered for provisioning is not canonical.
     ///
     /// Distinct from [`InvalidTenant`](Self::InvalidTenant) because it carries
@@ -254,6 +273,11 @@ pub enum ValidationError {
         /// Human-readable failure detail.
         message: String,
     },
+
+    /// A patch document could not be applied; nothing was written. Kept typed
+    /// so the REST layer chooses the status per cause (#1406).
+    #[error(transparent)]
+    Patch(#[from] crate::core::PatchError),
 }
 
 /// Detailed validation error information.
@@ -348,6 +372,49 @@ pub enum SearchError {
         message: String,
     },
 
+    /// A date search value that is not a FHIR date, dateTime or instant.
+    ///
+    /// Raised by [`crate::search::validate_date_values`] before any backend
+    /// builds a query, so every backend answers an invalid date the same way.
+    #[error("invalid value for date parameter '{param}': {reason}")]
+    InvalidDateValue {
+        /// Name of the search parameter carrying the value.
+        param: String,
+        /// The rejected value, as received.
+        value: String,
+        /// What is wrong with it, and the forms that are accepted.
+        reason: String,
+    },
+
+    /// A number or quantity search value whose number is not a finite decimal.
+    ///
+    /// Raised by [`crate::search::validate_numeric_values`] before any backend
+    /// builds a query, so every backend answers an invalid number the same way.
+    #[error("invalid value for number or quantity parameter '{param}': {reason}")]
+    InvalidNumberValue {
+        /// Name of the search parameter carrying the value.
+        param: String,
+        /// The rejected value, as received.
+        value: String,
+        /// What is wrong with it, and the forms that are accepted.
+        reason: String,
+    },
+
+    /// A search value that is empty, or has an empty alternative in its
+    /// comma-separated list (`family=Zzz,`).
+    ///
+    /// Raised by [`crate::search::validate_value_presence`] before any backend
+    /// builds a query: the empty string is a prefix of every string, so such a
+    /// value used to match everything (#1380).
+    #[error(
+        "invalid value for parameter '{param}': {}",
+        crate::search::EMPTY_VALUE_REASON
+    )]
+    EmptyValue {
+        /// The search parameter carrying the value, as nearly as written.
+        param: String,
+    },
+
     /// Composite search parameter error.
     #[error("invalid composite search parameter: {message}")]
     InvalidComposite {
@@ -358,6 +425,22 @@ pub enum SearchError {
     /// Text search not available.
     #[error("full-text search not available")]
     TextSearchNotAvailable,
+
+    /// The modifier needs a terminology server (value-set membership, or code
+    /// subsumption on a token) and none is configured. Raised for a direct
+    /// parameter and for the terminal parameter of a chained / `_has` search
+    /// alike, so both forms report it identically.
+    #[error(
+        "search modifier ':{modifier}' on token parameter '{param}' requires a \
+         configured terminology server (set HFS_TERMINOLOGY_SERVER)"
+    )]
+    TerminologyRequired {
+        /// Modifier name (e.g., `in`, `below`).
+        modifier: String,
+        /// The parameter as the client wrote it (`code`, `subject.gender`,
+        /// `_has:Observation:subject:code`).
+        param: String,
+    },
 }
 
 /// Errors related to transactions.
@@ -377,6 +460,81 @@ pub enum TransactionError {
         reason: String,
     },
 
+    /// The backend aborted the transaction with a transient error (for MongoDB,
+    /// a `TransientTransactionError` such as `WriteConflict`) on every attempt
+    /// it was allowed (#1586).
+    ///
+    /// Distinct from [`RolledBack`](Self::RolledBack) and
+    /// [`BundleError`](Self::BundleError): nothing committed and nothing in the
+    /// request was wrong — the transaction lost a race with concurrent writers
+    /// and the backend re-ran it `attempts` times before giving up. It carries
+    /// no entry index because the conflict is not the entry's fault. Callers
+    /// should surface it as a retryable `503`, not a client error.
+    ///
+    /// `reason` is the last attempt's raw backend detail: it is for logs and
+    /// must never reach a client response.
+    #[error("transaction aborted by a transient backend error after {attempts} attempts: {reason}")]
+    Transient {
+        /// How many times the transaction ran, the first attempt included.
+        attempts: u32,
+        /// Raw backend detail of the last attempt's failure. Log-only.
+        reason: String,
+    },
+
+    /// The transaction's commit was sent but its outcome could not be learned
+    /// (#1586).
+    ///
+    /// The commit may or may not have been applied, so unlike
+    /// [`Transient`](Self::Transient) the transaction was not re-run — running
+    /// it again could apply every entry twice. The caller must verify the
+    /// stored state before retrying.
+    ///
+    /// `reason` is raw backend detail: for logs, never for a client response.
+    #[error("transaction commit outcome unknown: {reason}")]
+    CommitOutcomeUnknown {
+        /// Raw backend detail of the commit failure. Log-only.
+        reason: String,
+    },
+
+    /// The transaction's uncommitted writes did not fit in the backend's
+    /// storage-engine cache, and the backend rolled it back (#1837). For MongoDB
+    /// this is `TransactionTooLargeForCache` (388): WiredTiger's "transaction is
+    /// too large and will not fit in the storage engine cache", on one of the
+    /// transaction's writes or on its commit, which also writes the
+    /// transaction's oplog entry (#1991). It is also a cache-pressure rollback
+    /// (112 "rolled back for eviction", or 365) of a Bundle that held the whole
+    /// admission room and so ran alone, which a replay meets again (#1895).
+    ///
+    /// Distinct from [`Transient`](Self::Transient): running it again meets the
+    /// same cache, so the backend does not. Distinct from
+    /// [`BundleError`](Self::BundleError): no entry is at fault, because the
+    /// Bundle exceeds a server capacity limit. Nothing was applied. Callers
+    /// should surface it as a `5xx` without `Retry-After`, naming the Bundle's
+    /// size rather than the backend detail.
+    ///
+    /// [`cause`](TooLargeForCacheCause) says which of the two ended it, because
+    /// they differ in what an unchanged resubmit can expect (#1993): 388 is the
+    /// backend's verdict on the write set itself, while a lone Bundle's eviction
+    /// rollback also depends on what else fills the cache. Tell a client that a
+    /// resubmit will fail only for
+    /// [`WriteSetTooLarge`](TooLargeForCacheCause::WriteSetTooLarge).
+    ///
+    /// `reason` is raw backend detail: for logs, never for a client response.
+    #[error(
+        "transaction too large for the storage engine cache ({entries} entries, {cause}): {reason}"
+    )]
+    TooLargeForCache {
+        /// Which signal ended the transaction; it decides what a client is
+        /// told about an unchanged resubmit (#1993). Shown in the log line.
+        cause: TooLargeForCacheCause,
+        /// Entries the transaction ran, so an operator can size the cache from
+        /// the log.
+        entries: usize,
+        /// Raw backend detail of the failure, after a prefix naming the entry
+        /// being written (`Entry N ...`) or the commit (`Commit ...`). Log-only.
+        reason: String,
+    },
+
     /// Transaction is no longer valid (already committed or rolled back).
     #[error("transaction no longer valid")]
     InvalidTransaction,
@@ -389,6 +547,30 @@ pub enum TransactionError {
     #[error("bundle processing error at entry {index}: {message}")]
     BundleError {
         /// Zero-based index of the bundle entry that failed.
+        index: usize,
+        /// Human-readable failure detail.
+        message: String,
+    },
+
+    /// A PATCH entry rejected a candidate and the whole bundle rolled back.
+    /// Preserve the entry's status and full OperationOutcome for the REST layer.
+    #[error("PATCH entry {index} failed with status {status}")]
+    PatchEntry {
+        /// Zero-based index of the failed entry.
+        index: usize,
+        /// HTTP status code of the refusal.
+        status: u16,
+        /// Complete FHIR OperationOutcome.
+        outcome: serde_json::Value,
+    },
+
+    /// A conditional entry's `ifMatch` was not satisfied by the resource its
+    /// criteria resolved to — or its criteria resolved to nothing, which no
+    /// `ifMatch` (`*` included) is satisfied by (#1381). Raised while the
+    /// entries are being resolved, before any is written.
+    #[error("precondition failed at entry {index}: {message}")]
+    PreconditionFailed {
+        /// Zero-based index of the bundle entry whose precondition failed.
         index: usize,
         /// Human-readable failure detail.
         message: String,
@@ -428,11 +610,46 @@ pub enum TransactionError {
     },
 }
 
+/// Why a transaction ended as [`TransactionError::TooLargeForCache`] (#1993).
+///
+/// The two causes differ in what an unchanged resubmit can expect, so a caller
+/// that answers a client words each on its own. Every constructor must name
+/// one. Deliberately not `#[non_exhaustive]`: a caller's `match` (the
+/// `too-costly` text in `helios-rest`) then has to word a new cause on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TooLargeForCacheCause {
+    /// The backend reported that the transaction's own write set does not fit
+    /// its cache. For MongoDB, `TransactionTooLargeForCache` (388), which
+    /// mongod sends only when the transaction holds more than
+    /// `transactionTooLargeForCacheThreshold` (0.75) of the cache's dirty
+    /// bytes. An unchanged resubmit brings the same write set to the same
+    /// cache and fails again.
+    WriteSetTooLarge,
+    /// The backend rolled the transaction back under cache pressure while it
+    /// ran alone: it held the whole admission room, so no other transaction
+    /// Bundle of this backend instance was open (#1895). For MongoDB, a
+    /// `WriteConflict` (112) "rolled back for eviction" or a
+    /// `TemporarilyUnavailable` (365). A replay usually fails again (49 of 50
+    /// in the benchmark) but not always: the room bounds only this backend
+    /// instance's transaction Bundles, and single-resource writes, batch
+    /// Bundles, other HFS instances and other clients share the same cache.
+    LoneEviction,
+}
+
+impl fmt::Display for TooLargeForCacheCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TooLargeForCacheCause::WriteSetTooLarge => write!(f, "write set too large"),
+            TooLargeForCacheCause::LoneEviction => write!(f, "lone eviction rollback"),
+        }
+    }
+}
+
 /// Errors originating from the database backend.
 #[derive(Error, Debug)]
 pub enum BackendError {
     /// The backend is currently unavailable.
-    #[error("backend unavailable: {backend_name}")]
+    #[error("backend unavailable: {backend_name}: {message}")]
     Unavailable {
         /// Backend identifier (e.g., `postgres`).
         backend_name: String,
@@ -523,6 +740,34 @@ pub enum BackendError {
         /// Failure detail from the serializer.
         message: String,
     },
+}
+
+impl BackendError {
+    /// Whether this is a transient infrastructure failure (the backend is
+    /// down, unreachable or saturated) rather than a fault in the request or
+    /// the server: [`Self::Unavailable`], [`Self::ConnectionFailed`] and
+    /// [`Self::PoolExhausted`].
+    ///
+    /// This is the single definition of "transient" for the layers that answer
+    /// `503` rather than `500` for these errors, so adding a variant here
+    /// changes their status codes together (#2048).
+    /// [`Self::Timeout`] is deliberately not included: it is a `504`.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            BackendError::Unavailable { .. }
+                | BackendError::ConnectionFailed { .. }
+                | BackendError::PoolExhausted { .. }
+        )
+    }
+}
+
+impl StorageError {
+    /// Whether this error is a transient backend failure; see
+    /// [`BackendError::is_unavailable`].
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, StorageError::Backend(e) if e.is_unavailable())
+    }
 }
 
 /// Errors related to bulk export operations.
@@ -705,6 +950,19 @@ pub enum BulkSubmitError {
         reason: String,
     },
 
+    /// A submitted file's body could not be read to the end (#1127) — a broken
+    /// connection, a timeout, or a resume that could not be completed. The
+    /// message is the reader's own, so the cause reaches the manifest's error
+    /// artifact unprefixed; the reader's error is kept as `source`.
+    #[error("{message}")]
+    InputStream {
+        /// The reader's own failure message, reproduced verbatim.
+        message: String,
+        /// The underlying reader error, when one is available.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+
     /// Rollback failed.
     #[error("rollback failed for submission {submission_id}: {message}")]
     RollbackFailed {
@@ -779,18 +1037,33 @@ pub fn classify_sqlite_error(context: &str, err: rusqlite::Error) -> BackendErro
             backend_name: "sqlite".to_string(),
             message,
         },
-        Some(ErrorCode::DatabaseBusy) | Some(ErrorCode::DatabaseLocked) => {
-            BackendError::Unavailable {
-                backend_name: "sqlite".to_string(),
-                message,
-            }
-        }
+        _ if is_sqlite_busy_or_locked(&err) => BackendError::Unavailable {
+            backend_name: "sqlite".to_string(),
+            message,
+        },
         _ => BackendError::Internal {
             backend_name: "sqlite".to_string(),
             message,
             source: Some(Box::new(err)),
         },
     }
+}
+
+/// Whether `err` is `SQLITE_BUSY` or `SQLITE_LOCKED`: the `busy_timeout`
+/// elapsed waiting for a lock held by another connection.
+///
+/// The one definition of "SQLite is merely contended" —
+/// [`classify_sqlite_error`] maps it to [`BackendError::Unavailable`], and the
+/// transaction Bundle path maps it to [`TransactionError::Transient`] (#1636),
+/// so the two cannot disagree about which codes count.
+#[cfg(feature = "sqlite")]
+pub(crate) fn is_sqlite_busy_or_locked(err: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode;
+
+    matches!(
+        err.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy) | Some(ErrorCode::DatabaseLocked)
+    )
 }
 
 #[cfg(feature = "sqlite")]
@@ -908,10 +1181,12 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 /// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
 ///   message this helper's callers produced before.
 ///
-/// Note that HFS does not currently set `maxTimeMS` on its queries, so the
-/// timeout arm fires only when the deadline comes from the server or a
-/// connection-string option. Wiring an HFS-side query deadline is tracked
-/// separately; the classification is in place either way.
+/// Search commands can set `maxTimeMS` from an optional whole-search deadline.
+/// Optional planner probes classify their own shorter timeouts before this helper.
+/// The cross-tenant `count_by_tenant` aggregate has a separate budget (#1828,
+/// `MongoBackendConfig::count_by_tenant_max_time_ms`). `maxTimeMS` bounds server
+/// execution at interrupt points; server selection, pool checkout and socket
+/// time are outside it.
 #[cfg(feature = "mongodb")]
 pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> BackendError {
     use mongodb::error::ErrorKind;
@@ -1099,6 +1374,39 @@ mod tests {
             message: "invalid JSON".to_string(),
         };
         assert!(err.to_string().contains("line 42"));
+    }
+
+    /// A file body that breaks mid-stream must reach the manifest's error
+    /// artifact as the reader wrote it — no `internal error in sqlite: ` and
+    /// no `parse error at line N: ` in front of it (#1127) — and the io error
+    /// must stay reachable through the standard `source()` chain.
+    #[test]
+    fn test_bulk_submit_input_stream_display_is_unprefixed() {
+        let reader_message = "reading file http://host/patients.ndjson?[redacted]: \
+                              connection reset by peer (gave up after 512 bytes and 3 retries)";
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, reader_message);
+
+        let storage_err: StorageError = BulkSubmitError::InputStream {
+            message: io_err.to_string(),
+            source: Some(Box::new(io_err)),
+        }
+        .into();
+
+        // `StorageError::BulkSubmit` is `#[error(transparent)]` and the
+        // variant's Display is just `{message}`, so the two hops add nothing.
+        assert_eq!(storage_err.to_string(), reader_message);
+
+        // The io error is still walkable: StorageError → BulkSubmitError → io.
+        let mut source = std::error::Error::source(&storage_err);
+        let mut found_io = false;
+        while let Some(err) = source {
+            if err.downcast_ref::<std::io::Error>().is_some() {
+                found_io = true;
+                break;
+            }
+            source = err.source();
+        }
+        assert!(found_io, "the io error should be reachable via source()");
     }
 
     // ── Driver-error classification (issue #353) ────────────────────────────
@@ -1332,5 +1640,88 @@ mod tests {
         };
         let storage_err: StorageError = submit_err.into();
         assert!(matches!(storage_err, StorageError::BulkSubmit(_)));
+    }
+
+    /// #2048: the one predicate the 503-vs-500 decisions share.
+    #[test]
+    fn is_unavailable_is_true_only_for_transient_backend_failures() {
+        let transient = [
+            BackendError::Unavailable {
+                backend_name: "s3".to_string(),
+                message: "slow down".to_string(),
+            },
+            BackendError::ConnectionFailed {
+                backend_name: "postgres".to_string(),
+                message: "refused".to_string(),
+            },
+            BackendError::PoolExhausted {
+                backend_name: "postgres".to_string(),
+            },
+        ];
+        for err in transient {
+            assert!(err.is_unavailable(), "{err:?}");
+            assert!(StorageError::Backend(err).is_unavailable());
+        }
+
+        let not_transient = [
+            BackendError::Timeout {
+                backend_name: "postgres".to_string(),
+                message: "statement_timeout".to_string(),
+            },
+            BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: "boom".to_string(),
+                source: None,
+            },
+            BackendError::QueryError {
+                message: "syntax".to_string(),
+            },
+        ];
+        for err in not_transient {
+            assert!(!err.is_unavailable(), "{err:?}");
+            assert!(!StorageError::Backend(err).is_unavailable());
+        }
+
+        let not_backend: StorageError = ResourceError::NotFound {
+            resource_type: "Patient".to_string(),
+            id: "1".to_string(),
+        }
+        .into();
+        assert!(!not_backend.is_unavailable());
+    }
+
+    #[test]
+    fn test_unavailable_display_includes_the_failure_reason() {
+        let error = BackendError::Unavailable {
+            backend_name: "mongodb".to_string(),
+            message: "reason-7c1d: no primary in replica set".to_string(),
+        };
+        let expected = "backend unavailable: mongodb: reason-7c1d: no primary in replica set";
+
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(StorageError::Backend(error).to_string(), expected);
+    }
+
+    /// #1993: the log line names the cause, keeping the prefix and the count.
+    #[test]
+    fn test_too_large_for_cache_display_names_the_cause() {
+        let err = TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::WriteSetTooLarge,
+            entries: 7412,
+            reason: "raw".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transaction too large for the storage engine cache (7412 entries, write set too large): raw"
+        );
+        let err = TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::LoneEviction,
+            entries: 1502,
+            reason: "raw".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transaction too large for the storage engine cache (1502 entries, lone eviction rollback): raw"
+        );
     }
 }

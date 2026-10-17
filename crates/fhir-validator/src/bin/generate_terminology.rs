@@ -13,6 +13,14 @@
 //! live terminology server, and the embedded [`CoreTerminology`] provider
 //! reports "not checked" for them rather than guessing.
 //!
+//! A StructureDefinition authored against another FHIR release (the SQL on
+//! FHIR ViewDefinition, `fhirVersion: 5.0.0`, ships in every version's spec
+//! files) has its core bindings pinned to that release by
+//! `generate-schema-packs` (`…/FHIR-version|5.0.0`). Those value sets are
+//! expanded from that release's bundle and stored under the pinned URL, so a
+//! pack checks them against the codes they actually mean. This reads the
+//! schema pack, so run `generate-schema-packs` first.
+//!
 //! The packs are **committed** and embedded via `include_bytes!` in
 //! `src/terminology.rs`. Re-run after spec updates:
 //!
@@ -21,11 +29,13 @@
 //! ```
 
 use flate2::Compression;
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use helios_fhir_validator::terminology::{CORE_VALUE_SET_PREFIX, fhir_release};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -83,6 +93,117 @@ fn generate(source: &Path, packs_dir: &Path, version: &str) -> Result<String, St
             source.display()
         ));
     }
+    let (mut table, unresolved) = expand_bundle(source)?;
+
+    // Core value sets the schema pack pins to another release, expanded from
+    // that release's bundle under the pinned URL.
+    let mut foreign = 0usize;
+    for pinned in foreign_pinned_value_sets(packs_dir, version)? {
+        let Some((url, pinned_version)) = pinned.split_once('|') else {
+            continue;
+        };
+        let Some(other) = fhir_release(pinned_version).and_then(version_dir) else {
+            continue;
+        };
+        let other_source = source
+            .parent()
+            .and_then(Path::parent)
+            .map(|resources| resources.join(other).join("valuesets.json"))
+            .ok_or("no resources root")?;
+        let (other_table, _) = expand_bundle(&other_source)?;
+        if let Some(codes) = other_table.get(url) {
+            table.insert(pinned.clone(), codes.clone());
+            foreign += 1;
+        }
+    }
+
+    // Diff-stable output: BTreeMap already sorts by url; the pairs list is sorted.
+    let pairs: Vec<(&String, &Vec<(String, String)>)> = table.iter().collect();
+    let json = serde_json::to_vec(&pairs).expect("table serializes");
+    let out_path = packs_dir.join(format!("terminology_{}.json.gz", version.to_lowercase()));
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(&json).expect("gzip write");
+    let compressed = encoder.finish().expect("gzip finish");
+    fs::write(&out_path, &compressed).map_err(|e| format!("write pack: {e}"))?;
+
+    Ok(format!(
+        "{version}: {} value sets expanded ({foreign} from other releases; {unresolved} skipped as not offline-resolvable) → {} ({} KB raw, {} KB gz)",
+        table.len(),
+        out_path.display(),
+        json.len() / 1024,
+        compressed.len() / 1024
+    ))
+}
+
+/// The spec directory holding a FHIR release (`major.minor`).
+fn version_dir(release: &str) -> Option<&'static str> {
+    match release {
+        "4.0" => Some("R4"),
+        "4.3" => Some("R4B"),
+        "5.0" => Some("R5"),
+        "6.0" => Some("R6"),
+        _ => None,
+    }
+}
+
+/// The versioned core value-set URLs `version`'s schema pack binds to a
+/// release other than its own.
+fn foreign_pinned_value_sets(packs_dir: &Path, version: &str) -> Result<BTreeSet<String>, String> {
+    let path = packs_dir.join(format!("fhir_schemas_{}.json.gz", version.to_lowercase()));
+    let mut json = Vec::new();
+    GzDecoder::new(
+        fs::read(&path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+            .as_slice(),
+    )
+    .read_to_end(&mut json)
+    .map_err(|e| format!("decompress {}: {e}", path.display()))?;
+    let pack: Value =
+        serde_json::from_slice(&json).map_err(|e| format!("parse schema pack: {e}"))?;
+    let own = version_dir_release(version);
+    let mut out = BTreeSet::new();
+    collect_pinned(&pack, own, &mut out);
+    Ok(out)
+}
+
+fn version_dir_release(version: &str) -> Option<&'static str> {
+    ["4.0", "4.3", "5.0", "6.0"]
+        .into_iter()
+        .find(|release| version_dir(release) == Some(version))
+}
+
+fn collect_pinned(node: &Value, own: Option<&str>, out: &mut BTreeSet<String>) {
+    match node {
+        Value::Object(map) => {
+            if let Some(value_set) = map
+                .get("binding")
+                .and_then(|b| b.get("valueSet"))
+                .and_then(Value::as_str)
+                && value_set.starts_with(CORE_VALUE_SET_PREFIX)
+                && let Some((_, pinned)) = value_set.split_once('|')
+                && fhir_release(pinned).is_some_and(|release| Some(release) != own)
+            {
+                out.insert(value_set.to_string());
+            }
+            for child in map.values() {
+                collect_pinned(child, own, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_pinned(item, own, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every offline-resolvable ValueSet in a spec value-set bundle, expanded,
+/// plus the count of those that are not.
+#[allow(clippy::type_complexity)]
+fn expand_bundle(
+    source: &Path,
+) -> Result<(BTreeMap<String, Vec<(String, String)>>, usize), String> {
     let raw = fs::read_to_string(source).map_err(|e| format!("read: {e}"))?;
     let bundle: Value = serde_json::from_str(&raw).map_err(|e| format!("parse: {e}"))?;
     let entries = bundle
@@ -128,23 +249,7 @@ fn generate(source: &Path, packs_dir: &Path, version: &str) -> Result<String, St
             _ => unresolved += 1,
         }
     }
-
-    // Diff-stable output: BTreeMap already sorts by url; the pairs list is sorted.
-    let pairs: Vec<(&String, &Vec<(String, String)>)> = table.iter().collect();
-    let json = serde_json::to_vec(&pairs).expect("table serializes");
-    let out_path = packs_dir.join(format!("terminology_{}.json.gz", version.to_lowercase()));
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
-    encoder.write_all(&json).expect("gzip write");
-    let compressed = encoder.finish().expect("gzip finish");
-    fs::write(&out_path, &compressed).map_err(|e| format!("write pack: {e}"))?;
-
-    Ok(format!(
-        "{version}: {} value sets expanded ({unresolved} skipped as not offline-resolvable) → {} ({} KB raw, {} KB gz)",
-        table.len(),
-        out_path.display(),
-        json.len() / 1024,
-        compressed.len() / 1024
-    ))
+    Ok((table, unresolved))
 }
 
 /// Fully expand a ValueSet using only `complete` in-bundle CodeSystems, or

@@ -45,7 +45,8 @@
  *
  * Each server lint diagnostic's `fixes` (#821) becomes a `Diagnostic.action`
  * - a button in the hover tooltip and the lint panel alike, and reachable
- * by keyboard as Ctrl+. - that edits the document by the fix's own RFC 6901
+ * by keyboard as Ctrl+. (one fix applies directly, several open a menu
+ * next to the cursor) - that edits the document by the fix's own RFC 6901
  * pointer, resolved against the browser's live syntax tree at the moment
  * it is actually clicked, never at diagnostic time. `message`/fix `label`
  * strings already arrive translated from the server; the one string this
@@ -291,6 +292,31 @@
     return { from: openBrace.to, to: propertyNode.to };
   }
 
+  /* ---- quick fixes: pure helpers (#1757) ---------------------------------- */
+
+  /* Whether a diagnostic range `[diagFrom, diagTo]` "touches" the selection
+   * `[selFrom, selTo]`. A zero-width selection (the common case, a plain
+   * cursor) touches a range it sits anywhere inside, endpoints included; a
+   * real selection touches one it actually overlaps, so sharing only a
+   * border does not count. */
+  function diagnosticTouchesSelection(diagFrom, diagTo, selFrom, selTo) {
+    if (selFrom === selTo) return selFrom >= diagFrom && selFrom <= diagTo;
+    return selFrom < diagTo && selTo > diagFrom;
+  }
+
+  /* `diagnostics` is an array of `{ from, to, message, actions? }`. Returns
+   * `[{ message, actions }]`: in input order, one entry for every diagnostic
+   * that touches the selection and carries at least one action. */
+  function groupFixActions(diagnostics, selFrom, selTo) {
+    var groups = [];
+    diagnostics.forEach(function (d) {
+      if (!d.actions || d.actions.length === 0) return;
+      if (!diagnosticTouchesSelection(d.from, d.to, selFrom, selTo)) return;
+      groups.push({ message: d.message, actions: d.actions });
+    });
+    return groups;
+  }
+
   /* ---- mount -------------------------------------------------------------- */
 
   function mount(root) {
@@ -310,6 +336,8 @@
     // point in `mount`; `undefined` when absent (no `data-msg-required`, or
     // no grid at all) degrades to no marker rather than an English literal.
     var requiredLabel = grid ? grid.dataset.msgRequired : undefined;
+    // #1757: the quick-fix menu's accessible name, read once the same way.
+    var quickFixLabel = grid ? grid.dataset.msgQuickfix : undefined;
     var view = null;
 
     if (CodeEditor && CM) {
@@ -740,7 +768,11 @@
        * whatever this held before that pass started, not a half-finished
        * one - there is no reliable "pass in progress" signal to block on
        * instead, and the previous pass's result is the closest
-       * approximation available without delaying the click on the network. */
+       * approximation available without delaying the click on the network.
+       * #1014: the Save guard takes the larger of this count and the guided
+       * form's validity chip (`chipErrorCount` below) - both are "the most
+       * recently completed" analysis of their own kind, the chip settling
+       * about 600ms after the last keystroke via `editor-form.js`. */
       var lastLintDiagnostics = [];
 
       var recordLintResult = function (diagnostics) {
@@ -754,40 +786,150 @@
         return fetchServerDiagnostics(view).then(recordLintResult);
       };
 
-      /* ---- Ctrl+. : apply the fix under the cursor (#821) -----------------
+      /* ---- Ctrl+. : apply the fix under the cursor (#821, #1757) ----------
        *
-       * `Mod-.` collects every action of every diagnostic whose range
-       * touches the current cursor or selection via `forEachDiagnostic` -
-       * the live set CM6's own lint state already tracks, so no separate
-       * bookkeeping of "diagnostics at the cursor" is needed here. A
-       * zero-width selection (the common case, a plain cursor) "touches" a
-       * diagnostic range it sits anywhere inside, endpoints included; a real
-       * selection "touches" one it actually overlaps. Exactly one action
-       * across all of them applies it directly; more than one opens the
-       * lint panel (`openLintPanel` - navigable and clickable from there,
-       * `lintKeymap` below adds F8/Ctrl-Shift-M to reach it by keyboard
-       * too); none returns `false`, letting `.` fall through to its normal
-       * self-insertion.
+       * `Mod-.` collects every diagnostic touching the current cursor or
+       * selection via `forEachDiagnostic` - the live set CM6's own lint
+       * state already tracks, so no separate bookkeeping of "diagnostics at
+       * the cursor" is needed here - and groups their actions with
+       * `groupFixActions` (see its own doc comment for what "touches"
+       * means). Exactly one action across all of them applies it directly;
+       * more than one opens the quick-fix menu, a small tooltip at the
+       * cursor (`quickFixField`) grouped by diagnostic and driven by the
+       * arrow keys, Enter and Escape; none returns `false`, letting `.` fall
+       * through to its normal self-insertion. The bottom lint panel stays
+       * reachable through `lintKeymap` (Ctrl-Shift-M opens it; F8 jumps to
+       * the next diagnostic), below.
        */
-      var diagnosticTouchesSelection = function (diagFrom, diagTo, selFrom, selTo) {
-        if (selFrom === selTo) return selFrom >= diagFrom && selFrom <= diagTo;
-        return selFrom < diagTo && selTo > diagFrom;
+      var quickFixEffect = CM.StateEffect.define();
+
+      var buildQuickFixMenu = function (view, groups) {
+        var sel = view.state.selection.main;
+        var menu = document.createElement("div");
+        menu.className = "cm-quickfix";
+        menu.setAttribute("role", "menu");
+        if (quickFixLabel) menu.setAttribute("aria-label", quickFixLabel);
+
+        // The menu's own removal from the DOM can fire `focusout` while the
+        // update that cleared the field is still running; only dispatch when
+        // the field still holds a menu.
+        var close = function () {
+          if (view.state.field(quickFixField, false) === null) return;
+          view.dispatch({ effects: quickFixEffect.of(null) });
+        };
+        groups.forEach(function (group) {
+          var groupEl = document.createElement("div");
+          groupEl.className = "cm-quickfix__group";
+          groupEl.setAttribute("role", "group");
+          groupEl.setAttribute("aria-label", group.message);
+          var label = document.createElement("div");
+          label.className = "cm-quickfix__label";
+          label.setAttribute("aria-hidden", "true");
+          label.textContent = group.message;
+          groupEl.appendChild(label);
+          group.actions.forEach(function (action) {
+            var item = document.createElement("button");
+            item.type = "button";
+            item.className = "cm-quickfix__item";
+            item.setAttribute("role", "menuitem");
+            item.setAttribute("tabindex", "-1");
+            item.textContent = action.name;
+            item.addEventListener("click", function () {
+              close();
+              action.apply(view, sel.from, sel.to);
+              view.focus();
+            });
+            groupEl.appendChild(item);
+          });
+          menu.appendChild(groupEl);
+        });
+
+        var items = function () {
+          return Array.prototype.slice.call(menu.querySelectorAll(".cm-quickfix__item"));
+        };
+        menu.addEventListener("keydown", function (event) {
+          var list = items();
+          var at = list.indexOf(document.activeElement);
+          var target = null;
+          if (event.key === "ArrowDown") target = list[(at + 1) % list.length];
+          else if (event.key === "ArrowUp") target = list[(at - 1 + list.length) % list.length];
+          else if (event.key === "Home") target = list[0];
+          else if (event.key === "End") target = list[list.length - 1];
+          else if (event.key === "Escape" || event.key === "Tab") {
+            event.preventDefault();
+            close();
+            view.focus();
+            return;
+          } else return;
+          event.preventDefault();
+          if (target) target.focus();
+        });
+        menu.addEventListener("focusout", function (event) {
+          if (event.relatedTarget && menu.contains(event.relatedTarget)) return;
+          close();
+        });
+
+        return {
+          dom: menu,
+          mount: function () {
+            var first = menu.querySelector(".cm-quickfix__item");
+            if (first) first.focus();
+          },
+        };
       };
+
+      var quickFixField = CM.StateField.define({
+        create: function () {
+          return null;
+        },
+        update: function (value, tr) {
+          for (var i = 0; i < tr.effects.length; i++) {
+            var effect = tr.effects[i];
+            if (!effect.is(quickFixEffect)) continue;
+            if (!effect.value) return null;
+            var groups = effect.value.groups;
+            return {
+              pos: effect.value.pos,
+              above: false,
+              arrow: false,
+              create: function (view) {
+                return buildQuickFixMenu(view, groups);
+              },
+            };
+          }
+          if (tr.docChanged || tr.selection) return null;
+          return value;
+        },
+        provide: function (f) {
+          return CM.showTooltip.from(f);
+        },
+      });
 
       var applyFixAtCursor = function (view) {
         var sel = view.state.selection.main;
-        var actions = [];
+        var diagnostics = [];
         CM.forEachDiagnostic(view.state, function (diagnostic, from, to) {
-          if (!diagnosticTouchesSelection(from, to, sel.from, sel.to)) return;
-          (diagnostic.actions || []).forEach(function (action) {
-            actions.push(action);
+          diagnostics.push({
+            from: from,
+            to: to,
+            message: diagnostic.message,
+            actions: diagnostic.actions,
           });
         });
-        if (actions.length === 1) {
-          actions[0].apply(view, sel.from, sel.to);
+        var groups = groupFixActions(diagnostics, sel.from, sel.to);
+        var total = groups.reduce(function (n, g) {
+          return n + g.actions.length;
+        }, 0);
+        if (total === 1) {
+          groups[0].actions[0].apply(view, sel.from, sel.to);
           return true;
         }
-        if (actions.length > 1) return CM.openLintPanel(view);
+        if (total > 1) {
+          view.dispatch({
+            effects: quickFixEffect.of({ pos: sel.head, groups: groups }),
+          });
+          return true;
+        }
         return false;
       };
 
@@ -1268,16 +1410,18 @@
         extensions: [
           CM.linter(vdLinter, { delay: 400 }),
           CM.lintGutter(),
+          quickFixField,
           // #821: Mod-. applies the single fix under the cursor, or
-          // opens the lint panel when more than one applies; `lintKeymap`
-          // rides along in the same extension, adding F8 (next diagnostic)
-          // and Ctrl-Shift-M (open panel). Added here, in `vd-editor.js`,
-          // not `code-editor.js`: no other editor in this crate has fixes
-          // to apply. Ordered ahead of `code-editor.js`'s own
-          // `keymap.of(...)` (built from its own `extensions` array, added
-          // after this one) so these bindings are checked first - moot
-          // today (none collide with `completionKeymap`/`defaultKeymap`),
-          // but keeps the intent explicit.
+          // opens the quick-fix menu at the cursor when more than one
+          // applies (#1757); `lintKeymap` rides along in the same extension,
+          // adding F8 (next diagnostic) and Ctrl-Shift-M (open panel).
+          // Added here, in `vd-editor.js`, not `code-editor.js`: no other
+          // editor in this crate has fixes to apply. Ordered ahead of
+          // `code-editor.js`'s own `keymap.of(...)` (built from its own
+          // `extensions` array, added after this one) so these bindings
+          // are checked first - moot today (none collide with
+          // `completionKeymap`/`defaultKeymap`), but keeps the intent
+          // explicit.
           CM.keymap.of([{ key: "Mod-.", run: applyFixAtCursor }].concat(CM.lintKeymap)),
           // #821 (axe `nested-interactive`, WCAG 4.1.2): the bottom lint
           // panel (`openLintPanel`) renders each diagnostic as `<li
@@ -1348,6 +1492,7 @@
         // editors (`sql-editor.js` never passes this option).
         completion: [vdCompletionSource],
         fold: true,
+        format: "json",
         wrapperClass: "vd-editor",
         id: "vd-editor",
       });
@@ -1361,12 +1506,16 @@
        * carrying `name="action"` with a different `value` rather than one
        * of them lacking the attribute - while the most recently *completed*
        * lint pass (`lastLintDiagnostics` above) still has at least one
-       * `error`-severity diagnostic pops a native `window.confirm` naming
-       * the count, plural-correct in the negotiated locale. Cancelling it
-       * keeps the page as it is and returns focus to the editor, the same
-       * shape as cancelling any other destructive confirm in this crate
-       * (`data-crud-delete`); accepting it lets the submit continue.
-       * Warnings alone, or no diagnostics yet, submit with no prompt.
+       * `error`-severity diagnostic asks first, through the shared in-page
+       * confirmation (`HfsConfirm`, #1667), naming the count, plural-correct
+       * in the negotiated locale. That answer comes back asynchronously, so
+       * the submit is always held (`preventDefault`) while it is asked.
+       * Cancelling keeps the page as it is and returns focus to the editor,
+       * the same shape as cancelling any other destructive confirm in this
+       * crate (`data-crud-delete`); accepting re-submits with the same
+       * submitter (so the `action` value still reaches the server) and lets
+       * that one submit through unasked. Warnings alone, or no diagnostics
+       * yet, submit with no prompt.
        */
       var isDuplicateSubmit = function (submitter) {
         return !!submitter && submitter.name === "action" && submitter.value === "duplicate";
@@ -1378,6 +1527,19 @@
           if (diagnostics[i].severity === "error") count++;
         }
         return count;
+      };
+
+      /* #1014: the guided form's validity chip (`editor-form-pane.html`,
+       * re-rendered by editor-form.js after every settled edit) carries the
+       * server's own error count - FHIR schema + required-binding findings
+       * the lint endpoint never reports. Missing chip or attribute (no
+       * editor-pair.js, a fragment without the pane) reads as 0. */
+      var chipErrorCount = function () {
+        if (!grid) return 0;
+        var chip = grid.querySelector(".editor-validity");
+        if (!chip || !chip.dataset || chip.dataset.errorCount == null) return 0;
+        var n = parseInt(chip.dataset.errorCount, 10);
+        return isNaN(n) || n < 0 ? 0 : n;
       };
 
       /* `data-msg-save-errors-one`/`-other` on `#vd-editor-grid` (Fluent
@@ -1394,20 +1556,36 @@
         if (!grid) return null;
         var template =
           errorCount === 1 ? grid.dataset.msgSaveErrorsOne : grid.dataset.msgSaveErrorsOther;
-        return template ? template.replace("{count}", String(errorCount)) : null;
+        return template ? template.replace("{count}", window.HfsNumber.format(errorCount)) : null;
       };
 
+      var confirmedSubmit = false;
       form.addEventListener("submit", function (event) {
+        if (confirmedSubmit) return;
         if (isDuplicateSubmit(event.submitter)) return;
-        var errorCount = errorCountFrom(lastLintDiagnostics);
+        var errorCount = Math.max(errorCountFrom(lastLintDiagnostics), chipErrorCount());
         if (errorCount === 0) return;
         var message = saveConfirmMessage(errorCount);
         if (!message) return;
-        if (!root.confirm(message)) {
-          event.preventDefault();
-          if (view) view.focus();
-          else textarea.focus();
-        }
+        event.preventDefault();
+        var submitter = event.submitter && event.submitter.form === form ? event.submitter : null;
+        root.HfsConfirm.ask(message).then(function (confirmed) {
+          if (!confirmed) {
+            if (view) view.focus();
+            else textarea.focus();
+            return;
+          }
+          /* `requestSubmit` dispatches `submit` synchronously, so the flag
+             covers exactly that one event — and is cleared even when
+             constraint validation stops the submit before it fires. */
+          confirmedSubmit = true;
+          try {
+            if (submitter) form.requestSubmit(submitter);
+            else form.requestSubmit();
+          } finally {
+            confirmedSubmit = false;
+          }
+        });
       });
     }
 
@@ -1419,6 +1597,22 @@
     // template) or a missing `editor-pair.js`/`editor-form.js` load leaves
     // the editor above exactly as it is and touches nothing else.
     if (EditorPair) EditorPair.mount({ textarea: textarea, view: view, grid: grid });
+
+    // #1240: `serialize(form)` alone covers this form's own `id` and `json`
+    // fields (compared in canonical form, so reindenting the JSON is not a
+    // change) — including the mutations a lint fix applies to the textarea,
+    // since those already dispatch `input`. The native Save submit suspends
+    // `beforeunload` on its own (the shared `document`-level `submit`
+    // listener in unsaved.js), so nothing else needs wiring here.
+    if (root.HfsUnsaved) {
+      root.HfsUnsaved.track({
+        root: grid || form,
+        checkOnExit: true,
+        form: form,
+        read: function () { return root.HfsUnsaved.withPending(root.HfsUnsaved.serialize(form), grid); },
+        cue: form.querySelector(".form-actions"),
+      });
+    }
   }
 
   return {
@@ -1436,6 +1630,9 @@
     stringContentRange: stringContentRange,
     escapeJsonStringContent: escapeJsonStringContent,
     removeKeyRange: removeKeyRange,
+    // #1757: the pure half of the Ctrl+. quick-fix menu.
+    diagnosticTouchesSelection: diagnosticTouchesSelection,
+    groupFixActions: groupFixActions,
     mount: mount,
   };
 });

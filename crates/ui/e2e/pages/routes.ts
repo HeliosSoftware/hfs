@@ -13,7 +13,6 @@ export const ROUTES = [
   "/ui/compartments",
   "/ui/search-parameters",
   "/ui/terminology",
-  "/ui/queries",
   "/ui/history",
   "/ui/search",
   "/ui/tenants",

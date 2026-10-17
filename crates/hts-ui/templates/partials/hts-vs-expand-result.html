@@ -49,8 +49,8 @@
     {% if let Some(requested) = r.ceiling_warning %}
     <p id="expand-ceiling-warning" class="notice notice--warn" role="status">
       <strong>{{ chrome.i18n.t("hts-vs-expand-ceiling-warning-title") }}</strong>
-      {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-warning-body", "requested", requested.to_string()) }}
-      {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-value", "ceiling", ceiling.to_string()) }}
+      {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-warning-body", "requested", *requested) }}
+      {{ chrome.i18n.t_arg("hts-vs-expand-ceiling-value", "ceiling", *ceiling) }}
     </p>
     {% endif %}
   {% endif %}
@@ -78,7 +78,7 @@
           <label class="field__label" for="expand-raise-threshold">{{ chrome.i18n.t("hts-vs-expand-raise-threshold") }}</label>
           <input class="field__input" id="expand-raise-threshold" name="threshold" type="number" min="1"
                  value="{% match view.threshold %}{% when Some(t) %}{{ t }}{% when None %}{% endmatch %}">
-          <span class="field__hint">{{ chrome.i18n.t_arg("hts-vs-expand-ceiling-note", "ceiling", ceiling.to_string()) }}</span>
+          <span class="field__hint">{{ chrome.i18n.t_arg("hts-vs-expand-ceiling-note", "ceiling", *ceiling) }}</span>
         </div>
         <input type="hidden" name="mode" value="{% if view.tree_mode %}tree{% else %}flat{% endif %}">
         <div class="form-actions">
@@ -159,19 +159,19 @@
 
         <div class="table-foot">
           {% if result.is_tree %}
-            <span>{{ chrome.i18n.t_arg("hts-vs-expand-tree-label", "count", result.total_leaves().to_string()) }}</span>
+            <span>{{ chrome.i18n.t_arg("hts-vs-expand-tree-label", "count", result.total_leaves()) }}</span>
             <span>{{ chrome.i18n.t("hts-vs-expand-tree-note") }}</span>
           {% else %}
             <span>
               {%- match result.total -%}
                 {%- when Some(t) -%}
-                  {{ chrome.i18n.t_arg("hts-vs-expand-total-label", "total", t.to_string()) }}
+                  {{ chrome.i18n.t_arg("hts-vs-expand-total-label", "total", *t) }}
                 {%- when None -%}
                   {{ chrome.i18n.t("hts-vs-expand-total-unknown") }}
               {%- endmatch -%}
               {%- match result.offset -%}
                 {%- when Some(o) -%}
-                  · {{ chrome.i18n.t_arg("hts-vs-expand-offset-label", "offset", o.to_string()) }}
+                  · {{ chrome.i18n.t_arg("hts-vs-expand-offset-label", "offset", *o) }}
                 {%- when None -%}
               {%- endmatch -%}
             </span>

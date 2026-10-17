@@ -41,6 +41,10 @@ pub(crate) struct VersionSnapshot {
     /// False when the fetch failed — the snapshot is then empty and the page
     /// says so instead of silently under-reporting.
     pub spec_loaded: bool,
+    /// The failed fetch was a `501`: the backend cannot list SearchParameter
+    /// at all, so the notice says that rather than blaming the credential
+    /// (#1821).
+    pub listing_unsupported: bool,
     /// Canonical URL → stored FHIR resource id, for the editor deep-links
     /// (#238). Only resources the server returned with an id appear here.
     pub resource_ids: std::collections::HashMap<String, String>,
@@ -97,7 +101,10 @@ async fn fetch_snapshot(
 ) -> VersionSnapshot {
     match source.fetch("SearchParameter", version, tenant).await {
         Ok(resources) => build_snapshot(version, resources, true),
-        Err(_) => build_snapshot(version, Vec::new(), false),
+        Err(error) => VersionSnapshot {
+            listing_unsupported: crate::conformance::is_not_implemented(&error),
+            ..build_snapshot(version, Vec::new(), false)
+        },
     }
 }
 
@@ -126,6 +133,7 @@ fn build_snapshot(
     VersionSnapshot {
         params,
         spec_loaded,
+        listing_unsupported: false,
         resource_ids,
     }
 }
@@ -148,7 +156,7 @@ impl SpQuery {
         self.version
             .as_deref()
             .and_then(version_from_str)
-            .unwrap_or_default()
+            .unwrap_or_else(FhirVersion::default_enabled)
     }
 
     /// Serializes the state to an href, with `page` and `sel` reset unless
@@ -365,6 +373,11 @@ pub(crate) struct SpView {
     pub pages: Vec<PageLink>,
     pub detail: Option<SpDetail>,
     pub spec_loaded: bool,
+    /// See [`VersionSnapshot::listing_unsupported`].
+    pub listing_unsupported: bool,
+    /// The fetch succeeded but the server holds no SearchParameter for this
+    /// version: the page says so instead of blaming the credential (#1838).
+    pub listing_empty: bool,
     /// Hidden inputs so the rail's search form round-trips the other filters
     /// (`base` is always present, empty for "All types" — see
     /// `SpQuery::href_with`'s doc).
@@ -383,6 +396,7 @@ pub(crate) fn build_view(
     snapshot: &VersionSnapshot,
     query: &SpQuery,
     stored_rail: &rail_state::RailState,
+    lang: &str,
 ) -> SpView {
     let params = &snapshot.params;
     let version = query.fhir_version();
@@ -433,7 +447,7 @@ pub(crate) fn build_view(
             *base_counts.entry(base.as_str()).or_default() += 1;
         }
     }
-    let needle = query.q.to_lowercase();
+    let needle = query.q.trim().to_lowercase();
     let rail: Vec<RailItem> = base_counts
         .iter()
         .filter(|(name, _)| needle.is_empty() || name.to_lowercase().contains(&needle))
@@ -464,11 +478,10 @@ pub(crate) fn build_view(
     };
 
     // The "Recently used" group, resolved against every base with at least
-    // one parameter — unfiltered by the search box's `needle`, since a
-    // recent must stay visible even while the box hides it from the
-    // scrollable list. Every surviving base is also a valid live entry, so
-    // `resolve_recents`'s snapshot fallback never triggers here: type rails
-    // never store one (only the SQL rails do).
+    // one parameter, then narrowed by the search box's `needle` exactly like
+    // the scrollable list (#1275). Every surviving base is also a valid live
+    // entry, so `resolve_recents`'s snapshot fallback never triggers here:
+    // type rails never store one (only the SQL rails do).
     let recent_live: HashMap<String, rail_state::LiveRailItem> = base_counts
         .iter()
         .map(|(name, count)| {
@@ -476,7 +489,7 @@ pub(crate) fn build_view(
             let item = rail_state::LiveRailItem {
                 label: name.clone(),
                 meta: None,
-                count: Some(count.to_string()),
+                count: Some(crate::grouped(*count as u64, lang)),
                 href: query.href_with(
                     Some(&name),
                     query.ptype.as_deref(),
@@ -490,7 +503,7 @@ pub(crate) fn build_view(
         })
         .collect();
     let recent_is_valid: &dyn Fn(&str) -> bool = &|id| recent_live.contains_key(id);
-    let recent = stored_rail.resolve_recents(
+    let mut recent = stored_rail.resolve_recents(
         &recent_live,
         |id| {
             query.href_with(
@@ -503,6 +516,7 @@ pub(crate) fn build_view(
         },
         Some(recent_is_valid),
     );
+    rail_state::retain_matching_recents(&mut recent, query.q.trim(), |_| false);
 
     // Facets are scoped to the current base type and show live counts.
     let in_base: Vec<&Arc<SearchParameterDefinition>> = params
@@ -734,6 +748,8 @@ pub(crate) fn build_view(
         pages,
         detail,
         spec_loaded: snapshot.spec_loaded,
+        listing_unsupported: snapshot.listing_unsupported,
+        listing_empty: snapshot.spec_loaded && snapshot.params.is_empty(),
         hidden_fields,
         recent,
         rail_page: rail_state::RailPage::SearchParameters.key(),
@@ -787,6 +803,16 @@ mod tests {
     /// group, no stored `base`).
     fn no_rail() -> rail_state::RailState {
         rail_state::RailState::default()
+    }
+
+    /// #2051: the UI offers exactly the FHIR releases this build's helios-fhir
+    /// carries -- the set the server's `$versions` reports. Feature unification
+    /// can switch a helios-fhir version on that this crate did not ask for
+    /// (helios-audit's R5/R6 enable R4B); this crate's features follow it
+    /// instead of a catch-all arm hiding it.
+    #[test]
+    fn enabled_versions_match_the_helios_fhir_build() {
+        assert_eq!(enabled_versions(), FhirVersion::enabled_versions().to_vec());
     }
 
     /// A source whose first fetch is empty and later fetches carry data, the
@@ -908,7 +934,7 @@ mod tests {
             sel: Some("http://example.org/SearchParameter/color".into()),
             ..SpQuery::default()
         };
-        let view = build_view(&snapshot, &query, &no_rail());
+        let view = build_view(&snapshot, &query, &no_rail(), "en");
         assert_eq!(
             view.detail.expect("selected").resource_id.as_deref(),
             Some("sp-1")
@@ -933,7 +959,7 @@ mod tests {
             base: Some("Patient".into()),
             ..SpQuery::default()
         };
-        let view = build_view(&snapshot, &query, &no_rail());
+        let view = build_view(&snapshot, &query, &no_rail(), "en");
 
         assert!(view.total < snapshot.params.len());
         assert!(view.total > 10, "Patient supports dozens of parameters");
@@ -957,6 +983,7 @@ mod tests {
                     ..SpQuery::default()
                 },
                 &no_rail(),
+                "en",
             );
             for row in &view.rows {
                 assert!(seen.insert(row.url.clone()), "row repeated: {}", row.url);
@@ -980,6 +1007,7 @@ mod tests {
                 ..SpQuery::default()
             },
             &no_rail(),
+            "en",
         );
         let detail = view.detail.expect("selected parameter resolves");
         assert_eq!(detail.url, first);
@@ -1002,9 +1030,10 @@ mod tests {
         let snapshot = VersionSnapshot {
             params: vec![Arc::new(spec), Arc::new(stored)],
             spec_loaded: true,
+            listing_unsupported: false,
             resource_ids: Default::default(),
         };
-        let view = build_view(&snapshot, &SpQuery::default(), &no_rail());
+        let view = build_view(&snapshot, &SpQuery::default(), &no_rail(), "en");
 
         let spec_row = view
             .rows
@@ -1033,10 +1062,65 @@ mod tests {
         let snapshot = VersionSnapshot {
             params: vec![Arc::new(one), Arc::new(two)],
             spec_loaded: true,
+            listing_unsupported: false,
             resource_ids: Default::default(),
         };
-        let view = build_view(&snapshot, &SpQuery::default(), &no_rail());
+        let view = build_view(&snapshot, &SpQuery::default(), &no_rail(), "en");
         assert!(view.rows.iter().all(|r| r.chips[0].kind == "conflict"));
+    }
+
+    /// A source whose fetch fails with the given error text.
+    struct FailingSource(&'static str);
+
+    #[async_trait::async_trait]
+    impl ConformanceSource for FailingSource {
+        async fn fetch(
+            &self,
+            _rt: &str,
+            _v: FhirVersion,
+            _t: &str,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            Err(self.0.to_string())
+        }
+    }
+
+    /// #1821: a `501` from the self-fetch marks the snapshot as a listing the
+    /// backend cannot serve, so the page names that cause; any other failure
+    /// (a `401`, a refused connection) keeps the credential wording.
+    #[tokio::test]
+    async fn a_501_fetch_is_told_apart_from_other_failures() {
+        let unsupported = SpCatalog::new(Arc::new(FailingSource(
+            "http://127.0.0.1:8080/SearchParameter?_count=10000 returned 501 Not Implemented",
+        )))
+        .snapshot("t", FhirVersion::default())
+        .await;
+        assert!(!unsupported.spec_loaded);
+        assert!(unsupported.listing_unsupported);
+
+        let unauthorized = SpCatalog::new(Arc::new(FailingSource(
+            "http://127.0.0.1:8080/SearchParameter?_count=10000 returned 401 Unauthorized",
+        )))
+        .snapshot("t", FhirVersion::default())
+        .await;
+        assert!(!unauthorized.spec_loaded);
+        assert!(!unauthorized.listing_unsupported);
+    }
+
+    /// #1838: a fetch that succeeds with no SearchParameter at all is not a
+    /// failure: the view flags it as an empty listing, not a degraded one.
+    #[test]
+    fn an_empty_successful_listing_is_flagged_as_empty() {
+        let empty = build_snapshot(FhirVersion::default(), Vec::new(), true);
+        let view = build_view(&empty, &SpQuery::default(), &no_rail(), "en");
+        assert!(view.spec_loaded);
+        assert!(view.listing_empty);
+
+        let failed = build_snapshot(FhirVersion::default(), Vec::new(), false);
+        let view = build_view(&failed, &SpQuery::default(), &no_rail(), "en");
+        assert!(
+            !view.listing_empty,
+            "a failed fetch keeps the degraded notice"
+        );
     }
 
     #[test]

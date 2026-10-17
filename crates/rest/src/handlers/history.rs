@@ -23,7 +23,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use helios_persistence::core::{
     HistoryEntry, HistoryMethod, HistoryParams, InstanceHistoryProvider, ResourceStorage,
-    SystemHistoryProvider, TypeHistoryProvider,
+    SearchProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -32,6 +32,7 @@ use tracing::{debug, warn};
 use crate::error::{RestError, RestResult};
 use crate::extractors::TenantExtractor;
 use crate::middleware::content_type::negotiate_format;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::state::AppState;
 
@@ -153,10 +154,8 @@ fn respond_with_bundle(
     format_param: Option<&str>,
 ) -> Response {
     let negotiated = negotiate_format(req_headers, format_param);
-    match format_resource_response(StatusCode::OK, HeaderMap::new(), bundle, negotiated.format) {
-        Ok(response) => response,
-        Err(response) => response,
-    }
+    format_resource_response(StatusCode::OK, HeaderMap::new(), bundle, negotiated.format)
+        .unwrap_or_else(|refusal| refusal.into_response())
 }
 
 /// Handler for instance history.
@@ -180,11 +179,12 @@ pub async fn history_instance_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     Query(params): Query<HistoryQuery>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + InstanceHistoryProvider + Send + Sync,
+    S: ResourceStorage + InstanceHistoryProvider + SearchProvider + Send + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -194,6 +194,35 @@ where
     );
 
     let history_params = build_history_params(&params, &state)?;
+
+    // A `patient/` scope sees the history of the launch patient's resources
+    // only (#1618): the resource must currently be in the compartment — a
+    // deleted or absent one has no payload to prove it with — and versions from
+    // before it joined are left out of the page below.
+    if compartment.is_confined() {
+        let current = match state
+            .storage()
+            .read(tenant.context(), &resource_type, &id)
+            .await
+        {
+            Ok(current) => current,
+            Err(helios_persistence::error::StorageError::Resource(
+                helios_persistence::error::ResourceError::Gone { .. },
+            )) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let Some(current) = current else {
+            return Err(compartment.outside_compartment(format!(
+                "history of {resource_type}/{id} is not available under a patient/ scope: the resource has no current version in the launch patient's compartment"
+            )));
+        };
+        compartment.assert_member(
+            || state.storage().search_param_registry(tenant.context()),
+            current.fhir_version(),
+            current.content(),
+            "history",
+        )?;
+    }
 
     let page = state
         .storage()
@@ -212,8 +241,27 @@ where
         return Err(RestError::NotFound { resource_type, id });
     }
 
-    let total = page.page_info.total.unwrap_or(page.items.len() as u64);
-    let bundle = build_history_bundle(&page.items, &state, &tenant, total);
+    // Under a confined grant, keep the versions that are in the compartment and
+    // the delete markers (no payload to judge); drop the rest (#1618).
+    let items: Vec<HistoryEntry> = if compartment.is_confined() {
+        let registry = state.storage().search_param_registry(tenant.context());
+        page.items
+            .iter()
+            .filter(|entry| {
+                entry.resource.is_deleted()
+                    || compartment.is_member(
+                        || registry.clone(),
+                        entry.resource.fhir_version(),
+                        entry.resource.content(),
+                    )
+            })
+            .cloned()
+            .collect()
+    } else {
+        page.items
+    };
+    let total = page.page_info.total.unwrap_or(items.len() as u64);
+    let bundle = build_history_bundle(&items, &state, &tenant, total);
 
     Ok(respond_with_bundle(
         &bundle,

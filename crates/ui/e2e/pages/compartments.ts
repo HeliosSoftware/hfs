@@ -1,6 +1,6 @@
 // CompartmentDefinition viewer + membership tester (/ui/compartments). The rail,
 // tabs, and tester are all link/GET-form based, so they work without JS.
-import type { Page, Locator } from "@playwright/test";
+import { expect, type Page, type Locator } from "@playwright/test";
 
 export class CompartmentsPage {
   constructor(readonly page: Page) {}
@@ -30,6 +30,22 @@ export class CompartmentsPage {
   }
   tab(label: RegExp | string): Locator {
     return this.page.locator("nav.tabs a.tab", { hasText: label });
+  }
+  /**
+   * Click a rail item or tab and wait until the swapped page marks it current.
+   * `networkidle` alone is not enough after a boosted click: when the page is
+   * already idle it can resolve before htmx's request starts, so the next
+   * step would still read the previous definition's controls.
+   */
+  async selectDefinition(code: string): Promise<void> {
+    await this.railItem(code).click();
+    await expect(this.railItem(code)).toHaveAttribute("aria-current", "true");
+    await this.page.waitForLoadState("networkidle");
+  }
+  async openTab(label: RegExp | string): Promise<void> {
+    await this.tab(label).click();
+    await expect(this.tab(label)).toHaveAttribute("aria-current", "true");
+    await this.page.waitForLoadState("networkidle");
   }
 
   // Tester form.

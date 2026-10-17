@@ -42,6 +42,17 @@
       }
     }
   ],
+  "dosageInstruction": {
+    "step": [
+      {
+        "component": [
+          {
+            "text": "Take one tablet daily as directed"
+          }
+        ]
+      }
+    ]
+  },
   "meta": {
     "tag": [
       {

@@ -46,9 +46,12 @@ mod conformance;
 mod editor;
 mod history;
 mod i18n;
+mod login;
 mod lookup;
+mod navigation;
 mod rail_state;
 mod search_params;
+mod sql_artifact_duplicate;
 mod sql_export;
 
 /// The bounded JSON-fragment engine behind the Raw CapabilityStatement fold
@@ -61,13 +64,20 @@ pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
+// Public but hidden: the coordinator's counters and view are what #1849's
+// integration tests and evidence harnesses observe.
+#[doc(hidden)]
+pub mod tenant_inventory;
 mod tenants;
 mod vd_complete;
 
+pub use login::{LoginRuntime, SignedIn, set_interactive_login};
+
 #[doc(hidden)]
 pub use conformance::{
-    Caller, ConformanceSource, RecordedExportCall, SqlExportParameter, SqlExportRequest,
-    SqlExportStatus, SqlExportSubject, StaticConformanceSource, sql_export_parameters_body,
+    Caller, ConformanceSource, RecordedExportCall, SqlExportFailure, SqlExportParameter,
+    SqlExportRequest, SqlExportStatus, SqlExportSubject, StaticConformanceSource,
+    sql_export_parameters_body,
 };
 
 /// The locale plumbing, re-exported out of the private `i18n` module.
@@ -92,17 +102,17 @@ use axum::{
     routing::get,
 };
 use axum_embed::ServeEmbed;
-use axum_htmx::{AutoVaryLayer, HxRequest};
+use axum_htmx::{AutoVaryLayer, HxHistoryRestoreRequest, HxRequest, HxTarget};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
-    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts,
-    SnapshotState, TypeCount,
+    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, Figures,
+    ReindexActivity, SnapshotState, TypeCount,
 };
 use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, RwLock, atomic::AtomicBool};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Static UI assets (htmx, CSS) embedded into the binary at compile time.
@@ -161,6 +171,10 @@ struct WebState {
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
     tenants: Option<Arc<dyn ResourceStorage>>,
+    /// The background tenant inventory over `tenants` (#1850): one
+    /// cross-tenant discovery cache and single-flight refresh per mounted
+    /// app. `None` exactly when `tenants` is.
+    tenant_inventory: Option<Arc<tenant_inventory::TenantInventory>>,
     /// Tenant provisioning jobs started from the tenants page (#581).
     provisioning: tenants::ProvisioningRegistry,
     /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
@@ -173,6 +187,10 @@ struct WebState {
     /// Trusted loopback base used for UI calls back into this HFS process.
     /// Unlike `public_base_url`, this never carries a reverse-proxy prefix.
     self_base_url: String,
+    /// Credential for the UI's self-calls that carry no caller identity
+    /// (the Import page's own kick-offs and polls, the Export workspace,
+    /// #1436/#1438): the same provider the conformance source uses.
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     /// Runtime capability cache. A standards-compliant 501 from Patient name
     /// search downgrades this process to exact-id lookup only.
     patient_name_search: Arc<AtomicBool>,
@@ -194,6 +212,30 @@ struct WebState {
     /// the tenant's operators. None when the backend has no store; the Bulk
     /// Import workspace then reports itself unavailable.
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    /// The server's post-commit write observer (#1078): tenant provisioning
+    /// seeds and purges started from the tenants page report to it, so the
+    /// dashboard's live figures follow them. `None` reports nothing.
+    write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
+    /// The interactive browser login (#1449), when the server installed one
+    /// with [`set_interactive_login`]. `None` means no login and no session
+    /// gate — the pre-#1449 behaviour.
+    login: Option<Arc<login::LoginRuntime>>,
+}
+
+impl WebState {
+    /// The tenant inventory, when it does not already hear this UI's purge
+    /// and deregistration events through the server's write-observer fan-out
+    /// (see the subscription in [`mount_with_conformance_source_and_runtime`]).
+    /// Handlers notify the inventory directly through this, so each event
+    /// reaches it exactly once.
+    fn unobserved_tenant_inventory(&self) -> Option<&Arc<tenant_inventory::TenantInventory>> {
+        let observed = self
+            .write_observer
+            .as_deref()
+            .and_then(|observer| observer.fan_out())
+            .is_some();
+        self.tenant_inventory.as_ref().filter(|_| !observed)
+    }
 }
 
 /// The settings keys holding the user's FHIR-version and tenant choices, and
@@ -257,6 +299,13 @@ pub(crate) struct RequestTenant {
     /// Whether this install has any tenant beyond the server default â€” the
     /// sidebar tenant picker only renders when it does (#544).
     pub(crate) multi: bool,
+    /// Who is signed in through the web UI's interactive login, when a
+    /// session gate is installed and this request carries a valid session
+    /// (#1449, #738). `None` on a server without the login, or for the
+    /// login-flow routes that run outside the gate. Carried here, next to the
+    /// tenant, because it is the same per-request rendering context the
+    /// topbar draws from.
+    pub(crate) signed_in: Option<helios_auth::SessionPrincipal>,
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -277,6 +326,7 @@ where
                 id: "default".to_string(),
                 display: None,
                 multi: false,
+                signed_in: None,
             }))
     }
 }
@@ -299,11 +349,18 @@ async fn resolve_prefs(
     }
 
     let user_key = settings_user_key(request.extensions().get::<helios_auth::Principal>());
+    // Stamped by the session gate (`login::require_session`), which runs
+    // before this middleware, when the request carries a valid session.
+    let signed_in = request
+        .extensions()
+        .get::<login::SignedIn>()
+        .map(|s| s.0.clone());
     let mut version = state.fhir_version;
     let mut tenant = RequestTenant {
         id: state.default_tenant.clone(),
         display: None,
         multi: false,
+        signed_in: signed_in.clone(),
     };
     // The single settings read every rail page's state (`rail_state::RequestSettings`,
     // stamped below) is built from too — reading it again per page would break
@@ -330,6 +387,7 @@ async fn resolve_prefs(
                 id: record.id,
                 display: record.display_name,
                 multi: false,
+                signed_in: signed_in.clone(),
             };
         }
     }
@@ -377,6 +435,57 @@ pub(crate) struct Status {
     /// The raw value is never exposed to templates unless it is a valid HTTP(S)
     /// base URL.
     terminology: TerminologyNavigation,
+    /// The signed-in user the topbar account menu shows (#738), from the
+    /// interactive login's session (#1449). `None` renders the signed-out,
+    /// local-operator shape.
+    user: Option<UserSummary>,
+    /// Authentication is on but no interactive login is installed (#1560):
+    /// every browser-originated FHIR call is refused, so the shell says so
+    /// once instead of each page failing with the API's 401 text.
+    bearer_only_auth: bool,
+}
+
+/// What the account menu shows for a signed-in user, derived once per request
+/// from the session's ID-token claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UserSummary {
+    /// Primary line: the IdP's `name`, else `preferred_username`, else
+    /// `email`, else the subject.
+    display: String,
+    /// Secondary line: the email when the IdP sent one, else the
+    /// `preferred_username` unless it is already the display name, else the
+    /// subject — something that still identifies the account when the name
+    /// is generic. Entra ID sends no `email` for a user without a mailbox, and
+    /// its `sub` is an opaque per-application value (#1874).
+    secondary: String,
+    /// One or two letters for the avatar when there is no photo: the first
+    /// letters of the first two words of the display name.
+    initials: String,
+    /// Avatar image URL, when the IdP sent a `picture` claim.
+    photo: Option<String>,
+}
+
+impl UserSummary {
+    fn from_session(principal: Option<&helios_auth::SessionPrincipal>) -> Option<Self> {
+        let principal = principal?;
+        let display = principal.display().to_string();
+        let secondary = principal
+            .email
+            .clone()
+            .or_else(|| {
+                principal
+                    .preferred_username
+                    .clone()
+                    .filter(|username| *username != display)
+            })
+            .unwrap_or_else(|| principal.subject.clone());
+        Some(Self {
+            initials: initials_of(&display),
+            display,
+            secondary,
+            photo: principal.picture.clone(),
+        })
+    }
 }
 
 enum TerminologyNavigation {
@@ -437,32 +546,35 @@ impl Status {
         self.show_tenant_picker
     }
 
-    /// The topbar avatar menu's identity (#725). `/ui` sits outside the auth
-    /// layer today (#320), so no request carries a signed-in principal — every
-    /// accessor returns the signed-out shape and the menu renders its
-    /// local-operator state. When the browser login flow lands, these become
-    /// the seam where the IdP's profile claims (#724) surface: display name,
-    /// secondary line (email or subject), initials, photo URL.
+    /// The topbar avatar menu's identity (#725, #738): the signed-in user's
+    /// profile claims from the interactive login's session (#1449) — display
+    /// name, secondary line (email or subject), initials, photo URL. Every
+    /// accessor returns the signed-out shape when no session is installed or
+    /// this request carries none, and the menu renders its local-operator
+    /// state exactly as before.
     pub(crate) fn user_display(&self) -> Option<&str> {
-        None
+        self.user.as_ref().map(|u| u.display.as_str())
     }
 
     pub(crate) fn user_secondary(&self) -> Option<&str> {
-        None
+        self.user.as_ref().map(|u| u.secondary.as_str())
     }
 
     pub(crate) fn user_initials(&self) -> Option<&str> {
-        None
+        self.user
+            .as_ref()
+            .map(|u| u.initials.as_str())
+            .filter(|s| !s.is_empty())
     }
 
     pub(crate) fn user_photo(&self) -> Option<&str> {
-        None
+        self.user.as_ref().and_then(|u| u.photo.as_deref())
     }
 
-    /// Whether the menu offers Sign out — requires an interactive session,
-    /// which does not exist yet (#320).
+    /// Whether the menu offers Sign out — only for an interactive session,
+    /// which `/ui/logout` ends (#1449).
     pub(crate) fn user_can_logout(&self) -> bool {
-        false
+        self.user.is_some()
     }
 
     /// The topbar account menu, rendered by `helios-ui-chrome` so HFS and HTS
@@ -605,6 +717,12 @@ struct ChartSeriesView {
     href: Option<String>,
     /// Whether this series holds the focus â€” picks the link's label.
     focused: bool,
+    /// The series has no storage history yet (#1603): `polyline` covers only
+    /// the buckets its counters recorded, drawn dashed, and `end_x`/`end_y`
+    /// mark its current point so a lone bucket is still visible.
+    partial: bool,
+    end_x: i64,
+    end_y: i64,
 }
 
 /// One row of the chart's tabular alternative: a bucket label and the
@@ -649,6 +767,9 @@ struct LegendEntry {
     color: usize,
     href: Option<String>,
     focused: bool,
+    /// The series' history is still loading (#1603): the entry says so next
+    /// to its total, which is a real figure.
+    partial: bool,
 }
 
 /// One option in the chart's type picker: a link that toggles the type in or
@@ -669,49 +790,228 @@ struct WindowEntry {
     active: bool,
 }
 
-/// Why the dashboard is showing something other than a complete live reading
-/// — and therefore which notice the page carries (#956).
+/// What the dashboard states about the figures it shows (#956, #1078): where
+/// they come from and how far they can be trusted. A render carries exactly
+/// one, as one notice line ([`dashboard_notice`]).
 ///
-/// The three degraded cases used to collapse into one "sample data" banner,
-/// which made a merely-slow window claim the build had no metrics at all and
-/// put invented clinical volumes on screen. They are distinct states with
-/// distinct pages.
+/// The degraded cases used to collapse into one "sample data" banner, which
+/// made a merely-slow window claim the build had no metrics at all and put
+/// invented clinical volumes on screen. They are distinct facts with distinct
+/// lines.
+///
+/// The line follows the snapshot state and its [`Figures`] one to one:
+///
+/// - [`SnapshotState::NoProvider`] — [`Self::Sample`].
+/// - [`SnapshotState::Pending`], or a [`SnapshotState::Ready`] with
+///   [`Figures::Pending`] — [`Self::Pending`]: no figure is known, so there is
+///   nothing to date.
+/// - [`Figures::Unsupported`] — [`Self::Unsupported`], undated.
+/// - [`Figures::Exact`] — [`Self::Live`], dated with its `read_at`.
+/// - [`Figures::Approximate`] — [`Self::Approximate`], dated with its
+///   `read_at`; [`Self::HistoryLoading`] instead when a charted series has
+///   no storage history yet (#1603).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DashboardNotice {
-    /// A complete live snapshot: nothing to say.
-    None,
-    /// A provider is registered but this window's snapshot is still being
-    /// computed. Nothing is charted and no headline figure is shown — waiting
-    /// is rendered as waiting.
+    /// Exact figures ([`Figures::Exact`]). Its line carries only the "as of"
+    /// time.
+    Live,
+    /// No figure is known yet: nothing is cached for the tenant, or the
+    /// provider is still seeding it ([`Figures::Pending`]). Nothing is charted
+    /// and no headline figure is shown — waiting is rendered as waiting.
     Pending,
-    /// A live snapshot in which some query failed and was filled in with a
-    /// zero or an empty series (see [`DashboardSnapshot::partial`]).
-    Partial,
+    /// Measured figures that are not an exact storage match
+    /// ([`Figures::Approximate`]).
+    Approximate,
+    /// Approximate, and at least one charted series has no storage history
+    /// behind it yet (#1603): its line shows only the writes recorded since
+    /// the counters' base was read, so the note says so. Same slug as
+    /// [`Self::Approximate`] — it is the same reading, said more precisely.
+    HistoryLoading,
     /// This build has no metrics provider at all, so the placeholder snapshot
     /// is rendered — and labelled as invented.
     Sample,
+    /// The storage backend cannot count resources ([`Figures::Unsupported`],
+    /// e.g. an S3 primary). A plain label, not a warning: nothing is broken or
+    /// late, the figures simply do not exist here — so no "as of", no retry and
+    /// no polling.
+    Unsupported,
 }
 
 impl DashboardNotice {
-    /// The i18n key of the notice line, or `None` when the page carries none.
+    /// The i18n key of the line's text, or `None` for [`Self::Live`], whose
+    /// line is only its "as of" time.
     fn key(self) -> Option<&'static str> {
         match self {
-            DashboardNotice::None => None,
+            DashboardNotice::Live => None,
             DashboardNotice::Pending => Some("chart-pending-note"),
-            DashboardNotice::Partial => Some("chart-partial-note"),
+            DashboardNotice::Approximate => Some("chart-approximate-note"),
+            DashboardNotice::HistoryLoading => Some("chart-approximate-history-note"),
             DashboardNotice::Sample => Some("chart-sample-note"),
+            DashboardNotice::Unsupported => Some("chart-counts-unsupported-note"),
         }
     }
 
-    /// Whether the page is waiting on a snapshot — the chart renders its
-    /// waiting state and the notice offers a retry.
-    fn is_pending(self) -> bool {
+    /// A stable hook for the line (`data-dash-notice`), independent of the
+    /// locale's wording.
+    fn slug(self) -> &'static str {
+        match self {
+            DashboardNotice::Live => "live",
+            DashboardNotice::Pending => "pending",
+            DashboardNotice::Approximate | DashboardNotice::HistoryLoading => "approximate",
+            DashboardNotice::Sample => "sample",
+            DashboardNotice::Unsupported => "unsupported",
+        }
+    }
+
+    /// Whether the line is a warning (`.notice--warn`) rather than a plain
+    /// label: something is missing or invented. Approximate and live figures
+    /// are real readings, so they are labelled, not flagged; a backend that
+    /// cannot count is a fact about the deployment, not a fault.
+    fn is_warning(self) -> bool {
+        !matches!(
+            self,
+            DashboardNotice::Live
+                | DashboardNotice::Approximate
+                | DashboardNotice::HistoryLoading
+                | DashboardNotice::Unsupported
+        )
+    }
+
+    /// Whether the page is still waiting for its figures — the chart area
+    /// renders its waiting state and the line offers a retry.
+    fn is_waiting(self) -> bool {
         matches!(self, DashboardNotice::Pending)
     }
 }
 
+/// When a snapshot's figures were read, rendered as a `<time>` (#1078).
+struct AsOf {
+    /// RFC 3339, for the `datetime` attribute.
+    datetime: String,
+    /// The visible fallback: `HH:MM:SS UTC` on the current UTC day, with the
+    /// date in front otherwise — UTC like the chart's own axis labels.
+    label: String,
+}
+
+impl AsOf {
+    fn new(read_at: DateTime<Utc>, now: DateTime<Utc>) -> Self {
+        let label = if read_at.date_naive() == now.date_naive() {
+            read_at.format("%H:%M:%S UTC")
+        } else {
+            read_at.format("%Y-%m-%d %H:%M:%S UTC")
+        };
+        AsOf {
+            datetime: read_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            label: label.to_string(),
+        }
+    }
+}
+
+/// The rendered notice line: the fact, and the "as of" time when the figures
+/// carry one.
+struct NoticeLine {
+    kind: DashboardNotice,
+    as_of: Option<AsOf>,
+}
+
+/// The notice line a dashboard render carries, following the mapping
+/// documented on [`DashboardNotice`].
+fn dashboard_notice(state: &SnapshotState, now: DateTime<Utc>) -> NoticeLine {
+    let (kind, read_at) = match state {
+        SnapshotState::NoProvider => (DashboardNotice::Sample, None),
+        SnapshotState::Pending => (DashboardNotice::Pending, None),
+        SnapshotState::Ready(snapshot) => {
+            let kind = match snapshot.figures {
+                Figures::Exact { .. } => DashboardNotice::Live,
+                Figures::Approximate { .. }
+                    if snapshot.series.iter().any(|s| s.recorded_from.is_some()) =>
+                {
+                    DashboardNotice::HistoryLoading
+                }
+                Figures::Approximate { .. } => DashboardNotice::Approximate,
+                Figures::Pending => DashboardNotice::Pending,
+                Figures::Unsupported => DashboardNotice::Unsupported,
+            };
+            (kind, snapshot.figures.read_at())
+        }
+    };
+    NoticeLine {
+        kind,
+        as_of: read_at.map(|read_at| AsOf::new(read_at, now)),
+    }
+}
+
+/// `data-dash-notice` slug of the rebuild line while a rebuild runs (#1065).
+const REBUILD_NOTICE: &str = "rebuilding";
+/// `data-dash-notice` slug of the rebuild line once the tenant's last rebuild
+/// left resources unindexed (#1125). Distinct from [`REBUILD_NOTICE`], so the
+/// switch from "rebuilding" to "failed" is announced rather than kept quiet.
+const REBUILD_FAILED_NOTICE: &str = "rebuild-failed";
+
+/// The rebuild line's `data-dash-notice` slug for `activity`.
+fn rebuild_notice(activity: &ReindexActivity) -> &'static str {
+    if activity.is_running() {
+        REBUILD_NOTICE
+    } else {
+        REBUILD_FAILED_NOTICE
+    }
+}
+
+/// The rebuild line's `data-rebuild-state`: `running` or `failed`.
+fn rebuild_state(activity: &ReindexActivity) -> &'static str {
+    if activity.is_running() {
+        "running"
+    } else {
+        "failed"
+    }
+}
+
+/// The rebuild line's sentence.
+///
+/// For a running rebuild (#1065): with its percentage once the rebuild has
+/// counted its resources, without one before, so it never shows a fabricated
+/// "0%". For a last rebuild that left resources unindexed (#1125): how many,
+/// when the job attributed its errors to resources, and the `$reindex-status`
+/// job that lists them — the job ending does not make them searchable.
+fn rebuild_text(i18n: &I18n, activity: &ReindexActivity) -> String {
+    match activity {
+        ReindexActivity::Running {
+            processed, total, ..
+        } => match activity.percent() {
+            Some(percent) => i18n.t_args(
+                "search-index-rebuilding",
+                &std::collections::BTreeMap::from([
+                    ("percent".to_string(), percent.to_string()),
+                    ("processed".to_string(), i18n.num(*processed)),
+                    ("total".to_string(), i18n.num(*total)),
+                ]),
+            ),
+            None => i18n.t("search-index-rebuilding-counting"),
+        },
+        ReindexActivity::Failed { job_id, errors: 0 } => i18n.t_args(
+            "search-index-rebuild-failed-job",
+            &std::collections::BTreeMap::from([("job".to_string(), job_id.clone())]),
+        ),
+        // `errors` goes in as a number so the catalog can select the plural
+        // form (#1125); `count` is the same figure grouped for the locale
+        // (11.704 in German).
+        ReindexActivity::Failed { job_id, errors } => i18n.t_arg3(
+            "search-index-rebuild-failed",
+            "errors",
+            *errors,
+            "count",
+            i18n.num(*errors),
+            "job",
+            job_id.clone(),
+        ),
+    }
+}
+
+/// The landing page. `dash_live` (`#dash-live`) and `chart_card`
+/// (`#dash-chart`) are also rendered alone, as the htmx fragments [`index`]
+/// answers a request targeting either region with.
 #[derive(Template)]
-#[template(path = "pages/index.html")]
+#[template(path = "pages/index.html", blocks = ["dash_live", "chart_card"])]
 struct IndexPage {
     status: Status,
     metrics: DashboardMetrics,
@@ -725,20 +1025,116 @@ struct IndexPage {
     all_types: bool,
     /// Link that flips the "View all resources" toggle.
     all_types_href: String,
-    /// Which degraded state, if any, this render is in — and so which notice
-    /// the page carries (#555, #956). Never silent.
-    notice: DashboardNotice,
+    /// What this render says about its figures — where they come from, and
+    /// when they were read (#555, #956, #1078). Never silent; see
+    /// [`DashboardNotice`].
+    notice: NoticeLine,
+    /// Whether the page renders its waiting state: no figure is known yet
+    /// (#1078).
+    chart_waiting: bool,
+    /// A search-index rebuild running for the tenant (#1065), or its last one
+    /// that left resources unindexed (#1125), rendered as a warning line
+    /// inside the live region so each refresh keeps it current.
+    rebuild: Option<ReindexActivity>,
+    /// Whether the storage backend cannot count at all
+    /// ([`Figures::Unsupported`]): the chart area says so
+    /// instead of waiting or charting, and nothing polls.
+    chart_unsupported: bool,
+    /// The i18n key naming why a figure renders as "—": still waiting, or not
+    /// available on this backend.
+    figures_unknown_key: &'static str,
     /// The same view, re-requested. Rendered as a "retry now" link in the
-    /// pending notice so the page is recoverable without JavaScript.
+    /// waiting notice so the page is recoverable without JavaScript.
     retry_href: String,
     /// [`Self::retry_href`] with one more attempt spent, or `None` once the
     /// budget is exhausted. Drives the htmx auto-refresh: the page polls a
     /// bounded number of times and then leaves the manual link, so a server
     /// already too busy to answer is not also asked to serve an endless poll.
     auto_retry_href: Option<String>,
+    /// The same view, re-requested periodically while its figures are still
+    /// moving: counted from recent writes and not yet reconciled, or an import
+    /// is running (#1078). `None` once they settle, which ends the poll.
+    /// Mutually exclusive with [`Self::auto_retry_href`]: that one waits for
+    /// figures that are not here yet, this one follows figures that are.
+    ///
+    /// Also the slow watch of a waiting page whose retry budget is spent
+    /// ([`Self::refresh_waiting`]), so it does not go dead.
+    refresh_href: Option<String>,
+    /// Whether [`Self::refresh_href`] is the slow watch of a page still
+    /// waiting for its figures (`data-dash-waiting`): its href keeps the spent
+    /// retry count, and every watch request carries it, so the server keeps
+    /// watching slowly instead of restarting the fast retries.
+    refresh_waiting: bool,
+    /// `tenant|FHIR version|locale` this render was made for
+    /// (`data-dash-ctx`). Every live-region request sends it back as `ctx`; a
+    /// request whose context no longer matches gets `HX-Refresh` instead of a
+    /// region from another tenant, version or language.
+    dash_ctx: String,
+    /// Seconds between two [`Self::refresh_href`] polls.
+    refresh_secs: u32,
+    /// Whether the figures are still moving — approximate, or an import is
+    /// running — which is what the fast poll follows; settled figures are only
+    /// watched (#1078).
+    refresh_moving: bool,
+    /// A digest of the figures this render shows (see [`dash_state`]). A
+    /// settled tick that sends it back as `state` while it still matches is
+    /// answered `204 No Content`, so nothing is swapped.
+    refresh_state: String,
+    /// Notice kinds (slugs) the requesting page already shows, sent by a
+    /// periodic refresh. Their lines render with `aria-live="off"`, so a
+    /// swap every few seconds does not re-announce an unchanged notice; a
+    /// notice whose kind changed is still announced.
+    quiet_notices: Vec<String>,
+    /// Whether the type picker (`#chart-pick`) renders open: the requesting
+    /// page had it open (`open=pick`), or the request is the picker's own.
+    pick_open: bool,
+    /// Whether the open picker also carries `hx-preserve`: a refresh keeps the
+    /// node the user is in as-is, while the picker's own request must replace
+    /// it so its checkboxes follow the new selection.
+    pick_preserve: bool,
+    /// Whether the data table (`#chart-table`) renders open (`open=table`).
+    table_open: bool,
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
+}
+
+impl IndexPage {
+    /// The rebuild line's wording (see [`rebuild_text`]).
+    fn rebuild_text(&self, activity: &ReindexActivity) -> String {
+        rebuild_text(&self.i18n, activity)
+    }
+
+    /// The rebuild line's `data-dash-notice` slug (see [`rebuild_notice`]).
+    fn rebuild_notice(&self, activity: &ReindexActivity) -> &'static str {
+        rebuild_notice(activity)
+    }
+
+    /// The rebuild line's `data-rebuild-state` (see [`rebuild_state`]).
+    fn rebuild_state(&self, activity: &ReindexActivity) -> &'static str {
+        rebuild_state(activity)
+    }
+
+    /// The rebuild line's `aria-live`: announced when it appears or changes
+    /// from running to failed, then quiet on the refreshes that only move its
+    /// percentage.
+    fn rebuild_aria_live(&self, activity: &ReindexActivity) -> &'static str {
+        let slug = rebuild_notice(activity);
+        if self.quiet_notices.iter().any(|seen| seen == slug) {
+            "off"
+        } else {
+            "polite"
+        }
+    }
+
+    /// The `aria-live` politeness of a notice line of `kind` (#1078).
+    fn notice_aria_live(&self, kind: &DashboardNotice) -> &'static str {
+        if self.quiet_notices.iter().any(|seen| seen == kind.slug()) {
+            "off"
+        } else {
+            "polite"
+        }
+    }
 }
 
 /// Search page (#255, Figma "Search V1.0"): natural language and the visual
@@ -758,16 +1154,15 @@ struct SearchPage {
     /// How-to page for the unconfigured state (docs live in the book).
     docs_url: &'static str,
     resource_types: Vec<String>,
-    /// The saved-query controls are the Saved Queries page's job, not this
-    /// page's (see `partials/search-builder.html`).
-    show_save: bool,
+    /// Whether the rail's counts are approximate (see [`RailCounts`]).
+    rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
     /// This request's resolved rail selection (`rail_state`): explicit
     /// `?type=` when given, else the stored `rails.search.last` when it still
     /// resolves, else `Patient`. Exposed as `data-selected-type` so
-    /// `saved-queries.js` never falls back to a hardcoded default on initial
+    /// `search-builder.js` never falls back to a hardcoded default on initial
     /// load or `popstate` — the same contract `ResourcesPage` already
     /// carries.
     selected_type: String,
@@ -775,7 +1170,7 @@ struct SearchPage {
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
+    /// carried to the client so `search-builder.js` never redeclares it.
     rail_page: &'static str,
     /// `rail_state::MAX_RECENT`, carried the same way.
     max_recent: usize,
@@ -803,9 +1198,12 @@ struct ResourcesPage {
     create_advertised_types: String,
     create_schema_types: String,
     create_metadata_available: bool,
-    /// The search-builder partial's save controls are the Saved Queries page's
-    /// job, not this one's.
-    show_save: bool,
+    /// A search-index rebuild running for the tenant (#1065), or its last one
+    /// that left resources unindexed (#1125): results may miss stored
+    /// resources, so the page head says so.
+    rebuild: Option<ReindexActivity>,
+    /// Whether the rail's counts are approximate (see [`RailCounts`]).
+    rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
@@ -813,13 +1211,25 @@ struct ResourcesPage {
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
+    /// carried to the client so `search-builder.js` never redeclares it.
     rail_page: &'static str,
     /// `rail_state::MAX_RECENT`, carried the same way.
     max_recent: usize,
     /// No-JS prefill for the builder's URL input (#605): `GET /{selected_type}`,
     /// so the form already shows the query the client JS runs on load.
     builder_url: Option<String>,
+}
+
+impl ResourcesPage {
+    /// The rebuild line's wording (see [`rebuild_text`]).
+    fn rebuild_text(&self, activity: &ReindexActivity) -> String {
+        rebuild_text(&self.i18n, activity)
+    }
+
+    /// The rebuild line's `data-rebuild-state` (see [`rebuild_state`]).
+    fn rebuild_state(&self, activity: &ReindexActivity) -> &'static str {
+        rebuild_state(activity)
+    }
 }
 
 /// Explains how to configure terminology navigation, or why the configured
@@ -832,39 +1242,6 @@ struct TerminologyPage {
     active_page: &'static str,
 }
 
-/// Saved FHIR queries page (#234). The shell is server-rendered; the list is
-/// hydrated client-side from `/_user/settings` by `assets/saved-queries.js`,
-/// the same per-user document (and fetch pattern) the theme toggle uses.
-#[derive(Template)]
-#[template(path = "pages/queries.html")]
-struct QueriesPage {
-    status: Status,
-    i18n: I18n,
-    active_page: &'static str,
-    /// The version's resource types for the picker rail, from the spec
-    /// CompartmentDefinitions already vendored for the compartment viewer.
-    resource_types: Vec<String>,
-    show_save: bool,
-    /// The type rail (#541), server-rendered from `resource_types` and the
-    /// dashboard snapshot's counts.
-    rail_entries: Vec<RailEntry>,
-    /// This request's resolved rail selection — see `SearchPage`'s field of
-    /// the same name.
-    selected_type: String,
-    /// The "Recently used" group's rows, server-rendered by
-    /// `partials/rail_recent.html`.
-    recent_entries: Vec<rail_state::ResolvedRailEntry>,
-    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
-    rail_page: &'static str,
-    /// `rail_state::MAX_RECENT`, carried the same way.
-    max_recent: usize,
-    /// No-JS prefill for the builder's URL input (see `ResourcesPage`'s field
-    /// of the same name); this page opens with no type context, so it is
-    /// always `None`.
-    builder_url: Option<String>,
-}
-
 /// SearchParameter viewer (#238). Read-only against the same snapshot the
 /// storage backends seed their registries from; the write half lands
 /// behind #235.
@@ -875,6 +1252,22 @@ struct SearchParametersPage {
     i18n: I18n,
     active_page: &'static str,
     view: search_params::SpView,
+    editor_return_to: String,
+}
+
+impl SearchParametersPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("SearchParameter", id, &self.editor_return_to)
+    }
+}
+
+fn conformance_editor_href(resource_type: &str, id: &str, origin: &str) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("type", resource_type);
+    if !id.is_empty() {
+        query.append_pair("id", id);
+    }
+    navigation::with_return(&format!("/ui/editor?{}", query.finish()), Some(origin))
 }
 
 /// Batch/Transaction workspace (#476): a static shell; batch.js does the rest.
@@ -884,6 +1277,11 @@ struct BatchPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// The server's request-body limit (`HFS_MAX_BODY_SIZE`, #1662): batch.js
+    /// refuses a bundle above it before uploading, since the server answers
+    /// such a request before reading it and the browser may only see the
+    /// connection drop.
+    max_body_size: usize,
 }
 
 /// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
@@ -892,8 +1290,6 @@ struct BatchPage {
 struct JsonViewFragment {
     i18n: I18n,
     json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
 }
 
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
@@ -906,6 +1302,13 @@ struct CompartmentsPage {
     i18n: I18n,
     active_page: &'static str,
     view: compartments::CmpView,
+    editor_return_to: String,
+}
+
+impl CompartmentsPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("CompartmentDefinition", id, &self.editor_return_to)
+    }
 }
 
 /// The compartments page when no definitions could be fetched (#320): the
@@ -916,6 +1319,11 @@ struct CompartmentsDegradedPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// The fetch failed with `501`: the backend cannot list the definitions
+    /// (#1821).
+    unsupported: bool,
+    /// The fetch succeeded with no definitions stored (#1838).
+    empty: bool,
 }
 
 #[derive(Template)]
@@ -934,7 +1342,7 @@ struct ParamOption {
     targets: String,
 }
 
-/// Parameter suggestions for the search builder (`/ui/queries/params`),
+/// Parameter suggestions for the search builder (`/ui/resources/params`),
 /// rendered from the same registry snapshot the SearchParameter viewer
 /// reads. An HTML fragment the page swaps per resource type â€” hypermedia,
 /// not a UI-facing JSON API.
@@ -1060,10 +1468,14 @@ pub fn mount_with_body_limit(
         false,
         bulk_provider,
         PatientNameSearchSupport::Enabled,
+        None,
     )
 }
 
 /// Mounts the UI with explicit tenant-path routing behavior.
+///
+/// `write_observer` is the server's post-commit write observer; the tenants
+/// page reports its conformance seeds and purges to it (#1078).
 #[allow(clippy::too_many_arguments)]
 pub fn mount_with_body_limit_and_tenant_routing(
     fhir_app: Router,
@@ -1082,10 +1494,11 @@ pub fn mount_with_body_limit_and_tenant_routing(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     patient_name_search: PatientNameSearchSupport,
+    write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url.clone(),
-        outbound_auth,
+        outbound_auth.clone(),
         fhir_version,
         data_dir.clone(),
     ));
@@ -1105,7 +1518,9 @@ pub fn mount_with_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         self_base_url,
+        outbound_auth,
         patient_name_search,
+        write_observer,
     )
 }
 
@@ -1217,7 +1632,9 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         public_base_url,
+        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
         PatientNameSearchSupport::Enabled,
+        None,
     )
 }
 
@@ -1240,7 +1657,9 @@ pub fn mount_with_conformance_source_and_runtime(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     patient_name_search: PatientNameSearchSupport,
+    write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
 ) -> Router {
     let nl_enabled = nl.enabled;
     let mut parsed_self_base = reqwest::Url::parse(&self_base_url)
@@ -1273,8 +1692,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui", get(index))
         // Resources workspace (#282): the type filter + search + edit modal.
         .route("/ui/resources", get(resources))
-        .route("/ui/queries", get(queries))
-        .route("/ui/queries/params", get(query_params_catalog))
+        .route("/ui/resources/params", get(resources_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/terminology", get(terminology_page))
         .route("/ui/compartments", get(compartments_page))
@@ -1289,7 +1707,17 @@ pub fn mount_with_conformance_source_and_runtime(
             axum::routing::post(capability_json_expand),
         )
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
-        .route("/ui/batch", get(batch_page))
+        .route(
+            "/ui/batch",
+            get(
+                move |state: State<WebState>,
+                      locale: RequestLocale,
+                      rv: RequestVersion,
+                      rt: RequestTenant| {
+                    batch_page(state, locale, rv, rt, max_body_size)
+                },
+            ),
+        )
         // SQL on FHIR workspaces (#649).
         .route(
             "/ui/sql/view-definitions",
@@ -1420,6 +1848,11 @@ pub fn mount_with_conformance_source_and_runtime(
         )
         .route("/ui/bulk-export/new", get(bulk_export::page))
         .route("/ui/bulk-export/active", get(bulk_export::active_redirect))
+        .route("/ui/bulk-export/active/{id}", get(bulk_export::detail_page))
+        .route(
+            "/ui/bulk-export/active/{id}/detail",
+            get(bulk_export::detail_fragment),
+        )
         .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
         .route(
             "/ui/bulk-export/active/{id}/cancel",
@@ -1428,6 +1861,10 @@ pub fn mount_with_conformance_source_and_runtime(
         .route(
             "/ui/bulk-export/active/{id}/retry",
             axum::routing::post(bulk_export::retry),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/rerun",
+            axum::routing::post(bulk_export::rerun),
         )
         .route(
             "/ui/bulk-export/active/{id}/delete",
@@ -1450,6 +1887,10 @@ pub fn mount_with_conformance_source_and_runtime(
             get(bulk_import::empty_manifest),
         )
         .route("/ui/bulk-import/keys", get(bulk_import::keys))
+        .route(
+            "/ui/bulk-import/rebuild",
+            get(bulk_import::rebuild_fragment),
+        )
         .route("/ui/bulk-import/{id}", get(bulk_import::detail))
         .route(
             "/ui/bulk-import/{id}/status",
@@ -1479,10 +1920,31 @@ pub fn mount_with_conformance_source_and_runtime(
         // The tenant selector (#344): lazily-loaded options and the persisted
         // choice, mirroring /ui/version.
         .route("/ui/tenant/options", get(tenant_options))
-        .route("/ui/tenant", axum::routing::post(set_tenant));
+        .route("/ui/tenant", axum::routing::post(set_tenant))
+        // Interactive browser login (#1449): Authorization Code + PKCE against
+        // the configured IdP, a server-side session, and RP-initiated logout.
+        // Answer 404 until a login is installed (see `login::installed`).
+        .route("/ui/login", get(login::login))
+        .route("/ui/callback", get(login::callback))
+        .route("/ui/logout", axum::routing::post(login::logout));
 
     if nl_enabled {
         router = router.route("/ui/search", get(search));
+    }
+
+    // One inventory per mounted app, never process-global (#1850). It also
+    // follows purges and deregistrations made outside this UI (the
+    // `/admin/tenants` API) when the server's observer is its fan-out; the
+    // subscription holds the inventory weakly, and the fan-out drops it on a
+    // later subscription once this app is torn down.
+    let tenant_inventory = tenants
+        .clone()
+        .map(tenant_inventory::TenantInventory::over_storage);
+    if let (Some(inventory), Some(fan_out)) = (
+        tenant_inventory.as_ref(),
+        write_observer.as_deref().and_then(|o| o.fan_out()),
+    ) {
+        fan_out.subscribe(inventory.observer());
     }
 
     let state = WebState {
@@ -1492,24 +1954,35 @@ pub fn mount_with_conformance_source_and_runtime(
         conformance: source,
         nl: Arc::new(nl),
         tenants,
+        tenant_inventory,
         provisioning: Default::default(),
         settings,
         bulk_provider,
+        write_observer,
         data_dir,
         fhir_version,
         default_tenant,
         terminology,
         public_base_url,
         self_base_url,
+        outbound_auth,
         patient_name_search: Arc::new(AtomicBool::new(matches!(
             patient_name_search,
             PatientNameSearchSupport::Enabled
         ))),
         tenant_path_routing,
+        login: login::installed(),
     };
 
     router
+        .route("/ui/{*rest}", axum::routing::any(ui_not_found))
         .merge(assets)
+        // With authentication on and no browser sign-in installed, nothing a
+        // browser sends can be authenticated, so the handlers that reach the
+        // tenant registry and the bulk-submit store directly refuse rather
+        // than act for an anonymous caller (#1619). Inside the locale layer
+        // so the refusal is worded in the request's language.
+        .layer(middleware::from_fn(refuse_anonymous_storage_access))
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
@@ -1519,12 +1992,144 @@ pub fn mount_with_conformance_source_and_runtime(
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
+        // Every self-call a page makes on the user's behalf carries the
+        // browser's credential, else the signed-in session's bearer, ahead
+        // of the outbound service credential (#1671).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            scope_request_authorization,
+        ))
+        // Outermost of the UI layers so it runs first: with a login installed
+        // it stamps the signed-in Principal that `resolve_prefs` keys the
+        // per-user settings on, or turns the request away to `/ui/login`
+        // (#1449). Without one it is a no-op.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            login::require_session,
+        ))
         .with_state(state)
         // Registered after the UI layers so neither arm of `/` picks them up:
         // the redirect needs none, and `POST /` (FHIR batch) must reach the
         // fallback with the same middleware stack as every other FHIR route.
-        .route("/", get(root_redirect).fallback_service(fhir_app.clone()))
-        .fallback_service(fhir_app)
+        .route(
+            "/",
+            get({
+                let fhir_app = fhir_app.clone();
+                move |request: axum::extract::Request| root_get(fhir_app.clone(), request)
+            })
+            .fallback_service(fhir_app.clone()),
+        )
+        .fallback(move |request: axum::extract::Request| {
+            let fhir_app = fhir_app.clone();
+            async move {
+                if let Some(location) = lowercase_ui_prefix(request.uri()) {
+                    return axum::response::Redirect::permanent(&location).into_response();
+                }
+                match tower::ServiceExt::oneshot(fhir_app, request).await {
+                    Ok(response) => response,
+                    Err(never) => match never {},
+                }
+            }
+        })
+}
+
+/// Any `/ui/…` path no UI route matches (#1673): the not-found page inside
+/// the shell, never the FHIR API's answer for an unknown resource type.
+async fn ui_not_found(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    let i18n = I18n::new(locale);
+    render_not_found(
+        current_status(&state, rv.0, &rt),
+        i18n,
+        "",
+        "/ui",
+        i18n.t("nav-home"),
+    )
+}
+
+/// The same address with its `/ui` prefix lowercased, when the request wrote
+/// that prefix in another case (`/UI/nope`, `/Ui`); `None` for every other
+/// path, including a correctly cased `/ui…` one (#1673).
+fn lowercase_ui_prefix(uri: &axum::http::Uri) -> Option<String> {
+    let path = uri.path();
+    let prefix = path.get(..3)?;
+    let at_boundary = path.len() == 3 || path.as_bytes()[3] == b'/';
+    if !at_boundary || prefix == "/ui" || !prefix.eq_ignore_ascii_case("/ui") {
+        return None;
+    }
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Some(format!("/ui{}{query}", &path[3..]))
+}
+
+/// Middleware (#1671): runs the rest of the request with its own credential
+/// in scope for every self-call — the browser's `Authorization`, else the
+/// signed-in session's bearer — so a page never depends on the outbound
+/// service token while its user has a valid session. Assets make no
+/// self-calls and skip the session lookup.
+async fn scope_request_authorization(
+    State(state): State<WebState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if request.uri().path().starts_with("/ui/assets/") {
+        return next.run(request).await;
+    }
+    let authorization = login::caller_for(&state, request.headers(), "")
+        .await
+        .authorization;
+    conformance::with_request_authorization(authorization, next.run(request)).await
+}
+
+/// The UI routes whose handlers act on storage themselves — the tenant
+/// registry and the bulk-submit store — rather than through the FHIR API.
+/// The API-backed pages carry the browser's credential on their self-call and
+/// so already answer `401` without one; these would act with none.
+fn acts_on_storage_directly(path: &str) -> bool {
+    path == "/ui/tenants"
+        || path.starts_with("/ui/tenants/")
+        || path == "/ui/tenant"
+        || path.starts_with("/ui/tenant/")
+        || path == "/ui/bulk-import"
+        || path.starts_with("/ui/bulk-import/")
+}
+
+/// Middleware (#1619): in the bearer-only posture — authentication enabled,
+/// no interactive login installed, so no session principal can ever be
+/// stamped — a request for a route that acts on storage directly is refused
+/// with `401` and the same notice the shell shows. With a login installed
+/// `require_session` gates every page instead, and with authentication off
+/// there is nothing to refuse.
+async fn refuse_anonymous_storage_access(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if bearer_only_auth()
+        && acts_on_storage_directly(request.uri().path())
+        && request
+            .extensions()
+            .get::<helios_auth::SessionPrincipal>()
+            .is_none()
+    {
+        let locale = request
+            .extensions()
+            .get::<RequestLocale>()
+            .copied()
+            .unwrap_or_default();
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            I18n::new(locale).t("auth-bearer-only"),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Redirects the bare root to the UI home (#896), mirroring HTS. Registered
@@ -1533,8 +2138,21 @@ pub fn mount_with_conformance_source_and_runtime(
 /// layer — an unauthenticated browser lands on `/ui` instead of a 401.
 /// Temporary (307) rather than HTS's 308: `/` is also the FHIR batch
 /// endpoint, and a permanent redirect gets cached hard by browsers.
-async fn root_redirect() -> axum::response::Redirect {
-    axum::response::Redirect::temporary("/ui")
+///
+/// Only the *bare* root is a browser landing. `GET /?_type=Patient` is a FHIR
+/// request — system-level search — and goes to the FHIR router like every
+/// other FHIR path, so a client gets that router's answer (today a `501`
+/// OperationOutcome, #1338) rather than a redirect to an HTML page.
+async fn root_get(fhir_app: Router, request: axum::extract::Request) -> Response {
+    use tower::ServiceExt;
+
+    if request.uri().query().is_some_and(|query| !query.is_empty()) {
+        return match fhir_app.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+    }
+    axum::response::Redirect::temporary("/ui").into_response()
 }
 
 /// Form body for `POST /ui/version` â€” the sidebar selector's submit.
@@ -1730,13 +2348,76 @@ async fn revalidate_assets(request: axum::extract::Request, next: middleware::Ne
 /// the picker offers every resource type of the active FHIR version, not just
 /// the ones the tenant stores, and a type with no data can be charted as a
 /// flat zero line.
+///
+/// With htmx the page answers its two live regions (#1078) by `HX-Target`:
+///
+/// - `dash-live` (the bounded retry, slow watch or periodic refresh) gets
+///   only the `#dash-live` fragment. When that request sends `state` equal to
+///   the fresh render's [`dash_state`] digest and the figures are settled —
+///   polled, neither moving nor a waiting page's slow watch — the answer is
+///   `204 No Content` and htmx swaps nothing. `open=pick,table` names what
+///   the page has open; the fragment renders the picker `open hx-preserve`
+///   and the table `open` to match.
+/// - `dash-chart` (a type-picker option, #555/#599) gets only the chart card,
+///   picker open, with `HX-Push-Url` set to the selection's own link — never
+///   carrying `ctx`, `open`, `state`, `notices` or `retry`.
+///
+/// Anything else — a plain navigation, a history restore, another target —
+/// gets the whole page, so every link works without JavaScript.
+///
+/// Every request either region makes carries `ctx` (see [`dash_ctx`]). When
+/// it no longer matches the tenant, FHIR version and locale this request
+/// resolves to — switched in another tab — the answer is an empty `200` with
+/// `HX-Refresh: true`, so htmx reloads the whole page (sidebar, selector and
+/// figures together) instead of swapping one context's region into another's
+/// page. A request without `ctx` renders as usual.
+#[allow(clippy::too_many_arguments)]
 async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    HxRequest(is_htmx): HxRequest,
+    HxTarget(hx_target): HxTarget,
+    HxHistoryRestoreRequest(history_restore): HxHistoryRestoreRequest,
     RawQuery(query): RawQuery,
+    settings: rail_state::RequestSettings,
 ) -> Response {
+    if is_htmx
+        && let Some(sent) = query.as_deref().and_then(|q| {
+            form_urlencoded::parse(q.as_bytes())
+                .find(|(key, _)| key == "ctx")
+                .map(|(_, value)| value.into_owned())
+        })
+        && sent != dash_ctx(&rt, rv.0, locale)
+    {
+        return (
+            StatusCode::OK,
+            [(axum::http::HeaderName::from_static("hx-refresh"), "true")],
+        )
+            .into_response();
+    }
+    // Which block of the page this request asks for. A history restore
+    // always rebuilds the whole page, whatever element it names.
+    let region = match hx_target.as_deref() {
+        _ if !is_htmx || history_restore => DashRegion::Page,
+        Some("dash-live") => DashRegion::Live,
+        Some("dash-chart") => DashRegion::Chart,
+        _ => DashRegion::Page,
+    };
+    // Does this request carry an explicit chart selection, or is it a bare
+    // navigation to Home? Any of `types`/`type`/`window`/`all` being present
+    // marks an explicit selection (a picker click's `dash_href` always carries
+    // `types` and `window`). When none are present — the sidebar/brand `/ui`
+    // links, or a session's first visit — restore the last stored selection
+    // instead of the provider default (#1358). An explicit selection is
+    // persisted below; a restore is not, so returning to Home is idempotent.
+    let has_selection_param = query_value(query.as_deref(), "types").is_some()
+        || query_value(query.as_deref(), "type").is_some()
+        || query_value(query.as_deref(), "window").is_some()
+        || query_value(query.as_deref(), "all").is_some();
+    let stored = (!has_selection_param).then(|| settings.dashboard(&rt.id));
+
     let types: Vec<String> = query_value(query.as_deref(), "types")
         .or_else(|| query_value(query.as_deref(), "type"))
         .map(|csv| {
@@ -1746,10 +2427,19 @@ async fn index(
                 .map(str::to_string)
                 .collect()
         })
+        .or_else(|| stored.as_ref().map(|s| s.types.clone()))
         .unwrap_or_default();
     let window = query_value(query.as_deref(), "window")
         .and_then(|slug| DashboardWindow::from_slug(&slug))
+        .or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|s| s.window.as_deref())
+                .and_then(DashboardWindow::from_slug)
+        })
         .unwrap_or_default();
+    // "View all resources" is not restored from storage (see DashboardSelection):
+    // it is a transient exploration mode, off unless this request asks for it.
     let all_types = query_value(query.as_deref(), "all").as_deref() == Some("1");
     // The full type list is only fetched when offered â€” the common,
     // flag-off case pays nothing extra for it.
@@ -1769,16 +2459,100 @@ async fn index(
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0)
         .min(DASH_PENDING_RETRIES);
-    render(
-        build_index_page(
-            &state, locale, types, window, all_types, spec_types, focus, retry, rv.0, &rt,
-        )
-        .await,
+    // `?notices=a,b` names the notice kinds a periodically refreshing page
+    // already shows (#1078), so the swap stays quiet for the ones unchanged.
+    let quiet_notices: Vec<String> = query_value(query.as_deref(), "notices")
+        .map(|csv| {
+            csv.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // `?open=pick,table`: what a refreshing page has open, kept open by the
+    // render instead of by the client. Unknown tokens are ignored.
+    let open = query_value(query.as_deref(), "open").unwrap_or_default();
+    let open = |token: &str| open.split(',').any(|t| t.trim() == token);
+    // `?state=<digest>`: the figures the refreshing page shows. Anything that
+    // is not a plausible digest is ignored rather than compared.
+    let sent_state = query_value(query.as_deref(), "state")
+        .filter(|s| !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_hexdigit()));
+    // Persist an explicit selection so it survives navigation back to Home
+    // (#1358). Only for an explicit pick — the chart-card picker request and a
+    // no-JS full-page selection — never the `dash-live` polling refresh (which
+    // would write on every tick) nor a bare `/ui` visit (`has_selection_param`
+    // is false there, so the restore path ran instead). Best-effort, so it
+    // never delays or fails the render.
+    if has_selection_param && !matches!(region, DashRegion::Live) {
+        let selection = rail_state::DashboardSelection {
+            types: types.clone(),
+            window: Some(window.as_str().to_string()),
+        };
+        rail_state::persist_dashboard(&state.settings, &settings.user_key, &rt.id, &selection)
+            .await;
+    }
+    // The selection's own link, pushed by a picker request.
+    let canonical_href = dash_href(&types, window, all_types, focus.as_deref());
+    let mut page = build_index_page(
+        &state,
+        locale,
+        types,
+        window,
+        all_types,
+        spec_types,
+        focus,
+        retry,
+        rv.0,
+        &rt,
+        dashboard_refresh(),
     )
+    .await;
+    page.quiet_notices = quiet_notices;
+    page.table_open = open("table");
+    match region {
+        DashRegion::Page => {
+            page.pick_open = open("pick");
+            page.pick_preserve = page.pick_open;
+            render(page)
+        }
+        DashRegion::Live => {
+            let unchanged = sent_state.as_deref() == Some(page.refresh_state.as_str())
+                && page.refresh_href.is_some()
+                && !page.refresh_moving
+                && !page.refresh_waiting;
+            if unchanged {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            page.pick_open = open("pick");
+            page.pick_preserve = page.pick_open;
+            render(page.as_dash_live())
+        }
+        DashRegion::Chart => {
+            page.pick_open = true;
+            let mut response = render(page.as_chart_card());
+            if let Ok(value) = axum::http::HeaderValue::from_str(&canonical_href) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::HeaderName::from_static("hx-push-url"), value);
+            }
+            response
+        }
+    }
 }
 
-/// One resource-type rail item â€” the primitive Resources, Search, and Saved
-/// Queries share for their type picker (#541): a real link the server marks
+/// The part of the landing page a request asks for (see [`index`]).
+enum DashRegion {
+    /// The whole page, layout included.
+    Page,
+    /// The `#dash-live` region alone (`HX-Target: dash-live`).
+    Live,
+    /// The chart card alone (`HX-Target: dash-chart`).
+    Chart,
+}
+
+/// One resource-type rail item â€” the primitive Resources and Search
+/// share for their type picker (#541): a real link the server marks
 /// current, with an optional instance count. `count` is `None` when no
 /// dashboard provider is registered; the partial then omits the whole count
 /// span rather than mixing real counts with blanks.
@@ -1789,19 +2563,21 @@ struct RailEntry {
     current: bool,
 }
 
-/// Builds the shared type-rail entries for Resources, Search, and Saved
-/// Queries: one entry per resource type, linking back to `base` with
+/// Builds the shared type-rail entries for Resources and Search:
+/// one entry per resource type, linking back to `base` with
 /// `?type=<name>`, marked `current` against `selected`. `available` is the
 /// dashboard snapshot's per-type totals (`None` when no provider answered â€”
 /// every entry then gets `count: None`, never a fabricated zero).
 fn build_rail_entries(
     base: &str,
     resource_types: &[String],
-    available: Option<&[TypeCount]>,
+    available: Option<RailCounts<'_>>,
     selected: Option<&str>,
+    lang: &str,
 ) -> Vec<RailEntry> {
     let counts: Option<std::collections::HashMap<&str, u64>> = available.map(|types| {
         types
+            .available
             .iter()
             .map(|t| (t.resource_type.as_str(), t.total))
             .collect()
@@ -1813,13 +2589,44 @@ fn build_rail_entries(
             href: format!("{base}?type={name}"),
             count: counts
                 .as_ref()
-                .map(|by_name| by_name.get(name.as_str()).copied().unwrap_or(0).to_string()),
+                .map(|by_name| grouped(by_name.get(name.as_str()).copied().unwrap_or(0), lang)),
             current: selected == Some(name.as_str()),
         })
         .collect()
 }
 
-/// For a type rail (Resources, Search, Saved Queries): the stored `last`
+/// The rail's per-type counts from a live snapshot — but only when the snapshot
+/// carries figures ([`Figures::is_known`], #1078). A snapshot whose tenant is
+/// still being seeded, or from a backend that cannot count at all, has an empty
+/// `available` that is not "every type is empty"; trusting it would render
+/// every type as a fabricated `0`, which reads as "the server lost my data"
+/// rather than "counts are momentarily unavailable" (#1065). Returning `None`
+/// makes [`build_rail_entries`] show no count at all instead.
+fn rail_counts(live: &Option<DashboardSnapshot>) -> Option<RailCounts<'_>> {
+    live.as_ref()
+        .filter(|s| s.figures.is_known())
+        .map(|s| RailCounts {
+            available: s.available.as_slice(),
+            approximate: s.figures.is_approximate(),
+        })
+}
+
+/// The per-type counts a type rail may show, from [`rail_counts`].
+#[derive(Clone, Copy)]
+struct RailCounts<'a> {
+    available: &'a [TypeCount],
+    /// Measured but not an exact storage match ([`Figures::Approximate`]):
+    /// each count renders with "≈" and says so (#1078).
+    approximate: bool,
+}
+
+/// Whether the rail's counts are approximate — the page-level flag the rail
+/// partials read, since the "Recently used" rows carry the same counts.
+fn rail_counts_approximate(counts: Option<RailCounts<'_>>) -> bool {
+    counts.is_some_and(|c| c.approximate)
+}
+
+/// For a type rail (Resources, Search): the stored `last`
 /// when it still names one of `resource_types`, else `fallback`. Only
 /// consulted when the request carried no explicit selection at all — an
 /// explicit one always wins outright, valid or not (see
@@ -1937,6 +2744,66 @@ async fn prune_stale_selection(
     }
 }
 
+/// Existence sweep for a SQL rail's "Recently used" group (#1014): every
+/// recent id absent from `live_ids` (this render's own page, plus the id
+/// resolved as the current selection) is checked against the server;
+/// `404`/`410` prune it, anything else keeps it. Persists once, only when
+/// something was pruned. At most `MAX_RECENT` lookups, sequential.
+#[allow(clippy::too_many_arguments)]
+async fn prune_gone_recents(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    version: helios_fhir::FhirVersion,
+    page: rail_state::RailPage,
+    resource_type: &str,
+    rail: rail_state::RailState,
+    live_ids: &std::collections::HashSet<String>,
+) -> rail_state::RailState {
+    let candidates = rail
+        .recent
+        .iter()
+        .filter(|entry| !live_ids.contains(&entry.id))
+        .map(|entry| entry.id.clone())
+        .collect();
+    let verdicts =
+        resource_existence_verdicts(state, tenant, version, resource_type, candidates).await;
+    match rail.prune_gone(&verdicts) {
+        Some(next) => {
+            rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
+            next
+        }
+        None => rail,
+    }
+}
+
+/// Check only explicit candidates, once per ID. Search results are not an
+/// existence verdict: only the source's definitive absence permits pruning.
+async fn resource_existence_verdicts(
+    state: &WebState,
+    tenant: &str,
+    version: helios_fhir::FhirVersion,
+    resource_type: &str,
+    candidates: Vec<String>,
+) -> Vec<(String, Result<bool, String>)> {
+    let mut checked = std::collections::HashSet::new();
+    let mut verdicts = Vec::new();
+    for id in candidates {
+        if !checked.insert(id.clone()) {
+            continue;
+        }
+        let verdict = state
+            .conformance
+            .resource_exists(resource_type, &id, version, tenant)
+            .await;
+        if let Err(error) = &verdict {
+            tracing::debug!("existence check failed for {resource_type}/{id}: {error}");
+        }
+        verdicts.push((id, verdict));
+    }
+    verdicts
+}
+
 /// Search page: natural language and the visual builder over one editable query.
 async fn search(
     State(state): State<WebState>,
@@ -1964,11 +2831,13 @@ async fn search(
     let live =
         helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
             .await;
+    let counts = rail_counts(&live);
     let rail_entries = build_rail_entries(
         "/ui/search",
         &resource_types,
-        live.as_ref().map(|s| s.available.as_slice()),
+        counts,
         Some(selected_type.as_str()),
+        &I18n::new(locale).lang(),
     );
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/search");
     render(SearchPage {
@@ -1978,7 +2847,7 @@ async fn search(
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
         resource_types,
-        show_save: false,
+        rail_counts_approximate: rail_counts_approximate(counts),
         rail_entries,
         selected_type,
         recent_entries,
@@ -1992,63 +2861,6 @@ async fn search(
 /// rail's own links round-trip through `/ui/search?type=Observation` (#541).
 #[derive(Deserialize, Default)]
 struct SearchQuery {
-    #[serde(rename = "type")]
-    resource_type: Option<String>,
-}
-
-/// Saved FHIR queries page.
-async fn queries(
-    State(state): State<WebState>,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
-    Query(query): Query<QueriesQuery>,
-    settings: rail_state::RequestSettings,
-) -> Response {
-    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
-    let explicit_type = query.resource_type.as_deref().filter(|t| !t.is_empty());
-    let rail = record_type_selection(
-        &state,
-        &settings.user_key,
-        &rt.id,
-        rail_state::RailPage::Queries,
-        settings.rail(rail_state::RailPage::Queries, &rt.id),
-        explicit_type,
-        &resource_types,
-    )
-    .await;
-    let selected_type = explicit_type
-        .map(str::to_string)
-        .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
-    let live =
-        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
-            .await;
-    let rail_entries = build_rail_entries(
-        "/ui/queries",
-        &resource_types,
-        live.as_ref().map(|s| s.available.as_slice()),
-        Some(selected_type.as_str()),
-    );
-    let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/queries");
-    render(QueriesPage {
-        status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
-        active_page: "queries",
-        resource_types,
-        show_save: true,
-        rail_entries,
-        selected_type,
-        recent_entries,
-        rail_page: rail_state::RailPage::Queries.key(),
-        max_recent: rail_state::MAX_RECENT,
-        builder_url: None,
-    })
-}
-
-/// Query string for the Saved Queries page: an optional pre-selected type, so
-/// the rail's own links round-trip through `/ui/queries?type=Observation` (#541).
-#[derive(Deserialize, Default)]
-struct QueriesQuery {
     #[serde(rename = "type")]
     resource_type: Option<String>,
 }
@@ -2124,12 +2936,15 @@ async fn resources(
     let live =
         helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
             .await;
+    let counts = rail_counts(&live);
     let rail_entries = build_rail_entries(
         "/ui/resources",
         &resource_types,
-        live.as_ref().map(|s| s.available.as_slice()),
+        counts,
         Some(selected_type.as_str()),
+        &I18n::new(locale).lang(),
     );
+    let rail_counts_approximate = rail_counts_approximate(counts);
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/resources");
     render(ResourcesPage {
         status: current_status(&state, rv.0, &rt),
@@ -2155,7 +2970,10 @@ async fn resources(
             .map(capability::CreateTargets::schema_resources_csv)
             .unwrap_or_default(),
         create_metadata_available: targets.is_some(),
-        show_save: false,
+        rebuild: live
+            .as_ref()
+            .and_then(|snapshot| snapshot.reindex_active.clone()),
+        rail_counts_approximate,
         rail_entries,
         recent_entries,
         rail_page: rail_state::RailPage::Resources.key(),
@@ -2266,7 +3084,7 @@ struct ParamsCatalogQuery {
 /// Parameter datalist for the search builder: the active parameters that
 /// apply to the given resource type (including `Resource` /
 /// `DomainResource`-level ones), from the selected version's snapshot.
-async fn query_params_catalog(
+async fn resources_params_catalog(
     State(state): State<WebState>,
     rt: RequestTenant,
     rv: RequestVersion,
@@ -2292,23 +3110,22 @@ async fn query_params_catalog(
     })
 }
 
-/// Default result-table columns for a resource type (#958): its summary
-/// elements minus resource infrastructure, capped so the table stays
-/// scannable. Replaces the six-type hardcoded map in the browser — every
-/// type the spec defines summary elements for now gets real columns.
+/// Default result-table columns for a resource type (#958): every summary
+/// element minus resource infrastructure. Replaces the six-type hardcoded map
+/// in the browser — every type the spec defines summary elements for now
+/// gets real columns.
+///
+/// The list is the type's full summary set; the browser derives the table's
+/// actual columns from the resources a page returns and only falls back to
+/// this hint when the page is empty (#1105).
+///
+/// The names are JSON element names straight from
+/// [`helios_fhir::summary_elements`] — the browser uses each one as both the
+/// header text and the `resource[col]` lookup key, so they must match the
+/// resource's keys exactly. This function used to convert the generated Rust
+/// field names itself and missed the raw-identifier prefix, so Claim and ~50
+/// other types got `R#TYPE` / `R#USE` headers over empty columns (#1107).
 fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str) -> Vec<String> {
-    let summary_fields: &[&str] = match version {
-        #[cfg(feature = "R4")]
-        helios_fhir::FhirVersion::R4 => helios_fhir::r4::get_summary_fields(resource_type),
-        #[cfg(feature = "R4B")]
-        helios_fhir::FhirVersion::R4B => helios_fhir::r4b::get_summary_fields(resource_type),
-        #[cfg(feature = "R5")]
-        helios_fhir::FhirVersion::R5 => helios_fhir::r5::get_summary_fields(resource_type),
-        #[cfg(feature = "R6")]
-        helios_fhir::FhirVersion::R6 => helios_fhir::r6::get_summary_fields(resource_type),
-        #[allow(unreachable_patterns)]
-        _ => &[],
-    };
     const INFRASTRUCTURE: [&str; 9] = [
         "resourceType",
         "id",
@@ -2320,30 +3137,10 @@ fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str
         "extension",
         "modifierExtension",
     ];
-    summary_fields
-        .iter()
-        .map(|f| snake_to_camel(f))
+    helios_fhir::summary_elements(version, resource_type)
+        .into_iter()
         .filter(|f| !INFRASTRUCTURE.contains(&f.as_str()))
-        .take(5)
         .collect()
-}
-
-/// `get_summary_fields` returns Rust field names; resources carry camelCase
-/// JSON keys, which is what the results table indexes by.
-fn snake_to_camel(field: &str) -> String {
-    let mut out = String::with_capacity(field.len());
-    let mut upper_next = false;
-    for c in field.chars() {
-        if c == '_' {
-            upper_next = true;
-        } else if upper_next {
-            out.extend(c.to_uppercase());
-            upper_next = false;
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Query string for the SearchParameter viewer. Every filter is a link and
@@ -2446,13 +3243,14 @@ async fn search_parameters(
     rt: RequestTenant,
     Query(raw): Query<SearchParametersQuery>,
     settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
     // Explicit ?version= wins; otherwise the user's stored choice (#343).
     let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
     let fhir_version = version
         .as_deref()
         .and_then(search_params::version_from_str)
-        .unwrap_or_default();
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
     if raw.refresh.is_some() {
         state.sp_catalog.invalidate(&rt.id, fhir_version);
     }
@@ -2484,7 +3282,8 @@ async fn search_parameters(
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "search-parameters",
-        view: search_params::build_view(&snapshot, &query, &rail),
+        view: search_params::build_view(&snapshot, &query, &rail, &I18n::new(locale).lang()),
+        editor_return_to: uri.to_string(),
     })
 }
 
@@ -2538,8 +3337,6 @@ async fn render_json_view(
     render(JsonViewFragment {
         i18n: I18n::new(locale),
         json_lines,
-        json_view_id: String::new(),
-        json_view_paths: false,
     })
 }
 
@@ -2551,11 +3348,13 @@ async fn batch_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    max_body_size: usize,
 ) -> Response {
     render(BatchPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "batch",
+        max_body_size,
     })
 }
 
@@ -2568,6 +3367,7 @@ async fn batch_page(
 #[derive(Template)]
 #[template(path = "pages/sql-view-definitions.html")]
 struct SqlViewDefinitionsPage {
+    navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -2585,6 +3385,9 @@ struct SqlViewDefinitionsPage {
     selected: Option<SelectedVd>,
     /// `?vd=new`: the JSON below is the starter document, not a stored view.
     is_new: bool,
+    /// An explicit `?vd=` the rail's filter excludes: the main pane says so,
+    /// with a link that clears the filter and keeps the selection (#1780).
+    selection_filtered: bool,
     /// The guided-form card, alongside the JSON editor (#843): the same
     /// `pane=form` fragment `POST /ui/editor/render` would render for
     /// `selected`'s document, built inline instead of fetched — the page's
@@ -2624,6 +3427,7 @@ struct SelectedVd {
 /// appear alongside a failure message, and the page's own "nothing has run
 /// yet" state is distinct from both — the invalid combinations simply have
 /// no constructor.
+#[derive(Clone)]
 enum RunResultsState {
     /// A successful run — its table, plus how long the `$sql-run` call took
     /// in whole milliseconds.
@@ -2648,6 +3452,33 @@ enum RunResultsState {
     Empty,
 }
 
+/// Which half of a run partial a render emits. Every partial writes the
+/// `#run-notice` element first and the results markup after it; the
+/// Library-backed pages place those two halves in different parts of the
+/// document, so a full-page render asks for each half separately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunPart {
+    /// Both halves in one render: the `/run` fragments and the View
+    /// Definitions page.
+    Both,
+    /// Only `#run-notice`: the SQL card of a Library-backed page.
+    Notice,
+    /// Only the results markup: the foot of a Library-backed page.
+    Results,
+}
+
+impl RunPart {
+    /// Whether this render emits `#run-notice`.
+    fn notice(self) -> bool {
+        matches!(self, Self::Both | Self::Notice)
+    }
+
+    /// Whether this render emits the results markup.
+    fn results(self) -> bool {
+        matches!(self, Self::Both | Self::Results)
+    }
+}
+
 /// The `$sql-run` preview card and its failure notice (#752, generalized to
 /// share one partial across View Definitions, SQL Queries, and SQL Views in
 /// #839): `partials/sql_run_results.html`'s markup is written once and
@@ -2663,18 +3494,21 @@ enum RunResultsState {
 /// partial itself never hardcodes one page's ids or i18n keys: every field
 /// below but `i18n`/`fragment`/`state` only names where this render's
 /// fragment endpoint, form, and i18n keys live — never resource data.
-#[derive(Template)]
+#[derive(Template, Clone)]
 #[template(path = "partials/sql_run_results.html")]
 struct RunResultsPartial {
     i18n: I18n,
     fragment: bool,
+    /// Which half of the partial this render emits ([`RunPart`]).
+    part: RunPart,
     /// The surface's own `POST …/run` fragment endpoint — the `Empty` arm's
     /// `hx-post` load trigger targets it (the surface's own textarea, wired
     /// outside this partial, posts to the identical URL on every edit).
     run_href: &'static str,
     /// The id of the `<form>` the surface's editable fields live in. The
-    /// `Empty` arm's shell sits outside that form, so it reaches back in via
-    /// `hx-include="#{form_id}"` for its own initial-load request.
+    /// `Empty` arm's shell names that form via `hx-include="#{form_id}"` for
+    /// its own initial-load request (View Definitions renders the shell
+    /// outside the form; the Library pages render it inside).
     form_id: &'static str,
     /// The results card's `<h3>` key.
     heading_key: &'static str,
@@ -2699,8 +3533,98 @@ const VD_EDITOR_FORM_ID: &str = "vd-editor-form";
 const VD_RESULTS_HEADING_KEY: &str = "vd-results-heading";
 const VD_RUN_FAILED_KEY: &str = "vd-run-failed";
 
+/// Navigation for paired SQL editors. The incoming Cancel destination and
+/// the current page used by onward links are deliberately separate.
+#[derive(Clone)]
+struct SqlEditorNavigation {
+    return_to: Option<String>,
+    current_path: String,
+    cancel_href: String,
+    new_href: String,
+}
+
+impl SqlEditorNavigation {
+    fn new(
+        base: &str,
+        selection: &str,
+        id: &str,
+        is_new: bool,
+        requested: Option<&str>,
+        current: Option<&str>,
+    ) -> Self {
+        let return_to = navigation::safe_ui_return(requested);
+        let current_path =
+            sql_editor_path(base, selection, if is_new { "new" } else { id }, current);
+        let cancel_href = return_to.clone().unwrap_or_else(|| {
+            if is_new || id.is_empty() {
+                base.to_string()
+            } else {
+                current_path.clone()
+            }
+        });
+        let new_href =
+            navigation::with_return(&format!("{base}?{selection}=new"), Some(&current_path));
+        Self {
+            return_to,
+            current_path,
+            cancel_href,
+            new_href,
+        }
+    }
+
+    fn saved_href(&self, base: &str, selection: &str, id: &str) -> String {
+        let own = sql_editor_path(base, selection, id, Some(&self.current_path));
+        let mut url = reqwest::Url::parse(&format!("https://hfs.invalid{own}"))
+            .expect("validated editor path");
+        url.query_pairs_mut().append_pair("saved", "1");
+        let own = format!(
+            "{}{}{}",
+            url.path(),
+            url.query().map(|q| format!("?{q}")).unwrap_or_default(),
+            url.fragment().map(|f| format!("#{f}")).unwrap_or_default()
+        );
+        navigation::with_return(&own, self.return_to.as_deref())
+    }
+}
+
+/// Preserve the current section's query context, replacing its selection and
+/// stripping the previous caller before this editor becomes another caller.
+fn sql_editor_path(base: &str, selection: &str, id: &str, current: Option<&str>) -> String {
+    let mut pairs = vec![];
+    let mut fragment = String::new();
+    if let Some(current) = navigation::safe_ui_return(current) {
+        let url = reqwest::Url::parse(&format!("https://hfs.invalid{current}"))
+            .expect("validated UI path");
+        if url.path() == base {
+            fragment = url.fragment().map(|f| format!("#{f}")).unwrap_or_default();
+            pairs.extend(
+                url.query_pairs()
+                    .filter(|(key, _)| {
+                        key != "return_to"
+                            && key != "saved"
+                            && key != selection
+                            && !(selection == "lib" && key == "deleted")
+                    })
+                    .map(|(key, value)| (key.into_owned(), value.into_owned())),
+            );
+        }
+    }
+    if !id.is_empty() {
+        pairs.insert(0, (selection.to_string(), id.to_string()));
+    }
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish();
+    if query.is_empty() {
+        format!("{base}{fragment}")
+    } else {
+        format!("{base}?{query}{fragment}")
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct SqlVdQuery {
+    return_to: Option<String>,
     vd: Option<String>,
     filter: Option<String>,
     saved: Option<String>,
@@ -2792,6 +3716,7 @@ fn invalid_form_pane(
         pretty: text,
         error_count: 0,
         orphan_errors: Vec::new(),
+        issues_json: "[]".to_string(),
         parse_error: Some(parse_error),
         focus_path: String::new(),
         auto_open_add: false,
@@ -2862,15 +3787,19 @@ async fn resolve_vd_by_id(
 
 /// For View Definitions: the "Recently used" group's rows, resolved against
 /// this render's own page of the server-paged rail search so
-/// label/meta/href/current match what the list already shows. "The group
-/// is never itself filtered by `?filter=`" falls out for free: an id the
+/// label/meta/href/current match what the list already shows. An id the
 /// current page/filter excludes is simply absent from `summaries` (and so
 /// from `live`), so [`rail_state::RailState::resolve_recents`] renders it
 /// from its stored `{name, meta}` snapshot instead.
+///
+/// The group follows the rail's `?filter=` (#1275): an entry stays when the
+/// filtered page lists it or its label matches the filter, so a term that
+/// matches nothing leaves the group empty (and so `hidden`).
 fn resolve_vd_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_views::VdSummary],
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -2887,11 +3816,22 @@ fn resolve_vd_recents(
             )
         })
         .collect();
-    rail.resolve_recents(
+    let mut recents = rail.resolve_recents(
         &live,
         |id| format!("/ui/sql/view-definitions?vd={id}"),
         None,
-    )
+    );
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
+}
+
+/// Header the SQL rails' filter inputs send while filtering as you type
+/// (#1275). Such a request re-renders the page only to swap the rail, so it
+/// must not record the echoed `?vd=`/`?lib=` as a user pick.
+const RAIL_FILTER_HEADER: &str = "x-rail-filter";
+
+fn is_live_rail_filter(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(RAIL_FILTER_HEADER)
 }
 
 /// `GET /ui/sql/view-definitions`: the rail is one page of a server-side
@@ -2902,15 +3842,20 @@ fn resolve_vd_recents(
 /// carried over into `name:contains` — it was never a documented part of
 /// #649 and has no standard FHIR search expression (see
 /// [`sql_views::rail_search_params`] for why).
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_view_definitions_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<SqlVdQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let live_filter = is_live_rail_filter(&headers);
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     // Absent or non-numeric falls back to page 1 rather than 400ing — a
     // stale or hand-edited `?page=` is a navigation mistake, not an error.
     let page = query
@@ -2939,7 +3884,12 @@ async fn sql_view_definitions_page(
         )
         .await
     {
-        Ok(page) => (page.resources, page.has_next, None),
+        Ok(mut page) => {
+            if !filter.is_empty() && page.unapplied.iter().any(|p| p == "name:contains") {
+                sql_views::filter_by_name(&mut page.resources, &filter);
+            }
+            (page.resources, page.has_next, None)
+        }
         Err(error) => {
             tracing::warn!("ViewDefinition search failed: {error}");
             (Vec::new(), false, Some(error))
@@ -2974,15 +3924,21 @@ async fn sql_view_definitions_page(
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = record_snapshot_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    rail_state::RailPage::ViewDefinitions,
-                    rail_before,
-                    entry,
-                )
-                .await;
+                // Typing in the rail filter echoes the page's selection back
+                // as `?vd=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    record_snapshot_selection(
+                        &state,
+                        &settings.user_key,
+                        &rt.id,
+                        rail_state::RailPage::ViewDefinitions,
+                        rail_before,
+                        entry,
+                    )
+                    .await
+                };
                 (Some(SelectedVd { id, name, json }), Some(vd), rail)
             }
             None => {
@@ -3001,15 +3957,28 @@ async fn sql_view_definitions_page(
                 (None, None, rail)
             }
         }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
     } else {
         // No explicit selection: try the stored `last`, falling back to
         // the rail's first visible entry when there is none or it no
-        // longer resolves — both silently: no write either way.
+        // longer resolves — both silently: no write either way. (A recent
+        // entry that has since been deleted server-side is instead caught
+        // by the existence sweep below, [`prune_gone_recents`], #1014.)
         let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
         let mut resolved = match stored_id.as_deref() {
             Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
             None => None,
         };
+        if resolved
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter))
+        {
+            resolved = None;
+        }
         if resolved.is_none() {
             let fallback_id = summaries.first().map(|e| e.id.clone());
             resolved = match fallback_id.as_deref() {
@@ -3026,8 +3995,39 @@ async fn sql_view_definitions_page(
         }
     };
 
-    let recent_entries =
-        resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter));
+
+    // Existence sweep (#1014): a recent id off this render's own page and
+    // not the current selection is checked against the server, and a
+    // definitive 404/410 prunes it from the stored registry.
+    let mut live_ids: std::collections::HashSet<String> =
+        summaries.iter().map(|s| s.id.clone()).collect();
+    if let Some(s) = &selected {
+        if !s.id.is_empty() {
+            live_ids.insert(s.id.clone());
+        }
+    }
+    let rail = prune_gone_recents(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rv.0,
+        rail_state::RailPage::ViewDefinitions,
+        "ViewDefinition",
+        rail,
+        &live_ids,
+    )
+    .await;
+
+    let recent_entries = resolve_vd_recents(
+        &rail,
+        &summaries,
+        selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
+    );
 
     // `?saved=1` (Save's own redirect) runs the just-stored definition
     // through $sql-run once, server-side, so the nojs path shows results
@@ -3051,7 +4051,21 @@ async fn sql_view_definitions_page(
     // whichever document `selected` already resolved above.
     let form_pane = vd_form_pane_for_selection(i18n, rv.0, is_new, selected_value.as_ref());
 
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&uri.to_string()),
+    );
+    let prev_href =
+        prev_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
+    let next_href =
+        next_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
     render(SqlViewDefinitionsPage {
+        navigation,
+        selection_filtered,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: "sql-view-definitions",
@@ -3066,6 +4080,7 @@ async fn sql_view_definitions_page(
         run_results: RunResultsPartial {
             i18n,
             fragment: false,
+            part: RunPart::Both,
             run_href: VD_RUN_HREF,
             form_id: VD_EDITOR_FORM_ID,
             heading_key: VD_RESULTS_HEADING_KEY,
@@ -3127,6 +4142,10 @@ async fn run_sql_preview(
 
 #[derive(Deserialize)]
 struct SqlVdSaveForm {
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    current_path: Option<String>,
     /// Empty for a create; the stored id for an update.
     #[serde(default)]
     id: String,
@@ -3147,6 +4166,14 @@ async fn sql_view_definitions_save(
     rt: RequestTenant,
     axum::Form(form): axum::Form<SqlVdSaveForm>,
 ) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        &form.id,
+        form.id.is_empty(),
+        form.return_to.as_deref(),
+        form.current_path.as_deref(),
+    );
     let error_page = |save_error: String, json: String, is_new: bool, id: String| {
         // #843: the guided-form panel keeps up with whatever the user
         // submitted — parses it exactly like `editor::render_body` would, so
@@ -3164,6 +4191,8 @@ async fn sql_view_definitions_save(
             ),
         };
         SqlViewDefinitionsPage {
+            navigation: navigation.clone(),
+            selection_filtered: false,
             status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "sql-view-definitions",
@@ -3188,6 +4217,7 @@ async fn sql_view_definitions_save(
             run_results: RunResultsPartial {
                 i18n: I18n::new(locale),
                 fragment: false,
+                part: RunPart::Both,
                 run_href: VD_RUN_HREF,
                 form_id: VD_EDITOR_FORM_ID,
                 heading_key: VD_RESULTS_HEADING_KEY,
@@ -3230,15 +4260,29 @@ async fn sql_view_definitions_save(
         ));
     }
 
+    if duplicate
+        && let Err(error) = sql_artifact_duplicate::prepare(
+            state.conformance.as_ref(),
+            "ViewDefinition",
+            &mut resource,
+            rv.0,
+            &rt.id,
+        )
+        .await
+    {
+        return render(error_page(
+            error.message(I18n::new(locale)),
+            form.json,
+            form.id.is_empty(),
+            form.id,
+        ));
+    }
+
     let id = if duplicate || form.id.is_empty() {
-        // A create must not carry a stored id; a duplicate also gets a fresh
-        // name so the two are tellable apart in the rail.
+        // A create must not carry a stored id. Duplicate already prepared
+        // its own name and canonical before reaching the write.
         if let Some(map) = resource.as_object_mut() {
             map.remove("id");
-            if duplicate && let Some(name) = map.get("name").and_then(serde_json::Value::as_str) {
-                let copy = format!("{name}_copy");
-                map.insert("name".to_string(), serde_json::Value::String(copy));
-            }
         }
         None
     } else {
@@ -3259,8 +4303,10 @@ async fn sql_view_definitions_save(
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            axum::response::Redirect::to(&format!(
-                "/ui/sql/view-definitions?vd={stored_id}&saved=1"
+            axum::response::Redirect::to(&navigation.saved_href(
+                "/ui/sql/view-definitions",
+                "vd",
+                stored_id,
             ))
             .into_response()
         }
@@ -3305,6 +4351,7 @@ async fn sql_view_definitions_run(
         render(RunResultsPartial {
             i18n,
             fragment: true,
+            part: RunPart::Both,
             run_href: VD_RUN_HREF,
             form_id: VD_EDITOR_FORM_ID,
             heading_key: VD_RESULTS_HEADING_KEY,
@@ -4211,13 +5258,16 @@ struct TableRowView {
 /// message. `sql_libraries` itself never localizes (matching every other
 /// pure-model/view split in this module), so this is the one place a
 /// [`sql_libraries::TableTarget`] variant becomes catalog text.
-fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow) -> TableRowView {
+fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> TableRowView {
     match row.target {
         sql_libraries::TableTarget::ViewDefinition { id, name } => TableRowView {
             label: row.label,
             chip: i18n.t("lib-tables-kind-view-definition"),
             chip_class: "type",
-            link_href: Some(format!("/ui/sql/view-definitions?vd={id}")),
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/view-definitions?vd={id}"),
+                Some(origin),
+            )),
             link_label: Some(name),
             detail: None,
         },
@@ -4225,7 +5275,10 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow) -> TableRowView {
             label: row.label,
             chip: i18n.t("sql-views-chip"),
             chip_class: "type",
-            link_href: Some(format!("/ui/sql/views?lib={id}")),
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/views?lib={id}"),
+                Some(origin),
+            )),
             link_label: Some(name),
             detail: None,
         },
@@ -4278,7 +5331,7 @@ struct UsedByRowView {
 /// each group already sorted by its own producer, name for artifacts
 /// ([`sql_libraries::used_by_artifacts`]), most-recently-started for
 /// exports ([`sql_export::jobs_for_used_by`])).
-fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
+fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis, origin: &str) -> Vec<UsedByRowView> {
     let mut rows: Vec<UsedByRowView> = analysis
         .used_by_artifacts
         .iter()
@@ -4291,7 +5344,10 @@ fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
             };
             UsedByRowView {
                 chip: i18n.t(chip_key),
-                href: format!("{base_href}?lib={}", artifact.id),
+                href: navigation::with_return(
+                    &format!("{base_href}?lib={}", artifact.id),
+                    Some(origin),
+                ),
                 label: artifact.name.clone(),
             }
         })
@@ -4304,10 +5360,14 @@ fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
     rows
 }
 
-/// The *Add table* panel's own re-submitted state (#842): the `table`/
-/// `alias` text [`sql_library_document`] echoes back into the `<details>`
+/// The always-visible add row's own re-submitted state (#842): the
+/// `table`/`alias` text [`sql_library_document`] echoes back into the row
 /// on a rejected `add-table`, and the validation message alongside them.
-/// `Default` is every other render's own state — closed, empty, no error.
+/// `open` no longer toggles any disclosure (#1238: the row has none) — it
+/// only marks a rejected submission's own state as no longer the untouched
+/// default, so [`build_tables_card`] does not clobber it with the
+/// *first* unknown table's own no-JS prefill. `Default` is every other
+/// render's own state — untouched, empty, no error.
 #[derive(Default)]
 struct AddTableFormState {
     table: String,
@@ -4318,10 +5378,11 @@ struct AddTableFormState {
 
 /// [`build_tables_card`]'s presentation-only options — mirrors
 /// [`ParamsCardOptions`] for the Tables panel: `Default` is the page's own
-/// inline render (no OOB swap, no `data_document`, the *Add table* panel
-/// closed and clean).
+/// inline render (no OOB swap, no `data_document`, the add row's own state
+/// untouched and clean).
 #[derive(Default)]
 struct TablesCardOptions {
+    origin: String,
     add: AddTableFormState,
     /// `true` only for the `/run` fragment's own OOB companion (#842) — see
     /// [`ParamsCardOptions::oob`]'s identical role for the Parameters card.
@@ -4333,23 +5394,25 @@ struct TablesCardOptions {
     data_document: Option<String>,
 }
 
-/// Builds the Tables panel's left-hand card (#842) from an already-computed
-/// [`TablesAnalysis`] plus `options`' presentation state — mirrors
-/// [`build_params_card`]'s own role for the Parameters card.
+/// Builds the Tables panel's left-hand card (#842, redesigned as a flat
+/// list #1238) from an already-computed [`TablesAnalysis`] plus `options`'
+/// presentation state — mirrors [`build_params_card`]'s own role for the
+/// Parameters card.
 ///
 /// #842/04: on a page-level render (`!options.oob` — the page's own first
 /// paint, the `document` endpoint's own no-JS echo, or a validation-error
 /// re-render; never the `/run` fragment's own OOB companion) whose SQL
-/// reads at least one unknown table, the panel opens itself with the
-/// *first* one's own name already in the alias field whenever
-/// `options.add` is still its own untouched default (closed, empty, no
+/// reads at least one unknown table, the always-visible add row's own
+/// alias field pre-fills itself with the *first* one's own name whenever
+/// `options.add` is still its own untouched default (empty, not open, no
 /// error — never the case after a rejected *Add table* submission, which
 /// always sets at least one of those) — the no-JS half of *Declare*'s own
-/// contract: a no-JS visitor has no other way to reach the panel at
-/// all. With JavaScript, the live `/run` fragment never auto-opens it —
-/// only clicking a specific row's own *Declare {name}* button
-/// (`sql-library-panels.js`) does, so introducing a typo while typing
-/// never yanks focus into a panel the visitor did not ask for.
+/// contract: a no-JS visitor has no other way to name the target it
+/// still needs picking from the combobox. With JavaScript, the live `/run`
+/// fragment never overwrites a visitor's own typing this way — only
+/// clicking a specific row's own *Declare {name}* button
+/// (`sql-library-panels.js`) refills the alias field, so introducing a
+/// typo while typing never yanks focus away from the editor.
 fn build_tables_card(
     i18n: I18n,
     kind: &LibraryKind,
@@ -4357,11 +5420,11 @@ fn build_tables_card(
     table_options_href: String,
     options: TablesCardOptions,
 ) -> LibTablesCard {
-    let used_by = used_by_view(&i18n, &analysis);
+    let used_by = used_by_view(&i18n, &analysis, &options.origin);
     let rows = analysis
         .rows
         .into_iter()
-        .map(|row| table_row_view(&i18n, row))
+        .map(|row| table_row_view(&i18n, row, &options.origin))
         .collect();
     let unknown_rows: Vec<UnknownTableRowView> = analysis
         .unknown
@@ -4373,10 +5436,10 @@ fn build_tables_card(
         && options.add.alias.is_empty()
         && !options.add.open
         && options.add.error.is_none();
-    let (add_alias, add_open) = if add_is_default && let Some(first) = unknown_rows.first() {
-        (first.name.clone(), true)
+    let add_alias = if add_is_default && let Some(first) = unknown_rows.first() {
+        first.name.clone()
     } else {
-        (options.add.alias, options.add.open)
+        options.add.alias
     };
     LibTablesCard {
         i18n,
@@ -4388,18 +5451,18 @@ fn build_tables_card(
         signature: analysis.signature,
         add_table: options.add.table,
         add_alias,
-        add_open,
         add_error: options.add.error,
         oob: options.oob,
         data_document: options.data_document,
     }
 }
 
-/// `partials/sql_tables_card.html`'s render surface (#842): the resolved
-/// *Reads from* rows, the *Used by* rows, the `tables_sig` signature, and
-/// the *Add table* panel — built once by [`build_tables_card`] and shared
-/// by the page's own first paint, the `/run` fragment's OOB companion, and
-/// the `document` endpoint's own response, exactly like [`LibParamsCard`].
+/// `partials/sql_tables_card.html`'s render surface (#842, redesigned as a
+/// flat list #1238): the resolved *Reads from* rows, the *Used by* rows,
+/// the `tables_sig` signature, and the always-visible add row's own state
+/// — built once by [`build_tables_card`] and shared by the page's own
+/// first paint, the `/run` fragment's OOB companion, and the `document`
+/// endpoint's own response, exactly like [`LibParamsCard`].
 #[derive(Template)]
 #[template(path = "partials/sql_tables_card.html")]
 struct LibTablesCard {
@@ -4420,7 +5483,6 @@ struct LibTablesCard {
     signature: String,
     add_table: String,
     add_alias: String,
-    add_open: bool,
     add_error: Option<String>,
     /// `true` only for the `/run` fragment's own OOB companion — see
     /// [`TablesCardOptions::oob`].
@@ -4519,11 +5581,13 @@ fn build_columns_card(
 /// (if any) is left untouched, and only its meta is relabelled "last
 /// successful run" — see [`unknown_tables_notice`] for how its own fields
 /// are built.
-#[derive(Template)]
+#[derive(Template, Clone)]
 #[template(path = "partials/lib_run_unknown_tables.html")]
 struct UnknownTablesNotice {
     i18n: I18n,
     fragment: bool,
+    /// Which half of the partial this render emits ([`RunPart`]).
+    part: RunPart,
     /// The *first* unknown table's own 1-based line — `data-error-line`,
     /// the same attribute [`sql_views::extract_error_line`]'s own findings
     /// already tint via `sql-editor.js`.
@@ -4586,6 +5650,7 @@ fn unknown_tables_notice(
     UnknownTablesNotice {
         i18n,
         fragment,
+        part: RunPart::Both,
         first_line: tables[0].position.line,
         message,
         diagnostics_json: serde_json::to_string(&diagnostics).unwrap_or_default(),
@@ -4604,9 +5669,21 @@ fn unknown_tables_notice(
 /// ([`SqlLibraryPage::run_results`]) that must show the identical notice
 /// in place of results (`?…&saved=1`, the `document` endpoint's own no-JS
 /// echo).
+#[derive(Clone)]
 enum LibRunNotice {
     Standard(RunResultsPartial),
     UnknownTables(UnknownTablesNotice),
+}
+
+impl LibRunNotice {
+    /// The same notice restricted to one half of its markup ([`RunPart`]).
+    fn with_part(mut self, part: RunPart) -> Self {
+        match &mut self {
+            Self::Standard(partial) => partial.part = part,
+            Self::UnknownTables(notice) => notice.part = part,
+        }
+        self
+    }
 }
 
 /// The SQL Queries / SQL Views workspace (#649): the same shape as View
@@ -4616,6 +5693,12 @@ enum LibRunNotice {
 #[derive(Template)]
 #[template(path = "pages/sql-library.html")]
 struct SqlLibraryPage {
+    /// Delete signals are candidates for the next authoritative render.
+    delete_redirect: String,
+    /// An incomplete fetch or a still-existing/unverifiable off-list candidate
+    /// prevents claiming that the collection is empty.
+    collection_unverified: bool,
+    navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -4646,6 +5729,9 @@ struct SqlLibraryPage {
     degraded: Option<String>,
     selected: Option<SelectedLib>,
     is_new: bool,
+    /// An explicit `?lib=` the rail's filter excludes (#1780), as on View
+    /// Definitions.
+    selection_filtered: bool,
     /// The Details card's guided-form panel (#840), alongside its own JSON
     /// editor — the same shape View Definitions' `form_pane` is, built
     /// inline from the document `selected.json` already shows so the page's
@@ -4670,11 +5756,15 @@ struct SqlLibraryPage {
     /// alongside a selection, so this needs no further gate of its own in
     /// the template).
     columns_card: Option<LibColumnsCard>,
-    /// The `$sql-run` preview card and its failure notice — either the
-    /// shared `partials/sql_run_results.html` markup or the unknown-table
-    /// lint's own notice (#842/04, [`LibRunNotice`]). `fragment: false` on
-    /// the `Standard` arm here — the page's own render has nothing to
-    /// swap into.
+    /// The `$sql-run` preview's `#run-notice` half ([`RunPart::Notice`]),
+    /// rendered inside the SQL card between the editor and the Save row.
+    run_notice: LibRunNotice,
+    /// The `$sql-run` preview card — either the shared
+    /// `partials/sql_run_results.html` markup or the unknown-table
+    /// lint's own notice (#842/04, [`LibRunNotice`]), restricted to the
+    /// results half ([`RunPart::Results`]) and rendered after the tables
+    /// panel. `fragment: false` on the `Standard` arm here — the page's
+    /// own render has nothing to swap into.
     run_results: LibRunNotice,
     save_error: Option<String>,
     saved: bool,
@@ -4704,7 +5794,10 @@ struct SelectedLib {
 
 #[derive(Deserialize, Default)]
 struct SqlLibQuery {
+    return_to: Option<String>,
     lib: Option<String>,
+    /// Untrusted hint from a successful DELETE; always verify it.
+    deleted: Option<String>,
     filter: Option<String>,
     /// `?saved=1` (Save's own redirect): renders the just-saved Library's
     /// `$sql-run` results server-side. There is no `?run=1` — the live
@@ -4714,10 +5807,8 @@ struct SqlLibQuery {
 
 /// Shapes a stored `Library` resource into the editor's `(id, name, json,
 /// sql)` quadruple: `sql` decoded out of the base64 `application/sql`
-/// attachment for the SQL card, `json` the Details card's own document —
-/// `lib` with that same attachment stripped back out (#840,
-/// [`sql_libraries::strip_sql_attachment`]) — so the two cards never show
-/// the SQL text twice.
+/// attachment for the SQL card, `json` the full stored document — the SQL
+/// card below is a second view of its `application/sql` attachment (#1233).
 fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
     let id = lib
         .get("id")
@@ -4730,8 +5821,7 @@ fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
         .unwrap_or(&id)
         .to_string();
     let sql = sql_libraries::extract_sql(lib);
-    let json =
-        serde_json::to_string_pretty(&sql_libraries::strip_sql_attachment(lib)).unwrap_or_default();
+    let json = serde_json::to_string_pretty(lib).unwrap_or_default();
     (id, name, json, sql)
 }
 
@@ -4743,9 +5833,11 @@ fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
 /// place on first paint, not fetched after the fact. Mirrors
 /// [`render_vd_form_pane`]; `document`'s own `resourceType` decides the
 /// fallback resource type when absent, falling back to `"Library"` — every
-/// caller on this page hands it a `Library` (its SQL attachment already
-/// stripped by the caller), except the one Save-error path where the
-/// submitted document parses but carries some other type.
+/// caller on this page hands it the full `Library` document, `application/sql`
+/// attachment included (#1233), except the one Save-error path where the
+/// submitted document parses but carries some other type; `hidden=["content"]`
+/// below is what keeps that attachment out of the form's own rows and its
+/// "+ Add" list.
 fn render_lib_details_pane(
     i18n: I18n,
     version: helios_fhir::FhirVersion,
@@ -4776,9 +5868,10 @@ fn render_lib_details_pane(
 }
 
 /// The Details panel for whichever document this render selected (#840):
-/// the stored library — its SQL attachment stripped — or `?lib=new`'s
-/// starter document (which carries none to begin with), mirroring
-/// [`vd_form_pane_for_selection`]. `None` only alongside `selected: None`.
+/// the stored library — full document, `application/sql` attachment
+/// included (#1233) — or `?lib=new`'s starter document (which carries none
+/// to begin with), mirroring [`vd_form_pane_for_selection`]. `None` only
+/// alongside `selected: None`.
 fn lib_details_pane_for_selection(
     i18n: I18n,
     version: helios_fhir::FhirVersion,
@@ -4793,9 +5886,7 @@ fn lib_details_pane_for_selection(
             sql_libraries::starter_library_value(kind.code),
         ))
     } else {
-        selected_value.map(|lib| {
-            render_lib_details_pane(i18n, version, sql_libraries::strip_sql_attachment(lib))
-        })
+        selected_value.map(|lib| render_lib_details_pane(i18n, version, lib.clone()))
     }
 }
 
@@ -4820,16 +5911,18 @@ fn resolve_lib_of_kind(
 /// For the Library-backed rails (SQL Queries, SQL Views): the "Recently
 /// used" group's rows, resolved against this render's own (kind- and
 /// search-box-filtered) rail list so label/meta/href/current match what the
-/// list already shows. "The group is never itself filtered by `?filter=`"
-/// falls out for free: an id the current filter excludes is simply absent
+/// list already shows. An id the current filter excludes is simply absent
 /// from `summaries` (and so from `live`), so
 /// [`rail_state::RailState::resolve_recents`] renders it from its stored
-/// `{name, meta}` snapshot instead.
+/// `{name, meta}` snapshot instead — and the group then follows the rail's
+/// `?filter=` (#1275): an entry stays when the filtered list shows it or its
+/// label matches, so a term matching nothing leaves the group empty.
 fn resolve_lib_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_libraries::LibSummary],
     base_href: &str,
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -4846,7 +5939,9 @@ fn resolve_lib_recents(
             )
         })
         .collect();
-    rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None)
+    let mut recents = rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None);
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4856,11 +5951,13 @@ async fn sql_library_page(
     rv: RequestVersion,
     rt: RequestTenant,
     query: SqlLibQuery,
+    current_path: String,
     kind: &LibraryKind,
     settings: rail_state::RequestSettings,
     user_key: String,
+    live_filter: bool,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     let (mut libraries, degraded) = match state.conformance.fetch("Library", rv.0, &rt.id).await {
         Ok(resources) => (resources, None),
         Err(error) => {
@@ -4868,20 +5965,46 @@ async fn sql_library_page(
             (Vec::new(), Some(error))
         }
     };
+    let stored_rail = settings.rail(kind.page, &rt.id);
+    let is_new = query.lib.as_deref() == Some("new");
+    // Five recent IDs, plus an explicit selection and a deletion hint: at
+    // most seven reads. Even IDs still returned by search must be checked.
+    let candidates = stored_rail
+        .recent
+        .iter()
+        .map(|entry| entry.id.clone())
+        .chain(query.lib.iter().filter(|id| id.as_str() != "new").cloned())
+        .chain(query.deleted.iter().cloned())
+        .collect();
+    let verdicts = resource_existence_verdicts(&state, &rt.id, rv.0, "Library", candidates).await;
+    let gone: std::collections::HashSet<&str> = verdicts
+        .iter()
+        .filter_map(|(id, verdict)| matches!(verdict, Ok(false)).then_some(id.as_str()))
+        .collect();
+    libraries.retain(|lib| {
+        !lib.get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| gone.contains(id))
+    });
+    let collection_unverified = degraded.is_some()
+        || verdicts.iter().any(|(id, verdict)| {
+            !matches!(verdict, Ok(false))
+                && !libraries.iter().any(|lib| {
+                    lib.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
+        });
+    let rail_before = stored_rail
+        .prune_gone(&verdicts)
+        .unwrap_or_else(|| stored_rail.clone());
     let summaries = {
         let mut s = sql_libraries::summarize(&libraries, kind.code);
-        if !filter.is_empty() {
-            let needle = filter.to_lowercase();
-            s.retain(|e| e.name.to_lowercase().contains(&needle));
-        }
+        s.retain(|e| rail_state::matches_rail_filter(&e.name, &filter));
         s
     };
 
-    let rail_before = settings.rail(kind.page, &rt.id);
-    let is_new = query.lib.as_deref() == Some("new");
     let (selected, selected_value, rail) = if is_new {
-        // "Create New" is never a selection (the `?lib=new` exception):
-        // nothing here reads or writes `rails.<page>`.
+        // "Create New" never records a selection. The existence sweep
+        // may still have cleaned a confirmed deletion from this rail.
         (
             Some(SelectedLib {
                 id: String::new(),
@@ -4905,15 +6028,13 @@ async fn sql_library_page(
                 let status = sql_libraries::extract_status(&lib);
                 let meta = (!status.is_empty()).then(|| status.clone());
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = record_snapshot_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    kind.page,
-                    rail_before,
-                    entry,
-                )
-                .await;
+                // Typing in the rail filter echoes the page's selection back
+                // as `?lib=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    rail_before.select(entry).unwrap_or(rail_before)
+                };
                 (
                     Some(SelectedLib {
                         id,
@@ -4927,22 +6048,15 @@ async fn sql_library_page(
                     rail,
                 )
             }
-            None => {
-                // A stale or mistyped explicit id is pruned from the
-                // registry; the page itself keeps its current "no selection"
-                // render either way.
-                let rail = prune_stale_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    kind.page,
-                    rail_before,
-                    &explicit_id,
-                )
-                .await;
-                (None, None, rail)
-            }
+            // Absence from a filtered, incomplete or failed list is not
+            // evidence of deletion. The existence sweep already decided it.
+            None => (None, None, rail_before),
         }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
     } else {
         // No explicit selection: try the stored `last`, falling back to
         // the rail's first visible entry when there is none or it no
@@ -4950,6 +6064,12 @@ async fn sql_library_page(
         let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
         let mut resolved =
             stored_id.and_then(|id| resolve_lib_of_kind(&id, kind.code, &mut libraries));
+        if resolved
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter))
+        {
+            resolved = None;
+        }
         if resolved.is_none() {
             let fallback_id = summaries.first().map(|e| e.id.clone());
             resolved =
@@ -4976,11 +6096,28 @@ async fn sql_library_page(
         }
     };
 
+    if rail != stored_rail {
+        rail_state::persist(
+            &state.settings,
+            &settings.user_key,
+            &rt.id,
+            kind.page,
+            &rail,
+        )
+        .await;
+    }
+
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter));
+
     let recent_entries = resolve_lib_recents(
         &rail,
         &summaries,
         kind.base_href,
         selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
     );
 
     // `?saved=1` (Save's own redirect) runs the just-stored Library through
@@ -4991,6 +6128,14 @@ async fn sql_library_page(
     // starter document (#839, mirroring View Definitions' own `?vd=…&saved=
     // 1` handling in `sql_view_definitions_page`).
     let i18n = I18n::new(locale);
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&current_path),
+    );
     // Owned, not borrowed: `selected` itself moves into the response below,
     // in the same expression that still needs this id for `export_href`.
     let selected_id = selected.as_ref().map(|s| s.id.clone()).unwrap_or_default();
@@ -5041,7 +6186,10 @@ async fn sql_library_page(
                 kind,
                 analysis,
                 table_options_href(&selected_id),
-                TablesCardOptions::default(),
+                TablesCardOptions {
+                    origin: navigation.current_path.clone(),
+                    ..Default::default()
+                },
             ))
         }
         None => None,
@@ -5055,10 +6203,18 @@ async fn sql_library_page(
     // in before `?…&saved=1` can show a table; until then this render's own
     // `run_results` below shows the same "waiting" notice the `/run`
     // fragment would.
+    //
+    // #1276: built off `tables_document`, not `selected_value`, so
+    // `?lib=new` analyzes its starter document too. Without that the page
+    // renders no `#lib-params` at all, and `/run`'s own out-of-band card —
+    // sent once the pasted JSON declares a parameter — has no element to
+    // replace, so htmx drops it and no value can ever be typed in. The
+    // starter's own signature is what `/run` computes for an unedited
+    // document, so the card is swapped only once a declaration changes.
     let no_values = std::collections::HashMap::new();
     let analysis = kind
         .declares_parameters
-        .then_some(selected_value.as_ref())
+        .then_some(tables_document.as_ref())
         .flatten()
         .map(|lib| {
             let sql = selected
@@ -5084,6 +6240,7 @@ async fn sql_library_page(
         LibRunNotice::Standard(RunResultsPartial {
             i18n,
             fragment: false,
+            part: RunPart::Both,
             run_href: kind.run_href,
             form_id: LIB_EDITOR_FORM_ID,
             heading_key: kind.results_heading_key,
@@ -5174,6 +6331,10 @@ async fn sql_library_page(
     let details = lib_details_pane_for_selection(i18n, rv.0, kind, is_new, selected_value.as_ref());
 
     render(SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &selected_id),
+        collection_unverified,
+        navigation,
+        selection_filtered,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: kind.active_page,
@@ -5200,7 +6361,8 @@ async fn sql_library_page(
         params_card,
         tables_card,
         columns_card,
-        run_results,
+        run_notice: run_results.clone().with_part(RunPart::Notice),
+        run_results: run_results.with_part(RunPart::Results),
         save_error: None,
         saved: query.saved.as_deref() == Some("1"),
         recent_entries,
@@ -5209,8 +6371,17 @@ async fn sql_library_page(
     })
 }
 
+fn sql_library_delete_redirect(base: &str, id: &str) -> String {
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("deleted", id)
+        .finish();
+    format!("{base}?{query}")
+}
+
 #[derive(Default)]
 struct SqlLibSaveForm {
+    return_to: String,
+    current_path: String,
     id: String,
     json: String,
     /// The decoded SQL pane; re-embedded as the base64 attachment on save.
@@ -5237,6 +6408,8 @@ fn parse_lib_save_form(body: &[u8]) -> SqlLibSaveForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -5332,6 +6505,7 @@ async fn render_lib_document_page(
     rt: &RequestTenant,
     kind: &LibraryKind,
     user_key: &str,
+    navigation: SqlEditorNavigation,
     json: String,
     sql: String,
     is_new: bool,
@@ -5378,6 +6552,7 @@ async fn render_lib_document_page(
                 analysis,
                 table_options_href(&id),
                 TablesCardOptions {
+                    origin: navigation.current_path.clone(),
                     add: add_table,
                     ..Default::default()
                 },
@@ -5386,6 +6561,7 @@ async fn render_lib_document_page(
                 LibRunNotice::Standard(RunResultsPartial {
                     i18n,
                     fragment: false,
+                    part: RunPart::Both,
                     run_href: kind.run_href,
                     form_id: LIB_EDITOR_FORM_ID,
                     heading_key: kind.results_heading_key,
@@ -5403,6 +6579,7 @@ async fn render_lib_document_page(
             LibRunNotice::Standard(RunResultsPartial {
                 i18n,
                 fragment: false,
+                part: RunPart::Both,
                 run_href: kind.run_href,
                 form_id: LIB_EDITOR_FORM_ID,
                 heading_key: kind.results_heading_key,
@@ -5418,6 +6595,10 @@ async fn render_lib_document_page(
         .is_some()
         .then(|| build_columns_card(i18n, kind, Vec::new(), false));
     SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &id),
+        collection_unverified: false,
+        navigation,
+        selection_filtered: false,
         status: current_status(state, version, rt),
         i18n,
         active_page: kind.active_page,
@@ -5451,7 +6632,8 @@ async fn render_lib_document_page(
         params_card,
         tables_card,
         columns_card,
-        run_results,
+        run_notice: run_results.clone().with_part(RunPart::Notice),
+        run_results: run_results.with_part(RunPart::Results),
         save_error,
         saved: false,
         // Neither a save nor a navigation — there is nothing new to record
@@ -5471,6 +6653,14 @@ async fn sql_library_save(
     form: SqlLibSaveForm,
     kind: &LibraryKind,
 ) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        &form.id,
+        form.id.is_empty(),
+        Some(&form.return_to),
+        Some(&form.current_path),
+    );
     // A form-validation error re-renders in place: nothing has run
     // server-side, no rail to repaint, and the submitted text is kept
     // rather than lost — [`render_lib_document_page`]'s own shape, shared
@@ -5494,6 +6684,7 @@ async fn sql_library_save(
             &rt,
             kind,
             &user_key,
+            navigation.clone(),
             json,
             sql,
             is_new,
@@ -5548,8 +6739,9 @@ async fn sql_library_save(
     // #840: this page only ever shows and saves Libraries of its own kind —
     // saving a `sql-view` from SQL Queries (or the reverse) would silently
     // vanish it from the rail it was just edited on. Checked ahead of
-    // `embed_sql` below, against the resource exactly as submitted, so a
-    // rejected Save changes nothing about what the user typed.
+    // `fill_sql_attachment` below, against the resource exactly as
+    // submitted, so a rejected Save changes nothing about what the user
+    // typed.
     if !sql_libraries::has_library_code(&resource, kind.code) {
         let status = sql_libraries::extract_status(&resource);
         return render(
@@ -5569,7 +6761,8 @@ async fn sql_library_save(
     // `0..0` — reject a save (or Duplicate) that would persist a non-empty
     // one rather than silently keeping declarations the page never lets the
     // user act on. Checked after #840's own type gate above, against the
-    // resource exactly as submitted (before `embed_sql`), same as it is.
+    // resource exactly as submitted (before `fill_sql_attachment`), same as
+    // it is.
     if !kind.declares_parameters
         && resource
             .get("parameter")
@@ -5590,18 +6783,41 @@ async fn sql_library_save(
             .await,
         );
     }
-    sql_libraries::embed_sql(&mut resource, &form.sql);
+    // #1233: the Details JSON attachment wins over the SQL card — this only
+    // fills in when the JSON carries no readable `application/sql`
+    // attachment of its own.
+    sql_libraries::fill_sql_attachment(&mut resource, &form.sql);
     // Read before `resource` moves into `save_resource` below — only the
     // save-failure branch needs it, but the value must be captured here.
     let status = sql_libraries::extract_status(&resource);
 
+    if duplicate
+        && let Err(error) = sql_artifact_duplicate::prepare(
+            state.conformance.as_ref(),
+            "Library",
+            &mut resource,
+            rv.0,
+            &rt.id,
+        )
+        .await
+    {
+        return render(
+            error_page(
+                error.message(I18n::new(locale)),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        );
+    }
+
     let id = if duplicate || form.id.is_empty() {
         if let Some(map) = resource.as_object_mut() {
             map.remove("id");
-            if duplicate && let Some(name) = map.get("name").and_then(serde_json::Value::as_str) {
-                let copy = format!("{name}_copy");
-                map.insert("name".to_string(), serde_json::Value::String(copy));
-            }
         }
         None
     } else {
@@ -5621,7 +6837,7 @@ async fn sql_library_save(
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            axum::response::Redirect::to(&format!("{}?lib={stored_id}&saved=1", kind.base_href))
+            axum::response::Redirect::to(&navigation.saved_href(kind.base_href, "lib", stored_id))
                 .into_response()
         }
         Err(error) => render(
@@ -5641,6 +6857,8 @@ async fn sql_library_save(
 
 #[derive(Default)]
 struct SqlLibRunForm {
+    return_to: String,
+    current_path: String,
     /// The Library id the posted document was opened from, empty for an
     /// unsaved one — only ever used to gate the Export action's `href`
     /// (#839); a stored Library is never read back through it, so a
@@ -5649,9 +6867,10 @@ struct SqlLibRunForm {
     /// The editor's full text, exactly as posted — never reformatted or
     /// re-serialized before either parsing it or embedding `sql` into it.
     json: String,
-    /// The SQL pane's exact posted text, embedded into `json`'s
-    /// `application/sql` attachment the same way Save does
-    /// ([`sql_libraries::embed_sql`]).
+    /// The SQL pane's exact posted text, folded into `json`'s
+    /// `application/sql` attachment the same way Save does — only when
+    /// `json` carries no readable one of its own (#1233,
+    /// [`sql_libraries::fill_sql_attachment`]).
     sql: String,
     /// Every submitted `param:{name}` value (#841), keyed by name.
     values: std::collections::HashMap<String, String>,
@@ -5676,6 +6895,8 @@ fn parse_lib_run_form(body: &[u8]) -> SqlLibRunForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -5761,15 +6982,11 @@ async fn columns_fragment_for_success(
     raw_rows: &[serde_json::Value],
     sql: &str,
     deps: &[sql_libraries::TableDependency],
+    libraries: &[serde_json::Value],
 ) -> ColumnsFragment {
     let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
-    let libraries = state
-        .conformance
-        .fetch("Library", version, tenant)
-        .await
-        .unwrap_or_default();
     let view_definitions =
-        resolve_view_definition_dependencies(state, version, tenant, &used_deps, &libraries).await;
+        resolve_view_definition_dependencies(state, version, tenant, &used_deps, libraries).await;
     let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &view_definitions);
     ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
 }
@@ -5806,6 +7023,7 @@ async fn sql_library_run(
         LibRunNotice::Standard(RunResultsPartial {
             i18n,
             fragment: true,
+            part: RunPart::Both,
             run_href: kind.run_href,
             form_id: LIB_EDITOR_FORM_ID,
             heading_key: kind.results_heading_key,
@@ -5860,6 +7078,13 @@ async fn sql_library_run(
         );
     }
 
+    // #1233: the Details JSON attachment wins over the SQL card — fill in
+    // only when the JSON carries no readable `application/sql` attachment
+    // of its own, once, ahead of every analysis below. `sql` is the
+    // effective SQL this run analyzes and executes from here on.
+    sql_libraries::fill_sql_attachment(&mut resource, &form.sql);
+    let sql = sql_libraries::extract_sql(&resource);
+
     // #841: a SQL View's own profile fixes `Library.parameter` to
     // `0..0` — this kind never declares parameters, so it never builds the
     // Parameters card (`kind.declares_parameters` gates that below) and
@@ -5892,15 +7117,20 @@ async fn sql_library_run(
     // always runs — the run/notice gate below needs its result regardless
     // of whether the card travels.
     let deps = sql_libraries::table_dependencies(&resource);
-    let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+    let unknown_tables = sql_libraries::unknown_tables(&sql, &deps);
     let unknown_names: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
     let tables_signature = sql_libraries::tables_signature_with_unknown(&deps, &unknown_names);
+    // The Library collection is read at most once per request: the Tables
+    // card and the Columns card both resolve against it.
+    let mut libraries: Option<Vec<serde_json::Value>> = None;
     let tables_card = if tables_signature != form.tables_sig {
-        let libraries = state
-            .conformance
-            .fetch("Library", rv.0, &rt.id)
-            .await
-            .unwrap_or_default();
+        let libraries = libraries.insert(
+            state
+                .conformance
+                .fetch("Library", rv.0, &rt.id)
+                .await
+                .unwrap_or_default(),
+        );
         let jobs = sql_export::jobs_for_used_by(&state, &user_key, &rt.id).await;
         let analysis = analyze_tables(
             &state,
@@ -5909,7 +7139,7 @@ async fn sql_library_run(
             &resource,
             &deps,
             &unknown_tables,
-            &libraries,
+            libraries,
             &jobs,
         )
         .await;
@@ -5919,6 +7149,12 @@ async fn sql_library_run(
             analysis,
             table_options_href(&form.id),
             TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
                 oob: true,
                 ..Default::default()
             },
@@ -5943,7 +7179,6 @@ async fn sql_library_run(
     }
 
     if !kind.declares_parameters {
-        sql_libraries::embed_sql(&mut resource, &form.sql);
         let (run_results, columns) =
             match run_sql_preview(&state, &resource, &[], rv.0, &rt.id).await {
                 Ok((table, raw_rows, ms)) => {
@@ -5953,8 +7188,18 @@ async fn sql_library_run(
                         kind = kind.code,
                         "ran a Library preview"
                     );
+                    let libs = match libraries.as_deref() {
+                        Some(libs) => libs,
+                        None => libraries.insert(
+                            state
+                                .conformance
+                                .fetch("Library", rv.0, &rt.id)
+                                .await
+                                .unwrap_or_default(),
+                        ),
+                    };
                     let columns = columns_fragment_for_success(
-                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &form.sql, &deps,
+                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
                     )
                     .await;
                     (standard(RunResultsState::Success(table, ms)), columns)
@@ -5973,7 +7218,7 @@ async fn sql_library_run(
     // #841: SQL Query — declared parameters, undeclared-placeholder hints,
     // and the values/bindings this run supplies, all from one analysis so
     // the signature comparison below and the run itself never disagree.
-    let analysis = analyze_params(&resource, &form.sql, &form.values);
+    let analysis = analyze_params(&resource, &sql, &form.values);
     let oob = analysis.signature != form.params_sig;
 
     let (run_results, columns) = if !analysis.missing_required.is_empty() {
@@ -5985,7 +7230,6 @@ async fn sql_library_run(
             stale_columns(),
         )
     } else {
-        sql_libraries::embed_sql(&mut resource, &form.sql);
         // Borrowed across the `await`, not cloned: `analysis` itself is
         // untouched until after this call returns, so its own `bindings`
         // stay valid for the whole request.
@@ -5997,8 +7241,18 @@ async fn sql_library_run(
                     kind = kind.code,
                     "ran a Library preview"
                 );
+                let libs = match libraries.as_deref() {
+                    Some(libs) => libs,
+                    None => libraries.insert(
+                        state
+                            .conformance
+                            .fetch("Library", rv.0, &rt.id)
+                            .await
+                            .unwrap_or_default(),
+                    ),
+                };
                 let columns = columns_fragment_for_success(
-                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &form.sql, &deps,
+                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
                 )
                 .await;
                 (standard(RunResultsState::Success(table, ms)), columns)
@@ -6028,6 +7282,8 @@ async fn sql_library_run(
 
 #[derive(Default)]
 struct SqlLibDocumentForm {
+    return_to: String,
+    current_path: String,
     id: String,
     json: String,
     sql: String,
@@ -6076,6 +7332,8 @@ fn parse_lib_document_form(body: &[u8]) -> SqlLibDocumentForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -6200,7 +7458,6 @@ async fn document_whole_error_response(
                     signature: String::new(),
                     add_table: form.table.clone(),
                     add_alias: form.table_alias.clone(),
-                    add_open: true,
                     add_error: Some(message),
                     oob: false,
                     data_document: None,
@@ -6216,6 +7473,14 @@ async fn document_whole_error_response(
                 rt,
                 kind,
                 user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
                 form.json.clone(),
                 form.sql.clone(),
                 form.id.is_empty(),
@@ -6282,6 +7547,14 @@ async fn apply_add_parameter(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         updated_pretty,
                         form.sql,
                         form.id.is_empty(),
@@ -6326,6 +7599,14 @@ async fn apply_add_parameter(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         form.json,
                         form.sql,
                         form.id.is_empty(),
@@ -6480,6 +7761,12 @@ async fn apply_add_table(
                     analysis,
                     table_options_href(&form.id),
                     TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
                         // Closed again after a successful add (#842) —
                         // mirrors `apply_add_parameter`'s own rule.
                         add: AddTableFormState::default(),
@@ -6497,6 +7784,14 @@ async fn apply_add_table(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         updated_pretty,
                         form.sql,
                         form.id.is_empty(),
@@ -6537,6 +7832,12 @@ async fn apply_add_table(
                     analysis,
                     table_options_href(&form.id),
                     TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
                         add,
                         oob: false,
                         data_document: None,
@@ -6552,6 +7853,14 @@ async fn apply_add_table(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         form.json,
                         form.sql,
                         form.id.is_empty(),
@@ -6609,6 +7918,12 @@ async fn apply_remove_table(
             analysis,
             table_options_href(&form.id),
             TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
                 data_document: Some(updated_pretty),
                 ..Default::default()
             },
@@ -6623,6 +7938,14 @@ async fn apply_remove_table(
                 rt,
                 kind,
                 user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
                 updated_pretty,
                 form.sql,
                 form.id.is_empty(),
@@ -6726,6 +8049,8 @@ async fn sql_library_document(
     }
 }
 
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_queries_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -6733,18 +8058,23 @@ async fn sql_queries_page(
     rt: RequestTenant,
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
     sql_library_page(
         state,
         locale,
         rv,
         rt,
         query,
+        uri.to_string(),
         &SQL_QUERY_KIND,
         settings,
         user_key,
+        live_filter,
     )
     .await
 }
@@ -6814,6 +8144,8 @@ async fn sql_queries_document(
     .await
 }
 
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_views_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -6821,18 +8153,23 @@ async fn sql_views_page(
     rt: RequestTenant,
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
     sql_library_page(
         state,
         locale,
         rv,
         rt,
         query,
+        uri.to_string(),
         &SQL_VIEW_KIND,
         settings,
         user_key,
+        live_filter,
     )
     .await
 }
@@ -7249,13 +8586,14 @@ async fn compartments_page(
     rt: RequestTenant,
     Query(raw): Query<CompartmentsQuery>,
     settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
     // Explicit ?version= wins; otherwise the user's stored choice (#343).
     let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
     let fhir_version = version
         .as_deref()
         .and_then(search_params::version_from_str)
-        .unwrap_or_default();
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
     if raw.refresh.is_some() {
         state.compartments.invalidate(&rt.id, fhir_version);
     }
@@ -7298,6 +8636,7 @@ async fn compartments_page(
             i18n: I18n::new(locale),
             active_page: "compartments",
             view,
+            editor_return_to: uri.to_string(),
         }),
         // No definitions means the self-fetch degraded (an outage, or auth
         // without an outbound token, #320) â€” a warning, not a 404. The failed
@@ -7306,6 +8645,8 @@ async fn compartments_page(
             status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "compartments",
+            unsupported: state.compartments.listing_unsupported(&rt.id, fhir_version),
+            empty: state.compartments.listing_empty(&rt.id, fhir_version),
         }),
     }
 }
@@ -7336,6 +8677,7 @@ async fn status(
                 0,
                 rv.0,
                 &rt,
+                dashboard_refresh(),
             )
             .await,
         )
@@ -7420,17 +8762,170 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
 /// out.
 const DASH_PENDING_RETRIES: u32 = 3;
 
+/// The Home dashboard's refresh cadences (#1078), in whole seconds.
+///
+/// **Process-wide**: installed once at startup with [`set_dashboard_refresh`]
+/// (the server passes `HFS_DASHBOARD_REFRESH_SECS` /
+/// `HFS_DASHBOARD_IDLE_REFRESH_SECS`), the same way the dashboard provider is
+/// installed with `helios_observability::dashboard::set_provider`, so the
+/// mount functions' signatures do not carry it. A process that never installs
+/// one renders the [`Default`] cadences. Zero is clamped to one second when a
+/// page renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DashboardRefresh {
+    /// Seconds between two refreshes of a dashboard whose figures are still
+    /// moving — approximate, or with an import running. Default `5`.
+    ///
+    /// Unlike the bounded pending retry this poll is not bounded by a count:
+    /// what it re-reads is the in-memory counter snapshot (constant time, no
+    /// storage scan), which the snapshot cache keeps for at most a couple of
+    /// seconds, so it cannot add to the load an import puts on storage, and it
+    /// stops as soon as the server renders the page without it. Five seconds
+    /// keeps the figures visibly climbing during an import.
+    pub moving_secs: u32,
+    /// Seconds between two watch ticks of a dashboard whose figures are
+    /// settled: exact, and no import running. Default `10`.
+    ///
+    /// Without it a tab opened before an import starts never learns the
+    /// import began — the page it was given has nothing moving to follow. Ten
+    /// seconds notices an import soon after it starts; a tick whose figures
+    /// did not change is not swapped in, so a quiet page stays still. It
+    /// should not be shorter than [`Self::moving_secs`]: a settled page has
+    /// less reason to poll than a moving one.
+    pub settled_secs: u32,
+}
+
+impl Default for DashboardRefresh {
+    fn default() -> Self {
+        Self {
+            moving_secs: 5,
+            settled_secs: 10,
+        }
+    }
+}
+
+impl DashboardRefresh {
+    /// The cadence a page renders with: the moving one while its figures
+    /// move, the settled one otherwise, never below one second.
+    fn secs(self, moving: bool) -> u32 {
+        let secs = if moving {
+            self.moving_secs
+        } else {
+            self.settled_secs
+        };
+        secs.max(1)
+    }
+}
+
+static DASHBOARD_REFRESH: RwLock<Option<DashboardRefresh>> = RwLock::new(None);
+
+/// Install (or replace) the process-wide Home dashboard refresh cadences
+/// (#1078). Called once from the server's startup before the UI is mounted;
+/// the most recent call wins, and every later page render reads it.
+pub fn set_dashboard_refresh(refresh: DashboardRefresh) {
+    match DASHBOARD_REFRESH.write() {
+        Ok(mut guard) => *guard = Some(refresh),
+        Err(poisoned) => *poisoned.into_inner() = Some(refresh),
+    }
+}
+
+/// The installed cadences, or the defaults when none were installed (or the
+/// lock was poisoned).
+fn dashboard_refresh() -> DashboardRefresh {
+    DASHBOARD_REFRESH
+        .read()
+        .ok()
+        .and_then(|guard| *guard)
+        .unwrap_or_default()
+}
+
+static BEARER_ONLY_AUTH: RwLock<bool> = RwLock::new(false);
+
+/// Record whether the server runs with authentication enabled and no
+/// interactive login installed (#1560). Called once from the server's
+/// startup next to [`set_interactive_login`]; the most recent call wins, and
+/// every later page render reads it for the shell's notice.
+pub fn set_bearer_only_auth(bearer_only: bool) {
+    *BEARER_ONLY_AUTH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = bearer_only;
+}
+
+fn bearer_only_auth() -> bool {
+    *BEARER_ONLY_AUTH
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A short digest of the figures a dashboard render shows, carried on
+/// `#dash-live` as `data-dash-state` (#1078).
+///
+/// Covers what the region renders from the snapshot — totals, the picker's
+/// type counts, every plotted point, job counts, which [`Figures`] variant it
+/// is — plus the requested selection, but not the variant's timestamps (the
+/// "as of" time), so two renders of the same figures digest the same and a
+/// watch tick can be dropped. The current
+/// minute is folded in so a settled page still re-renders at most once a
+/// minute, keeping the uptime card and the 1h axis current.
+fn dash_state(
+    snapshot: &DashboardSnapshot,
+    types: &[String],
+    all_types: bool,
+    now: DateTime<Utc>,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    snapshot.window.as_str().hash(&mut hasher);
+    types.hash(&mut hasher);
+    all_types.hash(&mut hasher);
+    snapshot.total_resources.hash(&mut hasher);
+    snapshot.distinct_types.hash(&mut hasher);
+    for entry in &snapshot.available {
+        entry.resource_type.hash(&mut hasher);
+        entry.total.hash(&mut hasher);
+    }
+    for series in &snapshot.series {
+        series.resource_type.hash(&mut hasher);
+        series.total.hash(&mut hasher);
+        // History arriving changes how the line is drawn even when every
+        // point keeps its value (nothing written in the window), so it must
+        // change the digest too (#1603).
+        series
+            .recorded_from
+            .map(|t| t.timestamp())
+            .hash(&mut hasher);
+        for point in &series.points {
+            point.bucket_start.timestamp().hash(&mut hasher);
+            point.delta.hash(&mut hasher);
+            point.cumulative.hash(&mut hasher);
+        }
+    }
+    snapshot
+        .export_jobs
+        .map(|jobs| (jobs.running, jobs.queued))
+        .hash(&mut hasher);
+    snapshot.import_jobs_active.hash(&mut hasher);
+    snapshot.reindex_active.hash(&mut hasher);
+    std::mem::discriminant(&snapshot.figures).hash(&mut hasher);
+    (now.timestamp() / 60).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Assembles the landing page from the live dashboard snapshot.
 ///
 /// Three outcomes, three pages (#956):
 ///
-/// - [`SnapshotState::Ready`] renders the figures, flagged as incomplete when
-///   the provider had to fill part of the snapshot in
-///   ([`DashboardSnapshot::partial`]).
-/// - [`SnapshotState::Pending`] — a provider is registered, this window's
-///   snapshot is still computing — renders an explicit waiting state: no
-///   chart, no headline figures, and a retry. Every window switch is a cold
-///   cache key, so this is an ordinary path, not an error.
+/// - [`SnapshotState::Ready`] with figures ([`Figures::Exact`] or
+///   [`Figures::Approximate`]) renders them, dated by their "as of" time and
+///   labelled approximate when they are not an exact storage match (#1078).
+///   With [`Figures::Pending`] — the provider is still seeding the tenant — it
+///   renders the waiting page below, which keeps a slow watch once its retries
+///   are spent. [`Figures::Unsupported`] renders unknown figures, the
+///   unsupported-backend notice, and never polls.
+/// - [`SnapshotState::Pending`] — a provider is registered, nothing is cached
+///   for the tenant yet — renders an explicit waiting state: no chart, no
+///   headline figures, and a bounded retry with no slow watch after it.
 /// - [`SnapshotState::NoProvider`] — the build genuinely has no metrics —
 ///   renders the placeholder snapshot, labelled as invented (#555).
 ///
@@ -7447,6 +8942,7 @@ async fn build_index_page(
     retry: u32,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
+    refresh: DashboardRefresh,
 ) -> IndexPage {
     let status = current_status(state, fhir_version, tenant);
     let i18n = I18n::new(locale);
@@ -7454,41 +8950,107 @@ async fn build_index_page(
         helios_observability::dashboard::snapshot_state(window, &tenant.id, &types, all_types)
             .await;
 
-    let (notice, snapshot) = match live {
-        SnapshotState::Ready(s) if s.partial => (DashboardNotice::Partial, s),
-        SnapshotState::Ready(s) => (DashboardNotice::None, s),
+    let notice = dashboard_notice(&live, Utc::now());
+    let ready = matches!(live, SnapshotState::Ready(_));
+    let unsupported = matches!(&live, SnapshotState::Ready(s) if s.figures == Figures::Unsupported);
+    // No figure is known yet: the cache's own cold state, or a provider still
+    // seeding the tenant (#1078).
+    let chart_waiting = notice.kind.is_waiting();
+
+    let snapshot = match live {
+        SnapshotState::Ready(mut s) => {
+            if !s.figures.is_known() {
+                // Never chart anything from a snapshot that measured nothing.
+                s.series.clear();
+            }
+            s
+        }
         // Nothing measured yet: an empty snapshot, so every figure renders as
         // unknown rather than as a number.
-        SnapshotState::Pending => (
-            DashboardNotice::Pending,
-            DashboardSnapshot {
-                window,
-                ..Default::default()
-            },
-        ),
-        SnapshotState::NoProvider => (DashboardNotice::Sample, sample_snapshot(window)),
+        SnapshotState::Pending => DashboardSnapshot {
+            window,
+            figures: Figures::Pending,
+            ..Default::default()
+        },
+        SnapshotState::NoProvider => sample_snapshot(window),
     };
 
-    let mut dash = build_dashboard(&snapshot, all_types, &spec_types, focus.as_deref());
-    if notice.is_pending() {
-        // The pending snapshot plots nothing, so the selectors it derived
-        // point at an empty charted set. Rebuild the two that must survive
+    let mut dash = build_dashboard(
+        &snapshot,
+        all_types,
+        &spec_types,
+        focus.as_deref(),
+        &i18n.lang(),
+    );
+    if chart_waiting {
+        // The waiting snapshot plots nothing, so the selectors it derived
+        // point at an empty charted set. Rebuild the ones that must survive
         // the wait from what was actually requested, or the retry would come
         // back with the user's type selection silently dropped.
         dash.windows = window_entries(&types, window, all_types, focus.as_deref());
         dash.all_types_href = dash_href(&types, window, !all_types, focus.as_deref());
-        // No figure is known yet, and a zero here reads as a measurement.
+        dash.picker = picker_entries(
+            &snapshot.available,
+            all_types,
+            &spec_types,
+            &types,
+            window,
+            focus.as_deref(),
+            &i18n.lang(),
+        );
+    }
+    if chart_waiting || unsupported {
+        // No figure is known yet at all — or none can ever be measured here.
+        // Either way a zero would read as a measurement.
         dash.metrics.resource_types = None;
         dash.metrics.stored_resources = None;
         dash.metrics.chart_total = None;
     }
 
     // The same view again, one attempt further in. Built from the requested
-    // types rather than the plotted ones: while pending there are none.
+    // types rather than the plotted ones: while waiting there are none.
     let retry_base = dash_href(&types, window, all_types, focus.as_deref());
     let retry_href = format!("{retry_base}&retry={}", retry.saturating_add(1));
     let auto_retry_href =
-        (notice.is_pending() && retry < DASH_PENDING_RETRIES).then(|| retry_href.clone());
+        (chart_waiting && retry < DASH_PENDING_RETRIES).then(|| retry_href.clone());
+    // Item 4 of #1078: a page waiting on a provider that did answer (still
+    // seeding the tenant) must not go dead once the fast retries
+    // are spent — the figures are on their way and nothing else would fetch
+    // them. It keeps a slow watch at the settled cadence instead, whose href
+    // keeps the spent count so the server answers with the watch again rather
+    // than restarting the fast retries. The cache's own cold `Pending` keeps
+    // only the bounded retry: a server too busy to fill it is not polled.
+    let slow_watch = ready && chart_waiting && retry >= DASH_PENDING_RETRIES;
+    // Figures that are here but still moving follow themselves (#1078): the
+    // counter-backed snapshot is read in constant time, so this poll adds no
+    // storage load, and it ends by itself once the figures are exact and no
+    // import is running. Never on a waiting page (that one is bounded above)
+    // and never on the no-provider sample, which has nothing live to follow.
+    //
+    // Settled figures are watched too, only slower: a tab opened before an
+    // import starts must notice it without a reload, and the server alone
+    // knows when that happens. A watch tick whose figures did not change is
+    // answered `204` by [`index`] (same `refresh_state`), so an idle page is
+    // not re-rendered under the user.
+    //
+    // A backend that cannot count has nothing to follow at all, so it is
+    // neither retried nor watched.
+    let live_refresh = ready && !chart_waiting && !unsupported;
+    let refresh_moving = live_refresh
+        && (snapshot.figures.is_approximate()
+            || snapshot.import_jobs_active.is_some_and(|n| n > 0)
+            // Only a running rebuild moves; a failed one is a settled fact.
+            || snapshot
+                .reindex_active
+                .as_ref()
+                .is_some_and(ReindexActivity::is_running));
+    let refresh_href = if slow_watch {
+        Some(format!("{retry_base}&retry={DASH_PENDING_RETRIES}"))
+    } else {
+        live_refresh.then(|| retry_base.clone())
+    };
+    let refresh_secs = refresh.secs(refresh_moving);
+    let refresh_state = dash_state(&snapshot, &types, all_types, Utc::now());
 
     IndexPage {
         status,
@@ -7500,11 +9062,47 @@ async fn build_index_page(
         all_types: dash.all_types,
         all_types_href: dash.all_types_href,
         notice,
+        rebuild: snapshot.reindex_active.clone(),
+        chart_waiting,
+        chart_unsupported: unsupported,
+        figures_unknown_key: if unsupported {
+            "chart-counts-unsupported"
+        } else {
+            "chart-pending-empty"
+        },
         retry_href,
         auto_retry_href,
+        refresh_href,
+        refresh_waiting: slow_watch,
+        dash_ctx: dash_ctx(tenant, fhir_version, locale),
+        refresh_secs,
+        refresh_moving,
+        refresh_state,
+        quiet_notices: Vec::new(),
+        pick_open: false,
+        pick_preserve: false,
+        table_open: false,
         i18n,
         active_page: "home",
     }
+}
+
+/// The context a dashboard render belongs to — `tenant|FHIR version|locale` —
+/// carried on `#dash-live` as `data-dash-ctx` and sent back by every request
+/// the region makes as `ctx` (#1078). The `/ui` handler compares it with the
+/// context it resolves now, so a tab whose tenant, version or language changed
+/// in another tab reloads instead of swapping in figures from the other one.
+fn dash_ctx(
+    tenant: &RequestTenant,
+    fhir_version: helios_fhir::FhirVersion,
+    locale: RequestLocale,
+) -> String {
+    format!(
+        "{}|{}|{}",
+        tenant.id,
+        fhir_version.as_str(),
+        I18n::new(locale).lang()
+    )
 }
 
 /// Everything `build_dashboard` hands the landing page.
@@ -7584,6 +9182,7 @@ fn build_dashboard(
     all_types: bool,
     spec_types: &[String],
     focus: Option<&str>,
+    lang: &str,
 ) -> DashboardView {
     let charted: Vec<String> = snapshot
         .series
@@ -7595,7 +9194,7 @@ fn build_dashboard(
     // in the query renders the ordinary unfocused view.
     let focus = focus.filter(|f| charted.iter().any(|c| c == f));
 
-    let mut chart = build_chart(&snapshot.series, snapshot.window, focus);
+    let mut chart = build_chart(&snapshot.series, snapshot.window, focus, lang);
 
     // The plotted lines carry the same focus links as their legend entries
     // (#602): clicking a line focuses its series, clicking the focused one
@@ -7611,11 +9210,90 @@ fn build_dashboard(
         }
     }
 
+    let picker = picker_entries(
+        &snapshot.available,
+        all_types,
+        spec_types,
+        &charted,
+        snapshot.window,
+        focus,
+        lang,
+    );
+
+    // The legend names each plotted series; while more than one is plotted,
+    // an entry links to focusing that series â€” or back out of the focus when
+    // it already holds it (#602). Removal lives in the picker.
+    let legend = snapshot
+        .series
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let focused = focus == Some(s.resource_type.as_str());
+            let href = (snapshot.series.len() > 1).then(|| {
+                let target = if focused {
+                    None
+                } else {
+                    Some(s.resource_type.as_str())
+                };
+                dash_href(&charted, snapshot.window, all_types, target)
+            });
+            LegendEntry {
+                resource_type: s.resource_type.clone(),
+                total: grouped(s.total, lang),
+                color: i % SERIES_COLORS + 1,
+                href,
+                focused,
+                partial: s.recorded_from.is_some(),
+            }
+        })
+        .collect();
+
+    let windows = window_entries(&charted, snapshot.window, all_types, focus);
+
+    let metrics = DashboardMetrics {
+        resource_types: Some(grouped(snapshot.distinct_types as u64, lang)),
+        stored_resources: Some(compact_count(snapshot.total_resources, lang)),
+        export_jobs: snapshot.export_jobs,
+        import_jobs: snapshot.import_jobs_active,
+        uptime: format_uptime(helios_observability::uptime::uptime_seconds()),
+        chart_total: {
+            let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
+            Some(grouped(sum, lang))
+        },
+    };
+
+    DashboardView {
+        metrics,
+        chart,
+        legend,
+        picker,
+        windows,
+        all_types,
+        all_types_href: dash_href(&charted, snapshot.window, !all_types, focus),
+    }
+}
+
+/// The chart's type picker: one toggle per option, checked for the types in
+/// `charted`.
+///
+/// Separate from `build_dashboard` for the same reason as [`window_entries`]:
+/// while the chart waits (#956, #1078) nothing is plotted, so the checked
+/// state and every toggle link have to come from the *requested* types, or
+/// picking a type while waiting would drop the rest of the selection.
+fn picker_entries(
+    available: &[TypeCount],
+    all_types: bool,
+    spec_types: &[String],
+    charted: &[String],
+    window: DashboardWindow,
+    focus: Option<&str>,
+    lang: &str,
+) -> Vec<PickerEntry> {
     // The picker's option list: the tenant's stored types (largest first,
     // from the provider), plus â€” with `all_types` â€” every other type of the
     // active FHIR version, at 0, alphabetically after (never duplicating a
     // type the provider already listed).
-    let mut options: Vec<TypeCount> = snapshot.available.clone();
+    let mut options: Vec<TypeCount> = available.to_vec();
     if all_types {
         let stored: std::collections::HashSet<&str> =
             options.iter().map(|t| t.resource_type.as_str()).collect();
@@ -7632,7 +9310,7 @@ fn build_dashboard(
     }
 
     // Each option toggles membership.
-    let picker = options
+    options
         .iter()
         .map(|t| {
             let selected = charted.contains(&t.resource_type);
@@ -7655,65 +9333,14 @@ fn build_dashboard(
             };
             PickerEntry {
                 resource_type: t.resource_type.clone(),
-                total: grouped(t.total),
+                total: grouped(t.total, lang),
                 // dash_href drops the focus itself if this toggle removes
                 // the focused type.
-                href: dash_href(&toggled, snapshot.window, all_types, focus),
+                href: dash_href(&toggled, window, all_types, focus),
                 selected,
             }
         })
-        .collect();
-
-    // The legend names each plotted series; while more than one is plotted,
-    // an entry links to focusing that series â€” or back out of the focus when
-    // it already holds it (#602). Removal lives in the picker.
-    let legend = snapshot
-        .series
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let focused = focus == Some(s.resource_type.as_str());
-            let href = (snapshot.series.len() > 1).then(|| {
-                let target = if focused {
-                    None
-                } else {
-                    Some(s.resource_type.as_str())
-                };
-                dash_href(&charted, snapshot.window, all_types, target)
-            });
-            LegendEntry {
-                resource_type: s.resource_type.clone(),
-                total: grouped(s.total),
-                color: i % SERIES_COLORS + 1,
-                href,
-                focused,
-            }
-        })
-        .collect();
-
-    let windows = window_entries(&charted, snapshot.window, all_types, focus);
-
-    let metrics = DashboardMetrics {
-        resource_types: Some(snapshot.distinct_types.to_string()),
-        stored_resources: Some(compact_count(snapshot.total_resources)),
-        export_jobs: snapshot.export_jobs,
-        import_jobs: snapshot.import_jobs_active,
-        uptime: format_uptime(helios_observability::uptime::uptime_seconds()),
-        chart_total: {
-            let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
-            Some(grouped(sum))
-        },
-    };
-
-    DashboardView {
-        metrics,
-        chart,
-        legend,
-        picker,
-        windows,
-        all_types,
-        all_types_href: dash_href(&charted, snapshot.window, !all_types, focus),
-    }
+        .collect()
 }
 
 // Chart plot area within the `0 0 1060 H` viewBox: the value axis occupies the
@@ -7736,7 +9363,12 @@ const CHART_MAX_SERIES: usize = 6;
 /// re-fits the focused series so a small type is legible next to a large one;
 /// the other series stay plotted at their true values, receded, and the plot
 /// clip-path cuts them where they exceed the focused scale.
-fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&str>) -> ChartView {
+fn build_chart(
+    all: &[DashboardSeries],
+    window: DashboardWindow,
+    focus: Option<&str>,
+    lang: &str,
+) -> ChartView {
     let height = CHART_HEIGHT;
     let plot_bottom = height - 22;
     let plotted: Vec<&DashboardSeries> = all.iter().filter(|s| !s.points.is_empty()).collect();
@@ -7756,11 +9388,30 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
         n => format!("{} +{}", plotted[0].resource_type, n - 1),
     };
 
+    // Where each series' measurements begin (#1603): the index of the bucket
+    // holding `recorded_from`, or 0 when the whole window is history. Points
+    // before it are not drawn, tipped or tabled.
+    let bucket = window.bucket_seconds();
+    let known_from: Vec<usize> = plotted
+        .iter()
+        .map(|s| match s.recorded_from {
+            None => 0,
+            Some(from) => {
+                let floor = from.timestamp() - from.timestamp().rem_euclid(bucket);
+                // At least the current point is always a measurement.
+                s.points
+                    .iter()
+                    .position(|p| p.bucket_start.timestamp() >= floor)
+                    .unwrap_or(s.points.len() - 1)
+            }
+        })
+        .collect();
+
     if plotted.is_empty() {
         return ChartView {
             has_data: false,
             series: Vec::new(),
-            y_ticks: y_axis_ticks(0, height, plot_bottom),
+            y_ticks: y_axis_ticks(0, height, plot_bottom, lang),
             x_ticks: Vec::new(),
             height,
             tip_json: "{}".to_string(),
@@ -7780,8 +9431,9 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
     // unless a series is focused, in which case the axis fits that series.
     let peak = plotted
         .iter()
-        .filter(|s| focus.is_none() || focus == Some(s.resource_type.as_str()))
-        .flat_map(|s| s.points.iter().map(|p| p.cumulative))
+        .zip(&known_from)
+        .filter(|(s, _)| focus.is_none() || focus == Some(s.resource_type.as_str()))
+        .flat_map(|(s, &from)| s.points[from..].iter().map(|p| p.cumulative))
         .max()
         .unwrap_or(0);
     let axis_max = nice_ceil(peak).max(1);
@@ -7798,26 +9450,34 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
 
     let series: Vec<ChartSeriesView> = plotted
         .iter()
+        .zip(&known_from)
         .enumerate()
-        .map(|(si, s)| ChartSeriesView {
-            resource_type: s.resource_type.clone(),
-            color: si % SERIES_COLORS + 1,
-            polyline: s
-                .points
-                .iter()
-                .enumerate()
-                .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
-                .collect::<Vec<_>>()
-                .join(" "),
-            emphasis: match focus {
-                None => "",
-                Some(f) if f == s.resource_type => " series--focused",
-                Some(_) => " series--receded",
-            },
-            // build_dashboard fills the focus link in; geometry stays the
-            // only concern here.
-            href: None,
-            focused: focus == Some(s.resource_type.as_str()),
+        .map(|(si, (s, &from))| {
+            let last = s.points.len() - 1;
+            ChartSeriesView {
+                resource_type: s.resource_type.clone(),
+                color: si % SERIES_COLORS + 1,
+                polyline: s
+                    .points
+                    .iter()
+                    .enumerate()
+                    .skip(from)
+                    .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                emphasis: match focus {
+                    None => "",
+                    Some(f) if f == s.resource_type => " series--focused",
+                    Some(_) => " series--receded",
+                },
+                // build_dashboard fills the focus link in; geometry stays the
+                // only concern here.
+                href: None,
+                focused: focus == Some(s.resource_type.as_str()),
+                partial: s.recorded_from.is_some(),
+                end_x: x_at(last as i64),
+                end_y: y_at(s.points[last].cumulative),
+            }
         })
         .collect();
 
@@ -7844,10 +9504,14 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
                 label,
                 values: plotted
                     .iter()
-                    .map(|s| {
+                    .zip(&known_from)
+                    .map(|(s, &from)| {
+                        if (idx as usize) < from {
+                            return UNMEASURED.to_string();
+                        }
                         s.points
                             .get(idx as usize)
-                            .map(|p| grouped(p.cumulative))
+                            .map(|p| grouped(p.cumulative, lang))
                             .unwrap_or_default()
                     })
                     .collect(),
@@ -7865,12 +9529,19 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
         "xs": (0..n).map(&x_at).collect::<Vec<_>>(),
         "series": plotted
             .iter()
+            .zip(&known_from)
             .enumerate()
-            .map(|(si, s)| serde_json::json!({
+            .map(|(si, (s, &from))| serde_json::json!({
                 "type": s.resource_type,
                 "color": si % SERIES_COLORS + 1,
-                "values": s.points.iter().map(|p| p.cumulative).collect::<Vec<_>>(),
-                "ys": s.points.iter().map(|p| y_at(p.cumulative)).collect::<Vec<_>>(),
+                // `null` before the series' measurements begin (#1603); the
+                // script shows a dash there, never a number.
+                "values": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then_some(p.cumulative))
+                    .collect::<Vec<_>>(),
+                "ys": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then(|| y_at(p.cumulative)))
+                    .collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
     })
@@ -7879,7 +9550,7 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
     ChartView {
         has_data,
         series,
-        y_ticks: y_axis_ticks(axis_max, height, plot_bottom),
+        y_ticks: y_axis_ticks(axis_max, height, plot_bottom, lang),
         x_ticks,
         height,
         tip_json,
@@ -7889,15 +9560,19 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
     }
 }
 
+/// What the chart's table shows for a bucket a series has no measurement
+/// for (#1603): a dash, never a number.
+const UNMEASURED: &str = "—";
+
 /// Five horizontal value gridlines from `axis_max` (top) down to `0` (bottom).
-fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64) -> Vec<AxisTick> {
+fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64, lang: &str) -> Vec<AxisTick> {
     let plot_height = plot_bottom - PLOT_TOP;
     (0..=4i64)
         .map(|k| {
             let value = axis_max * (4 - k) as u64 / 4;
             let pos = PLOT_TOP + plot_height * k / 4;
             AxisTick {
-                label: compact_count(value),
+                label: compact_count(value, lang),
                 pos,
                 // Nudge the label baseline down so it centres on the gridline.
                 label_y: pos + 3,
@@ -7920,29 +9595,24 @@ fn nice_ceil(n: u64) -> u64 {
 }
 
 /// Compact count for axis labels and the stat card: `61 400 -> "61.4k"`,
-/// `2 000 -> "2.0k"`, `1 500 000 -> "1.5M"`, small values verbatim.
-fn compact_count(n: u64) -> String {
+/// `2 000 -> "2.0k"`, `1 500 000 -> "1.5M"`, small values verbatim — with
+/// the locale's decimal separator (`"61,4k"` in German and Spanish).
+fn compact_count(n: u64, lang: &str) -> String {
+    use helios_ui_chrome::number::decimal;
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        format!("{}M", decimal(n as f64 / 1_000_000.0, 1, lang))
     } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
+        format!("{}k", decimal(n as f64 / 1_000.0, 1, lang))
     } else {
         n.to_string()
     }
 }
 
-/// Thousands-separated integer for prominent totals: `1204 -> "1,204"`.
-pub(crate) fn grouped(n: u64) -> String {
-    let digits = n.to_string();
-    let bytes = digits.as_bytes();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
+/// Thousands-separated integer for prominent totals, the way the locale
+/// writes it: `1204 -> "1,204"` in English, `"1.204"` in German (#1125).
+/// For a handler that holds a lang tag rather than an [`I18n`].
+pub(crate) fn grouped(n: u64, lang: &str) -> String {
+    helios_ui_chrome::number::integer(n, lang)
 }
 
 /// A compact x-axis label for a bucket: a UTC clock time (`"14:30"`) when the
@@ -8004,6 +9674,7 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
             resource_type: resource_type.to_string(),
             total: cumulative,
             points,
+            recorded_from: None,
         }
     };
 
@@ -8031,10 +9702,51 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         available,
         export_jobs: None,
         import_jobs_active: None,
-        // Wholly invented rather than partly missing: the page says so with
-        // the sample-data notice, which `partial` must not water down (#956).
-        partial: false,
+        reindex_active: None,
+        // Invented figures take the same rendering path as measured ones, so
+        // they carry figures. Nothing reads this time: a no-provider render's
+        // notice is the undated sample-data line, which says the figures are
+        // invented (#956).
+        figures: Figures::Exact {
+            read_at: Utc::now(),
+        },
     }
+}
+
+#[test]
+fn rail_counts_are_shown_only_for_known_figures() {
+    // Exact figures hand their per-type counts to the rail.
+    let exact = sample_snapshot(DashboardWindow::default());
+    assert!(
+        rail_counts(&Some(exact.clone()))
+            .is_some_and(|c| !c.available.is_empty() && !c.approximate),
+        "exact figures should expose their counts, as exact"
+    );
+
+    // Approximate counts are still shown, marked as such (#1078).
+    let read_at = Utc::now();
+    let approximate = DashboardSnapshot {
+        figures: Figures::Approximate {
+            read_at,
+            reconciled_at: read_at - Duration::minutes(1),
+        },
+        ..exact.clone()
+    };
+    assert!(rail_counts(&Some(approximate)).is_some_and(|c| c.approximate));
+
+    // No figures to give — the tenant still being seeded, or a backend that
+    // cannot count — shows no count rather than zeros (#1065, #1078), whatever
+    // `available` happens to hold.
+    for figures in [Figures::Pending, Figures::Unsupported] {
+        let unknown = DashboardSnapshot {
+            figures,
+            ..exact.clone()
+        };
+        assert!(rail_counts(&Some(unknown)).is_none(), "{figures:?}");
+    }
+
+    // No provider at all: nothing to show.
+    assert!(rail_counts(&None).is_none());
 }
 
 /// Floors `ts` to the start of the epoch-aligned bucket containing it. Mirrors
@@ -8062,6 +9774,8 @@ pub(crate) fn current_status(
         tenant_display: tenant.display.clone(),
         show_tenant_picker: tenant.multi,
         terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
+        user: UserSummary::from_session(tenant.signed_in.as_ref()),
+        bearer_only_auth: bearer_only_auth(),
     }
 }
 
@@ -8111,6 +9825,34 @@ pub(crate) fn render_not_found(
         back_label: back_label.into(),
     };
     (StatusCode::NOT_FOUND, render(page)).into_response()
+}
+
+/// Renders a failed self-call to HFS with its cause. `reqwest::Error`'s
+/// `Display` stops at the URL — `error sending request for url (...)` — and
+/// hides the reason in `source()`, which made a timeout, a refused
+/// connection, and a reset read byte-identically (#957).
+///
+/// A timeout is the one cause worth naming outright, because it is the only
+/// one the user can act on by waiting: `timeout_secs` is the cap this
+/// particular call gave the server, and `timeout_hint` says why that call can
+/// legitimately run long. Every other cause is the `Display` text with its
+/// `source()` chain appended, colon-separated (#1185).
+pub(crate) fn upstream_failure_detail(
+    e: &reqwest::Error,
+    timeout_secs: u64,
+    timeout_hint: &str,
+) -> String {
+    if e.is_timeout() {
+        return format!("timed out after {timeout_secs}s — {timeout_hint}");
+    }
+    let mut detail = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    detail
 }
 
 fn unix_timestamp_seconds() -> u64 {
@@ -8173,8 +9915,10 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         );
         IndexPage {
+            rebuild: None,
             status: Status {
                 version,
                 checked_at,
@@ -8183,6 +9927,8 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
+                user: None,
+                bearer_only_auth: false,
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -8191,9 +9937,22 @@ mod tests {
             windows: dash.windows,
             all_types: dash.all_types,
             all_types_href: dash.all_types_href,
-            notice: DashboardNotice::Sample,
+            notice: dashboard_notice(&SnapshotState::NoProvider, Utc::now()),
+            chart_waiting: false,
+            chart_unsupported: false,
+            figures_unknown_key: "chart-pending-empty",
             retry_href: "/ui?types=&window=30d&retry=1".to_string(),
             auto_retry_href: None,
+            refresh_href: None,
+            refresh_waiting: false,
+            dash_ctx: "default|R4|en".to_string(),
+            refresh_secs: DashboardRefresh::default().moving_secs,
+            refresh_moving: false,
+            refresh_state: String::new(),
+            quiet_notices: Vec::new(),
+            pick_open: false,
+            pick_preserve: false,
+            table_open: false,
             i18n,
             active_page: "home",
         }
@@ -8204,10 +9963,10 @@ mod tests {
     #[test]
     fn legend_focus_rescales_recedes_and_links_back() {
         let snapshot = sample_snapshot(DashboardWindow::default());
-        let unfocused = build_dashboard(&snapshot, false, &[], None);
+        let unfocused = build_dashboard(&snapshot, false, &[], None, "en");
         // Patient is the smallest sample series, so focusing it must lower
         // the axis ceiling relative to the shared (Observation-driven) scale.
-        let dash = build_dashboard(&snapshot, false, &[], Some("Patient"));
+        let dash = build_dashboard(&snapshot, false, &[], Some("Patient"), "en");
 
         assert_eq!(dash.chart.series.len(), unfocused.chart.series.len());
         for s in &dash.chart.series {
@@ -8251,13 +10010,13 @@ mod tests {
         assert!(line(&dash, "Observation").contains("focus=Observation"));
 
         // A focus that names an uncharted type renders the ordinary view.
-        let bogus = build_dashboard(&snapshot, false, &[], Some("Nope"));
+        let bogus = build_dashboard(&snapshot, false, &[], Some("Nope"), "en");
         assert!(bogus.chart.series.iter().all(|s| s.emphasis.is_empty()));
 
         // The focus link keeps "View all resources" on too (#599 + #602
         // interaction): a focus click while `?all=1` is active must not drop
         // the flag.
-        let with_all_types = build_dashboard(&snapshot, true, &[], Some("Patient"));
+        let with_all_types = build_dashboard(&snapshot, true, &[], Some("Patient"), "en");
         let all_types_entry = with_all_types
             .legend
             .iter()
@@ -8356,6 +10115,8 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
+                user: None,
+                bearer_only_auth: false,
             },
             i18n: i18n("en"),
         }
@@ -8386,6 +10147,13 @@ mod tests {
         assert!(Assets::get("fonts/figtree-latin.woff2").is_some());
         assert!(Assets::get("fonts/figtree-latin-ext.woff2").is_some());
         assert!(Assets::get("logo.png").is_some());
+    }
+
+    /// #1240: the shared unsaved-changes tracker (`window.HfsUnsaved`),
+    /// loaded from the layout like every other shared helper.
+    #[test]
+    fn unsaved_helper_is_embedded() {
+        assert!(Assets::get("unsaved.js").is_some());
     }
 
     /// #753: the CodeMirror 6 + lezer-fhirpath vendoring ritual's
@@ -8484,6 +10252,14 @@ mod tests {
         assert!(Assets::get("code-editor.js").is_some());
     }
 
+    /// #1239: `editor-add.js`, the "+ Add Element" picker module shared by
+    /// the three editor hosts (the standalone editor, the Resources modal and
+    /// the `pane=form` guided form), is embedded like every other page script.
+    #[test]
+    fn editor_add_helper_script_is_embedded() {
+        assert!(Assets::get("editor-add.js").is_some());
+    }
+
     /// The theme script persists the choice to the per-user settings document
     /// (#197): it must read the document on load and merge-patch `theme` on
     /// toggle, with localStorage kept as the first-paint cache. Guards the
@@ -8499,10 +10275,33 @@ mod tests {
     }
 
     #[test]
-    fn queries_page_renders_shell_and_marks_nav_current() {
+    fn rail_counts_are_grouped_for_the_locale() {
+        let resource_types = vec!["Observation".to_string(), "Patient".to_string()];
+        let available = vec![TypeCount {
+            resource_type: "Observation".to_string(),
+            total: 70_048,
+        }];
+        let counts = || {
+            Some(RailCounts {
+                available: &available,
+                approximate: false,
+            })
+        };
+        let count_of = |lang: &str| {
+            build_rail_entries("/ui/resources", &resource_types, counts(), None, lang)
+                .into_iter()
+                .map(|e| e.count)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(count_of("en"), [Some("70,048".into()), Some("0".into())]);
+        assert_eq!(count_of("de"), [Some("70.048".into()), Some("0".into())]);
+        assert_eq!(count_of("es"), [Some("70.048".into()), Some("0".into())]);
+    }
+
+    fn render_search_page(lang: &str) -> String {
         let resource_types = vec!["Patient".to_string(), "Observation".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None);
-        let html = QueriesPage {
+        let rail_entries = build_rail_entries("/ui/search", &resource_types, None, None, "en");
+        SearchPage {
             status: Status {
                 version: "1.2.3",
                 checked_at: 42,
@@ -8511,34 +10310,90 @@ mod tests {
                 tenant_display: None,
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
+                user: None,
+                bearer_only_auth: false,
             },
-            i18n: i18n("en"),
-            active_page: "queries",
-            show_save: true,
+            i18n: i18n(lang),
+            active_page: "search",
+            nl: NlSearch::default(),
+            docs_url: NL_SEARCH_DOCS,
+            rail_counts_approximate: false,
             resource_types,
             selected_type: String::new(),
             rail_entries,
             recent_entries: Vec::new(),
-            rail_page: rail_state::RailPage::Queries.key(),
+            rail_page: rail_state::RailPage::Search.key(),
             max_recent: rail_state::MAX_RECENT,
             builder_url: None,
         }
         .render()
-        .expect("queries page renders");
+        .expect("search page renders")
+    }
+
+    /// #1643: the builder's condition parameter is a typeahead, so every page
+    /// hosting the builder loads `typeahead.js` before `search-builder.js`, and
+    /// the empty-state text reaches the script through `data-msg-param-none`.
+    #[test]
+    fn typeahead_script_loads_before_the_builder_on_every_builder_page() {
+        assert!(Assets::get("typeahead.js").is_some());
+        let search = include_str!("../templates/pages/search.html");
+        let resources = include_str!("../templates/pages/resources.html");
+        for (name, html) in [("search", search), ("resources", resources)] {
+            let typeahead = html
+                .find("/ui/assets/typeahead.js")
+                .unwrap_or_else(|| panic!("{name} page loads typeahead.js"));
+            let builder = html
+                .find("/ui/assets/search-builder.js")
+                .unwrap_or_else(|| panic!("{name} page loads search-builder.js"));
+            assert!(typeahead < builder, "{name}: typeahead.js must load first");
+            let codec = html
+                .find("/ui/assets/fhir-search-value.js")
+                .expect("codec loads");
+            assert!(
+                codec < builder,
+                "{name}: the search-value codec must load first"
+            );
+        }
+    }
+
+    #[test]
+    fn typeahead_builder_partial_renders_the_no_match_text() {
+        let html = render_search_page("en");
+        assert!(html.contains(r#"data-msg-param-none="No matching parameters""#));
+    }
+
+    /// #1643: the unknown-parameter state reaches the script through
+    /// `data-msg-param-unknown`, a hidden slot carrying `data-template`.
+    #[test]
+    fn builder_renders_the_unknown_param_messages() {
+        let html = render_search_page("en");
+        assert!(html.contains(
+            r#"data-msg-param-unknown="Not a search parameter for {type}. Pick one from the list.""#
+        ));
+        assert!(!html.contains(r#""unknownParam":"#));
+        assert!(html.contains(
+            r#"id="query-plain-unknown" data-template="&#34;{param}&#34; is not a search parameter for {type}" hidden>"#
+        ));
+    }
+
+    #[test]
+    fn search_page_renders_builder_and_recent_shell() {
+        let html = render_search_page("en");
 
         assert!(html.contains(r#"id="saved-query-form""#));
-        assert!(html.contains(r#"id="saved-queries""#));
+        assert!(!html.contains(r#"id="saved-queries""#));
         assert!(html.contains("/ui/assets/fhir-search-value.js"));
-        assert!(html.contains("/ui/assets/saved-queries.js"));
+        assert!(html.contains("/ui/assets/search-builder.js"));
         assert!(
-            html.find("/ui/assets/fhir-search-value.js") < html.find("/ui/assets/saved-queries.js"),
+            html.find("/ui/assets/fhir-search-value.js")
+                < html.find("/ui/assets/search-builder.js"),
             "the FHIR search-value codec must load before its consumer"
         );
-        // Search Builder: the featured GET URL input, both submit intents,
+        // Search Builder: the featured GET URL input, Run,
         // and the Recent dropdown shell the script hydrates.
         assert!(html.contains(r#"name="url""#));
         assert!(html.contains(r#"data-intent="run""#));
-        assert!(html.contains(r#"data-intent="save""#));
+        assert!(!html.contains(r#"data-intent="save""#));
         assert!(html.contains(r#"id="recent-searches""#));
         // The Recent panel closes from an explicit X as well as outside
         // click / Esc (addbox.js covers details.menu too).
@@ -8548,7 +10403,7 @@ mod tests {
         for resource_type in ["Patient", "Observation"] {
             let attributes =
                 format!(r#"data-type="{resource_type}" data-full-name="{resource_type}""#);
-            let href = format!(r#"href="/ui/queries?type={resource_type}""#);
+            let href = format!(r#"href="/ui/search?type={resource_type}""#);
             assert!(
                 html.contains(&attributes),
                 "{resource_type} rail attributes"
@@ -8556,53 +10411,28 @@ mod tests {
             assert!(html.contains(&href), "{resource_type} rail link");
         }
         assert!(!html.contains(r#"class="count""#));
-        // Saved Queries has no nav entry any more (#282 folded search / editor
-        // / history / saved-queries into Resources); the route still renders.
-        assert!(!html.contains(r#"href="/ui/queries" aria-current="page""#));
-        // The delete-confirm string reaches the script with its {name} slot.
-        assert!(html.contains("{name}"));
     }
 
     #[test]
-    fn queries_page_renders_in_the_negotiated_locale() {
-        let resource_types = vec!["Patient".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None);
-        let html = QueriesPage {
-            status: Status {
-                version: "1.2.3",
-                checked_at: 42,
-                fhir_version: helios_fhir::FhirVersion::R4,
-                tenant_id: "default".to_string(),
-                tenant_display: None,
-                show_tenant_picker: true,
-                terminology: TerminologyNavigation::Unconfigured,
-            },
-            i18n: i18n("es"),
-            active_page: "queries",
-            show_save: true,
-            resource_types,
-            selected_type: String::new(),
-            rail_entries,
-            recent_entries: Vec::new(),
-            rail_page: rail_state::RailPage::Queries.key(),
-            max_recent: rail_state::MAX_RECENT,
-            builder_url: None,
-        }
-        .render()
-        .expect("queries page renders");
-
-        assert!(html.contains("Consultas guardadas"));
+    fn shared_builder_renders_in_the_negotiated_locale() {
+        let html = render_search_page("es");
+        assert!(html.contains("Buscar"));
+        assert!(html.contains(r#"data-msg-saved="Guardadas""#));
     }
 
-    /// The saved-queries script owns a structural read-modify-write against
+    /// The shared search builder owns a structural read-modify-write against
     /// the shared settings document, so â€” unlike theme.js â€” it must use the
     /// conditional-request cycle: capture the ETag, send If-Match, and absorb
     /// a 412 by re-reading. Guards the wiring; the endpoint semantics are
     /// covered in helios-rest's `user_settings` tests.
     #[test]
-    fn saved_queries_script_is_wired_to_user_settings() {
-        let file = Assets::get("saved-queries.js").expect("saved-queries.js embedded");
-        let source = std::str::from_utf8(&file.data).expect("saved-queries.js is UTF-8");
+    fn search_builder_script_is_wired_to_user_settings() {
+        assert!(
+            Assets::get("saved-queries.js").is_none(),
+            "retired asset has no alias"
+        );
+        let file = Assets::get("search-builder.js").expect("search-builder.js embedded");
+        let source = std::str::from_utf8(&file.data).expect("search-builder.js is UTF-8");
         assert!(source.contains("/_user/settings"));
         assert!(source.contains("savedQueries"));
         assert!(source.contains("If-Match"));
@@ -8610,13 +10440,12 @@ mod tests {
             source.contains("412"),
             "recovers from optimistic-lock races"
         );
-        assert!(source.contains("lastAccessedAt"));
         // Every run is recorded to the roaming recent-searches list.
         assert!(source.contains("recentSearches"));
         // Results render in-page from the FHIR API itself, and the builder's
         // parameter suggestions come from the server-rendered datalist.
         assert!(source.contains("application/fhir+json"));
-        assert!(source.contains("/ui/queries/params"));
+        assert!(source.contains("/ui/resources/params"));
     }
 
     #[test]
@@ -8628,6 +10457,46 @@ mod tests {
     }
 
     /// The builder's datalist fragment is fed by the SearchParameter
+    /// The column hint carries JSON element names, never the generated
+    /// structs' raw identifiers: Claim's `type` and `use` fields are `r#type`
+    /// and `r#use` in Rust, and the browser indexes `resource[col]` with the
+    /// hinted string verbatim (#1107).
+    #[cfg(feature = "R4")]
+    #[test]
+    fn default_result_columns_use_json_element_names() {
+        assert_eq!(
+            default_result_columns(helios_fhir::FhirVersion::R4, "Claim"),
+            [
+                "status",
+                "type",
+                "use",
+                "patient",
+                "billablePeriod",
+                "created",
+                "insurer",
+                "provider",
+                "priority",
+                "insurance"
+            ]
+        );
+        assert_eq!(
+            default_result_columns(helios_fhir::FhirVersion::R4, "Patient"),
+            [
+                "identifier",
+                "active",
+                "name",
+                "telecom",
+                "gender",
+                "birthDate",
+                "deceased",
+                "address",
+                "managingOrganization",
+                "link"
+            ]
+        );
+        assert!(default_result_columns(helios_fhir::FhirVersion::R4, "Nope").is_empty());
+    }
+
     /// registry and scoped to the requested resource type.
     #[test]
     fn param_options_partial_renders_datalist() {
@@ -8679,6 +10548,7 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         );
 
         // Every series the snapshot carries is plotted, on one shared y scale.
@@ -8729,6 +10599,7 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         )
         .windows;
 
@@ -8755,6 +10626,7 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         )
         .chart;
         assert!(
@@ -8775,6 +10647,7 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         )
         .chart;
         assert!(
@@ -8795,7 +10668,7 @@ mod tests {
     fn every_window_renders_a_bounded_chart() {
         for window in DashboardWindow::ALL {
             let snapshot = sample_snapshot(window);
-            let chart = build_dashboard(&snapshot, false, &[], None).chart;
+            let chart = build_dashboard(&snapshot, false, &[], None, "en").chart;
             assert!(chart.has_data, "{}", window.as_str());
             assert_eq!(snapshot.series[0].points.len(), window.points());
             assert!(
@@ -8818,9 +10691,12 @@ mod tests {
             available: Vec::new(),
             export_jobs: None,
             import_jobs_active: None,
-            partial: false,
+            reindex_active: None,
+            figures: Figures::Exact {
+                read_at: DateTime::from_timestamp(1_752_451_200, 0).expect("valid instant"),
+            },
         };
-        let dash = build_dashboard(&empty, false, &[], None);
+        let dash = build_dashboard(&empty, false, &[], None, "en");
         assert!(!dash.chart.has_data);
         assert!(dash.chart.series.is_empty());
         assert!(dash.legend.is_empty());
@@ -8858,6 +10734,7 @@ mod tests {
                 resource_type: "Patient".to_string(),
                 total: 5,
                 points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
             }],
             available: vec![helios_observability::dashboard::TypeCount {
                 resource_type: "Patient".to_string(),
@@ -8865,7 +10742,10 @@ mod tests {
             }],
             export_jobs: None,
             import_jobs_active: None,
-            partial: false,
+            reindex_active: None,
+            figures: Figures::Exact {
+                read_at: DateTime::from_timestamp(1_752_451_200, 0).expect("valid instant"),
+            },
         };
         let spec_types = vec![
             "Observation".to_string(),
@@ -8873,7 +10753,7 @@ mod tests {
             "Patient".to_string(), // already stored â€” must not be duplicated
         ];
 
-        let dash = build_dashboard(&snapshot, true, &spec_types, None);
+        let dash = build_dashboard(&snapshot, true, &spec_types, None, "en");
 
         let names: Vec<&str> = dash
             .picker
@@ -8899,7 +10779,7 @@ mod tests {
         );
 
         // Without the flag, the union never happens â€” today's behavior.
-        let off = build_dashboard(&snapshot, false, &spec_types, None);
+        let off = build_dashboard(&snapshot, false, &spec_types, None, "en");
         assert_eq!(off.picker.len(), 1, "only the stored type is offered");
         assert!(!off.picker[0].href.contains("all=1"));
     }
@@ -8914,17 +10794,18 @@ mod tests {
                 resource_type: "Patient".to_string(),
                 total: 5,
                 points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
             }],
             ..DashboardSnapshot::default()
         };
 
-        let off = build_dashboard(&snapshot, false, &[], None);
+        let off = build_dashboard(&snapshot, false, &[], None, "en");
         assert!(!off.all_types);
         assert!(off.all_types_href.contains("Patient"));
         assert!(off.all_types_href.contains("window=24h"));
         assert!(off.all_types_href.ends_with("all=1"));
 
-        let on = build_dashboard(&snapshot, true, &[], None);
+        let on = build_dashboard(&snapshot, true, &[], None, "en");
         assert!(on.all_types);
         assert!(!on.all_types_href.contains("all=1"), "toggles back off");
     }
@@ -8941,11 +10822,13 @@ mod tests {
                 point_at(1_752_454_800, 0, 0),
                 point_at(1_752_458_400, 0, 0),
             ],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&empty_type),
             DashboardWindow::LastHour,
             None,
+            "en",
         );
 
         assert!(chart.has_data, "a plotted series, even all-zero, has data");
@@ -8958,13 +10841,15 @@ mod tests {
 
     #[test]
     fn formatting_helpers() {
-        assert_eq!(compact_count(999), "999");
-        assert_eq!(compact_count(2_000), "2.0k");
-        assert_eq!(compact_count(61_400), "61.4k");
-        assert_eq!(compact_count(1_500_000), "1.5M");
-        assert_eq!(grouped(1_204), "1,204");
-        assert_eq!(grouped(38_910), "38,910");
-        assert_eq!(grouped(7), "7");
+        assert_eq!(compact_count(999, "en"), "999");
+        assert_eq!(compact_count(2_000, "en"), "2.0k");
+        assert_eq!(compact_count(61_400, "en"), "61.4k");
+        assert_eq!(compact_count(1_500_000, "en"), "1.5M");
+        assert_eq!(grouped(1_204, "en"), "1,204");
+        assert_eq!(grouped(38_910, "en"), "38,910");
+        assert_eq!(grouped(38_910, "de"), "38.910");
+        assert_eq!(grouped(7, "en"), "7");
+        assert_eq!(compact_count(61_400, "de"), "61,4k");
         assert_eq!(nice_ceil(1_204), 2_000);
         assert_eq!(nice_ceil(38_910), 40_000);
         assert_eq!(nice_ceil(0), 0);
@@ -8977,6 +10862,296 @@ mod tests {
         assert_eq!(axis_time_label(at, DashboardWindow::LastHour), "14:30");
         assert_eq!(axis_time_label(at, DashboardWindow::LastDay), "14:30");
         assert_eq!(axis_time_label(at, DashboardWindow::LastMonth), "JUL 14");
+    }
+
+    /// #1078: the `data-dash-state` digest lets a settled watch tick be
+    /// dropped, so it must not change when only the "as of" time does — and
+    /// must change with the figures, the selection, or a new minute.
+    #[test]
+    fn dash_state_ignores_the_as_of_time_and_tracks_the_figures() {
+        let now = DateTime::parse_from_rfc3339("2026-09-13T08:00:30Z")
+            .expect("valid instant")
+            .with_timezone(&Utc);
+        let types = vec!["Patient".to_string()];
+        let base = DashboardSnapshot {
+            window: DashboardWindow::LastHour,
+            total_resources: 100,
+            distinct_types: 1,
+            available: vec![helios_observability::dashboard::TypeCount {
+                resource_type: "Patient".to_string(),
+                total: 100,
+            }],
+            figures: Figures::Exact { read_at: now },
+            ..Default::default()
+        };
+        let state = dash_state(&base, &types, false, now);
+        assert_eq!(state.len(), 16);
+        assert!(state.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Read again a few seconds later: same figures, same digest.
+        let reread = DashboardSnapshot {
+            figures: Figures::Exact {
+                read_at: now + chrono::Duration::seconds(20),
+            },
+            ..base.clone()
+        };
+        assert_eq!(dash_state(&reread, &types, false, now), state);
+
+        // More resources, another selection, or a new minute all change it.
+        let grown = DashboardSnapshot {
+            total_resources: 101,
+            ..base.clone()
+        };
+        assert_ne!(dash_state(&grown, &types, false, now), state);
+        let other = vec!["Observation".to_string()];
+        assert_ne!(dash_state(&base, &other, false, now), state);
+        assert_ne!(
+            dash_state(&base, &types, false, now + chrono::Duration::seconds(60)),
+            state
+        );
+    }
+
+    /// #1078: each snapshot state and [`Figures`] variant maps to exactly one
+    /// notice line, and only measured figures are dated — with their
+    /// `read_at`, never their `reconciled_at`. The two ways of having no
+    /// snapshot stay undated (#956).
+    #[test]
+    fn dashboard_notice_follows_the_figures() {
+        let read_at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let reconciled_at = read_at - Duration::minutes(5);
+        let now = read_at + Duration::seconds(30);
+        let dated = |line: &NoticeLine| line.as_of.as_ref().map(|a| a.datetime.clone());
+        let ready = |figures: Figures| {
+            SnapshotState::Ready(DashboardSnapshot {
+                figures,
+                ..Default::default()
+            })
+        };
+
+        let sample = dashboard_notice(&SnapshotState::NoProvider, now);
+        assert_eq!(sample.kind, DashboardNotice::Sample);
+        assert_eq!(dated(&sample), None);
+        assert!(sample.kind.is_warning() && !sample.kind.is_waiting());
+
+        // Waiting is the same line whether nothing is cached yet or the
+        // provider is still seeding the tenant.
+        for (label, state) in [
+            ("cold", SnapshotState::Pending),
+            ("seeding", ready(Figures::Pending)),
+        ] {
+            let line = dashboard_notice(&state, now);
+            assert_eq!(line.kind, DashboardNotice::Pending, "{label}");
+            assert_eq!(dated(&line), None, "{label}");
+            assert!(line.kind.is_waiting() && line.kind.is_warning(), "{label}");
+            assert_eq!(line.kind.slug(), "pending", "{label}");
+        }
+
+        let live = dashboard_notice(&ready(Figures::Exact { read_at }), now);
+        assert_eq!(live.kind, DashboardNotice::Live);
+        assert_eq!(dated(&live).as_deref(), Some("2025-07-14T14:30:00Z"));
+        assert!(!live.kind.is_warning() && !live.kind.is_waiting());
+
+        let approximate = dashboard_notice(
+            &ready(Figures::Approximate {
+                read_at,
+                reconciled_at,
+            }),
+            now,
+        );
+        assert_eq!(approximate.kind, DashboardNotice::Approximate);
+        assert_eq!(dated(&approximate).as_deref(), Some("2025-07-14T14:30:00Z"));
+        assert!(!approximate.kind.is_warning() && !approximate.kind.is_waiting());
+
+        // A backend that cannot count: one plain, undated label that neither
+        // warns nor waits.
+        let unsupported = dashboard_notice(&ready(Figures::Unsupported), now);
+        assert_eq!(unsupported.kind, DashboardNotice::Unsupported);
+        assert_eq!(dated(&unsupported), None);
+        assert!(!unsupported.kind.is_warning() && !unsupported.kind.is_waiting());
+        assert_eq!(unsupported.kind.slug(), "unsupported");
+    }
+
+    /// #1078: the digest a watch tick compares changes with the [`Figures`]
+    /// variant, so the figures replacing a waiting page are swapped in even
+    /// when every other figure is the same (empty) — but not with the
+    /// variant's timestamps, which change on every read.
+    #[test]
+    fn dash_state_tracks_the_figures_variant_but_not_its_times() {
+        let now = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let read_at = now - Duration::seconds(5);
+        let digest = |figures: Figures| {
+            let snapshot = DashboardSnapshot {
+                figures,
+                ..Default::default()
+            };
+            dash_state(&snapshot, &[], false, now)
+        };
+
+        let states = [
+            digest(Figures::Pending),
+            digest(Figures::Unsupported),
+            digest(Figures::Exact { read_at }),
+            digest(Figures::Approximate {
+                read_at,
+                reconciled_at: read_at,
+            }),
+        ];
+        for (i, a) in states.iter().enumerate() {
+            for b in &states[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+
+        assert_eq!(
+            digest(Figures::Exact {
+                read_at: read_at - Duration::seconds(20),
+            }),
+            states[2]
+        );
+        assert_eq!(
+            digest(Figures::Approximate {
+                read_at: now,
+                reconciled_at: read_at - Duration::hours(1),
+            }),
+            states[3]
+        );
+    }
+
+    /// The "as of" fallback text is UTC, like the chart axis, and names the
+    /// date only when the reading is not from the current UTC day.
+    #[test]
+    fn as_of_label_is_utc_with_the_date_only_when_not_today() {
+        let read_at = DateTime::from_timestamp(1_752_503_431, 0).expect("valid instant");
+        let same_day = AsOf::new(read_at, read_at + Duration::minutes(5));
+        assert_eq!(same_day.label, "14:30:31 UTC");
+        assert_eq!(same_day.datetime, "2025-07-14T14:30:31Z");
+
+        let next_day = AsOf::new(read_at, read_at + Duration::days(1));
+        assert_eq!(next_day.label, "2025-07-14 14:30:31 UTC");
+    }
+
+    /// #1078: while the chart waits, the picker is rebuilt from the requested
+    /// types — checked state and toggle links — so picking a type keeps the
+    /// rest of the selection instead of starting from an empty one.
+    #[test]
+    fn picker_entries_follow_the_requested_types_while_waiting() {
+        let available = vec![
+            TypeCount {
+                resource_type: "Observation".to_string(),
+                total: 1_200,
+            },
+            TypeCount {
+                resource_type: "Patient".to_string(),
+                total: 40,
+            },
+        ];
+        let requested = vec!["Patient".to_string()];
+        let picker = picker_entries(
+            &available,
+            false,
+            &[],
+            &requested,
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+
+        assert_eq!(picker.len(), 2);
+        let observation = &picker[0];
+        assert!(!observation.selected);
+        assert_eq!(observation.total, "1,200", "real counts from the snapshot");
+        assert_eq!(observation.href, "/ui?types=Patient,Observation&window=1h");
+        let patient = &picker[1];
+        assert!(patient.selected);
+        assert_eq!(patient.href, "/ui?types=&window=1h");
+    }
+
+    /// #1078: the configured cadences reach the rendered page — a moving page
+    /// polls at `moving_secs`, a settled one at `settled_secs`, and a zero is
+    /// clamped to one second. Renders with an explicit [`DashboardRefresh`],
+    /// never the process-wide one, so parallel tests cannot race on it.
+    #[test]
+    fn dashboard_refresh_sets_the_rendered_cadence() {
+        let refresh = DashboardRefresh {
+            moving_secs: 2,
+            settled_secs: 7,
+        };
+        let mut page = sample_index_page("1.2.3", 42, i18n("en"));
+        page.refresh_href = Some("/ui?types=&window=30d".to_string());
+
+        for (moving, secs) in [(true, 2), (false, 7)] {
+            page.refresh_moving = moving;
+            page.refresh_secs = refresh.secs(moving);
+            let html = page.render().expect("index renders");
+            assert!(
+                html.contains(&format!(
+                    r#"hx-trigger="every {secs}s [hfsDashCanRefresh()]""#
+                )),
+                "moving={moving}"
+            );
+            assert!(
+                html.contains(&format!(r#"data-dash-refresh="{secs}""#)),
+                "moving={moving}"
+            );
+        }
+
+        let defaults = DashboardRefresh::default();
+        assert_eq!((defaults.secs(true), defaults.secs(false)), (5, 10));
+        let zero = DashboardRefresh {
+            moving_secs: 0,
+            settled_secs: 0,
+        };
+        assert_eq!((zero.secs(true), zero.secs(false)), (1, 1));
+    }
+
+    /// The notice line renders as documented: a plain label for approximate
+    /// figures with the "as of" time as a machine-readable `<time>`, and a
+    /// warning with the retry link, undated, while waiting.
+    #[test]
+    fn index_page_renders_the_notice_line() {
+        let read_at = DateTime::from_timestamp(1_752_503_431, 0).expect("valid instant");
+        let mut page = sample_index_page("1.2.3", 42, i18n("en"));
+        page.notice = dashboard_notice(
+            &SnapshotState::Ready(DashboardSnapshot {
+                figures: Figures::Approximate {
+                    read_at,
+                    reconciled_at: read_at - Duration::minutes(1),
+                },
+                ..Default::default()
+            }),
+            read_at,
+        );
+        let html = page.render().expect("index renders");
+
+        assert!(
+            html.contains(
+                r#"<p class="notice" aria-live="polite" data-dash-notice="approximate">"#
+            )
+        );
+        assert!(
+            html.contains(r#"<time datetime="2025-07-14T14:30:31Z">As of 14:30:31 UTC.</time>"#)
+        );
+        assert_eq!(html.matches("<time ").count(), 1, "dated once");
+        assert_eq!(html.matches("data-dash-notice=").count(), 1, "one line");
+        assert!(
+            !html.contains("Retry now"),
+            "measured figures wait for nothing"
+        );
+
+        page.notice = dashboard_notice(&SnapshotState::Pending, read_at);
+        page.chart_waiting = true;
+        let html = page.render().expect("index renders");
+
+        assert!(html.contains(
+            r#"<p class="notice notice--warn" aria-live="polite" data-dash-notice="pending">"#
+        ));
+        assert!(
+            !html.contains("<time "),
+            "nothing was read, so no \"as of\""
+        );
+        assert_eq!(html.matches("Retry now").count(), 1);
+        assert!(html.contains("Waiting for the live figures"));
+        assert!(!html.contains(r#"<svg class="chart""#));
     }
 
     #[test]
@@ -9019,11 +11194,13 @@ mod tests {
             resource_type: "Patient".to_string(),
             total: 5,
             points: vec![point_at(1_752_503_400, 5, 5)],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&series),
             DashboardWindow::default(),
             None,
+            "en",
         );
 
         assert!(chart.has_data);
@@ -9046,11 +11223,13 @@ mod tests {
                 point_at(1_752_503_460, -6, 4),
                 point_at(1_752_503_520, 0, 4),
             ],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&series),
             DashboardWindow::LastHour,
             None,
+            "en",
         );
 
         assert!(chart.has_data);
@@ -9067,5 +11246,262 @@ mod tests {
                 "y {y} escaped the plot"
             );
         }
+    }
+
+    /// #1603: a series whose window history is not loaded plots only the
+    /// buckets its counters recorded — from the bucket holding
+    /// `recorded_from` to the current one — dashed and with its current point
+    /// marked. The earlier buckets are not drawn, tipped or tabled as numbers:
+    /// before the fix they were a flat line at today's total.
+    #[test]
+    fn a_series_without_history_plots_only_its_recorded_buckets() {
+        // Three one-minute buckets; the counters' base was read 10 s into the
+        // second, so the first bucket is not a measurement.
+        let series = DashboardSeries {
+            resource_type: "Observation".to_string(),
+            total: 7_699_987,
+            points: vec![
+                point_at(1_752_503_400, 0, 7_699_987),
+                point_at(1_752_503_460, 0, 7_699_987),
+                point_at(1_752_503_520, 0, 7_699_987),
+            ],
+            recorded_from: DateTime::from_timestamp(1_752_503_470, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        let pairs: Vec<&str> = s.polyline.split(' ').collect();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "the first bucket is not drawn: {}",
+            s.polyline
+        );
+        // x of the second of three buckets: 40 + 1020 / 2.
+        assert!(pairs[0].starts_with("550,"), "{}", s.polyline);
+        assert_eq!(format!("{},{}", s.end_x, s.end_y), pairs[1]);
+        let tip: serde_json::Value = serde_json::from_str(&chart.tip_json).expect("json");
+        assert_eq!(tip["series"][0]["values"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["ys"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["values"][1], 7_699_987);
+        assert_eq!(chart.table.len(), 3);
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "7,699,987");
+
+        // The same points with their history loaded are the whole line.
+        let seeded = DashboardSeries {
+            recorded_from: None,
+            ..series
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&seeded),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        assert!(!chart.series[0].partial);
+        assert_eq!(chart.series[0].polyline.split(' ').count(), 3);
+        assert_eq!(chart.table[0].values[0], "7,699,987");
+    }
+
+    /// A `recorded_from` past the last bucket (a skewed clock) still plots
+    /// the current point: the total is always a measurement.
+    #[test]
+    fn a_series_recorded_from_the_future_keeps_its_current_point() {
+        let series = DashboardSeries {
+            resource_type: "Patient".to_string(),
+            total: 5,
+            points: vec![point_at(1_752_503_400, 0, 5), point_at(1_752_503_460, 0, 5)],
+            recorded_from: DateTime::from_timestamp(1_752_507_000, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        assert_eq!(s.polyline, format!("{},{}", s.end_x, s.end_y));
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "5");
+    }
+
+    /// #1603: history still loading is said next to the series' total in the
+    /// legend and by the notice line — under the "approximate" slug, since it
+    /// is the same reading said more precisely — and it changes the refresh
+    /// digest, so the whole line is drawn as soon as the history lands even
+    /// when no point changes value.
+    #[test]
+    fn history_loading_is_said_in_the_legend_and_the_note() {
+        let read_at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let reconciled_at = read_at - Duration::seconds(30);
+        let now = read_at + Duration::seconds(5);
+        let snapshot = |loading: bool| DashboardSnapshot {
+            series: vec![
+                DashboardSeries {
+                    resource_type: "Observation".to_string(),
+                    total: 9,
+                    points: vec![point_at(1_752_503_340, 0, 9), point_at(1_752_503_400, 0, 9)],
+                    recorded_from: loading.then_some(reconciled_at),
+                },
+                DashboardSeries {
+                    resource_type: "Patient".to_string(),
+                    total: 2,
+                    points: vec![point_at(1_752_503_340, 0, 2), point_at(1_752_503_400, 0, 2)],
+                    recorded_from: None,
+                },
+            ],
+            figures: Figures::Approximate {
+                read_at,
+                reconciled_at,
+            },
+            ..Default::default()
+        };
+
+        let dash = build_dashboard(&snapshot(true), false, &[], None, "en");
+        assert!(dash.legend[0].partial && !dash.legend[1].partial);
+        assert!(dash.chart.series[0].partial && !dash.chart.series[1].partial);
+
+        let line = dashboard_notice(&SnapshotState::Ready(snapshot(true)), now);
+        assert_eq!(line.kind, DashboardNotice::HistoryLoading);
+        assert_eq!(line.kind.slug(), "approximate");
+        assert_eq!(line.kind.key(), Some("chart-approximate-history-note"));
+        assert!(!line.kind.is_warning() && !line.kind.is_waiting());
+        assert!(line.as_of.is_some(), "a measured reading is dated");
+        let settled = dashboard_notice(&SnapshotState::Ready(snapshot(false)), now);
+        assert_eq!(settled.kind, DashboardNotice::Approximate);
+
+        assert_ne!(
+            dash_state(&snapshot(true), &[], false, now),
+            dash_state(&snapshot(false), &[], false, now),
+            "history arriving must redraw the line"
+        );
+    }
+}
+
+/// The account menu's identity (#738), derived from the interactive login's
+/// session (#1449).
+#[cfg(test)]
+mod user_summary_tests {
+    use super::*;
+
+    fn principal() -> helios_auth::SessionPrincipal {
+        helios_auth::SessionPrincipal {
+            subject: "937f5c4f-demo".to_string(),
+            issuer: "https://idp.example.com/realms/fhir".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: Some("demo".to_string()),
+            email: Some("demo@example.org".to_string()),
+            picture: None,
+        }
+    }
+
+    fn status_with(user: Option<UserSummary>) -> Status {
+        Status {
+            version: "1.2.3",
+            checked_at: 42,
+            fhir_version: helios_fhir::FhirVersion::R4,
+            tenant_id: "default".to_string(),
+            tenant_display: None,
+            show_tenant_picker: false,
+            terminology: TerminologyNavigation::Unconfigured,
+            user,
+            bearer_only_auth: false,
+        }
+    }
+
+    #[test]
+    fn initials_take_the_first_letter_of_the_first_two_words() {
+        assert_eq!(initials_of("Demo User"), "DU");
+        assert_eq!(initials_of("Ada Byron Lovelace"), "AB");
+        assert_eq!(initials_of("demo"), "D");
+        assert_eq!(initials_of("  spaced   out  "), "SO");
+        // The shared helper marks an unlabelable input with "?" — never reached for
+        // a signed-in user, whose display name falls back to the subject.
+        assert_eq!(initials_of(""), "?");
+    }
+
+    #[test]
+    fn a_session_becomes_display_secondary_initials_and_photo() {
+        let summary = UserSummary::from_session(Some(&principal())).expect("signed in");
+        assert_eq!(summary.display, "Demo User");
+        assert_eq!(summary.secondary, "demo@example.org");
+        assert_eq!(summary.initials, "DU");
+        assert_eq!(summary.photo, None);
+
+        // No name and no email: the username is the display, the subject the
+        // secondary line — something still identifies the account.
+        let mut bare = principal();
+        bare.name = None;
+        bare.email = None;
+        bare.picture = Some("https://idp.example.com/avatar.png".to_string());
+        let summary = UserSummary::from_session(Some(&bare)).unwrap();
+        assert_eq!(summary.display, "demo");
+        assert_eq!(summary.secondary, "937f5c4f-demo");
+        assert_eq!(summary.initials, "D");
+        assert_eq!(
+            summary.photo.as_deref(),
+            Some("https://idp.example.com/avatar.png")
+        );
+
+        assert!(UserSummary::from_session(None).is_none());
+    }
+
+    #[test]
+    fn without_an_email_the_secondary_line_is_the_username() {
+        // Entra ID: a user without a mailbox has no `email`, and `sub` is an
+        // opaque pairwise value; `preferred_username` is the sign-in name.
+        let mut entra = principal();
+        entra.name = Some("Demo User".to_string());
+        entra.preferred_username = Some("demo@contoso.example".to_string());
+        entra.email = None;
+        entra.subject = "AAAAAAAAAAAAAAAAAAAAAIkzqFVrSaSaFHy782bbtaQ".to_string();
+        let summary = UserSummary::from_session(Some(&entra)).unwrap();
+        assert_eq!(summary.display, "Demo User");
+        assert_eq!(summary.secondary, "demo@contoso.example");
+    }
+
+    #[test]
+    fn a_signed_in_status_feeds_the_menu_and_offers_sign_out() {
+        let status = status_with(UserSummary::from_session(Some(&principal())));
+        assert_eq!(status.user_display(), Some("Demo User"));
+        assert_eq!(status.user_secondary(), Some("demo@example.org"));
+        assert_eq!(status.user_initials(), Some("DU"));
+        assert_eq!(status.user_photo(), None);
+        assert!(status.user_can_logout());
+
+        let html = status
+            .user_menu(&I18n::from_tag("en").expect("supported locale"))
+            .unwrap();
+        assert!(html.contains("Demo User"), "{html}");
+        assert!(html.contains("demo@example.org"), "{html}");
+        assert!(
+            html.contains(
+                "<form class=\"user-menu__out-form\" method=\"post\" action=\"/ui/logout\">"
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_signed_out_status_keeps_the_local_operator_shape() {
+        let status = status_with(None);
+        assert_eq!(status.user_display(), None);
+        assert_eq!(status.user_secondary(), None);
+        assert_eq!(status.user_initials(), None);
+        assert_eq!(status.user_photo(), None);
+        assert!(!status.user_can_logout());
+
+        let html = status
+            .user_menu(&I18n::from_tag("en").expect("supported locale"))
+            .unwrap();
+        assert!(!html.contains("user-menu__out"), "{html}");
+        assert!(!html.contains("/ui/logout"), "{html}");
     }
 }

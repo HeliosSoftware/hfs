@@ -511,6 +511,7 @@ fn build_home_chart(
         window.tick_count(),
         series.color(),
         |secs_before| window.axis_label(i18n, secs_before),
+        &i18n.lang(),
     );
 
     let empty = if !metrics_ok {
@@ -546,9 +547,10 @@ fn build_home_chart(
             // Observed requests of this class inside the window — summed
             // from the per-interval deltas, so an unobserved stretch adds
             // nothing rather than dumping its whole backlog on the window.
-            total: chart::compact_count(metrics_ring::window_total(&samples, start, now, |c| {
-                s.pick(c)
-            })),
+            total: chart::compact_count(
+                metrics_ring::window_total(&samples, start, now, |c| s.pick(c)),
+                &i18n.lang(),
+            ),
         })
         .collect();
 

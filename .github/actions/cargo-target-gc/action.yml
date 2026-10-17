@@ -2,7 +2,8 @@ name: Cargo target dir GC
 description: >
   Cap the size of the workspace `target/` directory on a self-hosted runner by
   evicting least-recently-used build artifacts. Runs at the end of every job
-  that compiles Rust on a persistent runner.
+  that compiles Rust on a persistent runner, and (`mode: preflight`) before the
+  build in jobs too large to start on a nearly-full disk.
 
 # Why this exists
 # ---------------
@@ -21,13 +22,24 @@ description: >
 # hours old and several runs have already gone red.
 #
 # It is a soft cap, not a hard ceiling. cargo-sweep evicts the artifacts cargo
-# manages under `deps/`, `build/`, `.fingerprint/` and `incremental/` — which is
-# precisely the part that compounds — but it does not remove the linked outputs
+# manages under `deps/`, `build/` and `.fingerprint/` — most of the part that
+# compounds — but it does not remove the linked outputs
 # at `target/<profile>/<bin>`. Those are hardlinked to their `deps/` copy
 # (verified: link count 2), so sweeping the dep entry frees nothing while the
 # top-level name survives. That residue is a small constant per profile and is
 # overwritten by the next build; it does not accumulate. Expect the swept
 # directory to settle slightly above `maxsize`, not exactly at it.
+#
+# cargo-sweep does not manage `target/<profile>/incremental/` at all: it never
+# removes it, but it does count it toward `maxsize`. Left alone, incremental
+# caches for hashes nobody builds any more (and rustc sessions a cancelled run
+# killed mid-compile) pile up there and squeeze the warm dependency artifacts
+# out of the cap. So both modes of this action delete per-crate incremental
+# dirs that no build has touched in `incremental-max-age-days`. Age is read
+# from the directory's mtime, not atime: rustc creates a fresh session dir
+# inside it on every compile of that crate, which bumps the mtime, whereas
+# atime is unreliable on NTFS (last-access updates are often disabled). Crates
+# still being built keep their caches, so incremental rebuilds stay fast.
 #
 # Scope: this caps `target/` only. `~/.cargo/registry` also grows without bound
 # (every `.crate` tarball and unpacked source ever resolved), but far more
@@ -35,6 +47,25 @@ description: >
 # the problem it needs a different tool; cargo-sweep does not touch it. The
 # `free-floor-gb` warning exists so that "something *else* on this box is
 # filling up" surfaces in a job log rather than as a mystery.
+#
+# Pre-build headroom
+# ------------------
+# The post-job sweep caps what a runner carries *between* jobs. It does nothing
+# about how much a job needs *during* its build, and on Windows that is far
+# more than the cap suggests: an all-features `test-rust` there grows target/
+# by 130-150GB per run (cargo-sweep's "Cleaned" line, every run on 2026-10-14),
+# against ~30GB on the Linux agents. Meanwhile the space outside target/ on
+# both Windows agents had grown well past the ~125GB assumed under `maxsize`
+# (agent9 ~235GB, agent4 ~270GB by that evening), so a run that started with
+# ~150GB free died in the linker with "no space on device" (run 38627332199,
+# github-agent9; agent4 the same way in job 115938868471).
+#
+# `mode: preflight` runs before the build and does nothing unless the disk has
+# less than `min-free-gb` free. When it does, it sweeps target/ below `maxsize`
+# by the shortfall, re-measures, and as a last resort removes target/ outright:
+# a cold build is slow, but a build that dies of ENOSPC an hour in is slower
+# and red. It also prints what is using the space outside target/, because that
+# is the part no sweep here can reclaim and someone has to look at the box.
 #
 # Why two near-identical steps below
 # ----------------------------------
@@ -61,10 +92,17 @@ inputs:
       the entire warm cache on every run.
 
       100GB suits every agent we have: the smallest disk in the fleet is the
-      1.5TB C: on the Windows agent, so the ceiling leaves an order of magnitude
-      of headroom while still bounding the thing that compounds. Check this
-      assumption before adding a runner with a smaller disk — a ceiling above
-      the volume size is a no-op, not a cap.
+      500GB C: on the Windows agent, which carries ~125GB of everything else
+      (OS, VS build tools, toolchains, ~/.cargo, the runner) — so at the cap
+      it idles around 225GB used, leaving room for a job's in-flight growth
+      (the sweep runs after the build, not during it) and a from-scratch
+      release build on a tag. Check this assumption before shrinking that disk
+      or adding a runner with a smaller one — a ceiling above the volume size
+      is a no-op, not a cap.
+
+      That ~125GB figure no longer holds on either Windows agent (see
+      "Pre-build headroom" above), which is why `test-rust` also runs this
+      action in `preflight` mode rather than relying on the cap alone.
     required: false
     default: 100GB
   free-floor-gb:
@@ -80,6 +118,25 @@ inputs:
       already failed.
     required: false
     default: "100"
+  mode:
+    description: >
+      `post` (default): the end-of-job sweep to `maxsize`. `preflight`: run
+      before the build; only acts when free space is below `min-free-gb`.
+    required: false
+    default: post
+  min-free-gb:
+    description: >
+      `preflight` only. Free space, in GB, the job needs to build without
+      running out of disk. Evicts from target/ (ultimately all of it) until the
+      disk has this much free. `0` disables.
+    required: false
+    default: "0"
+  incremental-max-age-days:
+    description: >
+      Delete `target/*/incremental/<crate>-<hash>` dirs no build has written to
+      in this many days. cargo-sweep never evicts them. `0` disables.
+    required: false
+    default: "3"
   cargo-sweep-version:
     description: >
       Pinned cargo-sweep version. >=0.7.0 is required for unit suffixes on
@@ -94,9 +151,12 @@ runs:
       if: runner.os != 'Windows'
       shell: bash
       env:
+        MODE: ${{ inputs.mode }}
         MAXSIZE: ${{ inputs.maxsize }}
         WANT: ${{ inputs.cargo-sweep-version }}
         FREE_FLOOR_GB: ${{ inputs.free-floor-gb }}
+        MIN_FREE_GB: ${{ inputs.min-free-gb }}
+        INCREMENTAL_MAX_AGE_DAYS: ${{ inputs.incremental-max-age-days }}
       # `${GITHUB_ACTION_PATH//\\//}` — the runner hands this out in native form,
       # so on Windows it arrives with backslashes, which bash reads as escapes.
       # Normalising in both steps keeps the two `run:` bodies byte-identical.
@@ -106,7 +166,10 @@ runs:
       if: runner.os == 'Windows'
       shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
       env:
+        MODE: ${{ inputs.mode }}
         MAXSIZE: ${{ inputs.maxsize }}
         WANT: ${{ inputs.cargo-sweep-version }}
         FREE_FLOOR_GB: ${{ inputs.free-floor-gb }}
+        MIN_FREE_GB: ${{ inputs.min-free-gb }}
+        INCREMENTAL_MAX_AGE_DAYS: ${{ inputs.incremental-max-age-days }}
       run: bash "${GITHUB_ACTION_PATH//\\//}/sweep.sh"

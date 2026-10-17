@@ -40,7 +40,9 @@
   </codeSystem>
   <codeSystem>
     <uri value="http://loinc.org"/>
-    <version/>
+    <version>
+      <value value="2.73"/>
+    </version>
     <content value="complete"/>
   </codeSystem>
 </TerminologyCapabilities>

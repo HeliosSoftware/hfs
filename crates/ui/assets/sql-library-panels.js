@@ -25,13 +25,14 @@
  *    or still holds the *previous* autofill, never overwriting text the
  *    visitor typed by hand.
  *
- * 3. #842/04: clicking an unknown table's own *Declare {name}* button
- *    (`data-declare-table`, `sql_tables_card.html`) opens the *Add table*
- *    `<details>` and fills the Alias field with that row's own name —
- *    never a submit, unlike a Parameters hint's one-click *Declare*: the
- *    target itself still needs picking from the combobox. Event
- *    delegation, since the button is re-rendered on every `#lib-tables`
- *    swap the same way the combobox listener below already assumes.
+ * 3. #842/04, #1238: clicking an unknown table's own *Declare {name}*
+ *    button (`data-declare-table`, `sql_tables_card.html`) fills the
+ *    always-visible add row's Alias field with that row's own name and
+ *    moves focus to its search field — never a submit, unlike a
+ *    Parameters hint's one-click *Declare*: the target itself still needs
+ *    picking from the combobox. Event delegation, since the button is
+ *    re-rendered on every `#lib-tables` swap the same way the combobox
+ *    listener below already assumes.
  *
  * Both `#lib-params` and `#lib-tables` are always swapped wholesale
  * (`hx-swap="outerHTML"`, on every path that can produce either — the
@@ -93,15 +94,17 @@
     }
   });
 
-  // #842/04: an unknown table's own *Declare {name}* button — opens the
-  // Add table panel and pre-fills its alias with that row's own name,
-  // overwriting whatever the panel already held (a visitor declaring a
+  // #842/04, #1238: an unknown table's own *Declare {name}* button —
+  // pre-fills the always-visible add row's Alias field with that row's own
+  // name, overwriting whatever it already held (a visitor declaring a
   // second unknown table after the first means to replace it, not merge
-  // with it). Deliberately *not* recorded in `lastAutofill`: the combobox
-  // listener above only overwrites an alias it last wrote itself, so
-  // picking the target VD afterwards leaves this exact spelling alone —
-  // the whole point of *Declare* is to match the SQL's own (mis)spelled
-  // table name, not the artifact's own name the combobox would offer.
+  // with it), then moves focus to the add row's own search field so
+  // picking the target is the very next step. Deliberately *not* recorded
+  // in `lastAutofill`: the combobox listener above only overwrites an
+  // alias it last wrote itself, so picking the target VD afterwards leaves
+  // this exact spelling alone — the whole point of *Declare* is to match
+  // the SQL's own (mis)spelled table name, not the artifact's own name the
+  // combobox would offer.
   document.addEventListener("click", function (event) {
     var button = event.target.closest && event.target.closest("[data-declare-table]");
     if (!button) return;
@@ -109,9 +112,13 @@
     if (!name) return;
     var tablesCard = document.getElementById("lib-tables");
     if (!tablesCard) return;
-    var details = tablesCard.querySelector(".editor-add");
     var alias = tablesCard.querySelector('input[name="table_alias"]');
-    if (details) details.open = true;
     if (alias) alias.value = name;
+    var search = document.querySelector('#lib-tables-add-table input[role="combobox"]');
+    if (search && !search.disabled) {
+      search.focus();
+    } else if (alias) {
+      alias.focus();
+    }
   });
 })();

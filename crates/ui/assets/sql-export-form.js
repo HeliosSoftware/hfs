@@ -37,7 +37,10 @@
      "· k value(s) missing" suffix counting empty, default-less fields
      across every *checked* query, recomputed on every relevant change; a
      submit with any such field blocks, opens the first affected row, and
-     marks/focuses the field — the native `required` attribute is kept in
+     marks/focuses the field, showing the field's own "This value is
+     required." message (its server-rendered, initially hidden error span,
+     now its aria-describedby target) until the next keystroke hides it
+     again (#2049) — the native `required` attribute is kept in
      sync with "checked and no default" throughout, so a plain browser
      submit (JavaScript absent, or this very check having already passed)
      can never be blocked by a query nobody selected.
@@ -69,15 +72,14 @@
   // validation always has a real field to focus.
   form.noValidate = true;
 
-  // #836: the CSV header switch's visibility. The switch's own `checked`
-  // state is never touched here — only whether its label (and the hint
-  // right below it) is shown at all; a value set before switching away from
-  // csv survives switching back. Independent of the subjects table below,
-  // so it keeps working even if that table were ever empty.
+  // #836, #1716: the CSV header switch's visibility. The switch's own
+  // `checked` state is never touched here — only whether its wrapper (label
+  // and hint, `data-csv-header-option`) is shown at all; a value set before
+  // switching away from csv survives switching back. Independent of the
+  // subjects table below, so it keeps working even if that table were ever
+  // empty.
   var formatInputs = Array.prototype.slice.call(form.querySelectorAll('input[name="format"]'));
-  var headerCheckbox = form.querySelector('input[name="header"]');
-  var headerLabel = headerCheckbox ? headerCheckbox.closest("label") : null;
-  var headerHint = headerLabel ? headerLabel.nextElementSibling : null;
+  var headerOption = form.querySelector("[data-csv-header-option]");
 
   function selectedFormat() {
     var checked = formatInputs.filter(function (input) {
@@ -87,10 +89,8 @@
   }
 
   function synchronizeHeaderVisibility() {
-    if (!headerLabel) return;
-    var isCsv = selectedFormat() === "csv";
-    headerLabel.hidden = !isCsv;
-    if (headerHint) headerHint.hidden = !isCsv;
+    if (!headerOption) return;
+    headerOption.hidden = selectedFormat() !== "csv";
   }
 
   formatInputs.forEach(function (input) {
@@ -206,6 +206,15 @@
     return field.querySelector("input, select");
   }
 
+  // #2049: partials/sql_parameter_fields.html always renders this span
+  // inside the field, hidden unless the server flagged the field, but it
+  // points the control's aria-describedby at it only when the server
+  // already rendered an error. On a fresh page the span must therefore be
+  // found inside the field, not through that attribute.
+  function fieldError(field) {
+    return field.querySelector(".field__hint--error");
+  }
+
   function fieldHasDefault(field) {
     return "default" in field.dataset;
   }
@@ -235,7 +244,7 @@
 
   function missingCountText(count) {
     var template = count === 1 ? missingOneTemplate : missingOtherTemplate;
-    return template ? template.replace("{count}", String(count)) : "";
+    return template ? template.replace("{count}", window.HfsNumber.format(count)) : "";
   }
 
   function expanded(entry) {
@@ -305,13 +314,42 @@
     if (!entry.summary.hidden) renderSummary(entry);
   }
 
-  function clearFieldInvalid(field) {
+  /* Marks (or clears) one field's inline error (#2049). Keeps the same id
+     handling as bulk-export.js `setFieldError`: the error span's id joins
+     the control's aria-describedby only while the message is shown, so a
+     hidden span never stays the control's description. Any other id the
+     control already lists is left alone, and the attribute is removed
+     when nothing is left. */
+  function setFieldInvalid(field, invalid, message) {
     var control = fieldControl(field);
     if (!control) return;
-    control.removeAttribute("aria-invalid");
-    var errorId = control.getAttribute("aria-describedby");
-    var errorEl = errorId ? document.getElementById(errorId) : null;
-    if (errorEl) errorEl.hidden = true;
+    var errorEl = fieldError(field);
+    var describedBy = (control.getAttribute("aria-describedby") || "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .filter(function (id) {
+        return !errorEl || id !== errorEl.id;
+      });
+    if (invalid) {
+      control.setAttribute("aria-invalid", "true");
+      if (errorEl) {
+        if (message) errorEl.textContent = message;
+        errorEl.hidden = false;
+        if (errorEl.id) describedBy.push(errorEl.id);
+      }
+    } else {
+      control.removeAttribute("aria-invalid");
+      if (errorEl) errorEl.hidden = true;
+    }
+    if (describedBy.length) {
+      control.setAttribute("aria-describedby", describedBy.join(" "));
+    } else {
+      control.removeAttribute("aria-describedby");
+    }
+  }
+
+  function clearFieldInvalid(field) {
+    setFieldInvalid(field, false);
   }
 
   function paramEntryFor(row) {
@@ -362,13 +400,9 @@
       sync(entry);
       var control = fieldControl(missingField);
       if (control) {
-        control.setAttribute("aria-invalid", "true");
-        var errorId = control.getAttribute("aria-describedby");
-        var errorEl = errorId ? document.getElementById(errorId) : null;
-        if (errorEl) {
-          if (paramRequiredMessage) errorEl.textContent = paramRequiredMessage;
-          errorEl.hidden = false;
-        }
+        // Mark and describe first, then focus, so focusing the field reads
+        // "This value is required." (#2049).
+        setFieldInvalid(missingField, true, paramRequiredMessage);
         control.focus();
       }
       return true;
@@ -434,8 +468,8 @@
       return total + (box && box.checked ? 1 : 0);
     }, 0);
     var text = countHint.dataset.msgCount
-      .replace("{selected}", String(selected))
-      .replace("{total}", String(rows.length));
+      .replace("{selected}", window.HfsNumber.format(selected))
+      .replace("{total}", window.HfsNumber.format(rows.length));
     var missing = totalMissingCount();
     if (missing > 0) {
       var missingText = missingCountText(missing);
@@ -482,6 +516,13 @@
 
   if (filterInput) {
     filterInput.addEventListener("input", applyFilter);
+    // #1665: the filter already applies as the user types, so Enter has
+    // nothing to do here; without this the browser's implicit submission
+    // posts the whole export form and can start a job.
+    filterInput.addEventListener("keydown", function (event) {
+      if (event.isComposing) return;
+      if (event.key === "Enter") event.preventDefault();
+    });
   }
 
   if (selectAll) {

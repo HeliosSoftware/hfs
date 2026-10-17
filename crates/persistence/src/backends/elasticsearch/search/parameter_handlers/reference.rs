@@ -63,7 +63,7 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
         }));
     }
     if param.modifier == Some(SearchModifier::Above) {
-        let parents = super::uri::compute_parent_uris(value);
+        let parents = crate::search::compute_parent_uris(value);
         return Some(json!({
             "nested": {
                 "path": "search_params.reference",

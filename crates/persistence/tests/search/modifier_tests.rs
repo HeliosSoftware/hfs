@@ -6,9 +6,10 @@
 use serde_json::json;
 
 use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::error::{SearchError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, TotalMode,
 };
 
 use helios_fhir::FhirVersion;
@@ -489,6 +490,152 @@ async fn test_not_modifier_includes_resources_missing_the_element() {
             .iter()
             .any(|r| r.content().get("gender").is_none()),
         "a patient without a gender element must match gender:not=male"
+    );
+}
+
+/// #1092: `_id` is dispatched by name into a dedicated builder that bypassed
+/// the generic `:not` handling entirely, so `_id:not=<id>` returned *only*
+/// the resource the caller asked to exclude — the precise inverse of the
+/// request. `:missing` is unaffected (it resolves before this dispatch) and
+/// is already pinned above; this covers `:not` and the modifier-rejection
+/// gate that now guards it.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_id_not_excludes_listed_ids() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    for id in ["a", "b", "c"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("b")],
+        chain: vec![],
+        components: vec![],
+    });
+    query.total = Some(TotalMode::Accurate);
+
+    let result = backend.search(&tenant, &query).await.unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a", "c"], "_id:not=b must exclude only b");
+    assert_eq!(result.total, Some(2));
+
+    let mut query_two = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+        chain: vec![],
+        components: vec![],
+    });
+    query_two.total = Some(TotalMode::Accurate);
+
+    let result_two = backend.search(&tenant, &query_two).await.unwrap();
+    let ids_two: Vec<&str> = result_two.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids_two, vec!["c"], "_id:not=a,b must exclude both a and b");
+    assert_eq!(result_two.total, Some(1));
+}
+
+/// #1092: modifiers the `_id` builder cannot honour must be rejected rather
+/// than silently degrading to a positive match (mirrors #1055/#1091's
+/// MongoDB `metadata_param_honoured` gate).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_id_unsupported_modifier_is_rejected() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "a"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Text),
+        values: vec![SearchValue::eq("a")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let err = backend.search(&tenant, &query).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "text"
+        ),
+        "_id:text must be rejected as an unsupported modifier, got: {err:?}"
+    );
+}
+
+/// `_lastUpdated` is dispatched by name into a dedicated builder that reads
+/// only `param.values`, so a modifier other than `:missing` would be dropped
+/// and the value consumed as a plain positive date match. It must be
+/// rejected up front instead, the same way unsupported `_id` modifiers are
+/// (#1092 follow-up).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_last_updated_unsupported_modifier_is_rejected() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "a"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_lastUpdated".to_string(),
+        param_type: SearchParamType::Date,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("2020")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let err = backend.search(&tenant, &query).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "not"
+        ),
+        "_lastUpdated:not must be rejected as an unsupported modifier, got: {err:?}"
+    );
+
+    let err = backend.search_count(&tenant, &query).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "not"
+        ),
+        "search_count must reject _lastUpdated:not as well, got: {err:?}"
     );
 }
 
@@ -1227,4 +1374,56 @@ async fn test_of_type_modifier_type_discrimination() {
     // Test documents expected behavior when :of-type is implemented
     let _dl_result = backend.search(&tenant, &dl_query.with_count(100)).await;
     let _pp_result = backend.search(&tenant, &pp_query.with_count(100)).await;
+}
+
+/// #1408: every modifier `SearchModifier::is_valid_for` allows, on every
+/// parameter type, over one data set. The scenarios are backend-agnostic
+/// (`modifier_parity_suite.rs`): PostgreSQL, MongoDB and Elasticsearch run the
+/// same ones.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_modifier_parity_suite() {
+    use super::modifier_parity_suite::{Divergence, Expect};
+
+    let backend = create_sqlite_backend();
+    super::modifier_parity_suite::every_valid_modifier_agrees_across_backends(
+        &backend,
+        "modifier-parity",
+        &[
+            // A short `:of-type` value is read as `type-code|value`, or `value`.
+            Divergence {
+                label: "Patient?identifier:ofType=MR|12345",
+                expect: Expect::Ids(&["p1"]),
+            },
+            Divergence {
+                label: "Patient?identifier:ofType=12345",
+                expect: Expect::Ids(&["p1", "p2"]),
+            },
+            // Terminology-backed token modifiers are not refused but degraded:
+            // `:in` / `:not-in` match nothing, `:above` / `:below` match the code
+            // itself. Unreachable over REST, which expands them or answers 501 first.
+            Divergence {
+                label: "Observation?code:in=http://example.org/fhir/ValueSet/a",
+                expect: Expect::Ids(&[]),
+            },
+            Divergence {
+                label: "Observation?code:not-in=http://example.org/fhir/ValueSet/a",
+                expect: Expect::Ids(&[]),
+            },
+            Divergence {
+                label: "Observation?code:above=http://loinc.org|1234-5",
+                expect: Expect::Ids(&["ob-pat"]),
+            },
+            Divergence {
+                label: "Observation?code:below=http://loinc.org|1234-5",
+                expect: Expect::Ids(&["ob-pat"]),
+            },
+            // A value naming another type wins over the `:[type]` modifier.
+            Divergence {
+                label: "Observation?subject:Patient=Group/p1",
+                expect: Expect::Ids(&["ob-grp"]),
+            },
+        ],
+    )
+    .await;
 }

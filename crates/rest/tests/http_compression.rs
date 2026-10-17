@@ -6,7 +6,8 @@
 //!   decompressed before parsing.
 //! - Invalid compressed bodies produce a 4xx, unsupported encodings a 415.
 //! - `HFS_MAX_BODY_SIZE` applies to the *decompressed* body, so a small
-//!   highly-compressed payload cannot bypass the limit.
+//!   highly-compressed payload cannot bypass the limit, and an over-limit
+//!   body is a 413 on the batch/transaction endpoint too.
 //! - Responses are gzip-compressed when the client sends
 //!   `Accept-Encoding: gzip` (with `Content-Encoding` and
 //!   `Vary: Accept-Encoding` set) and left identity-encoded otherwise.
@@ -176,6 +177,84 @@ async fn test_body_limit_applies_to_decompressed_size() {
         .await;
 
     assert_eq!(response.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A batch Bundle whose decompressed size is far above a 1 KiB limit.
+fn oversized_batch_bundle() -> Vec<u8> {
+    let mut patient = patient_json();
+    patient["name"][0]["family"] = json!("a".repeat(64 * 1024));
+    serde_json::to_vec(&json!({
+        "resourceType": "Bundle",
+        "type": "batch",
+        "entry": [{
+            "resource": patient,
+            "request": {"method": "POST", "url": "Patient"}
+        }]
+    }))
+    .unwrap()
+}
+
+// The batch/transaction handler reads its own body, so it has to map the
+// limit to 413 itself rather than to a generic 400 (#1662).
+#[tokio::test]
+async fn test_batch_body_over_limit_is_413() {
+    let config = ServerConfig {
+        max_body_size: 1024,
+        ..test_config()
+    };
+    let server = create_test_server(config);
+
+    let response = server
+        .post("/")
+        .add_header("x-tenant-id", "test-tenant")
+        .content_type("application/fhir+json")
+        .bytes(oversized_batch_bundle().into())
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+    let outcome: Value = response.json();
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    assert_eq!(outcome["issue"][0]["code"], "too-long");
+}
+
+#[tokio::test]
+async fn test_batch_body_limit_applies_to_decompressed_size() {
+    let config = ServerConfig {
+        max_body_size: 1024,
+        ..test_config()
+    };
+    let server = create_test_server(config);
+
+    let compressed = gzip_bytes(&oversized_batch_bundle());
+    assert!(
+        compressed.len() < 1024,
+        "test payload must compress below the limit"
+    );
+
+    let response = server
+        .post("/")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("content-encoding", "gzip")
+        .content_type("application/fhir+json")
+        .bytes(compressed.into())
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn test_batch_invalid_gzip_body_stays_400() {
+    let server = create_test_server(test_config());
+
+    let response = server
+        .post("/")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("content-encoding", "gzip")
+        .content_type("application/fhir+json")
+        .bytes(b"this is not gzip data".to_vec().into())
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
 }
 
 // =============================================================================

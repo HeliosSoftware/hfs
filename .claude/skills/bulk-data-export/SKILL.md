@@ -29,22 +29,24 @@ All kick-offs require `Prefer: respond-async`. The default response is `202 Acce
 | `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local filesystem output root |
 | `HFS_BULK_EXPORT_S3_BUCKET` | none | S3 bucket, required when output backend is s3 |
 | `HFS_BULK_EXPORT_S3_ENDPOINT` | AWS | S3-compatible endpoint URL, such as MinIO |
-| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers |
+| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers; forced on when `HFS_BULK_EXPORT_S3_ENDPOINT` is set |
 | `HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: auto, true, or false; false is invalid with local-fs |
 | `HFS_BULK_EXPORT_FILE_URL_TTL` | `3600` | Pre-signed download URL lifetime in seconds |
 | `HFS_BULK_EXPORT_OUTPUT_TTL` | `86400` | Output retention after job completion in seconds |
 | `HFS_BULK_EXPORT_WORKER_CONCURRENCY` | `2` | In-process worker pool size |
 | `HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers for separate exporter deployments |
 | `HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active job cap; kick-off returns `429` if exceeded |
+| `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | Claims allowed per job; a job reclaimed past this is failed as abandoned |
 | `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per `fetch_export_batch` |
 | `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length in seconds; must exceed heartbeat interval |
-| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
+| `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released export is claimable by another instance at once, without spending one of its `HFS_BULK_EXPORT_MAX_ATTEMPTS`, and restarts from scratch. Past the deadline, leases lapse after the lease duration as before |
+| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Lease-keeper renewal cadence in seconds; a background task renews the lease at this cadence while a job runs; must be below the lease duration |
 | `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group export `_since` toggle: include or exclude |
 
 Job-state storage reuses the same backend and connection pool that holds FHIR resources. SQLite deployments share `./data/hfs.db`. PostgreSQL deployments share `HFS_DATABASE_URL`. There is no separate job-store configuration.
 
-Bulk export is currently available on `sqlite`, `postgres`, `sqlite-elasticsearch`, and `postgres-elasticsearch`. Other backends return `501` until job-state implementations exist.
+Bulk export is currently available on `sqlite`, `postgres`, `sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb`, and `s3-elasticsearch` — the last two through a SQLite sidecar job store. The composite `mongo-elasticsearch` and standalone `s3` return `501` until job-state implementations exist there.
 
 ## Single-instance Recipe
 
@@ -77,10 +79,16 @@ The full local stack is in `docker/bulk-export/docker-compose.yml`: HFS, Postgre
 
 ## Behavior Notes
 
-- `_typeFilter` is parsed and applied.
+- `_typeFilter` is validated against the search parameter registry at kick-off (unknown parameters or invalid values → `400`, regardless of `Prefer: handling`) and applied by the worker per batch.
 - Unsupported result-control params inside `_typeFilter` are rejected with `400` regardless of `Prefer: handling`: `_sort`, `_include`, `_revinclude`, `_count`, `_elements`.
 - `_elements` is implemented: subset to listed paths plus `id`, `resourceType`, and `meta`, with a `SUBSETTED` `meta.tag` added.
 - Unsupported parameters `includeAssociatedData`, `organizeOutputBy`, and `allowPartialManifests` return `400` when `Prefer: handling=strict` is set. Without strict handling, or with lenient handling, they are ignored and a warning is logged.
 - Group export `_since` late membership uses `include` by default, returning pre-`_since` resources for patients added after `_since`.
 - `exclude` is reserved for a follow-up that requires group-membership-history tracking.
 - Group export flattens nested `Group/` members iteratively with a visited-set cycle guard.
+- Patient and Group export decide compartment membership with the spec `CompartmentDefinition` (`helios_fhir::get_compartment_params`), the same table `GET /Patient/{id}/*` and `$everything` use, evaluated on the stored payload so it also holds when search is offloaded (#1122). A resource joins through any of its type's compartment parameters (`Observation.performer`, `AllergyIntolerance.recorder`, `Coverage.beneficiary`, `Patient.link`, …), not only `subject`/`patient`; the parameters come from the server's search-parameter registry, so a server started without the spec SearchParameters under `HFS_DATA_DIR` exports no compartment members.
+- On PostgreSQL, Patient and Group export narrow compartment candidates with the GIN index `idx_resources_patient_refs_v1` on Patient references (#1594). `init_schema` builds it on `postgres` and on `postgres-elasticsearch` alike, because `$export` reads compartments from PostgreSQL even when search is offloaded; before #1663 `pg-es` skipped it and fell back to a full-scan JSON-path predicate that hit the 30 s `HFS_PG_STATEMENT_TIMEOUT_MS` on a large corpus. The first startup against an existing database without the index builds it with `CREATE INDEX CONCURRENTLY` under the schema-migration lock, before the server answers requests: #1594 measured about 6 min 40 s and 57 MB on a 19M-resource corpus. If the build fails, startup continues and exports use the JSON predicate until the next startup retries it. Only the audit-only PostgreSQL store skips the index.
+- A storage read that exceeds the backend's statement timeout fails the job with `export failed: storage query timed out` (status poll `500`), distinct from `export failed: internal storage error` for other storage faults. Neither message carries SQL; the server log keeps the full error. Raising `HFS_PG_STATEMENT_TIMEOUT_MS` is the workaround while an index is missing or still building.
+- `DELETE /export-status/{job_id}` is the whole teardown, and the UI's **Cancel** sends exactly that request; the UI's later **Delete** gets `404` and only drops the card. The handler cancels an active job, deletes its outputs, deletes the job row, then deletes the outputs again. Cancellation is cooperative and nothing waits for the worker, so the second sweep reclaims a part a still-running worker finalized in between; a worker that writes after the row is gone finds the job missing on its way out and deletes the outputs itself (#1272). The first sweep runs while the row still exists and may lose the race to a part being finalized into the directory: the local-FS store retries `remove_dir_all` on `ENOTEMPTY` (20 × 50 ms), and if it still fails the handler logs a warning and carries on to the row delete and the second sweep instead of answering `500` (#1549). The response is `202` whenever the row is gone; only a failure of the second sweep surfaces. `BulkExportStorage::delete_export` only removes rows — outputs are always the caller's job.
+- Status poll `202`: `X-Progress` is the percentage of resource types fully written; the body is a `Parameters` with `typesTotal`, `typesDone` and `currentType` (the type in flight), like `$sql-export`.
+- Transient storage failures on any export route answer `503` with `Retry-After: 5` and an `OperationOutcome` whose issue code is `transient`, not `500`. The usual cause on SQLite is a foreground write losing the race with a background search-index rebuild: the single writer lock is held elsewhere, the connection exhausts its `busy_timeout` (default 30 s) and the driver reports `database is locked`. Kick-off is the visible case because it is the first write of a job. A `503` here means retry shortly, not that the export is broken.

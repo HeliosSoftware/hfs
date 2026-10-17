@@ -37,6 +37,17 @@
           ],
           "text": "Water"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 83.61,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -50,6 +61,17 @@
             }
           ],
           "text": "Energy (Atwater General Factors)"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 64.6609,
+          "comparator": "ad",
+          "unit": "kcal"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -65,6 +87,17 @@
           ],
           "text": "Energy (Atwater Specific Factors)"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 58.20306,
+          "comparator": "ad",
+          "unit": "kcal"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -78,6 +111,17 @@
             }
           ],
           "text": "Nitrogen"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.02375,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -93,6 +137,17 @@
           ],
           "text": "Protein"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.1484375,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -106,6 +161,17 @@
             }
           ],
           "text": "Total lipid (fat)"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.1625,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -121,6 +187,17 @@
           ],
           "text": "Ash"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.4279,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -134,6 +211,17 @@
             }
           ],
           "text": "Carbohydrate, by difference"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 15.6511625,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -149,6 +237,17 @@
           ],
           "text": "Carbohydrate, by summation"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 15.405,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -162,6 +261,17 @@
             }
           ],
           "text": "Fiber, total dietary"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 2.075,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -177,6 +287,17 @@
           ],
           "text": "Sugars, Total"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 13.332,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -190,6 +311,17 @@
             }
           ],
           "text": "Sugars, total including NLEA"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 13.33,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -205,6 +337,17 @@
           ],
           "text": "Sucrose"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 1.704,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -218,6 +361,17 @@
             }
           ],
           "text": "Glucose"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 3.038,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -233,6 +387,17 @@
           ],
           "text": "Fructose"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 8.59,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -246,6 +411,17 @@
             }
           ],
           "text": "Lactose"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -261,6 +437,17 @@
           ],
           "text": "Maltose"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -274,6 +461,17 @@
             }
           ],
           "text": "Calcium, Ca"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 5.975,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -289,6 +487,17 @@
           ],
           "text": "Iron, Fe"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.015,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -302,6 +511,17 @@
             }
           ],
           "text": "Magnesium, Mg"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 4.67,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -317,6 +537,17 @@
           ],
           "text": "Phosphorus, P"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 9.78,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -330,6 +561,17 @@
             }
           ],
           "text": "Potassium, K"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 103.8,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -345,6 +587,17 @@
           ],
           "text": "Sodium, Na"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 1.013,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -358,6 +611,17 @@
             }
           ],
           "text": "Zinc, Zn"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.01676,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -373,6 +637,17 @@
           ],
           "text": "Copper, Cu"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.03279,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -386,6 +661,17 @@
             }
           ],
           "text": "Manganese, Mn"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.03263,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -401,6 +687,17 @@
           ],
           "text": "Thiamin"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.00625,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -414,6 +711,17 @@
             }
           ],
           "text": "Riboflavin"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.0675,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     },
@@ -429,6 +737,17 @@
           ],
           "text": "Niacin"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.09063,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
+        }
       }
     },
     {
@@ -442,6 +761,17 @@
             }
           ],
           "text": "Vitamin B-6"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.03544,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "apple"
         }
       }
     }

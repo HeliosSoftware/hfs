@@ -267,6 +267,41 @@ fn test_process_ndjson_chunked_csv() {
     assert!(output_str.contains("p3,other"));
 }
 
+/// #1569: a resource without a value for a column yields an empty CSV cell in
+/// the chunked path, the same as the buffered one, not the text null.
+#[test]
+#[cfg(feature = "R4")]
+fn test_process_ndjson_chunked_csv_writes_a_missing_value_as_an_empty_cell() {
+    let ndjson = r#"{"resourceType": "Patient", "id": "p1", "gender": "male"}
+{"resourceType": "Patient", "id": "p2"}"#;
+
+    let view_def = create_patient_view_definition();
+    let input = BufReader::new(Cursor::new(ndjson));
+    let mut output = Vec::new();
+    let config = ChunkConfig {
+        chunk_size: 1,
+        skip_invalid_lines: false,
+    };
+    process_ndjson_chunked(
+        view_def,
+        input,
+        &mut output,
+        ContentType::CsvWithHeader,
+        config,
+    )
+    .unwrap();
+
+    let output_str = String::from_utf8(output).unwrap();
+    assert_eq!(
+        output_str,
+        "id,gender
+p1,male
+p2,
+",
+        "{output_str}"
+    );
+}
+
 /// Test chunked processing to NDJSON output
 #[test]
 #[cfg(feature = "R4")]

@@ -51,6 +51,12 @@
       <value value="23-56Tu-XX-47-20150M14"/>
     </reference>
   </related>
+  <request>
+    <reference value="MedicationRequest/medrx002"/>
+  </request>
+  <!-- <originalPrescription>
+		<reference value="MedicationRequest/medrx0301"/>
+	</originalPrescription> -->
   <facility>
     <reference value="Location/1"/>
   </facility>

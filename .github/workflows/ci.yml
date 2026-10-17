@@ -8,7 +8,35 @@ on:
   pull_request:
     branches: [main]
 
+# One run per ref. Merging a stack of PRs pushes to `main` once per merge, and
+# every intermediate run is superseded by the next one — so a new push cancels
+# the in-flight run and only the latest commit is tested. PRs get the same
+# treatment per PR (`refs/pull/<n>/merge`).
+#
+# Cancellation does not leak resources: the cancelled run still executes its
+# `if: always()` work — each job's "Cap target dir size" / server-cleanup
+# steps, and the `cleanup-test-containers` job, which reaps every container
+# stamped with this run's `github.run_id`.
+#
+# Tag runs (`v*`) build, publish and deploy a release and must never be cut
+# short; each tag is its own ref anyway, so this is belt and braces.
+#
+# The group name is deliberately NOT `${{ github.workflow }}-${{ github.ref }}`:
+# inside a reusable workflow `github.workflow` resolves to the *caller's* name,
+# and hts-ig-conformance.yml (called from this file on tags) uses exactly that
+# expression for its own group. A matching group here would make the callee
+# cancel or deadlock against its own caller.
+concurrency:
+  group: hfs-ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
+  # Pin the toolchain by environment, which rustup ranks above a directory
+  # override. A self-hosted runner kept a leftover `rustup override` to nightly
+  # for this checkout: the "Install Rust toolchain" step still reported stable,
+  # but every cargo command ran nightly, and nightly clippy failed lints that
+  # stable does not have — on that one runner only.
+  RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -35,14 +63,10 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -77,7 +101,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -158,6 +190,18 @@ jobs:
             exit 1
           fi
           echo "All test subdirectories are wired into a top-level test binary."
+
+      # Make room before the build, not after it fails. On the Windows agents
+      # this build grows target/ by 130-150GB, and the end-of-job sweep below
+      # only caps what is left between jobs; a run that started with ~150GB
+      # free ran out mid-link (run 38627332199). 175 covers the largest growth
+      # seen plus margin, and is a no-op on the Linux agents (~230GB free, ~30GB
+      # growth). See "Pre-build headroom" in .github/actions/cargo-target-gc.
+      - name: Ensure build headroom
+        uses: ./.github/actions/cargo-target-gc
+        with:
+          mode: preflight
+          min-free-gb: "175"
 
       # `--all-features` enables R5, so this is the one job where the R5 FHIRPath
       # conformance suite is live rather than compiled to its `#[cfg(not(R5))]`
@@ -396,14 +440,10 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -438,7 +478,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -485,14 +533,10 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -527,7 +571,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -550,6 +602,135 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --all-targets --all-features -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+
+      # The clippy run above uses `--all-features`, and every workflow that
+      # builds `hfs` on a PR enables most backends at once, so an item gated on
+      # one backend but used by another compiles everywhere CI looks and breaks
+      # only the narrower builds people actually deploy (#1291: a `mongodb`-gated
+      # helper called from the Postgres and S3 startup paths). Check `hfs` once
+      # per backend on its own, with warnings denied so a helper left unused by
+      # a subset fails here too. `--no-default-features` is required: the
+      # default set enables `sqlite`.
+      #
+      # The loop is bash, and a bare `shell: bash` resolves to WSL's
+      # `C:\Windows\System32\bash.exe` on the self-hosted Windows agent, which
+      # aborts with "Windows Subsystem for Linux has no installed distributions".
+      # Same split as the MinIO steps above: Git Bash via the space-free 8.3
+      # path on Windows, plain `shell: bash` elsewhere. The two steps run the
+      # identical script; exactly one fires per run via the `runner.os` guard.
+      - name: Check hfs builds with single-backend feature sets (#1291)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
+            echo "::group::helios-hfs --no-default-features --features $features"
+            cargo clippy -p helios-hfs --no-default-features --features "$features" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+      - name: Check hfs builds with single-backend feature sets (#1291) (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        run: |
+          for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
+            echo "::group::helios-hfs --no-default-features --features $features"
+            cargo clippy -p helios-hfs --no-default-features --features "$features" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+
+      # FHIR version features are the other axis a default build never
+      # exercises. `helios-audit`'s R5/R6 features deliberately enable
+      # `helios-fhir/R4B` (the BALP AuditEvent baseline), so through feature
+      # unification a crate can see a `FhirVersion` variant its own features
+      # did not ask for: `helios-fhir-validator` had a match with no arm for it
+      # and `helios-rest --features R4,R5` did not compile (#1367). A
+      # single-version non-R4 build catches the opposite mistake — an import or
+      # arm that is only used under R4. Kept to two invocations: each rebuilds
+      # the generated `helios-fhir` model for its feature set.
+      #
+      # `ui` is listed on the `helios-hfs` spec because `--no-default-features`
+      # drops it, and helios-ui gates its own total `FhirVersion` matches on its
+      # own features. With `ui` dropped, an R5-without-R4B set never compiled it
+      # (#2051). helios-fhir's feature set is unchanged by adding it, so this is
+      # still two model builds.
+      #
+      # Same Windows/non-Windows split as the #1291 step above: a bare
+      # `shell: bash` is WSL's bash on the self-hosted Windows agent.
+      - name: Check builds with FHIR version feature subsets (#1367)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite,ui"; do
+            set -- $spec
+            echo "::group::$1 --no-default-features --features $2"
+            cargo clippy -p "$1" --no-default-features --features "$2" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+          # helios-rest and helios-hfs R5/R6 enable R4B on purpose (#2064), so
+          # neither spec above still compiles a crate whose own features lack a
+          # variant helios-fhir has. helios-persistence R5 does not enable its
+          # R4B (only helios-audit turns helios-fhir/R4B on), nor do the
+          # helios-sof and helios-fhirpath it pulls in, so this spec keeps the
+          # #1367-style E0004 coverage for them. It ends up with the same
+          # FHIR version set as the helios-hfs spec above.
+          echo "::group::helios-persistence --no-default-features --features R5,sqlite"
+          cargo clippy -p helios-persistence --no-default-features --features R5,sqlite -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+          echo "::endgroup::"
+          # `cargo clippy` cannot catch a runtime panic, and #2064 was one: a
+          # validator catch-all arm that panicked for a FHIR version helios-fhir
+          # had enabled (through helios-audit R5) but the validator was built
+          # without. The regression test only fails in an R5/R6 build that does
+          # not enable R4B; default features (R4 only) and --all-features
+          # (every version) cannot fail it, so run it under R5 here.
+          echo "::group::helios-rest fhir_version_coverage --no-default-features --features R5,sqlite"
+          cargo test -p helios-rest --no-default-features --features R5,sqlite --test fhir_version_coverage
+          echo "::endgroup::"
+      - name: Check builds with FHIR version feature subsets (#1367) (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        run: |
+          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite,ui"; do
+            set -- $spec
+            echo "::group::$1 --no-default-features --features $2"
+            cargo clippy -p "$1" --no-default-features --features "$2" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+          # helios-rest and helios-hfs R5/R6 enable R4B on purpose (#2064), so
+          # neither spec above still compiles a crate whose own features lack a
+          # variant helios-fhir has. helios-persistence R5 does not enable its
+          # R4B (only helios-audit turns helios-fhir/R4B on), nor do the
+          # helios-sof and helios-fhirpath it pulls in, so this spec keeps the
+          # #1367-style E0004 coverage for them. It ends up with the same
+          # FHIR version set as the helios-hfs spec above.
+          echo "::group::helios-persistence --no-default-features --features R5,sqlite"
+          cargo clippy -p helios-persistence --no-default-features --features R5,sqlite -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+          echo "::endgroup::"
+          # `cargo clippy` cannot catch a runtime panic, and #2064 was one: a
+          # validator catch-all arm that panicked for a FHIR version helios-fhir
+          # had enabled (through helios-audit R5) but the validator was built
+          # without. The regression test only fails in an R5/R6 build that does
+          # not enable R4B; default features (R4 only) and --all-features
+          # (every version) cannot fail it, so run it under R5 here.
+          echo "::group::helios-rest fhir_version_coverage --no-default-features --features R5,sqlite"
+          cargo test -p helios-rest --no-default-features --features R5,sqlite --test fhir_version_coverage
+          echo "::endgroup::"
+
+      # Git for Windows defaults to `core.symlinks=false` and checks a symlink
+      # out as a text file holding the link target, which broke the Windows
+      # release build (#1257). No Windows job builds the UI crates before
+      # merge, so reproduce that checkout shape here and prove the build
+      # scripts' workspace-path fallback still compiles.
+      - name: Check UI crates build without symlink support (#1257)
+        if: runner.os != 'Windows'
+        run: |
+          links="crates/ui/locales crates/hts-ui/locales crates/hts-ui/ui-assets"
+          restore() { git checkout-index --force -- $links; }
+          trap restore EXIT
+          for link in $links; do
+            target=$(readlink "$link")
+            rm "$link"
+            printf '%s' "$target" > "$link"
+          done
+          cargo check -p helios-ui -p helios-hts-ui
 
       - name: Format check
         working-directory: crates/pysof
@@ -582,14 +763,10 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -624,7 +801,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -700,6 +885,23 @@ jobs:
         # reaching the bug would require AWS itself to send the hostile frame
         # stream. Remove this once the AWS SDK drops its hyper 0.14 fallback
         # client.
+        #
+        # rustls 0.21.12 (RUSTSEC-2026-0346, RUSTSEC-2026-0349). The copy we
+        # build ourselves is on the patched 0.23.46; this is the same legacy
+        # AWS fallback copy (rustls 0.21 <- aws-smithy-http-client 1.1.10
+        # `legacy-rustls-ring`), only linked under `--all-features`. The
+        # advisories' fix lands in >= 0.23.46 only, so no 0.21.x upgrade
+        # exists. Neither is reachable through that path:
+        #   - RUSTSEC-2026-0346 (derived `Debug` on client session values
+        #     prints the master secret / resumption PSK): only affects custom
+        #     `ClientSessionStore` impls that Debug-format those values; the
+        #     AWS SDK uses rustls's built-in, redacted session cache.
+        #   - RUSTSEC-2026-0349 (unauthenticated ServerHello downgrades later
+        #     handshakes from X25519MLKEM768 to classical X25519): rustls 0.21
+        #     has no post-quantum hybrid group, so its key exchange is already
+        #     classical-only and there is nothing to downgrade.
+        # Remove these with the h2 entry above, once the AWS SDK drops its
+        # hyper 0.14 fallback client.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0098
@@ -709,6 +911,8 @@ jobs:
           --ignore RUSTSEC-2026-0195
           --ignore RUSTSEC-2026-0235
           --ignore RUSTSEC-2026-0258
+          --ignore RUSTSEC-2026-0346
+          --ignore RUSTSEC-2026-0349
 
       # See the note in `test-rust`.
       - name: Cap target dir size
@@ -731,14 +935,10 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -773,7 +973,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -1506,7 +1714,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -1979,10 +2195,24 @@ jobs:
             "${IMAGE}:${VERSION}-arm64"
 
   # ── Continuous Delivery ────────────────────────────────────────
+  # fhirpath-server, sof-server and hfs all use hts as their terminology
+  # server, and every hts deploy wipes hts.db and re-imports the bundled
+  # terminology before it serves. hts therefore deploys first, and its job
+  # only goes green once HTS answers a real $validate-code (#1534). If hts
+  # does not come up, the clients are skipped rather than deployed against a
+  # dead terminology server.
+  deploy-hts:
+    name: Deploy hts
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/deploy-server.yml
+    with:
+      server: hts
+    secrets: inherit
+
   deploy:
     name: Deploy ${{ matrix.server }}
-    runs-on: [self-hosted, Linux, Deploy]
-    needs: [release]
+    needs: [release, deploy-hts]
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
@@ -1991,195 +2221,7 @@ jobs:
           - fhirpath-server
           - sof-server
           - hfs
-          - hts
-    steps:
-      - name: Download release binary
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const fs = require('fs');
-            const tag = '${{ github.ref_name }}';
-
-            console.log(`Fetching release for tag: ${tag}`);
-
-            const { data: release } = await github.rest.repos.getReleaseByTag({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag: tag
-            });
-
-            const version = tag.startsWith('v') ? tag.substring(1) : tag;
-
-            const asset = release.assets.find(asset =>
-              asset.name === `hfs-${version}-x86_64-unknown-linux-gnu.tar.gz`
-            );
-
-            if (!asset) {
-              throw new Error(`Linux archive not found. Expected: hfs-${version}-x86_64-unknown-linux-gnu.tar.gz`);
-            }
-
-            const { data } = await github.rest.repos.getReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              asset_id: asset.id,
-              headers: {
-                Accept: 'application/octet-stream'
-              }
-            });
-
-            fs.writeFileSync('release-binary.tar.gz', Buffer.from(data));
-            console.log(`Downloaded: ${asset.name}`);
-
-      - name: Extract release archive
-        run: |
-          mkdir -p extracted
-          tar -xzf release-binary.tar.gz -C extracted
-          mv extracted/${{ matrix.server }} .
-          chmod +x ${{ matrix.server }}
-          # Preserve data directory (search parameters, etc.) if present
-          if [ -d extracted/data ]; then
-            cp -r extracted/data .
-          fi
-          # Preserve bundled terminology distributions (hts bootstrap-on-startup)
-          if [ -d extracted/terminology-data ]; then
-            cp -r extracted/terminology-data .
-          fi
-          rm -rf extracted
-
-      - name: Deploy binary and create service
-        env:
-          DEPLOY_HOST: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_HOST || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_HOST || matrix.server == 'hts' && secrets.HTS_DEPLOY_HOST || secrets.HFS_DEPLOY_HOST }}
-          DEPLOY_USER: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_USER || matrix.server == 'hts' && secrets.HTS_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
-          DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || matrix.server == 'hts' && secrets.HTS_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
-          SERVER_NAME: ${{ matrix.server }}
-          HFS_PUBLIC_URL: ${{ secrets.HFS_PUBLIC_URL }}
-          # Terminology backend for the three FHIR services. Each binary reads its own
-          # variable name (FHIRPATH_/SOF_/HFS_TERMINOLOGY_SERVER); sof and hfs propagate
-          # theirs into the embedded FHIRPath engine. Since #217 there is no built-in
-          # default, so an unset value is not a fallback -- %terminologies, memberOf,
-          # subsumes and the :in/:not-in search modifiers all fail outright.
-          # HTS serves operations at the root of its base URL: no /r4 or /r5 segment.
-          TERMINOLOGY_SERVER_URL: https://hts.heliossoftware.com
-        run: |
-          # Define SSH command with proper options (runner's own key is trusted by targets)
-          SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
-          SCP_CMD="scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P $DEPLOY_PORT"
-
-          # Create deployment directory on remote
-          $SSH_CMD "sudo mkdir -p /opt/$SERVER_NAME"
-
-          # Stop existing service (if running)
-          $SSH_CMD "sudo systemctl stop $SERVER_NAME || true"
-
-          # Reset the database on each deploy so the server starts clean.
-          # For hts this also clears the bootstrap_imports ledger, so the
-          # HTS_BOOTSTRAP_DIR sync below re-imports every bundled terminology.
-          if [ "$SERVER_NAME" = "hfs" ]; then
-            $SSH_CMD "sudo rm -f /opt/$SERVER_NAME/fhir.db /opt/$SERVER_NAME/fhir.db-wal /opt/$SERVER_NAME/fhir.db-shm \
-                                 /opt/$SERVER_NAME/data/hfs.db /opt/$SERVER_NAME/data/hfs.db-wal /opt/$SERVER_NAME/data/hfs.db-shm"
-          elif [ "$SERVER_NAME" = "hts" ]; then
-            $SSH_CMD "sudo rm -f /opt/$SERVER_NAME/data/hts.db /opt/$SERVER_NAME/data/hts.db-wal /opt/$SERVER_NAME/data/hts.db-shm"
-          fi
-
-          # Backup current version
-          $SSH_CMD "sudo cp /opt/$SERVER_NAME/$SERVER_NAME \
-             /opt/$SERVER_NAME/$SERVER_NAME.backup || true"
-
-          # Copy new binary to remote
-          $SCP_CMD $SERVER_NAME $DEPLOY_USER@$DEPLOY_HOST:/tmp/
-
-          # Copy data directory (search parameters, etc.) if present
-          if [ -d data ]; then
-            $SCP_CMD -r data $DEPLOY_USER@$DEPLOY_HOST:/tmp/hfs-data
-          fi
-
-          # Copy bundled terminology distributions for hts bootstrap-on-startup
-          if [ "$SERVER_NAME" = "hts" ] && [ -d terminology-data ]; then
-            $SSH_CMD "rm -rf /tmp/hts-terminology-data"
-            $SCP_CMD -r terminology-data $DEPLOY_USER@$DEPLOY_HOST:/tmp/hts-terminology-data
-          fi
-
-          # Move binary to final location and set permissions
-          $SSH_CMD "sudo mv /tmp/$SERVER_NAME /opt/$SERVER_NAME/ && \
-                    sudo chown $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/$SERVER_NAME && \
-                    sudo chmod +x /opt/$SERVER_NAME/$SERVER_NAME"
-
-          # Deploy data directory if present
-          $SSH_CMD "if [ -d /tmp/hfs-data ]; then
-            sudo rm -rf /opt/$SERVER_NAME/data
-            sudo mv /tmp/hfs-data /opt/$SERVER_NAME/data
-            sudo chown -R $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/data
-          fi"
-
-          # Deploy bundled terminology distributions (hts) for bootstrap-on-startup
-          $SSH_CMD "if [ -d /tmp/hts-terminology-data ]; then
-            sudo rm -rf /opt/$SERVER_NAME/terminology-data
-            sudo mv /tmp/hts-terminology-data /opt/$SERVER_NAME/terminology-data
-            sudo chown -R $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/terminology-data
-          fi"
-
-          # Ensure the directory is owned by deploy user so the service can write data files (e.g. fhir.db)
-          $SSH_CMD "sudo chown $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME"
-
-          # Build the systemd unit definition for this server
-          if [ "$SERVER_NAME" = "fhirpath-server" ]; then
-            SERVICE_DESCRIPTION="FHIRPath Server"
-            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"FHIRPATH_SERVER_HOST=0.0.0.0\"\nEnvironment=\"FHIRPATH_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
-          elif [ "$SERVER_NAME" = "sof-server" ]; then
-            SERVICE_DESCRIPTION="SQL-on-FHIR Server"
-            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"SOF_SERVER_HOST=0.0.0.0\"\nEnvironment=\"SOF_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
-          elif [ "$SERVER_NAME" = "hfs" ]; then
-            SERVICE_DESCRIPTION="Helios FHIR Server"
-            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\"\nEnvironment=\"HFS_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
-          elif [ "$SERVER_NAME" = "hts" ]; then
-            SERVICE_DESCRIPTION="Helios Terminology Server"
-            # hts uses a subcommand CLI: host/port/db flags live under `run`
-            # (top-level `hts` only takes an optional subcommand), unlike the
-            # other servers which accept --host at the top level.
-            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME run --host 0.0.0.0"
-            # SQLite backend (default); DB lives under the service WorkingDirectory (/opt/hts/data/hts.db).
-            # HTS_BOOTSTRAP_DIR points at the bundled terminology distributions so
-            # the server auto-imports them on startup (idempotent via the
-            # bootstrap_imports ledger, which the DB reset above clears each deploy).
-            SERVICE_ENV="Environment=\"HTS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HTS_STORAGE_BACKEND=sqlite\"\nEnvironment=\"HTS_DATABASE_URL=/opt/$SERVER_NAME/data/hts.db\"\nEnvironment=\"HTS_BOOTSTRAP_DIR=/opt/$SERVER_NAME/terminology-data\""
-          fi
-
-          # Always (re)write the unit so env changes (e.g. HTS_BOOTSTRAP_DIR)
-          # are reconciled on every deploy rather than only on first install.
-          $SSH_CMD "sudo tee /etc/systemd/system/$SERVER_NAME.service > /dev/null <<EOF
-          [Unit]
-          Description=$SERVICE_DESCRIPTION
-          After=network.target
-
-          [Service]
-          Type=simple
-          User=$DEPLOY_USER
-          Group=$DEPLOY_USER
-          WorkingDirectory=/opt/$SERVER_NAME
-          ExecStart=$SERVICE_EXEC_START
-          Restart=always
-          RestartSec=5
-          $(echo -e "$SERVICE_ENV")
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-          sudo systemctl daemon-reload
-          sudo systemctl enable $SERVER_NAME"
-
-          # Start the service
-          $SSH_CMD "sudo systemctl start $SERVER_NAME"
-
-          # Verify deployment
-          sleep 5
-          if $SSH_CMD "sudo systemctl is-active --quiet $SERVER_NAME"; then
-            echo "Deployment successful - $SERVER_NAME is running"
-            $SSH_CMD "sudo systemctl status $SERVER_NAME"
-          else
-            echo "Deployment failed - $SERVER_NAME is not running"
-            $SSH_CMD "sudo journalctl -u $SERVER_NAME --lines=20"
-            exit 1
-          fi
+    uses: ./.github/workflows/deploy-server.yml
+    with:
+      server: ${{ matrix.server }}
+    secrets: inherit

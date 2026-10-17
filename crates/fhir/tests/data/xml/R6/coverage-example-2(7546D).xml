@@ -83,7 +83,9 @@
   </class>
   <order value="2"/>
   <!-- Second after the national medical coverage -->
-  <network/>
+  <network>
+    <reference value="Organization/hl7pay"/>
+  </network>
   <costToBeneficiary>
     <type>
       <!-- normally $40.00 -->

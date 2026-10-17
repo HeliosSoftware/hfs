@@ -14,12 +14,13 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::Response,
 };
-use helios_persistence::core::{ResourceStorage, VersionedStorage};
+use helios_persistence::core::{ResourceStorage, SearchProvider, VersionedStorage};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::middleware::content_type::{FhirContentType, negotiate_format};
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
@@ -50,11 +51,12 @@ pub async fn vread_handler<S>(
     Path((resource_type, id, version_id)): Path<(String, String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + VersionedStorage + Send + Sync,
+    S: ResourceStorage + VersionedStorage + SearchProvider + Send + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -97,6 +99,16 @@ where
             }
         }
         Some(stored) => {
+            // A `patient/` scope reads the launch patient's compartment only
+            // (#1618), judged on this very version's payload: a version from
+            // before the resource joined the compartment is not the patient's.
+            compartment.assert_member(
+                || state.storage().search_param_registry(tenant.context()),
+                stored.fhir_version(),
+                stored.content(),
+                "read",
+            )?;
+
             // If the client requested a specific FHIR version, verify it matches.
             if let Some(requested) = version.accept_version() {
                 if stored.fhir_version() != requested {
@@ -139,9 +151,6 @@ where
                 &stored.content_with_meta(),
                 negotiated.format,
             )
-            .map_err(|_| RestError::InternalError {
-                message: "Failed to serialize response".to_string(),
-            })
         }
         None => Err(RestError::VersionNotFound {
             resource_type,

@@ -18,17 +18,17 @@
 <section class="stat-grid">
   <article class="card stat">
     <span class="stat__label"><span class="status-dot status-dot--ok" aria-hidden="true"></span>{{ i18n.t("subs-card-active") }}</span>
-    <span class="stat__value">{{ cards.active }}</span>
+    <span class="stat__value">{{ i18n.num(cards.active) }}</span>
     <span class="stat__sub">{{ i18n.t("subs-card-active-sub") }}</span>
   </article>
   <article class="card stat">
     <span class="stat__label"><span class="status-dot status-dot--danger" aria-hidden="true"></span>{{ i18n.t("subs-card-failing") }}</span>
-    <span class="stat__value">{{ cards.failing }}</span>
+    <span class="stat__value">{{ i18n.num(cards.failing) }}</span>
     <span class="stat__sub">{{ i18n.t("subs-card-failing-sub") }}</span>
   </article>
   <article class="card stat">
     <span class="stat__label"><span class="status-dot status-dot--warn" aria-hidden="true"></span>{{ i18n.t("subs-card-idle") }}</span>
-    <span class="stat__value">{{ cards.idle }}</span>
+    <span class="stat__value">{{ i18n.num(cards.idle) }}</span>
     <span class="stat__sub">{{ i18n.t("subs-card-idle-sub") }}</span>
   </article>
   <article class="card stat">
@@ -42,7 +42,7 @@
   <div class="toolbar">
     <h2 class="toolbar__title">
       {{ i18n.t("subs-table-heading") }}
-      <span class="toolbar__count">{{ rows.len() }}</span>
+      <span class="toolbar__count">{{ i18n.num(rows.len()) }}</span>
     </h2>
     <!-- Sort is a plain-links menu, so it works without JavaScript. -->
     <details class="menu subs-sort">

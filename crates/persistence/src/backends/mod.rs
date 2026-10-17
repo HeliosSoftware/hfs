@@ -42,6 +42,9 @@
 //! # }
 //! ```
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) mod sql_literal;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 

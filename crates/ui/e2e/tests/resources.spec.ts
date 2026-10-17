@@ -1,6 +1,66 @@
-import { test, expect } from "../pages/fixtures";
-import { createResource, waitSearchable } from "../pages/api";
+import { searchLifecycleTests } from "../pages/search-lifecycle";
+import { test, expect, acceptConfirm } from "../pages/fixtures";
+import {
+  createResource,
+  updateResource,
+  seedTwoVersions,
+  waitSearchable,
+  deleteResources,
+} from "../pages/api";
 import type { ResourcesPage } from "../pages/resources";
+
+const noChartData = process.env.HFS_E2E_NO_CHART_DATA === "1";
+
+test("issue2080 modal History choices follow the rail and a reopened resource", async ({ page, resources, request }) => {
+  const id = await seedTwoVersions(request, "Patient", { name: [{ family: "ModalThemedOne" }] },
+    () => ({ name: [{ family: "ModalThemedTwo" }] }));
+  const single = await createResource(request, "Patient", { name: [{ family: "ModalThemedSingle" }] });
+  const posts: string[] = [];
+  page.on("request", req => {
+    if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/history/diff") posts.push(req.postData() || "");
+  });
+  try {
+    await waitSearchable(request, "Patient", id);
+    await waitSearchable(request, "Patient", single);
+    await resources.goto("Patient");
+    const builderMode = page.locator("[data-mode-btn=builder]");
+    if (await builderMode.count()) await builderMode.click();
+    await resources.builder.run(`Patient?_id=${id}`);
+    await resources.results.waitDone();
+    await page.locator("#query-results-body a.result-id").first().click();
+    await resources.modal.waitOpen();
+    await resources.modal.showHistory();
+    const history = resources.modal.history;
+    await expect(history.diff).toContainText("ModalThemedTwo");
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    expect(posts).toHaveLength(1);
+    await history.chooseTo("1");
+    await expect(history.diff).not.toContainText("ModalThemedTwo");
+    expect(posts).toHaveLength(2);
+    await history.versions.first().click();
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    await expect(history.diff).toContainText("ModalThemedTwo");
+    expect(posts).toHaveLength(3);
+    await history.toTrigger.click();
+    await history.toTrigger.press("Escape");
+    await expect(history.toTrigger).toHaveAttribute("aria-expanded", "false");
+    await expect(resources.modal.root).toBeVisible();
+    await resources.modal.close();
+
+    await resources.builder.run(`Patient?_id=${single}`);
+    await resources.results.waitDone();
+    await page.locator("#query-results-body a.result-id").first().click();
+    await resources.modal.waitOpen();
+    await resources.modal.showHistory();
+    await expect(history.versions).toHaveCount(1);
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v1");
+    await expect(history.toSelect.locator("option")).toHaveCount(1);
+    expect(posts).toHaveLength(4);
+    await resources.modal.close();
+  } finally { await deleteResources(request, "Patient", [id, single]); }
+});
 
 // The Resources workspace beyond the edit flows: the type rail (filter + live
 // counts), the modal's open/close/tab surface, the delete flow, and the promise
@@ -25,6 +85,38 @@ test("the rail filter narrows the visible types", async ({ resources }) => {
   await expect(resources.railItem("Patient")).toBeHidden();
   await resources.railFilter.fill("");
   await expect(resources.railItem("Patient")).toBeVisible();
+});
+
+test("the rail filter narrows the Recently used group too (#1275)", async ({ resources }) => {
+  await resources.goto("Patient");
+  await resources.pickType("Account");
+  await expect(resources.recentGroup).toBeVisible();
+  await expect(resources.recentDivider).toBeVisible();
+
+  // A term matching nothing leaves the whole rail empty, group and divider included.
+  await resources.railFilter.fill("zzzznomatch");
+  await expect(resources.recentItem("Account")).toBeHidden();
+  await expect(resources.recentGroup).toBeHidden();
+  await expect(resources.recentDivider).toBeHidden();
+
+  await resources.railFilter.fill("accou");
+  await expect(resources.recentItem("Account")).toBeVisible();
+  await expect(resources.recentDivider).toBeVisible();
+
+  // A pick made while a filter is active repaints the group under that
+  // filter: Observation matches and joins it, Account does not.
+  await resources.railFilter.fill("observ");
+  await resources.railItem("Observation").click();
+  await expect(resources.recentItem("Observation")).toBeVisible();
+  await expect(resources.recentItem("Account")).toBeHidden();
+
+  // Under a term matching nothing the group stays hidden, and clearing the
+  // box brings back both entries.
+  await resources.railFilter.fill("zzzznomatch");
+  await expect(resources.recentGroup).toBeHidden();
+  await resources.railFilter.fill("");
+  await expect(resources.recentItem("Account")).toBeVisible();
+  await expect(resources.recentItem("Observation")).toBeVisible();
 });
 
 test("a clipped rail name keeps its shared hover and focus tooltip", async ({
@@ -117,6 +209,120 @@ test("opening Resources with no type shows Patient results without interaction",
   await expect(resources.results.rows.first()).toBeVisible();
 });
 
+// The results header is a centred flex row whose heading reuses the stacked
+// query-group heading class. Flex centres each child's margin box, so the
+// heading's own bottom margin used to lift "RESULTS" ~2px above the count
+// beside it (#994). Guard the box centres, not the text: that is the property
+// the layout promises, and the one the margin was breaking.
+test("the results heading sits on the same row as its count", async ({ resources, page }) => {
+  await resources.goto("Patient");
+  await resources.results.waitShown();
+  await expect(resources.results.meta).not.toBeEmpty();
+
+  const geometry = await page.locator("#query-results > .query-results__head").evaluate((head) => {
+    const heading = head.querySelector<HTMLElement>(":scope > h2")!;
+    const meta = head.querySelector<HTMLElement>("#query-results-meta")!;
+    const headingBox = heading.getBoundingClientRect();
+    const metaBox = meta.getBoundingClientRect();
+    return {
+      headingMarginBottom: getComputedStyle(heading).marginBottom,
+      centreOffset: (headingBox.top + headingBox.bottom) / 2 - (metaBox.top + metaBox.bottom) / 2,
+    };
+  });
+  expect(Math.abs(geometry.centreOffset)).toBeLessThanOrEqual(0.5);
+  expect(geometry.headingMarginBottom).toBe("0px");
+});
+
+// #1426: the results header groups digits for the active UI locale — English
+// 12345 reads "12,345 results", Spanish "12.345 resultados", German "12.345
+// Ergebnisse" — while the typed search still goes out exactly as before. The
+// Bundles are intercepted: five digits and a grouped include count would
+// otherwise mean seeding thousands of real resources.
+test("the results header groups counts in the active locale", async ({ page, resources }) => {
+  const patient = (id: string) => ({ resource: { resourceType: "Patient", id } });
+  const searchset = (
+    total: number | null,
+    entry: Array<{ resource: { resourceType: string; id: string } }>,
+    next = false,
+  ) => ({
+    resourceType: "Bundle",
+    type: "searchset",
+    ...(total === null ? {} : { total }),
+    ...(next ? { link: [{ relation: "next", url: "/Patient?_id=more&page=2" }] } : {}),
+    entry,
+  });
+
+  // One route serves every case: the run's own `_id` picks its Bundle, and
+  // anything else (the page's default Patient listing) answers empty.
+  const bundles: Record<string, unknown> = {
+    // Five digits is the smallest exact count *all* the locales below group:
+    // Spanish CLDR leaves four digits ungrouped ("1234 resultados").
+    "count-en": searchset(12345, [patient("count-en")]),
+    "count-es": searchset(12345, [patient("count-es")]),
+    "count-de": searchset(12345, [patient("count-de")]),
+    // One page whose total matches its entries: the include count runs
+    // through the same formatter.
+    "count-included": searchset(1235, [
+      patient("count-included"),
+      ...Array.from({ length: 1234 }, (_, index) => ({
+        resource: { resourceType: "Organization", id: `org-${index}` },
+      })),
+    ]),
+    // No `Bundle.total` with a next page: the page count is grouped and keeps
+    // its `+` wording (#1003).
+    "count-partial": searchset(
+      null,
+      Array.from({ length: 1234 }, (_, index) => patient(`p-${index}`)),
+      true,
+    ),
+    "count-small": searchset(42, [patient("count-small")]),
+    "count-zero": searchset(0, []),
+  };
+  const wire: string[] = [];
+  await page.route(
+    (url) => url.pathname.endsWith("/Patient") && url.search !== "",
+    async (route) => {
+      const url = new URL(route.request().url());
+      const marker = url.searchParams.get("_id") || "";
+      if (marker) wire.push(url.search);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/fhir+json",
+        body: JSON.stringify(bundles[marker] ?? searchset(0, [])),
+      });
+    },
+  );
+
+  const scenarios = [
+    { lang: "en", marker: "count-en", expected: "12,345 results" },
+    { lang: "es", marker: "count-es", expected: "12.345 resultados" },
+    { lang: "de", marker: "count-de", expected: "12.345 Ergebnisse" },
+    { lang: "en", marker: "count-included", expected: "1,235 results · 1,234 included" },
+    { lang: "en", marker: "count-partial", expected: "1,234+ results" },
+    { lang: "en", marker: "count-small", expected: "42 results" },
+    { lang: "en", marker: "count-zero", expected: "0 results" },
+  ] as const;
+  for (const scenario of scenarios) {
+    // `?lang=` is the page's own language switch (the fixture starts from a
+    // clean cookie jar), so each case states the locale it asserts.
+    await page.goto(`/ui/resources?type=Patient&lang=${scenario.lang}`, {
+      waitUntil: "networkidle",
+    });
+    await expect(page.locator("html")).toHaveAttribute("lang", scenario.lang);
+    await switchToBuilderMode(resources);
+    await resources.results.waitShown();
+
+    await resources.builder.run(`Patient?_id=${scenario.marker}`);
+    await expect(resources.results.meta).toHaveText(scenario.expected);
+  }
+
+  // Grouping is a rendering concern only: every run still asked for exactly
+  // the query the user typed, plus the existing `_total=accurate` (#1003).
+  await expect
+    .poll(() => wire)
+    .toEqual(scenarios.map((scenario) => `?_id=${scenario.marker}&_total=accurate`));
+});
+
 test("selecting a type updates the Create label and the URL", async ({ resources, page }) => {
   await resources.goto("Patient");
   await expect(resources.createLabel).toHaveText("Create new Patient");
@@ -166,6 +372,89 @@ test("a ?url= deep link still wins over the default Patient context", async ({ r
   await expect(resources.railItem("Observation")).toHaveAttribute("aria-current", "true");
   await expect(resources.createLabel).toHaveText("Create new Observation");
   await resources.results.waitShown();
+});
+
+test("URL encoding: Resources and deep links retain visual ampersands", async ({
+  page,
+  request,
+  resources,
+}) => {
+  const literal = "A&A HEALTHCARE LLC";
+  const expected = "GET /Location?name=A%26A%20HEALTHCARE%20LLC&_summary=true";
+  const deepLink = "/Location?name=A%26A%20HEALTHCARE%20LLC&_summary=true";
+  const ids: string[] = [];
+  const expectHydrated = async (withResults: boolean) => {
+    await expect(resources.builder.url).toHaveValue(expected);
+    await expect(resources.builder.conditionRows).toHaveCount(1);
+    await expect(
+      resources.builder.conditionRows.first().locator(".builder-row__value"),
+    ).toHaveValue(literal);
+    if (!withResults) return;
+    await expect(resources.results.rows).toHaveCount(2);
+    await expect(
+      resources.results.rows.locator(`[data-resource-id="${ids[0]}"]`),
+    ).toHaveCount(1);
+    await expect(
+      resources.results.rows.locator(`[data-resource-id="${ids[1]}"]`),
+    ).toHaveCount(1);
+    await expect(
+      resources.results.rows.locator(`[data-resource-id="${ids[2]}"]`),
+    ).toHaveCount(0);
+  };
+
+  try {
+    for (let i = 0; i < 2; i++) {
+      ids.push(await createResource(request, "Location", { name: literal }));
+    }
+    ids.push(await createResource(request, "Location", { name: "A ONLY DECOY" }));
+    for (const id of ids) await waitSearchable(request, "Location", id);
+
+    await resources.goto("Location");
+    await switchToBuilderMode(resources);
+    await resources.builder.addButton("condition").click();
+    const row = resources.builder.conditionRows.first();
+    await row.locator(".builder-row__key").fill("name");
+    await row.locator(".builder-row__value").fill(literal);
+    await expect(resources.builder.url).toHaveValue(expected);
+
+    const requestSent = page.waitForRequest((candidate) => {
+      const url = new URL(candidate.url());
+      return url.pathname === "/Location" && url.searchParams.has("name");
+    });
+    const recentPersisted = page.waitForResponse((response) => {
+      return (
+        new URL(response.url()).pathname === "/_user/settings" &&
+        response.request().method() === "PATCH" &&
+        response.ok()
+      );
+    });
+    await resources.builder.runButton.click();
+    const [sent] = await Promise.all([requestSent, recentPersisted]);
+    const sentUrl = new URL(sent.url());
+    expect(sentUrl.searchParams.getAll("name")).toEqual([literal]);
+    await expectHydrated(true);
+
+    await page.reload({ waitUntil: "networkidle" });
+    await switchToBuilderMode(resources);
+    await resources.builder.recentToggle.click();
+    await resources.builder.recentPanel
+      .getByRole("button", { name: expected, exact: true })
+      .click();
+    await expectHydrated(false);
+
+    for (const route of ["/ui/resources", "/ui/search"]) {
+      const url = route + "?url=" + encodeURIComponent(deepLink);
+      await page.goto(url, { waitUntil: "networkidle" });
+      await switchToBuilderMode(resources);
+      await expectHydrated(true);
+
+      await page.reload({ waitUntil: "networkidle" });
+      await switchToBuilderMode(resources);
+      await expectHydrated(true);
+    }
+  } finally {
+    await deleteResources(request, "Location", ids);
+  }
 });
 
 test("invalid, wrong-case, and empty inputs fail closed without losing the typed query", async ({
@@ -250,7 +539,7 @@ test("a conflicting Resources bookmark uses the query URL type everywhere after 
     await expect(page.locator("#query-plain-text")).toContainText("NavAlpha");
     await resources.results.waitShown();
     const resultLink = page.locator(
-      `#query-results-body a.url[data-resource-type='Patient'][data-resource-id='${patientId}']`,
+      `#query-results-body a.result-id[data-resource-type='Patient'][data-resource-id='${patientId}']`,
     );
     await expect(resultLink).toBeVisible();
     await expect(resultLink).toHaveAttribute(
@@ -320,6 +609,7 @@ test("counts render next to each type from the dashboard snapshot", async ({
   resources,
   request,
 }) => {
+  test.skip(noChartData, "no count read path on this backend");
   // Seed one so the count is unambiguous and non-empty. The dashboard
   // snapshot is cached briefly (#541), so poll a fresh page load rather than
   // waiting on a client-side hydration fetch.
@@ -391,7 +681,7 @@ test("create eligibility follows the effective FHIR version", async ({ resources
 });
 
 // "Recently used" group (#603, server-rendered per page since #754/#755):
-// saved-queries.js repaints it in-page on every rail click (cloning the
+// search-builder.js repaints it in-page on every rail click (cloning the
 // live list item — no reload needed to see the effect), and the server keeps
 // the authoritative `rails.resources.recent` list the group would render from
 // on a fresh load.
@@ -399,6 +689,7 @@ test("picking rail types repaints the recently-used group in MRU order, capped a
   resources,
   page,
 }) => {
+  test.skip(noChartData, "no count read path on this backend");
   await resources.goto("Patient");
   await resources.pickType("Account");
   await resources.pickType("ActivityDefinition");
@@ -487,12 +778,11 @@ test("the recently-used selection survives a reload", async ({ resources, page }
 });
 
 // Recents are per page (#603's shared-across-pages model is gone) — a type
-// picked in Resources must not surface in Search's or Saved Queries' own
+// picked in Resources must not surface in Search's own
 // group.
-test("recents are scoped per page, not shared across Resources, Search, and Saved Queries", async ({
+test("recents are scoped per page, not shared across Resources and Search", async ({
   resources,
   search,
-  queries,
   page,
 }) => {
   await resources.goto("Patient");
@@ -505,8 +795,6 @@ test("recents are scoped per page, not shared across Resources, Search, and Save
 
   await search.goto();
   await expect(search.recentGroup).toBeHidden();
-  await queries.goto();
-  await expect(queries.recentGroup).toBeHidden();
 
   // And the reverse: Resources never sees what those pages record either.
   await search.goto();
@@ -573,7 +861,6 @@ async function assertRecentsStayPinnedWhileScrolling(resources: ResourcesPage) {
 test("the type rails keep recents and the All Types heading fixed while type items scroll", async ({
   resources,
   search,
-  queries,
   page,
 }) => {
   await page.setViewportSize({ width: 1280, height: 700 });
@@ -599,11 +886,6 @@ test("the type rails keep recents and the All Types heading fixed while type ite
     await assertRecentsStayPinnedWhileScrolling(resources);
   });
 
-  await test.step("Saved queries", async () => {
-    await queries.goto("Account");
-    for (const type of picks) await queries.pickType(type);
-    await assertRecentsStayPinnedWhileScrolling(resources);
-  });
 });
 
 test("clicking a recently-used entry selects that type for real", async ({ resources, page }) => {
@@ -617,7 +899,7 @@ test("clicking a recently-used entry selects that type for real", async ({ resou
 });
 
 test("Create new does not register a recently-used entry", async ({ resources }) => {
-  // Create is a <button>, not a rail `<a>`, so saved-queries.js's rail click
+  // Create is a <button>, not a rail `<a>`, so search-builder.js's rail click
   // handler (scoped to `a.filter-rail__item` inside the list or the group,
   // #754/#755) never matches it — even though the default selection
   // (Patient, unpicked) still names it in the button's label. `goto()` with
@@ -658,7 +940,9 @@ test("a result under a public path prefix still opens in the modal", async ({
   const queryPath = `/Patient?_id=${id}`;
   const publicUrl = `https://fhir.example.test/public/fhir/acme/Patient/${id}`;
 
-  await page.route(`**${queryPath}`, async (route) => {
+  // The page appends `_total=accurate` to every search it sends (#1003);
+  // match the wire request, not the typed path.
+  await page.route(`**${queryPath}&_total=accurate`, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/fhir+json",
@@ -680,13 +964,89 @@ test("a result under a public path prefix still opens in the modal", async ({
   await page.locator("input.query-builder__url[name=url]").fill(queryPath.slice(1));
   await page.locator("[data-intent='run']").click();
 
-  const resultLink = page.locator("#query-results-body a.url").first();
+  const resultLink = page.locator("#query-results-body a.result-id").first();
   await expect(resultLink).toHaveAttribute("href", publicUrl);
   await expect(resultLink).toHaveAttribute("data-resource-type", "Patient");
   await expect(resultLink).toHaveAttribute("data-resource-id", id);
   await resultLink.click();
   await resources.modal.waitOpen();
   await expect(resources.modal.subject).toContainText(id);
+});
+
+// #1106: ids past 12 characters show only an 8-character prefix, on one line,
+// while the full id stays the link's accessible name and Ctrl+F target.
+test("a long result id shows an 8-character chip on one line and a short id stays whole", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const longId = crypto.randomUUID();
+  const shortId = "short-1106";
+  await updateResource(request, "Patient", longId, { name: [{ family: "LongId" }] });
+  await updateResource(request, "Patient", shortId, { name: [{ family: "ShortId" }] });
+  await waitSearchable(request, "Patient", longId);
+  await waitSearchable(request, "Patient", shortId);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${longId},${shortId}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const longLink = page.locator(`#query-results-body a.result-id[data-resource-id='${longId}']`);
+  await expect(longLink).toBeVisible();
+  await expect(longLink.locator(".result-id__text")).toHaveText(longId.slice(0, 8));
+  await expect(longLink).toHaveAccessibleName(longId);
+  expect(await longLink.evaluate((el) => el.getClientRects().length)).toBe(1);
+
+  const shortLink = page.locator(`#query-results-body a.result-id[data-resource-id='${shortId}']`);
+  await expect(shortLink.locator(".result-id__text")).toHaveText(shortId);
+});
+
+// #1106: row-navigation.js delegates the click from `document`, so a click on
+// any cell of the row — not just the id link — opens the modal.
+test("clicking a non-id cell opens the result in the modal", async ({ resources, page, request }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "RowClick" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  await page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator("td:last-child").click();
+  await resources.modal.waitOpen();
+  await expect(resources.modal.subject).toContainText(id);
+});
+
+test("selecting text in a result row does not open the modal", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "RowSelect" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const cell = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator("td:last-child");
+  // In Chromium a synthesized pointer click collapses a pre-existing selection
+  // before the click event fires, which would defeat the point of this test.
+  // Build the selection programmatically and dispatch the click directly: a
+  // click that lands while the row still holds a live selection, as after a
+  // drag-select.
+  await cell.evaluate((el) => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+  });
+  await page.waitForTimeout(200);
+  await expect(resources.modal.root).toBeHidden();
 });
 
 test("a created resource can be deleted from its modal", async ({ resources, page, request }) => {
@@ -697,12 +1057,12 @@ test("a created resource can be deleted from its modal", async ({ resources, pag
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await page.locator(`#query-results-body a.url`).first().click();
+  await page.locator(`#query-results-body a.result-id`).first().click();
   await resources.modal.waitOpen();
   await expect(resources.modal.subject).toContainText(id);
 
-  page.once("dialog", (d) => d.accept()); // confirm delete
   await resources.modal.deleteButton.click();
+  await acceptConfirm(page); // the in-page delete confirmation (#1667)
 
   await expect(resources.modal.root).toBeHidden();
   // It's gone from the API.
@@ -722,7 +1082,7 @@ test("the dialog stays put across tab switches and status messages", async ({
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await page.locator("#query-results-body a.url").first().click();
+  await page.locator("#query-results-body a.result-id").first().click();
   await resources.modal.waitOpen();
 
   // The dialog occupies a fixed rectangle (#607): switching panes or a
@@ -740,8 +1100,528 @@ test("the dialog stays put across tab switches and status messages", async ({
   await page.locator('[data-modal-tab="edit"]').click();
   await expect(page.locator('[data-modal-pane="edit"]')).toBeVisible();
 
+  // A successful save shows no status text since #1649, so provoke the
+  // message a blocked save shows: what is under test is that a status
+  // message appearing does not move the dialog, not which message it is.
+  await resources.modal.editor.fillRaw({
+    resourceType: "Patient",
+    id,
+    gender: "masculino",
+    name: [{ family: "Anchored" }],
+  });
   await page.click("#resource-save");
   await expect(page.locator("#resource-modal-status")).not.toBeEmpty();
   const withStatus = await head.boundingBox();
   expect(withStatus?.y).toBe(before.y);
+});
+
+// #1106: the copy button beside the id chip writes the full id (not the
+// 8-character prefix shown on screen) to the clipboard, and confirms with a
+// short-lived "Copied" pill without opening the row's modal.
+test("the copy button puts the full id on the clipboard and confirms", async ({
+  resources,
+  page,
+  context,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "CopyId" }] });
+  await waitSearchable(request, "Patient", id);
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const copyButton = page.locator(
+    `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copy`,
+  );
+  await expect(copyButton).toBeVisible();
+  await copyButton.click();
+
+  await expect
+    .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(id);
+  const pill = page.locator(
+    `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copied`,
+  );
+  await expect(pill).toBeVisible();
+  await expect(pill).toHaveText("Copied");
+  await expect(resources.modal.root).toBeHidden();
+
+  // #1106 regression: the pill sits exactly where the (now-hidden) button
+  // just was, so a fast second click lands on the pill. It must not fall
+  // through to row-navigation.js and open the modal.
+  await pill.click();
+  await expect(resources.modal.root).toBeHidden();
+
+  await expect(copyButton).toBeVisible({ timeout: 3000 });
+  await expect(pill).toBeHidden();
+});
+
+// #1106: the button is Clipboard-API-gated progressive enhancement, like
+// sql-export.js's Copy job id — a browser without it never renders a control
+// that cannot work.
+test("without the Clipboard API no copy button is rendered", async ({ resources, page, request }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "clipboard", { value: undefined });
+  });
+  const id = await createResource(request, "Patient", { name: [{ family: "NoClipboard" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  await expect(resources.results.rows).toHaveCount(1);
+  await expect(page.locator(".result-id__copy")).toHaveCount(0);
+});
+
+test("the copy label is translated", async ({ page, request, resources }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "CopyLabelEs" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await page.goto("/ui/resources?type=Patient&lang=es", { waitUntil: "networkidle" });
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const copyButton = page.locator(
+    `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copy`,
+  );
+  await expect(copyButton).toHaveAttribute("aria-label", "Copiar id");
+});
+
+// #1106: every result cell stays on one line, clipped with an ellipsis at
+// the same 240px width as the rail label, and the clipped value reveals
+// itself in the shared tooltip on hover.
+test("a long result value stays on one line and reveals itself in the shared tooltip", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const longFamily = "A".repeat(90);
+  const id = await createResource(request, "Patient", { name: [{ family: longFamily }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const nameRow = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`);
+  await expect(nameRow).toBeVisible();
+  const nameCell = nameRow.locator(".result-cell").nth(0);
+  expect(await nameCell.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+  expect(await nameCell.evaluate((el) => el.getClientRects().length)).toBe(1);
+
+  const tooltip = page.locator("#filter-rail-tooltip");
+  await nameCell.hover();
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(longFamily);
+
+  await page.mouse.move(0, 0);
+  await expect(tooltip).toBeHidden();
+});
+
+test("a short result value shows no tooltip", async ({ resources, page, request }) => {
+  const id = await createResource(request, "Patient", {
+    name: [{ family: "Short" }],
+    gender: "male",
+  });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const genderCell = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator(".result-cell").nth(1);
+  await expect(genderCell).toHaveText("male");
+  await genderCell.hover();
+  await page.waitForTimeout(200);
+  await expect(page.locator("#filter-rail-tooltip")).toBeHidden();
+});
+
+test("an abbreviated id shows the full id on hover and on keyboard focus", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "AbbrevTooltip" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  await link.hover();
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(id);
+
+  await page.mouse.move(0, 0);
+  await expect(tooltip).toBeHidden();
+
+  await link.focus();
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(id);
+  await expect(link).toHaveAttribute("aria-describedby", "filter-rail-tooltip");
+});
+
+// #1770: the clicked id keeps focus and hover behind the editor modal, and the
+// tooltip paints above the modal's z-index band, so it must hide on open and
+// stay hidden while the modal covers the results.
+test("an abbreviated id's tooltip hides when its click opens the editor modal", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "ModalTooltip" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  await link.hover();
+  await expect(tooltip).toBeVisible();
+
+  await link.click();
+  await expect(resources.modal.root).toBeVisible();
+  await expect(tooltip).toBeHidden();
+
+  // Neither pointer movement over the covered id nor the still-focused link
+  // brings it back while the modal is open.
+  const box = await link.boundingBox();
+  if (!box) throw new Error("result id has no layout box");
+  await page.mouse.move(box.x + box.width / 2 + 1, box.y + box.height / 2);
+  await page.waitForTimeout(200);
+  await expect(tooltip).toBeHidden();
+});
+
+// #1106: the pointer resting on a cell with nothing to show must not hide the
+// keyboard tooltip of a still-focused, abbreviated id (refresh() must fall
+// back to the focused item when the hovered one has no tooltip to show).
+test("an abbreviated id keeps its focus tooltip while the pointer rests on a short cell", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, {
+    name: [{ family: "IdlePointer" }],
+    gender: "male",
+  });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const genderCell = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator(".result-cell").nth(1);
+  await expect(genderCell).toHaveText("male");
+  const genderBox = await genderCell.boundingBox();
+  if (!genderBox) throw new Error("gender cell has no layout box");
+  await page.mouse.move(
+    genderBox.x + genderBox.width / 2,
+    genderBox.y + genderBox.height / 2,
+  );
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const tooltip = page.locator("#filter-rail-tooltip");
+  await link.focus();
+
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(id);
+  await expect(link).toHaveAttribute("aria-describedby", "filter-rail-tooltip");
+});
+
+test("rows with short and long values have the same height", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const shortId = await createResource(request, "Patient", { name: [{ family: "Short" }] });
+  const longId = await createResource(request, "Patient", { name: [{ family: "B".repeat(90) }] });
+  await waitSearchable(request, "Patient", shortId);
+  await waitSearchable(request, "Patient", longId);
+
+  await resources.goto("Patient");
+  await page
+    .locator("input.query-builder__url[name=url]")
+    .fill(`Patient?_id=${shortId},${longId}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+  await expect(resources.results.rows).toHaveCount(2);
+
+  const heights = await resources.results.rows.evaluateAll((rows) =>
+    rows.map((row) => row.getBoundingClientRect().height),
+  );
+  expect(Math.abs(heights[0] - heights[1])).toBeLessThanOrEqual(1);
+});
+
+/* ---- result columns follow the payload (#1105) ------------------------ */
+
+// The Resources page defaults to the natural-language search pane when NL
+// search is configured (the e2e server always configures it, #1105's e2e run
+// showed the builder pane is `display: none` in that mode regardless of its
+// `hidden` attribute) — switch to the structured builder before driving it
+// through `resources.builder`, mirroring the existing "switching away and
+// back" test above.
+async function switchToBuilderMode(resources: ResourcesPage): Promise<void> {
+  const builderMode = resources.page.locator("[data-mode-btn='builder']");
+  if (await builderMode.count()) await builderMode.click();
+}
+
+test("a full SearchParameter listing shows every attribute the server returned", async ({
+  resources,
+}) => {
+  await resources.goto("SearchParameter");
+  await switchToBuilderMode(resources);
+  await resources.builder.run("SearchParameter?_count=5");
+  await resources.results.waitDone();
+  // The card is already visible from the page's own initial default listing
+  // (#1105) — wait for this run's own response to land (an auto-retrying
+  // assertion) before reading the headers it produced.
+  await expect(resources.results.rows).toHaveCount(5);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  expect(headers).toContain("code");
+  expect(headers).toContain("base");
+  expect(headers).toContain("type");
+  expect(headers).toContain("expression");
+  expect(headers).not.toContain("resourceType");
+  expect(headers).not.toContain("meta");
+  expect(headers).not.toContain("text");
+  expect(headers[0]).toBe("id");
+
+  const updated = await resources.results.card.getAttribute("data-msg-updated");
+  expect(headers[headers.length - 1]).toBe(updated);
+});
+
+test("_summary=true lists the returned summary elements, not just five", async ({ resources }) => {
+  await resources.goto("SearchParameter");
+  await switchToBuilderMode(resources);
+  await resources.builder.run("SearchParameter?_summary=true&_count=5");
+  await resources.results.waitDone();
+  await expect(resources.results.rows).toHaveCount(5);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  expect(headers).toContain("code");
+  expect(headers).toContain("base");
+  expect(headers).toContain("type");
+  expect(headers).toContain("publisher");
+  expect(headers).not.toContain("expression");
+});
+
+test("_elements keeps overriding the returned attributes", async ({ resources }) => {
+  await resources.goto("SearchParameter");
+  await switchToBuilderMode(resources);
+  await resources.builder.run("SearchParameter?_elements=code,base&_count=5");
+  await resources.results.waitDone();
+  await expect(resources.results.rows).toHaveCount(5);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  const updated = await resources.results.card.getAttribute("data-msg-updated");
+  expect(headers).toEqual(["id", "code", "base", updated]);
+});
+
+test("a Patient summary shows every summary element it has, not a hand-picked four", async ({
+  resources,
+  request,
+}) => {
+  const id = await createResource(request, "Patient", {
+    identifier: [{ system: "urn:test", value: "cols-1105" }],
+    active: true,
+    name: [{ family: "Columns1105" }],
+    telecom: [{ system: "phone", value: "555-1105" }],
+    gender: "female",
+    birthDate: "1990-05-11",
+    address: [{ city: "Quito" }],
+  });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await switchToBuilderMode(resources);
+  await resources.builder.run(`Patient?_id=${id}&_summary=true`);
+  await resources.results.waitDone();
+  await expect(resources.results.rows).toHaveCount(1);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  const order = ["identifier", "active", "name", "telecom", "gender", "birthDate", "address"];
+  const positions = order.map((col) => headers.indexOf(col));
+  for (const position of positions) expect(position).toBeGreaterThanOrEqual(0);
+  for (let i = 1; i < positions.length; i++) {
+    expect(positions[i]).toBeGreaterThan(positions[i - 1]);
+  }
+});
+
+test("columns are the union across the returned resources", async ({ resources, request }) => {
+  const genderOnlyId = await createResource(request, "Patient", {
+    name: [{ family: "UnionGender" }],
+    gender: "female",
+  });
+  const birthDateOnlyId = await createResource(request, "Patient", {
+    name: [{ family: "UnionBirthDate" }],
+    birthDate: "1985-03-02",
+  });
+  await waitSearchable(request, "Patient", genderOnlyId);
+  await waitSearchable(request, "Patient", birthDateOnlyId);
+
+  await resources.goto("Patient");
+  await switchToBuilderMode(resources);
+  await resources.builder.run(`Patient?_id=${genderOnlyId},${birthDateOnlyId}`);
+  await resources.results.waitDone();
+  await expect(resources.results.rows).toHaveCount(2);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  expect(headers).toContain("gender");
+  expect(headers).toContain("birthDate");
+
+  const nameIndex = headers.indexOf("name");
+  const birthDateIndex = headers.indexOf("birthDate");
+  const rowCount = await resources.results.rows.count();
+  let genderOnlyRowCells: string[] | null = null;
+  for (let i = 0; i < rowCount; i++) {
+    const cells = await resources.results.rows.nth(i).locator("td").allTextContents();
+    if (cells[nameIndex] === "UnionGender") genderOnlyRowCells = cells;
+  }
+  expect(genderOnlyRowCells).not.toBeNull();
+  expect(genderOnlyRowCells![birthDateIndex]).toBe("");
+});
+
+test("an empty page falls back to the type's summary columns", async ({ resources }) => {
+  await resources.goto("Patient");
+  await switchToBuilderMode(resources);
+  await expect(resources.builder.paramOptions.first()).toBeAttached();
+  await resources.builder.run("Patient?name=NoSuchPerson1105");
+  await resources.results.waitDone();
+  // The card is already visible from the page's own initial default listing
+  // (#1105) — wait for the *new*, empty response to actually land (an
+  // auto-retrying assertion) before reading the headers it produced.
+  await expect(resources.results.rows).toHaveCount(0);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  for (const col of [
+    "identifier",
+    "active",
+    "name",
+    "telecom",
+    "gender",
+    "birthDate",
+    "managingOrganization",
+  ]) {
+    expect(headers).toContain(col);
+  }
+});
+
+searchLifecycleTests("/ui/resources?type=Patient");
+
+// #1675: "GET /{type}/{id}" in the query box is a read. The type is the
+// segment before the id, so the header and the plain-English line name the
+// real type, Run fetches the resource, and it shows as the one result.
+test("a read by id in the query box opens that resource", async ({ resources, request }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "ReadById" }] });
+  await resources.goto("Patient");
+  const builderMode = resources.page.locator("[data-mode-btn=builder]");
+  if (await builderMode.count()) await builderMode.click();
+
+  const url = resources.builder.url;
+  await url.fill(`GET /Patient/${id}`);
+  await url.dispatchEvent("change");
+  await url.blur();
+
+  await expect(resources.createButton).toBeEnabled();
+  await expect(resources.createButton).toContainText("Patient");
+  await expect(resources.builder.plainText).toHaveText(`Open Patient ${id}.`);
+  await expect(resources.builder.sections).toBeHidden();
+
+  await resources.builder.runButton.click();
+  await expect(resources.results.rows).toHaveCount(1);
+  await expect(resources.results.rows.first()).toContainText(id);
+  await expect(resources.results.error).toBeHidden();
+
+  // Back to a search: the builder returns.
+  await resources.builder.setUrl("GET /Patient?_count=5");
+  await expect(resources.builder.sections).toBeVisible();
+});
+
+// #1759: the truncated-cell tooltip goes below (or above) the cell instead of
+// beside it, where it would cover the neighbouring columns.
+test("a result cell's tooltip does not sit beside the cell", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "CellTooltipPlacement" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const cell = link.locator("xpath=ancestor::td");
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  await link.hover();
+  await expect(tooltip).toBeVisible();
+  const cellBox = await cell.boundingBox();
+  const tipBox = await tooltip.boundingBox();
+  if (!cellBox || !tipBox) throw new Error("cell or tooltip has no layout box");
+  const below = tipBox.y >= cellBox.y + cellBox.height - 1;
+  const above = tipBox.y + tipBox.height <= cellBox.y + 1;
+  expect(below || above).toBe(true);
+});
+
+// #1759: the modal's History tab lists versions as rows (version, date,
+// operation) and marks the compared pair; a bad date never renders as
+// "Invalid Date".
+test("the modal History tab lists versions as rows with date and operation", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = await seedTwoVersions(
+    request,
+    "Patient",
+    { name: [{ family: "ModalRowOne" }] },
+    () => ({ name: [{ family: "ModalRowTwo" }] }),
+  );
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await page.locator("#query-results-body a.result-id").first().click();
+  await resources.modal.waitOpen();
+  await page.locator('[data-modal-tab="history"]').click();
+
+  const rows = page.locator("#resource-history-versions .history-version");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0).locator(".history-version__id")).toHaveText("v2");
+  await expect(rows.nth(0).locator(".history-version__kind")).toHaveText("current");
+  await expect(rows.nth(1).locator(".history-version__kind")).toHaveText("created");
+  await expect(rows.nth(0)).toHaveClass(/history-version--to/);
+  await expect(rows.nth(1)).toHaveClass(/history-version--from/);
+  for (const i of [0, 1]) {
+    const when = (await rows.nth(i).locator(".history-version__when").textContent()) ?? "";
+    expect(when.trim()).not.toBe("");
+    expect(when).not.toContain("Invalid");
+  }
 });

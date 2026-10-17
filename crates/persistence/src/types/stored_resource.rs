@@ -213,7 +213,16 @@ impl StoredResource {
         Self::merge_meta(self.content, &self.version_id, self.last_modified)
     }
 
-    fn merge_meta(mut content: Value, version_id: &str, last_modified: DateTime<Utc>) -> Value {
+    /// Merges `meta.versionId` / `meta.lastUpdated` into `content`.
+    ///
+    /// Exposed to the crate for paths that read raw rows without building a
+    /// `StoredResource` (e.g. bulk export, #1273), so they emit the same
+    /// `meta` as [`Self::content_with_meta`].
+    pub(crate) fn merge_meta(
+        mut content: Value,
+        version_id: &str,
+        last_modified: DateTime<Utc>,
+    ) -> Value {
         if let Value::Object(obj) = &mut content {
             let meta = obj
                 .entry("meta")
@@ -619,5 +628,50 @@ mod tests {
         assert_eq!(parsed.id(), resource.id());
         assert_eq!(parsed.version_id(), resource.version_id());
         assert_eq!(parsed.fhir_version(), resource.fhir_version());
+    }
+
+    #[test]
+    fn test_merge_meta_preserves_client_meta_and_overwrites_server_fields() {
+        let last_modified = DateTime::parse_from_rfc3339("2026-09-24T12:34:56.789123+02:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let content = json!({
+            "resourceType": "Patient",
+            "meta": {
+                "versionId": "stale",
+                "lastUpdated": "2000-01-01T00:00:00Z",
+                "profile": ["http://example.org/StructureDefinition/p"],
+                "tag": [{"system": "http://example.org", "code": "t"}]
+            }
+        });
+
+        let merged = StoredResource::merge_meta(content, "7", last_modified);
+
+        let meta = &merged["meta"];
+        assert_eq!(meta["versionId"], "7");
+        assert_eq!(meta["lastUpdated"], "2026-09-24T10:34:56.789Z");
+        assert_eq!(
+            meta["profile"],
+            json!(["http://example.org/StructureDefinition/p"])
+        );
+        assert_eq!(
+            meta["tag"],
+            json!([{"system": "http://example.org", "code": "t"}])
+        );
+    }
+
+    #[test]
+    fn test_merge_meta_creates_meta_when_absent() {
+        let last_modified = DateTime::parse_from_rfc3339("2026-09-24T10:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let merged =
+            StoredResource::merge_meta(json!({"resourceType": "Patient"}), "1", last_modified);
+
+        assert_eq!(
+            merged["meta"],
+            json!({"versionId": "1", "lastUpdated": "2026-09-24T10:34:56.000Z"})
+        );
     }
 }

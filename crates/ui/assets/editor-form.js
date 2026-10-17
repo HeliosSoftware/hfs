@@ -1,14 +1,18 @@
 /*
  * Shared guided-form loop (#843), extracted from the standalone editor's
- * original (`editor.js`, still its own copy — migrating it, and the
- * Resources modal's own copy, onto this helper is a follow-up): every
+ * original (`editor.js`, now a client of this file: the Resource Editor
+ * page and the Resources modal run on it through `resource-json-editor.js`
+ * and `editor-pair.js`, #1756; View Definitions and the Library Details
+ * editor already did): every
  * interaction the guided form offers — `[data-add]`/`[data-remove]`/
  * `[data-extension]` clicks, `[data-choose]` changes, a settled `[data-set]`
- * blur, the add-picker's typeahead, live `$expand` on a bound field —
- * turned into one round trip to `/ui/editor/render` (`pane=form`, #843) and
- * a DOM swap, focus/caret/picker/scroll preserved across it (#547) —
- * without knowing which page it runs on or what the other half of the
- * document is.
+ * blur, live `$expand` on a bound field — turned into one round trip to
+ * `/ui/editor/render` (`pane=form`, #843) and a DOM swap, focus/caret/
+ * picker/scroll preserved across it (#547) — without knowing which page it
+ * runs on or what the other half of the document is. The add-picker's own
+ * state across that swap, filter typeahead, and extension-URL read are
+ * `window.HfsEditorAdd`'s job (#1239), shared with `editor.js` and
+ * `resources.js` — this file calls it rather than keeping its own copy.
  *
  * `window.HfsEditorForm.attach(root, host)` wires all of that inside `root`
  * — an element that already contains the hidden `#editor-form` state, the
@@ -40,6 +44,13 @@
   function attach(root, host) {
     if (!root || !host || !window.fetch) return { refresh: function () {} };
     var renderUrl = host.renderUrl || DEFAULT_RENDER_URL;
+    // #1239: the add-picker module, called wherever this file used to keep
+    // its own copy of that logic. Guarded the same way `host.fields` is —
+    // if the script did not load, the rest of this loop still works, just
+    // without the picker's own state surviving a re-render.
+    var picker = window.HfsEditorAdd;
+    if (picker) picker.attach(root);
+    if (window.HfsCombobox) window.HfsCombobox.install(root);
 
     /* ---- the round trip -------------------------------------------------- */
 
@@ -50,50 +61,57 @@
      * undo history, disruptive) echo. `isStale`, given, is checked right
      * before the swap — a response that fails it is dropped silently, state
      * capture and all, as though this request had never been sent. */
-    function request(op, fields, overrideDoc, updateHost, isStale) {
-      var form = new URLSearchParams();
-      form.set("doc", overrideDoc == null ? host.getDoc() : overrideDoc);
-      form.set("op", op || "");
-      form.set("pane", "form");
-      Object.keys(fields || {}).forEach(function (key) {
-        form.set(key, fields[key]);
-      });
-      // #840: a host-level extra, constant across every request this loop
-      // sends for this pairing (e.g. `hidden`/`legend`) - distinct from
-      // `fields` above, this call's own per-operation fields (`path`,
-      // `value`, ...).
-      Object.keys(host.fields || {}).forEach(function (key) {
-        form.set(key, host.fields[key]);
-      });
-      return fetch(renderUrl, { method: "POST", body: form })
-        .then(function (response) {
-          return response.text();
-        })
-        .then(function (html) {
-          if (isStale && isStale()) return;
-          var state = captureUiState();
-          swap(html);
-          restoreUiState(state);
-          if (updateHost) {
-            var pretty = root.querySelector("#editor-pretty");
-            if (pretty) host.setDoc(pretty.value);
-          }
-        });
+    function request(op, fields, overrideDoc, updateHost, isStale, operation) {
+      var version = picker ? picker.documentVersion(root) : 0;
+      function stale() {
+        return (isStale && isStale()) || (!op && picker && version !== picker.documentVersion(root));
+      }
+      function work() {
+        if (stale()) return Promise.resolve();
+        var form = new URLSearchParams();
+        form.set("doc", overrideDoc == null ? host.getDoc() : overrideDoc);
+        form.set("op", op || "");
+        form.set("pane", "form");
+        Object.keys(fields || {}).forEach(function (key) { form.set(key, fields[key]); });
+        Object.keys(host.fields || {}).forEach(function (key) { form.set(key, host.fields[key]); });
+        return fetch(renderUrl, { method: "POST", body: form })
+          .then(function (response) {
+            if (!response.ok) throw new Error(String(response.status));
+            return response.text();
+          })
+          .then(function (html) {
+            if (stale()) return;
+            var state = captureUiState();
+            if (!swap(html)) throw new Error("Invalid guided form response");
+            if (picker) picker.projectionSwapped(root, op);
+            // Row focus/highlight resolves against the updated JSON document.
+            if (updateHost) {
+              var pretty = root.querySelector("#editor-pretty");
+              if (pretty) host.setDoc(pretty.value);
+            }
+            restoreUiState(state, operation);
+          });
+      }
+      var pending;
+      if (op && picker) pending = picker.queueMutation(root, work, function () { picker.failedMutation(root, op, fields); }, op);
+      else {
+        var finish = picker ? picker.beginRequest(root) : function () {};
+        pending = work().finally(finish);
+      }
+      return pending.catch(function (error) { console.debug("Guided form render failed", error); });
     }
 
-    function send(op, fields) {
-      return request(op, fields, null, true, null);
+    function send(op, fields, operation) {
+      if (op && picker && picker.projectionBusy(root)) return Promise.resolve();
+      if (op) {
+        refreshSeq++;
+        if (host.beforeMutation) host.beforeMutation();
+      }
+      return request(op, fields, null, true, null, operation);
     }
 
-    /* `refresh` alone is guarded against out-of-order responses: it is the
-     * one operation a caller can reasonably fire again before the last call
-     * settles (JSON -> form sync re-arms on every keystroke) — a mutation
-     * (`send`, above) is one discrete user action at a time, the
-     * same as the standalone editor and the Resources modal this loop was
-     * extracted from, neither of which has ever needed this. A response
-     * that arrives after a later `refresh` already landed is simply
-     * discarded — swapping it in now would show the panel a step behind
-     * the document the caller has already moved on to. */
+    // Background JSON refreshes can run while a Guided mutation is pending,
+    // but cannot apply a document captured before that mutation was queued.
     var refreshSeq = 0;
 
     /* Replaces the hidden state, the guided-form card, and this render's
@@ -106,12 +124,14 @@
       var fresh = new DOMParser().parseFromString(html, "text/html");
 
       var freshState = fresh.querySelector("#editor-form");
+      var freshCard = fresh.querySelector("section.editor-form");
+      if (!freshState || !freshCard) return false;
       var oldState = root.querySelector("#editor-form");
       if (freshState && oldState) oldState.replaceWith(freshState);
       else if (freshState) root.appendChild(freshState);
 
-      var freshCard = fresh.querySelector("section.editor-form");
       var oldCard = root.querySelector("section.editor-form");
+      if (oldCard && window.HfsCombobox) window.HfsCombobox.destroy(oldCard);
       if (freshCard && oldCard) oldCard.replaceWith(freshCard);
       else if (freshCard) root.appendChild(freshCard);
 
@@ -121,6 +141,9 @@
       fresh.querySelectorAll("body > datalist").forEach(function (list) {
         root.appendChild(list);
       });
+      // This fetch-driven replacement does not emit htmx:afterSwap.
+      if (window.HfsCombobox) window.HfsCombobox.install(root);
+      return true;
     }
 
     /* ---- keeping the user's place across the swap (#547) ------------------ */
@@ -129,10 +152,9 @@
      * trip would destroy the focused field, the caret, any open add-picker
      * with its filter text, and the tree's scroll position. Captured at
      * response time — where the user is *now*, not where they were at
-     * request time. No raw-mode bookkeeping here: unlike the standalone
-     * editor and the Resources modal, a `pane=form` host keeps its own JSON
-     * view outside `root` entirely — there is no raw textarea inside it to
-     * track. */
+     * request time. The host's JSON pane is never re-rendered by this
+     * loop (a `pane=form` response carries only the form), so there is no
+     * editor state to carry across the swap. */
     function captureUiState() {
       var state = { focus: null, pickers: [], scroll: 0 };
       var tree = root.querySelector(".editor-tree");
@@ -145,25 +167,8 @@
           end: active.selectionEnd,
         };
       }
-      root.querySelectorAll("details.editor-add[open]").forEach(function (box) {
-        var row = box.closest("[data-path]");
-        var filter = box.querySelector(".editor-add__filter");
-        state.pickers.push({
-          path: row ? row.dataset.path : "",
-          filter: filter ? filter.value : "",
-          focusFilter: filter === document.activeElement,
-        });
-      });
+      if (picker) state.pickers = picker.capturePickers(root);
       return state;
-    }
-
-    function rowByPath(path) {
-      if (!path) return root;
-      var rows = root.querySelectorAll("[data-path]");
-      for (var i = 0; i < rows.length; i++) {
-        if (rows[i].dataset.path === path) return rows[i];
-      }
-      return null;
     }
 
     function inputByPath(path) {
@@ -174,44 +179,25 @@
       return null;
     }
 
-    function restoreUiState(state) {
-      state.pickers.forEach(function (saved) {
-        var row = rowByPath(saved.path);
-        if (!row) return;
-        var box = row.querySelector("details.editor-add");
-        if (!box) return;
-        box.setAttribute("open", "");
-        var filter = box.querySelector(".editor-add__filter");
-        if (filter && saved.filter) {
-          filter.value = saved.filter;
-          filter.dispatchEvent(new Event("input", { bubbles: true }));
-        }
-        if (saved.focusFilter && filter) filter.focus();
-      });
-
-      // The server names the node the mutation created; the caret goes
-      // there. Otherwise it returns to the field that was focused before
-      // the swap.
+    function restoreUiState(state, operation) {
       var formEl = root.querySelector("#editor-form");
       var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
-      var target = createdPath ? inputByPath(createdPath) : null;
+      if (picker) {
+        picker.restorePickers(root, state.pickers, createdPath, operation);
+        if (picker.revealCreated(root, createdPath, operation)) return;
+      }
+
+      var target = state.focus ? inputByPath(state.focus.path) : null;
       if (target) {
-        target.focus();
-        if (target.select) target.select();
-      } else if (state.focus) {
-        target = inputByPath(state.focus.path);
-        if (target) {
-          target.focus();
-          if (target.setSelectionRange && state.focus.start !== null) {
-            try {
-              target.setSelectionRange(state.focus.start, state.focus.end);
-            } catch (ignored) {}
-          }
+        target.focus({ preventScroll: true });
+        if (target.setSelectionRange && state.focus.start !== null) {
+          try { target.setSelectionRange(state.focus.start, state.focus.end); } catch (ignored) {}
         }
       }
 
       var tree = root.querySelector(".editor-tree");
       if (tree) tree.scrollTop = state.scroll;
+      if (picker) picker.restoreUndoFocus(root, operation);
     }
 
     /* ---- structural mutations: each is one round trip ------------------ */
@@ -219,23 +205,23 @@
     root.addEventListener("click", function (event) {
       var add = event.target.closest("[data-add]");
       if (add) {
-        send("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" });
+        send("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" }, picker ? picker.operationFrom(add) : null);
         return;
       }
 
       var remove = event.target.closest("[data-remove]");
       if (remove) {
-        send("remove", { path: remove.dataset.remove });
+        var removal = picker && remove.hasAttribute("data-add-undo")
+          ? picker.undoOperation(root, remove, host.getDoc()) : null;
+        if (remove.hasAttribute("data-add-undo") && !removal) return;
+        send("remove", { path: remove.dataset.remove }, removal);
         return;
       }
 
       var extension = event.target.closest("[data-extension]");
       if (extension) {
-        var panel = extension.closest(".editor-add__ext");
-        var url =
-          extension.dataset.url ||
-          (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
-        send("extension", { path: extension.dataset.extension, url: url });
+        var url = picker ? picker.extensionUrl(extension) : "";
+        send("extension", { path: extension.dataset.extension, url: url }, picker ? picker.operationFrom(extension) : null);
       }
     });
 
@@ -247,7 +233,7 @@
           path: choose.dataset.choose,
           name: choose.dataset.declarer,
           arm: choose.value,
-        });
+        }, picker ? picker.operationFrom(choose) : null);
       }
     });
 
@@ -269,61 +255,50 @@
     /* Live $expand picker (#365): bound inputs carry data-vs-url; typing
      * debounces a request to the UI's terminology proxy and fills a per-row
      * datalist. 204 (no server configured) leaves the plain input alone.
-     * Typeahead over the "add" list is the only thing here that is purely
-     * cosmetic, and the only thing that would be silly to round-trip. */
+     * The add-picker's own typeahead is `window.HfsEditorAdd.attach(root)`,
+     * wired once above (#1239). */
     var expandTimer = null;
     var expandSeq = 0;
     var liveListSeq = 0;
     root.addEventListener("input", function (event) {
       var input = event.target.closest("[data-vs-url]");
-      if (input) {
-        clearTimeout(expandTimer);
-        expandTimer = setTimeout(function () {
-          var seq = ++expandSeq;
-          fetch(
-            "/ui/editor/expand?url=" +
-              encodeURIComponent(input.dataset.vsUrl) +
-              "&filter=" +
-              encodeURIComponent(input.value),
-            { credentials: "same-origin" },
-          )
-            .then(function (r) {
-              return r.status === 200 ? r.json() : null;
-            })
-            .then(function (data) {
-              if (!data || seq !== expandSeq) return;
-              var listId = input.getAttribute("list");
-              if (!listId) {
-                listId = "vs-live-" + ++liveListSeq;
-                input.setAttribute("list", listId);
-              }
-              var list = document.getElementById(listId);
-              if (!list) {
-                list = document.createElement("datalist");
-                list.id = listId;
-                input.parentElement.appendChild(list);
-              }
-              list.textContent = "";
-              data.codes.forEach(function (item) {
-                var opt = document.createElement("option");
-                opt.value = item.code;
-                if (item.display) opt.label = item.display;
-                list.appendChild(opt);
-              });
-            })
-            .catch(function () {});
-        }, 300);
-        return;
-      }
-
-      var filter = event.target.closest(".editor-add__filter");
-      if (filter) {
-        var needle = filter.value.trim().toLowerCase();
-        var panel = filter.closest(".editor-add__panel");
-        panel.querySelectorAll("[data-add-name]").forEach(function (item) {
-          item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) === -1;
-        });
-      }
+      if (!input) return;
+      clearTimeout(expandTimer);
+      expandTimer = setTimeout(function () {
+        var seq = ++expandSeq;
+        fetch(
+          "/ui/editor/expand?url=" +
+            encodeURIComponent(input.dataset.vsUrl) +
+            "&filter=" +
+            encodeURIComponent(input.value),
+          { credentials: "same-origin" },
+        )
+          .then(function (r) {
+            return r.status === 200 ? r.json() : null;
+          })
+          .then(function (data) {
+            if (!data || seq !== expandSeq) return;
+            var listId = input.getAttribute("list");
+            if (!listId) {
+              listId = "vs-live-" + ++liveListSeq;
+              input.setAttribute("list", listId);
+            }
+            var list = document.getElementById(listId);
+            if (!list) {
+              list = document.createElement("datalist");
+              list.id = listId;
+              input.parentElement.appendChild(list);
+            }
+            list.textContent = "";
+            data.codes.forEach(function (item) {
+              var opt = document.createElement("option");
+              opt.value = item.code;
+              if (item.display) opt.label = item.display;
+              list.appendChild(opt);
+            });
+          })
+          .catch(function () {});
+      }, 300);
     });
 
     return {

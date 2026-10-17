@@ -15,7 +15,15 @@
   or `Failure`); the table markup itself (the `Success` arm) lives in
   exactly one place.
 
-  `#run-notice` is always present, in both modes:
+  `part` (`RunPart`) selects which half a render emits: `Both` (fragments
+  and View Definitions) writes `#run-notice` then the results markup;
+  `Notice` and `Results` write one half each, so the Library pages can
+  place `#run-notice` inside the SQL card and the results after the
+  tables panel. Every arm below wraps its notice in `part.notice()` and
+  everything else in `part.results()`.
+
+  `#run-notice` is always present, in both modes, whenever the render
+  includes the notice half:
   - Empty on success, so a fragment response clears a previous failure.
   - Carrying the surface's own `failed_key` message on a run or parse
     failure. When the message names the 1-based line of a `$sql-run` parse
@@ -23,10 +31,10 @@
     `data-error-line` for the editor to tint.
   - On its own, page-mode-only `Empty` arm: no results have reached the
     server yet, so this element also carries the *initial* load request —
-    `hx-trigger="load"`, `hx-include` reaching into the surface's own form
-    (`#{form_id}`) since this element sits outside it — run once against
-    whatever the editor currently holds, including a "Create New" starter
-    document.
+    `hx-trigger="load"`, `hx-include` naming the surface's own form
+    (`#{form_id}`) — run once against whatever the editor currently holds,
+    including a "Create New" starter document. On View Definitions the
+    element sits outside that form; on the Library pages it sits inside it.
 
   In fragment mode, `#run-notice` is the `hx-post`'s own swap target, so it
   never carries `hx-swap-oob` — the response's non-OOB content already lands
@@ -39,6 +47,12 @@
     travels inside the `#run-results` card instead, so the two never target
     the same swap.
 
+  The `.run-busy` status line (#1750) is `hidden` markup that busy.js
+  reveals while any preview request is in flight (`data-busy-region` on the
+  triggers). It lives inside the card's tools in `Success` and inside the
+  empty `#run-results` placeholder elsewhere, so at most one exists in the
+  document: each fragment response swaps the one it replaces.
+
   Page mode renders `#run-results` with the identical id and no OOB
   attribute — there is nothing to swap into on a hard navigation — so a
   later fragment response's OOB target already exists in the DOM.
@@ -49,7 +63,8 @@
   problem exactly once: the very first live run of a session that has never
   rendered a table (`Empty`, and page-mode `Failure` — both mean nothing
   real has appeared yet). The `Empty` and page-mode `Failure` arms below
-  render an empty, classless placeholder `<div id="run-results">` for that
+  render a classless placeholder `<div id="run-results">` (holding only the
+  hidden `.run-busy` line) for that
   reason alone — no `.card`/`.table-card` renders, nothing is visible — so a
   first successful fragment always has a real element to replace via its
   own OOB `outerHTML` swap into a genuine `<section class="card
@@ -59,12 +74,13 @@
 {% match state %}
 
 {% when RunResultsState::Success(table, ms) %}
-<div id="run-notice"></div>
-<section class="card table-card" id="run-results"{% if fragment %} hx-swap-oob="outerHTML"{% endif %}>
+{% if part.notice() %}<div id="run-notice"></div>
+{% endif %}{% if part.results() %}<section class="card table-card" id="run-results"{% if fragment %} hx-swap-oob="outerHTML"{% endif %}>
   <div class="card-head">
     <h3>{{ i18n.t(heading_key) }}</h3>
     <div class="card-head__tools">
-      <span id="run-results-meta" class="card-head__meta">{{ i18n.t_arg2("vd-results-meta", "rows", table.rows.len().to_string(), "ms", ms.to_string()) }}</span>
+      <p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
+      <span id="run-results-meta" class="card-head__meta">{{ i18n.t_arg2("vd-results-meta", "rows", table.rows.len(), "ms", *ms) }}</span>
       {% if let Some(href) = export_href %}
       <a class="btn" href="{{ href }}"><span class="icon">{% include "icons/export.svg" %}</span> {{ i18n.t("sql-run-export") }}</a>
       {% endif %}
@@ -86,14 +102,15 @@
     </table>
   </div>
 </section>
+{%- endif %}
 
 {% when RunResultsState::Failure(message, line) %}
-<div id="run-notice"><p class="notice notice--warn"{% if let Some(line) = line %} data-error-line="{{ line }}"{% endif %}>{{ i18n.t(failed_key) }} {{ message }}</p></div>
-{% if fragment %}
+{% if part.notice() %}<div id="run-notice"><p class="notice notice--warn"{% if let Some(line) = line %} data-error-line="{{ line }}"{% endif %}>{{ i18n.t(failed_key) }} {{ message }}</p></div>
+{% endif %}{% if part.results() %}{% if fragment %}
 <span id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
 {% else %}
-<div id="run-results"></div>
-{% endif %}
+<div id="run-results"><p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p></div>
+{% endif %}{% endif %}
 
 {% when RunResultsState::Waiting(message) %}
 {#- #841: a declared SQL Query parameter has no value yet — an expected
@@ -101,12 +118,12 @@
     `data-error-line` (there is no SQL error to tint). Otherwise the exact
     same OOB shape as `Failure` above: the previous table (if any) is left
     untouched, and only its meta is relabelled "last successful run". -#}
-<div id="run-notice"><p class="notice">{{ message }}</p></div>
-{% if fragment %}
+{% if part.notice() %}<div id="run-notice"><p class="notice">{{ message }}</p></div>
+{% endif %}{% if part.results() %}{% if fragment %}
 <span id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
 {% else %}
-<div id="run-results"></div>
-{% endif %}
+<div id="run-results"><p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p></div>
+{% endif %}{% endif %}
 
 {% when RunResultsState::Empty %}
 {#- Nothing has run on the server yet — the current selection has no
@@ -115,9 +132,10 @@
     replaces it with a plain notice that carries no load trigger, so the
     live preview never re-fires itself. Never produced by a `/run` fragment
     endpoint. -#}
-<div id="run-notice" hx-post="{{ run_href }}"
-     hx-trigger="load" hx-target="#run-notice" hx-swap="outerHTML"
-     hx-include="#{{ form_id }}"></div>
-<div id="run-results"></div>
+{% if part.notice() %}<div id="run-notice" hx-post="{{ run_href }}"
+     hx-trigger="load" hx-sync="#{{ form_id }}:replace" hx-target="#run-notice" hx-swap="outerHTML"
+     hx-include="#{{ form_id }}" data-busy-region=".run-busy"></div>
+{% endif %}{% if part.results() %}<div id="run-results"><p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p></div>
+{%- endif %}
 
 {% endmatch %}

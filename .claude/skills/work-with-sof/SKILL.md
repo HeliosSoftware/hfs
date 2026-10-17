@@ -19,6 +19,9 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 | `SOF_ENABLE_CORS` | `true` | Enable CORS |
 | `SOF_CORS_ORIGINS` | `*` | Allowed origins |
 | `SOF_TERMINOLOGY_SERVER` | none | Terminology server URL for FHIRPath memberOf and subsumes |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | `1000` | (helios-fhirpath setting) Max distinct terminology calls per ViewDefinition run (`0` disables) |
+
+All rows, where clauses, forEach/repeat items and streamed chunks of one view run share one FHIRPath `TerminologySession` (held by the public `PreparedViewDefinition`), so identical `memberOf()` lookups are sent once per run and the cap bounds the run, not each row. Raise the cap or set it to `0` for views that check many distinct codes. Any terminology error (cap, no server, failed request) fails the run in where clauses, top-level columns and forEach/forEachOrNull/unionAll/repeat item columns alike; `evaluate_path_on_item` detects it with `helios_fhirpath::evaluate_expression_typed` + `ExpressionError::is_terminology_error()`, not message text. Deterministic failures (4xx, invalid body) are cached for the run; transient ones (timeout, connection error, 408/429/5xx except 501) are retried by the next identical lookup and count against the cap again.
 
 ## API Endpoints
 
@@ -33,8 +36,15 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 - `subjectResource`: ViewDefinition resource.
 - `resource`: FHIR resources to transform.
 - `patient`: filter by patient reference.
+- `group`: filter by Group reference (members' compartments).
 - `_limit`: limit results, 1 to 10000.
 - `_since`: filter by modification time.
+
+On the HFS server, `patient`/`group`/`_since` also apply to every dependency view of a Library (SQLQuery/SQLView) subject, and `_limit` caps only the final rows.
+
+When changing HFS stored-data SQL row order, collection cells or preview
+limits, read the
+[stored-data ordering contract](../../../book/src/ch06-sql-on-fhir.md#hfs-stored-data-ordering).
 
 Parameter precedence is request body, then query params, then Accept header.
 
@@ -94,17 +104,21 @@ curl -X POST http://localhost:8080/\$sql-run \
   -d '{"_format": "parquet", "subjectResource": {...}, "resource": [...]}'
 ```
 
-Parquet type mapping follows Pathling conventions:
+Parquet / Arrow types follow the SQL-on-FHIR 3.0.0-ballot default mappings (shared resolver: `crates/sof/src/column_types.rs`):
 
 | SOF type | Parquet type |
 |---|---|
 | boolean | BOOLEAN |
-| string, code, uri | UTF8 |
-| integer | INT32 |
-| decimal | FLOAT64 |
-| dateTime, date | UTF8 |
+| integer, positiveInt, unsignedInt | INT32 |
+| integer64 | INT64 |
+| decimal | UTF8 (digits preserved, trailing zeros stripped) |
+| instant | TIMESTAMP (µs, UTC) |
+| base64Binary | BINARY |
+| date, dateTime, time, string, code, uri, other | UTF8 |
 
-Arrays map to Arrow List types. All fields are OPTIONAL. Snappy compression is the default.
+A column `tag` named `ansi/type` (element `tag`, singular; the spec prose's `tags` is a typo and is not read) overrides the default; an unknown or incompatible value is rejected (error names the column). Columns without a `type` are inferred from values. JSON/NDJSON/CSV keep their shape (decimal stays a JSON number, deliberately). The per-emitter comparison is in `crates/sof/README.md` → "Column Type Mapping". Collection columns map to Arrow List of the element type. All fields are OPTIONAL. Snappy compression is the default.
+
+Parquet/Arrow are encoded incrementally (`helios_sof::columnar_stream`): schema fixed up front, 8,192-row batches, row groups cut by encoded bytes (`row_group_size_mb`), and the `$sql-run` response streams with an aborted body on a mid-stream error. File splitting by size is per batch, so a file can overshoot by one batch plus the footer. Streamed responses have no `Content-Length` (chunked), the timeout layer does not cover the body, Arrow stays compressible, and a client disconnect stops the encoder and drops the `RowStream` (test: `streaming_columnar_client_disconnect_drops_the_row_stream`). A value that does not fit a declared type is an error naming the column (an out-of-range integer is not nulled or wrapped); the Postgres runner's text cells are parsed by the builders (unit-tested, not run against a live Postgres). Peak-memory evidence: `docs/sof-parquet-streaming-benchmark.md` (`cargo run -p helios-sof --example parquet_peak_memory`). Row groups are cut at `row_group_size_mb` encoded bytes (REST/CLI minimum 64 MB), so per-request peak memory is about 3x that (~190 MB at the minimum). The first split file keeps the plain name and later files are `_002`, `_003` (no `_001`).
 
 ## Async Export in the HFS Server
 
@@ -121,20 +135,36 @@ in-process fallback.
 | Variable | Default | Description |
 |---|---|---|
 | `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR ops (`$sql-run`, `$sql-export`) |
-| `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3` |
+| `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`); rows beyond it are silently dropped, not an error |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized in full before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. Narrow it with a ViewDefinition `where`, or raise this limit |
+| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's); does not cover materializing a dependency |
+| `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3`. Any other value fails startup; `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink |
-| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3` |
-| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`; startup fails without it |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink; defaults to `us-east-1` when `HFS_EXPORT_S3_ENDPOINT` is set |
+| `HFS_EXPORT_S3_ENDPOINT` | *(AWS)* | Custom S3 endpoint URL for the `s3` sink (e.g. MinIO); must be an `http(s)` URL with a host. Setting it forces path-style addressing |
+| `HFS_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Use path-style S3 addressing for the `s3` sink; forced on when `HFS_EXPORT_S3_ENDPOINT` is set |
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for `s3`, seconds (spec requires ≥ 24h) |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs |
+| `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum queued + running export jobs per tenant; beyond it `$sql-export` returns `429` with `Retry-After: 5` |
 | `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger results split across files |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory` in-process; `kafka`/`sqs` reserved) |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`) |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval, seconds (clamped to ≥ 1) |
 
-Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
-job's partial shards immediately; the reaper reclaims *completed* jobs once they
-age past `HFS_EXPORT_OUTPUT_TTL`. Full `HFS_EXPORT_*` reference lives in the
+Cancelling a job (`DELETE` on the status URL) deletes its partial shards
+immediately and stops it: a queued job never starts, a running one stops at its
+next checkpoint (before each subject and shard, every 4096 rows) and frees its
+slot. A SQL statement already executing is not interrupted;
+`HFS_SOF_SQLQUERY_TIMEOUT_SECS` bounds it. A mid-run failure also deletes the
+partial shards. The reaper reclaims every finished job (completed, failed or
+cancelled) once it ages past `HFS_EXPORT_OUTPUT_TTL`; a failed delete leaves the
+job unreachable (404) and is retried, with a warning, on every sweep. Request
+inputs have fixed limits, each a `400` naming the limit: 64 `subject` entries,
+1000 `patient` plus `group` values, 256 `context` entries, and 4 ×
+`HFS_SOF_SQLQUERY_MAX_VDS` `depends-on` entries per Library. Full
+`HFS_EXPORT_*` reference lives in the
 [helios-rest README](../../../crates/rest/README.md#sql-on-fhir-async-export).
 
 ## Testing
@@ -143,3 +173,15 @@ age past `HFS_EXPORT_OUTPUT_TTL`. Full `HFS_EXPORT_*` reference lives in the
 - Integration tests live in `tests/`.
 - ViewDefinition examples are embedded in test files.
 - For version-independent logic, use enum wrappers such as `SofViewDefinition` and traits such as `ViewDefinitionTrait`, `BundleTrait`, and `ResourceTrait`.
+
+## Columnar fast path (#1813)
+
+`SofRunner::run_view_columnar` (default `Ok(None)` = unsupported) lets the SQLite and PostgreSQL
+in-DB runners emit Arrow `RecordBatch`es directly via `helios_sof::columnar::ColumnarBatchBuilder`,
+used by `$viewdefinition-run` for Parquet/Arrow IPC: the handler streams the batches through the
+same blocking encoder as the row path (`columnar_stream::{ParquetStreamWriter, ArrowIpcStreamWriter}::write_batch`).
+Column kinds come from `ColumnDecode::column_kind`; `pin_declared_types` then gives declared columns
+the row path's Arrow type (`integer64` → Int64, `collection` → `List<Utf8>`), and the remaining
+`Json`/`Auto` columns stay `Deferred` (inferred at first flush).
+Profile with `crates/persistence/tests/sof_columnar_profile.rs` (`--ignored --nocapture`,
+`HFS_TEST_COLUMNAR_PROFILE_ROWS`).

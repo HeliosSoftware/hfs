@@ -27,6 +27,10 @@
           <display value="Lyophilised powder for conventional release solution for injection"/>
         </coding>
       </doseForm>
+      <instance>
+        <lotNumber value="12345"/>
+        <expirationDate value="2019-10-31"/>
+      </instance>
     </Medication>
   </contained>
   <status value="completed"/>

@@ -56,16 +56,28 @@ function progressReports(lines: string[]): { pct: number; written: number }[] {
   return lines
     .slice()
     .reverse() // the log renders newest first
-    .map((line) => /Processing (\d+)% of bytes - ([\d,]+) resources written/.exec(line))
+    .map((line) => /Processing (\d+)% - ([\d,]+) Resources written/.exec(line))
     .filter((match): match is RegExpExecArray => match !== null)
     .map((match) => ({ pct: Number(match[1]), written: Number(match[2].replace(/,/g, "")) }));
 }
+
+// The source listens on loopback, so it is only reachable by an hfs running on
+// this host. A remote HFS_E2E_BASE_URL (the backend matrix) cannot fetch it;
+// the per-PR ui-tests.yml run, where hfs and the browser share a host, keeps
+// the coverage. Skipped here, before the test body starts the source at all.
+test.beforeEach(({ baseURL }) => {
+  const host = new URL(baseURL!).hostname;
+  test.skip(
+    host !== "127.0.0.1" && host !== "localhost" && host !== "::1",
+    "the bulk-submit source is served on loopback; a remote server cannot fetch it",
+  );
+});
 
 test("a manifest submitted from the Import page ingests, and its counters only ever climb", async ({
   page,
   chrome,
   bulkImport,
-  queries,
+  search,
   request,
 }) => {
   // A per-run family name: the Patients this run writes are the only ones that
@@ -139,7 +151,7 @@ test("a manifest submitted from the Import page ingests, and its counters only e
       // lost on the way in.
       await expect(bulkImport.progressBar).toHaveAttribute("aria-valuenow", /^\d+$/);
       await expect(bulkImport.progressText).toHaveText(
-        /Processing \d+% of bytes - [\d,]+ resources written/,
+        /Processing \d+% - [\d,]+ Resources written/,
       );
 
       // HFS fetched both fixture files itself, server-to-server — and sized the
@@ -192,27 +204,27 @@ test("a manifest submitted from the Import page ingests, and its counters only e
       expect(Math.max(...written)).toBeLessThanOrEqual(RESOURCES);
     });
 
-    await test.step("§7.4 the imported data is searchable from the query builder", async () => {
-      await queries.goto("Patient");
-      await queries.builder.run(`Patient?family=${family}`);
-      await queries.results.waitShown();
+    await test.step("§7.5 the imported data is searchable from the query builder", async () => {
+      await search.gotoBuilder("Patient");
+      await search.builder.run(`Patient?family=${family}`);
+      await search.results.waitShown();
       // A page of real rows first: this is what an operator actually looks at,
       // and it proves the Patients were stored and indexed, not merely counted.
-      await expect(queries.results.rows.first()).toBeVisible({ timeout: 60_000 });
-      await expect(queries.results.rows.first()).toContainText(family);
+      await expect(search.results.rows.first()).toBeVisible({ timeout: 60_000 });
+      await expect(search.results.rows.first()).toContainText(family);
     });
 
-    await test.step("§7.4 and all of it landed, not just the first page", async () => {
+    await test.step("§7.5 and all of it landed, not just the first page", async () => {
       // A plain search returns one page, and its Bundle carries no `total`, so
       // the results meta counts the rows on screen — 20, the default page size.
       // `_summary=count` is the query that asks the server for the whole tally,
       // which is the number worth comparing against the manifest.
-      await queries.builder.run(`Patient?family=${family}&_summary=count`);
+      await search.builder.run(`Patient?family=${family}&_summary=count`);
       // Matched on the digits alone: Fluent wraps a placeable in bidi isolates,
       // so the rendered total is not the plain "2000 results" the .ftl reads as.
       // The window is wide because search follows the per-manifest reindex and
       // can trail the completion the status card just reported.
-      await expect(queries.results.meta).toHaveText(new RegExp(`\\b${RESOURCES}\\b`), {
+      await expect(search.results.meta).toHaveText(new RegExp(`\\b${RESOURCES}\\b`), {
         timeout: 60_000,
       });
     });

@@ -354,9 +354,13 @@ impl BundleBuilder {
 /// `serde_json` with `preserve_order` (required by `helios-fhir-validator`), so
 /// `Value::Object` is insertion-ordered and the emitted JSON follows the order
 /// the members are inserted here — `resourceType`, `type`, `total`, `link`,
-/// `entry`; then `fullUrl`, `resource`, `search`; then `mode`, `score`. `total`
-/// is emitted as `null` when absent, `link` and `entry` as arrays that may be
-/// empty, exactly as before.
+/// `entry`; then `fullUrl`, `resource`, `search`; then `mode`, `score`. `link`
+/// and `entry` are emitted as arrays that may be empty.
+///
+/// `total` is omitted when the backend did not compute one. FHIR JSON has no
+/// `null` primitives — an element is either present with a value or absent —
+/// so a missing count must drop the key rather than emit `"total": null`
+/// (#990).
 pub(crate) fn searchset_to_json(
     bundle: helios_persistence::types::SearchBundle,
     mut map_resource: impl FnMut(Value) -> Value,
@@ -416,13 +420,9 @@ pub(crate) fn searchset_to_json(
         Value::String("Bundle".to_string()),
     );
     root.insert("type".to_string(), Value::String(bundle.bundle_type));
-    root.insert(
-        "total".to_string(),
-        match bundle.total {
-            Some(total) => Value::Number(total.into()),
-            None => Value::Null,
-        },
-    );
+    if let Some(total) = bundle.total {
+        root.insert("total".to_string(), Value::Number(total.into()));
+    }
     root.insert("link".to_string(), Value::Array(link));
     root.insert("entry".to_string(), Value::Array(entry));
     Value::Object(root)
@@ -452,6 +452,35 @@ mod tests {
         assert_eq!(bundle["type"], "searchset");
         assert_eq!(bundle["total"], 1);
         assert_eq!(bundle["entry"][0]["search"]["mode"], "match");
+    }
+
+    /// A `SearchBundle` without a computed total serializes with no `total`
+    /// key at all — never `"total": null`, which is invalid FHIR JSON (#990).
+    #[test]
+    fn test_searchset_to_json_omits_missing_total() {
+        let bundle = helios_persistence::types::SearchBundle::new()
+            .with_self_link("http://example.com/Group");
+
+        let json = searchset_to_json(bundle, |resource| resource);
+        let root = json.as_object().expect("bundle is an object");
+
+        assert!(!root.contains_key("total"), "no total key: {json}");
+        assert_eq!(json["type"], "searchset");
+        assert_eq!(json["entry"], serde_json::json!([]));
+    }
+
+    /// A computed total of zero is a value, not an absence: it must serialize
+    /// as the number `0` (#990).
+    #[test]
+    fn test_searchset_to_json_emits_zero_total() {
+        let bundle = helios_persistence::types::SearchBundle::new()
+            .with_self_link("http://example.com/Group")
+            .with_total(0);
+
+        let json = searchset_to_json(bundle, |resource| resource);
+
+        assert_eq!(json["total"], serde_json::json!(0));
+        assert!(json["total"].is_u64());
     }
 
     #[test]

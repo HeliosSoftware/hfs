@@ -1,9 +1,15 @@
-{% macro rail_items(entries) %}
+{#
+  A rail item's live instance count. `approximate` (#1078): the counts come
+  from a snapshot counted from recent writes and not yet reconciled with
+  storage, so each one reads "≈N", with the reason as a hover title and as
+  text for assistive technology — never presented as an exact figure.
+#}
+{% macro rail_items(entries, approximate) %}
 {% for e in entries %}
 <a class="filter-rail__item" data-type="{{ e.name }}" data-full-name="{{ e.name }}"
    href="{{ e.href }}" title="{{ e.name }}"{% if e.current %} aria-current="true"{% endif %}>
   <span class="filter-rail__label">{{ e.name }}</span>
-  {% if let Some(c) = e.count %}<span class="count">{{ c }}</span>{% endif %}
+  {% if let Some(c) = e.count %}{% if approximate %}<span class="count count--approximate" title="{{ i18n.t("rail-count-approximate") }}">≈{{ c }}<span class="visually-hidden"> {{ i18n.t("rail-count-approximate") }}</span></span>{% else %}<span class="count">{{ c }}</span>{% endif %}{% endif %}
 </a>
 {% endfor %}
 {% endmacro %}

@@ -4,7 +4,7 @@
 //!
 //! - that `resolve_prefs` reads the settings store **exactly once** per
 //!   request;
-//! - that Resources, Search, Saved Queries, and Search Parameters actually
+//! - that Resources, Search, and Search Parameters actually
 //!   resolve and persist through `rail_state` — an explicit selection that
 //!   wins and is recorded, a stored `last` that restores and falls back
 //!   silently when stale, and the "Recently used" group staying resolved
@@ -13,8 +13,8 @@
 //!   store round trip;
 //! - the same, for the three SQL rails (View Definitions, SQL Queries, SQL
 //!   Views) — including their `{id, name, meta}` snapshot, pruning a stale
-//!   explicit selection, and the "Recently used" group staying immune to
-//!   the rail's own `?filter=`/pagination.
+//!   explicit selection, and the "Recently used" group following the rail's
+//!   own `?filter=` (#1275) while staying immune to its pagination.
 //! - Compartments' `def` restore — no "Recently used" group here (only 4-5
 //!   definitions), so there is nothing to render, only
 //!   `rails.compartments` to resolve and record. The "no settings store"
@@ -99,7 +99,7 @@ async fn each_of_several_page_loads_reads_settings_exactly_once() {
     assert_eq!(store.get_settings_calls(), 3);
 }
 
-// ── Ticket 02: Resources, Search, Saved Queries, Search Parameters ────────
+// ── Ticket 02: Resources, Search, Search Parameters ────────
 
 async fn body_text(response: Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -123,6 +123,34 @@ async fn get_ok_html(app: Router, path: &str) -> String {
         "unexpected status {} for {path}",
         response.status()
     );
+    body_text(response).await
+}
+
+/// Whether the always-emitted `#sql-selection-filtered` notice is `hidden`
+/// (the selection is on the filtered list) — the live rail filter swaps this
+/// element out of band, so it is present even when it does not apply (#1275).
+fn selection_notice_is_hidden(html: &str) -> bool {
+    let start = html
+        .find(r#"id="sql-selection-filtered""#)
+        .expect("the notice element is always emitted when something is selected");
+    let tag_end = html[start..].find('>').unwrap() + start;
+    html[start..tag_end].contains("hidden")
+}
+
+/// GET with the `X-Rail-Filter` header the SQL rails' inputs send while the
+/// user types.
+async fn get_live_filter_html(app: Router, path: &str) -> String {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header("x-rail-filter", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "status for {path}");
     body_text(response).await
 }
 
@@ -391,12 +419,12 @@ async fn search_parameters_recent_group_renders_live_count_and_current() {
     );
 }
 
-/// Search and Saved Queries restore and record through
-/// their own `rails.<page>` keys — never Resources', confirming recents are
+/// Search restores and records through
+/// its own `rails.<page>` key — never Resources', confirming recents are
 /// per page (#603's shared-across-pages model is gone).
 #[tokio::test]
-async fn search_and_queries_restore_and_record_their_own_rail_state() {
-    for (path, page_key) in [("/ui/search", "search"), ("/ui/queries", "queries")] {
+async fn search_restores_and_records_its_own_rail_state() {
+    for (path, page_key) in [("/ui/search", "search")] {
         let store = Arc::new(InMemorySettingsStore::new());
         seed_rail(
             &store,
@@ -495,7 +523,9 @@ fn rail_list_html<'a>(html: &'a str, list_id: &str) -> &'a str {
 /// For View Definitions, a stored `last` is restored whether it names an
 /// entry on the rail's current page or one that has to be read directly
 /// (#741) — and, when it names nothing real at all, the page falls back to
-/// the rail's first visible entry, silently (no write).
+/// the rail's first visible entry; the render then also sweeps the now-gone
+/// id off the registry, since the static source genuinely has no such id
+/// (#1014).
 #[tokio::test]
 async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_falls_back() {
     let vds: Vec<Value> = (1..=51)
@@ -529,7 +559,8 @@ async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_f
     assert!(html.contains(r#"<h2 class="page-head__title">vd_051</h2>"#));
 
     // Names nothing real anywhere: falls back to the rail's first visible
-    // entry (name-sorted), and the stale value is left untouched.
+    // entry (name-sorted); the existence sweep then prunes "ghost" for good,
+    // since the static source has no such id (#1014).
     let store = Arc::new(InMemorySettingsStore::new());
     seed_rail(
         &store,
@@ -540,11 +571,13 @@ async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_f
     let html = get_ok_html(vd_app_with(store.clone(), vds), "/ui/sql/view-definitions").await;
     assert!(html.contains(r#"<h2 class="page-head__title">vd_001</h2>"#));
     let doc = store.peek("l2:").expect("settings stored");
+    let rail = stored_rail(&doc, "viewDefinitions");
     assert_eq!(
-        stored_rail(&doc, "viewDefinitions")["last"],
-        "ghost",
-        "a silent fallback must not overwrite the stale value"
+        rail["last"],
+        Value::Null,
+        "ghost does not exist on the server, so the sweep prunes it"
     );
+    assert_eq!(rail["recent"], json!([]));
 }
 
 /// For View Definitions, an explicit `?vd=` selection that resolves is
@@ -641,15 +674,17 @@ async fn view_definitions_explicit_stale_selection_is_pruned() {
     );
 }
 
-/// For View Definitions, the "Recently used" group is immune to the rail's
-/// own `?filter=` — an entry on the current page renders with its live
-/// name/meta, overriding a stale snapshot; one the filter excludes falls
-/// back to that very snapshot, `href` included.
+/// For View Definitions, the "Recently used" group follows the rail's own
+/// `?filter=` (#1275) — an entry on the current page renders with its live
+/// name/meta, overriding a stale snapshot; one the filter takes off the page
+/// falls back to its snapshot (`href` included) only while that snapshot's
+/// name still matches, and is dropped otherwise.
 #[tokio::test]
-async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_snapshot() {
+async fn view_definitions_recent_group_follows_the_filter_and_falls_back_to_the_snapshot() {
     let vds = vec![
         json!({"resourceType": "ViewDefinition", "id": "keep", "name": "keep_me", "resource": "Encounter"}),
         json!({"resourceType": "ViewDefinition", "id": "other", "name": "other_thing", "resource": "Patient"}),
+        json!({"resourceType": "ViewDefinition", "id": "third", "name": "third_thing", "resource": "Patient"}),
     ];
     let store = Arc::new(InMemorySettingsStore::new());
     seed_rail(
@@ -659,14 +694,15 @@ async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_
             "last": "keep",
             "recent": [
                 {"id": "keep", "name": "old_keep_name", "meta": "Patient"},
-                {"id": "other", "name": "stale_other_name", "meta": "Patient"}
+                {"id": "other", "name": "keep_stale_name", "meta": "Patient"},
+                {"id": "third", "name": "third_stale_name", "meta": "Patient"}
             ]
         }),
     )
     .await;
 
     let html = get_ok_html(
-        vd_app_with(store, vds),
+        vd_app_with(store.clone(), vds.clone()),
         "/ui/sql/view-definitions?filter=keep",
     )
     .await;
@@ -683,11 +719,325 @@ async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_
     assert!(!group.contains("old_keep_name"));
     assert!(group.contains(r#"class="filter-rail__meta">Encounter<"#));
     assert!(group.contains(r#"data-type="keep""#) && group.contains(r#"aria-current="true""#));
-    // "other" is off the current page (the filter excludes it): the group
-    // falls back to its stored snapshot, with a working href.
-    assert!(group.contains("stale_other_name"));
+    // "other" is off the current page (the filter excludes it) but its
+    // snapshot name still matches: the group falls back to the snapshot,
+    // with a working href.
+    assert!(group.contains("keep_stale_name"));
     assert!(group.contains(r#"class="filter-rail__meta">Patient<"#));
     assert!(group.contains(r#"href="/ui/sql/view-definitions?vd=other""#));
+    // "third" matches neither the page nor its snapshot: dropped.
+    assert!(!group.contains(r#"data-type="third""#));
+
+    // A term that matches nothing leaves the group empty, hence `hidden`.
+    let html = get_ok_html(
+        vd_app_with(store, vds),
+        "/ui/sql/view-definitions?filter=zzzznomatch",
+    )
+    .await;
+    let group = recent_group_html(&html, "vd-rail-recent");
+    assert!(group[..group.find('>').unwrap()].contains("hidden"));
+    assert!(!group.contains("filter-rail__item"));
+}
+
+/// The SQL rails filter as the user types (#1275): the search input carries
+/// the htmx wiring that swaps the list and pulls the "Recently used" group
+/// (and View Definitions' pagination) from the same filtered render, while
+/// the surrounding form stays a plain GET for Enter and no-JS.
+#[tokio::test]
+async fn sql_rail_filter_inputs_carry_the_live_filter_htmx_wiring() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    let html = get_ok_html(
+        vd_app_with(store.clone(), vec![]),
+        "/ui/sql/view-definitions",
+    )
+    .await;
+    for needle in [
+        r#"hx-get="/ui/sql/view-definitions""#,
+        r#"hx-trigger="input changed delay:300ms""#,
+        r#"hx-sync="this:replace""#,
+        r##"hx-target="#vd-rail-list""##,
+        r##"hx-select-oob="#vd-rail-recent,#vd-rail-pagination,#sql-selection-filtered,#sql-empty-state""##,
+        r#"hx-replace-url="true""#,
+        r#"hx-history="false""#,
+        r#"hx-headers='{"X-Rail-Filter":"1"}'"#,
+        r#"<form class="filter-rail__search" method="get""#,
+    ] {
+        assert!(html.contains(needle), "missing {needle}");
+    }
+    // Always emitted so the out-of-band swap has a target; hidden with no
+    // prev/next link.
+    let nav = &html[html.find(r#"id="vd-rail-pagination""#).unwrap()..];
+    assert!(nav[..nav.find('>').unwrap()].contains("hidden"));
+
+    // A draft keeps `vd=new` across the live-filter request.
+    let html = get_ok_html(
+        vd_app_with(store, vec![]),
+        "/ui/sql/view-definitions?vd=new",
+    )
+    .await;
+    assert!(html.contains(r#"<input type="hidden" name="vd" value="new">"#));
+
+    for (_, path, _) in SQL_KINDS {
+        let html = get_ok_html(
+            lib_app_with(Arc::new(InMemorySettingsStore::new()), vec![]),
+            path,
+        )
+        .await;
+        for needle in [
+            format!(r#"hx-get="{path}""#),
+            r##"hx-target="#lib-rail-list""##.to_string(),
+            r##"hx-select-oob="#lib-rail-recent,#sql-selection-filtered,#sql-empty-state""##
+                .to_string(),
+            r#"hx-headers='{"X-Rail-Filter":"1"}'"#.to_string(),
+            r#"hx-history="false""#.to_string(),
+        ] {
+            assert!(html.contains(&needle), "{path}: missing {needle}");
+        }
+        // A draft keeps `lib=new` across the live-filter request.
+        let html = get_ok_html(
+            lib_app_with(Arc::new(InMemorySettingsStore::new()), vec![]),
+            &format!("{path}?lib=new"),
+        )
+        .await;
+        assert!(
+            html.contains(r#"<input type="hidden" name="lib" value="new">"#),
+            "{path}: draft hidden field"
+        );
+    }
+}
+
+/// The filter term is trimmed on the server like the client does (#1275): a
+/// term with surrounding spaces matches as it would without them, on the
+/// list and on the "Recently used" group alike.
+#[tokio::test]
+async fn rail_filters_trim_the_search_term_server_side() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "patient_demographics", "resource": "Patient"}),
+        json!({"resourceType": "ViewDefinition", "id": "vd2", "name": "observation_flat", "resource": "Observation"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "viewDefinitions",
+        json!({"recent": [
+            {"id": "vd1", "name": "patient_demographics", "meta": "Patient"},
+            {"id": "vd2", "name": "observation_flat", "meta": "Observation"}
+        ]}),
+    )
+    .await;
+    let html = get_ok_html(
+        vd_app_with(store, vds),
+        "/ui/sql/view-definitions?filter=%20patient%20",
+    )
+    .await;
+    let group = recent_group_html(&html, "vd-rail-recent");
+    assert!(group.contains(r#"data-type="vd1""#));
+    assert!(!group.contains(r#"data-type="vd2""#));
+    let list = rail_list_html(&html, "vd-rail-list");
+    assert!(list.contains(r#"data-type="vd1""#));
+    assert!(!list.contains(r#"data-type="vd2""#));
+
+    let libs = vec![
+        json!({"resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+            "type": {"coding": [{"system": "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", "code": "sql-query"}]}}),
+        json!({"resourceType": "Library", "id": "q2", "name": "encounter_counts", "status": "active",
+            "type": {"coding": [{"system": "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", "code": "sql-query"}]}}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "sqlQueries",
+        json!({"recent": [
+            {"id": "q1", "name": "patient_counts", "meta": "active"},
+            {"id": "q2", "name": "encounter_counts", "meta": "active"}
+        ]}),
+    )
+    .await;
+    let html = get_ok_html(
+        lib_app_with(store, libs),
+        "/ui/sql/queries?filter=+patient+",
+    )
+    .await;
+    let group = recent_group_html(&html, "lib-rail-recent");
+    assert!(group.contains(r#"data-type="q1""#));
+    assert!(!group.contains(r#"data-type="q2""#));
+
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "searchParameters",
+        json!({"recent": [{"id": "Encounter"}, {"id": "Patient"}]}),
+    )
+    .await;
+    let html = get_ok_html(app_with(store), "/ui/search-parameters?q=%20enc%20").await;
+    let group = recent_group_html(&html, "sp-rail-recent");
+    assert!(group.contains(r#"data-type="Encounter""#));
+    assert!(!group.contains(r#"data-type="Patient""#));
+}
+
+/// Typing in the rail filter echoes the page's selection back as `?vd=` /
+/// `?lib=`; with the `X-Rail-Filter` header that must not be recorded as a
+/// pick (#1275), while the same URL without it still is.
+#[tokio::test]
+async fn live_rail_filter_requests_do_not_record_the_echoed_selection() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "patient_demographics", "resource": "Patient"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    let html = get_live_filter_html(
+        vd_app_with(store.clone(), vds.clone()),
+        "/ui/sql/view-definitions?vd=vd1&filter=pat",
+    )
+    .await;
+    assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
+    assert!(store.peek("l2:").is_none(), "nothing written while typing");
+    get_ok_html(
+        vd_app_with(store.clone(), vds),
+        "/ui/sql/view-definitions?vd=vd1&filter=pat",
+    )
+    .await;
+    let doc = store.peek("l2:").expect("a real pick is recorded");
+    assert_eq!(stored_rail(&doc, "viewDefinitions")["last"], "vd1");
+
+    for (code, path, key) in SQL_KINDS {
+        let libs = vec![
+            json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", "code": code}]}}),
+        ];
+        let store = Arc::new(InMemorySettingsStore::new());
+        get_live_filter_html(
+            lib_app_with(store.clone(), libs.clone()),
+            &format!("{path}?lib=q1&filter=pat"),
+        )
+        .await;
+        assert!(store.peek("l2:").is_none(), "{path}: nothing written");
+        get_ok_html(
+            lib_app_with(store.clone(), libs),
+            &format!("{path}?lib=q1&filter=pat"),
+        )
+        .await;
+        let doc = store.peek("l2:").expect("a real pick is recorded");
+        assert_eq!(stored_rail(&doc, key)["last"], "q1", "{path}");
+    }
+}
+
+/// With nothing selected, a live-filter request keeps it that way: the
+/// first-match fallback would highlight an item the (unswapped) centre pane
+/// does not show (#1275). A plain GET still falls back as before.
+#[tokio::test]
+async fn live_rail_filter_keeps_an_empty_selection_empty() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "patient_demographics", "resource": "Patient"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    let html = get_live_filter_html(
+        vd_app_with(store.clone(), vds.clone()),
+        "/ui/sql/view-definitions?filter=pat",
+    )
+    .await;
+    let list = rail_list_html(&html, "vd-rail-list");
+    assert!(list.contains(r#"data-type="vd1""#));
+    assert!(!list.contains("aria-current"));
+    // The centre's empty-state card is swappable by id (its "No matches for"
+    // heading follows the filter).
+    assert!(html.contains(r#"id="sql-empty-state""#));
+    assert!(!html.contains(r#"<h2 class="page-head__title">"#));
+
+    let html = get_ok_html(
+        vd_app_with(store, vds),
+        "/ui/sql/view-definitions?filter=pat",
+    )
+    .await;
+    assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
+}
+
+/// Search Parameters narrows both its list and its "Recently used" group
+/// with `?q=` (#1275), and re-fetches the group out of band.
+#[tokio::test]
+async fn search_parameters_recent_group_follows_the_search_box() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "searchParameters",
+        json!({"recent": [{"id": "Encounter"}, {"id": "Patient"}]}),
+    )
+    .await;
+    let html = get_ok_html(app_with(store.clone()), "/ui/search-parameters?q=enc").await;
+    assert!(html.contains(r##"hx-select-oob="#sp-rail-recent""##));
+    let group = recent_group_html(&html, "sp-rail-recent");
+    assert!(group.contains(r#"data-type="Encounter""#));
+    assert!(!group.contains(r#"data-type="Patient""#));
+    let list = rail_list_html(&html, "sp-rail-list");
+    assert!(list.contains(r#"data-type="Encounter""#));
+
+    let html = get_ok_html(app_with(store), "/ui/search-parameters?q=zzzznomatch").await;
+    let group = recent_group_html(&html, "sp-rail-recent");
+    assert!(group[..group.find('>').unwrap()].contains("hidden"));
+}
+
+/// For View Definitions, a recent entry absent from the live rail page is
+/// checked against the server on render; a source that genuinely lacks it
+/// (a definitive 404/410 in the real HTTP source) prunes it from both the
+/// rendered group and the stored registry (#1014).
+#[tokio::test]
+async fn view_definitions_recent_group_drops_a_gone_entry_on_render() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients", "resource": "Patient"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "viewDefinitions",
+        json!({
+            "last": "gone",
+            "recent": [
+                {"id": "gone", "name": "gone", "meta": "Patient"},
+                {"id": "vd1", "name": "active_patients", "meta": "Patient"}
+            ]
+        }),
+    )
+    .await;
+
+    let html = get_ok_html(vd_app_with(store.clone(), vds), "/ui/sql/view-definitions").await;
+    let group = recent_group_html(&html, "vd-rail-recent");
+    assert!(!group.contains(r#"data-type="gone""#));
+    assert!(group.contains(r#"data-type="vd1""#));
+
+    let doc = store.peek("l2:").expect("settings stored");
+    let rail = stored_rail(&doc, "viewDefinitions");
+    assert_eq!(
+        rail["recent"],
+        json!([{"id": "vd1", "name": "active_patients", "meta": "Patient"}]),
+        "the gone entry is pruned from the persisted registry"
+    );
+    assert_eq!(rail["last"], Value::Null);
+}
+
+/// For View Definitions, a recent entry already on the live rail page needs
+/// no existence check at all — the render skips the lookup, and the stored
+/// registry is left untouched (#1014).
+#[tokio::test]
+async fn view_definitions_recent_group_skips_the_lookup_for_live_entries() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients", "resource": "Patient"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "viewDefinitions",
+        json!({"last": "vd1", "recent": [{"id": "vd1", "name": "active_patients", "meta": "Patient"}]}),
+    )
+    .await;
+    let before = store.peek("l2:").expect("settings stored");
+
+    get_ok_html(vd_app_with(store.clone(), vds), "/ui/sql/view-definitions").await;
+
+    let after = store.peek("l2:").expect("settings stored");
+    assert_eq!(
+        before, after,
+        "a recent entry already live needs no lookup and no rewrite"
+    );
 }
 
 /// Libraries (SQL Queries/SQL Views) show the same restore/record/prune
@@ -960,4 +1310,559 @@ async fn compartments_a_stale_stored_last_falls_back_silently_and_writes_nothing
         "NoSuchCompartment",
         "a silent fallback must not overwrite the stale value"
     );
+}
+
+/// #1780: a stored `last` the rail's filter excludes is not opened in the
+/// main pane — the page falls back to the filtered rail's first entry, or
+/// to the "No matches" card with its "Clear the filter" link when nothing
+/// matches — and the stored `last` survives for when the filter is cleared.
+/// An explicit `?vd=` the filter excludes still opens, with a visible note.
+#[tokio::test]
+async fn view_definitions_filter_overrides_a_stored_last_it_excludes() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "patient_demographics", "resource": "Patient"}),
+        json!({"resourceType": "ViewDefinition", "id": "vd2", "name": "observation_flat", "resource": "Observation"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "viewDefinitions",
+        json!({"last": "vd1", "recent": [{"id": "vd1", "name": "patient_demographics", "meta": "Patient"}]}),
+    )
+    .await;
+
+    let html = get_ok_html(
+        vd_app_with(store.clone(), vds.clone()),
+        "/ui/sql/view-definitions?filter=observation",
+    )
+    .await;
+    assert!(html.contains(r#"<h2 class="page-head__title">observation_flat</h2>"#));
+    assert!(selection_notice_is_hidden(&html));
+
+    let html = get_ok_html(
+        vd_app_with(store.clone(), vds.clone()),
+        "/ui/sql/view-definitions?filter=zzz",
+    )
+    .await;
+    assert!(!html.contains(r#"<h2 class="page-head__title">"#));
+    assert!(html.contains(r#"<p class="filter-rail__empty" id="sql-rail-empty">"#));
+    assert!(html.contains(r#"<a href="/ui/sql/view-definitions">Clear the filter</a>"#));
+    let doc = store.peek("l2:").expect("settings stored");
+    assert_eq!(stored_rail(&doc, "viewDefinitions")["last"], "vd1");
+
+    let html = get_ok_html(
+        vd_app_with(store, vds),
+        "/ui/sql/view-definitions?vd=vd1&filter=observation",
+    )
+    .await;
+    assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
+    assert!(!selection_notice_is_hidden(&html));
+    assert!(html.contains(r#"<a href="/ui/sql/view-definitions?vd=vd1">Clear the filter</a>"#));
+}
+
+/// #1780 on SQL Queries: the same rules as View Definitions.
+#[tokio::test]
+async fn sql_queries_filter_overrides_a_stored_last_it_excludes() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        json!({"resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        json!({"resourceType": "Library", "id": "q2", "name": "encounter_counts", "status": "draft",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+    ];
+    let title_row = |html: &str| -> Option<String> {
+        html.split(r#"<h2 class="page-head__title page-head__title--kind">"#)
+            .nth(1)
+            .and_then(|s| s.split("</h2>").next())
+            .map(str::to_string)
+    };
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "sqlQueries",
+        json!({"last": "q1", "recent": [{"id": "q1", "name": "patient_counts", "meta": "active"}]}),
+    )
+    .await;
+
+    let html = get_ok_html(
+        lib_app_with(store.clone(), libs.clone()),
+        "/ui/sql/queries?filter=encounter",
+    )
+    .await;
+    assert!(
+        title_row(&html)
+            .expect("a title row")
+            .contains("encounter_counts")
+    );
+    assert!(selection_notice_is_hidden(&html));
+
+    let html = get_ok_html(
+        lib_app_with(store.clone(), libs.clone()),
+        "/ui/sql/queries?filter=zzz",
+    )
+    .await;
+    assert!(title_row(&html).is_none());
+    assert!(html.contains(r#"<p class="filter-rail__empty" id="sql-rail-empty">"#));
+    assert!(html.contains(r#"<a href="/ui/sql/queries">Clear the filter</a>"#));
+    let doc = store.peek("l2:").expect("settings stored");
+    assert_eq!(stored_rail(&doc, "sqlQueries")["last"], "q1");
+
+    let html = get_ok_html(
+        lib_app_with(store, libs),
+        "/ui/sql/queries?lib=q1&filter=encounter",
+    )
+    .await;
+    assert!(
+        title_row(&html)
+            .expect("a title row")
+            .contains("patient_counts")
+    );
+    assert!(html.contains(r#"<a href="/ui/sql/queries?lib=q1">Clear the filter</a>"#));
+}
+
+/// Retiring the workspace leaves historical rail and saved-query settings
+/// intact while active rails continue recording their own selections.
+#[tokio::test]
+async fn active_rail_writes_preserve_legacy_settings() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    let legacy = json!({"last": "Observation", "recent": [{"id": "Observation"}]});
+    seed_rail(&store, "queries", legacy.clone()).await;
+    let saved = json!({"Patient": {"kept": {"name": "Kept query", "query": "name=smith", "createdAt": "2026-01-01T00:00:00Z"}}});
+    store
+        .patch_settings(
+            "l2:",
+            json!({"byTenant": {"default": {"savedQueries": saved.clone()}}}),
+            None,
+        )
+        .await
+        .unwrap();
+    get_ok_html(app_with(store.clone()), "/ui/resources?type=Encounter").await;
+    get_ok_html(app_with(store.clone()), "/ui/search?type=Patient").await;
+    let doc = store.peek("l2:").expect("settings preserved");
+    assert_eq!(stored_rail(&doc, "queries"), &legacy);
+    assert_eq!(doc["byTenant"]["default"]["savedQueries"], saved);
+}
+
+// #1884: list/search results may lag behind authoritative resource reads.
+struct LibraryExistenceSource {
+    libraries: Result<Vec<Value>, String>,
+    verdicts: std::collections::HashMap<String, Result<bool, String>>,
+    calls: std::sync::Mutex<Vec<(String, String, helios_fhir::FhirVersion)>>,
+}
+
+#[async_trait::async_trait]
+impl helios_ui::ConformanceSource for LibraryExistenceSource {
+    async fn fetch(
+        &self,
+        resource_type: &str,
+        _: helios_fhir::FhirVersion,
+        _: &str,
+    ) -> Result<Vec<Value>, String> {
+        if resource_type == "Library" {
+            self.libraries.clone()
+        } else {
+            Ok(vec![])
+        }
+    }
+    async fn resource_exists(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: helios_fhir::FhirVersion,
+        tenant: &str,
+    ) -> Result<bool, String> {
+        assert_eq!(resource_type, "Library");
+        self.calls
+            .lock()
+            .unwrap()
+            .push((id.to_string(), tenant.to_string(), version));
+        self.verdicts.get(id).cloned().unwrap_or(Ok(true))
+    }
+}
+
+fn existence_source(
+    libraries: Result<Vec<Value>, String>,
+    verdicts: &[(&str, Result<bool, String>)],
+) -> Arc<LibraryExistenceSource> {
+    Arc::new(LibraryExistenceSource {
+        libraries,
+        verdicts: verdicts
+            .iter()
+            .map(|(id, result)| (id.to_string(), result.clone()))
+            .collect(),
+        calls: Default::default(),
+    })
+}
+
+fn existence_app(
+    store: Arc<InMemorySettingsStore>,
+    source: Arc<LibraryExistenceSource>,
+    tenant: &str,
+) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(),
+        None,
+        Some(store),
+        tenant.to_string(),
+        source,
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+fn sql_library(id: &str, code: &str) -> Value {
+    json!({"resourceType":"Library", "id": id, "name": id, "status":"active",
+        "type":{"coding":[{"system":"http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", "code":code}]}})
+}
+
+const SQL_KINDS: [(&str, &str, &str); 2] = [
+    ("sql-query", "/ui/sql/queries", "sqlQueries"),
+    ("sql-view", "/ui/sql/views", "sqlViews"),
+];
+
+#[tokio::test]
+async fn sql_libraries_external_deletion_prunes_on_render_without_click() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"gone", "recent":[{"id":"gone"},{"id":"keep"}]}),
+        )
+        .await;
+        let source = existence_source(Ok(vec![sql_library("keep", code)]), &[("gone", Ok(false))]);
+        let html = get_ok_html(existence_app(store.clone(), source, "default"), path).await;
+        assert!(
+            !recent_group_html(&html, "lib-rail-recent").contains("data-type=\"gone\""),
+            "{path}: gone recent must disappear immediately"
+        );
+        let doc = store.peek("l2:").unwrap();
+        assert_eq!(stored_rail(&doc, key)["last"], Value::Null);
+        assert_eq!(stored_rail(&doc, key)["recent"], json!([{"id":"keep"}]));
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_authoritative_missing_filters_stale_search_before_selection() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"gone", "recent":[{"id":"gone"}]}),
+        )
+        .await;
+        let source = existence_source(
+            Ok(vec![sql_library("gone", code), sql_library("keep", code)]),
+            &[("gone", Ok(false))],
+        );
+        let html = get_ok_html(
+            existence_app(store.clone(), source, "default"),
+            &format!("{path}?lib=gone"),
+        )
+        .await;
+        assert!(
+            !rail_list_html(&html, "lib-rail-list").contains("data-type=\"gone\""),
+            "{path}: search lag must not resurrect gone"
+        );
+        assert!(!html.contains("name=\"json\""));
+        assert!(html.contains("Select a query or view"));
+        assert_eq!(
+            stored_rail(&store.peek("l2:").unwrap(), key)["recent"],
+            json!([])
+        );
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_failed_fetch_does_not_prune_unverifiable_explicit() {
+    for (_, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"keep", "recent":[{"id":"keep"}]}),
+        )
+        .await;
+        let before = store.peek("l2:").unwrap();
+        let source = existence_source(
+            Err("503 unavailable".to_string()),
+            &[("keep", Err("503 unavailable".to_string()))],
+        );
+        let html = get_ok_html(
+            existence_app(store.clone(), source, "default"),
+            &format!("{path}?lib=keep"),
+        )
+        .await;
+        assert_eq!(
+            before,
+            store.peek("l2:").unwrap(),
+            "{path}: outages cannot prove deletion"
+        );
+        assert!(html.contains("The available queries and views could not be verified."));
+        assert!(!html.contains("No SQL queries yet") && !html.contains("No SQL views yet"));
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_missing_only_prunes_while_true_and_errors_keep_off_list_history() {
+    for (_, path, key) in SQL_KINDS {
+        for verdict in [
+            Ok(true),
+            Err("401 unauthorized".into()),
+            Err("500 failure".into()),
+            Err("network unavailable".into()),
+            Err("non-default FHIR version".into()),
+        ] {
+            let store = Arc::new(InMemorySettingsStore::new());
+            seed_rail(
+                &store,
+                key,
+                json!({"last":"keep", "recent":[{"id":"keep", "name":"snapshot"}]}),
+            )
+            .await;
+            let before = store.get_settings("l2:").await.unwrap().unwrap();
+            let reads = store.get_settings_calls();
+            let source = existence_source(Ok(vec![]), &[("keep", verdict)]);
+            let html = get_ok_html(
+                existence_app(store.clone(), source.clone(), "default"),
+                &format!("{path}?lib=keep&deleted=keep&filter=snap"),
+            )
+            .await;
+            assert_eq!(
+                store.get_settings_calls() - reads,
+                1,
+                "one settings read per render"
+            );
+            let after = store.get_settings("l2:").await.unwrap().unwrap();
+            assert_eq!(
+                before.version, after.version,
+                "unverifiable/off-list must not write"
+            );
+            assert_eq!(before.document, after.document);
+            assert!(recent_group_html(&html, "lib-rail-recent").contains("snapshot"));
+            assert!(
+                rail_list_html(&html, "lib-rail-list")
+                    .contains("The available queries and views could not be verified.")
+            );
+            assert!(!html.contains("No SQL queries yet") && !html.contains("No SQL views yet"));
+            assert_eq!(
+                source.calls.lock().unwrap().len(),
+                1,
+                "recent, explicit and hint deduplicate"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_prune_and_explicit_record_persist_once_then_noop() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"gone", "recent":[{"id":"gone"}]}),
+        )
+        .await;
+        let source = existence_source(Ok(vec![sql_library("keep", code)]), &[("gone", Ok(false))]);
+        let before = store.get_settings("l2:").await.unwrap().unwrap().version;
+        get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?lib=keep"),
+        )
+        .await;
+        let after = store.get_settings("l2:").await.unwrap().unwrap();
+        assert_eq!(after.version, before + 1, "prune and select need one write");
+        assert_eq!(stored_rail(&after.document, key)["last"], "keep");
+        assert_eq!(
+            stored_rail(&after.document, key)["recent"],
+            json!([{"id":"keep", "name":"keep", "meta":"active"}])
+        );
+        get_ok_html(
+            existence_app(store.clone(), source, "default"),
+            &format!("{path}?lib=keep"),
+        )
+        .await;
+        assert_eq!(
+            store.get_settings("l2:").await.unwrap().unwrap().version,
+            after.version
+        );
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_deleted_hint_cleans_fallback_without_history_and_is_untrusted() {
+    for (code, path, _) in SQL_KINDS {
+        for verdict in [Ok(false), Ok(true), Err("403 forbidden".into())] {
+            let store = Arc::new(InMemorySettingsStore::new());
+            let source = existence_source(
+                Ok(vec![sql_library("gone", code)]),
+                &[("gone", verdict.clone())],
+            );
+            let html = get_ok_html(
+                existence_app(store.clone(), source.clone(), "default"),
+                &format!("{path}?deleted=gone"),
+            )
+            .await;
+            assert_eq!(html.contains("name=\"json\""), verdict != Ok(false));
+            assert_eq!(
+                rail_list_html(&html, "lib-rail-list").contains("data-type=\"gone\""),
+                verdict != Ok(false)
+            );
+            assert!(
+                store.peek("l2:").is_none(),
+                "fallback/prune no history writes nothing"
+            );
+            assert_eq!(source.calls.lock().unwrap().len(), 1);
+            assert!(!html.contains("return_to=%2Fui%2Fsql%2Fqueries%3Fdeleted"));
+            assert!(!html.contains("return_to=%2Fui%2Fsql%2Fviews%3Fdeleted"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_existence_sweep_is_bounded_and_reload_stays_clean() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(&store, key, json!({"last":"r0", "recent":[{"id":"r0"},{"id":"r1"},{"id":"r2"},{"id":"r3"},{"id":"r4"},{"id":"r5"}]})).await;
+        let source = existence_source(
+            Ok(vec![sql_library("explicit", code)]),
+            &[("r0", Ok(false))],
+        );
+        get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?lib=explicit&deleted=hint"),
+        )
+        .await;
+        let calls = source.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 7, "five recents plus explicit and hint");
+        assert!(!calls.iter().any(|(id, _, _)| id == "r5"));
+        source.calls.lock().unwrap().clear();
+        let html = get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            path,
+        )
+        .await;
+        assert!(!recent_group_html(&html, "lib-rail-recent").contains("data-type=\"r0\""));
+        assert!(
+            !source
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _, _)| id == "r0")
+        );
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_verified_filtered_recent_and_new_are_preserved() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"keep", "recent":[{"id":"keep"}]}),
+        )
+        .await;
+        let source = existence_source(Ok(vec![sql_library("keep", code)]), &[]);
+        let before = store.get_settings("l2:").await.unwrap().unwrap().version;
+        let html = get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?filter=unmatched"),
+        )
+        .await;
+        // The filter matches neither the list nor the (snapshot-less) recent:
+        // the group is empty, hence hidden.
+        let group = recent_group_html(&html, "lib-rail-recent");
+        assert!(group[..group.find('>').unwrap()].contains("hidden"));
+        assert!(!group.contains("data-type=\"keep\""));
+        assert!(html.contains("No matches for"));
+        // A matching term keeps the recent.
+        let html = get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?filter=kee"),
+        )
+        .await;
+        assert!(recent_group_html(&html, "lib-rail-recent").contains("data-type=\"keep\""));
+        let html = get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?lib=new"),
+        )
+        .await;
+        assert!(html.contains("name=\"json\""));
+        assert!(
+            !source
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _, _)| id == "new")
+        );
+        assert_eq!(
+            store.get_settings("l2:").await.unwrap().unwrap().version,
+            before
+        );
+    }
+}
+
+async fn inject_rail_user(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(user) = request
+        .headers()
+        .get("x-test-user")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string)
+    {
+        request.extensions_mut().insert(helios_auth::Principal {
+            subject: user,
+            issuer: "test".to_string(),
+            scopes: helios_auth::scope::ScopeSet::empty(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            ..Default::default()
+        });
+    }
+    next.run(request).await
+}
+
+#[tokio::test]
+async fn sql_libraries_pruning_is_scoped_to_user_tenant_and_page() {
+    for (_, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        let rail = json!({"last":"same", "recent":[{"id":"same"}]});
+        let doc = json!({"byTenant": {
+            "default":{"rails":{"sqlQueries":rail.clone(), "sqlViews":rail.clone()}},
+            "acme":{"rails":{"sqlQueries":rail.clone(), "sqlViews":rail.clone()}}
+        }});
+        for user in ["u2:4:test:alice", "u2:4:test:bob"] {
+            store.put_settings(user, doc.clone(), None).await.unwrap();
+        }
+        let source = existence_source(Ok(vec![]), &[("same", Ok(false))]);
+        let app = existence_app(store.clone(), source.clone(), "acme")
+            .layer(axum::middleware::from_fn(inject_rail_user));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("x-test-user", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let mut expected = doc.clone();
+        expected["byTenant"]["acme"]["rails"][key] = json!({"recent":[]});
+        assert_eq!(store.peek("u2:4:test:alice").unwrap(), expected);
+        assert_eq!(store.peek("u2:4:test:bob").unwrap(), doc);
+        assert_eq!(source.calls.lock().unwrap()[0].1, "acme");
+    }
 }

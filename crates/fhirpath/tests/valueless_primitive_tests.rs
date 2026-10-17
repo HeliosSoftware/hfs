@@ -56,6 +56,21 @@ fn valueless_element_is_present_but_has_no_value() {
     );
 }
 
+// tests-fhir-r5.xml `testHasValue2`: only a primitive has a value, so a complex
+// type is never hasValue(), even when it has content.
+#[test]
+fn complex_element_never_has_value() {
+    let ctx = valueless_given_context();
+    assert_eq!(
+        evaluate_expression("Patient.name.first().hasValue()", &ctx).unwrap(),
+        EvaluationResult::boolean(false)
+    );
+    assert_eq!(
+        evaluate_expression("Patient.name.given.last().hasValue()", &ctx).unwrap(),
+        EvaluationResult::boolean(true)
+    );
+}
+
 #[test]
 fn value_consuming_functions_return_empty_for_valueless_element() {
     let ctx = valueless_given_context();

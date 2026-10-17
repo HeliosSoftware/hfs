@@ -27,11 +27,12 @@
 //!   allowlisted concern of `helios_sof::remote_resolver`.
 //! - **Bounded fan-out:** a single evaluation can reference many resources, so the
 //!   reference set is de-duplicated and capped ([`StorageBackedResolver::new`]).
+//!   A batch over the cap fails the run rather than leaving references unresolved.
 //!   Resolution is one level deep — references discovered *inside* fetched
 //!   resources are not chased recursively.
-//! - **Fallback preserved:** a not-found / errored / version-mismatched reference
-//!   simply contributes nothing, leaving the engine's existing typed-stub / empty
-//!   semantics intact.
+//! - **Fallback preserved:** a not-found / version-mismatched reference simply
+//!   contributes nothing, leaving the engine's existing typed-stub / empty
+//!   semantics intact. A storage read that fails twice fails the run instead.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -42,14 +43,16 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::core::ResourceStorage;
+use crate::core::sof_runner::SofError;
 use crate::tenant::TenantContext;
 
 /// Resolves relative `Type/id` references to stored resources, tenant-scoped.
 ///
 /// Implementations MUST scope every read to `tenant` and MUST only return
-/// resources whose FHIR version equals `fhir_version`. Resolution is best-effort:
-/// references that are absent, errored, or version-mismatched are simply omitted
-/// from the result (the caller falls back to the engine's stub/empty semantics).
+/// resources whose FHIR version equals `fhir_version`. References that are absent
+/// or version-mismatched are omitted from the result (the caller falls back to the
+/// engine's stub/empty semantics). A reference that cannot be read at all is an
+/// error, never a silent omission: the view's rows would otherwise be wrong.
 #[async_trait]
 pub trait StorageReferenceResolver: Send + Sync {
     /// Batch-resolves `refs` (each `(resource_type, id)`) for `tenant`, returning
@@ -60,7 +63,7 @@ pub trait StorageReferenceResolver: Send + Sync {
         tenant: &TenantContext,
         fhir_version: FhirVersion,
         refs: &[(String, String)],
-    ) -> Vec<Value>;
+    ) -> Result<Vec<Value>, SofError>;
 }
 
 /// A [`StorageReferenceResolver`] backed by any [`ResourceStorage`] backend.
@@ -75,8 +78,8 @@ impl StorageBackedResolver {
     pub const DEFAULT_MAX_FANOUT: usize = 1000;
 
     /// Creates a resolver that reads from `storage`, resolving at most
-    /// `max_fanout` distinct references per call (excess references are dropped
-    /// with a warning rather than read).
+    /// `max_fanout` distinct references per call. A call with more fails with
+    /// [`SofError::ResolutionLimit`] before any read.
     pub fn new(storage: Arc<dyn ResourceStorage>, max_fanout: usize) -> Self {
         Self {
             storage,
@@ -92,64 +95,60 @@ impl StorageReferenceResolver for StorageBackedResolver {
         tenant: &TenantContext,
         fhir_version: FhirVersion,
         refs: &[(String, String)],
-    ) -> Vec<Value> {
+    ) -> Result<Vec<Value>, SofError> {
         if refs.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-
-        // Group ids by resource type, fairly capping fan-out before any I/O, so
-        // each type is read with a single tenant-scoped `read_batch`.
-        let (ids_by_type, total) = group_and_cap_refs(refs, self.max_fanout);
-        if total > self.max_fanout {
-            warn!(
-                requested = total,
-                cap = self.max_fanout,
-                "storage resolve(): reference fan-out exceeded cap; extra references left unresolved"
-            );
+        if refs.len() > self.max_fanout {
+            return Err(SofError::ResolutionLimit(format!(
+                "a batch of resources references {} distinct resources through resolve(), \
+                 more than the limit of {}; narrow the view with a where filter or a smaller _since window",
+                refs.len(),
+                self.max_fanout
+            )));
         }
 
         let mut out = Vec::new();
-        for (resource_type, ids) in ids_by_type {
-            match self.storage.read_batch(tenant, resource_type, &ids).await {
-                Ok(found) => {
-                    for stored in found {
-                        // Only hand the engine resources of the version it is
-                        // evaluating against; never mix FHIR versions.
-                        if stored.fhir_version() == fhir_version {
-                            out.push(stored.content().clone());
-                        }
-                    }
-                }
-                // Best-effort: a backend error for one type must not fail the whole
-                // evaluation — the affected references fall back to stub/empty.
+        for (resource_type, ids) in group_by_type(refs) {
+            let found = match self.storage.read_batch(tenant, resource_type, &ids).await {
+                Ok(found) => found,
                 Err(e) => {
                     warn!(
                         resource_type,
                         error = %e,
-                        "storage resolve(): batch read failed; references of this type left unresolved"
+                        "storage resolve(): batch read failed; retrying once"
                     );
+                    self.storage
+                        .read_batch(tenant, resource_type, &ids)
+                        .await
+                        .map_err(|e| {
+                            let message = format!(
+                                "could not read {} referenced {resource_type} resources for resolve(): {e}",
+                                ids.len()
+                            );
+                            // Keep a transient failure transient, so the run
+                            // answers 503 rather than 500 (#2048).
+                            match SofError::from_storage(e) {
+                                SofError::Unavailable(_) => SofError::Unavailable(message),
+                                _ => SofError::Storage(message),
+                            }
+                        })?
                 }
-            }
+            };
+            out.extend(
+                found
+                    .into_iter()
+                    .filter(|stored| stored.fhir_version() == fhir_version)
+                    .map(|stored| stored.content().clone()),
+            );
         }
-        out
+        Ok(out)
     }
 }
 
-/// Groups `refs` by resource type, fairly capping the total at `max_fanout`.
-///
-/// `refs` arrives sorted lexicographically by `"Type/id"` (it originates from a
-/// [`BTreeSet`] in [`collect_missing_references`]), so a naive prefix-slice cap
-/// would silently drop every reference of a later-alphabetical resource type
-/// once the budget is hit (e.g. 1000 `Observation`s would crowd out a lone
-/// `Practitioner`). Instead the budget is filled round-robin across types, so
-/// each type keeps a fair share and no type is dropped wholesale.
-///
-/// Returns the grouped (and possibly capped) ids plus the total number of
-/// references seen before capping, so the caller can warn when any were dropped.
-fn group_and_cap_refs(
-    refs: &[(String, String)],
-    max_fanout: usize,
-) -> (BTreeMap<&str, Vec<&str>>, usize) {
+/// Groups `refs` by resource type, so each type is read with a single
+/// tenant-scoped `read_batch`.
+fn group_by_type(refs: &[(String, String)]) -> BTreeMap<&str, Vec<&str>> {
     let mut by_type: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (resource_type, id) in refs {
         by_type
@@ -157,35 +156,7 @@ fn group_and_cap_refs(
             .or_default()
             .push(id.as_str());
     }
-
-    let total = refs.len();
-    if total <= max_fanout {
-        return (by_type, total);
-    }
-
-    // Fill the budget round-robin across types: one id per type per round, in
-    // sorted-type order, until the cap is reached or every type is exhausted.
-    let mut capped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut budget = max_fanout;
-    let mut round = 0;
-    'fill: while budget > 0 {
-        let mut progressed = false;
-        for (resource_type, ids) in &by_type {
-            if let Some(&id) = ids.get(round) {
-                capped.entry(*resource_type).or_default().push(id);
-                progressed = true;
-                budget -= 1;
-                if budget == 0 {
-                    break 'fill;
-                }
-            }
-        }
-        if !progressed {
-            break;
-        }
-        round += 1;
-    }
-    (capped, total)
+    by_type
 }
 
 /// Collects the distinct relative `Type/id` references found anywhere in
@@ -281,6 +252,9 @@ fn parse_relative_type_id(reference: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{BackendError, StorageError, StorageResult};
+    use crate::tenant::{TenantId, TenantPermissions};
+    use crate::types::StoredResource;
     use serde_json::json;
 
     #[test]
@@ -339,54 +313,15 @@ mod tests {
     }
 
     #[test]
-    fn fair_cap_is_noop_under_budget() {
+    fn group_by_type_keeps_every_reference() {
         let refs = vec![
-            ("Patient".to_string(), "1".to_string()),
+            ("Observation".to_string(), "1".to_string()),
             ("Observation".to_string(), "2".to_string()),
+            ("Patient".to_string(), "p".to_string()),
         ];
-        let (grouped, total) = group_and_cap_refs(&refs, 1000);
-        assert_eq!(total, 2);
-        assert_eq!(grouped.get("Patient").map(Vec::len), Some(1));
-        assert_eq!(grouped.get("Observation").map(Vec::len), Some(1));
-    }
-
-    #[test]
-    fn fair_cap_keeps_later_alphabetical_types() {
-        // Regression: a flat prefix-slice cap of the lexicographically-sorted
-        // ref list keeps 1000 `Observation`s and drops the lone `Practitioner`
-        // entirely. The fair round-robin cap must keep the Practitioner.
-        let mut refs: Vec<(String, String)> = (0..1000)
-            .map(|i| ("Observation".to_string(), format!("o{i}")))
-            .collect();
-        refs.push(("Practitioner".to_string(), "p1".to_string()));
-
-        let (capped, total) = group_and_cap_refs(&refs, 1000);
-        assert_eq!(total, 1001);
-        let kept: usize = capped.values().map(Vec::len).sum();
-        assert_eq!(kept, 1000, "must respect the fan-out cap");
-        assert_eq!(
-            capped.get("Practitioner").map(Vec::len),
-            Some(1),
-            "later-alphabetical type must not be dropped wholesale"
-        );
-        assert_eq!(capped.get("Observation").map(Vec::len), Some(999));
-    }
-
-    #[test]
-    fn fair_cap_spreads_budget_across_many_types() {
-        // 10 types, 100 ids each (1000 total), cap 500 → each type keeps 50.
-        let mut refs: Vec<(String, String)> = Vec::new();
-        for t in 0..10 {
-            for i in 0..100 {
-                refs.push((format!("Type{t:02}"), format!("id{i}")));
-            }
-        }
-        let (capped, total) = group_and_cap_refs(&refs, 500);
-        assert_eq!(total, 1000);
-        assert_eq!(capped.len(), 10, "every type must survive the cap");
-        for (ty, ids) in &capped {
-            assert_eq!(ids.len(), 50, "type {ty} should get an even share");
-        }
+        let grouped = group_by_type(&refs);
+        assert_eq!(grouped.get("Observation"), Some(&vec!["1", "2"]));
+        assert_eq!(grouped.get("Patient"), Some(&vec!["p"]));
     }
 
     #[test]
@@ -395,5 +330,125 @@ mod tests {
             parse_relative_type_id("Patient/123/_history/2"),
             Some(("Patient".to_string(), "123".to_string()))
         );
+    }
+
+    /// A storage whose every `read` fails, either transiently (`Unavailable`,
+    /// as an S3 object read does once its retries are spent) or not.
+    struct FailingReads {
+        transient: bool,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for FailingReads {
+        fn backend_name(&self) -> &'static str {
+            "failing-reads"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!()
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Err(StorageError::Backend(if self.transient {
+                BackendError::Unavailable {
+                    backend_name: "s3".to_string(),
+                    message: "failed to read object body after 3 attempts".to_string(),
+                }
+            } else {
+                BackendError::Internal {
+                    backend_name: "s3".to_string(),
+                    message: "boom".to_string(),
+                    source: None,
+                }
+            }))
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            unimplemented!()
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            unimplemented!()
+        }
+    }
+
+    async fn resolve_over_failing_reads(transient: bool) -> SofError {
+        let resolver = StorageBackedResolver::new(Arc::new(FailingReads { transient }), 10);
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        resolver
+            .resolve(
+                &tenant,
+                FhirVersion::default(),
+                &[("Patient".to_string(), "p1".to_string())],
+            )
+            .await
+            .expect_err("the reads fail on both attempts")
+    }
+
+    /// #2048: a referenced-resource read that runs out of attempts on a
+    /// transient failure stays `Unavailable`, so the run answers 503.
+    #[tokio::test]
+    async fn a_resolve_read_that_stays_unavailable_is_unavailable() {
+        match resolve_over_failing_reads(true).await {
+            SofError::Unavailable(message) => {
+                assert!(
+                    message.starts_with(
+                        "could not read 1 referenced Patient resources for resolve(): "
+                    ),
+                    "{message}"
+                );
+                assert!(message.contains("after 3 attempts"), "{message}");
+            }
+            other => panic!("expected SofError::Unavailable, got {other:?}"),
+        }
+    }
+
+    /// Any other read failure is still a storage error (a server fault).
+    #[tokio::test]
+    async fn a_resolve_read_that_fails_internally_stays_a_storage_error() {
+        match resolve_over_failing_reads(false).await {
+            SofError::Storage(message) => assert!(message.contains("boom"), "{message}"),
+            other => panic!("expected SofError::Storage, got {other:?}"),
+        }
     }
 }

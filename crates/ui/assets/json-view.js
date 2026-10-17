@@ -2,6 +2,11 @@
 (function () {
   "use strict";
 
+  // #1771-derived enhancement: this layout body script runs again on boost
+  // and history restore. One delegated handler also serves replaced views.
+  if (document.hfsJsonViewInstalled) return;
+  document.hfsJsonViewInstalled = true;
+
   function opener(view, foldId) {
     var candidates = view.querySelectorAll(".json-line[data-fold-id]");
     for (var i = 0; i < candidates.length; i++) {

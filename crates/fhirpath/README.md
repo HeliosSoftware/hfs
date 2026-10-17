@@ -170,6 +170,41 @@ export FHIRPATH_TERMINOLOGY_TIMEOUT=0
 
 Values that cannot be parsed as a non-negative integer fall back to the 30s default.
 
+Within one evaluation, identical terminology lookups are sent once and then
+answered from a cache. "Identical" means the same operation, server and
+arguments, e.g. the same code checked against the same ValueSet by `memberOf()`.
+Concurrent identical lookups wait for the one already in flight. A lookup that failed
+for a lasting reason (a 4xx answer such as an unknown ValueSet, or a response body
+that is not JSON) is answered from the cache too. A transient failure (a timeout,
+a connection error, or an HTTP 408, 429 or 5xx except 501 answer that outlasts the
+client's own retries of 502/503/504/530) is not kept: callers already waiting on
+that request get the failure, and the next identical lookup sends the request
+again, counting as a new call against the cap below. The cache belongs to the
+`EvaluationContext` (shared with its clones and child contexts, dropped with it).
+A caller that builds several contexts for one request can put them on one session with
+`EvaluationContext::terminology_session()` and `set_terminology_session()`.
+The number of distinct remote calls per session is capped at **1000** by
+default; exceeding the cap fails the evaluation with an error naming
+`FHIRPATH_TERMINOLOGY_MAX_CALLS`:
+
+```bash
+# Allow up to 5000 distinct terminology calls per evaluation
+export FHIRPATH_TERMINOLOGY_MAX_CALLS=5000
+
+# 0 disables the limit
+export FHIRPATH_TERMINOLOGY_MAX_CALLS=0
+```
+
+With the cap disabled (`0`), the session's cache is unbounded for as long as the
+session lives.
+
+Values that cannot be parsed fall back to the default.
+
+Terminology failures are `EvaluationError::TerminologyError` and the cap is
+`EvaluationError::TerminologyCallLimit`. `evaluate_expression_typed` returns them
+typed (`ExpressionError::is_terminology_error()` / `is_terminology_call_limit()`);
+`evaluate_expression` returns the same message text as before.
+
 **Supported %terminologies Functions:**
 ```fhirpath
 # Expand a ValueSet
@@ -559,6 +594,33 @@ The context includes:
 - **Resources**: Available FHIR resources for evaluation
 - **Variables**: Environment variables (including `$this`, `$index`, `$total`)
 - **Configuration**: Strict mode, ordered function checking, etc.
+- **Unresolved-identifier policy**: What to do with a leading identifier that is neither a known type nor an element of the context resource
+
+#### Leading type identifiers
+
+A path such as `Patient.name` starts with a type identifier. The evaluator resolves it as follows:
+
+| Leading identifier | Result |
+|---|---|
+| The context resource's own type (`Patient` on a Patient) | Resolves |
+| An abstract base the resource conforms to (`Resource`, `DomainResource`) | Resolves |
+| A known type that is not the context type (`Patient` on an Observation) | Empty, silently (required for union type-dispatch such as `Patient.name.family \| Observation.code.text`) |
+| Neither a known type nor an element of the context (`Bogus`) | Diagnosed according to the policy |
+
+The diagnosis is controlled by `EvaluationContext::set_unresolved_identifier_policy`:
+
+```rust
+use helios_fhirpath::{EvaluationContext, evaluator::UnresolvedIdentifierPolicy};
+
+let mut context = EvaluationContext::new(fhir_resources);
+context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
+```
+
+- `Ignore`: evaluate to an empty collection, as before.
+- `Warn` (default): evaluate to an empty collection and log a `tracing::warn!`, once per identifier and context type.
+- `Error`: return an `EvaluationError::SemanticError` naming the identifier and the context type.
+
+`fhirpath-cli` and `fhirpath-server` use `Error`, so a typo fails instead of printing an empty result (exit code 1, HTTP 422 with an OperationOutcome). Search-parameter indexing, validator constraints and compartment filtering keep the default `Warn`, because a single malformed expression must not discard the rest of a union.
 - **Variable Scoping**: Parent context support for proper variable scoping in functions like `select()` and `where()`
 
 ### Type System and Namespace Resolution
@@ -783,6 +845,7 @@ The server can be configured via command-line arguments or environment variables
 | `FHIRPATH_DEBUG_TRACE` | — | Enable step-by-step debug trace output | `false` |
 | `FHIRPATH_TERMINOLOGY_SERVER` | `--terminology-server` | Terminology server base URL (required for `%terminologies` and `memberOf`) | none |
 | `FHIRPATH_TERMINOLOGY_TIMEOUT` | — | Terminology request timeout in seconds (`0` disables) | `30` |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | — | Max distinct terminology server calls per evaluation (`0` disables) | `1000` |
 
 #### HTTP Compression
 

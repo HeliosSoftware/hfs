@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "collection-device",
   "meta": {
-    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+    "lastUpdated": "2026-09-14T16:43:45.341+00:00"
   },
   "text": {
     "status": "generated",
@@ -23,7 +23,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/ValueSet/collection-device",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-snapshot1",
   "name": "CollectionDevice",
   "title": "Collection Device",
   "status": "active",

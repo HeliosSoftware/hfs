@@ -26,11 +26,18 @@
 pub mod compile_path;
 pub mod compile_view;
 pub mod compiler;
+pub mod decode;
 pub mod dialect;
 pub mod emit;
 pub mod in_process;
 pub mod ir;
+pub mod normalize_union;
 pub mod reference_resolver;
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
+mod runtime;
+
+#[cfg(all(test, feature = "R4"))]
+mod golden_tests;
 
 #[cfg(feature = "sqlite")]
 pub mod sqlite;

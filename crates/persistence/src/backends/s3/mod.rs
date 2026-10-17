@@ -10,8 +10,11 @@ mod bulk_provider;
 mod bulk_submit;
 mod bundle;
 mod client;
+mod conditional;
 mod config;
+mod get_retry;
 mod keyspace;
+mod login_sessions;
 mod models;
 mod output_store;
 mod storage;
@@ -20,7 +23,8 @@ mod user_settings;
 
 pub use backend::S3Backend;
 pub use client::{AwsS3Client, AwsS3ClientOptions, S3Api};
-pub use config::{S3BackendConfig, S3TenancyMode};
+pub use config::{DEFAULT_SCAN_CONCURRENCY, S3BackendConfig, S3TenancyMode};
+pub use keyspace::KeyspaceLayout;
 pub use output_store::{AccessTokenMode, S3OutputStore};
 
 #[cfg(test)]

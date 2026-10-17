@@ -58,4 +58,12 @@
       <text value="Check for Peanut Allergy"/>
     </concept>
   </reason>
+  <bodyStructure>
+    <concept>
+      <coding>
+        <display value="Right arm"/>
+      </coding>
+      <text value="Right arm"/>
+    </concept>
+  </bodyStructure>
 </ServiceRequest>

@@ -15,7 +15,7 @@
       <SubscriptionStatus>
         <id value="dae6bdbc-71ab-4043-b11e-59b52bda60ad"/>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: SubscriptionStatus dae6bdbc-71ab-4043-b11e-59b52bda60ad</b></p><a name="dae6bdbc-71ab-4043-b11e-59b52bda60ad"> </a><a name="hcdae6bdbc-71ab-4043-b11e-59b52bda60ad"> </a><p><b>status</b>: Active</p><p><b>type</b>: Event Notification</p><p><b>eventsSinceSubscriptionStart</b>: 2</p><blockquote><p><b>notificationEvent</b></p><p><b>eventNumber</b>: 2</p><p><b>focus</b>: <a href="broken-link.html">http://example.org/FHIR/R5/Encounter/2</a></p><p><b>additionalContext</b>: <a href="broken-link.html">http://example.org/FHIR/R5/Patient/ABC</a></p><blockquote><p><b>relatedQuery</b></p><p><b>queryType</b>: [not stated]: </p><p><b>query</b>: Patient?_id=ABC&amp;_include:iterate=Patient:link</p></blockquote><blockquote><p><b>relatedQuery</b></p><p><b>queryType</b>: [not stated]: </p><p><b>query</b>: Patient/ABC$current-providers</p></blockquote></blockquote><p><b>subscription</b>: <a href="broken-link.html">http://example.org/FHIR/R5/Subscription/123</a></p><p><b>topic</b>: <a href="broken-link.html">http://example.org/FHIR/R5/SubscriptionTopic/admission</a></p></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: SubscriptionStatus dae6bdbc-71ab-4043-b11e-59b52bda60ad</b></p><a name="dae6bdbc-71ab-4043-b11e-59b52bda60ad"> </a><a name="hcdae6bdbc-71ab-4043-b11e-59b52bda60ad"> </a><p><b>status</b>: Active</p><p><b>type</b>: Event Notification</p><p><b>eventsSinceSubscriptionStart</b>: 2</p><blockquote><p><b>notificationEvent</b></p><p><b>eventNumber</b>: 2</p><p><b>focus</b>: <a href="broken-link.html">http://example.org/FHIR/R5/Encounter/2</a></p><p><b>additionalContext</b>: <a href="broken-link.html">http://example.org/FHIR/R5/Patient/ABC</a></p><blockquote><p><b>relatedQuery</b></p><p><b>queryType</b>: CodeSystem-patient-queries: current-patient (current-patient)</p><p><b>query</b>: Patient?_id=ABC&amp;_include:iterate=Patient:link</p></blockquote><blockquote><p><b>relatedQuery</b></p><p><b>queryType</b>: CodeSystem-patient-queries: current-providers (current-providers)</p><p><b>query</b>: Patient/ABC$current-providers</p></blockquote></blockquote><p><b>subscription</b>: <a href="broken-link.html">http://example.org/FHIR/R5/Subscription/123</a></p><p><b>topic</b>: <a href="broken-link.html">http://example.org/FHIR/R5/SubscriptionTopic/admission</a></p></div>
         </text>
         <status value="active"/>
         <type value="event-notification"/>
@@ -29,11 +29,17 @@
             <reference value="http://example.org/FHIR/R5/Patient/ABC"/>
           </additionalContext>
           <relatedQuery>
-            <queryType/>
+            <queryType>
+              <system value="http://example.org/fhir/CodeSystem-patient-queries"/>
+              <code value="current-patient"/>
+            </queryType>
             <query value="Patient?_id=ABC&amp;_include:iterate=Patient:link"/>
           </relatedQuery>
           <relatedQuery>
-            <queryType/>
+            <queryType>
+              <system value="http://example.org/fhir/CodeSystem-patient-queries"/>
+              <code value="current-providers"/>
+            </queryType>
             <query value="Patient/ABC$current-providers"/>
           </relatedQuery>
         </notificationEvent>

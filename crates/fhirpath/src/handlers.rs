@@ -48,8 +48,14 @@ pub async fn evaluate_fhirpath(
     let fhir_version = detect_fhir_version(&resource_json);
     let fhir_resource = parse_fhir_resource(resource_json.clone(), fhir_version)?;
 
+    // A declared contextType is checked statically before any evaluation
+    if let Some(error) = check_context_type(&expression, &extracted, fhir_version) {
+        return create_error_response(&expression, &extracted, error);
+    }
+
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
 
     // Set variables
     for var in &extracted.variables {
@@ -63,12 +69,7 @@ pub async fn evaluate_fhirpath(
 
     // Generate parse debug information if needed
     let (parse_debug_tree, parse_debug, expected_return_type) = if extracted.validate {
-        use chumsky::Parser as ChumskyParser;
-
-        match crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        match crate::parse_expression_spanned(expression.as_str()) {
             Ok(spanned) => {
                 // Create a type context with the resource type and FHIR version
                 let mut type_context = TypeContext::new().with_version(fhir_version);
@@ -121,17 +122,12 @@ pub async fn evaluate_fhirpath(
         .unwrap_or(false);
 
     // Set up debug tracer if enabled
-    if debug_trace_enabled {
-        use chumsky::Parser as ChumskyParser;
-        if let Ok(spanned) = crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
-            let parsed = spanned.to_expression();
-            let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
-            let tracer = crate::debug_trace::DebugTracer::new(span_map);
-            context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
-        }
+    if debug_trace_enabled && let Ok(spanned) = crate::parse_expression_spanned(expression.as_str())
+    {
+        let parsed = spanned.to_expression();
+        let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
+        let tracer = crate::debug_trace::DebugTracer::new(span_map);
+        context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
     }
 
     // Prepare results collection
@@ -151,11 +147,7 @@ pub async fn evaluate_fhirpath(
         };
 
         // Parse the main expression once
-        use chumsky::Parser as ChumskyParser;
-        let parsed_expr = match crate::parser::parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        let parsed_expr = match crate::parse_expression(expression.as_str()) {
             Ok(parsed) => parsed,
             Err(e) => {
                 return create_error_response(
@@ -263,8 +255,14 @@ async fn evaluate_fhirpath_with_version(
     let fhir_resource = parse_fhir_resource(resource_json.clone(), version)?;
     let fhir_version = version;
 
+    // A declared contextType is checked statically before any evaluation
+    if let Some(error) = check_context_type(&expression, &extracted, fhir_version) {
+        return create_error_response(&expression, &extracted, error);
+    }
+
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
 
     // Preserve underscore properties in context
     preserve_underscore_properties(&mut context, &resource_json);
@@ -281,12 +279,7 @@ async fn evaluate_fhirpath_with_version(
 
     // Generate parse debug information if needed
     let (parse_debug_tree, parse_debug, expected_return_type) = if extracted.validate {
-        use chumsky::Parser as ChumskyParser;
-
-        match crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        match crate::parse_expression_spanned(expression.as_str()) {
             Ok(spanned) => {
                 // Create a type context with the resource type and FHIR version
                 let mut type_context = TypeContext::new().with_version(fhir_version);
@@ -339,17 +332,12 @@ async fn evaluate_fhirpath_with_version(
         .unwrap_or(false);
 
     // Set up debug tracer if enabled
-    if debug_trace_enabled {
-        use chumsky::Parser as ChumskyParser;
-        if let Ok(spanned) = crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
-            let parsed = spanned.to_expression();
-            let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
-            let tracer = crate::debug_trace::DebugTracer::new(span_map);
-            context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
-        }
+    if debug_trace_enabled && let Ok(spanned) = crate::parse_expression_spanned(expression.as_str())
+    {
+        let parsed = spanned.to_expression();
+        let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
+        let tracer = crate::debug_trace::DebugTracer::new(span_map);
+        context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
     }
 
     // Prepare results collection
@@ -369,11 +357,7 @@ async fn evaluate_fhirpath_with_version(
         };
 
         // Parse the main expression once
-        use chumsky::Parser as ChumskyParser;
-        let parsed_expr = match crate::parser::parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        let parsed_expr = match crate::parse_expression(expression.as_str()) {
             Ok(parsed) => parsed,
             Err(e) => {
                 return create_error_response(
@@ -991,6 +975,23 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
     }
 }
 
+/// Statically checks `expression` against the request's `contextType`, if one
+/// was sent, returning the semantic error to report.
+///
+/// A parse error is not reported here: the normal evaluation path reports it.
+fn check_context_type(
+    expression: &str,
+    extracted: &ExtractedParameters,
+    fhir_version: FhirVersion,
+) -> Option<String> {
+    let context_type = extracted.context_type.as_deref()?;
+    let parsed = crate::parse_expression(expression).ok()?;
+    let focus_types = crate::semantic_check::parse_context_type(context_type);
+    crate::semantic_check::check_semantics(&parsed, &focus_types, fhir_version)
+        .err()
+        .map(|e| format!("Semantic error: {e}"))
+}
+
 /// Create error response
 fn create_error_response(
     expression: &str,
@@ -1296,6 +1297,7 @@ mod tests {
         let params = ExtractedParameters {
             expression: Some("Patient.name".to_string()),
             context: None,
+            context_type: None,
             resource: Some(json!({"resourceType": "Patient"})),
             variables: vec![],
             validate: false,
@@ -1339,6 +1341,7 @@ mod tests {
         let params = ExtractedParameters {
             expression: Some("Patient.name".to_string()),
             context: None,
+            context_type: None,
             resource: Some(json!({"resourceType": "Patient"})),
             variables: vec![],
             validate: false,

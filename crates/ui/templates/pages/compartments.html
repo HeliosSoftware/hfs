@@ -7,7 +7,7 @@
   <h1 class="page-head__title">{{ i18n.t("cmp-heading") }}</h1>
   <p class="page-head__lede">{{ i18n.t("cmp-lede") }}</p>
   <div class="page-head__actions">
-    <a class="btn btn--primary" href="/ui/editor?type=CompartmentDefinition">{{ i18n.t("cmp-new") }}</a>
+    <a class="btn btn--primary" href="{{ self.editor_href("") }}" data-editor-link>{{ i18n.t("cmp-new") }}</a>
   </div>
   {% if view.versions.len() > 1 %}
   <nav class="version-switch" aria-label="{{ i18n.t("sp-version-label") }}">
@@ -25,7 +25,7 @@
       {% for item in view.rail %}
       <a class="filter-rail__item" href="{{ item.href }}"{% if item.current %} aria-current="true"{% endif %}>
         <span>{{ item.code }}</span>
-        <span class="count">{{ item.members }} / {{ item.total }}</span>
+        <span class="count">{{ i18n.num(item.members) }} / {{ i18n.num(item.total) }}</span>
       </a>
       {% endfor %}
     </div>
@@ -69,8 +69,8 @@
       </div>
       {% if !view.def.id.is_empty() %}
       <div class="detail__actions">
-        <a class="btn" href="/ui/editor?type=CompartmentDefinition&id={{ view.def.id }}">{{ i18n.t("cmp-edit") }}</a>
-        <button type="button" class="btn btn--danger" data-crud-delete
+        <a class="btn" href="{{ self.editor_href(view.def.id) }}" data-editor-link>{{ i18n.t("cmp-edit") }}</a>
+        <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
                 data-type="CompartmentDefinition" data-id="{{ view.def.id }}"
                 data-confirm="{{ i18n.t("cmp-delete-confirm") }}"
                 data-failed="{{ i18n.t("crud-delete-failed") }}"
@@ -89,7 +89,7 @@
             {% else if f.key == "all" %}{{ i18n.t("cmp-filter-all") }}
             {% else %}{{ i18n.t("cmp-filter-excluded") }}{% endif %}
           </span>
-          <span class="count">{{ f.count }}</span>
+          <span class="count">{{ i18n.num(f.count) }}</span>
         </a>
         {% endfor %}
       </div>

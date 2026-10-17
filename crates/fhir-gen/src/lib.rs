@@ -605,7 +605,74 @@ fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
 fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     let file = File::open(path).map_err(serde_json::Error::io)?;
     let reader = BufReader::new(file);
-    serde_json::from_reader(reader)
+    let mut bundle: Bundle = serde_json::from_reader(reader)?;
+    if let Some(entries) = bundle.entry.as_mut() {
+        for entry in entries {
+            if let Some(Resource::StructureDefinition(def)) = entry.resource.as_mut() {
+                add_resource_definition_element(def);
+            }
+        }
+    }
+    Ok(bundle)
+}
+
+/// Marks a StructureDefinition as defining an *additional resource*: a resource
+/// type defined outside the core specification (e.g. SQL on FHIR's
+/// ViewDefinition).
+const ADDITIONAL_RESOURCE_EXTENSION: &str =
+    "http://hl7.org/fhir/tools/StructureDefinition/additional-resource";
+
+/// Gives an additional resource its `resourceDefinition` element.
+///
+/// Every instance of an additional resource carries a `resourceDefinition`
+/// property — the versioned canonical of the StructureDefinition that defines
+/// it — next to `resourceType`. The property belongs to the additional-resource
+/// mechanism rather than to the resource, so no snapshot lists it; without it
+/// the generated struct drops the value on a typed round trip. The element is
+/// added here, once, so that everything derived from the snapshot (the struct,
+/// the field type lookup, the documentation) sees it.
+fn add_resource_definition_element(def: &mut StructureDefinition) {
+    let is_additional_resource = def
+        .extension
+        .as_ref()
+        .is_some_and(|exts| exts.iter().any(|e| e.url == ADDITIONAL_RESOURCE_EXTENSION));
+    if !is_additional_resource {
+        return;
+    }
+    let path = format!("{}.resourceDefinition", def.name);
+    let Some(elements) = def.snapshot.as_mut().and_then(|s| s.element.as_mut()) else {
+        return;
+    };
+    if elements.iter().any(|e| e.path == path) {
+        return;
+    }
+    // Directly after the root element, so that it serializes where instances
+    // carry it: right after `resourceType`, ahead of `id`.
+    let position = elements
+        .iter()
+        .position(|e| e.path == def.name)
+        .map_or(0, |root| root + 1);
+    elements.insert(
+        position,
+        ElementDefinition {
+            id: Some(path.clone()),
+            path,
+            short: Some("Canonical of the definition of this additional resource".to_string()),
+            definition: Some(
+                "The versioned canonical URL of the StructureDefinition that defines this \
+                 resource type. Instances of an additional resource - a resource type \
+                 defined outside the core FHIR specification - carry it alongside \
+                 resourceType."
+                    .to_string(),
+            ),
+            min: Some(0),
+            max: Some("1".to_string()),
+            r#type: Some(vec![initial_fhir_model::ElementDefinitionType::new(
+                "canonical".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
 }
 
 /// Determines if a StructureDefinition should be included in code generation.
@@ -3335,6 +3402,54 @@ mod tests {
     use super::*;
     use initial_fhir_model::Resource;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_additional_resource_gets_resource_definition_element() {
+        let definition = |additional: bool| -> StructureDefinition {
+            let extension = if additional {
+                serde_json::json!([{ "url": ADDITIONAL_RESOURCE_EXTENSION, "valueBoolean": true }])
+            } else {
+                serde_json::json!([])
+            };
+            serde_json::from_value(serde_json::json!({
+                "resourceType": "StructureDefinition",
+                "extension": extension,
+                "url": "http://hl7.org/fhir/StructureDefinition/ViewDefinition",
+                "name": "ViewDefinition",
+                "status": "draft",
+                "kind": "resource",
+                "abstract": false,
+                "type": "ViewDefinition",
+                "snapshot": { "element": [
+                    { "id": "ViewDefinition", "path": "ViewDefinition" },
+                    { "id": "ViewDefinition.id", "path": "ViewDefinition.id" }
+                ]}
+            }))
+            .expect("Failed to build StructureDefinition")
+        };
+        let paths = |def: &StructureDefinition| -> Vec<String> {
+            let elements = def.snapshot.as_ref().unwrap().element.as_ref().unwrap();
+            elements.iter().map(|e| e.path.clone()).collect()
+        };
+
+        // Added directly after the root element, exactly once
+        let mut def = definition(true);
+        add_resource_definition_element(&mut def);
+        add_resource_definition_element(&mut def);
+        assert_eq!(
+            paths(&def),
+            [
+                "ViewDefinition",
+                "ViewDefinition.resourceDefinition",
+                "ViewDefinition.id"
+            ]
+        );
+
+        // Core resources are left alone
+        let mut def = definition(false);
+        add_resource_definition_element(&mut def);
+        assert_eq!(paths(&def), ["ViewDefinition", "ViewDefinition.id"]);
+    }
 
     #[test]
     fn test_process_fhir_version() {

@@ -12,7 +12,9 @@
   </extension>
   <type value="contraindication"/>
   <subject>
-    <reference/>
+    <reference>
+      <reference value="MedicinalProductDefinition/example"/>
+    </reference>
   </subject>
   <!-- example product is contraindicated with Hepatic disease -->
   <contraindication>

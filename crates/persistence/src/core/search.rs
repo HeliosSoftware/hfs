@@ -5,7 +5,6 @@
 //! - [`MultiTypeSearchProvider`] - Search across multiple resource types
 //! - [`IncludeProvider`] - Support for _include
 //! - [`RevincludeProvider`] - Support for _revinclude
-//! - [`ChainedSearchProvider`] - Chained parameters and _has
 //! - [`TerminologySearchProvider`] - :above, :below, :in, :not-in
 //! - [`TextSearchProvider`] - Full-text search (_text, _content, :text)
 
@@ -13,17 +12,80 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 
 use crate::error::StorageResult;
 use crate::search::{IndexValue, SearchParameterExtractor, SearchParameterRegistry};
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, IncludeType, Page, ReverseChainedParameter, SearchBundle, SearchParamType,
-    SearchParameter, SearchQuery, SearchValue, StoredResource,
+    IncludeDirective, IncludeType, Page, SearchBundle, SearchParamType, SearchParameter,
+    SearchQuery, SearchValue, StoredResource,
 };
 
 use super::storage::ResourceStorage;
+
+/// Reserved `id` of the synthetic `OperationOutcome` marker appended to
+/// `included` when include/revinclude resolution was truncated by a
+/// resource-count cap, so a Bundle stays bounded instead of unbounded (#1061).
+///
+/// The marker travels inside `Vec<StoredResource>` — the same channel
+/// `resolve_includes`/`resolve_revincludes` already return — rather than as a
+/// new `SearchResult` field, so it reaches every call site (including the
+/// duplicated include-resolution block backends may carry for a sorted search
+/// path) with no signature changes. Detected via [`is_include_truncation_marker`].
+pub const INCLUDE_TRUNCATION_OUTCOME_ID: &str = "hfs-include-truncated";
+
+/// Builds the synthetic truncation-marker resource described on
+/// [`INCLUDE_TRUNCATION_OUTCOME_ID`].
+///
+/// `directive_label` should name the directive that was truncated (e.g.
+/// `"_revinclude=Observation:subject"`) so the diagnostics text is
+/// actionable; `limit` is the resource-count cap that was hit.
+///
+/// `remedy` names what the operator can actually do about it, and is supplied
+/// by the caller because the cap has more than one source: a backend's own
+/// configurable limit, or the fixed [`MAX_ITERATE_INCLUDED`] bound on the
+/// `:iterate` continuation, which applies to every backend. Naming one
+/// backend's environment variable here would misdirect callers of the other
+/// path.
+pub fn include_truncation_outcome(
+    tenant: &TenantContext,
+    fhir_version: FhirVersion,
+    limit: usize,
+    directive_label: &str,
+    remedy: &str,
+) -> StoredResource {
+    let now = chrono::Utc::now();
+    let content = serde_json::json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "warning",
+            "code": "incomplete",
+            "diagnostics": format!(
+                "included resources for '{directive_label}' were truncated at {limit} \
+                 resources; {remedy}"
+            ),
+        }]
+    });
+    StoredResource::from_storage(
+        "OperationOutcome".to_string(),
+        INCLUDE_TRUNCATION_OUTCOME_ID.to_string(),
+        "1".to_string(),
+        tenant.tenant_id().clone(),
+        content,
+        now,
+        now,
+        None,
+        fhir_version,
+    )
+}
+
+/// True when `resource` is the synthetic truncation marker built by
+/// [`include_truncation_outcome`] rather than a genuine included resource.
+pub fn is_include_truncation_marker(resource: &StoredResource) -> bool {
+    resource.resource_type() == "OperationOutcome" && resource.id() == INCLUDE_TRUNCATION_OUTCOME_ID
+}
 
 /// Result of a search operation.
 #[derive(Debug, Clone)]
@@ -108,9 +170,21 @@ impl SearchResult {
     /// clone of every matched resource's JSON, and a handler that is about to
     /// drop the `SearchResult` has no use for it.
     pub fn to_bundle(&self, base_url: &str, self_link: &str) -> SearchBundle {
+        self.to_bundle_with_page_size(base_url, self_link, None)
+    }
+
+    /// [`Self::to_bundle`] for a caller that knows the page size the search
+    /// ran with. Offset-paged `previous` links step back by it; without it they
+    /// use the request's `_count`, and are left out when that is absent too.
+    pub fn to_bundle_with_page_size(
+        &self,
+        base_url: &str,
+        self_link: &str,
+        page_size: Option<usize>,
+    ) -> SearchBundle {
         use crate::types::BundleEntry;
 
-        let mut bundle = self.bundle_shell(self_link);
+        let mut bundle = self.bundle_shell(self_link, page_size);
 
         for resource in &self.resources.items {
             let url = resource.url();
@@ -125,10 +199,19 @@ impl SearchResult {
         }
 
         for resource in &self.included {
-            bundle = bundle.with_entry(BundleEntry::include_entry(
-                format!("{}/{}", base_url, resource.url()),
-                resource.content_with_meta(),
-            ));
+            bundle = bundle.with_entry(if is_include_truncation_marker(resource) {
+                // Defensive fallback for callers that build a bundle straight
+                // from `included` without draining truncation markers first
+                // (the REST search handler does drain them, routing the
+                // diagnostics through its own post-subsetting warning path
+                // instead — see `execute_search_bundle`).
+                BundleEntry::outcome_entry(resource.content().clone())
+            } else {
+                BundleEntry::include_entry(
+                    format!("{}/{}", base_url, resource.url()),
+                    resource.content_with_meta(),
+                )
+            });
         }
 
         bundle
@@ -143,9 +226,20 @@ impl SearchResult {
     /// and it bought nothing: every request handler drops the `SearchResult`
     /// immediately afterwards.
     pub fn into_bundle(self, base_url: &str, self_link: &str) -> SearchBundle {
+        self.into_bundle_with_page_size(base_url, self_link, None)
+    }
+
+    /// [`Self::into_bundle`] with the page size the search ran with; see
+    /// [`Self::to_bundle_with_page_size`].
+    pub fn into_bundle_with_page_size(
+        self,
+        base_url: &str,
+        self_link: &str,
+        page_size: Option<usize>,
+    ) -> SearchBundle {
         use crate::types::BundleEntry;
 
-        let mut bundle = self.bundle_shell(self_link);
+        let mut bundle = self.bundle_shell(self_link, page_size);
 
         let SearchResult {
             resources,
@@ -167,6 +261,11 @@ impl SearchResult {
         }
 
         for resource in included {
+            if is_include_truncation_marker(&resource) {
+                // See the matching comment in `to_bundle`.
+                bundle = bundle.with_entry(BundleEntry::outcome_entry(resource.into_content()));
+                continue;
+            }
             let url = resource.url();
             bundle = bundle.with_entry(BundleEntry::include_entry(
                 format!("{}/{}", base_url, url),
@@ -178,9 +277,9 @@ impl SearchResult {
     }
 
     /// Builds the bundle envelope — `total` and the `self` / `next` /
-    /// `previous` / `first` links — shared by [`Self::to_bundle`] and
-    /// [`Self::into_bundle`].
-    fn bundle_shell(&self, self_link: &str) -> SearchBundle {
+    /// `previous` / `first` links — shared by [`Self::to_bundle_with_page_size`]
+    /// and [`Self::into_bundle_with_page_size`].
+    fn bundle_shell(&self, self_link: &str, page_size: Option<usize>) -> SearchBundle {
         let mut bundle = SearchBundle::new().with_self_link(self_link);
 
         if let Some(total) = self.total {
@@ -199,12 +298,46 @@ impl SearchResult {
             bundle = bundle.with_previous_link(replace_cursor_param(self_link, cursor));
         }
 
+        let page_info = &self.resources.page_info;
+        let page_size = page_size.map(|size| size as u64).or_else(|| {
+            query_param(self_link, "_count").and_then(|value| value.parse::<u64>().ok())
+        });
+        // A cursor request remains cursor-paged even if its final page has no
+        // outgoing cursor. Only offset-paged results need this fallback.
+        let offset_paged = page_info.next_cursor.is_none()
+            && page_info.previous_cursor.is_none()
+            && query_param(self_link, "_cursor").is_none()
+            && page_size != Some(0);
+        if offset_paged {
+            let offset = query_param(self_link, "_offset")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            if page_info.has_next {
+                let next_offset = offset.saturating_add(self.resources.items.len() as u64);
+                // Empty pages and saturated offsets cannot advance the search.
+                if next_offset > offset {
+                    bundle = bundle.with_next_link(replace_offset_param(self_link, next_offset));
+                }
+            }
+            // A short final page still goes back by the page size the search
+            // ran with, not by the number of matches remaining on that page.
+            if page_info.has_previous
+                && let Some(page_size) = page_size
+            {
+                bundle = bundle.with_previous_link(replace_offset_param(
+                    self_link,
+                    offset.saturating_sub(page_size),
+                ));
+            }
+        }
+
         // First-page link: the self URL with paging params (`_cursor` / `_offset`)
         // stripped. Emitted only for multi-page results (when a next/previous page
         // exists). A `last` link is intentionally not emitted: under keyset
         // (cursor) paging the final page is not cheaply computable.
-        if self.resources.page_info.next_cursor.is_some()
-            || self.resources.page_info.previous_cursor.is_some()
+        if page_info.next_cursor.is_some()
+            || page_info.previous_cursor.is_some()
+            || (offset_paged && (page_info.has_next || page_info.has_previous))
         {
             bundle = bundle.with_link("first", strip_paging_params(self_link));
         }
@@ -213,24 +346,19 @@ impl SearchResult {
     }
 }
 
-/// Returns `url` with any existing `_cursor=…` query parameter replaced by the
-/// supplied opaque `cursor` value. Used to build pagination links from the
-/// request's self URL.
-///
-/// Cursors are base64-url-safe so they don't need percent-encoding; the only
-/// surgery required is splitting on the first `?`, dropping any pre-existing
-/// `_cursor` pair, and re-joining with `&`. This is what makes the difference
-/// between
-///
-/// ```text
-/// .../Patient?_count=3&_elements=id?_cursor=…   // wrong: literal `?` mid-query
-/// ```
-///
-/// and the spec-compliant
-///
-/// ```text
-/// .../Patient?_count=3&_elements=id&_cursor=…
-/// ```
+/// Reads the last occurrence, matching the REST search parameter extractor.
+fn query_param<'a>(url: &'a str, name: &str) -> Option<std::borrow::Cow<'a, str>> {
+    form_urlencoded::parse(url.split_once('?')?.1.as_bytes())
+        .filter_map(|(key, value)| (key == name).then_some(value))
+        .last()
+}
+
+fn replace_offset_param(url: &str, offset: u64) -> String {
+    let base = strip_paging_params(url);
+    let sep = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{sep}_offset={offset}")
+}
+
 /// Returns `url` with any `_cursor=…` and `_offset=…` query parameters removed,
 /// yielding the first-page URL for a paginated search.
 fn strip_paging_params(url: &str) -> String {
@@ -241,7 +369,11 @@ fn strip_paging_params(url: &str) -> String {
 
     let parts: Vec<String> = query
         .split('&')
-        .filter(|p| !p.is_empty() && !p.starts_with("_cursor=") && !p.starts_with("_offset="))
+        .filter(|part| {
+            !part.is_empty()
+                && !form_urlencoded::parse(part.as_bytes())
+                    .any(|(key, _)| key == "_cursor" || key == "_offset")
+        })
         .map(str::to_string)
         .collect();
 
@@ -252,20 +384,35 @@ fn strip_paging_params(url: &str) -> String {
     }
 }
 
+/// Returns `url` with any existing `_cursor=…` and `_offset=…` query parameters
+/// removed and the supplied opaque `cursor` value appended as `_cursor=…`. Used
+/// to build `next`/`previous` pagination links from the request's self URL.
+///
+/// `_offset` and `_cursor` are mutually exclusive pagination modes: a link that
+/// carries both is misleading (backends give the cursor precedence, but a
+/// backend that honoured `_offset` too would skip rows), so any inherited
+/// `_offset` is dropped before the new cursor is added. This reuses
+/// [`strip_paging_params`] to keep the two functions' notion of "paging
+/// parameters" in sync.
+///
+/// Cursors are base64-url-safe so they don't need percent-encoding; the only
+/// surgery required is stripping the old paging parameters and re-joining with
+/// `&` (or `?` if the base URL has no remaining query parameters). This is
+/// what makes the difference between
+///
+/// ```text
+/// .../Patient?_count=3&_elements=id?_cursor=…   // wrong: literal `?` mid-query
+/// ```
+///
+/// and the spec-compliant
+///
+/// ```text
+/// .../Patient?_count=3&_elements=id&_cursor=…
+/// ```
 fn replace_cursor_param(url: &str, cursor: &str) -> String {
-    let (base, query) = match url.find('?') {
-        Some(pos) => (&url[..pos], &url[pos + 1..]),
-        None => (url, ""),
-    };
-
-    let mut parts: Vec<String> = query
-        .split('&')
-        .filter(|p| !p.is_empty() && !p.starts_with("_cursor="))
-        .map(str::to_string)
-        .collect();
-    parts.push(format!("_cursor={}", cursor));
-
-    format!("{}?{}", base, parts.join("&"))
+    let base = strip_paging_params(url);
+    let sep = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{sep}_cursor={cursor}")
 }
 
 /// Basic search provider for single resource type queries.
@@ -306,6 +453,14 @@ fn replace_cursor_param(url: &str, cursor: &str) -> String {
 /// ```
 #[async_trait]
 pub trait SearchProvider: ResourceStorage {
+    /// Whether both `search` and `search_count` evaluate this query's reverse
+    /// chains natively. The shared resolver retains eligible queries unchanged;
+    /// all other queries continue through backend-independent resolution.
+    fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
+        let _ = (tenant, query);
+        false
+    }
+
     /// Searches for resources matching the query.
     ///
     /// # Arguments
@@ -328,6 +483,43 @@ pub trait SearchProvider: ResourceStorage {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult>;
 
+    /// Returns one page of logical ids in `query.resource_type` for internal
+    /// chain resolution. The page retains the same cursor as `search`.
+    /// Backends may avoid loading resource bodies; the default keeps existing
+    /// search behavior for providers without an id-only query path.
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        Ok(self
+            .search(tenant, query)
+            .await?
+            .resources
+            .map(|resource| resource.id().to_string()))
+    }
+
+    /// The indexed values of the reference parameter `reference_param` on
+    /// every current resource matching `query`, in one pass and without
+    /// paging (#1930). Each value is the reference exactly as the search
+    /// index stores it, which is what the chain resolver would extract from
+    /// the resource itself. `None` means the provider has no such path for
+    /// this query; the resolver then drains the matches page by page and
+    /// extracts the references itself.
+    ///
+    /// Implemented by SQLite (from the reference index) and Elasticsearch
+    /// (a partitioned `terms` aggregation over `search_params.reference`);
+    /// `CompositeStorage` forwards it to its search provider.
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        let _ = (tenant, query, reference_param);
+        Ok(None)
+    }
+
     /// Counts resources matching the query without returning them.
     ///
     /// This is more efficient than search when you only need the count.
@@ -346,6 +538,9 @@ pub trait SearchProvider: ResourceStorage {
     ///
     /// Returns an owned `Arc` (cloned from the per-tenant cache); bind it to a
     /// local before `.read()`.
+    /// PostgreSQL guarded writes and reindex use the persisted SearchParameter
+    /// overlay under the tenant write gate. Mutating this cached registry
+    /// directly does not change their authoritative indexing definitions.
     fn search_param_registry(&self, tenant: &TenantContext)
     -> Arc<RwLock<SearchParameterRegistry>>;
 
@@ -370,12 +565,45 @@ pub trait SearchProvider: ResourceStorage {
         let _ = param_type;
         Vec::new()
     }
+
+    /// Makes every write this storage acknowledged before the call visible
+    /// to a subsequent [`search`](Self::search) of the given resource types.
+    ///
+    /// A search normally reads whatever the index holds *now*; for most
+    /// callers that is the right trade. A caller that resolves a write
+    /// against existing content — a transaction's conditional reference
+    /// (`Organization?identifier=…`), an `If-None-Exist` create — needs the
+    /// index to reflect the writes the server already returned `201` for,
+    /// or it rejects a legitimate request with a misleading "matches no
+    /// existing resource" (#1047). Such a caller invokes this first.
+    ///
+    /// Backends whose index is written in the same transaction as the
+    /// resource (SQLite, PostgreSQL, MongoDB) are consistent by construction
+    /// and keep the default no-op. Elasticsearch refreshes the named indices
+    /// so documents it has acknowledged become searchable without waiting for
+    /// the refresh interval. A composite first drains its asynchronous sync
+    /// queue up to this point, then delegates to its search backend.
+    ///
+    /// The cost is paid only by callers that ask for it, and only for the
+    /// types they name; plain searches are untouched.
+    async fn ensure_writes_visible(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<()> {
+        let _ = (tenant, resource_types);
+        Ok(())
+    }
 }
 
 /// Search provider that supports searching across multiple resource types.
 ///
 /// This extends [`SearchProvider`] to support system-level search:
 /// `GET [base]?[parameters]`
+///
+/// Nothing calls this over HTTP yet: `helios-rest` does not route system-level
+/// search and refuses it with `501` (#1338). Only the SQLite and PostgreSQL
+/// backends implement the trait.
 #[async_trait]
 pub trait MultiTypeSearchProvider: SearchProvider {
     /// Searches across multiple resource types.
@@ -453,22 +681,90 @@ const MAX_INCLUDE_ITERATE_DEPTH: usize = 5;
 /// avoid the default page size silently truncating included resources.
 const INCLUDE_FETCH_LIMIT: u32 = 10_000;
 
+/// Upper bound on the number of resources [`resolve_includes_iterate_continuation`]
+/// will add, so a continuation hop over a large reverse set stays bounded the
+/// same way the MongoDB backend's own cap bounds its first hop (#1061/#1063).
+/// [`resolve_includes_iterative`]'s full pass keeps today's unbounded budget —
+/// SQLite/Postgres behaviour is unchanged by this constant.
+pub const MAX_ITERATE_INCLUDED: usize = 1000;
+
 /// Resolves `_include`/`_revinclude` directives for a set of primary matches,
 /// following `:iterate` directives transitively until no new resources are
 /// found (bounded by [`MAX_INCLUDE_ITERATE_DEPTH`]). Included resources are
 /// deduplicated by `type/id` and never include a primary match.
 ///
-/// This is the single, backend-agnostic include-resolution path used by the
-/// REST layer for backends whose `search()` does not resolve includes inline
-/// (SQLite, Postgres). References are extracted via the search-parameter
-/// registry's FHIRPath expression — so parameters whose name differs from the
-/// JSON field (e.g. Patient `organization` → `managingOrganization`) resolve
-/// correctly — and the referenced resources are fetched with `search()`.
+/// This is the single, backend-agnostic include-resolution path: every
+/// backend's `IncludeProvider` implementation delegates here. SQLite,
+/// Postgres and Elasticsearch call it directly from the REST layer, since
+/// their `search()` does not resolve includes inline. MongoDB calls it inline
+/// from within its own `search()` for hop 1 only (see
+/// [`resolve_includes_iterate_continuation`] for how the REST layer finishes
+/// any remaining `:iterate` hops in that case). References are extracted via
+/// the search-parameter registry's FHIRPath expression — so parameters whose
+/// name differs from the JSON field (e.g. Patient `organization` →
+/// `managingOrganization`) resolve correctly — and the referenced resources
+/// are fetched with `search()`. Only references the extractor has already
+/// resolved to a `resource_type` + `resource_id` pair are followed;
+/// conditional references (`Type?param=value`), `urn:` references, and
+/// contained (`#`) references have no resolvable id and therefore never
+/// produce an included resource.
+///
+/// Runs hop 1 (every directive) then `:iterate`-only hops, exactly as before
+/// #1063 — unbounded budget, so SQLite/Postgres see no behaviour change. For a
+/// backend that already resolved hop 1 inline, use
+/// [`resolve_includes_iterate_continuation`] instead so hop 1 is not re-issued.
 pub async fn resolve_includes_iterative<S>(
     provider: &S,
     tenant: &TenantContext,
     matches: &[StoredResource],
     includes: &[IncludeDirective],
+) -> StorageResult<Vec<StoredResource>>
+where
+    S: SearchProvider + ?Sized,
+{
+    resolve_includes_iterative_inner(provider, tenant, matches, includes, &[], usize::MAX).await
+}
+
+/// Continues transitive `:iterate` resolution for a backend whose `search()`
+/// already resolved hop 1 inline (only MongoDB does, through
+/// [`resolve_includes_iterative`] with `iterate` cleared — #1063).
+///
+/// `already_included` is what the backend's own `search()` returned in
+/// `SearchResult::included` (any [`is_include_truncation_marker`] entries are
+/// ignored, both as seeds and as frontier). Hop 1 is **not** re-run: the
+/// frontier starts at `already_included` and only directives carrying
+/// `iterate` are applied, so a resource the backend already returned is never
+/// fetched or counted twice. Bounded by [`MAX_ITERATE_INCLUDED`]; hitting the
+/// bound appends a synthetic truncation marker (see
+/// [`include_truncation_outcome`]) rather than growing without limit.
+pub async fn resolve_includes_iterate_continuation<S>(
+    provider: &S,
+    tenant: &TenantContext,
+    matches: &[StoredResource],
+    includes: &[IncludeDirective],
+    already_included: &[StoredResource],
+) -> StorageResult<Vec<StoredResource>>
+where
+    S: SearchProvider + ?Sized,
+{
+    resolve_includes_iterative_inner(
+        provider,
+        tenant,
+        matches,
+        includes,
+        already_included,
+        MAX_ITERATE_INCLUDED,
+    )
+    .await
+}
+
+async fn resolve_includes_iterative_inner<S>(
+    provider: &S,
+    tenant: &TenantContext,
+    matches: &[StoredResource],
+    includes: &[IncludeDirective],
+    already_included: &[StoredResource],
+    max_included: usize,
 ) -> StorageResult<Vec<StoredResource>>
 where
     S: SearchProvider + ?Sized,
@@ -481,13 +777,32 @@ where
     let extractor = SearchParameterExtractor::new(tenant_registry.clone());
     let key = |r: &StoredResource| format!("{}/{}", r.resource_type(), r.id());
 
-    // Don't re-include primary matches.
+    // Don't re-include primary matches, nor anything the backend already
+    // returned (real resources only — never seed from a truncation marker).
     let mut seen: HashSet<String> = matches.iter().map(&key).collect();
+    let real_already_included: Vec<StoredResource> = already_included
+        .iter()
+        .filter(|r| !is_include_truncation_marker(r))
+        .cloned()
+        .collect();
+    for r in &real_already_included {
+        seen.insert(key(r));
+    }
+
     let mut included: Vec<StoredResource> = Vec::new();
 
-    let mut frontier: Vec<StoredResource> = matches.to_vec();
-    let mut first_hop = true;
+    // No prior pass: behave exactly like the original single-entry-point
+    // function (hop 1 applies every directive). A prior pass: hop 1 was
+    // already done by the backend, so start the frontier there and only run
+    // `:iterate` directives.
+    let (mut frontier, mut first_hop): (Vec<StoredResource>, bool) =
+        if real_already_included.is_empty() {
+            (matches.to_vec(), true)
+        } else {
+            (real_already_included, false)
+        };
     let mut depth = 0;
+    let mut truncated_directive: Option<String> = None;
 
     loop {
         // First hop applies all directives; later hops only `:iterate` ones.
@@ -514,15 +829,18 @@ where
                         let Some(def) = def else { continue };
                         if let Ok(values) = extractor.extract_for_param(res.content(), &def) {
                             for v in values {
-                                if let IndexValue::Reference { reference, .. } = v.value {
-                                    if let Some((t, i)) = reference.split_once('/') {
-                                        if let Some(target) = &directive.target_type {
-                                            if t != target {
-                                                continue;
-                                            }
+                                if let IndexValue::Reference {
+                                    resource_type: Some(t),
+                                    resource_id: Some(i),
+                                    ..
+                                } = v.value
+                                {
+                                    if let Some(target) = &directive.target_type {
+                                        if &t != target {
+                                            continue;
                                         }
-                                        wanted.push((t.to_string(), i.to_string()));
                                     }
+                                    wanted.push((t, i));
                                 }
                             }
                         }
@@ -572,73 +890,74 @@ where
         }
 
         // Dedup against everything seen so far; newly-added become next frontier.
+        // Bounded by `max_included` — for the full pass that bound is
+        // `usize::MAX` so this never trips; for a continuation it caps the
+        // total this call can add.
         let mut next = Vec::new();
+        let mut hop_truncated = false;
         for r in fetched {
-            if seen.insert(key(&r)) {
-                next.push(r.clone());
-                included.push(r);
+            let k = key(&r);
+            if seen.contains(&k) {
+                continue;
             }
+            if included.len() >= max_included {
+                hop_truncated = true;
+                break;
+            }
+            seen.insert(k);
+            next.push(r.clone());
+            included.push(r);
+        }
+        if hop_truncated && truncated_directive.is_none() {
+            let label = active_labels(includes, first_hop);
+            truncated_directive = Some(label);
         }
 
         first_hop = false;
         depth += 1;
         frontier = next;
-        if frontier.is_empty() || depth >= MAX_INCLUDE_ITERATE_DEPTH {
+        if frontier.is_empty() || hop_truncated || depth >= MAX_INCLUDE_ITERATE_DEPTH {
             break;
         }
+    }
+
+    if let Some(label) = truncated_directive {
+        let fhir_version = matches
+            .first()
+            .or(already_included.first())
+            .map(|r| r.fhir_version())
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+        included.push(include_truncation_outcome(
+            tenant,
+            fhir_version,
+            max_included,
+            &label,
+            "the _include:iterate expansion limit is fixed and not configurable",
+        ));
     }
 
     Ok(included)
 }
 
-/// Search provider that supports chained parameters and _has.
-///
-/// Chained parameters search on referenced resources:
-/// `Observation?patient.name=Smith`
-///
-/// _has searches for resources referenced by other resources:
-/// `Patient?_has:Observation:patient:code=1234-5`
-#[async_trait]
-pub trait ChainedSearchProvider: SearchProvider {
-    /// Evaluates a chained search and returns matching resource IDs.
-    ///
-    /// This is used internally to resolve chains before the main search.
-    ///
-    /// # Arguments
-    ///
-    /// * `tenant` - The tenant context for this operation
-    /// * `base_type` - The base resource type being searched
-    /// * `chain` - The chain path (e.g., "patient.organization.name")
-    /// * `value` - The value to match
-    ///
-    /// # Returns
-    ///
-    /// IDs of base resources that match the chain condition.
-    async fn resolve_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        chain: &str,
-        value: &str,
-    ) -> StorageResult<Vec<String>>;
-
-    /// Evaluates a reverse chain (_has) and returns matching resource IDs.
-    ///
-    /// # Arguments
-    ///
-    /// * `tenant` - The tenant context for this operation
-    /// * `base_type` - The base resource type being searched
-    /// * `reverse_chain` - The reverse chain parameters
-    ///
-    /// # Returns
-    ///
-    /// IDs of base resources that are referenced by matching resources.
-    async fn resolve_reverse_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        reverse_chain: &ReverseChainedParameter,
-    ) -> StorageResult<Vec<String>>;
+/// Comma-joined `type:param[:iterate]` labels of the directives active for a
+/// hop, for the truncation marker's diagnostics text.
+fn active_labels(includes: &[IncludeDirective], first_hop: bool) -> String {
+    includes
+        .iter()
+        .filter(|d| first_hop || d.iterate)
+        .map(|d| {
+            let kind = match d.include_type {
+                IncludeType::Include => "_include",
+                IncludeType::Revinclude => "_revinclude",
+            };
+            if d.iterate {
+                format!("{kind}:iterate={}:{}", d.source_type, d.search_param)
+            } else {
+                format!("{kind}={}:{}", d.source_type, d.search_param)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Search provider that supports terminology-aware modifiers.
@@ -739,28 +1058,20 @@ pub trait TextSearchProvider: SearchProvider {
 ///
 /// This is a convenience trait that combines all search capabilities.
 pub trait FullSearchProvider:
-    SearchProvider
-    + MultiTypeSearchProvider
-    + IncludeProvider
-    + RevincludeProvider
-    + ChainedSearchProvider
+    SearchProvider + MultiTypeSearchProvider + IncludeProvider + RevincludeProvider
 {
 }
 
 // Blanket implementation for types that implement all required traits
 impl<T> FullSearchProvider for T where
-    T: SearchProvider
-        + MultiTypeSearchProvider
-        + IncludeProvider
-        + RevincludeProvider
-        + ChainedSearchProvider
+    T: SearchProvider + MultiTypeSearchProvider + IncludeProvider + RevincludeProvider
 {
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PageInfo;
+    use crate::types::{PageInfo, SearchEntryMode};
     use helios_fhir::FhirVersion;
 
     #[test]
@@ -873,6 +1184,27 @@ mod tests {
         assert_eq!(url.matches("_cursor=").count(), 1);
     }
 
+    /// An inherited `_offset` from the request URL must not survive into a
+    /// cursor-based link: `_offset` and `_cursor` are mutually exclusive
+    /// pagination modes, and a link carrying both is misleading.
+    #[test]
+    fn test_replace_cursor_param_drops_offset() {
+        let url =
+            replace_cursor_param("http://example.com/fhir/Patient?_offset=10&_count=3", "abc");
+        assert!(url.contains("_count=3"));
+        assert!(url.contains("_cursor=abc"));
+        assert!(!url.contains("_offset="));
+        assert_eq!(url.matches("_cursor=").count(), 1);
+    }
+
+    /// When the only inherited paging parameter is `_offset`, dropping it must
+    /// not leave a stray `&` or `?`: the result is exactly `?_cursor=…`.
+    #[test]
+    fn test_replace_cursor_param_only_offset_yields_single_param() {
+        let url = replace_cursor_param("http://example.com/fhir/Patient?_offset=10", "abc");
+        assert_eq!(url, "http://example.com/fhir/Patient?_cursor=abc");
+    }
+
     /// `to_bundle` should produce a `next` link whose URL contains exactly one
     /// `_cursor` and uses `&` between query params.
     #[test]
@@ -908,5 +1240,490 @@ mod tests {
             1,
             "exactly one '?' delimiter"
         );
+    }
+
+    /// Parameter-sorted MongoDB pages report `has_next` without a cursor.
+    /// The REST conversion must still give clients a link to the next page.
+    #[test]
+    fn test_into_bundle_offset_page_has_next_link_without_cursor() {
+        let resources = [("sort-a", "1970-01-01"), ("sort-b", "1980-01-01")]
+            .into_iter()
+            .map(|(id, birth_date)| {
+                StoredResource::new(
+                    "Patient",
+                    id,
+                    crate::tenant::TenantId::new("t1"),
+                    serde_json::json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "birthDate": birth_date
+                    }),
+                    FhirVersion::default(),
+                )
+            })
+            .collect();
+        let result = SearchResult::new(Page::new(
+            resources,
+            PageInfo {
+                next_cursor: None,
+                previous_cursor: None,
+                total: Some(3),
+                has_next: true,
+                has_previous: false,
+            },
+        ))
+        .with_total(3);
+
+        let bundle = result.into_bundle(
+            "http://example.com/fhir",
+            "http://example.com/fhir/Patient?_sort=birthdate&_count=2",
+        );
+
+        assert_eq!(bundle.entry.len(), 2);
+        let next = bundle
+            .link
+            .iter()
+            .find(|link| link.relation == "next")
+            .expect("an offset page with more matches must provide a next link");
+        assert_eq!(
+            next.url,
+            "http://example.com/fhir/Patient?_sort=birthdate&_count=2&_offset=2"
+        );
+    }
+
+    #[test]
+    fn test_offset_pagination_links_across_pages() {
+        for (offset, matches, has_next, has_previous, next, previous) in [
+            (0, 2, true, false, Some(2), None),
+            (2, 2, true, true, Some(4), Some(0)),
+            (4, 1, false, true, None, Some(2)),
+            (6, 0, false, true, None, Some(4)),
+            (0, 1, false, false, None, None),
+        ] {
+            let resources = (0..matches)
+                .map(|id| {
+                    StoredResource::new(
+                        "Patient",
+                        id.to_string(),
+                        crate::tenant::TenantId::new("t1"),
+                        serde_json::json!({"resourceType": "Patient", "id": id.to_string()}),
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+            let result = SearchResult::new(Page::new(
+                resources,
+                PageInfo {
+                    next_cursor: None,
+                    previous_cursor: None,
+                    total: None,
+                    has_next,
+                    has_previous,
+                },
+            ))
+            .with_included(vec![StoredResource::new(
+                "Organization",
+                "included",
+                crate::tenant::TenantId::new("t1"),
+                serde_json::json!({"resourceType": "Organization", "id": "included"}),
+                FhirVersion::default(),
+            )]);
+            let first = "http://example.com/fhir/Patient?_sort=birthdate&_count=2";
+            let self_link = format!("{first}&_offset={offset}");
+            // Both public conversions share the link builder. Included entries
+            // must not increase the next offset, and totals are not required.
+            for bundle in [
+                result.to_bundle("http://example.com/fhir", &self_link),
+                result.into_bundle("http://example.com/fhir", &self_link),
+            ] {
+                for (relation, expected) in [
+                    ("self", Some(self_link.clone())),
+                    ("next", next.map(|n| format!("{first}&_offset={n}"))),
+                    ("previous", previous.map(|n| format!("{first}&_offset={n}"))),
+                    (
+                        "first",
+                        (has_next || has_previous).then(|| first.to_string()),
+                    ),
+                ] {
+                    let urls: Vec<&str> = bundle
+                        .link
+                        .iter()
+                        .filter(|link| link.relation == relation)
+                        .map(|link| link.url.as_str())
+                        .collect();
+                    assert_eq!(
+                        urls,
+                        expected.as_deref().into_iter().collect::<Vec<_>>(),
+                        "offset={offset}, relation={relation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cursor_request_without_outgoing_cursors_gets_no_offset_links() {
+        let result = SearchResult::new(Page::new(
+            Vec::new(),
+            PageInfo {
+                next_cursor: None,
+                previous_cursor: None,
+                total: None,
+                has_next: false,
+                has_previous: true,
+            },
+        ));
+        let bundle = result.into_bundle(
+            "http://example.com/fhir",
+            "http://example.com/fhir/Patient?_cursor=last-page&_count=2",
+        );
+        assert!(bundle.link.iter().all(|link| link.relation == "self"));
+    }
+
+    /// The `previous` offset steps back by the page size the search ran with,
+    /// which the REST layer derives from `_count`, its default and its maximum.
+    #[test]
+    fn test_offset_previous_link_uses_the_effective_page_size() {
+        let page = |matches: usize| {
+            let resources = (0..matches)
+                .map(|id| {
+                    StoredResource::new(
+                        "Patient",
+                        id.to_string(),
+                        crate::tenant::TenantId::new("t1"),
+                        serde_json::json!({"resourceType": "Patient", "id": id.to_string()}),
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+            SearchResult::new(Page::new(
+                resources,
+                PageInfo {
+                    next_cursor: None,
+                    previous_cursor: None,
+                    total: None,
+                    has_next: false,
+                    has_previous: true,
+                },
+            ))
+        };
+        let previous = |bundle: &SearchBundle| {
+            bundle
+                .link
+                .iter()
+                .find(|link| link.relation == "previous")
+                .map(|link| link.url.clone())
+        };
+        let base = "http://example.com/fhir";
+
+        // `_count` omitted: the REST default (20) applies.
+        let bundle = page(20).into_bundle_with_page_size(
+            base,
+            "http://example.com/fhir/Patient?_sort=birthdate&_offset=40",
+            Some(20),
+        );
+        assert_eq!(
+            previous(&bundle).as_deref(),
+            Some("http://example.com/fhir/Patient?_sort=birthdate&_offset=20")
+        );
+
+        // `_count` above the maximum: the clamped size (1000) applies, not 5000.
+        let bundle = page(3).to_bundle_with_page_size(
+            base,
+            "http://example.com/fhir/Patient?_sort=birthdate&_count=5000&_offset=2000",
+            Some(1000),
+        );
+        assert_eq!(
+            previous(&bundle).as_deref(),
+            Some("http://example.com/fhir/Patient?_sort=birthdate&_count=5000&_offset=1000")
+        );
+
+        // No page size and no `_count`: the step is unknown, so no `previous`.
+        let bundle = page(1).into_bundle(
+            base,
+            "http://example.com/fhir/Patient?_sort=birthdate&_offset=40",
+        );
+        assert_eq!(previous(&bundle), None);
+    }
+
+    #[test]
+    fn test_offset_links_do_not_loop_on_zero_count_or_empty_pages() {
+        for (self_link, page_size, matches, zero_count) in [
+            (
+                "http://example.com/Patient?_count=0&_offset=2",
+                None,
+                0,
+                true,
+            ),
+            (
+                "http://example.com/Patient?_count=2&_offset=2",
+                Some(0),
+                0,
+                true,
+            ),
+            (
+                "http://example.com/Patient?_count=2&_offset=2",
+                Some(2),
+                0,
+                false,
+            ),
+            (
+                "http://example.com/Patient?_count=2&_offset=18446744073709551615",
+                Some(2),
+                1,
+                false,
+            ),
+        ] {
+            let resources = (0..matches)
+                .map(|id| {
+                    StoredResource::new(
+                        "Patient",
+                        id.to_string(),
+                        crate::tenant::TenantId::new("t1"),
+                        serde_json::json!({"resourceType": "Patient", "id": id.to_string()}),
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+            let result = SearchResult::new(Page::new(
+                resources,
+                PageInfo {
+                    next_cursor: None,
+                    previous_cursor: None,
+                    total: None,
+                    has_next: true,
+                    has_previous: true,
+                },
+            ));
+            for bundle in [
+                result.to_bundle_with_page_size("http://example.com", self_link, page_size),
+                result.into_bundle_with_page_size("http://example.com", self_link, page_size),
+            ] {
+                assert!(bundle.link.iter().all(|link| link.relation != "next"));
+                if zero_count {
+                    assert!(bundle.link.iter().all(|link| link.relation == "self"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_offset_links_decode_last_control_value_and_preserve_other_parameters() {
+        let result = SearchResult::new(Page::new(
+            vec![StoredResource::new(
+                "Patient",
+                "p1",
+                crate::tenant::TenantId::new("t1"),
+                serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::default(),
+            )],
+            PageInfo {
+                next_cursor: None,
+                previous_cursor: None,
+                total: None,
+                has_next: true,
+                has_previous: true,
+            },
+        ));
+        let base = "http://example.com/Patient?name=A%26B&name=C+D&_count=9&%5Fcount=%2B2";
+        let self_link = format!("{base}&_offset=100&%5Foffset=%2B4");
+        for bundle in [
+            result.to_bundle("http://example.com", &self_link),
+            result.into_bundle("http://example.com", &self_link),
+        ] {
+            for (relation, expected) in [
+                ("next", format!("{base}&_offset=5")),
+                ("previous", format!("{base}&_offset=2")),
+                ("first", base.to_string()),
+            ] {
+                assert_eq!(
+                    bundle
+                        .link
+                        .iter()
+                        .find(|link| link.relation == relation)
+                        .map(|link| link.url.as_str()),
+                    Some(expected.as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_encoded_cursor_request_gets_no_offset_fallback() {
+        let result = SearchResult::new(Page::new(
+            Vec::new(),
+            PageInfo {
+                next_cursor: None,
+                previous_cursor: None,
+                total: None,
+                has_next: true,
+                has_previous: true,
+            },
+        ));
+        let self_link = "http://example.com/Patient?%5Fcursor=last-page&_count=2";
+        for bundle in [
+            result.to_bundle("http://example.com", self_link),
+            result.into_bundle("http://example.com", self_link),
+        ] {
+            assert!(bundle.link.iter().all(|link| link.relation == "self"));
+        }
+        assert_eq!(
+            replace_cursor_param(
+                "http://example.com/Patient?name=A%26B&%5Fcursor=old&%5Foffset=2",
+                "new"
+            ),
+            "http://example.com/Patient?name=A%26B&_cursor=new"
+        );
+    }
+
+    /// A request made with `_offset` must not leak into the cursor-based
+    /// `next`/`previous` links: those carry `_cursor` only. The `first` link
+    /// (built via `strip_paging_params`) must carry neither `_offset` nor
+    /// `_cursor`.
+    #[test]
+    fn test_to_bundle_links_from_offset_request_carry_no_offset() {
+        let page = Page::new(
+            Vec::<StoredResource>::new(),
+            PageInfo {
+                next_cursor: Some("N".to_string()),
+                previous_cursor: Some("P".to_string()),
+                total: None,
+                has_next: true,
+                has_previous: true,
+            },
+        );
+        let result = SearchResult::new(page);
+
+        let bundle = result.to_bundle(
+            "http://example.com/fhir",
+            "http://example.com/fhir/Patient?_count=3&_offset=3",
+        );
+
+        let next = bundle
+            .link
+            .iter()
+            .find(|l| l.relation == "next")
+            .expect("next link present");
+        let previous = bundle
+            .link
+            .iter()
+            .find(|l| l.relation == "previous")
+            .expect("previous link present");
+        let first = bundle
+            .link
+            .iter()
+            .find(|l| l.relation == "first")
+            .expect("first link present");
+
+        assert!(!next.url.contains("_offset="));
+        assert!(next.url.contains("_count=3"));
+        assert_eq!(next.url.matches("_cursor=").count(), 1);
+        assert!(next.url.contains("_cursor=N"));
+
+        assert!(!previous.url.contains("_offset="));
+        assert!(previous.url.contains("_count=3"));
+        assert_eq!(previous.url.matches("_cursor=").count(), 1);
+        assert!(previous.url.contains("_cursor=P"));
+
+        assert!(!first.url.contains("_offset="));
+        assert!(!first.url.contains("_cursor="));
+    }
+
+    fn test_tenant() -> TenantContext {
+        TenantContext::new(
+            crate::tenant::TenantId::new("t1"),
+            crate::tenant::TenantPermissions::full_access(),
+        )
+    }
+
+    /// #1061: a truncation marker in `included` must become a `search.mode =
+    /// outcome` entry (no `fullUrl`, no `id` on the resource) rather than an
+    /// ordinary `include` entry — both via `to_bundle` and `into_bundle`. This
+    /// is the defensive fallback for non-REST callers (e.g. compartment
+    /// search) that build a bundle straight from `SearchResult` without
+    /// draining markers themselves.
+    #[test]
+    fn truncation_outcome_becomes_an_outcome_entry() {
+        let tenant = test_tenant();
+        let patient = StoredResource::new(
+            "Patient",
+            "123",
+            tenant.tenant_id().clone(),
+            serde_json::json!({"resourceType": "Patient", "id": "123"}),
+            FhirVersion::default(),
+        );
+        let marker = include_truncation_outcome(
+            &tenant,
+            FhirVersion::default(),
+            5,
+            "_revinclude=Observation:subject",
+            "increase the limit",
+        );
+        assert!(is_include_truncation_marker(&marker));
+        assert!(!is_include_truncation_marker(&patient));
+
+        let page = Page::new(Vec::new(), PageInfo::end());
+        let result = SearchResult::new(page).with_included(vec![patient.clone(), marker.clone()]);
+
+        // to_bundle (borrowing)
+        let bundle = result.to_bundle("http://example.com/fhir", "http://example.com/fhir/Patient");
+        assert_eq!(bundle.entry.len(), 2);
+
+        let outcome_entries: Vec<_> = bundle
+            .entry
+            .iter()
+            .filter(|e| e.search.as_ref().map(|s| s.mode) == Some(SearchEntryMode::Outcome))
+            .collect();
+        assert_eq!(outcome_entries.len(), 1, "exactly one outcome entry");
+        let outcome_entry = outcome_entries[0];
+        assert!(
+            outcome_entry.full_url.is_none(),
+            "outcome entry must not carry a fullUrl"
+        );
+        let resource = outcome_entry.resource.as_ref().expect("resource present");
+        assert_eq!(resource["resourceType"], "OperationOutcome");
+        assert!(
+            resource.get("id").is_none(),
+            "marker resource must carry no id in the bundle (rewrite_bundle_full_urls skips id-less resources)"
+        );
+        assert_eq!(resource["issue"][0]["severity"], "warning");
+        assert!(
+            resource["issue"][0]["diagnostics"]
+                .as_str()
+                .unwrap()
+                .contains('5'),
+            "diagnostics should name the limit"
+        );
+
+        let include_entries: Vec<_> = bundle
+            .entry
+            .iter()
+            .filter(|e| e.search.as_ref().map(|s| s.mode) == Some(SearchEntryMode::Include))
+            .collect();
+        assert_eq!(include_entries.len(), 1, "Patient stays an include entry");
+
+        // into_bundle (owning) — same assertions.
+        let page2 = Page::new(Vec::new(), PageInfo::end());
+        let result2 = SearchResult::new(page2).with_included(vec![patient, marker]);
+        let bundle2 =
+            result2.into_bundle("http://example.com/fhir", "http://example.com/fhir/Patient");
+        assert_eq!(bundle2.entry.len(), 2);
+        let outcome_entries2: Vec<_> = bundle2
+            .entry
+            .iter()
+            .filter(|e| e.search.as_ref().map(|s| s.mode) == Some(SearchEntryMode::Outcome))
+            .collect();
+        assert_eq!(outcome_entries2.len(), 1);
+        assert!(outcome_entries2[0].full_url.is_none());
+        assert_eq!(
+            outcome_entries2[0].resource.as_ref().unwrap()["resourceType"],
+            "OperationOutcome"
+        );
+        let include_entries2: Vec<_> = bundle2
+            .entry
+            .iter()
+            .filter(|e| e.search.as_ref().map(|s| s.mode) == Some(SearchEntryMode::Include))
+            .collect();
+        assert_eq!(include_entries2.len(), 1);
     }
 }

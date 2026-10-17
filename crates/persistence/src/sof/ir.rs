@@ -40,8 +40,9 @@ pub enum SqlExpr {
     /// Bound query parameter, 1-based.
     ///
     /// Indices 1 and 2 are reserved for `tenant_id` and `resource_type`.
-    /// Constants from `ViewDefinition.constant[]` and string literals lifted
-    /// out of `extension(url)` etc. allocate from index 3 upward.
+    /// Constants from `ViewDefinition.constant[]` allocate from index 3 upward
+    /// (FHIRPath string literals are not lifted into parameters; they are
+    /// inlined as [`LitValue::Str`]).
     Param(usize),
 
     /// Reference to a column projected by a CTE or subquery.
@@ -173,14 +174,16 @@ pub enum SqlExpr {
     /// FHIRPath `<base>.<field>.join(<sep>)` — aggregates the values of
     /// `<field>` across each element of `<base>` (flattened) into a single
     /// separator-joined string. Lowers to `string_agg` (PG) /
-    /// `group_concat` (SQLite) over a chained lateral unnest.
+    /// `group_concat` (SQLite) over a chained lateral unnest. Without an
+    /// `inner_field` (`line.join(sep)` relative to the current focus) the
+    /// elements of `outer_focus` are joined directly.
     JoinAggregate {
         /// Outer collection expression to iterate.
         outer_focus: Box<SqlExpr>,
         /// Outer iteration alias.
         outer_alias: String,
-        /// Field name to flatten on each outer row.
-        inner_field: String,
+        /// Field name to flatten on each outer row, if any.
+        inner_field: Option<String>,
         /// Inner iteration alias.
         inner_alias: String,
         /// Separator inserted between joined elements.
@@ -209,8 +212,35 @@ pub enum SqlExpr {
         chain_sql: String,
         /// Scalar projection extracted from the row at `offset`.
         projection: Box<SqlExpr>,
+        /// Optional `WHERE` criterion over the chain's innermost element —
+        /// `forEach: "<chain>.where(crit).first()"` indexes the FILTERED
+        /// collection.
+        filter: Option<Box<SqlExpr>>,
         /// Zero-based index into the flattened chain.
         offset: i64,
+    },
+
+    /// Flattened JSON array of the innermost elements of a pre-built chain
+    /// (the same `FROM` shape as [`ScalarFromChain`](Self::ScalarFromChain)),
+    /// computed as a correlated scalar subquery. A multi-step
+    /// `forEachOrNull` unnests this array once so the null row appears only
+    /// when the whole flattened collection is empty.
+    ChainArray {
+        /// Pre-built `FROM`-clause SQL for the flattened chain.
+        chain_sql: String,
+        /// Alias of the chain's innermost iteration row.
+        leaf_alias: String,
+        /// Optional `WHERE` criterion over the chain's innermost element
+        /// (`<chain>.where(crit)[N]`). Only used with `offset`.
+        filter: Option<Box<SqlExpr>>,
+        /// When set, the array holds ONLY the element at this position of the
+        /// (filtered) flattened chain — `[]` when absent. A trailing-`[N]`
+        /// `forEach` with a nested `select` unnests it like any other
+        /// iteration, so nested clauses resolve against that one element.
+        offset: Option<i64>,
+        /// Focus the chain navigates from (`r.data`, `fe.value`, ...), used to
+        /// place this source in the iteration scope chain.
+        scope_root: String,
     },
 
     /// FHIRPath `%rowIndex` environment variable — the 0-based position of the
@@ -259,9 +289,12 @@ pub enum BoundaryKind {
 
 /// Literal scalar value embedded directly in SQL.
 ///
-/// Strings derived from user input must be bound as parameters via
-/// [`SqlExpr::Param`] — `LitValue::Str` is reserved for compile-time-constant
-/// identifiers (e.g. polymorphic-type field names).
+/// FHIRPath string literals are inlined as [`LitValue::Str`], so the emitter
+/// never splices a `Str` verbatim: it is rendered through
+/// [`Dialect::string_literal`](super::dialect::Dialect::string_literal), which
+/// quotes it for the target dialect. Values that must stay out of the SQL text
+/// altogether (`ViewDefinition.constant[]`) are bound as parameters via
+/// [`SqlExpr::Param`] instead.
 #[derive(Debug, Clone)]
 pub enum LitValue {
     /// `NULL`.
@@ -270,10 +303,11 @@ pub enum LitValue {
     Bool(bool),
     /// Integer.
     Int(i64),
-    /// Decimal as a string to preserve precision.
+    /// Decimal as a string to preserve precision. Inlined as written, so the
+    /// emitter refuses anything that is not a plain numeral.
     Decimal(String),
-    /// String literal — used only for compile-time-constant idents; user input
-    /// must always go through [`SqlExpr::Param`].
+    /// String literal, rendered through the dialect's string literal. NUL is
+    /// refused (it cannot be represented in SQL text).
     Str(String),
 }
 
@@ -399,6 +433,41 @@ pub enum PathStep {
     TypeFilter(JsonType),
 }
 
+/// Bound runtime predicates applied to every SQL scan of a resource.
+///
+/// Slots are allocated once, after the view's consumed constants, and reused
+/// by every union branch, recursive seed and resource rejoin. Values stay in
+/// the runner's parameter list instead of the rendered SQL.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceFilter {
+    /// Parameter holding the inclusive last-modified lower bound.
+    pub since: Option<usize>,
+    /// Resolved compartment membership, when requested.
+    pub compartment: Option<CompartmentFilter>,
+    /// Slots holding the exclusive lower and inclusive upper resource-id
+    /// bounds of one keyset page (export reads only).
+    pub id_range: Option<(usize, usize)>,
+}
+
+/// Structural compartment predicate with preallocated parameter slots.
+#[derive(Debug, Clone)]
+pub enum CompartmentFilter {
+    /// The scanned resource owns the compartment; match its id to this list.
+    Owner {
+        /// Slot holding the compartment owners' ids.
+        refs: usize,
+    },
+    /// Match the compartment's linking search parameters and reference list.
+    SearchIndex {
+        /// Slots holding the spec-defined linking search-parameter names.
+        param_names: Vec<usize>,
+        /// Slot holding all canonical compartment references.
+        refs: usize,
+    },
+    /// The resource type does not belong to the requested compartment.
+    NoMatches,
+}
+
 /// Row-source plan node.
 ///
 /// Plans are trees: a [`Project`](PlanNode::Project) at the root, descending
@@ -408,12 +477,14 @@ pub enum PathStep {
 #[derive(Debug, Clone)]
 pub enum PlanNode {
     /// Top-level scan over the `resources` table for a single resource type.
-    /// The tenant predicate is injected by the emitter.
+    /// Tenant isolation and the runtime filter are lowered by the emitter.
     Scan {
         /// SQL alias for the scanned row (e.g., `r`).
         alias: String,
         /// FHIR resource type to scan.
         resource_type: String,
+        /// Bound predicates reused at every SQL scan generated from this node.
+        filter: ResourceFilter,
     },
 
     /// Lateral unnest of a JSON-array source. `out_alias` names the iteration
@@ -437,6 +508,11 @@ pub enum PlanNode {
         on_filter: Option<SqlExpr>,
         /// When set, restrict the unnest to the Nth element of the flattened collection.
         flat_index: Option<i64>,
+        /// True when the schema says `source` is one field holding a FHIR
+        /// array (`max = *`), which FHIR JSON always serializes as an array.
+        /// SQLite then iterates it with two-argument `json_each` instead of
+        /// the guard that wraps singleton objects.
+        array_source: bool,
     },
 
     /// `WHERE` filter applied to `parent`. Multiple `Filter` nodes compose
@@ -457,16 +533,24 @@ pub enum PlanNode {
     },
 
     /// `UNION ALL` of N row-compatible plans. Output schemas must align;
-    /// the emitter validates this and emits a single `ORDER BY 1` outside the
-    /// compound query.
+    /// the emitter validates this and leaves the compound query unordered.
     Union(Vec<PlanNode>),
 
     /// Recursive-CTE descent — used for SoF `repeat:` clauses.
+    ///
+    /// Placement contract: a `Recurse` may sit on a `Scan`, a `Filter`, a
+    /// `LateralUnnest` or another `Recurse`, i.e. anywhere in the linear
+    /// chain below a `Project`. Each node names its enclosing scope by alias
+    /// (`r.data`, `fe.value`, `rec_N.node`), and `seed_root` is that alias for
+    /// this descent. Emitters that give a descent a seed-row key (`pkey`) only
+    /// need it when `seed_root` is not the resource itself (`r.data`).
     Recurse {
         /// Plan producing the seed rows.
         parent: Box<PlanNode>,
-        /// Seed projection (currently unused; emitter walks `parent`).
-        seed: SqlExpr,
+        /// Alias of the scope the step paths are evaluated against for the
+        /// first hop: `r.data` for the resource, `fe.value` for a `forEach`
+        /// element, `rec_N.node` for the node of an enclosing `repeat`.
+        seed_root: String,
         /// Paths walked on each iteration.
         step_paths: Vec<JsonPath>,
         /// CTE alias also used as the `node` column alias.
@@ -481,12 +565,15 @@ pub struct Column {
     pub name: String,
     /// Expression that produces the column's value.
     pub expr: SqlExpr,
-    /// When true, lower to a JSON array via [`SqlExpr::JsonAgg`] over a lateral
-    /// subquery. When false, lower to a scalar (with a defensive `LIMIT 1` if
-    /// the underlying expression yields a row source).
+    /// Reserved: the emitters reject `true` as uncompilable. The compiler
+    /// always sets `false`; a ViewDefinition `collection: true` column is
+    /// lowered to [`SqlExpr::CollectionAgg`] inside `expr` and recorded in
+    /// [`decode`](Self::decode) instead.
     pub collection: bool,
     /// SQL type the column is projected as.
     pub ty: SqlType,
+    /// How the runners turn the column's text value into JSON.
+    pub decode: super::decode::ColumnDecode,
 }
 
 /// A subquery embedded inside a [`SqlExpr`]. Holds the inner plan together
@@ -501,3 +588,69 @@ pub struct SubQuery {
 
 /// Boxed dialect handle used by emission helpers.
 pub type DialectRef = Arc<dyn super::dialect::Dialect>;
+
+/// The alias (and whether it is an indexed `[N]` step) of the nearest
+/// `forEachOrNull` that the scope `root` (a focus such as `fe.value` or
+/// `rec_0.node`) depends on, walking the chain of
+/// enclosing iteration steps; `None` when the scope is the resource or has no
+/// `forEachOrNull` ancestor.
+pub(super) fn nearest_left_scope(parent: &PlanNode, root: &str) -> Option<(String, bool)> {
+    let mut alias = root.rsplit_once('.').map(|(a, _)| a.to_string())?;
+    if alias == "r" {
+        return None;
+    }
+    loop {
+        let mut cur = parent;
+        let step = loop {
+            match cur {
+                PlanNode::LateralUnnest {
+                    out_alias, parent, ..
+                } if *out_alias == alias => break Some(cur),
+                PlanNode::Recurse {
+                    out_alias, parent, ..
+                } if *out_alias == alias => break Some(cur),
+                PlanNode::LateralUnnest { parent: p, .. }
+                | PlanNode::Recurse { parent: p, .. }
+                | PlanNode::Filter { parent: p, .. } => cur = p,
+                _ => break None,
+            }
+        }?;
+        match step {
+            PlanNode::LateralUnnest {
+                left_join: true,
+                flat_index,
+                ..
+            } => return Some((alias, flat_index.is_some())),
+            PlanNode::LateralUnnest {
+                source: SqlExpr::JsonPath { root, .. },
+                ..
+            }
+            | PlanNode::LateralUnnest {
+                source:
+                    SqlExpr::ChainArray {
+                        scope_root: root, ..
+                    },
+                ..
+            }
+            | PlanNode::Recurse {
+                seed_root: root, ..
+            } => {
+                alias = root.rsplit_once('.').map(|(a, _)| a.to_string())?;
+                if alias == "r" {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The focus an unnest source navigates from: the root of a plain path, or the
+/// scope a computed [`SqlExpr::ChainArray`] hangs off.
+pub(super) fn unnest_source_root(source: &SqlExpr) -> Option<&str> {
+    match source {
+        SqlExpr::JsonPath { root, .. } => Some(root),
+        SqlExpr::ChainArray { scope_root, .. } => Some(scope_root),
+        _ => None,
+    }
+}

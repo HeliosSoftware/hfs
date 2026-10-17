@@ -60,7 +60,7 @@ The authentication flow follows the [SMART Backend Services](https://hl7.org/fhi
    - Rejects tokens using algorithms not in the allowed list
    - Fetches the public key from the cached JWKS keyset (refreshes on unknown `kid`)
    - Validates signature, expiration, issuer, and audience claims
-   - Parses SMART v2 scopes from the `scope` or `scp` claim
+   - Parses SMART v2 scopes from the `scope`, `scp` and `roles` claims, each as a space-delimited string or an array, and merges them
    - Extracts the tenant ID from the configured claim
 5. **HFS enforces authorization** by checking scopes against the requested FHIR operation
 
@@ -75,8 +75,11 @@ Scopes follow the SMART v2 syntax: `context/resourceType.permissions`
 | `system/Observation.r` | Read-only access to Observation |
 | `system/Condition.crud` | Create, read, update, delete Condition (no search) |
 | `user/Patient.rs` | User-level read/search on Patient |
+| `patient/Observation.rs` | Read/search Observations **in the launch patient's compartment** (see [Patient scopes](#patient-scopes)) |
 
 Permission characters: `c` = create, `r` = read, `u` = update, `d` = delete, `s` = search.
+
+A `system/` or `user/` scope grants the operation on every resource of the type in the tenant. A `patient/` scope grants it inside one patient's compartment only; `SmartScopePolicy::check` returns which of the two (`AccessScope::Unrestricted` or `AccessScope::PatientCompartment`), the widest matching context winning per resource type.
 
 ### Operation-to-Permission Mapping
 
@@ -103,6 +106,9 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 | `HFS_AUTH_ISSUER` | *(none)* | Expected JWT `iss` claim |
 | `HFS_AUTH_AUDIENCE` | *(none)* | Expected JWT `aud` claim (**recommended for production** — prevents accepting tokens intended for other services) |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant ID |
+| `HFS_AUTH_PATIENT_CLAIM` | `patient` | JWT claim carrying the SMART `patient` launch context |
+| `HFS_AUTH_ENCOUNTER_CLAIM` | `encounter` | JWT claim carrying the SMART `encounter` launch context |
+| `HFS_AUTH_FHIR_USER_CLAIM` | `fhirUser` | JWT claim carrying the SMART `fhirUser` |
 | `HFS_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Allowed signing algorithms |
 
 ### JWKS Caching
@@ -124,6 +130,110 @@ These populate the `GET /.well-known/smart-configuration` response:
 | `HFS_SMART_MANAGEMENT_ENDPOINT` | Token management endpoint |
 | `HFS_SMART_REGISTRATION_ENDPOINT` | Dynamic client registration endpoint |
 | `HFS_SMART_REVOCATION_ENDPOINT` | Token revocation endpoint |
+| `HFS_SMART_END_SESSION_ENDPOINT` | OIDC end-session (RP-initiated logout) endpoint; used by the web UI's Sign out. Discovered from the issuer when unset |
+
+### Web UI Interactive Login
+
+The web UI (`crates/ui`) signs users in with **Authorization Code + PKCE**
+against the same IdP (issue #1449). HFS is not the authorization server: the
+browser is sent to the IdP's login screen, comes back to `/ui/callback` with a
+code, and HFS exchanges it for tokens that stay **server-side**, referenced by
+an `HttpOnly; SameSite=Lax` session cookie (`hfs_session`). The auth middleware
+then treats a request carrying that cookie — and no `Authorization` header of
+its own — as if it had sent `Authorization: Bearer <session access token>`, so
+the pages' browser-originated FHIR calls are validated, scope-checked and
+audited exactly like any bearer. A cross-site request never rides the cookie.
+
+Off unless `HFS_UI_LOGIN_CLIENT_ID` is set (auth must be enabled). With
+authentication enabled and no client id, the UI still renders but every
+browser-originated FHIR call (Resources, Batch / Transaction,
+`/_user/settings`) is refused with `401`; the shell then shows a notice naming
+`HFS_UI_LOGIN_CLIENT_ID` on every page, and the Batch page's Execute reports
+the missing sign-in instead of `Missing Authorization header` (#1560). The
+pages whose handlers act on storage themselves — Tenants (`/ui/tenants*`, the
+tenant selector) and Import (`/ui/bulk-import*`) — are refused with the same
+`401` and notice in this posture (#1619): nothing a browser sends there can be
+authenticated, and before this they created, deregistered and purged tenants
+and deleted submissions for an anonymous caller.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_UI_LOGIN_CLIENT_ID` | unset | OAuth client id registered at the IdP for the UI (e.g. `hfs-web`). Setting it enables the login and the session gate on every `/ui` page |
+| `HFS_UI_LOGIN_CLIENT_SECRET` | unset | Only for a confidential client; a public PKCE client leaves it unset |
+| `HFS_UI_LOGIN_REDIRECT_URI` | `{HFS_BASE_URL}/ui/callback` | The `redirect_uri` registered at the IdP |
+| `HFS_UI_LOGIN_SCOPES` | `openid profile email` | Scopes requested at authorization |
+| `HFS_UI_LOGIN_COOKIE_SECURE` | `true` | `Secure` attribute on the session cookie. Set `false` only for plain-HTTP local development |
+
+A page that starts a job on the user's behalf — the Export page's `$export`
+kick-off, poll and download, the SQL Export page's `$sql-export`, the
+Patient/Group pickers, the Import page's `$bulk-submit` and its status
+calls when the recipient is this server — makes a server-side self-call that
+runs **as the signed-in user**: the session's access token is forwarded
+(refreshed the same way the middleware does it), so the job carries the
+user's own scopes and is audited as them. The outbound service credential
+(`HFS_OUTBOUND_BEARER_TOKEN`) is only the fallback when there is no session.
+One consequence for the Import page: `$bulk-submit` is gated on the named
+operation scope `system/bulk-submit`, not on resource scopes, so a user who
+imports needs that scope on their own token — grant it at the IdP to the
+role that may import (HFS accepts the literal scope on any token). The
+bundled realm grants it to every `hfs-web` user so the local setup imports
+out of the box (#1633); a real IdP should grant it only to the users who may
+import. A submission whose
+recipient is another server keeps its own SMART Backend Services client, as
+before.
+
+The authorize and token endpoints come from `HFS_SMART_AUTHORIZE_ENDPOINT` /
+`HFS_SMART_TOKEN_ENDPOINT` when set, otherwise from the issuer's
+`.well-known/openid-configuration` at startup.
+
+**Where sessions live.** The session store keeps sessions in process and, on
+a storage backend that implements `SessionPersistence`, also in the primary
+store (`login_sessions` table), so a session established on one node resolves
+on every other — the callback and every later page may land anywhere behind
+a load balancer — and survives a restart. The in-process copy stays the fast
+path: a request costs no store read once the node knows the session, and a
+session's `last_seen` is written through at most once a minute. Two nodes
+refreshing the same session at once are reconciled by the row's version: the
+one whose write lands second adopts the winner's tokens instead of handing out
+its own, now-superseded ones. Pending logins are consumed exactly once
+cluster-wide because the store's delete is the arbiter. Every primary store
+implements it — **SQLite**, **PostgreSQL**, **MongoDB** and **S3**, standalone
+and with Elasticsearch (on S3 under `_system.login-sessions/`, with the same
+conditional-`PutObject` compare-and-swap as `/_user/settings`). Every `hfs`
+deployment is therefore store-backed, with one exception: S3 configured
+`HFS_S3_TENANCY=bucket-per-tenant` with no `HFS_S3_SYSTEM_BUCKET` has nowhere
+tenant-independent to keep them — the same configuration that leaves
+`/_user/settings` unwired (#1598) — so sessions stay in process there, which
+is logged at startup and then needs one node or sticky sessions. The user's access, refresh and ID tokens are
+stored as they are: they never leave the server, and the IdP's own lifetimes
+bound them.
+
+**The user's access token must be one HFS can validate and authorize.** Two
+things the IdP has to put in it:
+
+- **`sub`.** HFS rejects a token without a subject (`401 Missing required
+  claim: sub`). On Keycloak 26 `sub` comes from the built-in `basic` client
+  scope, which a client does not get unless it is assigned; `profile` and
+  `email` likewise supply the display claims the UI shows.
+- **SMART scopes.** Authorization is SMART v2 scopes on the `scope`, `scp` or
+  `roles` claim; a user with none signs in and then gets `403` on every FHIR
+  call. An interactively signed-in user acts in the **`user/`** context
+  (`user/*.cruds`, or narrower), which HFS accepts as-is.
+
+The bundled Keycloak realm therefore gives the `hfs-web` client
+`basic`, `profile`, `email` and `user/*.cruds` as default client scopes — mirror
+that for a real IdP — plus `system/bulk-submit`, which the Import page needs
+(see above).
+
+```bash
+# Local Keycloak (docker/keycloak): the `hfs-web` public client is pre-registered.
+HFS_UI_LOGIN_CLIENT_ID=hfs-web \
+  HFS_UI_LOGIN_COOKIE_SECURE=false \
+  HFS_AUTH_ENABLED=true HFS_AUTH_ISSUER=http://localhost:8180/realms/fhir \
+  HFS_AUTH_JWKS_URL=http://localhost:8180/realms/fhir/protocol/openid-connect/certs \
+  cargo run --bin hfs
+# then open http://localhost:8080/ui → redirected to the Keycloak login (demo / demo)
+```
 
 ## Running with Authentication
 
@@ -455,16 +565,49 @@ Auth0 tokens include granted scopes in the `scope` claim as a space-delimited st
 ```bash
 HFS_AUTH_JWKS_URL=https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys
 HFS_AUTH_ISSUER=https://login.microsoftonline.com/{tenant}/v2.0
-# Permissions are typically in the "roles" claim
 ```
 
-**Setup summary:** Register an application, define App Roles with SMART scope names, grant the client application the roles, and use the client credentials flow. Entra tokens include granted permissions in the `roles` array rather than `scope`.
+**Setup summary:** Register an application, define App Roles with SMART scope names, grant the client application the roles, and use the client credentials flow.
+
+#### Entra ID Scope Claim Notes
+
+HFS reads both shapes of Entra ID token:
+- **Client credentials (application permissions):** the granted App Roles arrive in the `roles` array.
+- **Signed-in user (delegated permissions):** the granted scopes arrive in `scp` as a space-delimited string.
+
+HFS does not map names, so a granted value must be the SMART scope itself:
+- **App Roles** accept `/` and `*`, so an App Role value can be `system/*.cruds`.
+- **Delegated scopes** cannot contain `/` in Entra ID, so a SMART scope such as `user/*.cruds` cannot be a delegated scope. For a signed-in user, define it as an App Role whose allowed member types include users, and assign it to the user. The user's token then carries it in `roles`.
 
 ## Tenant Resolution
 
 When authentication is enabled, the tenant ID is derived **exclusively** from the JWT claim configured by `HFS_AUTH_TENANT_CLAIM` (default: `tenant_id`). The `X-Tenant-ID` header and URL-based tenant routing are ignored for authenticated requests — this prevents tenant impersonation.
 
 If the token does not contain the tenant claim, the server falls back to the standard tenant resolution (header, URL path, or default).
+
+## SMART Launch Context
+
+`Principal::launch_context` holds the token's SMART `patient`, `encounter` and `fhirUser` claims (names set by `HFS_AUTH_PATIENT_CLAIM`, `HFS_AUTH_ENCOUNTER_CLAIM`, `HFS_AUTH_FHIR_USER_CLAIM`). Only non-empty string claims count, and the field is `None` when none is present. The claims also stay in `custom_claims`.
+
+`LaunchContext::patient_id()` returns the patient's logical id from a bare `<id>` or `Patient/<id>`, where `<id>` is valid FHIR id syntax (1-64 characters of `A-Za-z0-9.-`). Any other value (another resource type, an absolute URL, a `_history` reference, empty) gives `None`.
+
+It narrows type-level `Patient/$everything` to the launch patient (see the [`Patient/$everything` section of the rest README](../rest/README.md#patienteverything)) and it is what a `patient/` scope is confined to.
+
+## Patient scopes
+
+SMART App Launch defines `patient/` scopes as access to the launch patient's compartment. HFS enforces that (#1618):
+
+- **The grant needs a launch patient.** When an operation is granted only by a `patient/` scope and the token has no usable `patient` claim (missing, empty, not a bare `<id>` or `Patient/<id>`), the request is `403` with an OperationOutcome saying so. The scope is never widened to `user/`. A token that also holds a `user/` or `system/` scope covering the type is unrestricted for that type and unaffected.
+- **Searches are filtered.** `GET /{type}` and `POST /{type}/_search` get the same Patient compartment filter `GET /Patient/{id}/{type}` applies (membership from the spec `CompartmentDefinition`), ANDed with the client's parameters; a search for `Patient` is pinned to the launch patient's id. `_include`/`_revinclude` entries outside the compartment are dropped. A type with no Patient compartment parameters (`Practitioner`, `Organization`, `Medication`, `Binary`, the conformance types, …) is refused with `403`: it cannot be confined to a patient, so a `patient/` scope does not reach it.
+- **Instance interactions are judged on the payload.** Read, vread, instance history, update, patch and delete check the stored resource's membership (a Patient is in its own compartment; anything else must reference the launch patient through a compartment parameter). Create and update also check the submitted payload, so a resource can be neither taken over nor moved out of the compartment. A deleted resource cannot be restored under the grant.
+- **Compartment paths are the launch patient's only.** `GET /Patient/{id}/{type}`, `/Patient/{id}/*` and `Patient/{id}/$everything` are refused for any other `{id}` and for any other compartment type.
+- **`$export`.** `Patient/$export` is pinned to the launch patient (a `patient` parameter naming anyone else is `403`); system-level `/$export` and `Group/{id}/$export` are refused. A `patient/*` wildcard does not override export job ownership.
+- **Bundles.** In a batch, `GET` entries are confined like their single-resource twins and write entries are refused per entry; a transaction holding anything but searches is refused whole. Use the single-resource endpoints to write.
+- **Refused outright** (`403`, cannot be confined): system and type history, conditional (type-level) update, patch, delete and conditional create, every other `$`-operation, and — for a token whose resource scopes are all `patient/` scopes — every endpoint the middleware does not classify (the console, `/_user/settings`, `$bulk-submit`, …).
+
+A refused request is a `403` with an OperationOutcome (`forbidden`) that names the reason; existence of the resource is therefore disclosed to the holder of a valid token, as it is for any other scope denial.
+
+Confinement is decided in the REST layer (`crates/rest/src/patient_compartment.rs` and the path check in `crates/rest/src/middleware/auth.rs`), so it applies on every storage backend.
 
 ## Token Replay
 
@@ -488,10 +631,13 @@ TLS, short token lifetimes, and audience/issuer validation.
 
 ## Multi-Instance Deployments
 
-`helios-auth` holds no cross-instance state. Each instance maintains its own
-JWKS cache, and token validation is purely local (signature plus claim checks),
-so instances behind a load balancer need no shared infrastructure and no sticky
-sessions.
+Bearer validation holds no cross-instance state. Each instance maintains its
+own JWKS cache, and token validation is purely local (signature plus claim
+checks), so instances behind a load balancer need no shared infrastructure and
+no sticky sessions. The web UI's interactive login is the one exception: its
+sessions are shared through the primary store where the backend supports it
+(see [Web UI Interactive Login](#web-ui-interactive-login)), and otherwise
+need sticky sessions.
 
 ## Testing
 
@@ -533,7 +679,8 @@ src/
 
 | Type | Description |
 |------|-------------|
-| `Principal` | Authenticated identity from a validated JWT (subject, issuer, scopes, tenant) |
+| `Principal` | Authenticated identity from a validated JWT (subject, issuer, scopes, tenant, SMART launch context) |
+| `LaunchContext` | SMART `patient` / `encounter` / `fhirUser` claims on `Principal::launch_context`; `patient_id()` normalises the patient |
 | `ScopeSet` | Parsed collection of SMART v2 scopes with permission checking |
 | `SmartPermissions` | Bitflags for CRUDS permissions |
 | `AuthProvider` | Trait for token validation (currently: JWKS Bearer) |

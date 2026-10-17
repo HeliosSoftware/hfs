@@ -1,5 +1,6 @@
 //! `ExportJobController` trait and associated types.
 
+use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_persistence::tenant::TenantContext;
@@ -161,8 +162,30 @@ pub enum JobStatus {
     },
     /// Job failed with an error.
     Failed {
-        /// Human-readable error message.
+        /// The message the result endpoint returns: the specific wording only
+        /// when `status` is a 4xx (the request's own failure). For a `503` (the
+        /// store was unavailable) it is fixed wording that names the subject
+        /// and tells the client to submit the export again, and for a server
+        /// fault a generic message that names the job. Neither carries the
+        /// underlying error's text, which is logged instead (#1703, #2048).
         message: String,
+        /// What the result endpoint answers: the 4xx `$sql-run` gives the
+        /// same failure when it is the request's own (a documented limit, a
+        /// subject the runner refuses), `503` when the store was unavailable
+        /// (#2048), `500` for a fault of the server. A `503` here is terminal
+        /// for this job, unlike a `503` on a status poll: the result URL keeps
+        /// answering it (and sends no `Retry-After`), and the stored `message`
+        /// tells the client to submit the export again.
+        status: StatusCode,
+        /// The `OperationOutcome.issue.code` that goes with `status`.
+        code: &'static str,
+        /// Output name of the subject the job was writing when it failed:
+        /// the client's own `subject.name` (or the subject's own `name`, or
+        /// the generated `output-N`). The result endpoint returns it as
+        /// `OperationOutcome.issue[0].expression` even when `message` is the
+        /// generic server-fault text (#1800). `None` when no subject was in
+        /// flight.
+        subject: Option<String>,
         /// Time the job was submitted.
         submitted_at: DateTime<Utc>,
         /// Time the worker recorded the failure. Captured once at the
@@ -225,6 +248,41 @@ pub enum ExportError {
     /// Output serialization (NDJSON/CSV) failed.
     #[error("serialization error: {0}")]
     Serialization(String),
+    /// The request's own fault — a documented limit or a subject the runner
+    /// refuses — with the status and issue code `$sql-run` answers it with.
+    #[error("{message}")]
+    Client {
+        /// The HTTP status the result endpoint answers with.
+        status: StatusCode,
+        /// The `OperationOutcome.issue.code` that goes with `status`.
+        code: &'static str,
+        /// The wording `$sql-run` gives the same failure.
+        message: String,
+    },
+    /// The store a subject reads from was unavailable (it could not be
+    /// reached, was throttling, or could not read an object after retries).
+    /// Transient rather than the request's fault: the result endpoint answers
+    /// `503`, the status `$sql-run` gives the same failure (#2048). The text
+    /// is the store's own, so it goes to the job log only: the stored wording
+    /// is fixed, and since the job itself still fails for good it asks the
+    /// client to submit the export again.
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+/// Why a controller refused to accept an export job.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SubmitError {
+    /// The task's tenant already has the controller's maximum number of jobs
+    /// queued or running (`HFS_EXPORT_MAX_JOBS_PER_TENANT`).
+    #[error(
+        "this tenant already has {limit} export jobs queued or running, the most HFS_EXPORT_MAX_JOBS_PER_TENANT allows; a job cancelled while it is still queued keeps counting until its turn comes; retry once one of them has finished"
+    )]
+    TenantJobLimit {
+        /// The per-tenant limit that was reached.
+        limit: usize,
+    },
 }
 
 /// Trait for managing async export jobs.
@@ -245,7 +303,11 @@ pub trait ExportJobController: Send + Sync + 'static {
     /// The job begins running immediately in the background. The tenant
     /// is taken from `task.tenant` and recorded so subsequent accessor
     /// calls can be tenant-checked.
-    fn submit(&self, task: ExportTask) -> JobId;
+    ///
+    /// Refuses the job with [`SubmitError::TenantJobLimit`] when the task's
+    /// tenant already has the controller's maximum number of jobs queued or
+    /// running.
+    fn submit(&self, task: ExportTask) -> Result<JobId, SubmitError>;
 
     /// Returns the current [`JobStatus`] for the given job, or `None` if
     /// the job ID is unknown OR if `tenant_id` does not match the tenant

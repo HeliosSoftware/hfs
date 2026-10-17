@@ -38,3 +38,6 @@ __pycache__/
 # docs/ are local working notes too (discussion #223); they never ship.
 /docs/cluster-*.md
 /docs/draft-issues-*.md
+
+# Local $bulk-submit output receipts
+data/submit/

@@ -47,8 +47,14 @@ pub struct Row {
     /// anchors onto a row by string equality.
     pub path: String,
     pub indent: usize,
-    /// Element name, or the index of a repeating item.
+    /// Element name (including collection headers), or an item's index under
+    /// its named collection.
     pub label: String,
+    /// Field identity and exact path, even when the visible label is `[0]`.
+    pub accessible_label: String,
+    /// An array header has append actions, never the child-field picker of
+    /// the array's item type. Its entries keep their own indexed rows.
+    pub collection: Option<CollectionRow>,
     /// `HumanName`, `string`, … — shown as a hint.
     pub type_label: String,
     /// Primitive value, for the input.
@@ -89,6 +95,13 @@ pub struct Row {
     /// The `short` human label; the raw element name stays as the technical
     /// hint next to it.
     pub short: String,
+}
+
+/// Presentation of an existing JSON array. An append still mutates the
+/// owning object, so its path is deliberately separate from [`Row::path`].
+pub struct CollectionRow {
+    pub parent_path: String,
+    pub append: Vec<AddOption>,
 }
 
 /// A profiled extension offered at a node (#363).
@@ -166,6 +179,7 @@ pub struct EditorPage {
     pub active_page: &'static str,
     pub resource_type: String,
     pub resource_id: String,
+    pub return_to: String,
 }
 
 #[derive(Template)]
@@ -176,21 +190,19 @@ pub struct EditorBody {
     /// The in-flight document. This *is* the editor's state: it rides in a
     /// hidden field and comes back with every mutation.
     pub document: String,
-    /// Pretty JSON (2-space indent, key order preserved), for the raw-edit
-    /// textarea and for `#editor-pretty` (#843) — a host that mirrors the
+    /// Pretty JSON (2-space indent, key order preserved), for
+    /// `#editor-pretty` (#843) — a host that mirrors the
     /// document into its own text editor always has the same pretty-printed
     /// text the guided form itself computed.
     pub pretty: String,
-    /// The foldable, line-numbered JSON view shown beside the guided form.
-    pub json_lines: Vec<crate::json_view::JsonLine>,
-    /// Shared JSON-view partial options. Editor hosts keep the legacy id and
-    /// path metadata used by editor-sync.js.
-    pub json_view_id: &'static str,
-    pub json_view_paths: bool,
     pub error_count: usize,
     /// Issues the validator reported against a path no row owns (an invariant
     /// on a backbone element, say). Surfaced rather than swallowed.
     pub orphan_errors: Vec<String>,
+    /// JSON array of `{path, message}` objects, one per validation issue,
+    /// published on the validity chip as `data-issues` so the JSON editor
+    /// can mark the line each issue belongs to. `"[]"` when there are none.
+    pub issues_json: String,
     pub parse_error: Option<String>,
     /// Dotted path of the node the last mutation created, so the client can
     /// put the caret straight into it after the swap (#547). Empty when the
@@ -216,12 +228,11 @@ pub struct EditorBody {
 }
 
 /// The `pane=form` fragment (#843): the guided-form panel alone, for a host —
-/// View Definitions — that keeps its own JSON view (a CodeMirror pane, not
-/// this crate's line-numbered [`crate::json_view`]) and only wants the form
-/// half re-rendered on every keystroke. Carries the same hidden-state
+/// View Definitions — that keeps its own JSON view (a CodeMirror pane) and
+/// only wants the form half re-rendered on every keystroke. Carries the same hidden-state
 /// contract as [`EditorBody`] (`partials/editor-hidden-form.html`, shared by
-/// both templates) plus the form card, minus the JSON pane, `.editor__grid`,
-/// and the raw-edit textarea.
+/// both templates) plus the form card, minus the JSON pane and
+/// `.editor__grid`.
 #[derive(Template)]
 #[template(path = "partials/editor-form-fragment.html")]
 pub struct EditorFormPane {
@@ -231,6 +242,10 @@ pub struct EditorFormPane {
     pub pretty: String,
     pub error_count: usize,
     pub orphan_errors: Vec<String>,
+    /// JSON array of `{path, message}` objects, one per validation issue,
+    /// published on the validity chip as `data-issues`. `"[]"` when there
+    /// are none or no analysis ran.
+    pub issues_json: String,
     pub parse_error: Option<String>,
     pub focus_path: String,
     pub auto_open_add: bool,
@@ -254,6 +269,7 @@ pub struct EditorQuery {
     #[serde(rename = "type")]
     pub resource_type: Option<String>,
     pub id: Option<String>,
+    pub return_to: Option<String>,
 }
 
 /// A mutation, plus the document it applies to.
@@ -308,12 +324,20 @@ pub async fn page(
     rt: RequestTenant,
     Query(query): Query<EditorQuery>,
 ) -> Response {
+    let resource_type = query.resource_type.unwrap_or_else(|| "Patient".to_string());
+    let fallback = match resource_type.as_str() {
+        "SearchParameter" => "/ui/search-parameters",
+        "CompartmentDefinition" => "/ui/compartments",
+        _ => "/ui/resources",
+    };
     render(EditorPage {
         status: crate::current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "editor",
-        resource_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
+        resource_type,
         resource_id: query.id.unwrap_or_default(),
+        return_to: crate::navigation::safe_ui_return(query.return_to.as_deref())
+            .unwrap_or_else(|| fallback.to_string()),
     })
 }
 
@@ -355,6 +379,7 @@ pub async fn render_body(
                     pretty: form.doc,
                     error_count: 0,
                     orphan_errors: Vec::new(),
+                    issues_json: "[]".to_string(),
                     parse_error: Some(error.to_string()),
                     focus_path: String::new(),
                     auto_open_add: false,
@@ -367,11 +392,9 @@ pub async fn render_body(
                     rows: Vec::new(),
                     document: form.doc.clone(),
                     pretty: form.doc,
-                    json_lines: Vec::new(),
-                    json_view_id: "json-view",
-                    json_view_paths: true,
                     error_count: 0,
                     orphan_errors: Vec::new(),
+                    issues_json: "[]".to_string(),
                     parse_error: Some(error.to_string()),
                     focus_path: String::new(),
                     auto_open_add: false,
@@ -536,11 +559,30 @@ const SOF_ONLY_LINT_CODES: &[helios_sof::lint::DiagnosticCode] = &[
     helios_sof::lint::DiagnosticCode::MultipleIterationDirectives,
 ];
 
+/// One validation issue as published to the JSON editor: the dotted path
+/// (without the `<ResourceType>.` prefix; `""` is the document root) and the
+/// bare message, without the `"{path}: "` prefix `orphan_errors` adds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EditorIssue {
+    /// Dotted element path, e.g. `name.0.given`; empty for the root.
+    pub path: String,
+    /// The validator's message for that path.
+    pub message: String,
+}
+
+/// Serializes issues for the `data-issues` attribute; `"[]"` on failure.
+fn issues_to_json(issues: &[EditorIssue]) -> String {
+    serde_json::to_string(issues).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// Row-anchored validation, flattened rows, and the document's serialized
 /// forms — everything [`EditorBody`] and [`EditorFormPane`] both render,
 /// computed once so the two response shapes can never disagree about what a
 /// document's issues are (#843).
 struct FormAnalysis {
+    /// Every deduplicated `(path, message)` the validator and lint reported,
+    /// including root and row-less paths, sorted by path then message.
+    issues: Vec<EditorIssue>,
     rows: Vec<Row>,
     document: String,
     pretty: String,
@@ -633,6 +675,17 @@ fn analyze(
         messages.retain(|message| seen.insert(message.clone()));
     }
 
+    let mut issues: Vec<EditorIssue> = by_path
+        .iter()
+        .flat_map(|(path, messages)| {
+            messages.iter().map(move |message| EditorIssue {
+                path: path.clone(),
+                message: message.clone(),
+            })
+        })
+        .collect();
+    issues.sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
+
     let mut rows = Vec::new();
     build_rows(
         &RowCtx {
@@ -680,6 +733,7 @@ fn analyze(
         .unwrap_or(false);
 
     FormAnalysis {
+        issues,
         document: serde_json::to_string(document).unwrap_or_default(),
         pretty: serde_json::to_string_pretty(document).unwrap_or_default(),
         error_count,
@@ -727,13 +781,11 @@ fn build_body(
     );
     EditorBody {
         i18n,
-        json_lines: crate::json_view::lines(&document),
-        json_view_id: "json-view",
-        json_view_paths: true,
         document: analysis.document,
         pretty: analysis.pretty,
         error_count: analysis.error_count,
         orphan_errors: analysis.orphan_errors,
+        issues_json: issues_to_json(&analysis.issues),
         rows: analysis.rows,
         parse_error,
         focus_path: analysis.focus_path,
@@ -789,6 +841,7 @@ pub(crate) fn build_form_pane(
         pretty: analysis.pretty,
         error_count: analysis.error_count,
         orphan_errors: analysis.orphan_errors,
+        issues_json: issues_to_json(&analysis.issues),
         rows: analysis.rows,
         parse_error: None,
         focus_path: analysis.focus_path,
@@ -843,6 +896,90 @@ struct RowCtx<'a> {
     hidden: &'a [String],
 }
 
+/// Projects the owning object's existing append offers onto one collection.
+/// Unknown arrays and arrays supplied for scalar fields stay visible without
+/// inventing an operation. Slice offers keep the projection's own seeds and
+/// cardinality rules.
+fn collection_row(
+    ctx: &RowCtx<'_>,
+    path: &[Step],
+    schema: Option<&helios_fhir_validator::FhirSchema>,
+) -> CollectionRow {
+    let mut collection = CollectionRow {
+        parent_path: String::new(),
+        append: Vec::new(),
+    };
+    let Some((Step::Field(name), parent_path)) = path.split_last() else {
+        return collection;
+    };
+    collection.parent_path = editor::path_to_string(parent_path);
+    let Some(schema) = schema.filter(|schema| schema.array == Some(true)) else {
+        return collection;
+    };
+    if !editor::node_at(ctx.document, parent_path).is_some_and(Value::is_object) {
+        return collection;
+    }
+    collection.append = editor::addable(ctx.resolver, ctx.resource_type, ctx.document, parent_path)
+        .into_iter()
+        .filter(|option| option.name == *name)
+        .map(to_option)
+        .collect();
+
+    // A taken choice is absent from the parent's picker, and concrete arms
+    // are always suppressed there. A repeated concrete arm can nevertheless
+    // append to itself. Resolve both ends of that relationship before offering
+    // it; `choose_type` would delete the existing entries and is never used.
+    if collection.append.is_empty()
+        && let Some(declarer) = &schema.choice_of
+    {
+        if schema.max.is_some_and(|max| {
+            editor::node_at(ctx.document, path)
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.len() as u64 >= max)
+        }) {
+            return collection;
+        }
+        let parent_schema = editor::schema_at_in(
+            ctx.resolver,
+            ctx.resource_type,
+            Some(ctx.document),
+            parent_path,
+        );
+        if parent_schema
+            .as_ref()
+            .and_then(|parent| parent.excluded.as_ref())
+            .is_some_and(|excluded| excluded.contains(name) || excluded.contains(declarer))
+        {
+            return collection;
+        }
+        let mut declarer_path = parent_path.to_vec();
+        declarer_path.push(Step::Field(declarer.clone()));
+        let declarer_schema = editor::schema_at_in(
+            ctx.resolver,
+            ctx.resource_type,
+            Some(ctx.document),
+            &declarer_path,
+        );
+        if declarer_schema
+            .as_ref()
+            .and_then(|schema| schema.choices.as_ref())
+            .is_some_and(|choices| choices.contains(name))
+        {
+            collection.append.push(AddOption {
+                name: name.clone(),
+                kind: "another",
+                type_label: schema.type_.clone().unwrap_or_default(),
+                required: false,
+                arms: Vec::new(),
+                must_support: schema.must_support.unwrap_or(false),
+                short: schema.short.clone().unwrap_or_default(),
+                slice: String::new(),
+            });
+        }
+    }
+    collection
+}
+
 /// Walks the document, emitting one row per node, depth-first, in spec order.
 fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>) {
     let RowCtx {
@@ -859,19 +996,12 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
         None => return,
     };
 
-    // A repeating element: one row per item, so each can be removed and edited
-    // independently.
-    if let Some(items) = node.as_array() {
-        for index in 0..items.len() {
-            let mut item_path = path.to_vec();
-            item_path.push(Step::Index(index));
-            build_rows(ctx, &item_path, depth, out);
-        }
-        return;
-    }
-
     let children = editor::present_children(resolver, resource_type, document, path);
-    let offered = editor::addable(resolver, resource_type, document, path);
+    let offered = if node.is_array() {
+        Vec::new()
+    } else {
+        editor::addable(resolver, resource_type, document, path)
+    };
 
     // #840: `hidden` only ever names first-level elements, so it only ever
     // filters the root row's own children (never visited, so never a row of
@@ -904,8 +1034,21 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
         Step::Index(_) => None,
     });
 
+    let accessible_name = match (last, name_of_node) {
+        (Some(Step::Index(index)), Some(name)) => format!("{name}[{index}]"),
+        _ => label.clone(),
+    };
+    let accessible_label = if key.is_empty() {
+        accessible_name
+    } else {
+        format!("{accessible_name} — {key}")
+    };
+
     let schema = editor::schema_at_in(resolver, resource_type, Some(document), path);
     let is_primitive = node.is_string() || node.is_boolean() || node.is_number();
+    let collection = node
+        .is_array()
+        .then(|| collection_row(ctx, path, schema.as_deref()));
 
     // An extended primitive lives in two JSON keys — `birthDate` and
     // `_birthDate`. The sibling is not a field of its own, so it gets a marker
@@ -926,6 +1069,8 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
         path: key.clone(),
         indent: depth * 18,
         label,
+        accessible_label,
+        collection,
         type_label: schema
             .as_ref()
             .and_then(|schema| schema.type_.clone())
@@ -941,22 +1086,27 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
         is_modifier: matches!(name_of_node, Some("modifierExtension")),
         is_unknown: !path.is_empty() && schema.is_none(),
         has_primitive_extension,
-        binding: schema.as_ref().and_then(|schema| {
-            schema.binding.as_ref().and_then(|binding| {
-                (binding.strength.as_deref() == Some("required")).then(|| {
-                    binding
-                        .value_set
-                        .split('/')
-                        .next_back()
-                        .unwrap_or_default()
-                        // The value set carries a `|4.0.1` version suffix.
-                        .split('|')
-                        .next()
-                        .unwrap_or_default()
-                        .to_string()
+        // Collection headers display binding metadata but have no input and
+        // must not add an input-only datalist of their own.
+        binding: schema
+            .as_ref()
+            .filter(|_| !node.is_array())
+            .and_then(|schema| {
+                schema.binding.as_ref().and_then(|binding| {
+                    (binding.strength.as_deref() == Some("required")).then(|| {
+                        binding
+                            .value_set
+                            .split('/')
+                            .next_back()
+                            .unwrap_or_default()
+                            // The value set carries a `|4.0.1` version suffix.
+                            .split('|')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string()
+                    })
                 })
-            })
-        }),
+            }),
         must_support: schema
             .as_ref()
             .and_then(|schema| schema.must_support)
@@ -1028,8 +1178,19 @@ fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>)
         } else {
             offered.into_iter().map(to_option).collect()
         },
-        can_remove: !path.is_empty(),
+        can_remove: !path.is_empty() && !node.is_array(),
     });
+
+    // Keep the array's own row, then its independently editable/removable
+    // indexed entries. Empty arrays from raw JSON still have a named header.
+    if let Some(items) = node.as_array() {
+        for index in 0..items.len() {
+            let mut item_path = path.to_vec();
+            item_path.push(Step::Index(index));
+            build_rows(ctx, &item_path, depth + 1, out);
+        }
+        return;
+    }
 
     if is_primitive {
         return;
@@ -1127,6 +1288,213 @@ fn to_option(addable: Addable) -> AddOption {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collection_registry(schema: Value) -> Arc<helios_fhir_validator::SchemaRegistry> {
+        let mut registry = helios_fhir_validator::SchemaRegistry::new();
+        registry.insert(serde_json::from_value(schema).unwrap());
+        for name in ["string", "code"] {
+            registry.insert(
+                serde_json::from_value(serde_json::json!({
+                    "name": name, "kind": "primitive-type"
+                }))
+                .unwrap(),
+            );
+        }
+        Arc::new(registry)
+    }
+
+    fn collection_analysis(
+        registry: &Arc<helios_fhir_validator::SchemaRegistry>,
+        document: &Value,
+    ) -> FormAnalysis {
+        analyze(
+            registry,
+            helios_fhir::FhirVersion::R4,
+            "CollectionTest",
+            document,
+            None,
+            &[],
+            "",
+        )
+    }
+
+    #[test]
+    fn collection_append_preserves_a_repeating_choice_and_checks_its_declarer() {
+        let schema = serde_json::json!({
+            "name": "CollectionTest", "kind": "resource",
+            "elements": {
+                "value": {"choices": ["valueString", "valueCode"]},
+                "valueString": {"type": "string", "array": true, "choiceOf": "value"},
+                "valueCode": {"type": "code", "choiceOf": "value"}
+            }
+        });
+        let registry = collection_registry(schema.clone());
+        let mut document =
+            serde_json::json!({"resourceType": "CollectionTest", "valueString": ["keep"]});
+        let analysis = collection_analysis(&registry, &document);
+        let group = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "valueString")
+            .unwrap();
+        let append = &group.collection.as_ref().unwrap().append;
+        assert_eq!(append.len(), 1);
+        assert_eq!(append[0].name, "valueString");
+        assert_eq!(append[0].kind, "another");
+        let form = mutation_form(&document, "add", "", &append[0].name, "");
+        let created = apply(
+            registry.as_ref(),
+            "CollectionTest",
+            &mut document,
+            &form,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(editor::path_to_string(&created), "valueString.1");
+        assert_eq!(document["valueString"], serde_json::json!(["keep", ""]));
+
+        for excluded in ["value", "valueString"] {
+            let mut excluded_schema = schema.clone();
+            excluded_schema["excluded"] = serde_json::json!([excluded]);
+            let registry = collection_registry(excluded_schema);
+            let analysis = collection_analysis(&registry, &document);
+            let group = analysis
+                .rows
+                .iter()
+                .find(|row| row.path == "valueString")
+                .unwrap();
+            assert!(group.collection.as_ref().unwrap().append.is_empty());
+        }
+        let mut unrelated = schema;
+        for maximum in [0, 2] {
+            let mut capped = unrelated.clone();
+            capped["elements"]["valueString"]["max"] = serde_json::json!(maximum);
+            let registry = collection_registry(capped);
+            let analysis = collection_analysis(&registry, &document);
+            let group = analysis
+                .rows
+                .iter()
+                .find(|row| row.path == "valueString")
+                .unwrap();
+            assert!(group.collection.as_ref().unwrap().append.is_empty());
+        }
+        unrelated["elements"]["value"]["choices"] = serde_json::json!(["valueCode"]);
+        let registry = collection_registry(unrelated);
+        let analysis = collection_analysis(&registry, &document);
+        let group = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "valueString")
+            .unwrap();
+        assert!(group.collection.as_ref().unwrap().append.is_empty());
+    }
+
+    #[test]
+    fn collection_append_keeps_slice_offers_caps_seeds_and_item_metadata() {
+        let registry = collection_registry(serde_json::json!({
+            "name": "CollectionTest", "kind": "resource",
+            "elements": {"identifier": {
+                "array": true, "type": "Identifier", "mustSupport": true,
+                "slicing": {"slices": {
+                    "mrn": {"max": 1, "match": {"type": "pattern", "value": {"system": "mrn"}},
+                            "schema": {"pattern": {"system": "mrn"}}},
+                    "other": {"max": 2, "match": {"type": "pattern", "value": {"system": "other"}},
+                              "schema": {"pattern": {"system": "other"}}},
+                    "forbidden": {"max": 0, "match": {"type": "pattern", "value": {"system": "forbidden"}}}
+                }}
+            }}
+        }));
+        let mut document = serde_json::json!({"resourceType": "CollectionTest", "identifier": [{"system": "mrn"}]});
+        let analysis = collection_analysis(&registry, &document);
+        let group = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "identifier")
+            .unwrap();
+        assert!(group.must_support);
+        assert!(group.addable.is_empty());
+        assert!(!group.accepts_extension);
+        assert!(!group.can_remove);
+        let append = &group.collection.as_ref().unwrap().append;
+        assert_eq!(append.len(), 2, "generic append and the unspent slice");
+        assert!(
+            !append
+                .iter()
+                .any(|option| option.slice == "mrn" || option.slice == "forbidden")
+        );
+        let item = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "identifier.0")
+            .unwrap();
+        assert_eq!(item.slice, "mrn");
+        assert!(item.must_support);
+        assert!(item.can_remove);
+
+        let option = append
+            .iter()
+            .find(|option| option.slice == "other")
+            .unwrap();
+        let mut form = mutation_form(&document, "add", "", &option.name, "");
+        form.slice = option.slice.clone();
+        let created = apply(
+            registry.as_ref(),
+            "CollectionTest",
+            &mut document,
+            &form,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(editor::path_to_string(&created), "identifier.1");
+        assert_eq!(document["identifier"][1]["system"], "other");
+    }
+
+    #[test]
+    fn collection_diagnostics_stay_on_the_array_or_its_exact_item() {
+        let registry = collection_registry(serde_json::json!({
+            "name": "CollectionTest", "kind": "resource",
+            "elements": {"codes": {
+                "array": true, "type": "code", "min": 2,
+                "short": "Codes in the collection",
+                "binding": {"strength": "required", "valueSet": "http://example.org/ValueSet/test"}
+            }}
+        }));
+        let document = serde_json::json!({"resourceType": "CollectionTest", "codes": [true]});
+        let analysis = collection_analysis(&registry, &document);
+        let group = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "codes")
+            .unwrap();
+        let item = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "codes.0")
+            .unwrap();
+        assert!(
+            !group.errors.is_empty(),
+            "array cardinality lands on the header"
+        );
+        assert!(
+            !item.errors.is_empty(),
+            "wrong primitive type lands on its item"
+        );
+        for error in group.errors.iter().chain(&item.errors) {
+            assert!(
+                !analysis
+                    .orphan_errors
+                    .iter()
+                    .any(|orphan| orphan.contains(error))
+            );
+        }
+        assert_eq!(group.binding_strength, "required");
+        assert_eq!(group.short, "Codes in the collection");
+        assert!(
+            group.binding.is_none(),
+            "headers do not emit input-only datalists"
+        );
+        assert_eq!(item.binding.as_deref(), Some("test"));
+    }
 
     #[test]
     fn dotted_path_from_pointer_converts_the_lint_examples() {
@@ -1400,5 +1768,55 @@ mod tests {
         let form = mutation_form(&document, "set", "status", "", "retired");
         apply(&*registry, "Library", &mut document, &form, &hidden);
         assert_eq!(document["status"], "retired");
+    }
+
+    fn patient_analysis(document: &Value) -> FormAnalysis {
+        analyze(
+            &packs::core_registry(helios_fhir::FhirVersion::R4),
+            helios_fhir::FhirVersion::R4,
+            "Patient",
+            document,
+            None,
+            &[],
+            "",
+        )
+    }
+
+    #[test]
+    fn analyze_lists_issues_with_dotted_paths() {
+        let analysis = patient_analysis(&serde_json::json!({
+            "resourceType": "Patient", "gender": "M"
+        }));
+        let issue = analysis
+            .issues
+            .iter()
+            .find(|issue| issue.path == "gender")
+            .unwrap_or_else(|| panic!("issues: {:?}", analysis.issues));
+        assert!(!issue.message.is_empty());
+        assert!(!issue.message.starts_with("gender: "), "{}", issue.message);
+    }
+
+    #[test]
+    fn analyze_issue_list_is_empty_for_a_valid_document() {
+        let analysis = patient_analysis(&serde_json::json!({
+            "resourceType": "Patient", "gender": "male"
+        }));
+        assert!(analysis.issues.is_empty(), "issues: {:?}", analysis.issues);
+    }
+
+    #[test]
+    fn analyze_issue_list_is_sorted_and_deduplicated() {
+        let analysis = patient_analysis(&serde_json::json!({
+            "resourceType": "Patient", "zzUnknown": "x", "gender": "M"
+        }));
+        let paths: Vec<&str> = analysis.issues.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            paths.contains(&"gender") && paths.contains(&"zzUnknown"),
+            "{paths:?}"
+        );
+        let mut sorted = analysis.issues.clone();
+        sorted.sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
+        sorted.dedup();
+        assert_eq!(analysis.issues, sorted);
     }
 }

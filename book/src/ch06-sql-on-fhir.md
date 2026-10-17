@@ -198,7 +198,7 @@ sof-cli [OPTIONS]
 | `-f, --format <FMT>` | Output format: `csv`, `json`, `ndjson`, `parquet` (default: `csv`) |
 | `--no-headers` | Omit CSV header row |
 | `-o, --output <FILE>` | Write to file instead of stdout |
-| `--since <RFC3339>` | Filter resources modified after this time |
+| `--since <RFC3339>` | Filter resources modified at or after this time |
 | `--limit <N>` | Limit results to N rows (1–10000) |
 | `--fhir-version <VER>` | FHIR version: `R4`, `R4B`, `R5`, `R6` (default: `R4`) |
 
@@ -206,7 +206,7 @@ sof-cli [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--parquet-row-group-size <MB>` | 256 | Row group size in MB (64–1024) |
+| `--parquet-row-group-size <MB>` | 256 | Encoded MB at which a row group is cut (64–1024); peak memory is about 3x this value |
 | `--parquet-page-size <KB>` | 1024 | Page size in KB (64–8192) |
 | `--parquet-compression <ALG>` | snappy | `none`, `snappy`, `gzip`, `lz4`, `brotli`, `zstd` |
 | `--max-file-size <MB>` | 1000 | Max file size; creates numbered files when exceeded |
@@ -257,18 +257,40 @@ cat view.json | sof-cli -b data.json -f csv
 | `ndjson` | One JSON row object per line (newline-delimited) |
 | `parquet` | Columnar binary format; Snappy compression by default |
 
+In CSV output, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'`, so a spreadsheet shows it as text instead of running it as a formula. A cell holding a plain number (for example `-5` or `+3.5`) is written unchanged. This applies to `sof-cli`, `sof-server`, `pysof` and the HFS `$sql-run` / `$sql-export` CSV output.
+
 ### Parquet Type Mapping
+
+Column types follow the `type` declared in the ViewDefinition, using the SQL-on-FHIR 3.0.0-ballot default mappings to ISO/IEC 9075 types:
 
 | FHIR type | Arrow / Parquet type |
 |-----------|----------------------|
 | `boolean` | `BOOLEAN` |
-| `string`, `code`, `uri` | `UTF8` |
-| `integer` | `INT32` |
-| `decimal` | `FLOAT64` |
-| `dateTime`, `date` | `UTF8` |
-| Arrays | Arrow `List` type |
+| `integer`, `positiveInt`, `unsignedInt` | `INT32` |
+| `integer64` | `INT64` |
+| `decimal` | `UTF8` (digits preserved, trailing zeros stripped; not a float) |
+| `instant` | `TIMESTAMP(µs, UTC)` |
+| `base64Binary` | `BINARY` |
+| `date`, `dateTime`, `time` | `UTF8` |
+| `string`, `code`, `uri` and other types | `UTF8` |
+| `collection: true` | Arrow `List` of the element type |
 
-All fields are `OPTIONAL`. Snappy compression is the default.
+Columns that declare no `type` are inferred from the values (a number with a fractional part becomes `UTF8`; integers become `INT32`, widened to `INT64` when needed). A column can override its default with a `tag` named `ansi/type`, for example `DATE` on a `birthDate` column to get a native date:
+
+```json
+{ "name": "birth_date", "path": "birthDate", "type": "date",
+  "tag": [{ "name": "ansi/type", "value": "DATE" }] }
+```
+
+An unknown or incompatible `ansi/type` value is rejected with an error naming the column, and so is a value that does not fit the requested type. The accepted values and the emitter-by-emitter comparison with the specification are in the [`helios-sof` README](https://github.com/HeliosSoftware/hfs/blob/main/crates/sof/README.md#column-type-mapping).
+
+**Upgrading:** `decimal` columns were `FLOAT64`, `instant` columns `UTF8`, `integer64` was truncated to `INT32` and `base64Binary` was `UTF8`. To keep a numeric decimal column, add the tag `ansi/type: DOUBLE PRECISION`. The tag element is `tag` (singular, as in the specification's StructureDefinition); the `tags` spelling in the specification's prose example is a typo and is not read.
+
+Types come from the `type` declared on each ViewDefinition column (a value that does not fit a declared `integer`-family type is an error naming the column); a column with no declared `type` is inferred from the first 100 rows only. An inferred integer column is `INT64` instead of `INT32` when an integer outside the 32-bit range appears in the rows available when the schema is fixed (every row for buffered output, only the leading rows for streamed output). For an inferred column, a later value that does not fit the inferred type (for example a non-integer in an `INT32` column, or a large integer past the leading rows of a streamed result) becomes null; declare the `type` to avoid this. All fields are `OPTIONAL`. Snappy compression is the default.
+
+Parquet and Arrow IPC are encoded incrementally: the schema is fixed before the first row, rows are encoded in batches, and a Parquet row group is written each time its encoded size reaches the configured row group size. Memory therefore stays bounded by about one row group rather than the whole result, and `$sql-run` sends the response as the row groups are written. If a row fails after the response has started, the body is aborted instead of ending in a truncated file with a clean `200`. When a maximum file size is set, splitting happens between batches, so a file can exceed the limit by one batch plus the footer. The first file keeps the plain name and later files are numbered `_002`, `_003` (there is no `_001`).
+
+On the HTTP side, a streamed Parquet or Arrow response has no `Content-Length` and uses chunked transfer encoding. The request timeout covers only the handler, not the body, so a slow client is bounded by backpressure rather than by a timeout. Arrow responses are still subject to response compression. If the client disconnects, encoding stops and the row stream is dropped. Typed columns accept numeric and boolean text (some runners return text); a value that does not fit its declared type is an error naming the column (the response is then aborted, as for any mid-stream error), while a misfit in an inferred column becomes null. The Binary envelope, `_format=fhir`, inline resources and SQLQuery/Library subjects are still built in memory.
 
 ---
 
@@ -333,6 +355,89 @@ curl -X POST http://localhost:8080/\$sql-run \
 | `SOF_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `SOF_ENABLE_CORS` | `true` | Enable CORS |
 | `SOF_CORS_ORIGINS` | `*` | Allowed CORS origins |
+
+---
+
+## HFS stored-data ordering
+
+For the same stored resources, tenant, ViewDefinition and filters, HFS's
+SQLite and PostgreSQL runners apply the following ordering contract.
+
+| Runner and view shape | Row order and preview | Collection cells |
+|-----------------------|-----------------------|------------------|
+| **SQLite/PostgreSQL, flat** | Ascending stored update timestamp, then bytewise resource ID. Preview is a prefix of unlimited output, and of export on SQLite. | Source occurrence order. |
+| **SQLite/PostgreSQL, forEach/forEachOrNull without unionAll/repeat** | The same resource order, then the source occurrence tuple. Preview is a prefix of unlimited output, and of export on SQLite. | Source occurrence order. |
+| **PostgreSQL export (`$sql-export`), all view shapes** | Ascending bytewise resource ID, then the source occurrence tuple for expanded views. Export is not ordered by update timestamp, so preview is not a prefix of export. | Source occurrence order. |
+| **PostgreSQL, unionAll/repeat** | No total global order guarantee; the output cap remains on the client. | Source occurrence order. |
+| **SQLite, unionAll/repeat** | No total global order guarantee; the legacy final SQL LIMIT remains. | Source occurrence order. |
+| **Other runners and the standalone evaluator** | Existing behavior; this stored-data SQL contract adds no ordering guarantee. | Existing behavior. |
+
+The occurrence tuple follows select declaration and path order, including
+nested, chained and Cartesian expansions. Empty nullable expansions retain
+their placeholder occurrence. Each collection array and `join()` string
+follows its own source iterations. A scalar first-match `where()` pick, such
+as `name.where(use = 'official').first().family`, selects the first matching
+source occurrence. These cell rules also apply inside SQL-compilable
+`unionAll` and `repeat` views; content, cardinality, casts and null handling
+remain unchanged.
+
+For the covered flat and expanded roots, `_limit=N` returns the first N
+rows of unlimited output. On SQLite, export preserves that same sequence;
+read shards in manifest order. This comparison assumes unchanged data and
+identical filters. The requested output cap is applied once after filtering
+and ordering; intrinsic scalar picks retain their own limits.
+
+On PostgreSQL, `$sql-export` reads each view in pages of resources in
+bytewise resource ID order, so that a view over a large resource type does
+not have to sort the whole type before returning its first row. Read shards
+in manifest order. Each page is a separate statement, so an export does not
+read from a single database snapshot: a resource created or deleted while
+the export runs may or may not appear, while resources that stay unchanged are neither
+repeated nor skipped. `unionAll` and `repeat` views are paged the same way
+and keep their lack of a total global order.
+
+The [#1623 regression](https://github.com/HeliosSoftware/hfs/issues/1623)
+uses `p-large` with 150 names, `p-empty` with no names and `p-filtered` with
+one temporary name. A `forEachOrNull: "name"` view produces 152 unlimited
+rows. Within `p-large`, `Family-1`, `Family-2` and `Family-3` retain their
+source order. `_limit=50` returns the first 50 rows of that full sequence,
+including any preceding nullable rows, with the same data and filters.
+
+A `forEach` inside `unionAll` or `repeat` follows its parent's legacy
+exception. A `repeat` with one path that cannot recur on the type it
+reaches, such as `repeat: ["component"]` on Observation (a component has no
+`component`), is planned as a `forEach` over that path and follows the
+`forEach` row order. Total global order for those shapes, and changes to indexed
+paths or `%rowIndex`, remain follow-up work in
+[#1867](https://github.com/HeliosSoftware/hfs/issues/1867).
+
+Previously tied expanded rows and unordered collection cells may now appear
+in a different sequence. The additional sort keys can increase query cost,
+especially for unlimited output; a preview limit does not guarantee that
+the database reads only N source rows.
+
+---
+
+## SQL Query and SQL View Subjects
+
+The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or SQL View Library as the subject, as well as a ViewDefinition. A ViewDefinition runs inside the storage backend (SQL on SQLite and PostgreSQL, an aggregation pipeline on MongoDB). A SQL Query or SQL View does not: its SQL runs in an embedded SQLite database that is created for each request, whichever backend stores the data. Before that SQL runs, each `depends-on` ViewDefinition or nested SQL View is materialized into the embedded database in full, and the query's `WHERE` clause is applied afterwards, to the materialized rows. Each dependency is therefore subject to a per-dependency row cap, `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). A dependency that produces more rows fails the request with a `422` that names the dependency. To stay under the cap, narrow the dependency itself by adding a `where` to its ViewDefinition, so the filtering happens before the rows are materialized. Raising the cap also works, but it loads more rows into the request's memory. A Library may declare at most 4 × `HFS_SOF_SQLQUERY_MAX_VDS` `depends-on` entries (64 by default) and a request at most 256 `context` entries; exceeding either is a `400` before that Library's own dependencies are fetched. `$sql-export` also accepts at most 64 `subject` entries, both operations accept at most 1000 `patient` plus `group` values, and a tenant may have at most `HFS_EXPORT_MAX_JOBS_PER_TENANT` (default 8) export jobs queued or running, with a `429` and `Retry-After` beyond that.
+
+A `unionAll` ViewDefinition can be a dependency of either Library type. Its dependency table has one column per distinct name, retaining the first declaration's position and type; every branch contributes its rows, including duplicates. The SQL emitters still require the branches to declare the same columns in the same order.
+
+For `$sql-run` on HFS and sof-server, a `patient` or `group` body parameter must contain a nonblank `valueReference.reference` or `valueString`. The value is trimmed. Identifier-only or display-only references, unsupported value fields, and empty values return a `400` OperationOutcome naming the parameter. HFS applies this rule to inline resources, stored ViewDefinitions and Library subjects; `$sql-export` uses the same rule.
+
+Stored-data runners on SQLite, PostgreSQL and S3 use `HFS_DEFAULT_FHIR_VERSION` for FHIR metadata. A server configured for R5 therefore uses R5 cardinality and compartment rules; correcting an earlier R4 default can change stored-data results on such a server.
+
+When SQLite or PostgreSQL cannot lower a computed iteration source, a direct ViewDefinition `$sql-run` returns `422`, including a NUL string literal inside a nested `extension()` or `where()` focus. It no longer substitutes an empty source. A non-path `forEach` source remains unsupported. A compilation failure inside a SQL Query or SQL View dependency currently surfaces as `500`; preserving its `422` through dependency execution is tracked in [#1864](https://github.com/HeliosSoftware/hfs/issues/1864).
+
+These limits apply to SQL Query and SQL View subjects of `$sql-run` and `$sql-export`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result. Rows beyond it are silently dropped, not an error. |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per dependency (a `depends-on` ViewDefinition or SQL View). A dependency that produces more fails the request with a `422` naming it. |
+| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in the resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries. |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, in seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's). It does not cover materializing a dependency. |
 
 ---
 

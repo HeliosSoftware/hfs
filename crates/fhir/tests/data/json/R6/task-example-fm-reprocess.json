@@ -24,7 +24,14 @@
     ]
   },
   "focus": [
-    null
+    {
+      "valueReference": {
+        "identifier": {
+          "system": "http://happyvalley.com/claim",
+          "value": "1501"
+        }
+      }
+    }
   ],
   "authoredOn": "2018-10-04T08:25:05+10:00",
   "lastModified": "2018-10-04T08:25:05+10:00",

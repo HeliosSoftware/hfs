@@ -11,16 +11,20 @@
       "valueCode": "normative"
     },
     {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version",
+      "valueCode": "6.0.0-snapshot1"
+    },
+    {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
       "valueCode": "fhir"
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Timing",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-snapshot1",
   "name": "Timing",
   "status": "active",
   "experimental": false,
-  "date": "2026-07-17T03:44:13+00:00",
+  "date": "2026-09-14T16:43:45+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -53,7 +57,7 @@
     }
   ],
   "purpose": "Need to able to track proposed timing schedules. There are several different ways to do this: one or more specified times, a simple rules like three times a day, or  before/after meals.",
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-snapshot1",
   "mapping": [
     {
       "identity": "v2",
@@ -730,7 +734,7 @@
           ],
           "strength": "required",
           "description": "A unit of time (units from UCUM).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1"
         },
         "mapping": [
           {
@@ -932,7 +936,7 @@
           ],
           "strength": "required",
           "description": "A unit of time (units from UCUM).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1"
         },
         "mapping": [
           {
@@ -1056,7 +1060,7 @@
             }
           ],
           "strength": "required",
-          "valueSet": "http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-snapshot1"
         },
         "mapping": [
           {
@@ -1151,7 +1155,7 @@
           ],
           "strength": "required",
           "description": "Real-world event relating to the schedule.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/event-timing|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/event-timing|6.0.0-snapshot1"
         },
         "mapping": [
           {
@@ -1548,7 +1552,7 @@
           ],
           "strength": "required",
           "description": "A unit of time (units from UCUM).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1"
         },
         "mapping": [
           {
@@ -1675,7 +1679,7 @@
           ],
           "strength": "required",
           "description": "A unit of time (units from UCUM).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1"
         },
         "mapping": [
           {
@@ -1754,7 +1758,7 @@
             }
           ],
           "strength": "required",
-          "valueSet": "http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-snapshot1"
         },
         "mapping": [
           {
@@ -1819,7 +1823,7 @@
           ],
           "strength": "required",
           "description": "Real-world event relating to the schedule.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/event-timing|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/event-timing|6.0.0-snapshot1"
         },
         "mapping": [
           {

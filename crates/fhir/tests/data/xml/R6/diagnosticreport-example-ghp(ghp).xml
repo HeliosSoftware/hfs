@@ -73,8 +73,19 @@
       <Specimen>
         <id value="rtt"/>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen rtt</b></p><a name="rtt"> </a><a name="hcrtt"> </a><p><b>identifier</b>: Accession ID/20150816-001245</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 119364003}">Serum sample</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p><h3>Devices</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Reference</b></td></tr><tr><td style="display: none">*</td><td><a href="device-example-specimen-container-example-sst-vacutainer.html">Device: identifier = http://acme.com/containers/id#345679</a></td></tr></table></blockquote></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen rtt</b></p><a name="rtt"> </a><a name="hcrtt"> </a><p><b>identifier</b>: Accession ID/20150816-001245, Accession ID/20150816-001245</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 119364003}">Serum sample</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p><h3>Devices</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Reference</b></td></tr><tr><td style="display: none">*</td><td><a href="device-example-specimen-container-example-sst-vacutainer.html">Device: identifier = http://acme.com/containers/id#345679</a></td></tr></table></blockquote></div>
         </text>
+        <identifier>
+          <type>
+            <coding>
+              <system value="http://terminology.hl7.org/CodeSystem/v2-0203"/>
+              <code value="ACSN"/>
+              <display value="Accession ID"/>
+            </coding>
+          </type>
+          <system value="http://acme.com/labs/accession-ids"/>
+          <value value="20150816-001245"/>
+        </identifier>
         <identifier>
           <type>
             <coding>
@@ -118,8 +129,19 @@
       <Specimen>
         <id value="ltt"/>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen ltt</b></p><a name="ltt"> </a><a name="hcltt"> </a><p><b>identifier</b>: Accession ID/20150816-00124</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 445295009}">Blood specimen with EDTA</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p><h3>Devices</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Reference</b></td></tr><tr><td style="display: none">*</td><td><a href="device-example-specimen-container-lavender-vacutainer.html">Device: identifier = http://acme.com/containers/id#345675; biologicalSourceEvent = </a></td></tr></table></blockquote></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen ltt</b></p><a name="ltt"> </a><a name="hcltt"> </a><p><b>identifier</b>: Accession ID/20150816-00124, Accession ID/20150816-00124</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 445295009}">Blood specimen with EDTA</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p><h3>Devices</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Reference</b></td></tr><tr><td style="display: none">*</td><td><a href="device-example-specimen-container-lavender-vacutainer.html">Device: identifier = http://acme.com/containers/id#345675; biologicalSourceEvent = http://terminology.hl7.org/NamingSystem/ib#A999908123456</a></td></tr></table></blockquote></div>
         </text>
+        <identifier>
+          <type>
+            <coding>
+              <system value="http://terminology.hl7.org/CodeSystem/v2-0203"/>
+              <code value="ACSN"/>
+              <display value="Accession ID"/>
+            </coding>
+          </type>
+          <system value="http://acme.com/lab/accession-ids"/>
+          <value value="20150816-00124"/>
+        </identifier>
         <identifier>
           <type>
             <coding>
@@ -163,8 +185,19 @@
       <Specimen>
         <id value="urine"/>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen urine</b></p><a name="urine"> </a><a name="hcurine"> </a><p><b>identifier</b>: Accession ID/20150816-00124</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 122575003}">Urine specimen</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p><h3>Devices</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Reference</b></td></tr><tr><td style="display: none">*</td><td><a href="device-example-specimen-container-polycup.html">Device: identifier = http://acme.com/containers/id#345675</a></td></tr></table></blockquote></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen urine</b></p><a name="urine"> </a><a name="hcurine"> </a><p><b>identifier</b>: Accession ID/20150816-00124, Accession ID/20150816-00124</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 122575003}">Urine specimen</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p><h3>Devices</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Reference</b></td></tr><tr><td style="display: none">*</td><td><a href="device-example-specimen-container-polycup.html">Device: identifier = http://acme.com/containers/id#345675</a></td></tr></table></blockquote></div>
         </text>
+        <identifier>
+          <type>
+            <coding>
+              <system value="http://terminology.hl7.org/CodeSystem/v2-0203"/>
+              <code value="ACSN"/>
+              <display value="Accession ID"/>
+            </coding>
+          </type>
+          <system value="http://acme.com/lab/accession-ids"/>
+          <value value="20150816-00124"/>
+        </identifier>
         <identifier>
           <type>
             <coding>

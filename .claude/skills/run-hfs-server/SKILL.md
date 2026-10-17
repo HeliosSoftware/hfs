@@ -33,19 +33,29 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_SERVER_PORT` | `8080` | Server port |
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_LOG_LEVEL` | `info` | Log level: error, warn, info, debug, trace |
-| `HFS_BASE_URL` | `http://localhost:8080` | Base URL for Location headers and Bundle links |
+| `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base for Location headers and Bundle links |
 | `HFS_DATA_DIR` | `./data` | FHIR data directory, including search parameters |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. `false` = headless (`/ui` returns 404 + OperationOutcome). Replaces the removed `headless` build feature (#975) |
+| `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes (`--dashboard-reconcile-interval-secs`). Whole seconds, `> 0`; `0` or non-numeric fails startup. Also spaces per-tenant full recounts (max(interval, 10 × last recount duration)) and failed-seed retries |
+| `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (`--dashboard-refresh-secs`). Whole seconds, `> 0`, `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise fails startup. In-memory counters only |
+| `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a settled Home dashboard (`--dashboard-idle-refresh-secs`). Whole seconds, `> 0`, `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise fails startup |
+
+Set `HFS_BASE_URL` explicitly for containers and reverse proxies. Include any
+published path prefix. HFS rejects non-HTTP(S) values, credentials, query
+strings, and fragments, and it never derives the public base from request
+forwarding headers. A loopback base that conflicts with the listener produces
+a startup warning.
 
 ## Limits
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size in bytes, applied after decompression |
+| `HFS_MAX_BODY_SIZE` | `134217728` | Max request body size in bytes (128 MiB), applied after decompression; sized for the largest per-patient Synthea Bundle (#1662); such a bundle takes minutes, so raise `HFS_REQUEST_TIMEOUT` too |
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 
 ## Compression
 
@@ -70,11 +80,29 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | Elasticsearch index prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | none | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | none | Elasticsearch basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
+| `HFS_ELASTICSEARCH_MAX_TERMS_COUNT` | `65536` | Index `max_terms_count`: most values one `terms` query carries; a chained or `_has` search that pins more ids is sent as several `terms` clauses of at most this many each (#1548). Set on new indices |
+| `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | ES-backed composite write sync mode: asynchronous, synchronous, or hybrid |
 
-Use `HFS_COMPOSITE_SYNC_MODE=synchronous` **and** `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search. Either alone still leaves a window: synchronous mode only guarantees the document reached Elasticsearch, and it is not searchable until the next index refresh. See `crates/persistence/README.md` (Search visibility on Elasticsearch-backed composites).
+Use `HFS_COMPOSITE_SYNC_MODE=synchronous` **and** `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search. Either alone still leaves a window: synchronous mode only guarantees the document reached Elasticsearch, and it is not searchable until the next index refresh. See `crates/persistence/README.md` (Search visibility on Elasticsearch-backed composites). Transaction conditional references (`Organization?identifier=…` in a resource body) and `If-None-Exist` creates are exempt: they make acknowledged writes visible before resolving, on any setting (#1047).
+
+### When the search index misses a write (#1334)
+
+On an ES-backed composite the primary is the system of record: a write succeeds once the primary has committed it, in **every** `HFS_COMPOSITE_SYNC_MODE` (synchronous included), even if Elasticsearch then refuses the document after the sync retries. The client sees the same `201`/`200`/`204` either way; the resource is readable by id but missing from (or stale in) search until it is re-synced. That failure is never silent:
+
+- **Metric** (`/metrics`): `composite_secondary_sync_failures_total{backend,operation}` counts final failures (once per failed write, not per retry; `backend` is the secondary's id, `es`; `operation` is `create`/`update`/`delete`). `composite_secondary_sync_needs_reindex` is the number of resources currently recorded as owed. Alert on the gauge staying above zero. No tenant, type or id labels — `/metrics` is public.
+- **Log event**: one `ERROR` "Secondary sync failed; …" per final failure with fields `tenant`, `resource_type`, `id`, `version`, `backend_id`, `operation`, `attempts`, `recorded`, `error`. No resource content.
+- **Durable record**: one row per (tenant, type, id, backend) in the primary's `secondary_sync_failures` table (SQLite, PostgreSQL) or collection (MongoDB): `operation`, `first_failed_at`, `last_failed_at`, `last_error`, `attempts`. It survives restarts. A later successful write of the same resource clears it. **S3 primaries keep no ledger**: metric and log only (`recorded=false`), repair with `$reindex`.
+- **Repair**: a background task re-syncs recorded resources from the primary's *current* state (a delete if the primary no longer has it) and clears the record; a secondary that is still down leaves the record for the next pass. It is idempotent and safe alongside writes. `$reindex` also rebuilds the index; the next pass then finds the records in sync and clears them.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_COMPOSITE_SYNC_REPAIR_INTERVAL` | `60` | Seconds between repair passes; `0` disables the task (the records are still written) |
+| `HFS_COMPOSITE_SYNC_REPAIR_BATCH` | `100` | Records examined per pass, least recently failed first |
+
+To list what is owed: `SELECT * FROM secondary_sync_failures ORDER BY last_failed_at;` on the primary.
 
 ## Storage Backends
 
@@ -96,12 +124,17 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name in prefix-per-tenant mode |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | `prefix-per-tenant` (one shared bucket, tenant key prefixes) or `bucket-per-tenant` (a dedicated bucket per mapped tenant), see below |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket, prefix-per-tenant only |
+| `HFS_S3_TENANT_BUCKETS` | none | Bucket-per-tenant, required: `tenant=bucket,…`, must include `HFS_DEFAULT_TENANT` |
+| `HFS_S3_SYSTEM_BUCKET` | none | Bucket-per-tenant, optional: the tenant-independent bucket (registry, user settings, login sessions, bulk-submit index, `__system__`) |
 | `HFS_S3_REGION` | AWS chain | AWS region override |
 | `HFS_S3_ENDPOINT` | AWS | S3-compatible endpoint URL, such as MinIO |
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Required by MinIO and most S3-compatible providers |
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure HTTP endpoint URLs when `HFS_S3_ENDPOINT` is set |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
 
 The standard AWS credential chain applies. For S3-compatible endpoints, set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`. One HFS process shares a single AWS credential chain, so a MinIO primary store and real-AWS bulk-export output store cannot be combined in the same process.
 
@@ -118,27 +151,96 @@ loudly; one that silently *ignores* them would turn every concurrent write into 
 lost update with no error anywhere, so verify support before pointing HFS at an
 unfamiliar S3-compatible provider.
 
+### Conditional interactions on S3
+
+S3 has no search index, so of the four conditional interactions it serves only
+**conditional create** (`POST [type]` with `If-None-Exist`, and `batch` entries
+with `ifNoneExist`), identifier-scoped (#1435): `_id` criteria read the objects
+they name, `identifier` criteria walk the type's prefix (one `LIST` plus `GET`s
+until the second match) and are read as token search reads them (`code`,
+`system|code`, `|code`, `system|`; repeated criteria AND, comma lists OR). Any
+other parameter is refused with `400` before anything is read. Conditional
+update, delete and patch answer `501`, and the CapabilityStatement says so.
+The scan costs what an export or SQL-on-FHIR scan of the type costs; see #1502
+for the `LIST` curve on large prefixes.
+
+### S3 tenancy: prefix-per-tenant or bucket-per-tenant (#1598)
+
+`HFS_S3_TENANCY` selects where tenants live. The default, `prefix-per-tenant`,
+keeps every tenant in `HFS_S3_BUCKET` under its own key prefix (shared storage,
+like every other backend). `bucket-per-tenant` gives each tenant a dedicated
+bucket, for deployments that need per-tenant bucket policies, lifecycle rules,
+encryption keys or regions:
+
+```bash
+HFS_STORAGE_BACKEND=s3 HFS_S3_TENANCY=bucket-per-tenant \
+HFS_S3_TENANT_BUCKETS="default=hfs-default,acme=hfs-acme" \
+HFS_S3_SYSTEM_BUCKET=hfs-system ./hfs
+```
+
+Rules the binary enforces at startup, each a fatal error with the variable
+named: the two modes' variables do not mix (`HFS_S3_BUCKET` is refused under
+bucket-per-tenant, `HFS_S3_TENANT_BUCKETS`/`HFS_S3_SYSTEM_BUCKET` under
+prefix-per-tenant); `HFS_S3_TENANT_BUCKETS` is required and must map
+`HFS_DEFAULT_TENANT`; every tenant id goes through the canonical validator
+(`__system__` cannot be mapped); two tenants cannot share a bucket (they would
+write identical keys); and every bucket, system bucket included, must already
+exist (`HeadBucket`, unless `HFS_S3_VALIDATE_BUCKETS=false`). HFS never
+creates buckets.
+
+The map is the provisioning. At startup every mapped tenant is registered
+(when a system bucket hosts the registry) and seeded with the conformance
+resources; `POST /admin/tenants` for an id outside the map answers `400`
+"has no bucket assigned", as does any request for such a tenant. Adding a
+tenant means creating its bucket, adding it to `HFS_S3_TENANT_BUCKETS` and
+restarting. `DELETE /admin/tenants/{id}` deregisters (and with `?purge=true`
+empties the bucket's `resources/`, `history/` and `bulk/` prefixes), but a
+tenant still in the map is registered again at the next start.
+
+`HFS_S3_SYSTEM_BUCKET` is where the cross-tenant state goes in this mode:
+`tenants/`, `_system.user-settings/`, `_system.login-sessions/`,
+`_system.bulk-submit/`, and the `__system__` tenant's own `resources/` (the
+AuditEvent trail of `HFS_AUDIT_BACKEND=database`). It is optional. Without it
+`/admin/tenants`, `/_user/settings` and `$bulk-submit` answer `501`, the
+tenants page lists nothing, web login sessions are held in process (one node
+or sticky sessions; a restart signs everyone out, and startup warns), and a
+shared database audit sink is refused at startup (give it `HFS_AUDIT_S3_BUCKET`
+instead). Tenant discovery (`/admin/tenants` data counts, console tenant
+metrics) is `unsupported` in this mode either way: tenants live in a static
+map, and HFS does not enumerate the account's buckets.
+
+A tenant's bucket holds its data with no tenant prefix: `resources/`,
+`history/`, `bulk/submit/` directly under the optional `HFS_S3_PREFIX`. IAM per
+bucket is therefore simple: the tenant's bucket policy needs the FHIR prefixes
+below with the leading `{tenant}/` segment dropped; the system bucket's policy
+needs the three cross-tenant prefixes plus `resources/` and `history/` for
+`__system__`.
+
 ### S3 key prefixes (IAM)
 
 The backend writes under these prefixes inside `HFS_S3_BUCKET` (each below the
-optional `HFS_S3_PREFIX`):
+optional `HFS_S3_PREFIX`; in bucket-per-tenant mode drop the `{tenant}/` segment
+and read "the tenant's bucket" for the first group and "`HFS_S3_SYSTEM_BUCKET`"
+for the rest):
 
 | Prefix | Contents |
 |---|---|
-| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history |
+| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history (`history/_keyspace.json` is the per-tenant layout marker; the policy must allow `GetObject`/`PutObject` on it) |
 | `{tenant}/bulk/submit/` | Bulk-submit staging |
 | `tenants/` | Tenant registry |
 | `_system.user-settings/` | Per-user UI settings (`/_user/settings`) |
+| `_system.login-sessions/` | Web UI login sessions and pending logins (#1481) |
 
-The last two are **cross-tenant** and sit outside any tenant prefix. A
+The last three are **cross-tenant** and sit outside any tenant prefix. A
 least-privilege bucket policy scoped only to the FHIR prefixes will pass startup
 validation (which only issues `HeadBucket`) and then return `AccessDenied` — a
 500 on every affected request. Grant the policy these prefixes too.
 
 Note also that a **bucket-wide** lifecycle rule (expiration or Glacier
-transition) will apply to `_system.user-settings/` as well: expiry silently resets
-users' preferences, and a Glacier transition makes them unreadable. Scope lifecycle
-rules to the FHIR prefixes.
+transition) will apply to `_system.user-settings/` and `_system.login-sessions/`
+as well: expiry silently resets users' preferences or signs everyone out, and a
+Glacier transition makes them unreadable. Scope lifecycle rules to the FHIR
+prefixes.
 
 ## Per-user UI settings
 
@@ -178,14 +280,23 @@ unattributed. Sending `byTenant` in a request body is rejected with `422`.
 Supported on the **SQLite, PostgreSQL, MongoDB, and S3** backends. Elasticsearch is
 search-only and never a standalone primary, so an Elasticsearch-only deployment
 gets an explained `501 Not Implemented`. On S3 the store is also unavailable (and
-reports the same `501`) in bucket-per-tenant mode with no default system bucket,
-since there is nowhere tenant-independent to keep a user-global document.
+reports the same `501`) under `HFS_S3_TENANCY=bucket-per-tenant` with no
+`HFS_S3_SYSTEM_BUCKET`, since there is nowhere tenant-independent to keep a
+user-global document (#1598; see "S3 tenancy" above).
 
 When authentication is disabled, every caller resolves to the same fallback user
 key (`l2:`) and therefore **shares one settings document**. When auth is enabled,
 each caller's key is derived injectively from the token's `iss` and `sub`
 (`u2:{iss_len}:{iss}:{sub}`); a document written under the pre-#270 `iss|sub`
 encoding is migrated to the new key on first access.
+
+## Formats
+
+JSON is always available. FHIR XML (`_format=xml`, `Accept: application/fhir+xml`)
+needs the `xml` feature on the `hfs` build (`cargo build -p helios-hfs --features xml`);
+without it every XML request answers `406 Not Acceptable` with an OperationOutcome
+that says so, and `/metadata` advertises `json` only. NDJSON is for the bulk
+endpoints.
 
 ## Multi-tenancy
 
@@ -208,7 +319,7 @@ curl http://localhost:8080/clinic-a/Patient
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` | Default FHIR version: R4, R4B, R5, R6 |
+| `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version: R4, R4B, R5, R6 |
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources instead of 404 |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
@@ -248,6 +359,7 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | delete | DELETE | `/[type]/[id]` |
 | create | POST | `/[type]` |
 | search | GET/POST | `/[type]?params` or `/[type]/_search` |
+| search, system | GET/POST | `/?params` or `/_search` — **not supported**: `501` + OperationOutcome (`not-supported`), and not listed in `/metadata` (#1338). With the UI mounted, bare `GET /` (no query) redirects to `/ui` |
 | history, instance | GET | `/[type]/[id]/_history` |
 | history, type | GET | `/[type]/_history` |
 | history, system | GET | `/_history` |
@@ -257,6 +369,8 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | purge, type | POST | `/[type]/$purge` |
 | reindex | POST | `/$reindex`, `/[type]/$reindex` |
 | reindex status / cancel | GET/DELETE | `/$reindex-status/[job_id]` |
+| everything, instance | GET/POST | `/Patient/[id]/$everything` |
+| everything, type | GET/POST | `/Patient/$everything` |
 
 `$purge` (permanent, irreversible deletion including history) and `$reindex`
 (rebuild the search index) are administrative, non-FHIR operations. They require

@@ -20,7 +20,11 @@
 //!   the wrong type, SQLView artifacts that violate the profile's
 //!   `parameter 0..0` constraint, and label collisions. Every structural
 //!   error found is collected — nothing is executed until the whole graph
-//!   has been checked — and returned together. On success, produces a
+//!   has been checked — and returned together. The node limit
+//!   (`sof_sqlquery_max_vds`, [`SubjectNode::max_nodes`]) is the exception:
+//!   the walk stops at the first node past it, before fetching anything
+//!   further, returning the errors found so far plus [`check_max_nodes`]'s
+//!   error. On success, produces a
 //!   [`GraphPlan`] whose nodes are topologically ordered (leaves first).
 //! - **Phase 2 — execution** ([`execute_plan`]): materializes the plan's
 //!   nodes in order — leaf ViewDefinitions via the wired `SofRunner`,
@@ -35,17 +39,18 @@
 //! see the `#[cfg(test)]` module below.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::Stream;
 use helios_persistence::core::search::SearchProvider;
-use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
+use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
-    BoundParam, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError, TableSchema,
+    BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
+    TableSchema,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -114,6 +119,10 @@ pub(crate) enum PlanNode {
         sql: String,
         /// This node's own `depends-on` edges, resolved.
         edges: Vec<Edge>,
+        /// The Library's `name`, or its canonical URL when it has none —
+        /// how an error (see [`SqlQueryError::DependencyRowCapExceeded`])
+        /// names this node. Not used for resolution.
+        name: String,
     },
 }
 
@@ -156,6 +165,16 @@ pub(crate) struct SubjectNode<'a> {
     pub parameters_empty: bool,
     /// The subject's own `depends-on` edges.
     pub depends_on: &'a [DependsOnView],
+    /// The most `relatedArtifact` depends-on entries any one Library in the
+    /// walk may declare (the subject's and each SQLView's), checked before
+    /// that Library's dependencies are fetched. Callers pass
+    /// `input_limits::max_depends_on(sof_sqlquery_max_vds)`.
+    pub max_depends_on: usize,
+    /// The most dependency nodes (`sof_sqlquery_max_vds`) the walk may
+    /// resolve. The walk stops at the first node past it, before fetching
+    /// anything further, with [`check_max_nodes`]'s error. Callers pass
+    /// `sof_sqlquery_max_vds`.
+    pub max_nodes: usize,
 }
 
 // ============================================================================
@@ -260,6 +279,9 @@ struct Frame {
     /// The label the parent used to reference this node. `None` for the
     /// root frame, which has no parent.
     label_for_parent: Option<String>,
+    /// Display name of this node (see [`PlanNode::SqlView::name`]). Unused
+    /// for the root frame.
+    name: String,
 }
 
 fn next_internal_name(counter: &mut usize) -> String {
@@ -301,10 +323,21 @@ fn register_label(
     }
 }
 
+/// Counts one more resolved dependency node; `Some` once the count passes
+/// `max_nodes`.
+fn count_node(resolved: &mut usize, max_nodes: usize) -> Option<RestError> {
+    *resolved += 1;
+    (*resolved > max_nodes).then(|| max_nodes_error(*resolved, max_nodes))
+}
+
 /// Phase 1: walks the dependency graph rooted at `subject`, producing a
 /// topologically-ordered [`GraphPlan`] or the aggregated list of every
 /// structural problem found. Runs no SQL and touches the in-memory engine
 /// not at all — only `fetcher` (and `inline`) perform I/O.
+///
+/// The walk stops at the first node past [`SubjectNode::max_nodes`], before
+/// fetching anything further, and returns the errors found so far plus
+/// [`check_max_nodes`]'s error.
 ///
 /// Iterative: the traversal is an explicit stack of [`Frame`]s, not Rust call
 /// recursion, so the graph's depth is bounded only by [`MAX_GRAPH_DEPTH`] and
@@ -322,6 +355,17 @@ pub(crate) async fn build_plan(
         ));
     }
 
+    if subject.depends_on.len() > subject.max_depends_on {
+        errors.push(super::input_limits::depends_on_limit_error(
+            subject.identity.unwrap_or("<subject>"),
+            subject.depends_on.len(),
+            subject.max_depends_on,
+        ));
+        return Err(errors);
+    }
+    let max_depends_on = subject.max_depends_on;
+    let max_nodes = subject.max_nodes;
+
     let root_identity = subject.identity.unwrap_or("<subject>").to_string();
     let mut on_stack: HashSet<String> = HashSet::new();
     on_stack.insert(root_identity.clone());
@@ -334,6 +378,7 @@ pub(crate) async fn build_plan(
         sql: String::new(),
         resolved_edges: Vec::new(),
         label_for_parent: None,
+        name: String::new(),
     }];
 
     let mut nodes: Vec<PlanNode> = Vec::new();
@@ -341,6 +386,9 @@ pub(crate) async fn build_plan(
     let mut failed: HashSet<String> = HashSet::new();
     let mut label_registry: HashMap<String, String> = HashMap::new();
     let mut next_internal_id: usize = 0;
+    // A leaf counts once fetched, a SQLView once its frame is pushed (before
+    // its children are fetched); equals `nodes.len()` when the walk ends.
+    let mut resolved_nodes: usize = 0;
     let mut subject_edges: Vec<Edge> = Vec::new();
 
     loop {
@@ -369,6 +417,7 @@ pub(crate) async fn build_plan(
                 internal_name: internal_name.clone(),
                 sql: frame.sql,
                 edges: frame.resolved_edges,
+                name: frame.name,
             });
 
             if let Some(err) = register_label(&mut label_registry, &label, &internal_name) {
@@ -479,6 +528,10 @@ pub(crate) async fn build_plan(
 
         match kind {
             SubjectKind::ViewDefinition => {
+                if let Some(err) = count_node(&mut resolved_nodes, max_nodes) {
+                    errors.push(err);
+                    return Err(errors);
+                }
                 let internal_name = next_internal_name(&mut next_internal_id);
                 finished.insert(dep.url.clone(), internal_name.clone());
                 nodes.push(PlanNode::Leaf {
@@ -519,8 +572,22 @@ pub(crate) async fn build_plan(
                     failed.insert(dep.url.clone());
                     continue;
                 }
+                if library.depends_on.len() > max_depends_on {
+                    errors.push(super::input_limits::depends_on_limit_error(
+                        &dep.url,
+                        library.depends_on.len(),
+                        max_depends_on,
+                    ));
+                    failed.insert(dep.url.clone());
+                    continue;
+                }
+                if let Some(err) = count_node(&mut resolved_nodes, max_nodes) {
+                    errors.push(err);
+                    return Err(errors);
+                }
                 on_stack.insert(dep.url.clone());
                 path.push(dep.url.clone());
+                let name = artifact_display_name(&artifact, &dep.url).to_string();
                 stack.push(Frame {
                     identity: dep.url.clone(),
                     depends_on: library.depends_on,
@@ -528,6 +595,7 @@ pub(crate) async fn build_plan(
                     sql: library.sql,
                     resolved_edges: Vec::new(),
                     label_for_parent: Some(dep.label.clone()),
+                    name,
                 });
             }
             SubjectKind::SqlQuery => {
@@ -545,14 +613,25 @@ pub(crate) async fn build_plan(
     })
 }
 
+/// The error for a dependency graph of `count` nodes where at most `max_vds`
+/// (`sof_sqlquery_max_vds`) are allowed. Shared by [`build_plan`], which stops
+/// at the first node past the limit, and [`check_max_nodes`].
+fn max_nodes_error(count: usize, max_vds: usize) -> RestError {
+    RestError::UnprocessableEntity {
+        message: format!("dependency graph has {count} nodes; max allowed is {max_vds}"),
+    }
+}
+
 /// Enforces `sof_sqlquery_max_vds` against the whole resolved plan (every
 /// node the graph reached, not just the subject's direct dependencies).
+///
+/// The final assertion on a finished plan: [`build_plan`] already stops at the
+/// first node past [`SubjectNode::max_nodes`], and this stays so that any plan
+/// is checked however it was built.
 pub(crate) fn check_max_nodes(plan: &GraphPlan, max_vds: usize) -> Result<(), RestError> {
     let count = plan.node_count();
     if count > max_vds {
-        return Err(RestError::UnprocessableEntity {
-            message: format!("dependency graph has {count} nodes; max allowed is {max_vds}"),
-        });
+        return Err(max_nodes_error(count, max_vds));
     }
     Ok(())
 }
@@ -623,7 +702,10 @@ pub(crate) struct ExecLimits {
 /// error, a backend statement timeout, or a lost connection while streaming
 /// a leaf ViewDefinition's rows — never that the Library or its
 /// ViewDefinitions were malformed; callers must not treat it as a client
-/// error.
+/// error. When the store reports itself unavailable ([`SofError::Unavailable`],
+/// from `run_view` or from a row), the error is instead
+/// [`SqlQueryError::SourceUnavailable`], which the REST layer answers with
+/// `503` (#2048).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan(
     mut engine: InMemorySqlEngine,
@@ -644,13 +726,29 @@ pub(crate) async fn execute_plan(
                 internal_name,
                 view,
             } => {
-                let schema = TableSchema::from_view_definition(view);
+                // An invalid `ansi/type` tag is a client error: name the view
+                // and column instead of silently dropping the tag.
+                let schema = TableSchema::try_from_view_definition(view).map_err(|e| {
+                    SqlQueryError::MalformedLibrary(format!(
+                        "dependency view '{}': {e}",
+                        artifact_display_name(view, internal_name)
+                    ))
+                })?;
                 engine.create_table(internal_name, &schema)?;
-                let view_label = leaf_view_label(view, internal_name);
+                let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();
                 let row_stream = match runner.run_view(tenant, view.clone(), filters.clone()).await
                 {
                     Ok(s) => s,
+                    Err(SofError::Unavailable(message)) => {
+                        warn!(
+                            table = %internal_name,
+                            view = %view_label,
+                            error = %message,
+                            "SQL query dependency unavailable"
+                        );
+                        return Err(SqlQueryError::SourceUnavailable(message));
+                    }
                     Err(e) => {
                         warn!(
                             table = %internal_name,
@@ -663,7 +761,11 @@ pub(crate) async fn execute_plan(
                         )));
                     }
                 };
-                let row_stream = adapt_row_stream(row_stream);
+                // The engine sees row errors as bare strings; this keeps the
+                // first one the store reported as unavailable, so the engine's
+                // `SourceStream` can be turned back into a 503 below (#2048).
+                let unavailable = Arc::new(OnceLock::new());
+                let row_stream = adapt_row_stream(row_stream, Arc::clone(&unavailable));
                 let (returned_engine, inserted) = match engine
                     .insert_rows(
                         internal_name,
@@ -675,6 +777,30 @@ pub(crate) async fn execute_plan(
                 {
                     Ok(v) => v,
                     Err(e) => {
+                        // The engine's bare row-cap error names neither the
+                        // dependency nor the setting; name both (#1473).
+                        let e = match e {
+                            SqlQueryError::RowCapExceeded { max } => {
+                                SqlQueryError::DependencyRowCapExceeded {
+                                    label: dependency_label(
+                                        &labels_by_target,
+                                        internal_name,
+                                        view_label,
+                                    )
+                                    .to_string(),
+                                    kind: DependencyKind::ViewDefinition,
+                                    view: view_label.to_string(),
+                                    max,
+                                }
+                            }
+                            // The row stream stopped on a store that reported
+                            // itself unavailable: transient, not a server bug.
+                            SqlQueryError::SourceStream(text) => match unavailable.get() {
+                                Some(message) => SqlQueryError::SourceUnavailable(message.clone()),
+                                None => SqlQueryError::SourceStream(text),
+                            },
+                            other => other,
+                        };
                         warn!(
                             table = %internal_name,
                             view = %view_label,
@@ -694,16 +820,13 @@ pub(crate) async fn execute_plan(
                     "materialized SQL query dependency"
                 );
                 leaf_schemas.push(schema);
-                engine = materialize_labels(
-                    engine,
-                    internal_name,
-                    &labels_by_target,
-                    limits.max_source_rows_per_vd,
-                )
-                .await?;
+                engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
             }
             PlanNode::SqlView {
-                internal_name, sql, ..
+                internal_name,
+                sql,
+                name,
+                ..
             } => {
                 let start = std::time::Instant::now();
                 let (returned_engine, result) = run_select_with_timeout(
@@ -716,7 +839,10 @@ pub(crate) async fn execute_plan(
                 .await?;
                 engine = returned_engine;
                 if result.rows.len() > limits.max_source_rows_per_vd {
-                    return Err(SqlQueryError::RowCapExceeded {
+                    return Err(SqlQueryError::DependencyRowCapExceeded {
+                        label: dependency_label(&labels_by_target, internal_name, name).to_string(),
+                        kind: DependencyKind::SqlView,
+                        view: name.clone(),
                         max: limits.max_source_rows_per_vd,
                     });
                 }
@@ -729,13 +855,7 @@ pub(crate) async fn execute_plan(
                     elapsed_ms,
                     "materialized SQL view node"
                 );
-                engine = materialize_labels(
-                    engine,
-                    internal_name,
-                    &labels_by_target,
-                    limits.max_source_rows_per_vd,
-                )
-                .await?;
+                engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
             }
         }
     }
@@ -752,15 +872,33 @@ pub(crate) async fn execute_plan(
     Ok((result, leaf_schemas))
 }
 
-/// Picks a human-readable label for a leaf ViewDefinition's log lines:
-/// `view.name` if it is a string, else `view.url` if it is a string, else
-/// `internal_name` (the plan's internal table name), which is always
-/// present.
-fn leaf_view_label<'a>(view: &'a Value, internal_name: &'a str) -> &'a str {
-    view.get("name")
+/// Picks a human-readable name for a dependency artifact (a ViewDefinition
+/// or a SQL View Library), for log lines and error messages: `artifact.name`
+/// if it is a string, else `artifact.url` if it is a string, else `fallback`
+/// (the plan's internal table name or the canonical URL the artifact was
+/// resolved from), which is always present.
+fn artifact_display_name<'a>(artifact: &'a Value, fallback: &'a str) -> &'a str {
+    artifact
+        .get("name")
         .and_then(|v| v.as_str())
-        .or_else(|| view.get("url").and_then(|v| v.as_str()))
-        .unwrap_or(internal_name)
+        .or_else(|| artifact.get("url").and_then(|v| v.as_str()))
+        .unwrap_or(fallback)
+}
+
+/// The label a dependency's consumer selects it by, for error messages.
+/// A node aliased by several labels (a diamond, or two names for one
+/// dependency) is named by the alphabetically first one so the message is
+/// deterministic; `fallback` covers a node no edge points at, which a plan
+/// built by [`build_plan`] never contains.
+fn dependency_label<'a>(
+    labels_by_target: &'a HashMap<String, Vec<String>>,
+    internal_name: &str,
+    fallback: &'a str,
+) -> &'a str {
+    labels_by_target
+        .get(internal_name)
+        .and_then(|labels| labels.iter().min())
+        .map_or(fallback, String::as_str)
 }
 
 /// Groups every distinct label used anywhere in the plan by the internal
@@ -794,26 +932,32 @@ fn labels_by_target(plan: &GraphPlan) -> HashMap<String, Vec<String>> {
         .collect()
 }
 
-/// Copies `internal_name`'s rows into a table named by every label that
-/// aliases it, so a consumer's SQL — which addresses its dependencies by
-/// label, not by internal name — finds them. A node with no referencing
-/// label is a no-op (never happens in practice: every plan node exists only
-/// because some edge pointed at it).
+/// Exposes `internal_name` under every label that aliases it, so a
+/// consumer's SQL — which addresses its dependencies by label, not by
+/// internal name — finds it. Each label is a view over the internal table
+/// (`CREATE VIEW "<label>" AS SELECT * FROM "<internal>"`): no rows are
+/// copied, and the DDL runs on a blocking thread like every other SQLite
+/// statement in the plan. A node with no referencing label is a no-op
+/// (never happens in practice: every plan node exists only because some
+/// edge pointed at it).
 async fn materialize_labels(
-    mut engine: InMemorySqlEngine,
+    engine: InMemorySqlEngine,
     internal_name: &str,
     labels_by_target: &HashMap<String, Vec<String>>,
-    max_rows: usize,
 ) -> Result<InMemorySqlEngine, SqlQueryError> {
     let Some(labels) = labels_by_target.get(internal_name) else {
         return Ok(engine);
     };
-    for label in labels {
-        let copy_sql = format!("SELECT * FROM \"{internal_name}\"");
-        let result = engine.execute_select(&copy_sql, &[], max_rows.saturating_add(1))?;
-        engine = materialize_query_result(engine, label, &result).await?;
-    }
-    Ok(engine)
+    let internal_name = internal_name.to_string();
+    let labels = labels.clone();
+    tokio::task::spawn_blocking(move || {
+        for label in &labels {
+            engine.create_view(label, &internal_name)?;
+        }
+        Ok(engine)
+    })
+    .await
+    .map_err(|e| SqlQueryError::Internal(format!("sqlquery worker panicked: {e}")))?
 }
 
 /// Builds a [`TableSchema`] from a [`QueryResult`]'s columns and inferred
@@ -828,6 +972,7 @@ fn schema_from_query_result(result: &QueryResult) -> TableSchema {
             .map(|(name, ty)| ColumnSchema {
                 name: name.clone(),
                 fhir_type: ty.clone(),
+                ansi: None,
             })
             .collect(),
     }
@@ -897,9 +1042,26 @@ async fn run_select_with_timeout(
 /// Converts a `RowStream<Result<Value, SofError>>` into a
 /// `Stream<Item = Result<Value, String>>` for the engine (it doesn't know the
 /// persistence crate's error type).
-fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, String>> + Send {
+///
+/// The conversion loses the error's kind, so the first [`SofError::Unavailable`]
+/// the stream yields is also recorded in `unavailable`: the caller reads it
+/// after the engine fails with `SourceStream`, to tell a store outage from a
+/// server fault (#2048). The engine stops at the first row error, so that
+/// error is the one it reports.
+fn adapt_row_stream(
+    stream: RowStream,
+    unavailable: Arc<OnceLock<String>>,
+) -> impl Stream<Item = Result<Value, String>> + Send {
     use futures::StreamExt;
-    stream.map(|r| r.map_err(|e| e.to_string()))
+    stream.map(move |r| {
+        r.map_err(|e| {
+            if let SofError::Unavailable(message) = &e {
+                // Only the first is kept: a later `set` finds the slot full.
+                let _ = unavailable.set(message.clone());
+            }
+            e.to_string()
+        })
+    })
 }
 
 // ============================================================================
@@ -908,6 +1070,8 @@ fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, Strin
 
 #[cfg(test)]
 mod tests {
+    use helios_persistence::tenant::{TenantId, TenantPermissions};
+
     use super::*;
 
     /// A fixed in-memory [`ArtifactFetcher`] for dry Phase 1 tests.
@@ -920,6 +1084,55 @@ mod tests {
                 resource_type: "ViewDefinition or Library".to_string(),
                 id: url.to_string(),
             })
+        }
+    }
+
+    /// A [`MapFetcher`] that records every URL it is asked for, in order.
+    struct CountingFetcher {
+        inner: MapFetcher,
+        fetched: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingFetcher {
+        fn new(entries: HashMap<String, Value>) -> Self {
+            Self {
+                inner: MapFetcher(entries),
+                fetched: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Every URL fetched so far, in request order.
+        fn fetched(&self) -> Vec<String> {
+            self.fetched.lock().expect("fetch log lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ArtifactFetcher for CountingFetcher {
+        async fn fetch(&self, url: &str) -> Result<Value, RestError> {
+            self.fetched
+                .lock()
+                .expect("fetch log lock")
+                .push(url.to_string());
+            self.inner.fetch(url).await
+        }
+    }
+
+    /// The node-cap error text [`check_max_nodes`] produces for a plan of
+    /// `count` leaf nodes against `max`.
+    fn check_max_nodes_message(count: usize, max: usize) -> String {
+        let plan = GraphPlan {
+            nodes: (0..count)
+                .map(|i| PlanNode::Leaf {
+                    internal_name: format!("__sof_node_{i}"),
+                    view: view_definition(&format!("http://example.org/p/{i}")),
+                })
+                .collect(),
+            subject_edges: Vec::new(),
+        };
+        match check_max_nodes(&plan, max).unwrap_err() {
+            RestError::UnprocessableEntity { message } => message,
+            other => panic!("expected a 422, got {other:?}"),
         }
     }
 
@@ -966,6 +1179,8 @@ mod tests {
             is_sql_view: false,
             parameters_empty: true,
             depends_on,
+            max_depends_on: usize::MAX,
+            max_nodes: usize::MAX,
         }
     }
 
@@ -1353,5 +1568,617 @@ mod tests {
             .expect("plan should resolve");
         assert!(check_max_nodes(&plan, 2).is_ok());
         assert!(check_max_nodes(&plan, 1).is_err());
+    }
+
+    /// The walk stops at the first node past `max_nodes`: that node is
+    /// fetched (it cannot be known to be a node before), the next is not.
+    #[tokio::test]
+    async fn node_limit_stops_the_walk_at_the_first_node_past_it() {
+        let fetcher = CountingFetcher::new(
+            (0..4)
+                .map(|i| {
+                    let url = format!("http://example.org/n/{i}");
+                    (url.clone(), view_definition(&url))
+                })
+                .collect(),
+        );
+        let deps: Vec<DependsOnView> = (0..4)
+            .map(|i| depends_on(&format!("t{i}"), &format!("http://example.org/n/{i}")))
+            .collect();
+
+        let errors = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_nodes: 2,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect_err("a 4-node graph must exceed max_nodes = 2");
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let RestError::UnprocessableEntity { message } = &errors[0] else {
+            panic!("expected a 422, got {:?}", errors[0]);
+        };
+        assert_eq!(message, "dependency graph has 3 nodes; max allowed is 2");
+        assert_eq!(*message, check_max_nodes_message(3, 2));
+        assert_eq!(
+            fetcher.fetched(),
+            vec![
+                "http://example.org/n/0",
+                "http://example.org/n/1",
+                "http://example.org/n/2",
+            ],
+            "n/3 must never be fetched"
+        );
+    }
+
+    /// A SQLView counts when it is accepted, before its children are
+    /// fetched, so a deep chain is bounded rather than fetched in full.
+    #[tokio::test]
+    async fn node_limit_counts_a_sqlview_before_its_children_are_fetched() {
+        let fetcher = CountingFetcher::new(HashMap::from([
+            (
+                "http://example.org/v1".to_string(),
+                sql_view(
+                    "http://example.org/v1",
+                    "SELECT * FROM t2",
+                    &[("t2", "http://example.org/v2")],
+                ),
+            ),
+            (
+                "http://example.org/v2".to_string(),
+                sql_view(
+                    "http://example.org/v2",
+                    "SELECT * FROM t3",
+                    &[("t3", "http://example.org/v3")],
+                ),
+            ),
+            (
+                "http://example.org/v3".to_string(),
+                sql_view(
+                    "http://example.org/v3",
+                    "SELECT * FROM leaf_t",
+                    &[("leaf_t", "http://example.org/leaf")],
+                ),
+            ),
+            (
+                "http://example.org/leaf".to_string(),
+                view_definition("http://example.org/leaf"),
+            ),
+        ]));
+        let deps = vec![depends_on("t1", "http://example.org/v1")];
+
+        let errors = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_nodes: 2,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect_err("a 4-node chain must exceed max_nodes = 2");
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let RestError::UnprocessableEntity { message } = &errors[0] else {
+            panic!("expected a 422, got {:?}", errors[0]);
+        };
+        assert_eq!(message, "dependency graph has 3 nodes; max allowed is 2");
+        assert_eq!(
+            fetcher.fetched(),
+            vec![
+                "http://example.org/v1",
+                "http://example.org/v2",
+                "http://example.org/v3",
+            ],
+            "the leaf below the third SQLView must never be fetched"
+        );
+    }
+
+    /// A graph of exactly `max_nodes` nodes is accepted, and a node shared
+    /// by two consumers counts once.
+    #[tokio::test]
+    async fn node_limit_equal_to_the_plan_size_is_accepted_and_a_shared_node_counts_once() {
+        let fetcher = MapFetcher(HashMap::from([
+            (
+                "http://example.org/a".to_string(),
+                sql_view(
+                    "http://example.org/a",
+                    "SELECT * FROM s",
+                    &[("s", "http://example.org/shared")],
+                ),
+            ),
+            (
+                "http://example.org/b".to_string(),
+                sql_view(
+                    "http://example.org/b",
+                    "SELECT * FROM s",
+                    &[("s", "http://example.org/shared")],
+                ),
+            ),
+            (
+                "http://example.org/shared".to_string(),
+                view_definition("http://example.org/shared"),
+            ),
+        ]));
+        let deps = vec![
+            depends_on("a_t", "http://example.org/a"),
+            depends_on("b_t", "http://example.org/b"),
+        ];
+
+        let plan = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_nodes: 3,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect("shared + a + b = 3 nodes fits max_nodes = 3");
+
+        assert_eq!(plan.node_count(), 3);
+        assert!(check_max_nodes(&plan, 3).is_ok());
+    }
+
+    /// A SQLView dependency is named by its Library `name`, falling back to
+    /// its canonical URL; the name is what a row-cap error reports (#1473).
+    #[tokio::test]
+    async fn sqlview_node_records_its_name_or_url() {
+        let named_url = "http://example.org/named-view";
+        let unnamed_url = "http://example.org/unnamed-view";
+        let leaf_url = "http://example.org/leaf";
+        let mut named = sql_view(named_url, "SELECT * FROM l", &[("l", leaf_url)]);
+        named["name"] = json!("female_patients");
+        let unnamed = sql_view(unnamed_url, "SELECT * FROM l", &[("l", leaf_url)]);
+        let fetcher = MapFetcher(HashMap::from([
+            (leaf_url.to_string(), view_definition(leaf_url)),
+            (named_url.to_string(), named),
+            (unnamed_url.to_string(), unnamed),
+        ]));
+        let deps = vec![
+            depends_on("named_t", named_url),
+            depends_on("unnamed_t", unnamed_url),
+        ];
+        let plan = build_plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect("plan should resolve");
+        let names: Vec<&str> = plan
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                PlanNode::SqlView { name, .. } => Some(name.as_str()),
+                PlanNode::Leaf { .. } => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["female_patients", unnamed_url]);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 — the per-dependency row cap (#1473). Runs `execute_plan`
+    // against a stub `SofRunner`; no HTTP and no storage.
+    // ------------------------------------------------------------------
+
+    /// A `SofRunner` that yields `rows` rows of `{"id": "p<i>"}`, then ends.
+    struct RowsRunner {
+        rows: usize,
+    }
+
+    #[async_trait]
+    impl SofRunner for RowsRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let rows = (0..self.rows).map(|i| Ok(json!({"id": format!("p{i}")})));
+            Ok(Box::pin(futures::stream::iter(rows)))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "rows-test-runner"
+        }
+    }
+
+    fn named_view_definition(name: &str) -> Value {
+        let mut view = view_definition(&format!("http://example.org/{name}"));
+        view["name"] = json!(name);
+        view
+    }
+
+    fn edge(label: &str, target: &str) -> Edge {
+        Edge {
+            label: label.to_string(),
+            target_internal_name: target.to_string(),
+        }
+    }
+
+    async fn run_plan(
+        runner_rows: usize,
+        limits: ExecLimits,
+        plan: &GraphPlan,
+        subject_sql: &str,
+    ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+        let runner: Arc<dyn SofRunner> = Arc::new(RowsRunner { rows: runner_rows });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            plan,
+            subject_sql,
+            &[],
+            limits,
+        )
+        .await
+    }
+
+    fn limits(max_source_rows_per_vd: usize, max_rows: usize) -> ExecLimits {
+        ExecLimits {
+            max_source_rows_per_vd,
+            max_rows,
+            timeout_secs: 5,
+        }
+    }
+
+    fn leaf_plan(label_edges: Vec<Edge>) -> GraphPlan {
+        GraphPlan {
+            nodes: vec![PlanNode::Leaf {
+                internal_name: "__sof_node_0".to_string(),
+                view: named_view_definition("observation_flat"),
+            }],
+            subject_edges: label_edges,
+        }
+    }
+
+    #[tokio::test]
+    async fn leaf_dependency_over_the_cap_names_label_view_cap_and_setting() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let err = run_plan(10, limits(3, 1000), &plan, "SELECT * FROM obs")
+            .await
+            .err()
+            .expect("a 10-row dependency must exceed a cap of 3");
+        let SqlQueryError::DependencyRowCapExceeded {
+            label,
+            kind,
+            view,
+            max,
+        } = &err
+        else {
+            panic!("expected DependencyRowCapExceeded, got {err:?}");
+        };
+        assert_eq!(label, "obs");
+        assert_eq!(*kind, DependencyKind::ViewDefinition);
+        assert_eq!(view, "observation_flat");
+        assert_eq!(*max, 3);
+
+        let text = err.to_string();
+        for needle in [
+            "dependency 'obs'",
+            "(ViewDefinition observation_flat)",
+            "more than 3 rows",
+            "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+    }
+
+    /// The cap is inclusive: a dependency of exactly `max` rows is fine.
+    #[tokio::test]
+    async fn leaf_dependency_at_the_cap_still_runs() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let (result, _) = run_plan(3, limits(3, 1000), &plan, "SELECT * FROM obs")
+            .await
+            .expect("a dependency of exactly the cap must run");
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    /// How a [`FailingStoreRunner`]'s store fails.
+    #[derive(Clone, Copy)]
+    enum StoreFailure {
+        /// `run_view` itself returns `SofError::Unavailable`.
+        UnavailableAtStart,
+        /// One good row, then an `Unavailable` row error.
+        UnavailableMidStream,
+        /// One good row, then a `Storage` row error (a server fault).
+        StorageMidStream,
+        /// `run_view` itself returns `SofError::Backend` (a server fault).
+        BackendAtStart,
+    }
+
+    /// A `SofRunner` whose store fails the way `failure` says.
+    struct FailingStoreRunner {
+        failure: StoreFailure,
+    }
+
+    const UNAVAILABLE_TEXT: &str = "failed to read object body after 3 attempts: connection reset";
+
+    #[async_trait]
+    impl SofRunner for FailingStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let rows = match self.failure {
+                StoreFailure::UnavailableAtStart => {
+                    return Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string()));
+                }
+                StoreFailure::BackendAtStart => {
+                    return Err(SofError::Backend("connection refused".to_string()));
+                }
+                StoreFailure::UnavailableMidStream => vec![
+                    Ok(json!({"id": "p0"})),
+                    Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string())),
+                ],
+                StoreFailure::StorageMidStream => vec![
+                    Ok(json!({"id": "p0"})),
+                    Err(SofError::Storage("bucket unreachable".to_string())),
+                ],
+            };
+            Ok(Box::pin(futures::stream::iter(rows)))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "failing-store-test-runner"
+        }
+    }
+
+    async fn run_plan_over_failing_store(failure: StoreFailure) -> SqlQueryError {
+        let runner: Arc<dyn SofRunner> = Arc::new(FailingStoreRunner { failure });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            &plan,
+            "SELECT * FROM obs",
+            &[],
+            limits(1000, 1000),
+        )
+        .await
+        .err()
+        .expect("a failing store must fail the plan")
+    }
+
+    /// #2048: a store that is unavailable keeps that fact through the plan, so
+    /// a SQL Query run answers 503 like a ViewDefinition run, whether the store
+    /// fails when the dependency starts or partway through its rows.
+    #[tokio::test]
+    async fn an_unavailable_store_is_a_503() {
+        for failure in [
+            StoreFailure::UnavailableAtStart,
+            StoreFailure::UnavailableMidStream,
+        ] {
+            let err = run_plan_over_failing_store(failure).await;
+            let SqlQueryError::SourceUnavailable(message) = &err else {
+                panic!("expected SourceUnavailable, got {err:?}");
+            };
+            assert_eq!(message, UNAVAILABLE_TEXT);
+
+            let rest = sqlquery_err_to_rest(err);
+            assert!(
+                matches!(rest, RestError::ServiceUnavailable { .. }),
+                "got {rest:?}"
+            );
+            assert_eq!(
+                rest.client_response().0,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
+
+    /// Only an unavailable store is a 503: any other source failure is still a
+    /// server fault (500), at the start of the dependency or partway through.
+    #[tokio::test]
+    async fn other_store_failures_stay_source_stream() {
+        for failure in [StoreFailure::StorageMidStream, StoreFailure::BackendAtStart] {
+            let err = run_plan_over_failing_store(failure).await;
+            assert!(
+                matches!(err, SqlQueryError::SourceStream(_)),
+                "expected SourceStream, got {err:?}"
+            );
+            assert_eq!(
+                sqlquery_err_to_rest(err).client_response().0,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+    }
+
+    /// A node reached under two labels is named by the alphabetically first,
+    /// so the message does not depend on hash order.
+    #[tokio::test]
+    async fn dependency_with_two_labels_is_named_by_the_first_alphabetically() {
+        let plan = leaf_plan(vec![
+            edge("zeta", "__sof_node_0"),
+            edge("alpha", "__sof_node_0"),
+        ]);
+        let err = run_plan(10, limits(3, 1000), &plan, "SELECT * FROM alpha")
+            .await
+            .err()
+            .expect("must exceed the cap");
+        assert!(
+            matches!(&err, SqlQueryError::DependencyRowCapExceeded { label, .. } if label == "alpha"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlview_dependency_over_the_cap_names_label_view_cap_and_setting() {
+        // `patients` yields 3 rows (within a cap of 5); the SQLView built on
+        // it cross-joins them with themselves into 9 rows (over it).
+        let plan = GraphPlan {
+            nodes: vec![
+                PlanNode::Leaf {
+                    internal_name: "__sof_node_0".to_string(),
+                    view: named_view_definition("patients"),
+                },
+                PlanNode::SqlView {
+                    internal_name: "__sof_node_1".to_string(),
+                    sql: "SELECT a.id FROM base a, base b".to_string(),
+                    edges: vec![edge("base", "__sof_node_0")],
+                    name: "pairs".to_string(),
+                },
+            ],
+            subject_edges: vec![edge("pairs_t", "__sof_node_1")],
+        };
+        let err = run_plan(3, limits(5, 1000), &plan, "SELECT * FROM pairs_t")
+            .await
+            .err()
+            .expect("the 9-row SQLView must exceed a cap of 5");
+        let SqlQueryError::DependencyRowCapExceeded {
+            label,
+            kind,
+            view,
+            max,
+        } = &err
+        else {
+            panic!("expected DependencyRowCapExceeded, got {err:?}");
+        };
+        assert_eq!(label, "pairs_t");
+        assert_eq!(*kind, DependencyKind::SqlView);
+        assert_eq!(view, "pairs");
+        assert_eq!(*max, 5);
+
+        let text = err.to_string();
+        for needle in [
+            "dependency 'pairs_t'",
+            "(SQL View pairs)",
+            "more than 5 rows",
+            "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+        assert!(!text.contains("(ViewDefinition pairs)"), "{text}");
+    }
+
+    /// The subject's own result is not a dependency: it is silently
+    /// truncated at `max_rows` (SoF v2 PR #353), never an error.
+    #[tokio::test]
+    async fn subject_result_over_max_rows_is_truncated_not_an_error() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let (result, _) = run_plan(10, limits(100, 4), &plan, "SELECT * FROM obs")
+            .await
+            .expect("the subject's own cap truncates");
+        assert_eq!(result.rows.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn subject_over_the_depends_on_limit_is_one_error_before_any_fetch() {
+        let fetcher = MapFetcher(HashMap::new());
+        let deps: Vec<DependsOnView> = (0..5)
+            .map(|i| depends_on(&format!("t{i}"), &format!("http://example.org/none/{i}")))
+            .collect();
+        let errors = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_depends_on: 4,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect_err("5 depends-on entries must exceed a limit of 4");
+        assert_eq!(errors.len(), 1, "no dependency may be fetched: {errors:?}");
+        let RestError::BadRequest { message } = &errors[0] else {
+            panic!("expected BadRequest, got {:?}", errors[0]);
+        };
+        assert!(
+            message.contains("declares 5") && message.contains("at most 4"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlview_over_the_depends_on_limit_is_rejected_before_its_children_are_fetched() {
+        let children: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("c{i}"), format!("http://example.org/none/{i}")))
+            .collect();
+        let child_refs: Vec<(&str, &str)> = children
+            .iter()
+            .map(|(l, u)| (l.as_str(), u.as_str()))
+            .collect();
+        let fetcher = MapFetcher(HashMap::from([(
+            "http://example.org/mid".to_string(),
+            sql_view("http://example.org/mid", "SELECT * FROM a_t", &child_refs),
+        )]));
+        let deps = vec![depends_on("mid_t", "http://example.org/mid")];
+        let errors = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_depends_on: 4,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect_err("the SQLView declares 5 depends-on entries");
+        assert_eq!(errors.len(), 1, "children must not be fetched: {errors:?}");
+        let RestError::BadRequest { message } = &errors[0] else {
+            panic!("expected BadRequest, got {:?}", errors[0]);
+        };
+        assert!(message.contains("http://example.org/mid"), "{message}");
+        assert!(
+            message.contains("declares 5") && message.contains("at most 4"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_the_depends_on_limit_is_accepted() {
+        let fetcher = MapFetcher(
+            (0..4)
+                .map(|i| {
+                    let url = format!("http://example.org/leaf/{i}");
+                    (url.clone(), view_definition(&url))
+                })
+                .collect(),
+        );
+        let deps: Vec<DependsOnView> = (0..4)
+            .map(|i| depends_on(&format!("t{i}"), &format!("http://example.org/leaf/{i}")))
+            .collect();
+        let plan = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_depends_on: 4,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect("4 entries are within a limit of 4");
+        assert_eq!(plan.node_count(), 4);
+    }
+
+    /// #1799: the engine itself refuses a write that reaches execution — here the
+    /// subject SQL goes straight to `execute_plan`, past `validate_select_only` —
+    /// and the refusal answers 400 like the REST SELECT-only check, never a 500.
+    #[tokio::test]
+    async fn subject_write_refused_by_the_engine_is_a_400_not_a_500() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let err = run_plan(
+            3,
+            limits(100, 100),
+            &plan,
+            "WITH c AS (SELECT 'x' AS id) INSERT INTO obs SELECT id FROM c",
+        )
+        .await
+        .err()
+        .expect("the engine must refuse an INSERT");
+        assert!(matches!(err, SqlQueryError::NotSelect(_)), "{err:?}");
+        let (status, code, message) = sqlquery_err_to_rest(err).client_response();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(code, "invalid");
+        assert_eq!(
+            message,
+            "only SELECT queries are allowed; INSERT statements are not permitted"
+        );
     }
 }

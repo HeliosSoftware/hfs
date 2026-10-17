@@ -48,5 +48,7 @@ mod search_impl;
 mod storage;
 
 pub use backend::{
-    ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig, WriteRefreshPolicy,
+    ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig, RefreshInterval,
+    WriteRefreshPolicy, parse_refresh_interval,
 };
+pub use schema::{SCHEMA_VERSION, SCHEMA_VERSION_META_KEY};

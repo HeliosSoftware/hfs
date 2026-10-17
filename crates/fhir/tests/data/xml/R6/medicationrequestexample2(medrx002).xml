@@ -45,5 +45,11 @@
       </coding>
     </concept>
   </reason>
-  <dosageInstruction/>
+  <dosageInstruction>
+    <step>
+      <component>
+        <text value="Take one tablet daily as directed"/>
+      </component>
+    </step>
+  </dosageInstruction>
 </MedicationRequest>

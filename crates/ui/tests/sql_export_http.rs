@@ -15,8 +15,14 @@ use axum::{Router, extract::Request as AxRequest, middleware::Next, response::Re
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::sqlite::SqliteBackend;
 use helios_persistence::core::SettingsStore;
-use helios_ui::{SqlExportStatus, StaticConformanceSource};
+use helios_ui::{SqlExportFailure, SqlExportStatus, StaticConformanceSource};
 use tower::ServiceExt;
+
+#[path = "support/export_settings.rs"]
+mod export_settings;
+
+#[path = "support/html.rs"]
+mod html;
 
 fn nl() -> helios_ui::NlSearch {
     helios_ui::NlSearch {
@@ -80,6 +86,7 @@ async fn inject_test_principal(mut request: AxRequest, next: Next) -> Response {
             jti: None,
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             custom_claims: Default::default(),
+            ..Default::default()
         });
     }
     next.run(request).await
@@ -574,8 +581,29 @@ async fn an_empty_store_offers_the_two_creation_links_but_a_degraded_fetch_does_
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("Nothing to export yet"));
-    assert!(html.contains(r#"href="/ui/sql/view-definitions?vd=new""#));
-    assert!(html.contains(r#"href="/ui/sql/queries?lib=new""#));
+    let dom = html::Dom::page(&html);
+    assert_eq!(
+        dom.count(r#"script[src="/ui/assets/conformance-crud.js"]"#),
+        1
+    );
+    for (path, selection) in [
+        ("/ui/sql/view-definitions", "vd"),
+        ("/ui/sql/queries", "lib"),
+    ] {
+        let link = dom.one(&format!(r#"a[data-editor-link][href^="{path}?"]"#));
+        let url = reqwest::Url::parse(&format!("http://localhost{}", link.attr("href").unwrap()))
+            .unwrap();
+        assert_eq!(url.path(), path);
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            query.get(selection).map(|value| value.as_ref()),
+            Some("new")
+        );
+        assert_eq!(
+            query.get("return_to").map(|value| value.as_ref()),
+            Some("/ui/sql/export/new")
+        );
+    }
     // No builder form at all — not the name field, not a format, not Start
     // Export. (The page's shared shell renders its own, unrelated `<form>`
     // for the sidebar's FHIR-version switcher, so this checks the specific
@@ -718,7 +746,10 @@ async fn starting_an_export_stores_an_in_progress_record_and_the_list_polls_its_
     assert!(html.contains(&format!(r#"id="job-{id}""#)));
     assert!(html.contains(&format!(r#"hx-get="/ui/sql/export/{id}/card""#)));
     assert!(html.contains("every 5s"));
-    assert!(html.contains("1 exports"));
+    assert_eq!(
+        html::Dom::page(&html).one("#sql-export-summary").text(),
+        "1 export · 1 running"
+    );
     assert!(html.contains("1 running"));
 }
 
@@ -933,7 +964,7 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
         "resourceType": "Parameters",
         "parameter": [{"name": "output", "part": [
             {"name": "name", "valueString": "patients"},
-            {"name": "location", "valueUri": "http://s/export/job-1/patients-0.csv"},
+            {"name": "location", "valueUri": "http://localhost:8080/export/job-1/patients-0.csv"},
         ]}]
     });
     let source = StaticConformanceSource::empty()
@@ -959,8 +990,8 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
     assert_eq!(job["status"], "complete");
     assert_eq!(
         job["outputs"],
-        // The manifest's absolute location is persisted as a same-origin
-        // path (#833).
+        // A location under the server's own `HFS_BASE_URL` (the mount's
+        // `http://localhost:8080`) is persisted as a same-origin path (#833).
         serde_json::json!([{"name": "patients", "locations": ["/export/job-1/patients-0.csv"]}])
     );
     assert!(!job["finishedAt"].as_str().unwrap_or_default().is_empty());
@@ -969,6 +1000,46 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
     assert!(job["subjectsDone"].is_null());
     assert!(job["subjectsTotal"].is_null());
     assert!(job["currentSubject"].is_null());
+}
+
+/// #2050: with `HFS_EXPORT_SINK=s3` the manifest's locations are S3
+/// pre-signed URLs on another host. They must be persisted and linked
+/// byte-for-byte; stripping the host sent the browser to HFS, which 404ed.
+#[tokio::test]
+async fn a_done_job_keeps_an_s3_presigned_location_verbatim_and_links_to_it() {
+    const PRESIGNED: &str = "https://my-bucket.s3.us-east-2.amazonaws.com/exports/job-1/shard-0.ndjson?x-id=GetObject&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20261014%2Fus-east-2%2Fs3%2Faws4_request&X-Amz-Date=20261014T120000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=0123abcd";
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": PRESIGNED},
+        ]}]
+    });
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_manifest(Ok(manifest));
+    let app = app(&backend, source);
+
+    // `load_detail` polls once and renders the post-poll job.
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body_text(response).await;
+    let dom = html::Dom::page(&page);
+    assert_eq!(
+        dom.one("a[download]").attr("href"),
+        Some(PRESIGNED),
+        "the file link must be the pre-signed URL, not an HFS path"
+    );
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "complete");
+    assert_eq!(
+        job["outputs"],
+        serde_json::json!([{"name": "patients", "locations": [PRESIGNED]}])
+    );
 }
 
 #[tokio::test]
@@ -1350,6 +1421,17 @@ async fn new_page_renders_the_narrow_card_and_the_closed_advanced_disclosure() {
     assert!(html.contains("Narrow it down"));
     assert!(html.contains(r#"data-combobox-name="patient""#));
     assert!(html.contains(r#"data-combobox-name="group""#));
+    // Fixed choices progressively enhance a single enabled named select.
+    assert!(html.contains(r#"data-combobox-mode="fixed""#));
+    assert_eq!(html.matches(r#"name="since_preset""#).count(), 1);
+    let since_pos = html.find(r#"name="since_preset""#).unwrap();
+    let since_start = html[..since_pos].rfind("<select").unwrap();
+    let since_end = since_pos + html[since_pos..].find('>').unwrap();
+    let since = &html[since_start..=since_end];
+    assert!(since.contains("data-combobox-native"));
+    assert!(!since.contains("disabled"));
+    assert!(!since.contains("hidden"));
+
     assert!(html.contains(r#"name="since_preset""#));
     assert!(html.contains(r#"name="since_custom""#));
     assert!(
@@ -1357,13 +1439,60 @@ async fn new_page_renders_the_narrow_card_and_the_closed_advanced_disclosure() {
         "All time is selected"
     );
 
-    // "Advanced": present, closed (no `open` on the `<details>`), the
-    // checkbox checked by default, and no error markup rendered.
+    // "Advanced": present, closed (no `open` on the `<details>`), and no
+    // error markup rendered.
     assert!(html.contains("Advanced"));
     assert!(html.contains(r#"name="client_tracking_id""#));
-    assert!(html.contains(r#"name="header" checked"#));
     assert!(!html.contains("<details class=\"card\" open>"));
     assert!(!html.contains(r#"aria-invalid="true""#));
+
+    // #1716: the CSV header switch, checked by default, sits in its own
+    // `data-csv-header-option` wrapper with the format choice — before the
+    // "Advanced" disclosure, which holds only the tracking id and carries no
+    // summary meta line.
+    assert!(html.contains(r#"name="header" checked"#));
+    let header_at = html.find(r#"data-csv-header-option"#).unwrap();
+    let header_input_at = html.find(r#"name="header""#).unwrap();
+    let advanced_at = html.find("<details class=\"card\"").unwrap();
+    let tracking_at = html.find(r#"name="client_tracking_id""#).unwrap();
+    assert!(header_at < header_input_at && header_input_at < advanced_at);
+    assert!(advanced_at < tracking_at);
+    let advanced = &html[advanced_at..];
+    let advanced = &advanced[..advanced.find("</details>").unwrap()];
+    assert!(!advanced.contains("card-head__meta"));
+    assert!(!advanced.contains(r#"name="header""#));
+    assert!(!html.contains("tracking id · CSV header"));
+}
+
+/// #1716: the CSV header switch no longer lives in "Advanced", so a
+/// re-render that carries an unchecked header (and no tracking id) leaves
+/// the disclosure closed while still keeping the box unchecked.
+#[tokio::test]
+async fn an_unchecked_header_no_longer_reopens_advanced() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source.clone());
+
+    // An invalid custom instant forces a re-render; `header` is absent, so
+    // the submission unchecked it.
+    let response = app
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&since_preset=custom&since_custom=not-an-instant",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"aria-describedby="sql-export-since-custom-error""#));
+    assert!(html.contains(r#"name="header">"#));
+    assert!(!html.contains(r#"name="header" checked"#));
+    assert!(!html.contains("<details class=\"card\" open>"));
+    assert!(source.export_calls().is_empty());
 }
 
 /// The AC in #836: two patients, one group, a tracking id, `csv` with the
@@ -1565,7 +1694,7 @@ async fn an_invalid_custom_instant_rerenders_with_an_inline_error_and_no_kickoff
         .clone()
         .oneshot(post_form(
             "/ui/sql/export",
-            "subject=ViewDefinition%2Fvd1&format=csv&since_preset=custom&since_custom=not-an-instant\
+            "subject=ViewDefinition%2Fvd1&format=csv&since_preset=custom&since_custom=2026-02-31T00%3A00%3A00Z\
              &client_tracking_id=trk-1",
         ))
         .await
@@ -1576,6 +1705,9 @@ async fn an_invalid_custom_instant_rerenders_with_an_inline_error_and_no_kickoff
         html.contains(r#"aria-invalid="true" aria-describedby="sql-export-since-custom-error""#)
     );
     assert!(html.contains("valid FHIR instant"));
+    assert!(html.contains(r#"value="custom" selected"#));
+    assert!(html.contains(r#"value="2026-02-31T00:00:00Z""#));
+    assert!(html.contains(r#"autofocus aria-invalid="true""#));
     assert!(html.contains(r#"value="ViewDefinition/vd1" aria-label="patients" checked"#));
     // The tracking id the submission also carried is conserved, and since
     // that's a non-empty "Advanced" field, the disclosure reopens.
@@ -1813,6 +1945,92 @@ async fn new_page_shows_parameter_chips_and_open_values_rows_only_for_parameteri
 }
 
 #[tokio::test]
+async fn numeric_parameter_fields_preserve_steps_defaults_required_and_native_submission() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with("Library", FhirVersion::R4, vec![
+        library_with_parameters("numeric", "numeric", "sql-query", "active", serde_json::json!([
+            {"name": "amount", "use": "in", "type": "decimal"},
+            {"name": "whole", "use": "in", "type": "integer", "defaultInteger": 30},
+            {"name": "big", "use": "in", "type": "integer64", "defaultInteger64": "9007199254740993"}
+        ]))
+    ]);
+    let response = app(&backend, source)
+        .oneshot(get("/ui/sql/export/new?subject=Library/numeric"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = html::Dom::page(&html);
+    for (name, step, value, required) in [
+        ("amount", "any", "", true),
+        ("whole", "1", "30", false),
+        ("big", "1", "9007199254740993", false),
+    ] {
+        let field = dom.one(&format!("input[name='param:Library/numeric:{name}']"));
+        assert!(field.has_class("field__input--number"));
+        assert_eq!(field.attr("type"), Some("number"));
+        assert_eq!(field.attr("step"), Some(step));
+        assert_eq!(field.attr("value"), Some(value));
+        assert_eq!(field.has_attr("required"), required);
+        assert!(!field.has_attr("form"));
+        assert!(!field.has_attr("disabled"));
+    }
+}
+
+/// #2049: `sql-export-form.js` shows "This value is required." by finding the
+/// field's own `.field__hint--error` span inside its `label.field`, because
+/// the control's `aria-describedby` is rendered only alongside a server-side
+/// error. This pins that contract on a fresh page: every parameter field
+/// carries its error span, hidden and empty, while the control itself has
+/// neither `aria-invalid` nor `aria-describedby` (the no-JavaScript markup
+/// is unchanged).
+#[tokio::test]
+async fn new_page_renders_each_parameter_fields_error_span_hidden_inside_its_field() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, parameterized_subjects_source());
+
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = html::Dom::page(&html);
+
+    for (reference, name) in [
+        ("Library/q1", "ward"),
+        ("Library/q2", "days"),
+        ("Library/q2", "from"),
+    ] {
+        let field = dom.one(&format!(
+            r#"tr.row--params[data-subject="{reference}"] label.field[data-param-name="{name}"]"#
+        ));
+        let control = field.one(&format!(r#"[name="param:{reference}:{name}"]"#));
+        assert!(
+            !control.has_attr("aria-invalid"),
+            "{reference} {name}: a fresh page marks nothing invalid: {control:?}"
+        );
+        assert!(
+            !control.has_attr("aria-describedby"),
+            "{reference} {name}: aria-describedby is rendered only with a server error: {control:?}"
+        );
+
+        let error = field.one(".field__hint--error");
+        assert_eq!(
+            error.attr("id"),
+            Some(format!("param:{reference}:{name}-error").as_str()),
+            "{reference} {name}: the error span keeps its `{{prefix}}:{{name}}-error` id"
+        );
+        assert!(
+            error.has_attr("hidden"),
+            "{reference} {name}: the error span renders hidden: {error:?}"
+        );
+        assert_eq!(
+            error.text(),
+            "",
+            "{reference} {name}: the error span renders empty"
+        );
+    }
+}
+
+#[tokio::test]
 async fn marking_a_parameterized_query_sends_its_value_as_a_typed_subject_parameter() {
     let backend = backend_with_schema().await;
     let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
@@ -1933,6 +2151,22 @@ async fn a_missing_required_parameter_rerenders_with_an_inline_error_and_no_kick
         source.export_calls().is_empty(),
         "no kickoff on a validation error"
     );
+
+    // #2049: the no-JavaScript, server-rendered path is unchanged — the
+    // control is flagged and described by its own visible error span.
+    let dom = html::Dom::page(&html);
+    let control = dom.one(r#"[name="param:Library/q1:ward"]"#);
+    assert_eq!(control.attr("aria-invalid"), Some("true"));
+    assert_eq!(
+        control.attr("aria-describedby"),
+        Some("param:Library/q1:ward-error")
+    );
+    let error = dom.one(r#"[id="param:Library/q1:ward-error"]"#);
+    assert!(
+        !error.has_attr("hidden"),
+        "the server-rendered error is visible: {error:?}"
+    );
+    assert_eq!(error.text(), "This value is required.");
 }
 
 #[tokio::test]
@@ -2544,6 +2778,7 @@ async fn detail_page_renders_a_complete_job_with_resolved_outputs() {
 
     // The Job card: id in <code>, format, started (with seconds), duration,
     // and both subjects as pills.
+    assert!(html.contains(r#"class="card__body kv-grid kv-grid--flush kv-grid--facts""#));
     assert!(html.contains("<code>job-1</code>"));
     assert!(html.contains(">2026-01-01 09:00:00 UTC<"));
     assert!(html.contains(">5m 08s<"));
@@ -2559,6 +2794,41 @@ async fn detail_page_renders_a_complete_job_with_resolved_outputs() {
     assert!(html.contains("patients-0.parquet"));
     assert!(html.contains("patients-1.parquet"));
     assert!(html.contains("encounter_counts-0.parquet"));
+
+    // #1717: each link is downloaded and labelled after the job's own name
+    // rather than the server's storage key — the output name only because
+    // this job has two outputs, the 1-based shard number only on the output
+    // that has two shards. Each name appears exactly twice: the `download`
+    // attribute (paired with its own `href`) and the visible label.
+    for (href, name) in [
+        (
+            "/export/job-1/encounter_counts-0.parquet",
+            "monthly-flat-files_encounter_counts.parquet",
+        ),
+        (
+            "/export/job-1/patients-0.parquet",
+            "monthly-flat-files_patients_1.parquet",
+        ),
+        (
+            "/export/job-1/patients-1.parquet",
+            "monthly-flat-files_patients_2.parquet",
+        ),
+    ] {
+        assert!(
+            html.contains(&format!(r#"<a href="{href}" download="{name}">"#)),
+            "{href} downloads as {name}"
+        );
+        assert!(
+            html.contains(&format!("</span>{name}")),
+            "{name} is the link's visible label"
+        );
+        assert_eq!(
+            html.matches(name).count(),
+            2,
+            "{name} is both the download attribute and the visible label"
+        );
+    }
+
     let encounter_output_at = html.find("<td>encounter_counts</td>").expect("output row");
     let patients_output_at = html.find("<td>patients</td>").expect("output row");
     assert!(
@@ -2571,6 +2841,48 @@ async fn detail_page_renders_a_complete_job_with_resolved_outputs() {
     assert!(
         encounter_output_at + encounter_subject_at < patients_output_at,
         "the resolved subject pill belongs to the encounter_counts row, not a later one"
+    );
+}
+
+/// #1717: a job submitted without a name downloads after the same
+/// subject-derived name its header shows — `Patients flat · Ward counts` —
+/// made filesystem-safe: lowercase, the spaces and the ` · ` separator
+/// collapsed to single dashes.
+#[tokio::test]
+async fn detail_page_names_an_unnamed_jobs_downloads_after_its_subjects() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        serde_json::json!({
+            "jobId": "job-1",
+            "subjects": [
+                {"name": "Patients flat", "reference": "ViewDefinition/vd1", "kind": "view-definition"},
+                {"name": "Ward counts", "reference": "Library/lib1", "kind": "sql-query"},
+            ],
+            "format": "ndjson",
+            "status": "complete",
+            "startedAt": "2026-01-01T09:00:00Z",
+            "finishedAt": "2026-01-01T09:05:00Z",
+            "outputs": [{"name": "Patients flat", "locations": ["/export/job-1/shard-0.ndjson"]}],
+        }),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(">Patients flat · Ward counts<"));
+    assert!(html.contains(
+        r#"<a href="/export/job-1/shard-0.ndjson" download="patients-flat-ward-counts.ndjson">"#
+    ));
+    assert!(html.contains("</span>patients-flat-ward-counts.ndjson"));
+    assert!(
+        !html.contains(">shard-0.ndjson"),
+        "the server's storage key is no longer the visible label"
     );
 }
 
@@ -2704,6 +3016,31 @@ async fn detail_page_falls_back_to_the_generic_notice_when_the_error_matches_no_
     assert!(html.contains("The export failed:"));
     assert!(html.contains("connection refused"));
     assert!(!html.contains("stopped on subject"));
+}
+
+#[tokio::test]
+async fn detail_page_names_the_subject_a_server_fault_result_attributes_the_failure_to() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_failure(SqlExportFailure {
+            message: "the result endpoint returned 500 Internal Server Error: Export job 'job-1' failed: The export failed because of a server error; see the server log for job job-1.".to_string(),
+            subject: Some("patients".to_string()),
+        });
+    let app = app(&backend, source);
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("The export stopped on subject"));
+    assert!(html.contains("<strong>patients</strong>"));
+    assert!(html.contains("see the server log for job job-1"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "failed");
+    assert_eq!(job["failedSubject"], "patients");
 }
 
 #[tokio::test]
@@ -3040,4 +3377,187 @@ async fn card_shows_the_right_contextual_action_and_overflow_items_per_status() 
     assert!(html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
     assert!(html.contains(r#"action="/ui/sql/export/job-a/remove""#));
     assert!(html.contains(r#"data-copy-job-id="job-1""#));
+}
+
+fn assert_sql_summary(html: &str, total: usize, running: usize) {
+    let dom = html::Dom::fragment(html);
+    let summary = dom.one("#sql-export-summary");
+    assert!(summary.has_class("page-head__lede"));
+    assert_eq!(summary.attr("hx-swap-oob"), Some("outerHTML"));
+    let word = if total == 1 { "export" } else { "exports" };
+    assert_eq!(
+        summary.text(),
+        format!("{total} {word} · {running} running")
+    );
+    assert_eq!(dom.count(".job-card"), 1);
+    assert_eq!(
+        dom.count(".job-card [hx-swap-oob]"),
+        0,
+        "summary must be a sibling, not part of the replaced card"
+    );
+    assert_eq!(dom.count("[hx-swap-oob]"), 1);
+    assert_eq!(dom.count("#bulk-export-summary"), 0);
+}
+
+#[tokio::test]
+async fn terminal_card_responses_refresh_the_summary_for_complete_failed_and_cancelled() {
+    for outcome in [SqlExportStatus::Done, SqlExportStatus::Unknown] {
+        for fail_manifest in [false, true] {
+            let backend = backend_with_schema().await;
+            seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+            seed_job(&backend, "default", "job-b", in_progress_job("job-2")).await;
+            seed_job(&backend, "other", "job-c", in_progress_job("job-3")).await;
+            seed_job_for_user(
+                &backend,
+                "u2:4:test:other",
+                "default",
+                "job-d",
+                in_progress_job("job-4"),
+            )
+            .await;
+            let running = app(
+                &backend,
+                StaticConformanceSource::empty().with_export_status(SqlExportStatus::running(None)),
+            );
+            let page = body_text(running.oneshot(get("/ui/sql/export")).await.unwrap()).await;
+            let dom = html::Dom::page(&page);
+            assert_eq!(
+                dom.one("#sql-export-summary").text(),
+                "2 exports · 2 running"
+            );
+            assert_eq!(
+                dom.one("#sql-export-jobs").attr("hx-sync"),
+                Some("#sql-export-jobs:drop")
+            );
+            assert_eq!(dom.one("#sql-export-jobs").all(".job-card").len(), 2);
+            assert_eq!(dom.count("[hx-swap-oob]"), 0);
+            let mut source = StaticConformanceSource::empty()
+                .with_export_status(outcome.clone())
+                .with_export_manifest(Ok(
+                    serde_json::json!({"resourceType": "Parameters", "parameter": []}),
+                ));
+            if fail_manifest {
+                source = source.with_export_manifest(Err("simulated manifest failure".to_string()));
+            }
+            let app = app(&backend, source);
+            let response = app
+                .clone()
+                .oneshot(get("/ui/sql/export/job-a/card"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert_sql_summary(&html, 2, 1);
+            let terminal = match outcome {
+                SqlExportStatus::Unknown => "cancelled",
+                _ if fail_manifest => "failed",
+                _ => "complete",
+            };
+            assert!(
+                html::Dom::fragment(&html)
+                    .one(".job-card .tag")
+                    .has_class(&format!("tag--{terminal}"))
+            );
+            assert!(
+                !html::Dom::fragment(&html)
+                    .one(".job-card")
+                    .has_attr("hx-trigger")
+            );
+            // Sibling job-b was counted, never polled by the first request.
+            let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+            assert_eq!(
+                stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-b"]["status"],
+                "in-progress"
+            );
+            let html =
+                body_text(app.oneshot(get("/ui/sql/export/job-b/card")).await.unwrap()).await;
+            assert_sql_summary(&html, 2, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_post_poll_settings_read_failure_returns_no_swap_and_the_next_tick_recovers() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let store = Arc::new(export_settings::ExportSettings::new(backend, 2, None));
+    let app = mount(
+        Some(store),
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Done),
+    );
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let html = body_text(response).await;
+    assert_eq!(html::Dom::fragment(&html).count("[hx-swap-oob]"), 0);
+    assert_eq!(html::Dom::fragment(&html).count("#job-job-a"), 0);
+    let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_sql_summary(&body_text(response).await, 1, 0);
+}
+
+#[tokio::test]
+async fn a_stale_sql_poll_renders_a_concurrent_cancel_or_404_for_a_removed_member() {
+    for replacement in [
+        serde_json::json!({"status": "cancelled"}),
+        serde_json::Value::Null,
+    ] {
+        let backend = backend_with_schema().await;
+        seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+        let deleted = replacement.is_null();
+        let race = serde_json::json!({"byTenant": {"default": {"sqlExport": {"jobs": {"job-a": replacement}}}}});
+        let store = Arc::new(export_settings::ExportSettings::new(
+            backend.clone(),
+            0,
+            Some(race),
+        ));
+        let app = mount(
+            Some(store),
+            StaticConformanceSource::empty().with_export_status(SqlExportStatus::Done),
+        );
+        let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+        if deleted {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert!(
+                html::Dom::fragment(&html)
+                    .one(".job-card .tag")
+                    .has_class("tag--cancelled")
+            );
+            assert_eq!(html::Dom::fragment(&html).count(".tag--complete"), 0);
+            assert_sql_summary(&html, 1, 0);
+        }
+        let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+        let member = stored.document["byTenant"]["default"]["sqlExport"]["jobs"].get("job-a");
+        assert_eq!(member.is_none(), deleted);
+        if let Some(member) = member {
+            assert_eq!(member["status"], "cancelled");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_sql_poll_write_keeps_the_persisted_running_card_polling() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let app = mount(
+        Some(Arc::new(FailingPatchSettingsStore(backend))),
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Done),
+    );
+    let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert_eq!(
+        html::Dom::fragment(&html)
+            .one(".job-card")
+            .attr("hx-trigger"),
+        Some("every 5s")
+    );
+    assert_eq!(html::Dom::fragment(&html).count("#sql-export-summary"), 0);
+    assert_eq!(html::Dom::fragment(&html).count(".tag--complete"), 0);
 }

@@ -1,0 +1,15 @@
+{
+  "head": "5df5f884835ccc14583748dfdb2fed2833d6109d",
+  "paths": {
+    "crates/persistence/src/backends/postgres/search/chain_builder.rs": "748cc8309bc5d062289cb9d0e4161d520abe744a8b8f5a49cefe9f04882373be",
+    "crates/persistence/src/backends/postgres/search/query_builder.rs": "71bff1ec39544379917e1a5b36f89ff9a04ad1f841ce403ed007502f8d7a5065",
+    "crates/persistence/src/backends/postgres/search_impl.rs": "9b10b03544ae5ffa4e83d4c3123392a0cbac6025d3668330db4b4372e63eb661",
+    "crates/persistence/src/composite/storage.rs": "4abf1bb85037ae655dff993762621689295985f4d36ab52e5350142b6549e3b2",
+    "crates/persistence/src/core/search.rs": "59b857171d3e09e05ddfbef4d73a8e70c8c9766e2d73f8f4d67b3172ab7db33b",
+    "crates/persistence/src/search/chain_resolver.rs": "28bc0edb1dcad3c34bdf058e0542e6ffa169747ed625fd40759196772f467bdc",
+    "crates/persistence/src/search/extractor.rs": "ecb919d02cc90fdd19991e7d008eb22ce2454fa7950f98ab566cf534cd481a93",
+    "crates/persistence/tests/postgres_tests.rs": "6834652c4f5547d239c1033472273815a07a7ec49059205fd26f7625c24763f3",
+    "crates/rest/tests/chained_search_resolution.rs": "ad461a025f98a4cca9ddd09a8865657a3d261df466705e2c6297fc005b8d0ed3"
+  },
+  "utc": "2026-09-30T07:52:30.646497+00:00"
+}

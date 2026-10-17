@@ -39,6 +39,14 @@ export class SqlExportPage {
 
   // --- The builder (/ui/sql/export/new) ---
 
+  get form(): Locator {
+    return this.page.locator("form[action='/ui/sql/export']");
+  }
+
+  get nameInput(): Locator {
+    return this.form.locator('input[name="name"]');
+  }
+
   subjectCheckbox(reference: string): Locator {
     return this.page.locator(`input[name="subject"][value="${reference}"]`);
   }
@@ -81,6 +89,13 @@ export class SqlExportPage {
   /** One parameter's own input/select inside its subject's values row. */
   paramField(reference: string, name: string): Locator {
     return this.paramsRow(reference).locator(`[name="param:${reference}:${name}"]`);
+  }
+
+  /** One parameter's inline error span (#2049). Always rendered, hidden
+   * until the server or sql-export-form.js flags the field; the id carries
+   * ':' and '/', hence the attribute selector. */
+  paramError(reference: string, name: string): Locator {
+    return this.paramsRow(reference).locator(`[id="param:${reference}:${name}-error"]`);
   }
 
   /** One of the four output-format choice cards' radio inputs (#834). */
@@ -165,6 +180,19 @@ export class SqlExportPage {
     return this.page.locator('select[name="since_preset"]');
   }
 
+  get sinceCombobox(): Locator {
+    return this.page.locator("#sql-export-since");
+  }
+
+  get sinceTrigger(): Locator {
+    return this.sinceCombobox.locator('button[role="combobox"]');
+  }
+
+  async chooseSince(value: string): Promise<void> {
+    await this.sinceTrigger.click();
+    await this.sinceCombobox.locator(`[role="option"][data-value="${value}"]`).click();
+  }
+
   get sinceCustom(): Locator {
     return this.page.locator('input[name="since_custom"]');
   }
@@ -173,7 +201,7 @@ export class SqlExportPage {
     return this.page.locator("#sql-export-since-custom-error");
   }
 
-  // --- "Advanced" (#836): tracking id and the CSV header switch. ---
+  // --- "Advanced" (#836): the format-independent tracking id only (#1716). ---
 
   get advancedDetails(): Locator {
     return this.page.locator("details.card").filter({
@@ -182,8 +210,8 @@ export class SqlExportPage {
   }
 
   /** Opens the "Advanced" `<details>` disclosure if it is not already open —
-   * its content (tracking id, the header switch) is native-hidden by the
-   * browser until then, exactly like any other closed `<details>`. */
+   * its content (the tracking id) is native-hidden by the browser until
+   * then, exactly like any other closed `<details>`. */
   async openAdvanced(): Promise<void> {
     const isOpen = await this.advancedDetails.evaluate((el) => (el as HTMLDetailsElement).open);
     if (!isOpen) await this.advancedDetails.locator("summary").click();
@@ -193,13 +221,22 @@ export class SqlExportPage {
     return this.page.locator('input[name="client_tracking_id"]');
   }
 
+  // --- The CSV header switch, under the Format choices (#836, #1716). ---
+
+  /** The wrapper holding the header switch and its CSV-only hint, right
+   * after the Format choice cards and outside "Advanced" (#1716) — what
+   * `sql-export-form.js` hides for a non-csv format. */
+  get headerOption(): Locator {
+    return this.page.locator("[data-csv-header-option]");
+  }
+
   get headerCheckbox(): Locator {
     return this.page.locator('input[name="header"]');
   }
 
-  /** The header checkbox's own `<label>` — what `sql-export-form.js` hides
-   * for a non-csv format (#836); the checkbox itself stays in the DOM (and
-   * enabled) throughout, only its label's visibility changes. */
+  /** The header checkbox's own `<label>`, inside `headerOption`; the
+   * checkbox itself stays in the DOM (and enabled) throughout, only the
+   * wrapper's visibility changes. */
   get headerLabel(): Locator {
     return this.page.locator('label:has(input[name="header"])');
   }

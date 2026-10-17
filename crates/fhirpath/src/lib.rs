@@ -291,6 +291,7 @@ mod repeat_all_function;
 mod repeat_function;
 mod resolve_function;
 mod resource_type;
+pub mod semantic_check;
 mod set_operations;
 mod subset_functions;
 mod terminology_client;
@@ -312,9 +313,86 @@ pub mod evaluator;
 pub mod parser;
 
 // Public API exports - this is what users of the fhirpath crate should use
-pub use evaluator::EvaluationContext;
+pub use evaluator::{EvaluationContext, UnresolvedIdentifierPolicy};
 pub use functions::{FunctionCategory, FunctionInfo, builtin_functions};
-pub use helios_fhirpath_support::EvaluationResult;
+pub use helios_fhirpath_support::{EvaluationError, EvaluationResult};
+pub use terminology_functions::TerminologySession;
+
+/// Why [`evaluate_expression_typed`] failed. Its `Display` text is exactly the `String`
+/// [`evaluate_expression`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpressionError {
+    /// The expression did not parse; the message [`parse_expression`] returned.
+    Parse(String),
+    /// The expression parsed but evaluating it failed.
+    Evaluation {
+        /// The expression text.
+        expression: String,
+        /// The evaluation error.
+        error: EvaluationError,
+    },
+}
+
+impl ExpressionError {
+    /// The evaluation error, if the expression parsed.
+    pub fn evaluation_error(&self) -> Option<&EvaluationError> {
+        match self {
+            Self::Evaluation { error, .. } => Some(error),
+            Self::Parse(_) => None,
+        }
+    }
+
+    /// True for a failed terminology operation, including the call limit.
+    pub fn is_terminology_error(&self) -> bool {
+        self.evaluation_error()
+            .is_some_and(EvaluationError::is_terminology_error)
+    }
+
+    /// True when the terminology call budget (`FHIRPATH_TERMINOLOGY_MAX_CALLS`) is used up.
+    pub fn is_terminology_call_limit(&self) -> bool {
+        self.evaluation_error()
+            .is_some_and(EvaluationError::is_terminology_call_limit)
+    }
+}
+
+impl std::fmt::Display for ExpressionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(message) => f.write_str(message),
+            Self::Evaluation { expression, error } => write!(
+                f,
+                "Failed to evaluate FHIRPath expression '{}': {}",
+                expression, error
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExpressionError {}
+
+/// Like [`evaluate_expression`], but the error is typed, so callers can tell terminology
+/// failures and the terminology call limit apart without matching message text.
+///
+/// ```rust,no_run
+/// use helios_fhirpath::{evaluate_expression_typed, EvaluationContext};
+///
+/// let context = EvaluationContext::new_empty_with_default_version();
+/// match evaluate_expression_typed("'a'.memberOf('http://example.org/vs')", &context) {
+///     Ok(_) => {}
+///     Err(e) if e.is_terminology_error() => eprintln!("terminology failure: {e}"),
+///     Err(e) => eprintln!("other error: {e}"),
+/// }
+/// ```
+pub fn evaluate_expression_typed(
+    expression: &str,
+    context: &EvaluationContext,
+) -> Result<EvaluationResult, ExpressionError> {
+    let parsed = parse_expression(expression).map_err(ExpressionError::Parse)?;
+    evaluator::evaluate(&parsed, context, None).map_err(|error| ExpressionError::Evaluation {
+        expression: expression.to_string(),
+        error,
+    })
+}
 
 /// Evaluates a FHIRPath expression against a given context.
 ///
@@ -357,15 +435,281 @@ pub fn evaluate_expression(
     expression: &str,
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, String> {
-    let parsed = parse_expression(expression)?;
+    evaluate_expression_typed(expression, context).map_err(|e| e.to_string())
+}
 
-    // Evaluate the parsed expression
-    evaluator::evaluate(&parsed, context, None).map_err(|e| {
-        format!(
-            "Failed to evaluate FHIRPath expression '{}': {}",
-            expression, e
-        )
+/// The maximum `(`/`[`/`{` nesting depth the parser accepts.
+///
+/// The FHIRPath grammar is recursive-descent, so an expression's nesting
+/// depth bounds the parser's stack use. Left unchecked, a pathologically
+/// nested expression (thousands of `(` deep) overflows the worker thread's
+/// stack and aborts the whole process — there is no unwinding a stack
+/// overflow. Every public parse entry point refuses input past this depth
+/// with an ordinary parse error first. The limit is far above any real
+/// expression: FHIRPath paths in the wild nest a handful deep, and the SQL
+/// compiler, search extractor, patch paths and ViewDefinition columns that
+/// feed untrusted text through here never approach it.
+pub const MAX_NESTING_DEPTH: usize = 100;
+
+/// Nesting depth safe to parse inline on any thread HFS runs on, including a
+/// 2 MB tokio worker in a debug build. Real FHIRPath expressions nest at most
+/// two or three deep (measured across the bundled spec search parameters), so
+/// the inline fast path covers all of them.
+const INLINE_PARSE_DEPTH: usize = 6;
+
+/// Stack for the off-thread parse of a deeply — but legally, within
+/// [`MAX_NESTING_DEPTH`] — nested expression. 32 MB parses depth 100 in a
+/// debug build with room to spare; 64 MB is margin. The address space is
+/// reserved, not committed, so the reservation is free until touched.
+const DEEP_PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// The maximum accumulated operator-chain depth the parser accepts.
+///
+/// `evaluate` and the other AST walkers recurse once per binary operator in a
+/// chain (`1 + 1 + … + 1`, `a or b or …`), once per postfix step
+/// (`.member`, `.f()`, `[i]`, `is T`) and once per prefix polarity. The parser
+/// is shielded from deep input (chumsky spills onto the heap) but the walkers
+/// are not, so a chain a few hundred long overflows a 2 MB tokio worker and a
+/// stack overflow aborts the whole process (#1219). Every public parse entry
+/// point refuses a larger depth with an ordinary parse error.
+///
+/// Measured on a 2 MiB thread (one process per depth, every construction
+/// alike): release evaluation survives 300 chained operators and aborts at
+/// 350; debug survives 64 and aborts at 80. 250 keeps release builds clear of
+/// the crash while staying far above real expressions (none of the 5,582
+/// bundled search-parameter expressions comes close). Debug builds are not
+/// covered below ~250. The
+/// depth is accumulated along the parenthesis path, so wrapping a chain in
+/// parentheses or function arguments does not reset it.
+pub const MAX_EXPRESSION_DEPTH: usize = 250;
+
+/// Words that act as binary operators when they are not a member name.
+const KEYWORD_OPERATORS: &[&str] = &[
+    "and", "or", "xor", "implies", "in", "contains", "is", "as", "div", "mod",
+];
+
+/// Per-bracket-level counters for [`scan_depths`].
+#[derive(Default)]
+struct Level {
+    binary: usize,
+    run: usize,
+    max_run: usize,
+    /// Deepest closed bracket group directly inside this level.
+    child_max: usize,
+    /// Cost of the comma-separated arguments already finished at this level.
+    done: usize,
+    /// Fixed cost of entering this level (a function call's argument list).
+    base: usize,
+}
+
+impl Level {
+    fn cost(&self) -> usize {
+        self.base + self.done.max(self.binary + self.max_run + self.child_max)
+    }
+
+    fn step(&mut self) {
+        self.run += 1;
+        self.max_run = self.max_run.max(self.run);
+    }
+}
+
+/// One linear pass over `expression` measuring both the deepest
+/// `(`/`[`/`{` nesting and the accumulated operator-chain depth (see
+/// [`MAX_EXPRESSION_DEPTH`]). Returns `(bracket_depth, chain_depth)`.
+///
+/// Lexes just enough to avoid miscounting: single-quoted strings and
+/// backtick identifiers (both with `\` escapes), `//` and `/* */` comments,
+/// two-character operators, decimals, `@` date literals, and keywords after a
+/// `.` (member names, not operators). Per bracket level the chain depth is the
+/// number of binary operators plus the longest run of postfix/prefix steps
+/// between them plus the deepest closed group inside it, so a chain wrapped in
+/// parentheses or function arguments still accumulates. A function call's
+/// argument list adds two, so nested calls cannot stack up uncounted. A `,` starts a fresh
+/// argument at the same level.
+fn scan_depths(expression: &str) -> (usize, usize) {
+    let chars: Vec<char> = expression.chars().collect();
+    let mut levels = vec![Level::default()];
+    let mut max_bracket = 0usize;
+    let mut prev_operand = false;
+    let mut prev_dot = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        let was_dot = std::mem::replace(&mut prev_dot, false);
+        let top = levels.last_mut().expect("level stack is never empty");
+        match c {
+            c if c.is_whitespace() => prev_dot = was_dot,
+            '\'' | '`' => {
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                prev_operand = true;
+            }
+            '/' if next == Some('/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '@' => {
+                while chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
+                {
+                    i += 1;
+                }
+                prev_operand = true;
+            }
+            c if c.is_ascii_digit() => {
+                while chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
+                    || (chars.get(i + 1) == Some(&'.')
+                        && chars.get(i + 2).is_some_and(|c| c.is_ascii_digit()))
+                {
+                    i += 1;
+                }
+                prev_operand = true;
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                {
+                    i += 1;
+                }
+                let word: String = chars[start..=i].iter().collect();
+                if !was_dot && KEYWORD_OPERATORS.contains(&word.as_str()) {
+                    if matches!(word.as_str(), "is" | "as") {
+                        // Postfix-style type operator: one more AST level.
+                        top.step();
+                    } else {
+                        top.binary += 1;
+                        top.run = 0;
+                    }
+                    prev_operand = false;
+                } else {
+                    prev_operand = true;
+                }
+            }
+            '.' => {
+                top.step();
+                prev_operand = false;
+                prev_dot = true;
+            }
+            '(' | '[' | '{' => {
+                if c == '[' {
+                    top.step();
+                }
+                // A function call's argument list: the invocation frames are
+                // deeper than one operator's, so the group weighs two extra.
+                let base = if c == '(' && prev_operand { 2 } else { 0 };
+                levels.push(Level {
+                    base,
+                    ..Level::default()
+                });
+                max_bracket = max_bracket.max(levels.len() - 1);
+                prev_operand = false;
+            }
+            ')' | ']' | '}' => {
+                if levels.len() > 1 {
+                    let child = levels.pop().map_or(0, |l| l.cost());
+                    let parent = levels.last_mut().expect("level stack is never empty");
+                    parent.child_max = parent.child_max.max(child);
+                }
+                prev_operand = true;
+            }
+            ',' => {
+                let (done, base) = (top.cost() - top.base, top.base);
+                *top = Level {
+                    done,
+                    base,
+                    ..Level::default()
+                };
+                prev_operand = false;
+            }
+            // Prefix polarity: one AST level per sign.
+            '+' | '-' if !prev_operand => top.step(),
+            '+' | '-' | '*' | '/' | '|' | '&' | '=' | '~' | '<' | '>' | '!' => {
+                if (matches!(c, '!' | '<' | '>') && matches!(next, Some('=' | '~')))
+                    || (c == '=' && next == Some('='))
+                {
+                    i += 1;
+                }
+                top.binary += 1;
+                top.run = 0;
+                prev_operand = false;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Fold any unclosed groups into their parents (such input fails to parse
+    // anyway, but must not slip past the bound).
+    while levels.len() > 1 {
+        let child = levels.pop().map_or(0, |l| l.cost());
+        let parent = levels.last_mut().expect("level stack is never empty");
+        parent.child_max = parent.child_max.max(child);
+    }
+    (max_bracket, levels[0].cost())
+}
+
+/// The depth `parse` is run at, or the refusal message when `expression` is
+/// nested or chained past [`MAX_NESTING_DEPTH`] / [`MAX_EXPRESSION_DEPTH`].
+fn check_depths(expression: &str) -> Result<usize, String> {
+    let (nesting, chain) = scan_depths(expression);
+    if nesting > MAX_NESTING_DEPTH {
+        Err(format!(
+            "nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}"
+        ))
+    } else if chain > MAX_EXPRESSION_DEPTH {
+        Err(format!(
+            "operator nesting exceeds the maximum depth of {MAX_EXPRESSION_DEPTH}"
+        ))
+    } else {
+        Ok(nesting)
+    }
+}
+
+/// Runs `parse` inline when `depth` is shallow, or on a dedicated large-stack
+/// thread when it is deeper, so a deeply nested expression cannot overflow the
+/// caller's (possibly 2 MB) stack. Depth past [`MAX_NESTING_DEPTH`] is the
+/// caller's to reject before calling this. The recursive-descent parser's
+/// stack use grows with nesting; before this guard a few-thousand-deep column
+/// path in a ViewDefinition overflowed the tokio worker and aborted the whole
+/// process, which a stack overflow gives no chance to unwind.
+fn run_parse<T: Send>(depth: usize, parse: impl FnOnce() -> T + Send) -> T {
+    if depth <= INLINE_PARSE_DEPTH {
+        return parse();
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(DEEP_PARSE_STACK_BYTES)
+            .spawn_scoped(scope, parse)
+            .expect("spawn FHIRPath deep-parse thread")
+            .join()
+            .expect("FHIRPath deep-parse thread panicked")
     })
+}
+
+/// The [`ParseDiagnostic`] returned when an expression is nested past
+/// [`MAX_NESTING_DEPTH`]: it spans the whole expression, since the depth is a
+/// property of the input as a whole rather than of one position in it.
+fn nesting_diagnostic(expression: &str, message: String) -> ParseDiagnostic {
+    ParseDiagnostic {
+        span: (0, expression.chars().count()),
+        message,
+    }
 }
 
 /// Parse a FHIRPath expression source string into a typed [`parser::Expression`] AST.
@@ -374,17 +718,20 @@ pub fn evaluate_expression(
 /// (e.g. compiling FHIRPath to SQL) without taking a dependency on the
 /// parser-combinator crate.
 pub fn parse_expression(expression: &str) -> Result<parser::Expression, String> {
-    use chumsky::Parser;
-
-    parser::parser()
-        .parse(expression)
-        .into_result()
-        .map_err(|e| {
-            format!(
-                "Failed to parse FHIRPath expression '{}': {:?}",
-                expression, e
-            )
-        })
+    let depth = check_depths(expression)
+        .map_err(|message| format!("Failed to parse FHIRPath expression: {message}"))?;
+    run_parse(depth, || {
+        use chumsky::Parser;
+        parser::parser()
+            .parse(expression)
+            .into_result()
+            .map_err(|e| {
+                format!(
+                    "Failed to parse FHIRPath expression '{}': {:?}",
+                    expression, e
+                )
+            })
+    })
 }
 
 /// A single parse error from [`parse_expression_diagnostics`], with its span
@@ -435,26 +782,29 @@ pub struct ParseDiagnostic {
 pub fn parse_expression_diagnostics(
     expression: &str,
 ) -> Result<parser::Expression, Vec<ParseDiagnostic>> {
-    use chumsky::Parser;
-
-    parser::parser()
-        .parse(expression)
-        .into_result()
-        .map_err(|errors| {
-            errors
-                .iter()
-                .map(|error| {
-                    let span = error.span();
-                    ParseDiagnostic {
-                        span: (
-                            byte_to_char_offset(expression, span.start),
-                            byte_to_char_offset(expression, span.end),
-                        ),
-                        message: error.to_string(),
-                    }
-                })
-                .collect()
-        })
+    let depth = check_depths(expression)
+        .map_err(|message| vec![nesting_diagnostic(expression, message)])?;
+    run_parse(depth, || {
+        use chumsky::Parser;
+        parser::parser()
+            .parse(expression)
+            .into_result()
+            .map_err(|errors| {
+                errors
+                    .iter()
+                    .map(|error| {
+                        let span = error.span();
+                        ParseDiagnostic {
+                            span: (
+                                byte_to_char_offset(expression, span.start),
+                                byte_to_char_offset(expression, span.end),
+                            ),
+                            message: error.to_string(),
+                        }
+                    })
+                    .collect()
+            })
+    })
 }
 
 /// Converts a UTF-8 byte offset into `s` (assumed to already fall on a
@@ -498,26 +848,29 @@ fn byte_to_char_offset(s: &str, byte_offset: usize) -> usize {
 pub fn parse_expression_spanned(
     expression: &str,
 ) -> Result<parser::SpannedExpression, Vec<ParseDiagnostic>> {
-    use chumsky::Parser;
-
-    parser::spanned_parser()
-        .parse(expression)
-        .into_result()
-        .map_err(|errors| {
-            errors
-                .iter()
-                .map(|error| {
-                    let span = error.span();
-                    ParseDiagnostic {
-                        span: (
-                            byte_to_char_offset(expression, span.start),
-                            byte_to_char_offset(expression, span.end),
-                        ),
-                        message: error.to_string(),
-                    }
-                })
-                .collect()
-        })
+    let depth = check_depths(expression)
+        .map_err(|message| vec![nesting_diagnostic(expression, message)])?;
+    run_parse(depth, || {
+        use chumsky::Parser;
+        parser::spanned_parser()
+            .parse(expression)
+            .into_result()
+            .map_err(|errors| {
+                errors
+                    .iter()
+                    .map(|error| {
+                        let span = error.span();
+                        ParseDiagnostic {
+                            span: (
+                                byte_to_char_offset(expression, span.start),
+                                byte_to_char_offset(expression, span.end),
+                            ),
+                            message: error.to_string(),
+                        }
+                    })
+                    .collect()
+            })
+    })
 }
 
 /// Converts a byte-offset [`parser::ExprSpan`] (as produced by

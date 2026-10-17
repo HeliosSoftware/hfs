@@ -5,11 +5,16 @@
 
 use futures::Stream;
 use futures::StreamExt;
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, ToSql, params_from_iter};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 
 use super::{BoundParam, SqlQueryError};
+use crate::SofError;
+use crate::column_types::{AnsiType, ColumnTypeInfo, default_for_fhir_type, resolve_columns};
 
 /// FHIR type code for a column. Mirrors the value-set used by
 /// `ViewDefinition.select.column.type` so we can pick the correct value[X]
@@ -70,6 +75,29 @@ impl ColumnFhirType {
         }
     }
 
+    /// The type this column is stored and rendered as once an `ansi/type` tag
+    /// has overridden the default for `self` (the declared FHIR type). The tag
+    /// was already checked for compatibility, so every arm is a refinement of
+    /// the declared type; a declared type that already satisfies the tag is
+    /// kept so `_format=fhir` still picks its exact `value[x]`.
+    pub fn with_ansi_override(self, ansi: AnsiType) -> Self {
+        match (ansi, self) {
+            (AnsiType::Varchar, ColumnFhirType::String(code)) => ColumnFhirType::String(code),
+            (AnsiType::Varchar, _) => ColumnFhirType::String("string".to_string()),
+            (AnsiType::Boolean, _) => ColumnFhirType::Boolean,
+            (AnsiType::Int, _) => ColumnFhirType::Integer,
+            (AnsiType::BigInt, _) => ColumnFhirType::Integer64,
+            (AnsiType::Double, _) => ColumnFhirType::Decimal,
+            (AnsiType::Date, _) => ColumnFhirType::Date,
+            (AnsiType::Time, _) => ColumnFhirType::Time,
+            (AnsiType::Timestamp | AnsiType::TimestampTz, ColumnFhirType::Instant) => {
+                ColumnFhirType::Instant
+            }
+            (AnsiType::Timestamp | AnsiType::TimestampTz, _) => ColumnFhirType::DateTime,
+            (AnsiType::Binary, _) => ColumnFhirType::Base64Binary,
+        }
+    }
+
     /// SQLite type-affinity declaration for `CREATE TABLE`.
     pub fn sqlite_affinity(&self) -> &'static str {
         match self {
@@ -87,6 +115,12 @@ impl ColumnFhirType {
 pub struct ColumnSchema {
     pub name: String,
     pub fhir_type: ColumnFhirType,
+    /// The resolved ISO/IEC 9075 type (the `ansi/type` tag if the column has
+    /// one, else the default for its declared `type`), when it is known. It is
+    /// kept beside `fhir_type` because a tag override is not recoverable from
+    /// the post-override `fhir_type` (a `DATE` tag and a declared `date` both
+    /// end up as [`ColumnFhirType::Date`]).
+    pub ansi: Option<AnsiType>,
 }
 
 /// Per-table schema: the column list (order matters for INSERT).
@@ -98,15 +132,48 @@ pub struct TableSchema {
 impl TableSchema {
     /// Build a schema from a ViewDefinition's `select[].column[]` list.
     /// Walks every `select` entry (including nested `select` under `forEach`)
-    /// and collects columns in document order.
+    /// and keeps the first declaration of each column name. In particular,
+    /// unionAll branches contribute rows to the same columns, not new columns.
+    ///
+    /// Infallible: if a column carries an invalid `ansi/type` tag the tag is
+    /// ignored here and the declared `type` is used. Callers that must reject
+    /// such a ViewDefinition use [`Self::try_from_view_definition`].
     pub fn from_view_definition(view: &Value) -> Self {
-        let mut columns = Vec::new();
-        if let Some(selects) = view.get("select").and_then(|v| v.as_array()) {
-            for s in selects {
-                collect_columns(s, &mut columns);
+        Self::try_from_view_definition(view).unwrap_or_else(|_| {
+            let mut columns = Vec::new();
+            if let Some(selects) = view.get("select").and_then(|v| v.as_array()) {
+                for s in selects {
+                    collect_columns(s, &mut columns);
+                }
             }
-        }
-        TableSchema { columns }
+            let mut seen = HashSet::new();
+            columns.retain(|column| seen.insert(column.name.clone()));
+            TableSchema { columns }
+        })
+    }
+
+    /// Like [`Self::from_view_definition`], but honours the `ansi/type` column
+    /// tag (resolved through [`crate::column_types::resolve_columns`]) and
+    /// returns [`SofError::InvalidViewDefinition`] for an unknown or
+    /// incompatible tag value.
+    pub fn try_from_view_definition(view: &Value) -> Result<Self, SofError> {
+        let columns = resolve_columns(view)?
+            .into_iter()
+            .map(|info| {
+                let declared =
+                    ColumnFhirType::from_code(info.fhir_type.as_deref().unwrap_or("string"));
+                let fhir_type = match (info.overridden, info.ansi) {
+                    (true, Some(ansi)) => declared.with_ansi_override(ansi),
+                    _ => declared,
+                };
+                ColumnSchema {
+                    name: info.name,
+                    fhir_type,
+                    ansi: info.ansi,
+                }
+            })
+            .collect();
+        Ok(TableSchema { columns })
     }
 }
 
@@ -124,6 +191,7 @@ fn collect_columns(select: &Value, out: &mut Vec<ColumnSchema>) {
             out.push(ColumnSchema {
                 name: name.to_string(),
                 fhir_type: ColumnFhirType::from_code(&type_code),
+                ansi: Some(default_for_fhir_type(&type_code)),
             });
         }
     }
@@ -137,6 +205,118 @@ fn collect_columns(select: &Value, out: &mut Vec<ColumnSchema>) {
             collect_columns(s, out);
         }
     }
+}
+
+/// One column as declared by a ViewDefinition, before any defaulting.
+///
+/// Unlike [`ColumnSchema`], a column without a `type` keeps `fhir_type: None`
+/// (so a columnar writer can fall back to inferring from the data) and the
+/// `collection` flag is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredColumn {
+    /// Column name.
+    pub name: String,
+    /// The declared FHIR `type`, or `None` to infer it from the data.
+    pub fhir_type: Option<ColumnFhirType>,
+    /// Whether the column is declared `collection: true`.
+    pub collection: bool,
+    /// The resolved ISO/IEC 9075 type: the `ansi/type` tag if the column has
+    /// one, else the default mapping for `fhir_type`. `None` when the column
+    /// declares neither (its type is inferred from the data).
+    pub ansi: Option<AnsiType>,
+}
+
+impl From<&ColumnTypeInfo> for DeclaredColumn {
+    fn from(info: &ColumnTypeInfo) -> Self {
+        DeclaredColumn {
+            name: info.name.clone(),
+            fhir_type: info.fhir_type.as_deref().map(ColumnFhirType::from_code),
+            collection: info.collection,
+            ansi: info.ansi,
+        }
+    }
+}
+
+/// Declared columns for a query result: each column takes the type the query
+/// reported, so every consumer (`$sql-run`, exports) builds the same schema.
+pub fn declared_from_query_types(
+    columns: &[String],
+    types: &[ColumnFhirType],
+) -> Vec<DeclaredColumn> {
+    columns
+        .iter()
+        .zip(types)
+        .map(|(name, t)| DeclaredColumn {
+            name: name.clone(),
+            fhir_type: Some(t.clone()),
+            collection: false,
+            ansi: Some(default_for_fhir_type(t.code())),
+        })
+        .collect()
+}
+
+/// Declared columns of a ViewDefinition, in declaration order, keeping the
+/// first declaration of each name (same walk as [`TableSchema::from_view_definition`]).
+///
+/// Infallible: if a column carries an invalid `ansi/type` tag, every column
+/// falls back to the default mapping for its declared `type` and the tag is
+/// ignored. Callers that must reject such a ViewDefinition use
+/// [`try_declared_columns`].
+pub fn declared_columns(view: &Value) -> Vec<DeclaredColumn> {
+    try_declared_columns(view).unwrap_or_else(|_| untagged_declared_columns(view))
+}
+
+/// Declared columns of a ViewDefinition with each column's resolved SQL type
+/// (the declared `type`'s default mapping, or its `ansi/type` tag). Fails with
+/// [`SofError::InvalidViewDefinition`], naming the column, when a tag is
+/// unknown, not a string, or incompatible with the column's `type`.
+pub fn try_declared_columns(view: &Value) -> Result<Vec<DeclaredColumn>, SofError> {
+    Ok(resolve_columns(view)?
+        .iter()
+        .map(DeclaredColumn::from)
+        .collect())
+}
+
+fn untagged_declared_columns(view: &Value) -> Vec<DeclaredColumn> {
+    fn walk(select: &Value, out: &mut Vec<DeclaredColumn>) {
+        if let Some(cols) = select.get("column").and_then(|v| v.as_array()) {
+            for col in cols {
+                let Some(name) = col.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let fhir_type = col
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(ColumnFhirType::from_code);
+                out.push(DeclaredColumn {
+                    name: name.to_string(),
+                    ansi: fhir_type.as_ref().map(|t| default_for_fhir_type(t.code())),
+                    fhir_type,
+                    collection: col
+                        .get("collection")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                });
+            }
+        }
+        for key in ["select", "unionAll"] {
+            if let Some(nested) = select.get(key).and_then(|v| v.as_array()) {
+                for s in nested {
+                    walk(s, out);
+                }
+            }
+        }
+    }
+
+    let mut columns = Vec::new();
+    if let Some(selects) = view.get("select").and_then(|v| v.as_array()) {
+        for s in selects {
+            walk(s, &mut columns);
+        }
+    }
+    let mut seen = HashSet::new();
+    columns.retain(|column| seen.insert(column.name.clone()));
+    columns
 }
 
 /// Result of running the user query.
@@ -193,6 +373,33 @@ impl InMemorySqlEngine {
             format!("CREATE TABLE \"{}\" ({})", label, columns_ddl.join(", "))
         };
         self.conn.execute(&sql, [])?;
+        Ok(())
+    }
+
+    /// Creates a view named `label` that exposes every row and column of
+    /// the existing table (or view) `source`, so a consumer's SQL can address
+    /// that table under a second name without copying a single row. Both
+    /// identifiers go through the same validation as [`Self::create_table`].
+    /// The view lives in this request's in-memory database and disappears
+    /// with it.
+    pub fn create_view(&self, label: &str, source: &str) -> Result<(), SqlQueryError> {
+        validate_identifier(label)?;
+        validate_identifier(source)?;
+        self.conn.execute(
+            &format!("CREATE VIEW \"{label}\" AS SELECT * FROM \"{source}\""),
+            [],
+        )?;
+        // SQLite defers a view's column/table resolution to first use (the
+        // same forward-reference allowance it grants triggers), so a missing
+        // `source` would otherwise go unnoticed until a caller later queries
+        // `label`. Prepare (without running) a statement against the new
+        // view right away so a missing `source` is reported from
+        // `create_view` itself, and drop the unusable view instead of
+        // leaving a dangling one behind.
+        if let Err(e) = self.conn.prepare(&format!("SELECT * FROM \"{label}\"")) {
+            let _ = self.conn.execute(&format!("DROP VIEW \"{label}\""), []);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -315,13 +522,60 @@ impl InMemorySqlEngine {
     }
 
     /// Run a SELECT with named bindings and a row cap.
+    ///
+    /// The SQL is prepared and stepped under a SQLite authorizer that allows
+    /// only reads (SELECT, column reads, function calls, recursive CTEs).
+    /// DML, DDL, PRAGMA, ATTACH/DETACH and transaction control, including an
+    /// INSERT/UPDATE behind a `WITH` prefix, are refused with
+    /// [`SqlQueryError::NotSelect`] before they run (#1799). VACUUM, which has
+    /// no authorizer action, is refused by a `sqlite3_stmt_readonly` check on
+    /// the prepared statement. The authorizer is removed before returning, so
+    /// the engine's own `create_table` / `insert_rows` / `create_view`
+    /// statements are unaffected.
     pub fn execute_select(
         &self,
         sql: &str,
         bindings: &[BoundParam],
         max_rows: usize,
     ) -> Result<QueryResult, SqlQueryError> {
+        let refused: Arc<OnceLock<&'static str>> = Arc::default();
+        let record = Arc::clone(&refused);
+        let read_only = move |ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Select
+            | AuthAction::Read { .. }
+            | AuthAction::Function { .. }
+            | AuthAction::Recursive => Authorization::Allow,
+            other => {
+                let _ = record.set(refused_statement_keyword(&other));
+                Authorization::Deny
+            }
+        };
+        self.conn.authorizer(Some(read_only));
+        let result = self.run_select(sql, bindings, max_rows);
+        self.conn
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        match refused.get() {
+            Some(keyword) => Err(not_select(keyword)),
+            None => result,
+        }
+    }
+
+    /// The body of [`Self::execute_select`], run while its authorizer is installed.
+    fn run_select(
+        &self,
+        sql: &str,
+        bindings: &[BoundParam],
+        max_rows: usize,
+    ) -> Result<QueryResult, SqlQueryError> {
         let mut stmt = self.conn.prepare(sql)?;
+        // Second layer behind the authorizer: SQLite has no authorizer action
+        // for VACUUM (and `sqlite3RunVacuum` clears the authorizer while it
+        // runs), so `VACUUM INTO '<path>'` would write a file. The prepared
+        // statement reports itself as not read-only for VACUUM and for any other
+        // statement that would write.
+        if !stmt.readonly() {
+            return Err(not_select("non-SELECT"));
+        }
 
         // Resolve each `:name` binding against the prepared statement's
         // parameter index. Names not referenced by the SQL are silently
@@ -359,10 +613,10 @@ impl InMemorySqlEngine {
             for (i, _) in columns.iter().enumerate() {
                 let v: rusqlite::types::Value = row.get(i)?;
                 let (json_val, inferred) = sqlite_value_to_json(v);
-                if matches!(column_types[i], ColumnFhirType::String(_)) {
-                    if let Some(ft) = inferred {
-                        column_types[i] = ft;
-                    }
+                if matches!(column_types[i], ColumnFhirType::String(_))
+                    && let Some(ft) = inferred
+                {
+                    column_types[i] = ft;
                 }
                 row_vals.push(json_val);
             }
@@ -375,6 +629,30 @@ impl InMemorySqlEngine {
             rows: rows_out,
         })
     }
+}
+
+/// Name the statement kind behind the first action the read-only authorizer
+/// denied. SQLite authorizes a CREATE's INSERT into `sqlite_master` (and a
+/// DROP's DELETE from it) before the CREATE or DROP itself, and a denial stops
+/// at the first action, so those two writes are reported as CREATE and DROP.
+fn refused_statement_keyword(action: &AuthAction<'_>) -> &'static str {
+    match action {
+        AuthAction::Insert { table_name } if table_name.starts_with("sqlite_") => "CREATE",
+        AuthAction::Delete { table_name } if table_name.starts_with("sqlite_") => "DROP",
+        AuthAction::Insert { .. } => "INSERT",
+        AuthAction::Update { .. } => "UPDATE",
+        AuthAction::Delete { .. } => "DELETE",
+        AuthAction::Pragma { .. } => "PRAGMA",
+        AuthAction::Attach { .. } => "ATTACH",
+        AuthAction::Detach { .. } => "DETACH",
+        _ => "non-SELECT",
+    }
+}
+
+fn not_select(keyword: &str) -> SqlQueryError {
+    SqlQueryError::NotSelect(format!(
+        "only SELECT queries are allowed; {keyword} statements are not permitted"
+    ))
 }
 
 fn validate_identifier(name: &str) -> Result<(), SqlQueryError> {
@@ -455,9 +733,100 @@ mod tests {
                 .map(|(n, t)| ColumnSchema {
                     name: (*n).to_string(),
                     fhir_type: t.clone(),
+                    ansi: None,
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn union_schema_keeps_first_declarations_in_traversal_order() {
+        let view = json!({"select": [{
+            "column": [{"name": "active", "type": "boolean"}],
+            "select": [{"column": [{"name": "id", "type": "id"}]}],
+            "unionAll": [
+                {"column": [{"name": "id", "type": "string"}, {"name": "score", "type": "integer"}]},
+                {"column": [{"name": "score", "type": "decimal"}, {"name": "id", "type": "string"}]}
+            ]
+        }]});
+        let actual = TableSchema::from_view_definition(&view)
+            .columns
+            .into_iter()
+            .map(|c| (c.name, c.fhir_type))
+            .collect::<Vec<_>>();
+        // TableSchema derives a table; it does not validate branch schemas.
+        // Even conflicting later declarations cannot replace the first type.
+        assert_eq!(
+            actual,
+            vec![
+                ("active".to_string(), ColumnFhirType::Boolean),
+                ("id".to_string(), ColumnFhirType::String("id".to_string())),
+                ("score".to_string(), ColumnFhirType::Integer),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_union_schema_is_unchanged() {
+        let view = json!({"select": [
+            {"column": [{"name": "id", "type": "id"}],
+             "select": [{"column": [{"name": "active", "type": "boolean"}]}]},
+            {"forEach": "name", "column": [{"name": "family"}, {"name": "score", "type": "integer"}]}
+        ]});
+        let actual = TableSchema::from_view_definition(&view)
+            .columns
+            .into_iter()
+            .map(|c| (c.name, c.fhir_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                ("id".to_string(), ColumnFhirType::String("id".to_string())),
+                ("active".to_string(), ColumnFhirType::Boolean),
+                (
+                    "family".to_string(),
+                    ColumnFhirType::String("string".to_string())
+                ),
+                ("score".to_string(), ColumnFhirType::Integer),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn union_dependency_table_has_unique_columns_and_aligned_rows() {
+        let view = json!({"select": [{"unionAll": [
+            {"column": [{"name": "id", "type": "string"}, {"name": "score", "type": "integer"}]},
+            {"column": [{"name": "score", "type": "integer"}, {"name": "id", "type": "string"}]}
+        ]}]});
+        let schema = TableSchema::from_view_definition(&view);
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine.create_table("union_rows", &schema).unwrap();
+        // The materializer reads by key, even when a producer's declaration
+        // and JSON object orders differ. Duplicate rows must survive.
+        let rows = stream::iter(vec![
+            Ok(json!({"id": "p1", "score": 1})),
+            Ok(json!({"id": "p2", "score": 2})),
+            Ok(json!({"score": 1, "id": "p1"})),
+            Ok(json!({"score": 2, "id": "p2"})),
+        ]);
+        let (engine, inserted) = engine
+            .insert_rows("union_rows", &schema, Box::pin(rows), 10)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 4);
+        let result = engine
+            .execute_select("SELECT * FROM union_rows ORDER BY score", &[], 10)
+            .unwrap();
+        assert_eq!(result.columns, vec!["id", "score"]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some(json!("p1")), Some(json!(1))],
+                vec![Some(json!("p1")), Some(json!(1))],
+                vec![Some(json!("p2")), Some(json!(2))],
+                vec![Some(json!("p2")), Some(json!(2))],
+            ]
+        );
     }
 
     #[tokio::test]
@@ -668,6 +1037,117 @@ mod tests {
         assert_eq!(ColumnFhirType::String("id".into()).code(), "id");
     }
 
+    fn tagged_view(ty: &str, tag: Option<&str>) -> Value {
+        let mut col = json!({"name": "c", "path": "x", "type": ty});
+        if let Some(t) = tag {
+            col["tag"] = json!([{"name": "ansi/type", "value": t}]);
+        }
+        json!({"select": [{"column": [col]}]})
+    }
+
+    fn affinity_of(view: &Value) -> &'static str {
+        let schema = TableSchema::try_from_view_definition(view).unwrap();
+        schema.columns[0].fhir_type.sqlite_affinity()
+    }
+
+    #[test]
+    fn default_affinities_for_decimal_instant_integer64() {
+        // decimal stays REAL on purpose: TEXT affinity would make `WHERE d > 5`
+        // compare as text. instant is TEXT, integer64 is INTEGER.
+        assert_eq!(affinity_of(&tagged_view("decimal", None)), "REAL");
+        assert_eq!(affinity_of(&tagged_view("instant", None)), "TEXT");
+        assert_eq!(affinity_of(&tagged_view("integer64", None)), "INTEGER");
+        assert_eq!(affinity_of(&tagged_view("base64Binary", None)), "TEXT");
+    }
+
+    #[test]
+    fn ansi_type_tag_overrides_affinity() {
+        assert_eq!(
+            affinity_of(&tagged_view("decimal", Some("VARCHAR"))),
+            "TEXT"
+        );
+        assert_eq!(
+            affinity_of(&tagged_view("integer", Some("bigint"))),
+            "INTEGER"
+        );
+        assert_eq!(
+            affinity_of(&tagged_view("integer", Some("DOUBLE PRECISION"))),
+            "REAL"
+        );
+        assert_eq!(
+            affinity_of(&tagged_view("integer64", Some("varchar"))),
+            "TEXT"
+        );
+        assert_eq!(affinity_of(&tagged_view("date", Some("DATE"))), "TEXT");
+    }
+
+    #[test]
+    fn ansi_type_tag_override_keeps_exact_fhir_type_when_it_already_fits() {
+        let s = TableSchema::try_from_view_definition(&tagged_view("integer64", Some("BIGINT")))
+            .unwrap();
+        assert_eq!(s.columns[0].fhir_type, ColumnFhirType::Integer64);
+        let s =
+            TableSchema::try_from_view_definition(&tagged_view("code", Some("VARCHAR"))).unwrap();
+        assert_eq!(s.columns[0].fhir_type.code(), "code");
+        let s = TableSchema::try_from_view_definition(&tagged_view("instant", Some("TIMESTAMP")))
+            .unwrap();
+        assert_eq!(s.columns[0].fhir_type, ColumnFhirType::Instant);
+    }
+
+    #[test]
+    fn invalid_tag_is_rejected_by_try_and_ignored_by_infallible_constructor() {
+        let bad_value = tagged_view("decimal", Some("GEOMETRY"));
+        let incompatible = tagged_view("decimal", Some("INT"));
+        for view in [&bad_value, &incompatible] {
+            let err = TableSchema::try_from_view_definition(view).unwrap_err();
+            assert!(matches!(err, SofError::InvalidViewDefinition(_)));
+            let s = TableSchema::from_view_definition(view);
+            assert_eq!(s.columns[0].fhir_type, ColumnFhirType::Decimal);
+        }
+    }
+
+    #[test]
+    fn decimal_binding_keeps_numbers_numeric_and_override_binds_as_text() {
+        use rusqlite::types::Value as RV;
+        let decimal = ColumnSchema {
+            name: "c".into(),
+            fhir_type: ColumnFhirType::Decimal,
+            ansi: None,
+        };
+        assert_eq!(
+            json_to_sqlite_value(&json!({"c": "1.5"}), &decimal),
+            RV::Real(1.5)
+        );
+        let integer64 = ColumnSchema {
+            name: "c".into(),
+            fhir_type: ColumnFhirType::Integer64,
+            ansi: None,
+        };
+        assert_eq!(
+            json_to_sqlite_value(&json!({"c": "9007199254740993"}), &integer64),
+            RV::Integer(9_007_199_254_740_993)
+        );
+        let instant = ColumnSchema {
+            name: "c".into(),
+            fhir_type: ColumnFhirType::Instant,
+            ansi: None,
+        };
+        assert_eq!(
+            json_to_sqlite_value(&json!({"c": "2024-01-01T00:00:00Z"}), &instant),
+            RV::Text("2024-01-01T00:00:00Z".into())
+        );
+        // A VARCHAR override on a decimal column binds the lexical form as text.
+        let overridden =
+            TableSchema::try_from_view_definition(&tagged_view("decimal", Some("VARCHAR")))
+                .unwrap()
+                .columns
+                .remove(0);
+        assert_eq!(
+            json_to_sqlite_value(&json!({"c": "1.50"}), &overridden),
+            RV::Text("1.50".into())
+        );
+    }
+
     #[test]
     fn schema_from_vd_select_columns() {
         let vd = json!({
@@ -698,5 +1178,283 @@ mod tests {
             s.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
             vec!["a", "b", "c"]
         );
+    }
+
+    #[tokio::test]
+    async fn create_view_exposes_source_rows_and_columns() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[
+            ("id", ColumnFhirType::String("id".into())),
+            ("n", ColumnFhirType::Integer),
+        ]);
+        engine.create_table("t", &s).unwrap();
+        let rows = stream::iter(vec![
+            Ok(json!({"id": "a", "n": 1})),
+            Ok(json!({"id": "b", "n": 2})),
+            Ok(json!({"id": "c", "n": 3})),
+        ]);
+        let (engine, inserted) = engine
+            .insert_rows("t", &s, Box::pin(rows), 10)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 3);
+        engine.create_view("v", "t").unwrap();
+
+        let from_view = engine
+            .execute_select("SELECT id, n FROM v ORDER BY n", &[], 100)
+            .unwrap();
+        let from_table = engine
+            .execute_select("SELECT id, n FROM t ORDER BY n", &[], 100)
+            .unwrap();
+        assert_eq!(from_view.rows.len(), 3);
+        assert_eq!(from_view.rows, from_table.rows);
+        assert_eq!(from_view.rows[0][0], Some(Value::String("a".into())));
+        assert_eq!(from_view.rows[0][1], Some(Value::Number(1.into())));
+        assert_eq!(from_view.rows[2][0], Some(Value::String("c".into())));
+        assert_eq!(from_view.rows[2][1], Some(Value::Number(3.into())));
+    }
+
+    #[tokio::test]
+    async fn create_view_reports_the_same_inferred_column_types_as_the_table() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[
+            ("id", ColumnFhirType::String("id".into())),
+            ("n", ColumnFhirType::Integer),
+        ]);
+        engine.create_table("t", &s).unwrap();
+        let rows = stream::iter(vec![
+            Ok(json!({"id": "a", "n": 1})),
+            Ok(json!({"id": "b", "n": 2})),
+            Ok(json!({"id": "c", "n": 3})),
+        ]);
+        let (engine, _inserted) = engine
+            .insert_rows("t", &s, Box::pin(rows), 10)
+            .await
+            .unwrap();
+        engine.create_view("v", "t").unwrap();
+
+        let from_view = engine.execute_select("SELECT * FROM v", &[], 100).unwrap();
+        let from_table = engine.execute_select("SELECT * FROM t", &[], 100).unwrap();
+        assert_eq!(from_view.columns, from_table.columns);
+        assert_eq!(from_view.column_types.len(), from_table.column_types.len());
+        for (view_ty, table_ty) in from_view.column_types.iter().zip(&from_table.column_types) {
+            assert_eq!(view_ty.code(), table_ty.code());
+        }
+    }
+
+    #[test]
+    fn create_view_over_empty_schema_table_works() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = TableSchema { columns: vec![] };
+        engine.create_table("e", &s).unwrap();
+        engine.create_view("ve", "e").unwrap();
+        let result = engine
+            .execute_select("SELECT COUNT(*) AS c FROM ve", &[], 100)
+            .unwrap();
+        assert_eq!(result.rows[0][0], Some(Value::Number(0.into())));
+    }
+
+    #[test]
+    fn create_view_rejects_invalid_identifiers() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[("a", ColumnFhirType::Integer)]);
+        engine.create_table("t", &s).unwrap();
+
+        let err = engine.create_view("bad\"name", "t").unwrap_err();
+        assert!(matches!(err, SqlQueryError::InvalidIdentifier(_)));
+
+        let err = engine.create_view("v", "").unwrap_err();
+        assert!(matches!(err, SqlQueryError::InvalidIdentifier(_)));
+    }
+
+    #[test]
+    fn create_view_on_missing_source_is_an_error() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let err = engine.create_view("v", "does_not_exist").unwrap_err();
+        assert!(!matches!(err, SqlQueryError::InvalidIdentifier(_)));
+    }
+
+    /// #1799: the engine itself must refuse anything that is not a read, so a
+    /// statement the REST pre-check misses (e.g. an INSERT behind a `WITH`
+    /// prefix) cannot modify the database.
+    #[test]
+    fn execute_select_refuses_writes_ddl_pragma_and_attach() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine
+            .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
+            .unwrap();
+
+        for (sql, keyword) in [
+            ("WITH c AS (SELECT 1) INSERT INTO t SELECT 1", "INSERT"),
+            ("INSERT INTO t VALUES (1)", "INSERT"),
+            ("UPDATE t SET n = 2", "UPDATE"),
+            ("DELETE FROM t", "DELETE"),
+            ("PRAGMA user_version = 1", "PRAGMA"),
+            ("ATTACH DATABASE ':memory:' AS other", "ATTACH"),
+            ("CREATE TABLE u (a INTEGER)", "CREATE"),
+            ("DROP TABLE t", "DROP"),
+            ("CREATE TEMP TABLE tt (a INTEGER)", "CREATE"),
+            ("CREATE VIEW v AS SELECT n FROM t", "CREATE"),
+            ("CREATE INDEX i ON t (n)", "CREATE"),
+            ("ALTER TABLE t ADD COLUMN m INTEGER", "non-SELECT"),
+            ("BEGIN", "non-SELECT"),
+            ("SAVEPOINT sp", "non-SELECT"),
+            ("DETACH DATABASE other", "DETACH"),
+            ("SELECT * FROM pragma_table_info('t')", "PRAGMA"),
+            ("VACUUM", "non-SELECT"),
+        ] {
+            let expected =
+                format!("only SELECT queries are allowed; {keyword} statements are not permitted");
+            let err = engine
+                .execute_select(sql, &[], 10)
+                .err()
+                .unwrap_or_else(|| panic!("{sql}: expected NotSelect, but the statement ran"));
+            let SqlQueryError::NotSelect(message) = &err else {
+                panic!("{sql}: expected NotSelect, got {err}")
+            };
+            assert_eq!(message, &expected, "{sql}");
+            assert_eq!(err.to_string(), expected, "{sql}");
+        }
+
+        // Nothing took effect: t still exists, is empty and kept its one column
+        // (the ALTER did not run), and no u, v, i or tt was created.
+        let count = |sql: &str| {
+            let result = engine.execute_select(sql, &[], 10).unwrap();
+            result.rows[0][0].clone()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM t"),
+            Some(Value::Number(0.into()))
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('u','v','i')"),
+            Some(Value::Number(0.into()))
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'tt'"),
+            Some(Value::Number(0.into()))
+        );
+        assert_eq!(
+            engine
+                .execute_select("SELECT * FROM t", &[], 10)
+                .unwrap()
+                .columns
+                .len(),
+            1
+        );
+    }
+
+    /// `VACUUM INTO` has no authorizer action and would write a file on the
+    /// server; the `sqlite3_stmt_readonly` check must refuse it.
+    #[test]
+    fn execute_select_refuses_vacuum_into() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine
+            .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("copy.db");
+        let sql = format!("VACUUM INTO '{}'", target.display());
+
+        let err = engine.execute_select(&sql, &[], 10).err();
+        assert!(
+            matches!(
+                &err,
+                Some(SqlQueryError::NotSelect(m))
+                    if m == "only SELECT queries are allowed; non-SELECT statements are not permitted"
+            ),
+            "{err:?}"
+        );
+        assert!(!target.exists());
+    }
+
+    /// Pins that a trailing write never runs (rusqlite drops the tail).
+    #[test]
+    fn execute_select_never_runs_a_trailing_statement() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine
+            .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
+            .unwrap();
+
+        let _ = engine.execute_select("SELECT 1; INSERT INTO t VALUES (1)", &[], 10);
+
+        let result = engine
+            .execute_select("SELECT COUNT(*) FROM t", &[], 10)
+            .unwrap();
+        assert_eq!(result.rows[0][0], Some(Value::Number(0.into())));
+    }
+
+    /// Guards against an allow-list that is too narrow: ordinary reads, CTEs,
+    /// recursive CTEs, subqueries and table-valued functions must still run.
+    #[tokio::test]
+    async fn execute_select_still_runs_read_only_queries() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[("n", ColumnFhirType::Integer)]);
+        engine.create_table("t", &s).unwrap();
+        let rows = stream::iter((1..=3).map(|i| Ok(json!({"n": i}))));
+        let (engine, _) = engine
+            .insert_rows("t", &s, Box::pin(rows), 100)
+            .await
+            .unwrap();
+
+        for (sql, expected) in [
+            (
+                "WITH c AS (SELECT n FROM t WHERE n > 1) SELECT COUNT(*) FROM c",
+                2,
+            ),
+            (
+                "SELECT COUNT(*) FROM t WHERE n IN (SELECT MAX(n) FROM t) \
+                 AND EXISTS (SELECT 1 FROM (SELECT n FROM t) s)",
+                1,
+            ),
+            (
+                "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 5) \
+                 SELECT COUNT(*) FROM r",
+                5,
+            ),
+            ("SELECT COUNT(*) FROM json_each('[1, 2, 3, 4]')", 4),
+        ] {
+            let result = engine
+                .execute_select(sql, &[], 10)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(result.rows.len(), 1, "{sql}");
+            assert_eq!(
+                result.rows[0][0],
+                Some(Value::Number(expected.into())),
+                "{sql}"
+            );
+        }
+
+        let sql = "SELECT n FROM t UNION ALL SELECT n FROM t";
+        let result = engine
+            .execute_select(sql, &[], 10)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(result.rows.len(), 6, "{sql}");
+    }
+
+    /// The authorizer is scoped to `execute_select`: the engine's own setup
+    /// statements keep working after a refused query.
+    #[tokio::test]
+    async fn engine_setup_still_runs_after_a_refused_query() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[("n", ColumnFhirType::Integer)]);
+        engine.create_table("t", &s).unwrap();
+
+        let refused = engine.execute_select("INSERT INTO t VALUES (1)", &[], 10);
+        assert!(matches!(refused.err(), Some(SqlQueryError::NotSelect(_))));
+
+        engine.create_table("u", &s).unwrap();
+        let rows = stream::iter((1..=2).map(|i| Ok(json!({"n": i}))));
+        let (engine, inserted) = engine
+            .insert_rows("t", &s, Box::pin(rows), 100)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 2);
+        engine.create_view("v", "t").unwrap();
+
+        let result = engine
+            .execute_select("SELECT COUNT(*) FROM v", &[], 10)
+            .unwrap();
+        assert_eq!(result.rows[0][0], Some(Value::Number(2.into())));
     }
 }

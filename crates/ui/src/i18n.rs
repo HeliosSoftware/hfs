@@ -6,7 +6,8 @@
 //! explicit `?lang=` override (persisted in the `hfs_lang` cookie by the
 //! language switcher) → cookie → `Accept-Language` (RFC 4647 Lookup) → `en`.
 //!
-//! Catalogs live in `locales/<locale>/main.ftl` at the workspace root and are
+//! Catalogs live in `locales/<locale>/main.ftl` at the workspace root (reached
+//! through this crate's `locales` symlink so `cargo publish` packages them) and are
 //! embedded at compile time — no runtime file or CDN dependency, matching the
 //! asset stance of this crate. `en` is the source locale and the final
 //! fallback: a key missing from a translation renders its English string,
@@ -19,19 +20,44 @@ use axum::{
     response::Response,
 };
 use fluent_templates::{Loader, fluent_bundle::FluentValue};
+use helios_ui_chrome::number::{UiDecimal, UiNumber};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use unic_langid::{LanguageIdentifier, langid};
 
+#[cfg(not(helios_workspace_locales))]
+fluent_templates::static_loader! {
+    static LOCALES = {
+        locales: "locales",
+        fallback_language: "en",
+        // The UI renders whole localized sentences into an LTR document; the
+        // Unicode bidi isolation marks Fluent adds around placeables by
+        // default would only show up as garbage in tests and diffs. Numeric
+        // placeables are grouped the locale's way (`70,048` / `70.048`).
+        customise: |bundle| {
+            bundle.set_use_isolating(false);
+            bundle.set_formatter(Some(helios_ui_chrome::number::fluent_formatter));
+        },
+    };
+}
+
+// Same loader against the workspace-root catalogs, for checkouts where the
+// `locales` symlink did not materialize as a directory (Windows without
+// `core.symlinks`, #1257). `build.rs` sets the cfg.
+#[cfg(helios_workspace_locales)]
 fluent_templates::static_loader! {
     static LOCALES = {
         locales: "../../locales",
         fallback_language: "en",
         // The UI renders whole localized sentences into an LTR document; the
         // Unicode bidi isolation marks Fluent adds around placeables by
-        // default would only show up as garbage in tests and diffs.
-        customise: |bundle| bundle.set_use_isolating(false),
+        // default would only show up as garbage in tests and diffs. Numeric
+        // placeables are grouped the locale's way (`70,048` / `70.048`).
+        customise: |bundle| {
+            bundle.set_use_isolating(false);
+            bundle.set_formatter(Some(helios_ui_chrome::number::fluent_formatter));
+        },
     };
 }
 
@@ -199,6 +225,22 @@ impl I18n {
         self.locale.to_string()
     }
 
+    /// An integer the way this locale writes it: `70,048` in English,
+    /// `70.048` in German, `1234` but `12.345` in Spanish — the same rule the
+    /// browser applies to the figures page scripts write
+    /// (`assets/number.js`), and the one numeric message placeables already
+    /// follow. For counts and totals only; identifiers (HTTP statuses, line
+    /// numbers, version ids, years) are printed as they are.
+    pub fn num(&self, n: impl UiNumber) -> String {
+        helios_ui_chrome::number::integer(n.ui_number(), &self.lang())
+    }
+
+    /// A decimal rounded to `fraction_digits` places, with this locale's
+    /// grouping and decimal separator (`97.3` / `97,3`).
+    pub fn dec(&self, x: impl UiDecimal, fraction_digits: usize) -> String {
+        helios_ui_chrome::number::decimal(x.ui_decimal(), fraction_digits, &self.lang())
+    }
+
     /// Look up a message. Missing keys fall back to `en` (the loader's
     /// fallback language); an unknown key renders the key itself rather
     /// than crashing or blanking the page.
@@ -234,6 +276,34 @@ impl I18n {
         let args: HashMap<Cow<'static, str>, FluentValue<'static>> = HashMap::from([
             (Cow::Owned(name1.to_owned()), value1.into()),
             (Cow::Owned(name2.to_owned()), value2.into()),
+        ]);
+        LOCALES
+            .try_lookup_with_args(self.locale, key, &args)
+            .unwrap_or_else(|| key.to_owned())
+    }
+
+    /// Three named placeables — the shape a message needs when one value
+    /// selects the plural form and another carries its localized rendering
+    /// (`{ $errors -> [one] … *[other] { $count } … }`, #1125).
+    ///
+    /// Three `(name, value)` pairs are six parameters by construction, like
+    /// [`Self::t_arg2`] above; they are not an argument list that wants
+    /// grouping into a struct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn t_arg3(
+        &self,
+        key: &str,
+        name1: &str,
+        value1: impl Into<FluentValue<'static>>,
+        name2: &str,
+        value2: impl Into<FluentValue<'static>>,
+        name3: &str,
+        value3: impl Into<FluentValue<'static>>,
+    ) -> String {
+        let args: HashMap<Cow<'static, str>, FluentValue<'static>> = HashMap::from([
+            (Cow::Owned(name1.to_owned()), value1.into()),
+            (Cow::Owned(name2.to_owned()), value2.into()),
+            (Cow::Owned(name3.to_owned()), value3.into()),
         ]);
         LOCALES
             .try_lookup_with_args(self.locale, key, &args)
@@ -450,6 +520,7 @@ mod tests {
             DiagnosticCode::SelectWithoutOutput,
             DiagnosticCode::FhirPathSyntax,
             DiagnosticCode::UndeclaredConstant,
+            DiagnosticCode::UnknownResourceType,
         ];
         // A stand-in value for every placeable any `vd-lint-*` message might
         // interpolate — `t_args`, not the argument-free `t`, since most of
@@ -501,6 +572,67 @@ mod tests {
     }
 
     #[test]
+    fn numeric_placeables_group_per_locale() {
+        let en = I18n { locale: &EN };
+        let de = I18n { locale: &DE };
+        let es = I18n { locale: &ES };
+        assert_eq!(
+            en.t_arg("sp-total", "count", 70_048u64),
+            "70,048 parameters"
+        );
+        assert_eq!(de.t_arg("sp-total", "count", 70_048u64), "70.048 Parameter");
+        assert_eq!(
+            es.t_arg("sp-total", "count", 1_234u64).split(' ').next(),
+            Some("1234")
+        );
+        // Grouping leaves the plural selection on the raw number.
+        assert_eq!(
+            en.t_arg("history-metadata-hidden", "count", 1usize),
+            "1 metadata change hidden"
+        );
+        assert_eq!(
+            en.t_arg("history-metadata-hidden", "count", 1_200usize),
+            "1,200 metadata changes hidden"
+        );
+        // Identifiers travel as strings and are never grouped.
+        assert_eq!(
+            en.t_arg(
+                "status-last-checked",
+                "timestamp",
+                1_759_312_345u64.to_string()
+            ),
+            "Last checked: 1759312345"
+        );
+    }
+
+    #[test]
+    fn num_and_dec_format_per_locale() {
+        let en = I18n { locale: &EN };
+        let de = I18n { locale: &DE };
+        let es = I18n { locale: &ES };
+        assert_eq!(en.num(70_048u64), "70,048");
+        assert_eq!(de.num(70_048usize), "70.048");
+        assert_eq!(es.num(1_234u32), "1234");
+        assert_eq!(es.num(12_345i64), "12.345");
+        assert_eq!(en.dec(97.26, 1), "97.3");
+        assert_eq!(de.dec(97.26, 1), "97,3");
+    }
+
+    #[test]
+    fn search_elapsed_interpolates_in_all_locales() {
+        for (locale, expected) in [
+            (&EN, "2 seconds elapsed"),
+            (&ES, "2 segundos transcurridos"),
+            (&DE, "2 Sekunden vergangen"),
+        ] {
+            assert_eq!(
+                I18n { locale }.t_arg("queries-search-elapsed", "seconds", "2"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn plural_categories_select_per_cldr() {
         let en = I18n { locale: &EN };
         assert_eq!(en.t_arg("resource-count", "count", 1), "1 resource");
@@ -508,6 +640,43 @@ mod tests {
         let de = I18n { locale: &DE };
         assert_eq!(de.t_arg("resource-count", "count", 1), "1 Ressource");
         assert_eq!(de.t_arg("resource-count", "count", 5), "5 Ressourcen");
+    }
+
+    #[test]
+    fn export_summaries_and_file_counts_pluralize_numeric_arguments_in_every_locale() {
+        for (locale, exports, files, running) in [
+            (
+                &EN,
+                ["0 exports", "1 export", "2 exports"],
+                ["0 files", "1 file", "2 files"],
+                "running",
+            ),
+            (
+                &ES,
+                ["0 exportaciones", "1 exportación", "2 exportaciones"],
+                ["0 archivos", "1 archivo", "2 archivos"],
+                "en curso",
+            ),
+            (
+                &DE,
+                ["0 Exporte", "1 Export", "2 Exporte"],
+                ["0 Dateien", "1 Datei", "2 Dateien"],
+                "laufend",
+            ),
+        ] {
+            let i18n = I18n { locale };
+            for count in 0..=2usize {
+                for key in ["bulk-export-summary-count", "sql-export-summary-count"] {
+                    assert_eq!(
+                        i18n.t_arg2(key, "count", count, "running", count),
+                        format!("{} · {count} {running}", exports[count])
+                    );
+                }
+                for key in ["bulk-export-files-count", "sql-export-files-count"] {
+                    assert_eq!(i18n.t_arg(key, "count", count), files[count]);
+                }
+            }
+        }
     }
 
     /// `en` is the source of truth: every locale must define exactly the

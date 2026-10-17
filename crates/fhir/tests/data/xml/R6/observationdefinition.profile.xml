@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ObservationDefinition"/>
   <meta>
-    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
+    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -211,7 +211,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -296,7 +296,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -337,7 +337,7 @@
             <a name="ObservationDefinition.description"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -386,7 +386,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Jurisdiction of the authority that maintains the this ObservationDefinition (if applicable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.2.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.3.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -402,7 +402,7 @@
             <a name="ObservationDefinition.purpose"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -422,7 +422,7 @@
             <a name="ObservationDefinition.copyright"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -442,7 +442,7 @@
             <a name="ObservationDefinition.copyrightLabel"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -1302,21 +1302,21 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status">
     <valueCode value="normative"/>
   </extension>
+  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version">
+    <valueCode value="6.0.0-snapshot1"/>
+  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="oo"/>
-  </extension>
-  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm">
-    <valueInteger value="1"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-security-category">
     <valueCode value="business"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/ObservationDefinition"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="ObservationDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-09-14T16:43:45+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -1339,7 +1339,7 @@
     </coding>
   </jurisdiction>
   <purpose value="In a catalog of health-related services that use or produce observations and measurements, this resource describes the expected characteristics of these observation / measurements."/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -1521,7 +1521,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1903,7 +1903,7 @@
         </extension>
         <strength value="required"/>
         <description value="Codes identifying the state of an ObservationDefinition."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -2595,7 +2595,7 @@
         </extension>
         <strength value="required"/>
         <description value="Permitted data type for observation value."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -3106,7 +3106,7 @@
           <valueBoolean value="true"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="ObservationDefinition.qualifiedValue.age">
@@ -3218,7 +3218,7 @@
           <valueString value="ObservationRangeCategory"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/observation-range-category|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/observation-range-category|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="ObservationDefinition.qualifiedValue.range">
@@ -3628,7 +3628,7 @@
         </extension>
         <strength value="required"/>
         <description value="Permitted data type for observation value."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="ObservationDefinition.component.permittedUnit">
@@ -3878,7 +3878,7 @@
         </extension>
         <strength value="required"/>
         <description value="Codes identifying the state of an ObservationDefinition."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -4330,7 +4330,7 @@
         </extension>
         <strength value="required"/>
         <description value="Permitted data type for observation value."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -4589,7 +4589,7 @@
           <valueBoolean value="true"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="ObservationDefinition.qualifiedValue.age">
@@ -4653,7 +4653,7 @@
           <valueString value="ObservationRangeCategory"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/observation-range-category|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/observation-range-category|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="ObservationDefinition.qualifiedValue.range">
@@ -4835,7 +4835,7 @@
         </extension>
         <strength value="required"/>
         <description value="Permitted data type for observation value."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="ObservationDefinition.component.permittedUnit">

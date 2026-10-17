@@ -31,9 +31,17 @@ impl StringHandler {
                 // Contains (case- and accent-insensitive). Match the folded
                 // column; OR the raw column (case-insensitive) so rows not yet
                 // reindexed — whose folded column is NULL — still match.
+                //
+                // The leading `IS NOT NULL` is for the planner, not the
+                // result: SQLite cannot infer non-null from `LIKE`, and
+                // without it the only usable index is a type-wide scan of
+                // `idx_search_composite`. With it, the partial
+                // `idx_search_string` — `WHERE value_string IS NOT NULL` —
+                // qualifies and narrows the scan to the parameter's rows.
                 SqlFragment::with_params(
                     format!(
-                        "(value_string_folded LIKE '%' || ?{} || '%' \
+                        "value_string IS NOT NULL AND \
+                          (value_string_folded LIKE '%' || ?{} || '%' \
                           OR value_string COLLATE NOCASE LIKE '%' || ?{} || '%')",
                         param_num,
                         param_num + 1
@@ -49,7 +57,8 @@ impl StringHandler {
                 // fallback for not-yet-reindexed rows (folded column NULL).
                 SqlFragment::with_params(
                     format!(
-                        "(value_string_folded LIKE ?{} || '%' \
+                        "value_string IS NOT NULL AND \
+                          (value_string_folded LIKE ?{} || '%' \
                           OR value_string COLLATE NOCASE LIKE ?{} || '%')",
                         param_num,
                         param_num + 1

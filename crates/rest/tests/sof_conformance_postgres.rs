@@ -14,7 +14,15 @@
 
 #![cfg(feature = "postgres")]
 
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
+#[allow(dead_code)]
+#[path = "common/sof_ordering.rs"]
+mod sof_ordering;
+
 mod sof_conformance_postgres_tests {
+    use super::sof_ordering::{self, Comparison, compare_rows, parse_ndjson};
     use axum::http::{HeaderName, HeaderValue};
     use axum_test::TestServer;
     use helios_fhir::FhirVersion;
@@ -23,7 +31,6 @@ mod sof_conformance_postgres_tests {
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
     use serde_json::{Value, json};
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use testcontainers::ImageExt;
@@ -43,6 +50,8 @@ mod sof_conformance_postgres_tests {
     struct SharedPg {
         host: String,
         port: u16,
+        /// Kept alive for the duration of the test binary; the
+        /// `container_cleanup` exit hook removes it at process exit.
         _container: testcontainers::ContainerAsync<Postgres>,
     }
 
@@ -56,12 +65,16 @@ mod sof_conformance_postgres_tests {
                 // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
                 // the backend sends as a startup option, so PG 11 rejects every
                 // connection FATAL. The rest of the repo runs 16.
-                let container = Postgres::default()
-                    .with_tag("16-alpine")
-                    .with_label("github.run_id", &run_id)
-                    .start()
-                    .await
-                    .expect("failed to start PostgreSQL container");
+                // `SHARED_PG` is a static and never dropped; the cleanup label
+                // lets the exit hook remove the container.
+                let container = super::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("failed to start PostgreSQL container");
 
                 let port = container
                     .get_host_port_ipv4(5432)
@@ -283,85 +296,6 @@ mod sof_conformance_postgres_tests {
         v
     }
 
-    fn parse_ndjson(body: &str) -> Vec<BTreeMap<String, Value>> {
-        body.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| {
-                let v: Value =
-                    serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid NDJSON: {l} — {e}"));
-                v.as_object()
-                    .map(|o| {
-                        o.iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect::<BTreeMap<_, _>>()
-                    })
-                    .unwrap_or_default()
-            })
-            .collect()
-    }
-
-    fn row_matches_expected(actual: &BTreeMap<String, Value>, expected: &Value) -> bool {
-        let expected_obj = match expected.as_object() {
-            Some(o) => o,
-            None => return false,
-        };
-        for (k, ev) in expected_obj {
-            match actual.get(k) {
-                Some(av) => {
-                    if !values_equal(av, ev) {
-                        return false;
-                    }
-                }
-                None => {
-                    if !ev.is_null() {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
-    }
-
-    fn values_equal(a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Null, Value::Null) => true,
-            (Value::Bool(x), Value::Bool(y)) => x == y,
-            (Value::String(x), Value::String(y)) => x == y,
-            (Value::Number(x), Value::Number(y)) => x
-                .as_f64()
-                .zip(y.as_f64())
-                .is_some_and(|(xf, yf)| (xf - yf).abs() < 1e-9),
-            (Value::Number(n), Value::String(s)) | (Value::String(s), Value::Number(n)) => {
-                n.to_string() == *s
-            }
-            (Value::Array(x), Value::Array(y)) => {
-                x.len() == y.len() && x.iter().zip(y.iter()).all(|(xi, yi)| values_equal(xi, yi))
-            }
-            _ => false,
-        }
-    }
-
-    fn compare_rows(actual: &[BTreeMap<String, Value>], expected: &[Value]) -> Option<String> {
-        if actual.len() != expected.len() {
-            return Some(format!(
-                "row count mismatch: got {}, expected {}",
-                actual.len(),
-                expected.len()
-            ));
-        }
-        let mut remaining: Vec<usize> = (0..actual.len()).collect();
-        'outer: for exp_row in expected {
-            for (pos, &idx) in remaining.iter().enumerate() {
-                if row_matches_expected(&actual[idx], exp_row) {
-                    remaining.remove(pos);
-                    continue 'outer;
-                }
-            }
-            return Some(format!("no matching actual row for expected: {exp_row}"));
-        }
-        None
-    }
-
     // =========================================================================
     // Main conformance test
     // =========================================================================
@@ -429,7 +363,7 @@ mod sof_conformance_postgres_tests {
                 let actual = parse_ndjson(&body);
 
                 if let Some(expected) = &test.expect {
-                    match compare_rows(&actual, expected) {
+                    match compare_rows(Comparison::Official, &actual, expected) {
                         None => {
                             eprintln!("  PASS  {key}");
                             passed += 1;
@@ -455,8 +389,8 @@ mod sof_conformance_postgres_tests {
         );
 
         // Regression floor — mirrors the SQLite ratchet at
-        // `sof_conformance.rs`. The full SoF v2 corpus passes against
-        // PostgreSQL; lowering this requires the same justification as the
+        // `sof_conformance.rs`. The full SoF v2 corpus (144 fixtures) passes
+        // against PostgreSQL; lowering this requires the same justification as the
         // SQLite floor (a fixture genuinely outside the in-DB runner's
         // coverage, listed in `KNOWN_SKIPS` with a reason).
         //
@@ -466,16 +400,106 @@ mod sof_conformance_postgres_tests {
         //
         // 124 -> 132: the upstream sync added `row_index.json` and the PG in-DB
         // compiler now supports `%rowIndex` (`WITH ORDINALITY` for forEach, a
-        // pre-order `ord_path` in the repeat CTE). 8 of the 9 pass; the 9th
-        // (`%rowIndex in unionAll inside forEach`) hits the pre-existing
-        // "unionAll nested inside another select" gap, shared with the
-        // nested-`repeat` fixtures on the failure floor.
-        const PG_PASS_FLOOR: usize = 132;
+        // pre-order `ord_path` in the repeat CTE).
+        //
+        // 132 -> 144: nested/sibling `repeat` and `unionAll` nested inside
+        // another `select` now compile, so the whole corpus passes.
+        const PG_PASS_FLOOR: usize = 144;
         assert!(
             passed >= PG_PASS_FLOOR,
             "regression: only {passed} fixtures pass (floor: {PG_PASS_FLOOR}). \
              Failures:\n  {}",
             failure_msgs.join("\n  "),
         );
+    }
+
+    #[tokio::test]
+    async fn total_order_exact_fixture_rest_prefixes() {
+        let backend = create_backend().await;
+        let (tenant, id) = unique_tenant();
+        let server = create_test_server(backend.clone()).await;
+        let resources =
+            sof_ordering::seed_fixture(backend.as_ref(), &tenant, sof_ordering::exact_fixture())
+                .await;
+        assert_eq!(resources.len(), 3);
+        sof_ordering::preview_acceptance(
+            &server,
+            backend.sof_runner().unwrap().as_ref(),
+            &tenant,
+            &id,
+            &resources,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn total_order_filtered_matrix_rest_prefixes() {
+        let backend = create_backend().await;
+        let (tenant, id) = unique_tenant();
+        let server = create_test_server(backend.clone()).await;
+        let resources =
+            sof_ordering::seed_fixture(backend.as_ref(), &tenant, sof_ordering::fixture()).await;
+        sof_ordering::preview_acceptance(
+            &server,
+            backend.sof_runner().unwrap().as_ref(),
+            &tenant,
+            &id,
+            &resources,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn total_order_collection_cells_rest() {
+        let backend = create_backend().await;
+        let (tenant, id) = unique_tenant();
+        let server = create_test_server(backend.clone()).await;
+        let resources =
+            sof_ordering::seed_fixture(backend.as_ref(), &tenant, sof_ordering::cell_fixture())
+                .await;
+        sof_ordering::cell_acceptance(
+            &server,
+            backend.sof_runner().unwrap().as_ref(),
+            &tenant,
+            &id,
+            &resources,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn total_order_export_manifest_shards_postgres() {
+        use helios_rest::export::{InMemoryController, InMemorySink};
+        let backend = create_backend().await;
+        let (tenant, id) = unique_tenant();
+        let runner = backend.sof_runner().unwrap();
+        let controller = InMemoryController::with_shard_rows(
+            runner.clone(),
+            InMemorySink::new("http://localhost"),
+            None,
+            Some(7),
+        );
+        let config = ServerConfig {
+            base_url: "http://localhost".into(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(backend.clone(), config)
+            .with_sof_runner(runner.clone())
+            .with_export_controller(Arc::new(controller));
+        let server =
+            TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).unwrap();
+        let mut fixture = sof_ordering::exact_fixture();
+        fixture.extend(sof_ordering::cell_fixture());
+        let resources = sof_ordering::seed_fixture(backend.as_ref(), &tenant, fixture).await;
+        // Export reads PostgreSQL in keyset pages over the resource id.
+        sof_ordering::export_acceptance(
+            &server,
+            runner.as_ref(),
+            &tenant,
+            &id,
+            &resources,
+            sof_ordering::ExportOrder::IdBytes,
+        )
+        .await;
     }
 }

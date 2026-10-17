@@ -46,6 +46,15 @@
       <text value="Heart valve disorder"/>
     </concept>
   </reason>
+  <bodyStructure>
+    <concept>
+      <coding>
+        <system value="http://snomed.info/sct"/>
+        <code value="17401000"/>
+        <display value="Heart valve structure"/>
+      </coding>
+    </concept>
+  </bodyStructure>
   <outcome>
     <concept>
       <text value="improved blood circulation"/>

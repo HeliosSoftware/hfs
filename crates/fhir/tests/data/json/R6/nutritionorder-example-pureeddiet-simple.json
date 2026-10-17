@@ -14,6 +14,10 @@
     "display": "Peter Chalmers"
   },
   "dateTime": "2014-09-17",
+  "requester": {
+    "reference": "Practitioner/example",
+    "display": "Dr Adam Careful"
+  },
   "oralDiet": {
     "type": [
       {

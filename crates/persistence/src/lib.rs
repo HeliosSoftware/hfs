@@ -72,8 +72,10 @@
 //!
 //! The S3 backend additionally supports a per-tenant *physical* boundary — a
 //! dedicated bucket, with its own IAM/policy surface — via
-//! `S3TenancyMode::BucketPerTenant` (tenants absent from the bucket map fall
-//! back to the shared system bucket). Schema-per-tenant and database-per-tenant
+//! `S3TenancyMode::BucketPerTenant` (a tenant absent from the bucket map is
+//! refused with `TenantError::UnmappedTenant`; only the `__system__` tenant
+//! falls back, to the optional `default_system_bucket`, which also holds the
+//! cross-tenant control-plane state). Schema-per-tenant and database-per-tenant
 //! are **not** offered for the SQL backends; unwired SQL generators for them
 //! were removed in
 //! [#370](https://github.com/HeliosSoftware/hfs/issues/370).
@@ -178,6 +180,11 @@
 pub mod advisor;
 pub mod backends;
 pub mod composite;
+/// Process-exit removal of the shared testcontainers the lib tests park in
+/// `static`s. Declared once here so every backend's tests share one exit hook.
+#[cfg(all(test, any(feature = "postgres", feature = "mongodb")))]
+#[path = "../tests/common/container_cleanup.rs"]
+pub(crate) mod container_cleanup;
 pub mod core;
 pub mod error;
 pub mod perf;

@@ -190,3 +190,44 @@ async fn capability_statement_is_tenant_scoped() {
         "acme2 metadata must not list nickname"
     );
 }
+
+/// A stored SearchParameter whose `code` carries a quote is never registered,
+/// so searching with that name is an unknown parameter — never text spliced
+/// into the backend's SQL.
+#[tokio::test]
+async fn a_search_parameter_code_with_a_quote_is_not_registered() {
+    let server = server().await;
+
+    let sp = json!({
+        "resourceType": "SearchParameter",
+        "url": "http://acme.health/fhir/SearchParameter/quoted",
+        "name": "Quoted",
+        "status": "active",
+        "code": "quo'ted",
+        "base": ["Patient"],
+        "type": "string",
+        "expression": "Patient.name.family"
+    });
+    server
+        .post("/SearchParameter")
+        .add_header(X_TENANT_ID, HeaderValue::from_static("acme1"))
+        .json(&sp)
+        .await;
+
+    for handling in ["strict", "lenient"] {
+        let response = server
+            .get("/Patient?quo'ted=x")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("acme1"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_str(&format!("handling={handling}")).unwrap(),
+            )
+            .await;
+        assert_ne!(
+            response.status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "handling={handling}: {}",
+            response.text()
+        );
+    }
+}

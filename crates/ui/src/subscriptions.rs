@@ -112,6 +112,8 @@ pub async fn page(
     rt: RequestTenant,
     RawQuery(query): RawQuery,
 ) -> Response {
+    let i18n = I18n::new(locale);
+    let lang = i18n.lang();
     let snapshot = helios_observability::subscriptions::snapshot(&rt.id);
     let available = snapshot.is_some();
     let sort = match query_value(query.as_deref(), "sort").as_deref() {
@@ -125,9 +127,10 @@ pub async fn page(
     let delivered_total: u64 = source_rows.iter().map(|r| r.delivered_24h).sum();
     let first_try_total: u64 = source_rows.iter().map(|r| r.first_try_24h).sum();
     let rate = (delivered_total > 0).then(|| {
-        format!(
-            "{:.1}",
-            first_try_total as f64 * 100.0 / delivered_total as f64
+        helios_ui_chrome::number::decimal(
+            first_try_total as f64 * 100.0 / delivered_total as f64,
+            1,
+            &lang,
         )
     });
 
@@ -161,13 +164,13 @@ pub async fn page(
                 channel: row.channel_type,
                 endpoint: row.endpoint.unwrap_or_default(),
                 state,
-                sent: grouped(row.events_since_start),
-                last24: grouped(row.delivered_24h),
+                sent: grouped(row.events_since_start, &lang),
+                last24: grouped(row.delivered_24h, &lang),
                 spark_points: spark_points(&row.delivered_series),
                 streak: if idle {
                     "—".to_string()
                 } else {
-                    row.consecutive_failures.to_string()
+                    i18n.num(row.consecutive_failures)
                 },
             }
         })
@@ -189,10 +192,8 @@ pub async fn page(
                 .then_with(|| a.id.cmp(&b.id))
         }),
         "fails" => rows.sort_by(|a, b| {
-            b.streak
-                .parse::<u64>()
-                .unwrap_or(0)
-                .cmp(&a.streak.parse::<u64>().unwrap_or(0))
+            parse_grouped(&b.streak)
+                .cmp(&parse_grouped(&a.streak))
                 .then_with(|| a.id.cmp(&b.id))
         }),
         _ => rows.sort_by(|a, b| {
@@ -207,13 +208,13 @@ pub async fn page(
         failing: rows.iter().filter(|r| r.state == "error").count(),
         idle: rows.iter().filter(|r| r.state == "idle").count(),
         active: rows.iter().filter(|r| r.state == "active").count(),
-        delivered: grouped(delivered_total),
+        delivered: grouped(delivered_total, &lang),
         rate,
     };
 
     render(SubscriptionsPage {
         status: crate::current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "subscriptions",
         available,
         cards,
@@ -222,8 +223,9 @@ pub async fn page(
     })
 }
 
-/// Reads a `grouped()` figure back ("4,182" → 4182) — the rows carry display
-/// strings, and the card sums reuse them rather than threading raw values.
+/// Reads a `grouped()` figure back ("4,182" or "4.182" → 4182; "—" → 0) —
+/// the rows carry display strings, and the sorts reuse them rather than
+/// threading raw values.
 fn parse_grouped(s: &str) -> u64 {
     s.chars()
         .filter(|c| c.is_ascii_digit())

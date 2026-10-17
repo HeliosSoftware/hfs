@@ -30,6 +30,17 @@
           ],
           "text": "Cholesterol"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
+        }
       }
     },
     {
@@ -43,6 +54,17 @@
             }
           ],
           "text": "Protein"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 21.88,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
         }
       }
     },
@@ -58,6 +80,17 @@
           ],
           "text": "Vitamin A, IU"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "IU"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
+        }
       }
     },
     {
@@ -71,6 +104,17 @@
             }
           ],
           "text": "Vitamin C, total ascorbic acid"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
         }
       }
     },
@@ -86,6 +130,17 @@
           ],
           "text": "Sugars, total including NLEA"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 9.38,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
+        }
       }
     },
     {
@@ -99,6 +154,17 @@
             }
           ],
           "text": "Carbohydrate, by difference"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 18.75,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
         }
       }
     },
@@ -114,6 +180,17 @@
           ],
           "text": "Fatty acids, total saturated"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 9.38,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
+        }
       }
     },
     {
@@ -127,6 +204,17 @@
             }
           ],
           "text": "Niacin"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 12.5,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
         }
       }
     },
@@ -142,6 +230,17 @@
           ],
           "text": "Fatty acids, total trans"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
+        }
       }
     },
     {
@@ -155,6 +254,17 @@
             }
           ],
           "text": "Sodium, Na"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 469,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
         }
       }
     },
@@ -170,6 +280,17 @@
           ],
           "text": "Calcium, Ca"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
+        }
       }
     },
     {
@@ -183,6 +304,17 @@
             }
           ],
           "text": "Total lipid (fat)"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 50,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
         }
       }
     },
@@ -198,6 +330,17 @@
           ],
           "text": "Energy"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 594,
+          "comparator": "ad",
+          "unit": "kcal"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
+        }
       }
     },
     {
@@ -212,6 +355,17 @@
           ],
           "text": "Iron, Fe"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 1.12,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
+        }
       }
     },
     {
@@ -225,6 +379,17 @@
             }
           ],
           "text": "Fiber, total dietary"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 6.2,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "spread"
         }
       }
     }
@@ -242,7 +407,8 @@
           ],
           "text": "peanuts"
         }
-      }
+      },
+      "allergen": true
     },
     {
       "item": {

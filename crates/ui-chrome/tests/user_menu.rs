@@ -183,13 +183,15 @@ fn avatar_falls_back_photo_then_initials_then_icon() {
     }
 }
 
-/// The signed-in state nobody can reach from either product yet: `can_logout`
-/// unlocks the sign-out link, and it points wherever the host says. HFS and HTS
-/// mount their logout routes at different paths, which is precisely why the
+/// The signed-in state (HFS reaches it through the interactive login, #1449):
+/// `can_logout` unlocks Sign out, and it posts wherever the host says. HFS and
+/// HTS mount their logout routes at different paths, which is precisely why the
 /// href is a parameter and not the `/ui/logout` literal the extracted markup
-/// used to hard-code.
+/// used to hard-code. Sign out is a POST form, not a link: ending a session is
+/// a state change, and a plain link would let any page log the user out by
+/// navigating them there.
 #[test]
-fn signed_in_renders_a_sign_out_link_at_the_given_href() {
+fn signed_in_renders_a_sign_out_form_posting_to_the_given_href() {
     let out = render(
         "en",
         UserIdentity {
@@ -202,8 +204,14 @@ fn signed_in_renders_a_sign_out_link_at_the_given_href() {
     );
 
     assert!(
-        out.contains("<a class=\"user-menu__out\" href=\"/hts/ui/logout\">"),
-        "sign-out link missing or pointing at the wrong href:\n{out}"
+        out.contains(
+            "<form class=\"user-menu__out-form\" method=\"post\" action=\"/hts/ui/logout\">"
+        ),
+        "sign-out form missing or posting to the wrong href:\n{out}"
+    );
+    assert!(
+        out.contains("<button class=\"user-menu__out\" type=\"submit\">"),
+        "sign-out must be a submit button, not a link:\n{out}"
     );
     assert!(
         out.contains(LOGOUT_ICON),

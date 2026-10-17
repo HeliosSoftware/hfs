@@ -25,12 +25,61 @@
 //! same string can be neither or both. The pre-ballot `viewResource` /
 //! `viewReference` pair conflated the two and is not accepted.
 //!
-//! The extractor is **permissive**: missing / wrong-typed `value[X]` fields
-//! produce `None`/empty rather than an error. Strict callers (sof-server) run
-//! an additional validation pass on the same JSON for bounds checks
-//! (e.g. `_limit` upper bound, `compression` allowed values).
+//! [`extract_run_params_from_json`] is **permissive**: missing / wrong-typed
+//! `value[X]` fields produce `None`/empty rather than an error. HFS uses
+//! [`extract_run_params_checked`] to reject unusable patient/group filters.
+//! The standalone sof-server shares that reference rule and also checks
+//! bounds and other value shapes (e.g. `_limit`, `compression`).
 
 use serde_json::Value;
+
+/// An unusable `patient` or `group` operation parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceParameterError {
+    /// The operation parameter whose value cannot be used.
+    pub param: String,
+    /// The client-facing explanation of the invalid value.
+    pub message: String,
+}
+
+impl std::fmt::Display for ReferenceParameterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReferenceParameterError {}
+
+/// Reads a usable `patient`/`group` reference from one parameter entry.
+///
+/// A string `valueReference.reference` takes precedence over `valueString`,
+/// even when it is blank. The selected string is trimmed and must be non-empty.
+/// Identifier-only and display-only references cannot restrict a run and are
+/// rejected instead of silently dropping the filter. Reference shape and
+/// target existence validation are outside this helper.
+pub fn read_patient_group_reference(
+    entry: &Value,
+    name: &str,
+) -> Result<String, ReferenceParameterError> {
+    entry
+        .get("valueReference")
+        .and_then(|r| r.get("reference"))
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("valueString").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            let ty = if name == "group" { "Group" } else { "Patient" };
+            ReferenceParameterError {
+                param: name.to_string(),
+                message: format!(
+                    "a `{name}` entry carries no usable reference; send \
+                     valueReference.reference (or valueString) as a relative `{ty}/{{id}}` reference"
+                ),
+            }
+        })
+}
 
 /// SoF v2 `$viewdefinition-run` parameters lifted out of a JSON `Parameters`
 /// resource. Scalar fields hold the first occurrence; `patient`, `group`,
@@ -242,6 +291,40 @@ pub fn extract_run_params_from_json(body: &Value) -> ExtractedRunParams {
         }
     }
     out
+}
+
+/// Extracts run parameters, refusing any unusable `patient`/`group` entry.
+///
+/// All other fields keep the permissive behavior of
+/// [`extract_run_params_from_json`]. The reference lists contain every entry
+/// in request order, normalized by [`read_patient_group_reference`]. Validate
+/// the body before applying query fallbacks so an invalid body filter cannot
+/// disappear behind another valid reference.
+pub fn extract_run_params_checked(
+    body: &Value,
+) -> Result<ExtractedRunParams, ReferenceParameterError> {
+    let mut out = extract_run_params_from_json(body);
+    if body.get("resourceType").and_then(Value::as_str) != Some("Parameters") {
+        return Ok(out);
+    }
+    let Some(entries) = body.get("parameter").and_then(Value::as_array) else {
+        return Ok(out);
+    };
+
+    out.patient.clear();
+    out.group.clear();
+    for entry in entries {
+        match parameter_name(entry).as_deref() {
+            Some("patient") => out
+                .patient
+                .push(read_patient_group_reference(entry, "patient")?),
+            Some("group") => out
+                .group
+                .push(read_patient_group_reference(entry, "group")?),
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Pulls a parameter's `name`. Accepts both raw-JSON shape (`"name": "..."`)
@@ -517,6 +600,73 @@ mod tests {
                 "Group/b".to_string(),
                 "Group/c".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn checked_reference_parameters_reject_unusable_values() {
+        let invalid_values = [
+            json!({"valueReference": {"identifier": {"system": "urn:s", "value": "v"}}}),
+            json!({"valueReference": {"display": "a patient"}}),
+            json!({"valueReference": {}}),
+            json!({"valueReference": {"reference": ""}}),
+            json!({"valueReference": {"reference": " \t "}}),
+            json!({"valueUri": "Patient/p1"}),
+            json!({"valueIdentifier": {"system": "urn:s", "value": "v"}}),
+            json!({"valueInteger": 42}),
+            json!({"valueString": 42}),
+            json!({"valueReference": {"reference": 42}}),
+            json!({"valueString": ""}),
+            json!({"valueString": " \t "}),
+            json!({}),
+            // A preferred string remains authoritative even when it is blank.
+            json!({"valueReference": {"reference": " "}, "valueString": "Patient/p1"}),
+        ];
+        for name in ["patient", "group"] {
+            for invalid in &invalid_values {
+                for typed_name in [false, true] {
+                    let mut entry = invalid.clone();
+                    entry["name"] = if typed_name {
+                        json!({"value": name})
+                    } else {
+                        json!(name)
+                    };
+                    let body = params(vec![
+                        json!({"name": name, "valueString": "valid-id"}),
+                        entry.clone(),
+                    ]);
+                    let error = extract_run_params_checked(&body).unwrap_err();
+                    assert_eq!(error.param, name, "{entry}");
+                    assert!(error.message.contains(name), "{error}");
+                    assert!(error.message.contains("no usable reference"), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_reference_parameters_normalize_all_entries_and_keep_fallback() {
+        let body = params(vec![
+            json!({"name": "patient", "valueReference": {"reference": " Patient/p1 "}, "valueString": "Patient/ignored"}),
+            json!({"name": {"value": "patient"}, "valueString": " p2 "}),
+            json!({"name": "patient", "valueReference": {"display": "p3"}, "valueString": " Patient/p3 "}),
+            json!({"name": "group", "valueReference": {"reference": " Group/g1 "}}),
+            json!({"name": {"value": "group"}, "valueString": " Group/g2 "}),
+            // Unrelated fields retain the permissive extraction contract.
+            json!({"name": "_format", "valueCode": "json"}),
+            json!({"name": "subjectReference", "valueReference": {"identifier": {"value": "v"}}}),
+            json!({"name": "unknown", "valueInteger": 1}),
+        ]);
+        let extracted = extract_run_params_checked(&body).unwrap();
+        assert_eq!(extracted.patient, ["Patient/p1", "p2", "Patient/p3"]);
+        assert_eq!(extracted.group, ["Group/g1", "Group/g2"]);
+        assert_eq!(extracted.format.as_deref(), Some("json"));
+        assert!(extracted.subject_reference.is_none());
+        assert!(
+            extract_run_params_checked(&json!({"resourceType": "ViewDefinition"}))
+                .unwrap()
+                .patient
+                .is_empty()
         );
     }
 

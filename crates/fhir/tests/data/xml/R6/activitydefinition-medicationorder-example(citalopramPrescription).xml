@@ -47,6 +47,7 @@
   <contained>
     <Substance>
       <id value="citalopramSubstance"/>
+      <!-- <instance value="true"/> -->
       <code>
         <concept>
           <coding>

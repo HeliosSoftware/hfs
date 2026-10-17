@@ -13,7 +13,7 @@ use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use helios_fhir::FhirVersion;
-use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
+use helios_persistence::backends::s3::{KeyspaceLayout, S3Backend, S3BackendConfig, S3TenancyMode};
 use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
 use helios_persistence::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
@@ -22,9 +22,12 @@ use helios_persistence::core::bulk_submit::{
 use helios_persistence::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
-use helios_persistence::core::{ResourceStorage, SettingsStore, VersionedStorage};
+use helios_persistence::core::{
+    DiscoveryCoverage, DiscoveryRequest, PresenceBasis, PurgableStorage, ResourceStorage,
+    SettingsStore, TenantDataEvidence, VersionedStorage,
+};
 use helios_persistence::error::{
-    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError,
+    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TenantError,
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{CursorValue, PageCursor, Pagination, PaginationMode};
@@ -35,8 +38,14 @@ use testcontainers::{GenericImage, ImageExt};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-const DEFAULT_MINIO_IMAGE: &str = "minio/minio";
-const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
+const DEFAULT_MINIO_IMAGE: &str = "ghcr.io/coollabsio/minio";
+const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-10-15T17-29-55Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
 const DEFAULT_MINIO_ROOT_PASSWORD: &str = "minioadmin";
 
@@ -44,6 +53,8 @@ struct SharedMinio {
     endpoint_url: String,
     root_user: String,
     root_password: String,
+    /// Kept alive for the duration of the test binary; the
+    /// `container_cleanup` exit hook removes it at process exit.
     _container: testcontainers::ContainerAsync<GenericImage>,
 }
 
@@ -105,18 +116,22 @@ async fn shared_minio() -> &'static SharedMinio {
                 .unwrap_or_else(|_| DEFAULT_MINIO_ROOT_PASSWORD.to_string());
 
             let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-            let container = GenericImage::new(image, tag)
-                .with_wait_for(WaitFor::message_on_stderr("API:"))
-                .with_exposed_port(9000.tcp())
-                .with_exposed_port(9001.tcp())
-                .with_env_var("MINIO_ROOT_USER", root_user.clone())
-                .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
-                .with_env_var("MINIO_CONSOLE_ADDRESS", ":9001")
-                .with_cmd(["server", "/data", "--console-address", ":9001"])
-                .with_label("github.run_id", &run_id)
-                .start()
-                .await
-                .expect("failed to start MinIO container");
+            // `SHARED_MINIO` is a static and never dropped; the cleanup label
+            // lets the exit hook remove the container.
+            let container = container_cleanup::with_cleanup_label(
+                GenericImage::new(image, tag)
+                    .with_wait_for(WaitFor::message_on_stderr("API:"))
+                    .with_exposed_port(9000.tcp())
+                    .with_exposed_port(9001.tcp())
+                    .with_env_var("MINIO_ROOT_USER", root_user.clone())
+                    .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
+                    .with_env_var("MINIO_CONSOLE_ADDRESS", ":9001")
+                    .with_cmd(["server", "/data", "--console-address", ":9001"])
+                    .with_label("github.run_id", &run_id),
+            )
+            .start()
+            .await
+            .expect("failed to start MinIO container");
 
             let host = container
                 .get_host()
@@ -174,6 +189,32 @@ async fn ensure_bucket_exists(client: &Client, bucket: &str) {
 }
 
 async fn make_prefix_backend(scope: &str) -> MinioHarness {
+    make_prefix_backend_with_layout(scope, KeyspaceLayout::V1).await
+}
+
+fn prefix_config(
+    shared: &SharedMinio,
+    bucket: &str,
+    prefix: &str,
+    layout: KeyspaceLayout,
+) -> S3BackendConfig {
+    S3BackendConfig {
+        tenancy_mode: S3TenancyMode::PrefixPerTenant {
+            bucket: bucket.to_string(),
+        },
+        prefix: Some(prefix.to_string()),
+        region: Some("us-east-1".to_string()),
+        endpoint_url: Some(shared.endpoint_url.clone()),
+        force_path_style: true,
+        allow_http: true,
+        validate_buckets_on_startup: true,
+        default_keyspace_layout: layout,
+        ..Default::default()
+    }
+}
+
+/// Like [`make_prefix_backend`], with the layout new (empty) tenants get.
+async fn make_prefix_backend_with_layout(scope: &str, layout: KeyspaceLayout) -> MinioHarness {
     let shared = shared_minio().await;
     ensure_backend_env_credentials(shared);
 
@@ -182,18 +223,7 @@ async fn make_prefix_backend(scope: &str) -> MinioHarness {
     ensure_bucket_exists(&sdk_client, &bucket).await;
 
     let prefix = format!("integration/{}/{}", Uuid::new_v4(), scope);
-    let config = S3BackendConfig {
-        tenancy_mode: S3TenancyMode::PrefixPerTenant {
-            bucket: bucket.clone(),
-        },
-        prefix: Some(prefix.clone()),
-        region: Some("us-east-1".to_string()),
-        endpoint_url: Some(shared.endpoint_url.clone()),
-        force_path_style: true,
-        allow_http: true,
-        validate_buckets_on_startup: true,
-        ..Default::default()
-    };
+    let config = prefix_config(shared, &bucket, &prefix, layout);
 
     let backend = S3Backend::from_env(config).expect("create S3 backend for MinIO");
     MinioHarness {
@@ -202,6 +232,31 @@ async fn make_prefix_backend(scope: &str) -> MinioHarness {
         bucket,
         prefix,
     }
+}
+
+/// A second backend over the same bucket and prefix, as another instance (or
+/// a restart with a different `HFS_S3_KEYSPACE_LAYOUT`) would be.
+async fn second_backend(harness: &MinioHarness, layout: KeyspaceLayout) -> S3Backend {
+    let shared = shared_minio().await;
+    let config = prefix_config(shared, &harness.bucket, &harness.prefix, layout);
+    S3Backend::from_env(config).expect("create second S3 backend for MinIO")
+}
+
+/// The two-hex-character V2 shard segment: `hex(sha256(id))[0..2]`.
+fn shard_of(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    format!("{:02x}", digest[0])
+}
+
+/// Every key under one tenant's prefix, sorted.
+async fn tenant_keys(harness: &MinioHarness, tenant_id: &str) -> Vec<String> {
+    let root = format!("{}/{}/", harness.prefix, tenant_id);
+    all_keys(&harness.sdk_client, &harness.bucket)
+        .await
+        .into_iter()
+        .filter(|k| k.starts_with(&root))
+        .collect()
 }
 
 fn is_precondition_failed<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool
@@ -825,6 +880,414 @@ async fn test_minio_pagination_over_1000_history_and_export() {
 }
 
 // ============================================================================
+// Keyspace layout V2 (#1502): sharded resources/type history, no
+// `history/system/`, per-tenant marker.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_v2_crud_versioning_history_and_key_shape() {
+    if skip_if_disabled("test_minio_v2_crud_versioning_history_and_key_shape") {
+        return;
+    }
+
+    let harness = make_prefix_backend_with_layout("v2-shape", KeyspaceLayout::V2).await;
+    let tenant_id = "minio-tenant-v2-shape";
+    let tenant = tenant(tenant_id);
+    let id = format!("p-{}", Uuid::new_v4());
+
+    let created = harness
+        .backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType":"Patient","id":id}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let updated = harness
+        .backend
+        .update(
+            &tenant,
+            &created,
+            json!({"resourceType":"Patient","id":created.id(),"active":true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.version_id(), "2");
+
+    let read = harness
+        .backend
+        .read(&tenant, "Patient", created.id())
+        .await
+        .unwrap()
+        .expect("read back through the sharded key");
+    assert_eq!(read.version_id(), "2");
+    assert!(
+        harness
+            .backend
+            .vread(&tenant, "Patient", created.id(), "1")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    harness
+        .backend
+        .delete(&tenant, "Patient", created.id())
+        .await
+        .unwrap();
+
+    let params = HistoryParams::new().include_deleted(true);
+    let instance = harness
+        .backend
+        .history_instance(&tenant, "Patient", created.id(), &params)
+        .await
+        .unwrap();
+    assert_eq!(instance.items.len(), 3);
+    assert_eq!(instance.items[0].resource.version_id(), "3");
+
+    let by_type = harness
+        .backend
+        .history_type(&tenant, "Patient", &params)
+        .await
+        .unwrap();
+    assert_eq!(by_type.items.len(), 3);
+    // System history has no index of its own in V2; it is served from the
+    // per-type events and must agree with them.
+    let system = harness
+        .backend
+        .history_system(&tenant, &params)
+        .await
+        .unwrap();
+    assert_eq!(system.items.len(), 3);
+    assert_eq!(
+        harness.backend.history_system_count(&tenant).await.unwrap(),
+        3
+    );
+
+    let shard = shard_of(created.id());
+    let root = format!("{}/{tenant_id}", harness.prefix);
+    let keys = tenant_keys(&harness, tenant_id).await;
+    let has = |key: String| keys.contains(&key);
+    assert!(has(format!(
+        "{root}/resources/Patient/{shard}/{}/current.json",
+        created.id()
+    )));
+    assert!(has(format!(
+        "{root}/resources/Patient/{shard}/{}/_history/1.json",
+        created.id()
+    )));
+    assert!(has(format!("{root}/history/_keyspace.json")));
+    assert!(
+        keys.iter()
+            .any(|k| k.starts_with(&format!("{root}/history/type/Patient/{shard}/"))),
+        "type events are sharded: {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|k| k.contains("/history/system/")),
+        "V2 writes no system index: {keys:?}"
+    );
+    assert!(
+        !keys
+            .iter()
+            .any(|k| k == &format!("{root}/resources/Patient/{}/current.json", created.id())),
+        "no flat key in a V2 tenant"
+    );
+
+    let marker = harness
+        .sdk_client
+        .get_object()
+        .bucket(&harness.bucket)
+        .key(format!("{root}/history/_keyspace.json"))
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(
+        KeyspaceLayout::from_marker_body(&marker),
+        Some(KeyspaceLayout::V2)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_v2_pagination_over_1000_history_and_export() {
+    if skip_if_disabled("test_minio_v2_pagination_over_1000_history_and_export") {
+        return;
+    }
+
+    let harness = make_prefix_backend_with_layout("v2-pagination", KeyspaceLayout::V2).await;
+    let tenant = tenant("minio-tenant-v2-pagination");
+
+    for i in 0..1005 {
+        harness
+            .backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("p-{i}-{}", Uuid::new_v4())}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        harness
+            .backend
+            .history_type_count(&tenant, "Patient")
+            .await
+            .unwrap(),
+        1005
+    );
+    assert_eq!(
+        harness.backend.history_system_count(&tenant).await.unwrap(),
+        1005
+    );
+
+    // Past one listing page: the type spans shards, and export still walks
+    // every resource exactly once across batches.
+    let request = ExportRequest::system();
+    let batch1 = harness
+        .backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(batch1.lines.len(), 1000);
+    assert!(!batch1.is_last);
+    let batch2 = harness
+        .backend
+        .fetch_export_batch(
+            &tenant,
+            &request,
+            "Patient",
+            batch1.next_cursor.as_deref(),
+            1000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(batch2.lines.len(), 5);
+    assert!(batch2.is_last);
+    let mut ids: Vec<&str> = batch1
+        .lines
+        .iter()
+        .chain(batch2.lines.iter())
+        .map(String::as_str)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 1005, "no resource exported twice or lost");
+
+    let system_page = harness
+        .backend
+        .history_system(
+            &tenant,
+            &HistoryParams {
+                pagination: Pagination {
+                    count: 10,
+                    mode: PaginationMode::Offset(1000),
+                },
+                ..HistoryParams::new()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(system_page.items.len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_v2_purge_and_purge_tenant_data_keep_the_layout() {
+    if skip_if_disabled("test_minio_v2_purge_and_purge_tenant_data_keep_the_layout") {
+        return;
+    }
+
+    let harness = make_prefix_backend_with_layout("v2-purge", KeyspaceLayout::V2).await;
+    let tenant_id = "minio-tenant-v2-purge";
+    let tenant = tenant(tenant_id);
+
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let created = harness
+            .backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("purge-{i}-{}", Uuid::new_v4())}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        ids.push(created.id().to_string());
+    }
+
+    harness
+        .backend
+        .purge(&tenant, "Patient", &ids[0])
+        .await
+        .unwrap();
+    assert!(
+        harness
+            .backend
+            .read(&tenant, "Patient", &ids[0])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        harness
+            .backend
+            .history_type_count(&tenant, "Patient")
+            .await
+            .unwrap(),
+        2,
+        "the purged resource's type events are gone, the others' stay"
+    );
+    assert_eq!(
+        harness.backend.history_system_count(&tenant).await.unwrap(),
+        2
+    );
+    let purged_keys = tenant_keys(&harness, tenant_id).await;
+    assert!(
+        !purged_keys.iter().any(|k| k.contains(&ids[0])),
+        "no object of the purged id remains: {purged_keys:?}"
+    );
+
+    assert_eq!(
+        harness.backend.purge_all(&tenant, "Patient").await.unwrap(),
+        2
+    );
+    assert_eq!(
+        harness
+            .backend
+            .history_type_count(&tenant, "Patient")
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Tenant purge sweeps data but keeps the marker: the layout of a tenant
+    // is immutable, other instances may have it cached.
+    let again = harness
+        .backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType":"Patient","id":format!("again-{}", Uuid::new_v4())}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert!(harness.backend.purge_tenant_data(tenant_id).await.unwrap() >= 1);
+    let root = format!("{}/{tenant_id}", harness.prefix);
+    assert_eq!(
+        tenant_keys(&harness, tenant_id).await,
+        vec![format!("{root}/history/_keyspace.json")]
+    );
+
+    // Same instance and a fresh one both keep writing V2 after the purge.
+    let fresh = second_backend(&harness, KeyspaceLayout::V1).await;
+    for backend in [&harness.backend, &fresh] {
+        let id = format!("after-{}", Uuid::new_v4());
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let key = format!(
+            "{root}/resources/Patient/{}/{id}/current.json",
+            shard_of(&id)
+        );
+        assert!(tenant_keys(&harness, tenant_id).await.contains(&key));
+    }
+    let _ = again;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_v2_default_keeps_a_tenant_with_flat_data_on_v1() {
+    if skip_if_disabled("test_minio_v2_default_keeps_a_tenant_with_flat_data_on_v1") {
+        return;
+    }
+
+    let harness = make_prefix_backend("v2-legacy").await;
+    let tenant_id = "minio-tenant-v2-legacy";
+    let tenant = tenant(tenant_id);
+    let old_id = format!("old-{}", Uuid::new_v4());
+    harness
+        .backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType":"Patient","id":old_id}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // The operator now asks for V2 by default; this tenant already has flat
+    // data and no marker, so it must stay V1.
+    let v2_default = second_backend(&harness, KeyspaceLayout::V2).await;
+    assert!(
+        v2_default
+            .read(&tenant, "Patient", &old_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let new_id = format!("new-{}", Uuid::new_v4());
+    v2_default
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType":"Patient","id":new_id}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let root = format!("{}/{tenant_id}", harness.prefix);
+    let keys = tenant_keys(&harness, tenant_id).await;
+    assert!(keys.contains(&format!("{root}/resources/Patient/{new_id}/current.json")));
+    assert!(!keys.contains(&format!("{root}/history/_keyspace.json")));
+    assert!(keys.iter().any(|k| k.contains("/history/system/")));
+    assert_eq!(
+        v2_default
+            .history_type_count(&tenant, "Patient")
+            .await
+            .unwrap(),
+        2
+    );
+
+    // A tenant that has never been written does take the configured default.
+    let fresh_tenant = TenantContext::new(
+        TenantId::new("minio-tenant-v2-fresh"),
+        TenantPermissions::full_access(),
+    );
+    let fresh_id = format!("fresh-{}", Uuid::new_v4());
+    v2_default
+        .create(
+            &fresh_tenant,
+            "Patient",
+            json!({"resourceType":"Patient","id":fresh_id}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let fresh_keys = tenant_keys(&harness, "minio-tenant-v2-fresh").await;
+    assert!(fresh_keys.iter().any(|k| k.ends_with(&format!(
+        "/resources/Patient/{}/{fresh_id}/current.json",
+        shard_of(&fresh_id)
+    ))));
+}
+
+// ============================================================================
 // Phase 2 — S3OutputStore tests against MinIO.
 // ============================================================================
 
@@ -935,6 +1398,195 @@ fn unique_user_key(scope: &str) -> String {
         "https://idp.example.com/realms/test|{scope}-{}",
         Uuid::new_v4()
     )
+}
+
+// ── Web UI login sessions (#1481) ──────────────────────────────────────
+
+fn login_session(id: &str) -> helios_auth::PersistedSession {
+    let now = chrono::Utc::now();
+    helios_auth::PersistedSession {
+        id: id.to_string(),
+        principal: helios_auth::SessionPrincipal {
+            subject: "demo-sub".to_string(),
+            issuer: "https://idp".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: None,
+            email: None,
+            picture: None,
+        },
+        access_token: "at-1".to_string(),
+        access_expires_at: now + chrono::TimeDelta::minutes(5),
+        refresh_token: Some("rt-1".to_string()),
+        id_token: None,
+        last_seen: now,
+        created_at: now,
+        version: 0,
+    }
+}
+
+fn pending_login(id: &str) -> helios_auth::PersistedPending {
+    helios_auth::PersistedPending {
+        id: id.to_string(),
+        state: "state-1".to_string(),
+        code_verifier: "verifier-1".to_string(),
+        next: "/ui/resources".to_string(),
+        started_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_minio_login_session_round_trip_and_conflict() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    if skip_if_disabled("test_minio_login_session_round_trip_and_conflict") {
+        return;
+    }
+    let harness = make_prefix_backend("login-session").await;
+    let backend = &harness.backend;
+    let id = format!("s-{}", Uuid::new_v4().simple());
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+
+    assert_eq!(
+        backend
+            .save_session(&login_session(&id), Some(0))
+            .await
+            .unwrap(),
+        SaveOutcome::Saved(1)
+    );
+    let loaded = backend.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.access_token, "at-1");
+    assert_eq!(loaded.principal.display(), "Demo User");
+
+    let mut stale = login_session(&id);
+    stale.access_token = "at-stale".to_string();
+    assert_eq!(
+        backend.save_session(&stale, Some(0)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, Some(7)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    let missing = format!("s-{}", Uuid::new_v4().simple());
+    assert_eq!(
+        backend
+            .save_session(&login_session(&missing), Some(1))
+            .await
+            .unwrap(),
+        SaveOutcome::Conflict { current: 0 }
+    );
+
+    let mut newer = loaded.clone();
+    newer.access_token = "at-2".to_string();
+    assert_eq!(
+        backend.save_session(&newer, Some(1)).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    assert_eq!(
+        backend.save_session(&newer, None).await.unwrap(),
+        SaveOutcome::Saved(3)
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-2"
+    );
+
+    // A fresh object survives the sweep.
+    backend.sweep(chrono::Utc::now()).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_some());
+
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_minio_pending_login_is_consumed_exactly_once() {
+    use helios_auth::SessionPersistence;
+    if skip_if_disabled("test_minio_pending_login_is_consumed_exactly_once") {
+        return;
+    }
+    let harness = make_prefix_backend("login-pending").await;
+    let backend = &harness.backend;
+    let id = format!("p-{}", Uuid::new_v4().simple());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+
+    backend.save_pending(&pending_login(&id)).await.unwrap();
+    let loaded = backend.load_pending(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.state, "state-1");
+    assert_eq!(loaded.next, "/ui/resources");
+    assert!(
+        backend.load_session(&id).await.unwrap().is_none(),
+        "a pending id is never a session"
+    );
+
+    assert!(backend.delete_pending(&id).await.unwrap());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+    assert!(backend.load_pending(&id).await.unwrap().is_none());
+}
+
+// ── Identifier-scoped conditional create (#1435) ─────────────────────────
+
+/// Against a real store: the first `If-None-Exist` on an identifier creates,
+/// the next answers the resource it created, two live matches are a
+/// `MultipleMatches`, and a criterion the scan cannot evaluate is refused.
+#[tokio::test]
+async fn test_minio_conditional_create_by_identifier() {
+    use helios_persistence::core::{ConditionalCreateResult, ConditionalStorage};
+
+    if skip_if_disabled("test_minio_conditional_create_by_identifier") {
+        return;
+    }
+    let harness = make_prefix_backend("conditional-create").await;
+    let backend = &harness.backend;
+    let t = tenant("tenant-cc");
+    let mrn = format!("mrn-{}", Uuid::new_v4().simple());
+    let patient = json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": mrn}],
+        "active": true
+    });
+    let criteria = format!("identifier=http%3A%2F%2Fexample.org%2Fmrn%7C{mrn}");
+
+    let created = match backend
+        .conditional_create(&t, "Patient", patient.clone(), &criteria, FhirVersion::R4)
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Created(stored) => stored,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    match backend
+        .conditional_create(&t, "Patient", patient.clone(), &criteria, FhirVersion::R4)
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Exists(stored) => assert_eq!(stored.id(), created.id()),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+
+    backend
+        .create(&t, "Patient", patient.clone(), FhirVersion::R4)
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .conditional_create(&t, "Patient", patient.clone(), &criteria, FhirVersion::R4)
+            .await
+            .unwrap(),
+        ConditionalCreateResult::MultipleMatches(2)
+    ));
+
+    let err = backend
+        .conditional_create(&t, "Patient", patient, "active=true", FhirVersion::R4)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Search(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -1339,6 +1991,194 @@ async fn test_minio_validate_buckets_missing_bucket_is_bucket_flavored() {
     }
 }
 
+/// Every key in `bucket`, for asserting what landed where.
+async fn all_keys(client: &Client, bucket: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let page = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .set_continuation_token(continuation.take())
+            .send()
+            .await
+            .expect("list bucket");
+        keys.extend(
+            page.contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string)),
+        );
+        match page.next_continuation_token() {
+            Some(token) => continuation = Some(token.to_string()),
+            None => break,
+        }
+    }
+    keys.sort();
+    keys
+}
+
+/// Bucket-per-tenant on a real S3-compatible store (#1598): each tenant's
+/// resources land in its own bucket with no tenant prefix, the registry and
+/// the per-user settings document land in the system bucket, a tenant outside
+/// the map is refused on request and on registration alike, and startup
+/// validation covers every mapped bucket. The mock proves the routing logic;
+/// this proves it against real buckets, which is what the mode exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_bucket_per_tenant_routes_each_tenant_to_its_own_bucket() {
+    if skip_if_disabled("test_minio_bucket_per_tenant_routes_each_tenant_to_its_own_bucket") {
+        return;
+    }
+
+    let shared = shared_minio().await;
+    ensure_backend_env_credentials(shared);
+    let sdk_client = build_minio_sdk_client(shared).await;
+
+    let run = Uuid::new_v4().simple();
+    let bucket_a = format!("hfs-bpt-a-{run}");
+    let bucket_b = format!("hfs-bpt-b-{run}");
+    let system_bucket = format!("hfs-bpt-system-{run}");
+    for bucket in [&bucket_a, &bucket_b, &system_bucket] {
+        ensure_bucket_exists(&sdk_client, bucket).await;
+    }
+
+    let config = |map: &[(&str, &str)], validate: bool| S3BackendConfig {
+        tenancy_mode: S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map: map
+                .iter()
+                .map(|(t, b)| (t.to_string(), b.to_string()))
+                .collect(),
+            default_system_bucket: Some(system_bucket.clone()),
+        },
+        region: Some("us-east-1".to_string()),
+        endpoint_url: Some(shared.endpoint_url.clone()),
+        force_path_style: true,
+        allow_http: true,
+        validate_buckets_on_startup: validate,
+        ..Default::default()
+    };
+
+    // Startup validation reaches every mapped bucket, not just the first.
+    let absent = format!("hfs-bpt-absent-{run}");
+    let err = S3Backend::from_env(config(
+        &[("tenant-a", &bucket_a), ("tenant-b", &absent)],
+        true,
+    ))
+    .expect_err("a mapped bucket that does not exist must fail startup");
+    match &err {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            assert!(
+                message.contains(&absent),
+                "must name the absent bucket: {message}"
+            );
+        }
+        other => panic!("expected Backend(Unavailable), got {other:?}"),
+    }
+
+    let backend = S3Backend::from_env(config(
+        &[("tenant-a", &bucket_a), ("tenant-b", &bucket_b)],
+        true,
+    ))
+    .expect("bucket-per-tenant backend against MinIO");
+    assert!(backend.supports_tenant_registry());
+    assert!(backend.supports_user_settings());
+
+    let (ta, tb) = (tenant("tenant-a"), tenant("tenant-b"));
+    backend
+        .create(
+            &ta,
+            "Patient",
+            json!({"resourceType":"Patient","id":"pa"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create in tenant-a");
+    backend
+        .create(
+            &tb,
+            "Patient",
+            json!({"resourceType":"Patient","id":"pb"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create in tenant-b");
+    backend
+        .register_tenant("tenant-a", Some("Tenant A"))
+        .await
+        .expect("register a mapped tenant");
+
+    // Each tenant's data is in its own bucket, directly under the root (no
+    // tenant prefix: the bucket is the tenant boundary).
+    let keys_a = all_keys(&sdk_client, &bucket_a).await;
+    let keys_b = all_keys(&sdk_client, &bucket_b).await;
+    assert!(
+        keys_a.contains(&"resources/Patient/pa/current.json".to_string()),
+        "tenant-a's resource must be at the bucket root: {keys_a:?}"
+    );
+    assert!(
+        keys_b.contains(&"resources/Patient/pb/current.json".to_string()),
+        "tenant-b's resource must be at the bucket root: {keys_b:?}"
+    );
+    assert!(
+        keys_a.iter().all(|k| !k.contains("/pb/")) && keys_b.iter().all(|k| !k.contains("/pa/")),
+        "no object may cross buckets: a={keys_a:?} b={keys_b:?}"
+    );
+    assert!(
+        keys_a
+            .iter()
+            .chain(&keys_b)
+            .all(|k| !k.starts_with("tenants/")),
+        "the registry must not be in a tenant bucket: a={keys_a:?} b={keys_b:?}"
+    );
+    assert!(
+        backend.read(&tb, "Patient", "pa").await.unwrap().is_none(),
+        "a read in tenant-b must not see tenant-a's resource"
+    );
+
+    // Cross-tenant state is in the system bucket and nowhere else.
+    let keys_system = all_keys(&sdk_client, &system_bucket).await;
+    assert!(
+        keys_system.iter().any(|k| k.starts_with("tenants/")),
+        "the registry record must be in the system bucket: {keys_system:?}"
+    );
+    assert!(
+        keys_system.iter().all(|k| !k.starts_with("resources/")),
+        "no tenant resource may land in the system bucket: {keys_system:?}"
+    );
+    assert_eq!(
+        backend
+            .get_tenant("tenant-a")
+            .await
+            .unwrap()
+            .map(|r| r.display_name),
+        Some(Some("Tenant A".to_string()))
+    );
+
+    // A tenant outside the map has no bucket: refused on request and refused
+    // at the mint point, with nothing written.
+    let tc = tenant("tenant-c");
+    assert!(matches!(
+        backend
+            .create(
+                &tc,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pc"}),
+                FhirVersion::default(),
+            )
+            .await,
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+    ));
+    assert!(matches!(
+        backend.register_tenant("tenant-c", None).await,
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+    ));
+    assert!(backend.get_tenant("tenant-c").await.unwrap().is_none());
+    assert_eq!(
+        all_keys(&sdk_client, &system_bucket).await,
+        keys_system,
+        "a refused registration must write nothing"
+    );
+}
+
 /// #330: on the real SDK path, a tenant deregistered without purge must stay
 /// discoverable through count_by_tenant (delimiter LIST + per-tenant counts).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1386,5 +2226,728 @@ async fn test_minio_count_by_tenant_survives_deregistration() {
     assert_eq!(
         counts,
         vec![("count-a".to_string(), 1), ("count-b".to_string(), 2)]
+    );
+}
+
+/// #1672: discovery through the new seam on the real SDK path. A tenant
+/// deregistered without purge stays present (presence only, never a count)
+/// until its data is purged; a registered tenant without data never appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_discover_tenants_survives_deregistration() {
+    if skip_if_disabled("test_minio_discover_tenants_survives_deregistration") {
+        return;
+    }
+
+    let harness = make_prefix_backend("discover-tenants").await;
+    let backend = &harness.backend;
+
+    backend.register_tenant("disc-a", None).await.unwrap();
+    backend.register_tenant("disc-empty", None).await.unwrap();
+    for (t, id) in [("disc-a", "p1"), ("disc-b", "q1")] {
+        backend
+            .create(
+                &tenant(t),
+                "Patient",
+                json!({"resourceType":"Patient","id":id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert!(backend.deregister_tenant("disc-a").await.unwrap());
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    let present = TenantDataEvidence::Present {
+        basis: PresenceBasis::ResourceObjects,
+    };
+    let found: Vec<(&str, &TenantDataEvidence)> = discovery
+        .tenants
+        .iter()
+        .map(|t| (t.id.as_str(), &t.evidence))
+        .collect();
+    assert_eq!(found, vec![("disc-a", &present), ("disc-b", &present)]);
+
+    backend.purge_tenant_data("disc-a").await.unwrap();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    let ids: Vec<&str> = discovery.tenants.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["disc-b"]);
+}
+
+/// #1672: more than 1,000 tenant groups on real `ListObjectsV2` pagination.
+/// A budgeted walk resumes with the `StartAfter` cursor slice by slice and
+/// ends with exactly the seeded set: no group listed twice (MinIO's own
+/// `StartAfter` handling of a group's prefix is not relied on) and none lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_discover_tenants_resumes_beyond_1000_groups() {
+    use futures::stream::{self, StreamExt};
+
+    if skip_if_disabled("test_minio_discover_tenants_resumes_beyond_1000_groups") {
+        return;
+    }
+
+    const GROUPS: usize = 1_100;
+    let harness = make_prefix_backend("discover-paginated").await;
+    let expected: Vec<String> = (0..GROUPS).map(|i| format!("g-{i:04}")).collect();
+
+    // Raw keys in the real layout (pointer + history version), not FHIR
+    // creates, so seeding 1,100 groups stays cheap.
+    let keys: Vec<String> = expected
+        .iter()
+        .flat_map(|id| {
+            [
+                format!("{}/{id}/resources/Patient/p1/current.json", harness.prefix),
+                format!(
+                    "{}/{id}/resources/Patient/p1/_history/1.json",
+                    harness.prefix
+                ),
+            ]
+        })
+        .collect();
+    stream::iter(keys)
+        .map(|key| {
+            let client = harness.sdk_client.clone();
+            let bucket = harness.bucket.clone();
+            async move {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from_static(b"{}"))
+                    .send()
+                    .await
+                    .expect("seed object");
+            }
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<()>>()
+        .await;
+    // A control-plane group rides along unseen.
+    harness
+        .backend
+        .register_tenant("registered-only", None)
+        .await
+        .unwrap();
+
+    let full = harness
+        .backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(full.coverage, DiscoveryCoverage::Complete);
+    let ids: Vec<String> = full.tenants.iter().map(|t| t.id.clone()).collect();
+    assert_eq!(ids, expected);
+
+    let mut seen = Vec::new();
+    let mut resume = None;
+    let mut slices = 0;
+    loop {
+        slices += 1;
+        assert!(slices < 20, "the walk must terminate");
+        let slice = harness
+            .backend
+            .discover_tenants(&DiscoveryRequest {
+                max_requests: std::num::NonZeroU32::new(250),
+                resume: resume.take(),
+            })
+            .await
+            .unwrap();
+        seen.extend(slice.tenants.into_iter().map(|t| t.id));
+        match slice.coverage {
+            DiscoveryCoverage::Partial {
+                resume: Some(cursor),
+            } => resume = Some(cursor),
+            DiscoveryCoverage::Complete => break,
+            other => panic!("unexpected coverage {other:?}"),
+        }
+    }
+    assert!(slices >= 5, "1,100 groups at 250 requests per slice");
+    assert_eq!(
+        seen, expected,
+        "no duplicates and no omissions across slices"
+    );
+}
+
+/// #1912: on the real SDK path, the tenant-scoped `MaxKeys=1` probe answers as
+/// `count_by_tenant` did — delete tombstones included, as S3 counts them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_tenant_has_resources_matches_discovery() {
+    if skip_if_disabled("test_minio_tenant_has_resources_matches_discovery") {
+        return;
+    }
+
+    let harness = make_prefix_backend("tenant-existence").await;
+    let backend = &harness.backend;
+    tenant_existence_suite::tenant_has_resources_matches_discovery(backend, "exist", true).await;
+    tenant_existence_suite::child_data_is_not_the_parents(backend, "exist").await;
+}
+
+// ============================================================================
+// SQL-on-FHIR streaming tests
+// ============================================================================
+
+/// Verifies that `scan_resources` on the S3 backend yields resources with
+/// server-populated `meta.versionId` and `meta.lastUpdated` merged in.
+///
+/// The S3 backend stores these fields separately from the resource body. The
+/// `since` filter and any ViewDefinition that reads `meta.*` both rely on
+/// `into_content_with_meta` being called during the scan; a regression to
+/// `content().clone()` would silently return null for both fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_scan_resources_include_server_meta() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    if skip_if_disabled("test_minio_sof_scan_resources_include_server_meta") {
+        return;
+    }
+
+    let harness = make_prefix_backend("sof-meta").await;
+    let backend = &harness.backend;
+    let t = tenant("sof-meta-tenant");
+
+    backend
+        .create(
+            &t,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "meta-obs-1",
+                "status": "final",
+                "code": { "text": "x" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // ViewDefinition that extracts the server-managed meta fields.
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [
+            { "path": "id",                "name": "obs_id" },
+            { "path": "meta.versionId",    "name": "version_id" },
+            { "path": "meta.lastUpdated",  "name": "last_updated" }
+        ]}]
+    });
+
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
+    let mut stream = runner
+        .run_view(&t, view, ViewFilters::default())
+        .await
+        .expect("run_view");
+
+    let row = stream
+        .next()
+        .await
+        .expect("at least one row")
+        .expect("row must not be an error");
+
+    assert_eq!(row["obs_id"], "meta-obs-1");
+    assert!(
+        row["version_id"].is_string() && !row["version_id"].as_str().unwrap().is_empty(),
+        "meta.versionId must be a non-empty string from the server; got: {:?}",
+        row["version_id"]
+    );
+    assert!(
+        row["last_updated"].is_string() && !row["last_updated"].as_str().unwrap().is_empty(),
+        "meta.lastUpdated must be a non-empty string from the server; got: {:?}",
+        row["last_updated"]
+    );
+}
+
+/// Verifies that the `since` filter works end-to-end on the S3 backend.
+///
+/// Correctness depends on `into_content_with_meta` being used in `scan_resources`
+/// so that `meta.lastUpdated` is present when the in-process runner evaluates the
+/// `since` cutoff. This test would silently pass without the fix only if
+/// `meta.lastUpdated` happened to be embedded in the stored body, which it is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_since_filter() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    if skip_if_disabled("test_minio_sof_since_filter") {
+        return;
+    }
+
+    let harness = make_prefix_backend("sof-since").await;
+    let backend = &harness.backend;
+    let t = tenant("sof-since-tenant");
+
+    backend
+        .create(
+            &t,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "s3-since-before",
+                "status": "final",
+                "code": { "text": "x" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let stored_before = backend
+        .read(&t, "Observation", "s3-since-before")
+        .await
+        .unwrap()
+        .unwrap();
+    // `since` is inclusive (#1707), so cut off 1 ms after the first resource's
+    // stamp to exclude it.
+    let cutoff = stored_before.last_modified() + chrono::Duration::milliseconds(1);
+
+    // Guarantee a strictly later timestamp for the second resource.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    backend
+        .create(
+            &t,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "s3-since-after",
+                "status": "final",
+                "code": { "text": "x" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+    });
+
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
+
+    let collect = |filters: ViewFilters| {
+        let runner = runner.clone();
+        let t = t.clone();
+        let view = view.clone();
+        async move {
+            let mut stream = runner.run_view(&t, view, filters).await.expect("run_view");
+            let mut ids = Vec::new();
+            while let Some(row) = stream.next().await {
+                ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());
+            }
+            ids.sort();
+            ids
+        }
+    };
+
+    // Unfiltered: both observations present.
+    let all = collect(ViewFilters::default()).await;
+    assert!(
+        all.contains(&"s3-since-before".to_string()),
+        "unfiltered must include before: {all:?}"
+    );
+    assert!(
+        all.contains(&"s3-since-after".to_string()),
+        "unfiltered must include after: {all:?}"
+    );
+
+    // since=cutoff: only the after-cutoff observation.
+    let filtered = collect(ViewFilters {
+        since: Some(cutoff),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        filtered,
+        vec!["s3-since-after"],
+        "since filter must exclude before-cutoff; cutoff={cutoff:?}: {filtered:?}"
+    );
+
+    // since=future: nothing.
+    let future_cutoff = cutoff + chrono::Duration::hours(1);
+    let empty = collect(ViewFilters {
+        since: Some(future_cutoff),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        empty.is_empty(),
+        "future cutoff must return nothing: {empty:?}"
+    );
+}
+
+/// Verifies that the patient compartment filter on S3 returns the correct
+/// observations for each patient, and that the two sets are disjoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_patient_filter() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    if skip_if_disabled("test_minio_sof_patient_filter") {
+        return;
+    }
+
+    let harness = make_prefix_backend("sof-patient").await;
+    let backend = &harness.backend;
+    let t = tenant("sof-patient-tenant");
+
+    for resource in [
+        json!({ "resourceType": "Patient", "id": "s3-pt-1" }),
+        json!({ "resourceType": "Patient", "id": "s3-pt-2" }),
+    ] {
+        backend
+            .create(&t, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    for id in ["s3-obs-p1-a", "s3-obs-p1-b"] {
+        backend
+            .create(
+                &t,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": "Patient/s3-pt-1" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    for id in ["s3-obs-p2-a"] {
+        backend
+            .create(
+                &t,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": "Patient/s3-pt-2" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+    });
+
+    let runner = backend
+        .sof_runner()
+        .expect("S3 backend must provide a SOF runner");
+
+    let collect = |filters: ViewFilters| {
+        let runner = runner.clone();
+        let t = t.clone();
+        let view = view.clone();
+        async move {
+            let mut stream = runner.run_view(&t, view, filters).await.expect("run_view");
+            let mut ids = Vec::new();
+            while let Some(row) = stream.next().await {
+                ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());
+            }
+            ids.sort();
+            ids
+        }
+    };
+
+    let all = collect(ViewFilters::default()).await;
+    assert_eq!(
+        all,
+        vec!["s3-obs-p1-a", "s3-obs-p1-b", "s3-obs-p2-a"],
+        "unfiltered: {all:?}"
+    );
+
+    let p1 = collect(ViewFilters {
+        patient: vec!["Patient/s3-pt-1".to_string()],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        p1,
+        vec!["s3-obs-p1-a", "s3-obs-p1-b"],
+        "patient/s3-pt-1 filter: {p1:?}"
+    );
+
+    let p2 = collect(ViewFilters {
+        patient: vec!["Patient/s3-pt-2".to_string()],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(p2, vec!["s3-obs-p2-a"], "patient/s3-pt-2 filter: {p2:?}");
+
+    let p1_set: std::collections::HashSet<_> = p1.iter().collect();
+    let p2_set: std::collections::HashSet<_> = p2.iter().collect();
+    assert!(
+        p1_set.is_disjoint(&p2_set),
+        "patient filters must return non-overlapping observations"
+    );
+}
+
+/// `Patient/$export` on S3 decides membership with the compartment's own
+/// parameter set (#1122), read from the payload the same way the other
+/// backends do. A bare `S3Backend` carries no spec parameters (a composite
+/// starter or the server's `populate_base_search_registry` loads them), so
+/// the test loads the workspace spec file into its base registry first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_patient_export_follows_the_compartment_definition() {
+    if skip_if_disabled("test_minio_patient_export_follows_the_compartment_definition") {
+        return;
+    }
+    use helios_persistence::core::bulk_export::PatientExportProvider;
+    use helios_persistence::search::SearchParameterLoader;
+
+    let harness = make_prefix_backend("compartment").await;
+    let tenant = tenant("minio-tenant-compartment");
+    {
+        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let mut registry = harness.backend.tenant_registries().base().write();
+        for param in loader.load_embedded().unwrap() {
+            let _ = registry.register(param);
+        }
+        for param in loader.load_from_spec_file(&data_dir).unwrap() {
+            let _ = registry.register(param);
+        }
+    }
+
+    for resource in [
+        json!({"resourceType": "Patient", "id": "p1"}),
+        json!({"resourceType": "Patient", "id": "other"}),
+        json!({"resourceType": "Patient", "id": "linked",
+            "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+        json!({"resourceType": "AllergyIntolerance", "id": "recorded",
+            "patient": {"reference": "Patient/other"},
+            "recorder": {"reference": "Patient/p1"}}),
+        json!({"resourceType": "AllergyIntolerance", "id": "someone-elses",
+            "patient": {"reference": "Patient/other"}}),
+        json!({"resourceType": "Observation", "id": "performed", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "performer": [{"reference": "Patient/p1/_history/2"}]}),
+        json!({"resourceType": "Observation", "id": "about", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+        json!({"resourceType": "Observation", "id": "mentions-only", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "focus": [{"reference": "Patient/p1"}]}),
+    ] {
+        let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+        harness
+            .backend
+            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let request = ExportRequest::patient();
+    let ids = ["p1".to_string()];
+    let mut exported = std::collections::BTreeMap::new();
+    for resource_type in [
+        "AllergyIntolerance",
+        "Observation",
+        "Patient",
+        "Organization",
+    ] {
+        let batch = harness
+            .backend
+            .fetch_patient_compartment_batch(&tenant, &request, resource_type, &ids, None, 100)
+            .await
+            .unwrap();
+        let mut found: Vec<String> = batch
+            .lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        found.sort();
+        exported.insert(resource_type, found);
+    }
+    assert_eq!(exported["AllergyIntolerance"], ["recorded"]);
+    assert_eq!(exported["Observation"], ["about", "performed"]);
+    assert_eq!(exported["Patient"], ["linked", "p1"]);
+    assert!(exported["Organization"].is_empty());
+}
+
+/// #1556: a submitter identifier with a URL system (`system|value`, the form
+/// every real client sends) used to put `//` into every key of the submission,
+/// which MinIO refuses with `XMinioInvalidObjectName`; the segment is escaped now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_bulk_submit_accepts_a_url_system_submitter() {
+    if skip_if_disabled("test_minio_bulk_submit_accepts_a_url_system_submitter") {
+        return;
+    }
+
+    let harness = make_prefix_backend("bulk-submit-url-submitter").await;
+    let tenant = tenant("minio-tenant-submit-url");
+
+    let submission_id = SubmissionId::new(
+        "http://example.org|smoke",
+        format!("sub-{}", Uuid::new_v4()),
+    );
+    harness
+        .backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .expect("a URL-system submitter must be storable on S3");
+    let manifest = harness
+        .backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+    let results = harness
+        .backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            vec![NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("bs-{}", Uuid::new_v4())}),
+            )],
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results[0].outcome, BulkEntryOutcome::Success);
+
+    let prefix = format!(
+        "{}/{}/bulk/submit/http:%2F%2Fexample.org|smoke/{}/",
+        harness.prefix.trim_matches('/'),
+        tenant.tenant_id().as_str(),
+        submission_id.submission_id
+    );
+    let objects = harness
+        .sdk_client
+        .list_objects_v2()
+        .bucket(&harness.bucket)
+        .prefix(prefix)
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<String> = objects
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    assert!(
+        keys.iter().any(|k| k.ends_with("/state.json")),
+        "state object under the escaped prefix: {keys:?}"
+    );
+    assert!(keys.iter().all(|k| !k.contains("//")), "{keys:?}");
+}
+
+/// Measure one layout: objects written per resource, ingest time, and the
+/// time to sweep the whole type (export batches, which list the type prefix).
+async fn measure_layout(layout: KeyspaceLayout, n: usize) -> (f64, f64, f64) {
+    use futures::StreamExt;
+
+    let harness = make_prefix_backend_with_layout("perf-compare", layout).await;
+    let tenant = tenant(&format!("minio-tenant-perf-{layout:?}").to_lowercase());
+
+    let started = std::time::Instant::now();
+    futures::stream::iter(0..n)
+        .map(|i| {
+            let backend = &harness.backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .create(
+                        tenant,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":format!("perf-{i}")}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        })
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    let ingest_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    let keys = tenant_keys(&harness, tenant.tenant_id().as_str()).await;
+    let objects_per_resource = keys.len() as f64 / n as f64;
+
+    let request = ExportRequest::system();
+    let started = std::time::Instant::now();
+    let mut cursor: Option<String> = None;
+    let mut exported = 0;
+    loop {
+        let batch = harness
+            .backend
+            .fetch_export_batch(&tenant, &request, "Patient", cursor.as_deref(), 1000)
+            .await
+            .unwrap();
+        exported += batch.lines.len();
+        if batch.is_last {
+            break;
+        }
+        cursor = batch.next_cursor;
+    }
+    let sweep_ms = started.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(exported, n);
+    (objects_per_resource, ingest_ms, sweep_ms)
+}
+
+/// V1 vs V2 on the same MinIO: objects per write (4 vs 3) and the cost of a
+/// type sweep. Size with `HFS_S3_PERF_N` (default 2000; the issue's regime is
+/// 50000+). Run: `RUN_MINIO_S3_TESTS=1 HFS_S3_PERF_N=50000 cargo test -p
+/// helios-persistence --features s3 --test minio_s3_tests --
+/// --ignored --nocapture perf_compare`.
+#[tokio::test]
+#[ignore = "perf measurement; set HFS_S3_PERF_N to scale"]
+async fn test_minio_perf_compare_v1_v2_sweep_and_write_cost() {
+    if skip_if_disabled("test_minio_perf_compare_v1_v2_sweep_and_write_cost") {
+        return;
+    }
+    let n: usize = std::env::var("HFS_S3_PERF_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+
+    let (o1, ingest1, sweep1) = measure_layout(KeyspaceLayout::V1, n).await;
+    let (o2, ingest2, sweep2) = measure_layout(KeyspaceLayout::V2, n).await;
+    eprintln!("n={n}");
+    eprintln!("v1: objects/resource={o1:.2} ingest={ingest1:.0}ms sweep={sweep1:.0}ms");
+    eprintln!("v2: objects/resource={o2:.2} ingest={ingest2:.0}ms sweep={sweep2:.0}ms");
+
+    // Structural, not timing: V2 drops the system-history PUT.
+    assert!(
+        o2 < o1,
+        "v2 writes fewer objects per resource: {o1} vs {o2}"
     );
 }

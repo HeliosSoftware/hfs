@@ -19,6 +19,11 @@
   <div>
     <h1 class="page-head__title">{{ i18n.t("resources-heading") }}</h1>
     <p class="page-head__lede" id="resources-subtitle">{{ i18n.t("resources-lede") }}</p>
+    {# #1065: results may miss stored resources while the search index rebuilds,
+       #1125: or after the last rebuild left resources unindexed. #}
+    {% if let Some(activity) = rebuild %}
+    <p class="notice notice--warn" role="status" data-rebuild-notice data-rebuild-state="{{ self.rebuild_state(activity) }}">{{ self.rebuild_text(activity) }}</p>
+    {% endif %}
   </div>
   <div class="resources-create-wrap">
     <button type="button" class="btn btn--primary resources-create" id="resource-create"
@@ -53,11 +58,11 @@
              placeholder="{{ i18n.t("queries-rail-filter") }}"
              aria-label="{{ i18n.t("queries-rail-filter") }}">
     </div>
-    {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries) %}{% endcall %}
+    {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, rail_counts_approximate) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
     <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="type-rail-list">
-      {% call rail::rail_items(rail_entries) %}{% endcall %}
+      {% call rail::rail_items(rail_entries, rail_counts_approximate) %}{% endcall %}
     </div>
   </aside>
 
@@ -85,7 +90,7 @@
           <input type="text" id="nl-text" maxlength="500" autocomplete="off"
                  placeholder="{{ i18n.t("search-nl-placeholder") }}"
                  aria-label="{{ i18n.t("search-nl-label") }}">
-          <button class="btn btn--primary" type="button" id="nl-submit">
+          <button class="btn btn--primary btn--busy-slot" type="button" id="nl-submit">
             <span class="icon">{% include "icons/search.svg" %}</span>
             {{ i18n.t("action-search") }}
           </button>
@@ -140,6 +145,9 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 <div class="modal" id="resource-modal" hidden
      data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"
      data-msg-saved="{{ i18n.t("editor-saved") }}"
+     data-msg-save-target="{{ i18n.t_arg("editor-save-target", "target", "{target}".to_string()) }}"
+     data-msg-id-exists="{{ i18n.t_arg("editor-id-exists", "target", "{target}".to_string()) }}"
+     data-msg-id-exists-confirm="{{ i18n.t("editor-id-exists-confirm") }}"
      data-msg-load-error="{{ i18n.t("editor-load-error") }}"
      data-msg-save-blocked="{{ i18n.t("resources-save-blocked") }}"
      data-msg-save-invalid="{{ i18n.t("resources-save-invalid") }}">
@@ -151,16 +159,19 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
         <span class="modal__subject" id="resource-modal-subject"></span>
       </div>
       <div class="modal__tabs" role="tablist">
-        <button type="button" class="modal__tab modal__tab--on" data-modal-tab="edit" aria-selected="true">{{ i18n.t("resources-tab-edit") }}</button>
-        <button type="button" class="modal__tab" data-modal-tab="history" aria-selected="false">{{ i18n.t("resources-tab-history") }}</button>
+        <button type="button" role="tab" class="modal__tab modal__tab--on" data-modal-tab="edit" aria-selected="true">{{ i18n.t("resources-tab-edit") }}</button>
+        <button type="button" role="tab" class="modal__tab" data-modal-tab="history" aria-selected="false">{{ i18n.t("resources-tab-history") }}</button>
       </div>
       <div class="modal__actions">
-        <button type="button" class="btn" id="resource-delete">{{ i18n.t("editor-delete") }}</button>
-        <button type="button" class="btn btn--primary" id="resource-save">{{ i18n.t("editor-save") }}</button>
+        <button type="button" class="btn btn--busy-slot" id="resource-delete">{{ i18n.t("editor-delete") }}</button>
+        <button type="button" class="btn btn--primary btn--busy-slot" id="resource-save">{{ i18n.t("editor-save") }}</button>
         <button type="button" class="modal__x" data-modal-close aria-label="{{ i18n.t("action-cancel") }}">×</button>
       </div>
     </header>
     <div class="modal__status" id="resource-modal-status" role="status"></div>
+    <!-- #1649: the saved confirmation for assistive technology only; see
+         pages/editor.html. -->
+    <span class="visually-hidden" id="resource-modal-announce" role="status"></span>
     <div class="modal__body">
       <div data-modal-pane="edit">
         <div id="resource-editor-body"></div>
@@ -169,6 +180,11 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
         <div id="resource-history"
              data-msg-load-error="{{ i18n.t("history-load-error") }}"
              data-msg-current="{{ i18n.t("history-current") }}"
+             data-msg-op-create="{{ i18n.t("history-op-create") }}"
+             data-msg-op-update="{{ i18n.t("history-op-update") }}"
+             data-msg-op-patch="{{ i18n.t("history-op-patch") }}"
+             data-msg-op-delete="{{ i18n.t("history-op-delete") }}"
+             data-msg-op-version="{{ i18n.t("history-op-version") }}"
              data-msg-not-found="{{ i18n.t("history-not-found") }}">
           <div class="history__split">
             <aside class="card history__rail">
@@ -180,9 +196,9 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
             </aside>
             <div>
               <div class="history__controls" id="resource-history-controls" hidden>
-                <label class="history__select"><span>{{ i18n.t("history-from") }}</span><select id="resource-history-from"></select></label>
+                <div class="history__select"><span id="resource-history-from-label">{{ i18n.t("history-from") }}</span><select id="resource-history-from" aria-labelledby="resource-history-from-label" data-combobox-select></select></div>
                 <span class="history__arrow">→</span>
-                <label class="history__select"><span>{{ i18n.t("history-to") }}</span><select id="resource-history-to"></select></label>
+                <div class="history__select"><span id="resource-history-to-label">{{ i18n.t("history-to") }}</span><select id="resource-history-to" aria-labelledby="resource-history-to-label" data-combobox-select></select></div>
                 <label class="history__meta-toggle"><input type="checkbox" id="resource-history-metadata"> {{ i18n.t("history-show-metadata") }}</label>
               </div>
               <div id="resource-history-diff">
@@ -197,8 +213,28 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 </div>
 
 <script src="/ui/assets/fhir-search-value.js" defer></script>
-<script src="/ui/assets/saved-queries.js" defer></script>
+<script src="/ui/assets/typeahead.js" defer></script>
+<script src="/ui/assets/combobox.js" defer></script>
+<script src="/ui/assets/search-builder.js" defer></script>
+<script src="/ui/assets/row-navigation.js" defer></script>
 {% if nl.configured %}<script src="/ui/assets/nl-search.js" defer></script>{% endif %}
 <script src="/ui/assets/resource-filter.js" defer></script>
+<!-- The resource editor's JSON pane is the shared code editor (#1756), paired
+     with the guided form like View Definitions' (sql-view-definitions.html):
+     the vendored CodeMirror 6 bundle loads before the mount helper, which
+     loads before the guided form's shared loop, which loads before the
+     editor/form pairing, which loads before resource-json-editor.js — each
+     reads globals (window.HfsCodeMirror, window.HfsCodeEditor,
+     window.HfsEditorForm, window.HfsEditorPair) when it runs. They are loaded
+     here, not from base.html: no other page drives this pairing through
+     them. editor-add.js (#1239) loads right before editor-form.js, which
+     reads window.HfsEditorAdd when it mounts. -->
+<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
+<script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
+<script src="/ui/assets/editor-form.js" defer></script>
+<script src="/ui/assets/editor-pair.js" defer></script>
+<script src="/ui/assets/resource-json-editor.js" defer></script>
+<script src="/ui/assets/save-target.js" defer></script>
 <script src="/ui/assets/resources.js" defer></script>
 {% endblock %}

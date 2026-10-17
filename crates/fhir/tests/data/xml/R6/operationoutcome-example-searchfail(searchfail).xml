@@ -12,6 +12,7 @@
       <p>The "name" parameter has the modifier "exact" which is not supported by this server</p>
     </div>
   </text>
+  <!-- <location value="http.name:exact"/> -->
   <issue>
     <severity value="fatal"/>
     <code value="code-invalid"/>

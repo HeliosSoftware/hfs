@@ -52,7 +52,9 @@
       <text value="Left forearm"/>
   </bodySite> -->
   <bodyStructure>
-    <reference/>
+    <reference>
+      <reference value="BodyStructure/skin-patch"/>
+    </reference>
   </bodyStructure>
   <complication>
     <concept>

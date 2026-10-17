@@ -83,7 +83,7 @@ use crate::{EvaluationResult, evaluate_expression};
 use helios_fhir::{FhirResource, FhirVersion};
 
 #[derive(Parser, Debug)]
-#[command(name = "fhirpath-cli")]
+#[command(name = "fhirpath-cli", version)]
 #[command(about = "FHIRPath CLI tool for evaluating expressions against FHIR resources")]
 #[command(
     long_about = "Evaluate FHIRPath expressions against FHIR resources with support for context expressions, variables, and debug output"
@@ -162,6 +162,7 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
 
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
 
     // Load variables if provided
     if let Some(vars_path) = &args.variables {
@@ -193,6 +194,7 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
 
         // Create a new context with the context result
         let mut scoped_context = EvaluationContext::new(vec![]);
+        scoped_context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
         // Set the context result as the root
         let context_items = match context_result {
             EvaluationResult::Collection { items, .. } => items,
@@ -224,13 +226,9 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
 
 /// Handle parse debug output
 fn handle_parse_debug(args: &Args) -> FhirPathResult<()> {
-    use chumsky::Parser as ChumskyParser;
-
     // Parse the expression
-    let parsed = crate::parser::parser()
-        .parse(args.expression.as_str())
-        .into_result()
-        .map_err(|e| FhirPathError::ParseError(format!("{:?}", e)))?;
+    let parsed =
+        crate::parse_expression(args.expression.as_str()).map_err(FhirPathError::ParseError)?;
 
     let output = if args.parse_debug_tree {
         // Generate JSON debug tree

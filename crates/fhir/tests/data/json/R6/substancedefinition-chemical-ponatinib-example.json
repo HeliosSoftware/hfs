@@ -37,6 +37,61 @@
     ]
   },
   "description": "Ponatinib hydrochloride — a small-molecule tyrosine kinase inhibitor (TKI) used in the treatment of chronic myeloid leukemia (CML) and Philadelphia chromosome-positive acute lymphoblastic leukemia (Ph+ ALL). Hydrochloride salt of ponatinib.",
+  "moiety": [
+    {
+      "role": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/MoietyRole",
+            "code": "active-moiety",
+            "display": "Active moiety"
+          }
+        ]
+      },
+      "name": "Ponatinib",
+      "molecularFormula": "C29H27F3N6O",
+      "amountQuantity": {
+        "value": 532.57,
+        "unit": "g/mol"
+      }
+    },
+    {
+      "role": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/MoietyRole",
+            "code": "counter-ion",
+            "display": "Counter-ion (salt)"
+          }
+        ]
+      },
+      "name": "Hydrochloride",
+      "molecularFormula": "HCl",
+      "amountQuantity": {
+        "value": 36.46,
+        "unit": "g/mol"
+      }
+    }
+  ],
+  "molecularWeight": [
+    {
+      "type": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/WeightType",
+            "code": "exact",
+            "display": "Exact"
+          }
+        ]
+      },
+      "amount": {
+        "value": 569.04,
+        "unit": "g/mol",
+        "system": "http://unitsofmeasure.org",
+        "code": "g/mol"
+      }
+    }
+  ],
   "code": [
     {
       "code": {
@@ -88,53 +143,6 @@
       ]
     }
   ],
-  "molecularWeight": [
-    {
-      "type": {
-        "coding": [
-          {
-            "system": "http://example.europa.eu/fhir/WeightType",
-            "code": "exact",
-            "display": "Exact"
-          }
-        ]
-      },
-      "amount": {
-        "value": 569.04,
-        "unit": "g/mol",
-        "system": "http://unitsofmeasure.org",
-        "code": "g/mol"
-      }
-    }
-  ],
-  "moiety": [
-    {
-      "role": {
-        "coding": [
-          {
-            "system": "http://example.europa.eu/fhir/MoietyRole",
-            "code": "active-moiety",
-            "display": "Active moiety"
-          }
-        ]
-      },
-      "name": "Ponatinib",
-      "molecularFormula": "C29H27F3N6O"
-    },
-    {
-      "role": {
-        "coding": [
-          {
-            "system": "http://example.europa.eu/fhir/MoietyRole",
-            "code": "counter-ion",
-            "display": "Counter-ion (salt)"
-          }
-        ]
-      },
-      "name": "Hydrochloride",
-      "molecularFormula": "HCl"
-    }
-  ],
   "relationship": [
     {
       "substanceDefinitionCodeableConcept": {
@@ -155,14 +163,11 @@
           }
         ]
       },
-      "interaction": {
-        "coding": [
-          {
-            "system": "http://hl7.org/fhir/substance-interaction-type",
-            "code": "inhibition",
-            "display": "Inhibition"
-          }
-        ]
+      "amountQuantity": {
+        "value": 0.37,
+        "unit": "nM",
+        "system": "http://unitsofmeasure.org",
+        "code": "nmol/L"
       },
       "measurementType": {
         "coding": [
@@ -173,11 +178,14 @@
           }
         ]
       },
-      "amountQuantity": {
-        "value": 0.37,
-        "unit": "nM",
-        "system": "http://unitsofmeasure.org",
-        "code": "nmol/L"
+      "interaction": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/substance-interaction-type",
+            "code": "inhibition",
+            "display": "Inhibition"
+          }
+        ]
       }
     }
   ],

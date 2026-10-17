@@ -44,7 +44,10 @@ HFS_UI_ENABLED=false cargo run -p helios-hfs
 The mount is `#[cfg(feature = "ui")]` plus the runtime `config.ui_enabled` check
 in `attach_ui` (`crates/hfs/src/main.rs`). FHIR version features forward through
 `helios-ui?/R4|R4B|R5|R6`, so the UI's viewers cover exactly the versions the
-server was built with.
+server was built with. helios-ui's own `R5`/`R6` also enable its `R4B`, and
+every version feature forwards to `helios-persistence`, mirroring helios-audit's
+BALP baseline, so the crate's total `FhirVersion` matches always have an arm for
+every variant helios-fhir is built with (#2051).
 
 ## Routes (`crates/ui/src/lib.rs`)
 
@@ -67,6 +70,9 @@ server was built with.
 | `/ui/status` | GET | Reference implementation of the fragment-vs-full-page pattern |
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice, redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector |
+| `/ui/login` | GET | Interactive login (#1449): starts Authorization Code + PKCE, redirects to the IdP. 404 unless `HFS_UI_LOGIN_CLIENT_ID` is set |
+| `/ui/callback` | GET | The IdP's redirect back: verifies `state`, exchanges the code, sets the `hfs_session` cookie |
+| `/ui/logout` | POST | Ends the session (and the IdP's, via end-session); the account menu's Sign out form posts here |
 | `/ui/assets/*` | GET | Embedded htmx, CSS, JS, fonts, logo |
 
 The router `fallback_service` is the FHIR app, so anything not under `/ui` falls
@@ -85,7 +91,21 @@ through to the normal REST surface.
   `{% include %}`d into pages so the first render and the swap emit identical markup.
 - `templates/icons/*.svg` — Figma exports, fills normalized to `currentColor`, inlined.
 - `assets/` — `htmx.min.js` (pinned), `app.css`, `fonts/`, `logo.png`, the
-  shared `busy.js` (#679, `window.hfsBusy`), the vendored CodeMirror 6 bundle
+  shared `busy.js` (#679, `window.hfsBusy`), the shared locale number
+  formatter `number.js` (`window.HfsNumber.format(n)` — every figure a
+  script writes goes through it; server-side the twin is `i18n.num(n)` /
+  `i18n.dec(x, digits)` in templates, and numbers passed to `t_arg*` are
+  grouped by the Fluent formatter — pass identifiers as strings), the shared
+  unsaved-changes
+  tracker `unsaved.js` (`window.HfsUnsaved.track({ root, form?, read?,
+  cue? })`, #1240 — one dirty flag per form, the `.tag--unsaved` pill, the
+  `beforeunload` guard, and `confirmDiscard(scope)` for in-page closes —
+  a Promise of a boolean, asked through `HfsConfirm`; no storage), the
+  shared in-page confirmation `confirm.js` (`window.HfsConfirm.ask(message,
+  { danger? })` → Promise of a boolean, #1667 — every "are you sure?",
+  including `hx-confirm`, goes through it; never call `window.confirm`, and
+  answer it in e2e with `acceptConfirm`/`dismissConfirm` from
+  `e2e/pages/fixtures.ts`), the vendored CodeMirror 6 bundle
   (`vendor/codemirror.bundle.js`, `window.HfsCodeMirror`) with its shared
   mount helper `code-editor.js` (`window.HfsCodeEditor`, #838, also the
   shared JSON token-color preset `jsonHighlight()`, #840), the shared
@@ -170,7 +190,8 @@ what to show in place of results.
   applies the one fix under the cursor, or opens the panel when several
   apply (F8/Ctrl-Shift-M reach the panel too, `lintKeymap`); every fix is one
   undoable transaction. Saving with at least one uncorrected error (Save,
-  not Duplicate) pops a plural-correct `window.confirm`. To regenerate the
+  not Duplicate) asks a plural-correct question through the shared in-page
+  `HfsConfirm` dialog. To regenerate the
   vendored bundle after touching `entry.js`, see `crates/ui/vendor/
   codemirror/README.md`'s own ritual — it is never run by `cargo build` or CI.
 
@@ -231,6 +252,7 @@ The UI reads no configuration of its own; `hfs` passes it in at `mount()`.
 | `HFS_NL_SEARCH_API_KEY` | Whether NL search is configured vs. showing its setup state |
 | `HFS_NL_SEARCH_MODEL` | Shown in the setup state |
 | `HFS_OUTBOUND_BEARER_TOKEN` | Credentials for the UI's self-call (below) |
+| `HFS_UI_LOGIN_CLIENT_ID` | Enables the browser sign-in (#1449). With auth on and this unset, browser-originated FHIR calls are refused and the shell shows a bearer-only notice on every page (#1560); the Tenants and Import routes, whose handlers act on storage directly, answer `401` with that notice instead of acting for an anonymous caller (#1619) |
 | `HFS_DEFAULT_TENANT`, `HFS_DEFAULT_FHIR_VERSION` | Defaults for the sidebar selectors |
 
 ### Conformance data comes over HTTP, from the server itself
@@ -256,7 +278,15 @@ the full semantics. The server renders each rail's "Recently used" group
 from `recent`; Compartments is the one exception — it remembers only `last`,
 no group, since its 4-5 definitions would make one noise. With no settings
 store configured there is nothing to render or restore, and every rail opens
-on its page default. `resource-filter.js` now only owns a rail's tooltip and
+on its page default. A rail's filter box applies to the "Recently used" group
+as well as the list (a term matching nothing hides the group and its divider):
+the SQL and Search Parameters rails filter server-side and swap the list and
+group via htmx as you type (View Definitions also swaps its pagination, and the
+SQL rails their "not in the filtered list" notice; Enter still submits the GET
+form). The SQL rails send `X-Rail-Filter` while typing so the echoed selection
+is never recorded as a pick, and replace the URL so reload keeps the filter,
+while the Resources/Search type rail filters client-side in `search-builder.js`.
+`resource-filter.js` now only owns a rail's tooltip and
 scroll-to-selection on arrival — recents are server-rendered, not client-side.
 
 ### i18n
@@ -321,6 +351,9 @@ across every storage backend.
   on — killing the UI — by `--all-features`, the selection that builds the
   released binaries (#975). Never add a negative feature here.
 - When the UI is not served (feature off, or `HFS_UI_ENABLED=false`), `/ui`
-  returns **404 + OperationOutcome** from `ui_absent_routes`. It must never fall
-  through to the FHIR router, which reads `ui` as a resource type and answers
-  `200` with an empty searchset.
+  returns **404 + OperationOutcome** from `ui_absent_routes`, whose diagnostics
+  say the UI is absent and why. Before #989 a fall-through to the FHIR router
+  read `ui` as a resource type and answered `200` with an empty searchset; the
+  router's resource-type gate (`helios_rest::middleware::resource_type`) now
+  refuses any unknown type with `404` + `not-supported`, so the stubs exist for
+  the specific message, not for the status.

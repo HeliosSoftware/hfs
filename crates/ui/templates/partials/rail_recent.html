@@ -1,6 +1,6 @@
 <!--
   Server-rendered "Recently used" group (#754/#755), shared by every type
-  rail (Resources, Search, Saved Queries, Search Parameters) and the SQL
+  rail (Resources, Search, Search Parameters) and the SQL
   rails too.
 
   `entries` is already resolved against the rail's own live items
@@ -9,22 +9,29 @@
   (`a.filter-rail__item[data-type][data-full-name][title]`, label,
   `aria-current`, plus whichever of live count or SQL-rail meta that page's
   list renders) — CSS, the tooltip/reveal script (`resource-filter.js`), and,
-  on Resources/Search/Saved Queries, `saved-queries.js`'s in-page repaint
+  on Resources/Search, `search-builder.js`'s in-page repaint
   after a rail click, all treat a recent exactly like any other rail item.
   `meta` (the SQL rails' `ViewDefinition.resource`/`Library.status` column)
   and `count` (the type rails' live count, `partials/type_rail.html`) are
   mutually exclusive in practice — a page's `ResolvedRailEntry`s only ever
   populate the one its own list uses — but both render conditionally so the
-  same macro serves every rail unchanged.
+  same macro serves every rail unchanged. `approximate` (#1078) marks the
+  counts as counted from recent writes, exactly as `partials/type_rail.html`
+  renders them; rails without live counts pass `false`.
 
   `rail_page` and `max_recent` are the only values a client script needs to
   write this page's own `rails.<page>` record back — the single source for
   both is `rail_state::RailPage::key`/`rail_state::MAX_RECENT`, never
-  redeclared in JS. The container stays present-but-`hidden` with no entries
+  redeclared in JS. The group follows its rail's filter box (#1275): each
+  page narrows `entries` server-side with the same needle as its list
+  (`rail_state::retain_matching_recents`), or Resources/Search hide items
+  client-side; a filter matching nothing leaves it empty, hence `hidden`.
+  The htmx-filtered rails re-fetch it by id (`hx-select-oob`), which is why
+  the container is always emitted. The container stays present-but-`hidden` with no entries
   (no store configured renders the same way), so CSS never has to key off
   its absence.
 -->
-{% macro group(id, rail_list_id, rail_page, max_recent, heading, entries) %}
+{% macro group(id, rail_list_id, rail_page, max_recent, heading, entries, approximate) %}
 <div class="filter-rail__group" id="{{ id }}"
      data-rail-page="{{ rail_page }}" data-max-recent="{{ max_recent }}"
      data-rail-list="{{ rail_list_id }}"{% if entries.is_empty() %} hidden{% endif %}>
@@ -34,7 +41,7 @@
      href="{{ e.href }}" title="{{ e.label }}"{% if e.current %} aria-current="true"{% endif %}>
     <span class="filter-rail__label">{{ e.label }}</span>
     {% if let Some(m) = e.meta %}<span class="filter-rail__meta">{{ m }}</span>{% endif %}
-    {% if let Some(c) = e.count %}<span class="count">{{ c }}</span>{% endif %}
+    {% if let Some(c) = e.count %}{% if approximate %}<span class="count count--approximate" title="{{ i18n.t("rail-count-approximate") }}">≈{{ c }}<span class="visually-hidden"> {{ i18n.t("rail-count-approximate") }}</span></span>{% else %}<span class="count">{{ c }}</span>{% endif %}{% endif %}
   </a>
   {% endfor %}
 </div>

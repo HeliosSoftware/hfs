@@ -8,6 +8,10 @@
     "display": "Ambulatory/Outpatient"
   },
   "dateTime": "2024-10-23T00:00:00Z",
+  "requester": {
+    "reference": "Practitioner/example",
+    "display": " Physician"
+  },
   "oralDiet": {
     "type": [
       {
@@ -31,17 +35,19 @@
     ]
   },
   "enteralFormula": {
-    "type": {
-      "concept": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "443111000124101",
-            "display": "High protein formula"
-          }
-        ]
+    "type": [
+      {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "443111000124101",
+              "display": "High protein formula"
+            }
+          ]
+        }
       }
-    },
+    ],
     "caloricDensity": {
       "value": 750,
       "unit": "kcal",
@@ -61,6 +67,20 @@
     ],
     "administration": [
       {
+        "schedule": {
+          "timing": [
+            {
+              "repeat": {
+                "frequency": 1,
+                "period": 1,
+                "periodUnit": "d",
+                "timeOfDay": [
+                  "19:00:00"
+                ]
+              }
+            }
+          ]
+        },
         "quantity": {
           "value": 750,
           "unit": "mL",

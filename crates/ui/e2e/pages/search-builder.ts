@@ -1,7 +1,8 @@
 // The shared FHIR query builder (partials/search-builder.html), used on the
-// Queries, Search, and Resources pages: an editable GET URL, Run/Save intents,
+// Search and Resources pages: an editable GET URL and Run,
 // condition/include/control rows, the Recent disclosure, and the results card.
 import type { Page, Locator } from "@playwright/test";
+import { chooseFixed, fixedTrigger } from "./fixed-select";
 
 export class SearchBuilder {
   constructor(readonly page: Page) {}
@@ -18,12 +19,15 @@ export class SearchBuilder {
   get runButton(): Locator {
     return this.page.locator("[data-intent='run']");
   }
-  get saveButton(): Locator {
-    return this.page.locator("[data-intent='save']");
-  }
-  get nameInput(): Locator {
-    return this.page.locator("#saved-query-form input[name=name]");
-  }
+  get status(): Locator { return this.page.locator("#query-search-status"); }
+  get cancel(): Locator { return this.page.locator("#query-search-cancel"); }
+  get elapsed(): Locator { return this.page.locator("#query-search-elapsed"); }
+  get slow(): Locator { return this.page.locator("#query-search-slow"); }
+  get keepWaiting(): Locator { return this.page.locator("#query-search-keep-waiting"); }
+  get sort(): Locator { return this.page.locator("#query-results-sort"); }
+  get sortTrigger(): Locator { return fixedTrigger(this.sort); }
+  async chooseSort(value: string): Promise<void> { await chooseFixed(this.sort, value); }
+
   get error(): Locator {
     return this.page.locator("#search-error");
   }
@@ -46,11 +50,40 @@ export class SearchBuilder {
   get paramOptions(): Locator {
     return this.page.locator("#param-options option");
   }
+  /** The open typeahead listbox(es) appended to `body` by `typeahead.js`. */
+  get typeaheadListboxes(): Locator {
+    return this.page.locator("body > .typeahead__listbox");
+  }
+  get typeaheadVisibleListbox(): Locator {
+    return this.page.locator("body > .typeahead__listbox:not([hidden])");
+  }
+  get typeaheadOptions(): Locator {
+    return this.typeaheadVisibleListbox.locator(".typeahead__option");
+  }
+  get typeaheadOptionValues(): Locator {
+    return this.typeaheadVisibleListbox.locator(".typeahead__value");
+  }
+  get typeaheadComboboxes(): Locator {
+    return this.page.locator("#builder-sections input[role='combobox']");
+  }
   get chainRows(): Locator {
     return this.page.locator("#builder-conditions .builder-row--chain");
   }
   get hasRows(): Locator {
     return this.page.locator("#builder-conditions .builder-row--has");
+  }
+  /** The inline "not a search parameter" message of a flagged row. */
+  rowError(row: Locator): Locator {
+    return row.locator(":scope > .builder-row__error");
+  }
+  get flaggedInputs(): Locator {
+    return this.page.locator("#builder-conditions [aria-invalid='true']");
+  }
+  get plainText(): Locator {
+    return this.page.locator("#query-plain-text");
+  }
+  get plainUnknown(): Locator {
+    return this.page.locator("#query-plain-unknown");
   }
   drillButton(row: Locator): Locator {
     return row.locator("[data-chain-from]");
@@ -85,6 +118,9 @@ export class SearchResults {
   get meta(): Locator {
     return this.page.locator("#query-results-meta");
   }
+  get previous(): Locator {
+    return this.page.locator("#query-results-previous");
+  }
   get rows(): Locator {
     return this.page.locator("#query-results-body tr");
   }
@@ -103,6 +139,22 @@ export class SearchResults {
 
   async waitShown(): Promise<void> {
     await this.card.waitFor({ state: "visible" });
+  }
+
+  async waitDone(): Promise<void> {
+    await this.page.locator("#query-search-status").waitFor({ state: "hidden" });
+    await this.card.waitFor({ state: "visible" });
+  }
+
+  /** Cancel restores diagnostics as well as the previous successful page.
+   * Keep this distinct from visibleState: a failed page request preserves the
+   * page while deliberately changing its diagnostic. */
+  async stableState() {
+    return {
+      ...(await this.visibleState()),
+      error: (await this.error.textContent()) || "",
+      errorVisible: await this.error.isVisible(),
+    };
   }
 
   async visibleState(): Promise<{

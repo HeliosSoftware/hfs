@@ -1,11 +1,16 @@
 <!--
-  The editor body. Re-rendered whole on every structural mutation: the server
-  applies the edit, re-validates, and hands back this fragment.
+  The editor body. Rendered whole once per document (first load, or the
+  fallback re-render when no `editor-pair.js` is available): after that the
+  guided-form card is swapped alone by `editor-form.js`, and the JSON pane is
+  never replaced — it is the live editor.
 
   Following Brett's Resource Editor, the JSON and the guided form sit side by
-  side over one document — not a toggle. `doc` is the state; every control posts
-  it back and the server hands back a new one, so a key we never render is also
-  a key we never destroy.
+  side over one document — not a toggle. The JSON pane is always editable: a
+  CodeMirror editor mounted over `#editor-source` by `resource-json-editor.js`
+  (the plain textarea, still visible and still synced, when the bundle does
+  not load). `doc` is the state; every control posts it back and the server
+  hands back a new one, so a key we never render is also a key we never
+  destroy.
 
   The hidden state and the guided-form card each live in their own partial
   (`editor-hidden-form.html`, `editor-form-pane.html`) so `pane=form` (#843)
@@ -23,33 +28,34 @@
 </div>
 {% else %}
 
-<div class="editor__grid">
+<div class="editor__grid" data-msg-json-invalid="{{ i18n.t("vd-form-invalid-chip") }}">
   <!-- ============ LEFT: JSON ============ -->
-  <section class="card editor-json" data-json-view-scope>
+  <section class="card editor-json">
     <div class="card-head">
       <h3><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("editor-view-json") }}</h3>
+      <!-- Revealed by resource-json-editor.js once the code editor mounts. -->
       <div class="card-head__tools card-head__tools--start">
-        <button type="button" class="editor-json__act" data-json-fold="all" title="{{ i18n.t("editor-collapse-all") }}">{{ i18n.t("editor-collapse-all") }}</button>
-        <button type="button" class="editor-json__act" data-json-fold="none" title="{{ i18n.t("editor-expand-all") }}">{{ i18n.t("editor-expand-all") }}</button>
+        <button type="button" class="editor-json__act" data-editor-fold="all" hidden title="{{ i18n.t("editor-collapse-all") }}">{{ i18n.t("editor-collapse-all") }}</button>
+        <button type="button" class="editor-json__act" data-editor-fold="none" hidden title="{{ i18n.t("editor-expand-all") }}">{{ i18n.t("editor-expand-all") }}</button>
       </div>
-      <div class="card-head__tools">
-        <button type="button" class="editor-json__act" id="editor-json-edit">{{ i18n.t("editor-edit-raw") }}</button>
+      <div class="card-head__tools card-head__tools--wrap">
+        <span class="editor-format__status" role="status" data-editor-format-status
+              data-msg-invalid="{{ i18n.t("editor-format-invalid") }}"></span>
+        <span class="editor-format__hint" aria-hidden="true">Shift+Alt+F</span>
+        <button type="button" class="editor-json__act" data-editor-format hidden
+                title="{{ i18n.t("editor-format-title") }}" aria-keyshortcuts="Shift+Alt+F">{{ i18n.t("editor-format") }}</button>
       </div>
     </div>
 
     <!--
-      Line-numbered, syntax-highlighted, foldable — rendered server-side (a
-      textarea cannot number lines or fold objects). Every object and array
-      carries a fold arrow; the gutter counts lines like a code editor.
+      The document. `resource-json-editor.js` mounts CodeMirror over this
+      textarea (line numbers, highlighting, folding); without the bundle it
+      stays as it is, visible, and `editor-pair.js` keeps it in sync with the
+      guided form all the same. It is also the one place the page reads the
+      document from.
     -->
-    {% include "partials/json-view.html" %}
-
-    <!-- Raw editing, one toggle away. On apply it re-parses and the form
-         re-renders from it. -->
-    <div class="editor-json__raw" id="editor-json-raw" hidden>
-      <textarea class="editor__source" id="editor-source" spellcheck="false">{{ pretty }}</textarea>
-      <p class="editor__source-hint">{{ i18n.t("editor-source-hint") }}</p>
-    </div>
+    <textarea class="editor-json__source" id="editor-source" spellcheck="false" aria-label="{{ i18n.t("editor-view-json") }}">{{ pretty }}</textarea>
+    <p class="editor__source-hint">{{ i18n.t("editor-source-hint") }}</p>
   </section>
 
   <!-- ============ RIGHT: Guided form ============ -->

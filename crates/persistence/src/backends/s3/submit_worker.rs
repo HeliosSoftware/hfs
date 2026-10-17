@@ -22,6 +22,8 @@
 //! `If-Match` fails with `PreconditionFailed` if anything changed in between.
 //! That is a genuine CAS, so two workers cannot both claim a manifest and a
 //! zombie worker's write is refused once its `fencing_token` no longer matches.
+//! A `409 ConditionalRequestConflict` (a conflicting write in flight on the same
+//! key) is retried like a lost race (#2047).
 //!
 //! What S3 does *not* give is a query. Three lookups the worker and REST layer
 //! need are cross-tenant and cannot scan tenant prefixes:
@@ -70,6 +72,7 @@ use super::backend::{S3Backend, TenantLocation};
 use super::client::S3ClientError;
 use super::keyspace::submit_index_object_id;
 use super::models::{SubmissionManifestState, SubmitIndexEntry};
+use super::user_settings::retry_backoff;
 
 /// Index namespace holding one entry per manifest awaiting or under a lease.
 const QUEUE_NAMESPACE: &str = "queue";
@@ -83,10 +86,12 @@ const REGISTRY_NAMESPACE: &str = "submissions";
 /// that keeps losing the head of the queue from starving.
 const CLAIM_CANDIDATES: usize = 16;
 
-/// Attempts at a compare-and-swap that lost its race. Counts total attempts.
-const CAS_ATTEMPTS: usize = 5;
+/// Attempts at a compare-and-swap that lost its race (`412`) or met a
+/// conflicting in-flight write (`409`, #2047), with a jittered backoff between
+/// attempts. Counts total attempts.
+pub(super) const CAS_ATTEMPTS: usize = 5;
 
-fn internal_error(message: impl Into<String>) -> StorageError {
+pub(super) fn internal_error(message: impl Into<String>) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "s3".to_string(),
         message: message.into(),
@@ -322,7 +327,7 @@ impl S3Backend {
     /// One `GetObject` returns body and ETag from the same snapshot; a
     /// `HeadObject` + `GetObject` pair could straddle a concurrent write and
     /// pair one generation's state with another's ETag.
-    async fn load_manifest_for_cas(
+    pub(super) async fn load_manifest_for_cas(
         &self,
         location: &TenantLocation,
         id: &SubmissionId,
@@ -339,8 +344,10 @@ impl S3Backend {
     }
 
     /// Writes a manifest state back only if it has not changed since it was
-    /// read. `Ok(false)` means the compare-and-swap lost.
-    async fn save_manifest_if_unchanged(
+    /// read. `Ok(false)` means the compare-and-swap lost (`412`) or S3 reported a
+    /// conflicting conditional write in flight (`409`, #2047); nothing was
+    /// written either way, so the caller re-reads and retries.
+    pub(super) async fn save_manifest_if_unchanged(
         &self,
         location: &TenantLocation,
         id: &SubmissionId,
@@ -373,6 +380,15 @@ impl S3Backend {
         {
             Ok(_) => Ok(true),
             Err(S3ClientError::PreconditionFailed) => Ok(false),
+            Err(S3ClientError::ConditionalConflict(message)) => {
+                tracing::debug!(
+                    key = %key,
+                    %message,
+                    "manifest-state write met a conflicting concurrent write (HTTP 409); \
+                     retrying as a lost race"
+                );
+                Ok(false)
+            }
             Err(e) => Err(self.map_client_error(e)),
         }
     }
@@ -387,11 +403,34 @@ impl S3Backend {
     where
         F: Fn(&mut SubmissionManifestState),
     {
+        self.fenced_mutate_if(lease, |_| true, mutate).await
+    }
+
+    /// [`Self::fenced_mutate`] with an extra `precondition` on the stored state,
+    /// failing with `LeaseLost` when it does not hold.
+    ///
+    /// The two writes that settle a manifest's outcome require it to still be
+    /// `processing`: `abort_submission` moves in-flight manifests to `failed`,
+    /// and a worker that finishes just afterwards must not rewrite that verdict
+    /// (#968).
+    async fn fenced_mutate_if<P, F>(
+        &self,
+        lease: &ManifestLease,
+        precondition: P,
+        mutate: F,
+    ) -> Result<(), LeaseError>
+    where
+        P: Fn(&SubmissionManifestState) -> bool,
+        F: Fn(&mut SubmissionManifestState),
+    {
         let location = self
             .tenant_location(&lease.tenant)
             .map_err(LeaseError::Storage)?;
 
-        for _ in 0..CAS_ATTEMPTS {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(retry_backoff(attempt - 1)).await;
+            }
             let loaded = self
                 .load_manifest_for_cas(&location, &lease.submission_id, &lease.manifest_id)
                 .await
@@ -399,7 +438,7 @@ impl S3Backend {
             let Some((mut state, etag)) = loaded else {
                 return Err(lease_lost(lease));
             };
-            if !holds_lease(&state, lease) {
+            if !holds_lease(&state, lease) || !precondition(&state) {
                 return Err(lease_lost(lease));
             }
 
@@ -441,7 +480,10 @@ impl S3Backend {
             .keyspace
             .submit_state_key(&id.submitter, &id.submission_id);
 
-        for _ in 0..CAS_ATTEMPTS {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(retry_backoff(attempt - 1)).await;
+            }
             let Some((mut state, metadata)) = self
                 .get_json_object::<super::models::SubmissionState>(&location.bucket, &key)
                 .await?
@@ -469,7 +511,9 @@ impl S3Backend {
                 .await
             {
                 Ok(_) => return Ok(outcome),
-                Err(S3ClientError::PreconditionFailed) => continue,
+                Err(S3ClientError::PreconditionFailed | S3ClientError::ConditionalConflict(_)) => {
+                    continue;
+                }
                 Err(e) => return Err(self.map_client_error(e)),
             }
         }
@@ -484,6 +528,12 @@ impl S3Backend {
 fn holds_lease(state: &SubmissionManifestState, lease: &ManifestLease) -> bool {
     state.worker_id.as_deref() == Some(lease.worker_id.as_str())
         && state.fencing_token == lease.fencing_token
+}
+
+/// Whether the manifest is still in flight — the precondition on the writes that
+/// settle its outcome, so an abort's verdict is not overwritten (#968).
+fn is_processing(state: &SubmissionManifestState) -> bool {
+    state.manifest.status == ManifestStatus::Processing
 }
 
 #[async_trait]
@@ -530,10 +580,13 @@ impl SubmitClaimStrategy for S3Backend {
             };
 
             // Eligible: never started, or held by a worker that stopped
-            // heartbeating. Anything terminal leaves the queue instead.
+            // heartbeating. A `processing` manifest with no lease stays put: a
+            // synchronous `process_entries` caller is ingesting it right now,
+            // having promoted it without taking a lease (#1530). Anything
+            // terminal leaves the queue instead.
             let eligible = match state.manifest.status {
                 ManifestStatus::Pending => true,
-                ManifestStatus::Processing => state.lease_expiry.is_none_or(|expiry| expiry < now),
+                ManifestStatus::Processing => state.lease_expiry.is_some_and(|expiry| expiry < now),
                 ManifestStatus::Completed | ManifestStatus::Failed | ManifestStatus::Replaced => {
                     self.dequeue_manifest(&tenant, &id, &manifest_id).await?;
                     false
@@ -565,20 +618,40 @@ impl SubmitClaimStrategy for S3Backend {
             }
 
             let new_token = state.fencing_token + 1;
+            let previous_holder = state.worker_id.take();
+            let previous_expiry = state.lease_expiry;
             state.manifest.status = ManifestStatus::Processing;
             state.worker_id = Some(worker_id.as_str().to_string());
             state.lease_expiry = Some(lease_expiry);
             state.fencing_token = new_token;
 
             // Losing here means another worker claimed it between our read and
-            // our write: move on to the next candidate rather than retrying,
-            // since it is no longer available anyway.
+            // our write, or a conflicting write was in flight (409, #2047):
+            // either way move on to the next candidate rather than retrying. In
+            // the first case it is no longer available anyway; in the second it
+            // stays queued and is claimable on the next poll.
             if !self
                 .save_manifest_if_unchanged(&location, &id, &state, etag.as_deref())
                 .await?
             {
                 continue;
             }
+
+            // A reclaim — a previous holder whose stored expiry had passed —
+            // is the event worth seeing in a log: it re-walks the manifest
+            // from its first file (#1127), and a holder that was alive and
+            // renewing means the stored expiry was wrong (#1229).
+            tracing::debug!(
+                submission = %id,
+                manifest = %manifest_id,
+                worker = %worker_id,
+                fencing_token = new_token,
+                previous_holder = ?previous_holder,
+                previous_expiry = ?previous_expiry,
+                held_until = %lease_expiry,
+                now = %now,
+                "bulk-submit lease acquired"
+            );
 
             return Ok(Some(ManifestLease {
                 tenant,
@@ -603,19 +676,25 @@ impl SubmitClaimStrategy for S3Backend {
         Ok(new_expiry)
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
-        // Best-effort: a lease we no longer hold has already been reclaimed by
-        // someone else, and there is nothing to give back.
-        let _ = self
-            .fenced_mutate(&lease, |state| {
-                if state.manifest.status == ManifestStatus::Processing {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
+        // A lease we no longer hold was reclaimed or aborted under us; there is
+        // nothing to give back.
+        match self
+            .fenced_mutate_if(
+                &lease,
+                |state| state.manifest.status == ManifestStatus::Processing,
+                |state| {
                     state.manifest.status = ManifestStatus::Pending;
                     state.worker_id = None;
                     state.lease_expiry = None;
-                }
-            })
-            .await;
-        Ok(())
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(LeaseError::LeaseLost { .. }) => Ok(false),
+            Err(LeaseError::Storage(e)) => Err(e),
+        }
     }
 }
 
@@ -649,6 +728,8 @@ impl SubmitWorkerStorage for S3Backend {
             import_directives: state.import_directives,
             metadata: state.submission_metadata,
             last_processed_line: state.last_processed_line,
+            file_resume_lines: Vec::new(),
+            completed_output_files: state.completed_output_files,
         })
     }
 
@@ -701,6 +782,23 @@ impl SubmitWorkerStorage for S3Backend {
             state.manifest.phase = Some(phase);
             state.manifest.files_done = files_done;
             state.manifest.files_total = files_total;
+        })
+        .await
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        self.fenced_mutate(lease, |state| {
+            if !state
+                .completed_output_files
+                .iter()
+                .any(|url| url == file_url)
+            {
+                state.completed_output_files.push(file_url.to_string());
+            }
         })
         .await
     }
@@ -778,7 +876,9 @@ impl SubmitWorkerStorage for S3Backend {
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        self.fenced_mutate(lease, |state| {
+        // Guarded on `processing` so a worker finishing just after an abort
+        // cannot rewrite the abort's `failed` verdict back to `completed` (#968).
+        self.fenced_mutate_if(lease, is_processing, |state| {
             state.manifest.status = ManifestStatus::Completed;
             state.worker_id = None;
             state.lease_expiry = None;
@@ -795,7 +895,8 @@ impl SubmitWorkerStorage for S3Backend {
         error_message: &str,
     ) -> Result<(), LeaseError> {
         let message = error_message.to_string();
-        self.fenced_mutate(lease, move |state| {
+        // Same `processing` guard as `finish_manifest` (#968).
+        self.fenced_mutate_if(lease, is_processing, move |state| {
             state.manifest.status = ManifestStatus::Failed;
             state.error_message = Some(message.clone());
             state.worker_id = None;
@@ -816,7 +917,10 @@ impl SubmitWorkerStorage for S3Backend {
     ) -> StorageResult<()> {
         let location = self.tenant_location(tenant)?;
 
-        for _ in 0..CAS_ATTEMPTS {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(retry_backoff(attempt - 1)).await;
+            }
             let Some((mut state, etag)) = self
                 .load_manifest_for_cas(&location, id, manifest_id)
                 .await?
@@ -871,7 +975,10 @@ impl SubmitWorkerStorage for S3Backend {
 
             // Re-read under compare-and-swap: a worker may be mid-manifest, and
             // writing the copy listed above would roll its progress back.
-            for _ in 0..CAS_ATTEMPTS {
+            for attempt in 0..CAS_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(retry_backoff(attempt - 1)).await;
+                }
                 let Some((mut state, etag)) = self
                     .load_manifest_for_cas(&location, id, &manifest_id)
                     .await?

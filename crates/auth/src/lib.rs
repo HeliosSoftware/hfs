@@ -20,6 +20,7 @@
 //! ## Key Types
 //!
 //! - [`Principal`] — Authenticated identity extracted from a validated JWT
+//! - [`LaunchContext`] — SMART launch context (`patient`, `encounter`, `fhirUser`) on a [`Principal`]
 //! - [`ScopeSet`] — Parsed SMART v2 scopes with permission checking
 //! - [`AuthProvider`] — Trait for token validation implementations
 //! - [`JwksBearerAuthProvider`] — JWKS-based JWT validation
@@ -36,6 +37,7 @@ pub mod policy;
 pub mod principal;
 pub mod provider;
 pub mod scope;
+pub mod session;
 
 // Re-export commonly used types
 pub use config::AuthConfig;
@@ -46,7 +48,12 @@ pub use outbound::{
     NoOpOutboundAuthProvider, OutboundAuthProvider, StaticBearerOutboundAuthProvider,
     provider_from_token,
 };
-pub use policy::SmartScopePolicy;
-pub use principal::Principal;
+pub use policy::{AccessScope, SmartScopePolicy};
+pub use principal::{LaunchContext, Principal};
 pub use provider::{AuthProvider, jwks_bearer::JwksBearerAuthProvider};
 pub use scope::{ScopeSet, SmartPermissions};
+pub use session::{
+    AccessOutcome, LoginConfig, PENDING_COOKIE, PersistedPending, PersistedSession, SESSION_COOKIE,
+    SaveOutcome, Session, SessionPersistence, SessionPrincipal, SessionStore, cookie_value,
+    discover_endpoints, is_cross_site, store_timestamp,
+};

@@ -319,3 +319,98 @@ async fn postgres_matches_string_and_full_hydration_contract() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{outcome}");
     assert_eq!(outcome["resourceType"], "OperationOutcome", "{outcome}");
 }
+
+fn link<'a>(body: &'a Value, relation: &str) -> Option<&'a str> {
+    body["link"]
+        .as_array()
+        .expect("searchset link array")
+        .iter()
+        .find(|link| link["relation"] == relation)
+        .and_then(|link| link["url"].as_str())
+}
+
+/// #1532: `total` is the match count across pages, `_summary=count` omits
+/// `entry`, and page links carry the remaining search parameters.
+macro_rules! assert_string_search_total_and_links {
+    ($app:expr) => {{
+        let app = &$app;
+
+        let (status, page) = app
+            .get_fhir("/CodeSystem?title:contains=candidate&_count=1")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["total"], 3, "{page}");
+        assert_eq!(entries(&page).len(), 1, "{page}");
+        assert!(link(&page, "previous").is_none(), "{page}");
+        assert!(
+            link(&page, "next")
+                .expect("next link")
+                .ends_with("/CodeSystem?title%3Acontains=candidate&_count=1&_offset=1"),
+            "{page}"
+        );
+
+        let (_, last) = app
+            .get_fhir("/CodeSystem?title:contains=candidate&_count=1&_offset=2")
+            .await;
+        assert_eq!(last["total"], 3, "{last}");
+        assert_eq!(entries(&last).len(), 1, "{last}");
+        assert!(link(&last, "next").is_none(), "{last}");
+        assert!(
+            link(&last, "previous")
+                .expect("previous link")
+                .ends_with("_count=1&_offset=1"),
+            "{last}"
+        );
+
+        let (status, count) = app
+            .get_fhir("/CodeSystem?title:contains=candidate&_summary=count")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{count}");
+        assert_eq!(count["total"], 3, "{count}");
+        assert!(count.get("entry").is_none(), "{count}");
+        assert!(link(&count, "next").is_none(), "{count}");
+
+        let (_, exact) = app
+            .get_fhir("/CodeSystem?url=http%3A%2F%2Fhts.test%2F719%2Fcs%2Fcafe&_summary=count")
+            .await;
+        assert_eq!(exact["total"], 1, "{exact}");
+        assert!(exact.get("entry").is_none(), "{exact}");
+    }};
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_total_counts_all_matches_and_summary_count_omits_entries() {
+    let app = TestApp::new();
+    app.import_bundle_ok(SEARCH_BUNDLE).await;
+    assert_string_search_total_and_links!(app);
+
+    let (_, first) = app.get_fhir("/CodeSystem?_count=2").await;
+    assert_eq!(first["total"], 6, "{first}");
+    assert_eq!(entries(&first).len(), 2, "{first}");
+    assert!(
+        link(&first, "next")
+            .expect("next link")
+            .ends_with("/CodeSystem?_count=2&_offset=2"),
+        "{first}"
+    );
+
+    for (path, expected) in [
+        ("/CodeSystem?_summary=count", 6),
+        ("/ValueSet?_summary=count", 1),
+        ("/ConceptMap?_summary=count", 1),
+        ("/ConceptMap?_count=0", 1),
+    ] {
+        let (status, body) = app.get_fhir(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(body["total"], expected, "{path}: {body}");
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_total_counts_all_matches_and_summary_count_omits_entries() {
+    let app = TestAppPg::new().await;
+    app.import_bundle_ok(SEARCH_BUNDLE).await;
+    assert_string_search_total_and_links!(app);
+}

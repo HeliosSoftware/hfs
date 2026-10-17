@@ -24,7 +24,28 @@ pub use scan::{
     Placeholder, ScanError, ScanResult, SourcePosition, TableRef, scan_sql, undeclared_tables,
 };
 
+use std::fmt;
+
 use thiserror::Error;
+
+/// The kind of artifact a `depends-on` dependency resolves to. Used to word
+/// [`SqlQueryError::DependencyRowCapExceeded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyKind {
+    /// A leaf ViewDefinition, materialized by the wired SQL-on-FHIR runner.
+    ViewDefinition,
+    /// An interior SQL View Library, materialized by running its SQL.
+    SqlView,
+}
+
+impl fmt::Display for DependencyKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ViewDefinition => f.write_str("ViewDefinition"),
+            Self::SqlView => f.write_str("SQL View"),
+        }
+    }
+}
 
 /// Errors produced by the `$sqlquery-run` pipeline.
 #[derive(Debug, Error)]
@@ -47,10 +68,35 @@ pub enum SqlQueryError {
     #[error("row limit exceeded ({max} rows)")]
     RowCapExceeded { max: usize },
 
+    /// A `depends-on` dependency (a ViewDefinition or a SQL View) produced
+    /// more rows than the per-dependency cap
+    /// (`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`). The engine's bare
+    /// [`SqlQueryError::RowCapExceeded`] names neither the dependency nor
+    /// the setting; the plan executor maps it to this variant, which does.
+    /// `label` is the name the consuming SQL selects the dependency by, and
+    /// `view` is the ViewDefinition's or SQL View's name (or canonical URL
+    /// when it has no name).
+    #[error(
+        "dependency '{label}' ({kind} {view}) produced more than {max} rows; SQL queries \
+         materialize each dependency in full before the query's WHERE runs. Narrow the \
+         dependency with a ViewDefinition 'where', or raise \
+         HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
+    )]
+    DependencyRowCapExceeded {
+        label: String,
+        kind: DependencyKind,
+        view: String,
+        max: usize,
+    },
+
     #[error("query exceeded {secs}s timeout")]
     Timeout { secs: u64 },
 
-    #[error("SQL parse error: {0}")]
+    /// The statement is not a read: the engine's read-only authorizer refused
+    /// a write, a schema change, a PRAGMA, an ATTACH/DETACH or a transaction
+    /// statement, or the statement is a VACUUM / any statement SQLite reports as
+    /// not read-only. The payload is the complete client-facing message.
+    #[error("{0}")]
     NotSelect(String),
 
     #[error("invalid parameter binding: {0}")]
@@ -74,6 +120,14 @@ pub enum SqlQueryError {
     #[error("dependency source failed: {0}")]
     SourceStream(String),
 
+    /// The store feeding a `depends-on` dependency was unavailable: it could
+    /// not be reached, was throttling, or could not read an object after
+    /// retries (#2048). Like [`SqlQueryError::SourceStream`] it is never the
+    /// client's fault, but it is transient, so the REST layer answers it with
+    /// `503` and a `Retry-After` hint rather than `500`.
+    #[error("dependency source unavailable: {0}")]
+    SourceUnavailable(String),
+
     /// A failure in the server's own execution machinery rather than in the
     /// client's request — e.g. the blocking worker that materializes a
     /// depends-on ViewDefinition's row stream panicked. This is never
@@ -81,4 +135,44 @@ pub enum SqlQueryError {
     /// not as a validation error.
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_row_cap_message_for_a_view_definition() {
+        let err = SqlQueryError::DependencyRowCapExceeded {
+            label: "obs".to_string(),
+            kind: DependencyKind::ViewDefinition,
+            view: "observation_flat".to_string(),
+            max: 1_000_000,
+        };
+        assert_eq!(
+            err.to_string(),
+            "dependency 'obs' (ViewDefinition observation_flat) produced more than 1000000 \
+             rows; SQL queries materialize each dependency in full before the query's WHERE \
+             runs. Narrow the dependency with a ViewDefinition 'where', or raise \
+             HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
+        );
+    }
+
+    #[test]
+    fn dependency_row_cap_message_for_a_sql_view() {
+        let err = SqlQueryError::DependencyRowCapExceeded {
+            label: "fp".to_string(),
+            kind: DependencyKind::SqlView,
+            view: "female_patients".to_string(),
+            max: 50,
+        };
+        let text = err.to_string();
+        assert!(
+            text.starts_with(
+                "dependency 'fp' (SQL View female_patients) produced more than 50 rows;"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("ViewDefinition female_patients"), "{text}");
+    }
 }

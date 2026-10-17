@@ -61,7 +61,7 @@
           <nav class="capability-json-pagination" aria-label="{{ i18n.t("cap-json-pagination-label") }}">
             <button type="button" class="btn" data-capability-json-page-direction="previous"{% if page.has_previous %}
                     hx-get="{{ page.previous_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-prev") }}</button>
-            <span>{{ page.first_item }}–{{ page.last_item }} / {{ page.total_items }}</span>
+            <span>{{ i18n.num(page.first_item) }}–{{ i18n.num(page.last_item) }} / {{ i18n.num(page.total_items) }}</span>
             <button type="button" class="btn" data-capability-json-page-direction="next"{% if page.has_next %}
                     hx-get="{{ page.next_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-next") }}</button>
           </nav>
@@ -77,7 +77,7 @@
   <nav class="capability-json-pagination" aria-label="{{ i18n.t("cap-json-pagination-label") }}">
     <button type="button" class="btn" data-capability-json-page-direction="previous"{% if expanded.root.has_previous %}
             hx-get="{{ expanded.root.previous_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-prev") }}</button>
-    <span>{{ expanded.root.first_item }}–{{ expanded.root.last_item }} / {{ expanded.root.total_items }}</span>
+    <span>{{ i18n.num(expanded.root.first_item) }}–{{ i18n.num(expanded.root.last_item) }} / {{ i18n.num(expanded.root.total_items) }}</span>
     <button type="button" class="btn" data-capability-json-page-direction="next"{% if expanded.root.has_next %}
             hx-get="{{ expanded.root.next_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-next") }}</button>
   </nav>

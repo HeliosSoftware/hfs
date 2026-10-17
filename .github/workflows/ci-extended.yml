@@ -2,8 +2,9 @@ name: HFS Extended CI (Beta/Nightly)
 
 on:
   schedule:
-    # Run nightly at 2am Eastern (7am UTC) on weekdays
-    - cron: '0 7 * * 1-5'
+    # 07:00 UTC on weekdays (02:00 EST / 03:00 EDT). Offset from the other
+    # self-hosted suites (hts-ig 03:00, validator 04:00, hts 05:00, ui 06:00).
+    - cron: "0 7 * * 1-5"
   workflow_dispatch:  # Allow manual trigger too
   workflow_call:      # invoked by ci.yml as a release conformance gate
 
@@ -16,6 +17,10 @@ env:
 jobs:
   test-rust:
     name: Test Rust (${{ matrix.rust }})
+    env:
+      # Rustup ranks this above a directory override left on a self-hosted
+      # runner (see ci.yml), so each leg really runs the toolchain it names.
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     runs-on: [self-hosted, Linux]
     strategy:
       fail-fast: false

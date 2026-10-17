@@ -78,20 +78,23 @@ async fn put(server: &TestServer, path: &str, body: Value) -> axum_test::TestRes
 async fn direct_updates_reject_unknown_wrong_case_missing_and_mismatched_types() {
     let (server, backend) = create_test_server("off", FhirVersion::default_enabled()).await;
 
+    // An unknown or wrong-case URL type is "resource type not supported":
+    // `404` per http.html, on writes as on reads (#989). A body that is
+    // missing its type or disagrees with the URL is a malformed request: `400`.
     put(
         &server,
         "/NoLongerValid/unknown",
         json!({ "resourceType": "NoLongerValid", "id": "unknown" }),
     )
     .await
-    .assert_status(StatusCode::BAD_REQUEST);
+    .assert_status(StatusCode::NOT_FOUND);
     put(
         &server,
         "/patient/lowercase",
         json!({ "resourceType": "patient", "id": "lowercase" }),
     )
     .await
-    .assert_status(StatusCode::BAD_REQUEST);
+    .assert_status(StatusCode::NOT_FOUND);
     put(&server, "/Patient/missing", json!({ "id": "missing" }))
         .await
         .assert_status(StatusCode::BAD_REQUEST);
@@ -130,7 +133,7 @@ async fn type_admission_is_independent_of_validation_mode() {
             json!({ "resourceType": "NoLongerValid", "id": "rejected" }),
         )
         .await
-        .assert_status(StatusCode::BAD_REQUEST);
+        .assert_status(StatusCode::NOT_FOUND);
         assert!(
             backend
                 .read(&tenant(), "NoLongerValid", "rejected")
@@ -229,7 +232,7 @@ async fn direct_update_rejects_a_type_from_another_compiled_version() {
         json!({ "resourceType": "ActorDefinition", "id": "r5-only" }),
     )
     .await
-    .assert_status(StatusCode::BAD_REQUEST);
+    .assert_status(StatusCode::NOT_FOUND);
     assert!(
         backend
             .read(&tenant(), "ActorDefinition", "r5-only")
@@ -249,7 +252,7 @@ async fn r6_rejects_a_resource_removed_after_r4() {
         json!({ "resourceType": "Media", "id": "r4-only" }),
     )
     .await
-    .assert_status(StatusCode::BAD_REQUEST);
+    .assert_status(StatusCode::NOT_FOUND);
     assert!(
         backend
             .read(&tenant(), "Media", "r4-only")

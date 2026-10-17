@@ -35,6 +35,15 @@
   </entry>
   <entry>
     <fullUrl value="http://example.org/FHIR/Basic/AD-11220"/>
+    <!-- <status value="in-progress" /> 
+        <coding>
+          <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode" />
+          <code value="VR"/>
+          <display value="virtual" />
+        </coding>
+        <subject>
+          <reference value="Patient/ABC" />
+        </subject> -->
     <resource>
       <Basic>
         <id value="AD-11220"/>
@@ -43,7 +52,7 @@
           <lastUpdated value="2019-08-07T10:49:22Z"/>
         </meta>
         <text>
-          <status value="extensions"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Basic AD-11220</b></p><a name="AD-11220"> </a><a name="hcAD-11220"> </a><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px">version: 1; Last updated: 2019-08-07T10:49:22Z</p></div><blockquote><p><b>org/fhir/StructureDefinition/admission-content</b></p><ul><li>status: in-progress</li><li>patient: <a href="broken-link.html">Patient/ABC</a></li><li>patient-group: <a href="broken-link.html">Group/XYZ</a></li></ul></blockquote><p><b>code</b>: <span title="Codes:{http://example.org/fhir/CodeSystem/basic-resource-codes admission}">Admission Notification</span></p><p><b>subject</b>: <a href="broken-link.html">Patient/ABC</a></p></div>
+          <status value="extensions"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Basic AD-11220</b></p><a name="AD-11220"> </a><a name="hcAD-11220"> </a><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px">version: 1; Last updated: 2019-08-07T10:49:22Z</p></div><blockquote><p><b>org/fhir/StructureDefinition/admission-content</b></p><ul><li>status: in-progress</li><li>patient: <a href="broken-link.html">Patient/ABC</a></li><li>patient-group: <a href="broken-link.html">Group/XYZ</a></li></ul></blockquote><p><b>code</b>: <span title="Codes:{http://example.org/fhir/CodeSystem/basic-resource-codes admission}">Admission Notification</span></p></div>
         </text>
         <extension url="http://example.org/fhir/StructureDefinition/admission-content">
           <extension url="status">
@@ -67,9 +76,6 @@
             <display value="Admission Notification"/>
           </coding>
         </code>
-        <subject>
-          <reference value="Patient/ABC"/>
-        </subject>
       </Basic>
     </resource>
   </entry>

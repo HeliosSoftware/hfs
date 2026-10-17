@@ -9,8 +9,9 @@ use crate::{
     data_source::{DataSource, UniversalDataSource},
     fhir_format::{self, accept_requires_unsupported_fhir_xml},
     filter_resources_by_patient_and_group as sof_filter_resources_by_patient_and_group,
-    filter_resources_by_since as sof_filter_resources_by_since, format_parquet_multi_file,
-    get_fhir_version_string, get_newest_enabled_fhir_version,
+    filter_resources_by_since as sof_filter_resources_by_since,
+    format_parquet_multi_file_with_schema, get_fhir_version_string,
+    get_newest_enabled_fhir_version,
     lint::{Diagnostic, Severity, lint_view_definition},
     parse_view_definition_for_version as sof_parse_view_definition_for_version,
     process_view_definition, run_view_definition_with_options,
@@ -85,7 +86,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// | group | Reference | 0 | * | Restrict to members of these Groups (resolved via `Group.member.entity` against inline resources). |
 /// | source | string | 0 | 1 | External data source. Supports file://, http(s)://, s3://, gs://, and azure:// URLs. |
 /// | _limit | integer | 0 | 1 | Maximum rows returned. (1-10000) |
-/// | _since | instant | 0 | 1 | Only resources modified after this time. (RFC3339) |
+/// | _since | instant | 0 | 1 | Only resources modified at or after this time. (RFC3339) |
 /// | resource | Resource | 0 | * | FHIR resources to transform instead of using server data. A Bundle is unwrapped one level. |
 ///
 /// ## Query Parameters
@@ -520,6 +521,7 @@ pub async fn sql_run_handler(
             .is_some()
     {
         // Use multi-file Parquet generation
+        let declared = view_definition.try_declared_columns()?;
         let processed_result = process_view_definition(view_definition, bundle)?;
 
         // Get max file size in bytes
@@ -530,10 +532,11 @@ pub async fn sql_run_handler(
             .map(|mb| mb as usize * 1024 * 1024)
             .unwrap_or(usize::MAX);
 
-        let file_buffers = format_parquet_multi_file(
+        let file_buffers = format_parquet_multi_file_with_schema(
             processed_result,
             validated_params.parquet_options.as_ref(),
             max_file_size_bytes,
+            &declared,
         )?;
 
         // Multi-file output is bundled into a ZIP archive; a single file is
@@ -878,6 +881,11 @@ fn find_inline_view_definition(json: &serde_json::Value) -> Option<&serde_json::
 /// `ServerError::InvalidViewDefinition`). Warnings never block `$sql-run` —
 /// the lint reports them for the UI's editor, not this endpoint.
 fn lint_inline_view_definition(json: &serde_json::Value) -> ServerResult<()> {
+    // A bad column tag (e.g. a non-string `ansi/type` value) is reported
+    // naming the column rather than as a bare lint path.
+    if json.is_object() {
+        crate::column_types::resolve_columns(json).map_err(ServerError::from)?;
+    }
     let errors: Vec<Diagnostic> = lint_view_definition(json)
         .into_iter()
         .filter(|diagnostic| diagnostic.severity == Severity::Error)
@@ -1140,11 +1148,12 @@ fn filter_resources_by_patient_and_group(
 /// Filter resources by their last updated time using the _since parameter
 ///
 /// This function filters FHIR resources based on their meta.lastUpdated field,
-/// returning only resources that have been modified after the specified timestamp.
+/// returning only resources whose meta.lastUpdated is at or after the specified timestamp;
+/// resources without one are dropped.
 ///
 /// # Arguments
 /// * `resources` - Vector of FHIR resources as JSON values
-/// * `since` - DateTime filter - only include resources modified after this time
+/// * `since` - DateTime filter - only include resources modified at or after this time
 ///
 /// # Returns
 /// * `Ok(Vec<serde_json::Value>)` - Filtered resources
@@ -1386,6 +1395,50 @@ mod tests {
             response.status(),
             StatusCode::BAD_REQUEST,
             "absent reference must surface as 400"
+        );
+    }
+
+    /// `Group` is in the patient CompartmentDefinition via `member`, so a Group
+    /// that lists a filtered patient as a member is in that patient's
+    /// compartment — even though the Group itself was never named in
+    /// `group_refs`. The `CompartmentFilter` refactor briefly short-circuited
+    /// every Group to "was it requested directly?", which silently dropped
+    /// these from `patient=` runs on all three callers of this helper.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn test_group_member_of_filtered_patient_is_in_the_compartment() {
+        let resources = vec![
+            serde_json::json!({ "resourceType": "Patient", "id": "p1" }),
+            serde_json::json!({
+                "resourceType": "Group",
+                "id": "g1",
+                "type": "person",
+                "actual": true,
+                "member": [{ "entity": { "reference": "Patient/p1" } }]
+            }),
+            serde_json::json!({
+                "resourceType": "Group",
+                "id": "g2",
+                "type": "person",
+                "actual": true,
+                "member": [{ "entity": { "reference": "Patient/other" } }]
+            }),
+        ];
+
+        let filtered = filter_resources_by_patient_and_group(
+            resources,
+            &["Patient/p1".to_string()],
+            &[],
+            helios_fhir::FhirVersion::R4,
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = filtered.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec!["p1", "g1"],
+            "Group/g1 has member Patient/p1 so it is in that compartment; \
+             Group/g2 does not: {ids:?}"
         );
     }
 

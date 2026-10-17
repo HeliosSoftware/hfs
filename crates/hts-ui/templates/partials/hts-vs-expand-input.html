@@ -131,7 +131,7 @@
 
     <details class="disclosure" id="expand-advanced">
       <summary class="disclosure__summary"
-               title="{{ chrome.i18n.t_arg("hts-vs-expand-ceiling-tooltip", "ceiling", ceiling.to_string()) }}">
+               title="{{ chrome.i18n.t_arg("hts-vs-expand-ceiling-tooltip", "ceiling", *ceiling) }}">
         <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
         {{ chrome.i18n.t("hts-vs-expand-advanced-summary") }}
       </summary>
@@ -188,7 +188,7 @@
           <label class="field__label" for="expand-threshold">{{ chrome.i18n.t("hts-vs-expand-threshold") }}</label>
           <input class="field__input" id="expand-threshold" name="threshold" type="number" min="0" autocomplete="off"
                  value="{% match threshold %}{% when Some(t) %}{{ t }}{% when None %}{% endmatch %}">
-          <span class="field__hint">{{ chrome.i18n.t_arg("hts-vs-expand-ceiling-note", "ceiling", ceiling.to_string()) }}</span>
+          <span class="field__hint">{{ chrome.i18n.t_arg("hts-vs-expand-ceiling-note", "ceiling", *ceiling) }}</span>
         </div>
       </div>
     </details>

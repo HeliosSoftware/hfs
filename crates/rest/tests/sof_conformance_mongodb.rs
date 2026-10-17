@@ -6,10 +6,8 @@
 //! same comparator, same regression-floor pattern.
 //!
 //! The MongoDB aggregation emitter is at parity with the SQL backends: it
-//! passes the same 132 fixtures. The remaining 12 failures are the identical
-//! structural-coverage gaps shared with SQLite/PostgreSQL (nested/sibling
-//! `repeat`, `unionAll` nested inside another `select`), absorbed by the
-//! regression floor.
+//! passes all 144 fixtures, including nested/sibling `repeat` and `unionAll`
+//! nested inside another `select`.
 //!
 //! The Stage-1 emitter (`$unwind`/`$function`/`$facet`/server-side JS for
 //! `repeat`) requires server-side JavaScript to be enabled (the default for the
@@ -19,6 +17,9 @@
 //! the gating used by `sof_conformance_postgres.rs`.
 
 #![cfg(feature = "mongodb")]
+
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
 
 mod sof_conformance_mongodb_tests {
     use axum::http::{HeaderName, HeaderValue};
@@ -48,6 +49,8 @@ mod sof_conformance_mongodb_tests {
 
     struct SharedMongo {
         connection_string: String,
+        /// Kept alive for the duration of the test binary; the
+        /// `container_cleanup` exit hook removes it at process exit.
         _container: testcontainers::ContainerAsync<Mongo>,
     }
 
@@ -56,14 +59,17 @@ mod sof_conformance_mongodb_tests {
     async fn shared_mongo() -> &'static SharedMongo {
         SHARED_MONGO
             .get_or_init(|| async {
-                // Label with the CI run id so the workflow's cleanup job can
-                // reap the container (mirrors the PostgreSQL conformance suite).
+                // Label with the CI run id (mirrors the PostgreSQL conformance
+                // suite); `SHARED_MONGO` is a static and never dropped, so the
+                // `container_cleanup` exit hook removes the container at
+                // process exit.
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = Mongo::default()
-                    .with_label("github.run_id", &run_id)
-                    .start()
-                    .await
-                    .expect("failed to start MongoDB container");
+                let container = super::container_cleanup::with_cleanup_label(
+                    Mongo::default().with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("failed to start MongoDB container");
                 let port = container
                     .get_host_port_ipv4(27017)
                     .await
@@ -274,6 +280,8 @@ mod sof_conformance_mongodb_tests {
         true
     }
 
+    /// Strict equality except that numbers are compared as f64: a number is
+    /// never equal to its string form (#1769).
     fn values_equal(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Null, Value::Null) => true,
@@ -283,9 +291,6 @@ mod sof_conformance_mongodb_tests {
                 .as_f64()
                 .zip(y.as_f64())
                 .is_some_and(|(xf, yf)| (xf - yf).abs() < 1e-9),
-            (Value::Number(n), Value::String(s)) | (Value::String(s), Value::Number(n)) => {
-                n.to_string() == *s
-            }
             (Value::Array(x), Value::Array(y)) => {
                 x.len() == y.len() && x.iter().zip(y.iter()).all(|(xi, yi)| values_equal(xi, yi))
             }
@@ -427,13 +432,10 @@ mod sof_conformance_mongodb_tests {
             "\nSoF v2 conformance (MongoDB): {passed} passed, {failed} failed, {skipped} skipped"
         );
 
-        // Regression floor — the Mongo aggregation emitter now passes the SAME
-        // 132 fixtures as the SQL backends. The remaining 12 failures are the
-        // identical structural-coverage gaps shared with SQLite/PostgreSQL
-        // (nested/sibling `repeat`, `unionAll` nested inside another `select`),
-        // so the floor matches the SQL suites exactly. A drop signals a
-        // Mongo-emitter regression; raise it only alongside the SQL floors.
-        const MONGO_PASS_FLOOR: usize = 132;
+        // Regression floor — the Mongo aggregation emitter passes the SAME
+        // 144 fixtures as the SQL backends, so the floor matches the SQL
+        // suites exactly. A drop signals a Mongo-emitter regression.
+        const MONGO_PASS_FLOOR: usize = 144;
         assert!(
             passed >= MONGO_PASS_FLOOR,
             "regression: only {passed} fixtures pass (floor: {MONGO_PASS_FLOOR}). \

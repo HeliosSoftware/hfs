@@ -15,10 +15,18 @@ categories = ["web-programming", "database"]
 default = ["R4", "sqlite"]
 
 # FHIR version features (pass through to helios-fhir, helios-persistence, helios-audit, helios-serde, helios-sof, helios-subscriptions, helios-fhir-validator)
+# This crate's version set must equal the set helios-fhir is unified to:
+# helios-fhir-validator (`packs::core_registry`, `core_terminology`) and the
+# per-version matches here, in persistence, sof, serde and subscriptions gate
+# each arm on their own crate's features, so a version helios-fhir enables
+# without them reaches a catch-all arm. For the validator that arm panics (#2064).
+# helios-audit's R5/R6 (reached directly and through helios-persistence) enable
+# helios-fhir/R4B as the BALP baseline, so R5/R6 enable this crate's own `R4B`,
+# as helios-audit does.
 R4 = ["helios-fhir/R4", "helios-persistence/R4", "helios-audit/R4", "helios-serde?/R4", "helios-sof/R4", "helios-subscriptions?/R4", "helios-fhir-validator/R4"]
 R4B = ["helios-fhir/R4B", "helios-persistence/R4B", "helios-audit/R4B", "helios-serde?/R4B", "helios-sof/R4B", "helios-subscriptions?/R4B", "helios-fhir-validator/R4B"]
-R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-audit/R5", "helios-serde?/R5", "helios-sof/R5", "helios-subscriptions?/R5", "helios-fhir-validator/R5"]
-R6 = ["helios-fhir/R6", "helios-persistence/R6", "helios-audit/R6", "helios-serde?/R6", "helios-sof/R6", "helios-subscriptions?/R6", "helios-fhir-validator/R6"]
+R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-audit/R5", "helios-serde?/R5", "helios-sof/R5", "helios-subscriptions?/R5", "helios-fhir-validator/R5", "R4B"]
+R6 = ["helios-fhir/R6", "helios-persistence/R6", "helios-audit/R6", "helios-serde?/R6", "helios-sof/R6", "helios-subscriptions?/R6", "helios-fhir-validator/R6", "R4B"]
 
 # Serialization format features
 xml = ["helios-fhir/xml", "dep:helios-serde", "helios-serde?/xml"]
@@ -43,21 +51,30 @@ otel = ["helios-observability/otel"]
 
 [dependencies]
 # Core dependencies
-helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false }
-helios-serde = { path = "../serde", version = "0.2.1", optional = true, default-features = false }
-helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
-helios-auth = { path = "../auth", version = "0.2.1" }
-helios-audit = { path = "../audit", version = "0.2.1", default-features = false }
-helios-subscriptions = { path = "../subscriptions", version = "0.2.1", optional = true, default-features = false }
-helios-fhir-validator = { path = "../fhir-validator", version = "0.2.1", default-features = false, features = ["fhirpath"] }
-helios-observability = { path = "../observability", version = "0.2.1" }
+helios-fhir = { path = "../fhir", version = "0.2.4", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.2.4", default-features = false }
+helios-serde = { path = "../serde", version = "0.2.4", optional = true, default-features = false }
+helios-sof = { path = "../sof", version = "0.2.4", default-features = false }
+helios-auth = { path = "../auth", version = "0.2.4" }
+# `SearchProvider::search_param_registry` returns a `parking_lot::RwLock`; the
+# patient-compartment confinement (#1618) names it, as do the batch unit
+# tests' mock storage.
+parking_lot = "0.12"
+helios-audit = { path = "../audit", version = "0.2.4", default-features = false }
+helios-subscriptions = { path = "../subscriptions", version = "0.2.4", optional = true, default-features = false }
+helios-fhir-validator = { path = "../fhir-validator", version = "0.2.4", default-features = false, features = ["fhirpath"] }
+helios-observability = { path = "../observability", version = "0.2.4" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 # `io` provides StreamReader, bridging the reqwest byte stream for bulk-submit
 # NDJSON files into the AsyncBufRead the ingestion engine consumes.
 tokio-util = { version = "0.7", features = ["io"] }
+# Bulk-submit file bodies are fetched without reqwest's transparent gzip so the
+# fetcher knows the wire offset a `Range` resume must start from; it decodes
+# gzip itself with the same decoder reqwest uses. `bytes` names the body chunks.
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+bytes = "1"
 async-trait = "0.1"
 
 # Web framework
@@ -65,6 +82,9 @@ axum = { version = "0.8", features = ["json", "query", "matched-path", "ws"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "compression-full", "decompression-full"] }
 http = "1.0"
+# Names the length-limit error of `axum::body::to_bytes`, so an over-limit
+# batch body maps to 413 instead of a generic 400.
+http-body-util = "0.1"
 mime = "0.3"
 
 # Serialization
@@ -89,19 +109,20 @@ chrono.workspace = true
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2.5"
-json-patch = "3"
 futures = "0.3"
 dashmap = "6"
 
-# SQL-query-run: DDL validation
-sqlparser = "0.54"
+# SQL-query-run: DDL validation; `visitor` walks nested statements (#1702)
+sqlparser = { version = "0.54", features = ["visitor"] }
 
 # Base64 (used to wrap $sqlquery-run flat output as Binary.data when the caller
 # asks for application/fhir+json)
 base64 = "0.22"
 
 # S3 export sink (optional — only when s3 feature is enabled)
-aws-sdk-s3 = { version = "1", optional = true }
+# Use the modern HTTPS client, as persistence and audit do. Preserve the
+# SDK's signing, HTTP 1.x and Tokio features without enabling legacy rustls.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 
 # HTTP client for terminology server integration (HTS)
@@ -128,6 +149,9 @@ p384 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-
 # same output size. No C toolchain is required for either.
 flate2 = { version = "1", features = ["zlib-rs"] }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # HTTP testing
 axum-test = "18.0"
@@ -139,15 +163,15 @@ helios-observability = { path = "../observability" }
 # Key generation for the JWE round-trip tests
 rand = "0.8"
 
-# `SearchProvider::search_param_registry` returns a `parking_lot::RwLock`, and
-# the batch unit tests' mock storage has to satisfy that trait since #478
-# widened `process_batch`'s bound. Test-only: the crate's own code reaches the
-# registry through `helios-persistence` and never names the lock type.
-parking_lot = "0.12"
 
 # Direct SQLite fixture access for legacy-row REST tests. Bounded to the version
 # already used by helios-persistence; no new backend code is exposed.
 rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"] }
+
+# Read streamed Parquet / Arrow IPC responses back in tests. Same versions as
+# helios-sof, which does the encoding.
+arrow = "54.0"
+parquet = "54.0"
 
 # Temp files
 tempfile = "3"
@@ -170,7 +194,11 @@ regex = "1"
 # Brings up a PostgreSQL container locally — same versions used by
 # `helios-persistence`'s integration tests for binary-version parity.
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres", "mongo"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mongo", "elastic_search"] }
+
+# `#[ctor::dtor]` exit hook that removes testcontainers held in `static`s
+# (tests/common/container_cleanup.rs).
+ctor = "0.2"
 
 [package.metadata.docs.rs]
 features = ["R4", "sqlite"]

@@ -6,7 +6,7 @@
  * `rails.<page>` — is no longer this script's job (#754/#755): the server
  * renders the group from `rails.<page>.recent` (`partials/rail_recent.html`),
  * and on the pages where a rail click is intercepted in-page,
- * `saved-queries.js` repaints the group locally and records the click, the
+ * `search-builder.js` repaints the group locally and records the click, the
  * same way it already owns the rest of that in-page navigation. This script
  * keeps only the two behaviors that apply to every rail item regardless of
  * where it came from — the server-rendered list or the server-rendered
@@ -21,13 +21,16 @@
    keyboard user. Replace that fallback with one body-level tooltip whenever
    a rail or resource-grid label is genuinely clipped (#634, #793). Keeping
    the tooltip outside scrolling and grid containers avoids overflow clipping,
-   and delegation means dynamically added items follow the same path. */
+   and delegation means dynamically added items follow the same path. The
+   same tooltip also covers the search-results table's clipped cells and
+   abbreviated ids (#1106). */
 (function () {
   "use strict";
 
   var ITEM_SELECTOR = [
     "a.filter-rail__item[data-full-name]",
     "label.typegrid__item[data-full-name]",
+    "#query-results-body td[data-full-name]",
   ].join(", ");
   var tooltip = document.createElement("div");
   var activeItem = null;
@@ -66,20 +69,49 @@
     return range.getBoundingClientRect().width > label.getBoundingClientRect().width + 0.01;
   }
 
+  /* An open modal dialog (the Resources editor, or a shared `addbox--modal`)
+     paints over the page but leaves the item that opened it focused and,
+     until the pointer moves, hovered. The tooltip sits above the dialog's
+     z-index band, so without this check it would stay drawn over the open
+     dialog (#1770). A dialog's panel only has client rects while it is
+     rendered, which covers both `[hidden]` and a closed `<details>`. */
+  function isUnderOpenModal(item) {
+    var dialogs = document.querySelectorAll('[aria-modal="true"]');
+    for (var i = 0; i < dialogs.length; i++) {
+      if (dialogs[i].getClientRects().length && !dialogs[i].contains(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function show(item) {
-    var label = item && item.querySelector(".filter-rail__label, .typegrid__label");
+    var label = item && item.querySelector(
+      ".filter-rail__label, .typegrid__label, .result-cell, .result-id"
+    );
     var fullName = item && item.getAttribute("data-full-name");
     var trigger = focusedItem === item && focusedTrigger
       ? focusedTrigger
       : item && item.matches("a.filter-rail__item")
         ? item
-        : item && item.querySelector('input[type="checkbox"]');
+        : item && item.matches("td")
+          ? item.querySelector("a.result-id") || item
+          : item && item.querySelector('input[type="checkbox"]');
     /* HTMX can replace Search Parameters rail items after the initial sweep;
        remove their fallback lazily as well. */
     if (item) item.removeAttribute("title");
-    if (!label || !fullName || !trigger || !isClipped(label)) {
+    /* Result-table ids can be clipped both by the shared ellipsis check and
+       by the deliberate 8-character abbreviation, which the label's own
+       geometry never reveals (#1106). */
+    if (
+      !label
+      || !fullName
+      || !trigger
+      || !(item.hasAttribute("data-tooltip-abbreviated") || isClipped(label))
+      || isUnderOpenModal(item)
+    ) {
       hide();
-      return;
+      return false;
     }
 
     var itemRect = item.getBoundingClientRect();
@@ -90,7 +122,7 @@
       || itemRect.left >= window.innerWidth
     ) {
       hide();
-      return;
+      return false;
     }
 
     if (activeTrigger && activeTrigger !== trigger) {
@@ -104,8 +136,13 @@
 
     var tooltipRect = tooltip.getBoundingClientRect();
     var gap = 8;
-    var rightFits = itemRect.right + gap + tooltipRect.width <= window.innerWidth - gap;
-    var leftFits = itemRect.left - gap - tooltipRect.width >= gap;
+    /* A result-table cell has neighbouring columns on both sides, so beside
+       the cell the tooltip would cover them: always go below (or above). */
+    var stacked = item.matches("td");
+    var rightFits = !stacked
+      && itemRect.right + gap + tooltipRect.width <= window.innerWidth - gap;
+    var leftFits = !stacked
+      && itemRect.left - gap - tooltipRect.width >= gap;
     var left;
     var top;
 
@@ -118,9 +155,9 @@
         window.innerHeight - tooltipRect.height - gap
       );
     } else {
-      /* In the stacked <=1100px layout there may be no room beside the rail.
-         Place the tooltip below (or above) so it never covers the trigger or
-         its right-aligned count. */
+      /* Result cells, and the stacked <=1100px layout where there may be no
+         room beside the rail. Place the tooltip below (or above) so it never
+         covers the trigger or its right-aligned count. */
       left = Math.min(
         Math.max(gap, itemRect.left),
         window.innerWidth - tooltipRect.width - gap
@@ -133,6 +170,7 @@
 
     tooltip.style.left = left + "px";
     tooltip.style.top = top + "px";
+    return true;
   }
 
   function closestItem(target) {
@@ -158,11 +196,12 @@
     ) {
       hoveredItem = null;
     }
-    /* Pointer intent wins while it is over an item; when it leaves, the
-       still-focused control resumes its keyboard tooltip. */
-    var item = hoveredItem || focusedItem;
-    if (item) show(item);
-    else hide();
+    /* Pointer intent wins while it is over an item that has a tooltip to
+       show; otherwise the still-focused control keeps its keyboard
+       tooltip. */
+    if (hoveredItem && show(hoveredItem)) return;
+    if (focusedItem && show(focusedItem)) return;
+    hide();
   }
 
   document.addEventListener("mouseover", function (event) {
@@ -199,6 +238,12 @@
   });
 
   document.addEventListener("change", refresh);
+  /* Opening a dialog fires none of the events above, so the dialogs announce
+     it: the Resources editor dispatches `hfs:modal-open`, and a shared
+     `<details>` dialog fires `toggle` (which does not bubble, hence the
+     capture-phase listener). */
+  document.addEventListener("hfs:modal-open", refresh);
+  document.addEventListener("toggle", refresh, true);
   window.addEventListener("resize", refresh);
   var scrollFrame = null;
   document.addEventListener("scroll", function () {

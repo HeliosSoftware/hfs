@@ -12,7 +12,8 @@
 //! per-request in-memory SQLite database, binds the supplied
 //! `Library.parameter` values to the subject's SQL, runs it, truncates the
 //! result to a caller-supplied `_limit` (if any), and serializes the result
-//! in the requested `_format`.
+//! in the requested `_format`. The request's `patient`, `group` and `_since`
+//! narrow every dependency view; `_limit` caps only the final rows.
 //!
 //! ## Output shape for flat formats
 //!
@@ -54,10 +55,11 @@ use axum::{
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_sof::sqlquery::SqlQueryError;
+use helios_sof::sqlquery::engine::DeclaredColumn;
 use helios_sof::{
-    ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef, bind_supplied_params,
-    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library, scan_sql,
-    undeclared_tables,
+    AnsiType, ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef,
+    bind_supplied_params, default_for_fhir_type, extract_sqlquery_params_from_json,
+    format_fhir_parameters, parse_sqlquery_library, scan_sql, undeclared_tables,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -93,6 +95,10 @@ pub struct SqlQueryRunQuery {
 /// [`super::subject::resolve_subject`], so `library_json` arrives resolved. The
 /// dependency graph it declares in `relatedArtifact` is materialized here,
 /// then its SQL runs against the resulting tables.
+///
+/// `filters` carries the request's `patient`, `group` and `_since` and narrows
+/// every dependency ViewDefinition. `_limit` is not in it and still caps only
+/// the final rows (applied after SQL, unchanged).
 pub(super) async fn run_library_subject<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
@@ -100,6 +106,7 @@ pub(super) async fn run_library_subject<S>(
     query: SqlQueryRunQuery,
     headers: &HeaderMap,
     library_json: Value,
+    filters: ViewFilters,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -180,17 +187,19 @@ where
     );
     let subject_url = library_json.get("url").and_then(|v| v.as_str());
     let fetcher = super::graph::StorageArtifactFetcher::new(&state, tenant.context());
+    let max_vds = state.config().sof_sqlquery_max_vds;
     let subject_node = super::graph::SubjectNode {
         identity: subject_url,
         is_sql_view,
         parameters_empty: library.parameters.is_empty(),
         depends_on: &library.depends_on,
+        max_depends_on: super::input_limits::max_depends_on(max_vds),
+        max_nodes: max_vds,
     };
     let plan = super::graph::build_plan(&fetcher, &inline_views, subject_node)
         .await
         .map_err(super::graph::errors_to_rest_error)?;
 
-    let max_vds = state.config().sof_sqlquery_max_vds;
     super::graph::check_max_nodes(&plan, max_vds)?;
 
     // Bind Library.parameter values from the supplied `parameters` Parameters.
@@ -209,7 +218,7 @@ where
         engine,
         &runner,
         tenant.context(),
-        &ViewFilters::default(),
+        &filters,
         &plan,
         &library.sql,
         &bindings,
@@ -233,20 +242,38 @@ where
     // we materialized from a leaf ViewDefinition anywhere in the dependency
     // graph, prefer the VD-declared FHIR type. Walk leaves in plan order so
     // the lookup is deterministic when two VDs declare the same column name.
-    let mut name_to_type: std::collections::HashMap<String, ColumnFhirType> =
+    let mut name_to_type: std::collections::HashMap<String, (ColumnFhirType, Option<AnsiType>)> =
         std::collections::HashMap::new();
     for schema in &schemas_in_order {
         for col in &schema.columns {
             name_to_type
                 .entry(col.name.clone())
-                .or_insert_with(|| col.fhir_type.clone());
+                .or_insert_with(|| (col.fhir_type.clone(), col.ansi));
         }
     }
     for (i, col) in result.columns.iter().enumerate() {
-        if let Some(t) = name_to_type.get(col) {
+        if let Some((t, _)) = name_to_type.get(col) {
             result.column_types[i] = t.clone();
         }
     }
+
+    // Typed Parquet/Arrow schema: only columns that match a declared leaf
+    // column by name are typed (by the leaf's resolved SQL type, so an
+    // `ansi/type` tag is honoured); the rest keep value-based inference, since
+    // an arbitrary SQL result has no declared types of its own.
+    let declared: Vec<DeclaredColumn> = result
+        .columns
+        .iter()
+        .filter_map(|col| {
+            let (t, ansi) = name_to_type.get(col)?;
+            Some(DeclaredColumn {
+                name: col.clone(),
+                fhir_type: Some(t.clone()),
+                collection: false,
+                ansi: Some(ansi.unwrap_or_else(|| default_for_fhir_type(t.code()))),
+            })
+        })
+        .collect();
 
     // Format output. `header` precedence mirrors `_format`: body > query.
     let include_header = params
@@ -254,7 +281,8 @@ where
         .or_else(|| parse_header_str(query.header.as_deref()))
         .unwrap_or(true);
     let wrap_in_binary = wants_fhir_binary(&format, headers);
-    let (content_type, body) = render_output(&format, include_header, &result, wrap_in_binary)?;
+    let (content_type, body) =
+        render_output(&format, include_header, &result, wrap_in_binary, &declared)?;
     Ok(build_response(content_type, body))
 }
 
@@ -337,8 +365,14 @@ fn wants_fhir_binary(format: &str, headers: &HeaderMap) -> bool {
 
 /// Sniff SQL to confirm a single `SELECT`/CTE statement. The spec doesn't
 /// strictly require this but every reference impl rejects DDL/DML here.
+///
+/// Every statement anywhere in the tree (CTE bodies, parenthesised queries,
+/// either side of a set operation, subqueries) must itself be a query, so
+/// `WITH ... INSERT` and `WITH ... UPDATE` are rejected too (#1702).
 pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
-    use sqlparser::ast::Statement;
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{Statement, visit_statements};
     use sqlparser::dialect::SQLiteDialect;
     use sqlparser::parser::Parser;
 
@@ -350,21 +384,27 @@ pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
             message: format!("exactly one SQL statement is required, got {}", stmts.len()),
         });
     }
-    match &stmts[0] {
-        Statement::Query(_) => Ok(()),
-        other => {
-            let keyword = other
+    // Visits `stmts[0]` itself, then every statement nested in it: sqlparser
+    // reads a leading `WITH` through `parse_query`, which wraps a following
+    // INSERT/UPDATE as a `Query` whose body is that statement (#1702).
+    let not_query = visit_statements(&stmts[0], |stmt| match stmt {
+        Statement::Query(_) => ControlFlow::Continue(()),
+        other => ControlFlow::Break(
+            other
                 .to_string()
                 .split_whitespace()
                 .next()
                 .unwrap_or("unknown")
-                .to_uppercase();
-            Err(RestError::BadRequest {
-                message: format!(
-                    "only SELECT queries are allowed; {keyword} statements are not permitted"
-                ),
-            })
-        }
+                .to_uppercase(),
+        ),
+    });
+    match not_query {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(keyword) => Err(RestError::BadRequest {
+            message: format!(
+                "only SELECT queries are allowed; {keyword} statements are not permitted"
+            ),
+        }),
     }
 }
 
@@ -373,6 +413,7 @@ fn render_output(
     include_header: bool,
     result: &QueryResult,
     wrap_in_binary: bool,
+    declared: &[helios_sof::sqlquery::engine::DeclaredColumn],
 ) -> Result<(&'static str, Vec<u8>), RestError> {
     match format {
         "fhir" | "application/fhir+json" => {
@@ -398,11 +439,21 @@ fn render_output(
                     ),
                 }
             })?;
-            let body = helios_sof::format_output(processed, ct, None).map_err(|e| {
-                RestError::InternalError {
-                    message: format!("output formatter failed: {e}"),
-                }
-            })?;
+            let body = helios_sof::format_output_with_schema(processed, ct, None, declared)
+                .map_err(|e| match &e {
+                    // A value that does not fit its declared column type is
+                    // the caller's view/data mismatch: a 422 naming the column.
+                    helios_sof::SofError::ParquetConversionError(msg)
+                        if super::run::declared_misfit_detail(msg).is_some() =>
+                    {
+                        RestError::UnprocessableEntity {
+                            message: msg.clone(),
+                        }
+                    }
+                    _ => RestError::InternalError {
+                        message: format!("output formatter failed: {e}"),
+                    },
+                })?;
             let inner_ct = content_type_for(ct);
             if wrap_in_binary {
                 let bytes = helios_sof::fhir_format::wrap_in_binary_envelope(inner_ct, &body)
@@ -504,6 +555,22 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         SqlQueryError::RowCapExceeded { max } => RestError::UnprocessableEntity {
             message: format!("result exceeds {max}-row limit; add a WHERE/LIMIT clause"),
         },
+        // A WHERE or LIMIT in the query cannot bound a dependency: it is
+        // materialized in full before the query runs. Name the dependency,
+        // the cap and the setting instead (#1473).
+        SqlQueryError::DependencyRowCapExceeded {
+            label,
+            kind,
+            view,
+            max,
+        } => RestError::UnprocessableEntity {
+            message: format!(
+                "dependency '{label}' ({kind} {view}) exceeds {max}-row limit: SQL queries \
+                 materialize each dependency in full before the query's WHERE runs. Narrow the \
+                 dependency with a ViewDefinition 'where', or raise \
+                 HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
+            ),
+        },
         SqlQueryError::Timeout { secs } => RestError::UnprocessableEntity {
             message: format!("query exceeded {secs}s timeout"),
         },
@@ -528,11 +595,22 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         SqlQueryError::SourceStream(msg) => RestError::InternalError {
             message: format!("dependency source failed: {msg}"),
         },
+        // The store could not serve a dependency (an object read out of
+        // attempts, a dropped connection, throttling): transient, so a 503
+        // with `Retry-After` rather than a 500 (#2048).
+        SqlQueryError::SourceUnavailable(msg) => {
+            warn!(error = %msg, "dependency source unavailable during $sql-run");
+            RestError::ServiceUnavailable {
+                message: format!("dependency source unavailable: {msg}"),
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use helios_sof::sqlquery::DependencyKind;
+
     use super::*;
 
     #[test]
@@ -556,5 +634,164 @@ mod tests {
             row_cap.client_response().0,
             StatusCode::UNPROCESSABLE_ENTITY
         );
+    }
+
+    /// #2048: a dependency the store could not serve (an object read that ran
+    /// out of attempts) is a retryable 503 with `Retry-After`, not a 500.
+    #[test]
+    fn an_unavailable_store_is_a_503() {
+        let rest = sqlquery_err_to_rest(SqlQueryError::SourceUnavailable(
+            "dependency failed to materialize: failed to read object body after 3 attempts".into(),
+        ));
+        assert!(
+            matches!(rest, RestError::ServiceUnavailable { .. }),
+            "got {rest:?}"
+        );
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert!(
+            message.contains("after 3 attempts"),
+            "the client needs the reason: {message}"
+        );
+
+        let response =
+            sqlquery_err_to_rest(SqlQueryError::SourceUnavailable("x".into())).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a 503 must carry Retry-After"
+        );
+    }
+
+    /// #1473: a dependency over the per-dependency cap is a 422 whose
+    /// message names the dependency, the cap and the setting, and does not
+    /// advise a WHERE/LIMIT clause (that cannot bound a dependency).
+    #[test]
+    fn dependency_row_cap_maps_to_422_naming_dependency_cap_and_setting() {
+        for (kind, expected) in [
+            (
+                DependencyKind::ViewDefinition,
+                "dependency 'obs' (ViewDefinition observation_flat)",
+            ),
+            (
+                DependencyKind::SqlView,
+                "dependency 'obs' (SQL View observation_flat)",
+            ),
+        ] {
+            let (status, code, message) =
+                sqlquery_err_to_rest(SqlQueryError::DependencyRowCapExceeded {
+                    label: "obs".to_string(),
+                    kind,
+                    view: "observation_flat".to_string(),
+                    max: 7,
+                })
+                .client_response();
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(code, "processing");
+            for needle in [
+                expected,
+                "exceeds 7-row limit",
+                "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+                "ViewDefinition 'where'",
+            ] {
+                assert!(message.contains(needle), "missing {needle:?} in: {message}");
+            }
+            assert!(!message.contains("add a WHERE/LIMIT"), "{message}");
+        }
+    }
+
+    /// The bare engine row cap keeps its own mapping and advice.
+    #[test]
+    fn bare_row_cap_keeps_the_where_limit_advice() {
+        let (status, _, message) =
+            sqlquery_err_to_rest(SqlQueryError::RowCapExceeded { max: 5 }).client_response();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            message,
+            "result exceeds 5-row limit; add a WHERE/LIMIT clause"
+        );
+    }
+
+    /// The 400 message `validate_select_only` returns for `sql`.
+    fn select_only_rejection(sql: &str) -> String {
+        let (status, code, message) = validate_select_only(sql).expect_err(sql).client_response();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}");
+        assert_eq!(code, "invalid", "{sql}");
+        message
+    }
+
+    /// #1702: sqlparser parses `WITH ... INSERT` / `WITH ... UPDATE` as a query whose body is the
+    /// DML statement; it is rejected at any depth with the same wording as a top-level one.
+    #[test]
+    fn select_only_rejects_insert_or_update_nested_in_a_query() {
+        for (sql, keyword) in [
+            (
+                "WITH c AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM c",
+                "INSERT",
+            ),
+            ("WITH c AS (SELECT 1) UPDATE t SET x = 1", "UPDATE"),
+            // CTE body
+            (
+                "WITH c AS (INSERT INTO t VALUES (1)) SELECT * FROM c",
+                "INSERT",
+            ),
+            // parenthesised query
+            ("(WITH c AS (SELECT 1) UPDATE t SET x = 1)", "UPDATE"),
+            // either side of a set operation
+            (
+                "(WITH c AS (SELECT 1) INSERT INTO t SELECT 1) UNION ALL SELECT 1",
+                "INSERT",
+            ),
+            (
+                "SELECT 1 UNION ALL (WITH c AS (SELECT 1) UPDATE t SET x = 1)",
+                "UPDATE",
+            ),
+            // derived table and expression subquery
+            (
+                "SELECT * FROM (WITH c AS (SELECT 1) INSERT INTO t SELECT 1)",
+                "INSERT",
+            ),
+            (
+                "SELECT 1 WHERE EXISTS (WITH c AS (SELECT 1) UPDATE t SET x = 1)",
+                "UPDATE",
+            ),
+        ] {
+            assert_eq!(
+                select_only_rejection(sql),
+                format!("only SELECT queries are allowed; {keyword} statements are not permitted"),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Queries without a nested write are still accepted, and the existing rejections keep their wording.
+    #[test]
+    fn select_only_keeps_existing_accepts_and_rejections() {
+        for sql in [
+            "SELECT 1",
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+            "SELECT a FROM t UNION ALL SELECT a FROM u",
+            "SELECT * FROM (SELECT 1 AS a) s WHERE EXISTS (SELECT 1) AND s.a IN (SELECT 1)",
+            "SELECT 'INSERT INTO t VALUES (1)' AS s",
+        ] {
+            assert!(validate_select_only(sql).is_ok(), "{sql}");
+        }
+        assert_eq!(
+            select_only_rejection("DELETE FROM t"),
+            "only SELECT queries are allowed; DELETE statements are not permitted"
+        );
+        assert_eq!(
+            select_only_rejection("DROP TABLE t"),
+            "only SELECT queries are allowed; DROP statements are not permitted"
+        );
+        assert_eq!(
+            select_only_rejection("SELECT 1; SELECT 2"),
+            "exactly one SQL statement is required, got 2"
+        );
+        let msg = select_only_rejection("WITH c AS (SELECT 1) DELETE FROM t");
+        assert!(msg.starts_with("SQL parse error"), "{msg}");
     }
 }

@@ -6,38 +6,45 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use helios_fhir::FhirVersion;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::BufReader;
 
 use crate::backends::s3::backend::S3Backend;
 use crate::backends::s3::client::{
-    ListObjectItem, ListObjectsResult, ObjectData, ObjectMetadata, S3Api, S3ClientError,
+    DelimitedListPage, ListObjectItem, ListObjectsResult, ObjectData, ObjectMetadata, S3Api,
+    S3ClientError,
 };
 use crate::backends::s3::config::{S3BackendConfig, S3TenancyMode};
 use crate::backends::s3::keyspace::S3Keyspace;
 use crate::backends::s3::user_settings::settings_object_id;
-use crate::core::bulk_export::{ExportDataProvider, ExportRequest};
+use crate::core::bulk_export::{ExportDataProvider, ExportRequest, PatientExportProvider};
 use crate::core::bulk_submit::{
-    BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
-    StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
+    BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
+    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, CancelToken, NdjsonEntry,
+    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionStatus, UnindexedEntry,
 };
 use crate::core::history::{
-    HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+    HistoryPage, HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use crate::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
 use crate::core::user_settings::SettingsStore;
-use crate::core::{Backend, BackendCapability, ResourceStorage, VersionedStorage};
+use crate::core::{
+    Backend, BackendCapability, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,
+    PresenceBasis, ResourceStorage, TenantDataEvidence, TenantDiscovery, VersionedStorage,
+};
 use crate::error::{
     BackendError, BulkSubmitError, ConcurrencyError, ResourceError, SearchError, StorageError,
     TenantError, TransactionError,
 };
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
-use crate::types::{CursorValue, PageCursor, Pagination, PaginationMode};
+use crate::types::{CursorValue, PageCursor, Pagination, PaginationMode, StoredResource};
 
 /// An in-memory representation of a single S3 object.
 #[derive(Debug, Clone)]
@@ -62,6 +69,20 @@ struct RecordedPut {
     if_none_match: Option<String>,
 }
 
+/// One LIST request the mock received, recorded so tests can assert the exact
+/// shape and number of round trips (#1672).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedList {
+    /// The `prefix` listed.
+    prefix: String,
+    /// The delimiter, for a delimited listing.
+    delimiter: Option<String>,
+    /// The `StartAfter` key, if any.
+    start_after: Option<String>,
+    /// The `MaxKeys` bound, if any.
+    max_keys: Option<i32>,
+}
+
 /// A one-shot "thief" run at the start of a `put_object` call, *before* its
 /// preconditions are evaluated, simulating a concurrent writer that lands between
 /// a caller's read and its write. This is what makes the compare-and-swap retry
@@ -79,11 +100,34 @@ struct MockState {
     etag_counter: u64,
     /// Total number of `put_object` calls received.
     put_count: u64,
+    /// Total number of `get_object` calls received.
+    get_count: u64,
+    /// Total number of LIST requests received: one per `list_objects` and
+    /// `list_common_prefixes_page` call, and one per 1,000-entry page an
+    /// exhaustive `list_common_prefixes` call would take on real S3.
+    list_count: u64,
+    /// Every LIST call received, in order.
+    recorded_lists: Vec<RecordedList>,
+    /// LIST calls on exactly these prefixes fail with the given error, simulating
+    /// a permission or transport failure on one listing.
+    failing_list_prefixes: HashMap<String, S3ClientError>,
+    /// `get_object` calls on exactly these keys fail with the given error,
+    /// simulating a GET whose body could not be read (#2048). Opt-in: a key not
+    /// listed here reads as before.
+    failing_get_keys: HashMap<String, S3ClientError>,
+    /// `list_objects` on exactly these prefixes first returns this many empty
+    /// pages that are still truncated, as S3 can over a run of delete markers
+    /// on a versioned bucket, before the real listing.
+    empty_truncated_pages: HashMap<String, usize>,
     /// When true, all `delete_object` calls return an internal error.
     fail_deletes: bool,
     /// When true, every `put_object` fails its precondition, simulating a writer
     /// that loses the compare-and-swap race on every attempt.
     fail_all_puts_with_precondition: bool,
+    /// Conditional `put_object` calls on exactly these keys fail with
+    /// `ConditionalConflict` (AWS 409) this many more times, without writing
+    /// (#2047).
+    conflicting_puts: HashMap<String, usize>,
     /// Preconditions carried by each `put_object` call, in order.
     recorded_puts: Vec<RecordedPut>,
     /// A [`StealHook`] to run before the next `put_object` evaluates its
@@ -150,8 +194,94 @@ impl MockS3Client {
     }
 
     /// Total number of `put_object` calls received so far.
+    /// Raw body of one stored object, for tests that re-key an object.
+    fn object_body(&self, bucket: &str, key: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .unwrap()
+            .objects
+            .get(&(bucket.to_string(), key.to_string()))
+            .map(|o| o.body.clone())
+    }
+
     fn put_count(&self) -> u64 {
         self.state.lock().unwrap().put_count
+    }
+
+    fn get_count(&self) -> u64 {
+        self.state.lock().unwrap().get_count
+    }
+
+    fn list_count(&self) -> u64 {
+        self.state.lock().unwrap().list_count
+    }
+
+    /// Every LIST call received so far, in order.
+    fn recorded_lists(&self) -> Vec<RecordedList> {
+        self.state.lock().unwrap().recorded_lists.clone()
+    }
+
+    /// Makes every subsequent LIST call on exactly `prefix` fail with `error`.
+    fn fail_lists_at(&self, prefix: &str, error: S3ClientError) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_list_prefixes
+            .insert(prefix.to_string(), error);
+    }
+
+    /// Makes every subsequent `get_object` call on exactly `key` fail with
+    /// `error`.
+    fn fail_gets_at(&self, key: &str, error: S3ClientError) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_get_keys
+            .insert(key.to_string(), error);
+    }
+
+    /// Makes every subsequent `list_objects` call on exactly `prefix` return
+    /// `pages` empty, truncated pages before the real listing.
+    fn empty_truncated_pages_at(&self, prefix: &str, pages: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .empty_truncated_pages
+            .insert(prefix.to_string(), pages);
+    }
+
+    /// Stores tiny objects at `keys` directly, without counting or recording
+    /// puts: seeds thousands of keys in the real layout cheaply.
+    fn seed_keys<I, K>(&self, bucket: &str, keys: I)
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        let mut state = self.state.lock().unwrap();
+        for key in keys {
+            state.etag_counter += 1;
+            let etag = format!("etag-{}", state.etag_counter);
+            state.objects.insert(
+                (bucket.to_string(), key.into()),
+                MockObject {
+                    body: b"{}".to_vec(),
+                    etag,
+                    last_modified: Utc::now(),
+                },
+            );
+        }
+    }
+
+    /// Records one LIST call and returns the injected failure for its prefix,
+    /// if any.
+    fn record_list(state: &mut MockState, list: RecordedList) -> Result<(), S3ClientError> {
+        state.list_count += 1;
+        let failure = state.failing_list_prefixes.get(&list.prefix).cloned();
+        state.recorded_lists.push(list);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// The preconditions carried by every `put_object` call so far, in order.
@@ -163,6 +293,19 @@ impl MockS3Client {
     /// writer that loses the compare-and-swap race on every single attempt.
     fn fail_all_puts_with_precondition(&self) {
         self.state.lock().unwrap().fail_all_puts_with_precondition = true;
+    }
+
+    /// Makes the next `times` *conditional* `put_object` calls on exactly `key`
+    /// fail with `ConditionalConflict` (AWS `409 ConditionalRequestConflict`)
+    /// without writing; `usize::MAX` means always (#2047). Unconditional puts
+    /// never consume the count. The conflicting calls are still counted and
+    /// recorded.
+    fn conflict_puts_at(&self, key: &str, times: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .conflicting_puts
+            .insert(key.to_string(), times);
     }
 
     /// Arranges for a concurrent writer to overwrite `key` with `body` exactly
@@ -238,9 +381,13 @@ impl S3Api for MockS3Client {
         bucket: &str,
         key: &str,
     ) -> Result<Option<ObjectData>, S3ClientError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.get_count += 1;
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
+        if let Some(error) = state.failing_get_keys.get(key).cloned() {
+            return Err(error);
         }
         Ok(state
             .objects
@@ -283,6 +430,21 @@ impl S3Api for MockS3Client {
         // ETag is now stale correctly sees `PreconditionFailed`.
         if let Some(steal) = state.steal_hook.take() {
             steal(&mut state);
+        }
+
+        // A conflicting conditional write in flight on this key (#2047): S3
+        // answers 409 and writes nothing. Only conditional puts are refused.
+        let conditional = if_match.is_some() || if_none_match.is_some();
+        if conditional
+            && let Some(remaining) = state.conflicting_puts.get_mut(key)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Err(S3ClientError::ConditionalConflict(
+                "A conflicting conditional operation is currently in progress against this \
+                 resource. Try again."
+                    .to_string(),
+            ));
         }
 
         let entry_key = (bucket.to_string(), key.to_string());
@@ -335,12 +497,40 @@ impl S3Api for MockS3Client {
         continuation: Option<&str>,
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        Self::record_list(
+            &mut state,
+            RecordedList {
+                prefix: prefix.to_string(),
+                delimiter: None,
+                start_after: None,
+                max_keys,
+            },
+        )?;
         // Faithful to S3: listing a bucket that does not exist is `NoSuchBucket`,
         // not an empty listing. Otherwise a misconfigured bucket would report zero
         // objects, and `count` would confidently answer "no resources".
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
+        // Leading empty-but-truncated pages: tokens `empty-<served>` walk
+        // through them, and the real listing starts after the last one.
+        let empty_pages = state
+            .empty_truncated_pages
+            .get(prefix)
+            .copied()
+            .unwrap_or(0);
+        let served = match continuation {
+            None => Some(0),
+            Some(token) => token
+                .strip_prefix("empty-")
+                .map(|n| n.parse::<usize>().expect("mock token")),
+        };
+        if let Some(served) = served.filter(|served| *served < empty_pages) {
+            return Ok(ListObjectsResult {
+                items: Vec::new(),
+                next_continuation_token: Some(format!("empty-{}", served + 1)),
+            });
         }
         let mut keys = state
             .objects
@@ -382,7 +572,16 @@ impl S3Api for MockS3Client {
         prefix: &str,
         delimiter: &str,
     ) -> Result<Vec<String>, S3ClientError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        Self::record_list(
+            &mut state,
+            RecordedList {
+                prefix: prefix.to_string(),
+                delimiter: Some(delimiter.to_string()),
+                start_after: None,
+                max_keys: None,
+            },
+        )?;
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
         }
@@ -398,7 +597,76 @@ impl S3Api for MockS3Client {
             .collect();
         prefixes.sort();
         prefixes.dedup();
+        // The real client follows continuation to exhaustion: one request per
+        // 1,000 groups, and the one above already counted the first.
+        state.list_count += (prefixes.len().saturating_sub(1) / 1000) as u64;
         Ok(prefixes)
+    }
+
+    /// Faithful to `ListObjectsV2` with a delimiter: `start_after` filters
+    /// *keys*, so a group is listed again when any of its keys sorts after
+    /// `start_after`, and `max_keys` bounds groups and objects together.
+    async fn list_common_prefixes_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        start_after: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<DelimitedListPage, S3ClientError> {
+        let mut state = self.state.lock().unwrap();
+        Self::record_list(
+            &mut state,
+            RecordedList {
+                prefix: prefix.to_string(),
+                delimiter: Some(delimiter.to_string()),
+                start_after: start_after.map(str::to_string),
+                max_keys,
+            },
+        )?;
+        if !state.buckets.contains(bucket) {
+            return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
+        let mut keys: Vec<(&String, &MockObject)> = state
+            .objects
+            .iter()
+            .filter(|((b, key), _)| {
+                b == bucket
+                    && key.starts_with(prefix)
+                    && start_after.is_none_or(|after| key.as_str() > after)
+            })
+            .map(|((_, key), object)| (key, object))
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(b.0));
+
+        let limit = max_keys.unwrap_or(1000).max(1) as usize;
+        let mut page = DelimitedListPage::default();
+        let mut entries = 0;
+        for (key, object) in keys {
+            let rest = &key[prefix.len()..];
+            let group = rest
+                .split_once(delimiter)
+                .map(|(segment, _)| format!("{prefix}{segment}{delimiter}"));
+            // Keys of one group are contiguous in key order.
+            if group.is_some() && page.common_prefixes.last() == group.as_ref() {
+                continue;
+            }
+            if entries == limit {
+                page.is_truncated = true;
+                break;
+            }
+            entries += 1;
+            match group {
+                Some(group) => page.common_prefixes.push(group),
+                None => page.items.push(ListObjectItem {
+                    key: key.clone(),
+                    etag: Some(object.etag.clone()),
+                    last_modified: Some(object.last_modified),
+                    size: object.body.len() as i64,
+                }),
+            }
+        }
+        Ok(page)
     }
 }
 
@@ -437,6 +705,82 @@ fn make_bucket_backend(mock: Arc<MockS3Client>) -> S3Backend {
 /// Creates a full-access `TenantContext` for the given tenant ID string.
 fn tenant(id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
+}
+
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[test]
+fn configured_fhir_version_controls_sof_compartment() {
+    // Generated FHIR resource deserialization needs a larger stack in debug
+    // builds. Give the runner's blocking engine thread room without requiring
+    // a process-wide RUST_MIN_STACK setting for this regression test.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("test runtime")
+        .block_on(async {
+            use crate::core::sof_runner::ViewFilters;
+
+            for version in [FhirVersion::R4, FhirVersion::R5] {
+                let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])))
+                    .with_fhir_version(version);
+                let tenant = tenant("sof-version");
+                for patient in ["p1", "p2"] {
+                    backend
+                        .create(
+                            &tenant,
+                            "Patient",
+                            json!({"resourceType":"Patient", "id":patient}),
+                            version,
+                        )
+                        .await
+                        .expect("seed supporting patient");
+                    backend.create(&tenant, "Task", json!({"resourceType":"Task", "id":format!("task-{patient}"),
+                        "status":"requested", "intent":"order", "for":{"reference":format!("Patient/{patient}")}}), version)
+                        .await.expect("seed task");
+                }
+                // The runner clones the backend for scanning and resolving references;
+                // constructing it from a clone must retain the configured version too.
+                let runner = backend.clone().sof_runner().expect("runner");
+                let view = json!({"resourceType":"ViewDefinition", "resource":"Task", "status":"active",
+                    "select":[{"column":[{"path":"id", "name":"task_id"}]}]});
+                let unfiltered = runner
+                    .run_view(&tenant, view.clone(), ViewFilters::default())
+                    .await
+                    .expect("run unfiltered view")
+                    .collect::<Vec<_>>()
+                    .await;
+                assert_eq!(unfiltered.len(), 2);
+                for row in unfiltered {
+                    row.expect("unfiltered row");
+                }
+                let mut stream = runner
+                    .run_view(
+                        &tenant,
+                        view,
+                        ViewFilters {
+                            patient: vec!["Patient/p1".into()],
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("run filtered view");
+                let mut ids = Vec::new();
+                while let Some(row) = stream.next().await {
+                    ids.push(
+                        row.expect("filtered row")["task_id"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                }
+                if version == FhirVersion::R5 {
+                    assert_eq!(ids, ["task-p1"]);
+                } else {
+                    assert!(ids.is_empty());
+                }
+            }
+        });
 }
 
 #[tokio::test]
@@ -832,6 +1176,269 @@ async fn history_instance_type_system_and_invalid_cursor() {
     ));
 }
 
+#[tokio::test]
+async fn type_history_reads_only_the_requested_page() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    for i in 0..12 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("p{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // Event keys carry the time in milliseconds; keep them distinct.
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    let params = HistoryParams {
+        pagination: Pagination {
+            count: 3,
+            mode: PaginationMode::Offset(0),
+        },
+        ..HistoryParams::new().include_deleted(true)
+    };
+
+    let gets_before = mock.get_count();
+    let page = backend
+        .history_type(&tenant, "Patient", &params)
+        .await
+        .unwrap();
+    let gets = mock.get_count() - gets_before;
+
+    assert_eq!(page.items.len(), 3);
+    assert_eq!(page.page_info.total, Some(12));
+    assert!(page.page_info.has_next);
+    let ids: Vec<&str> = page.items.iter().map(|e| e.resource.id()).collect();
+    assert_eq!(ids, ["p11", "p10", "p9"]);
+    // Two GETs (event + snapshot) per entry on the page, none for the other 9.
+    assert_eq!(gets, 6);
+
+    let gets_before = mock.get_count();
+    let system = backend.history_system(&tenant, &params).await.unwrap();
+    assert_eq!(system.items.len(), 3);
+    assert_eq!(mock.get_count() - gets_before, 6);
+}
+
+/// Creates `n` Patients a few milliseconds apart so every history event key
+/// carries a distinct millisecond, and returns them in creation order.
+async fn create_spaced_patients(
+    backend: &S3Backend,
+    tenant: &TenantContext,
+    n: usize,
+) -> Vec<StoredResource> {
+    let mut created = Vec::with_capacity(n);
+    for i in 0..n {
+        created.push(
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    created
+}
+
+fn history_page_params(count: u32, offset: u32) -> HistoryParams {
+    HistoryParams {
+        pagination: Pagination {
+            count,
+            mode: PaginationMode::Offset(offset),
+        },
+        ..HistoryParams::new().include_deleted(true)
+    }
+}
+
+fn history_ids(page: &HistoryPage) -> Vec<&str> {
+    page.items.iter().map(|e| e.resource.id()).collect()
+}
+
+/// `_since` / `before` are decided from the event key: only the events in the
+/// millisecond a bound falls in have their index body read, and only the page
+/// has its snapshots read (#1356).
+#[tokio::test]
+async fn system_history_since_and_before_window_from_the_keys() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let created = create_spaced_patients(&backend, &tenant, 12).await;
+
+    // `since` is p6's exact timestamp: p6 is in (>=), p0..p5 are out.
+    let params = HistoryParams {
+        since: Some(created[6].last_modified()),
+        ..history_page_params(3, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    let gets = mock.get_count() - gets_before;
+    assert_eq!(history_ids(&page), ["p11", "p10", "p9"]);
+    assert_eq!(page.page_info.total, Some(6));
+    assert!(page.page_info.has_next);
+    // p6's index body (the boundary millisecond) plus event + snapshot for the
+    // three entries on the page; nothing for the five excluded by key.
+    assert_eq!(gets, 1 + 2 * 3);
+
+    // One nanosecond later than p6's timestamp excludes it — the sub-millisecond
+    // part is only in the body, so this is what the boundary read is for.
+    let params = HistoryParams {
+        since: Some(created[6].last_modified() + chrono::Duration::nanoseconds(1)),
+        ..history_page_params(10, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    assert_eq!(page.page_info.total, Some(5));
+    assert_eq!(history_ids(&page), ["p11", "p10", "p9", "p8", "p7"]);
+    assert_eq!(mock.get_count() - gets_before, 1 + 2 * 5);
+
+    // A window: `before` is exclusive, so p9 is out and p6..p8 remain. Both
+    // boundary bodies are read, then the page.
+    let params = HistoryParams {
+        since: Some(created[6].last_modified()),
+        before: Some(created[9].last_modified()),
+        ..history_page_params(2, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    assert_eq!(page.page_info.total, Some(3));
+    assert_eq!(history_ids(&page), ["p8", "p7"]);
+    assert!(page.page_info.has_next);
+    // p6 (boundary, kept) costs 1 GET for its body and p9 (boundary, dropped)
+    // costs 1; the page's two entries cost 2 each.
+    assert_eq!(mock.get_count() - gets_before, 2 + 2 * 2);
+
+    // Second page of the window: the kept boundary entry p6 is on it, and its
+    // body was already read, so it costs one GET (the snapshot) and p7
+    // costs none since it is off the page.
+    let params = HistoryParams {
+        since: Some(created[6].last_modified()),
+        before: Some(created[9].last_modified()),
+        ..history_page_params(2, 2)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    assert_eq!(history_ids(&page), ["p6"]);
+    assert!(!page.page_info.has_next);
+    assert!(page.page_info.has_previous);
+    assert_eq!(mock.get_count() - gets_before, 2 + 1);
+
+    // A window nothing falls into reads nothing at all.
+    let params = HistoryParams {
+        since: Some(created[11].last_modified() + chrono::Duration::seconds(1)),
+        ..history_page_params(10, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    assert!(page.items.is_empty());
+    assert_eq!(page.page_info.total, Some(0));
+    assert_eq!(mock.get_count() - gets_before, 0);
+}
+
+/// Excluding deletes needs the delete flag, which is only in the index body:
+/// every event in the window has that small body read, but version snapshots
+/// are fetched for the page alone (#1356).
+#[tokio::test]
+async fn system_history_without_deletes_reads_snapshots_only_for_the_page() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    create_spaced_patients(&backend, &tenant, 6).await;
+    for id in ["p0", "p1"] {
+        backend.delete(&tenant, "Patient", id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    let params = HistoryParams {
+        include_deleted: false,
+        ..history_page_params(2, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    let gets = mock.get_count() - gets_before;
+
+    // The two deletes are the newest events and are dropped; total counts the
+    // six creates.
+    assert_eq!(history_ids(&page), ["p5", "p4"]);
+    assert_eq!(page.page_info.total, Some(6));
+    assert!(page.page_info.has_next);
+    // Eight index bodies (one per event) and two snapshots (the page).
+    assert_eq!(gets, 8 + 2);
+
+    // With deletes included the key decides everything: two GETs per entry on
+    // the page, nothing else.
+    let gets_before = mock.get_count();
+    let page = backend
+        .history_system(&tenant, &history_page_params(2, 0))
+        .await
+        .unwrap();
+    assert_eq!(history_ids(&page), ["p1", "p0"]);
+    assert_eq!(page.page_info.total, Some(8));
+    assert_eq!(mock.get_count() - gets_before, 2 * 2);
+}
+
+/// An event whose key does not start with a millisecond timestamp still takes
+/// part in the feed: it is ordered by the timestamp in its body, and the rest of
+/// the feed is still paged from the keys.
+#[tokio::test]
+async fn system_history_orders_an_unparseable_event_key_by_its_body() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let created = create_spaced_patients(&backend, &tenant, 4).await;
+
+    // Rewrite p1's two system/type index events under a key without the
+    // millisecond prefix.
+    let location = backend.resource_location(&tenant).await.unwrap();
+    let system_prefix = location.keyspace.history_system_prefix().unwrap();
+    let p1_key = mock
+        .keys("test-bucket")
+        .into_iter()
+        .find(|k| k.starts_with(&system_prefix) && k.contains("_Patient_p1_"))
+        .unwrap();
+    let body = mock.object_body("test-bucket", &p1_key).unwrap();
+    mock.delete_object("test-bucket", &p1_key).await.unwrap();
+    mock.put_object(
+        "test-bucket",
+        &format!("{system_prefix}legacy-p1.json"),
+        body,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let gets_before = mock.get_count();
+    let page = backend
+        .history_system(&tenant, &history_page_params(10, 0))
+        .await
+        .unwrap();
+    assert_eq!(history_ids(&page), ["p3", "p2", "p1", "p0"]);
+    assert_eq!(page.items[2].timestamp, created[1].last_modified());
+    assert_eq!(page.page_info.total, Some(4));
+    // p1's body was read once up front and not again for the page.
+    assert_eq!(mock.get_count() - gets_before, 1 + 2 * 3 + 1);
+
+    // Off the page it costs only the body read that orders it.
+    let gets_before = mock.get_count();
+    let page = backend
+        .history_system(&tenant, &history_page_params(2, 0))
+        .await
+        .unwrap();
+    assert_eq!(history_ids(&page), ["p3", "p2"]);
+    assert_eq!(mock.get_count() - gets_before, 1 + 2 * 2);
+}
+
 // The three `bundle_transaction_*` tests were removed here.
 //
 // They covered `S3Backend::process_transaction`'s happy path, its
@@ -895,6 +1502,250 @@ async fn bulk_export_fetch_batch_cursor() {
     assert!(batch2.is_last);
 }
 
+/// A full export walks the type once: the key cursor resumes after the last
+/// line (no repeats, no losses, deleted resources skipped), each batch reads
+/// only the objects it needs instead of the whole type (the sweep used to be
+/// O(n²/batch) GETs), and a legacy numeric cursor still pages correctly.
+#[tokio::test]
+async fn bulk_export_key_cursor_reads_each_object_once() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    for i in 0..20 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("p{i:02}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend.delete(&tenant, "Patient", "p05").await.unwrap();
+
+    let request = ExportRequest::system();
+    let gets_before = mock.get_count();
+    let mut cursor: Option<String> = None;
+    let mut ids = Vec::new();
+    loop {
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", cursor.as_deref(), 4)
+            .await
+            .unwrap();
+        for line in &batch.lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            ids.push(v["id"].as_str().unwrap().to_string());
+        }
+        if batch.is_last {
+            break;
+        }
+        assert!(
+            batch.next_cursor.as_deref().unwrap().starts_with("k:"),
+            "key cursor, not an offset"
+        );
+        cursor = batch.next_cursor;
+    }
+    let gets = mock.get_count() - gets_before;
+
+    let mut expected: Vec<String> = (0..20)
+        .filter(|i| *i != 5)
+        .map(|i| format!("p{i:02}"))
+        .collect();
+    expected.sort();
+    assert_eq!(ids, expected, "every live resource once, in key order");
+    // 19 live + 1 deleted object, plus at most one look-ahead object per
+    // batch; the old per-batch full walk cost 20 GETs on each of 5 batches.
+    assert!(gets <= 20 + 5, "{gets} GETs for a 20-object type");
+
+    // Legacy offset cursor (an export job started before the upgrade).
+    let legacy = backend
+        .fetch_export_batch(&tenant, &request, "Patient", Some("4"), 4)
+        .await
+        .unwrap();
+    assert_eq!(legacy.lines.len(), 4);
+    assert_eq!(legacy.next_cursor.as_deref(), Some("8"));
+}
+
+/// #1273: every exported NDJSON line carries the server's `meta.versionId`
+/// and `meta.lastUpdated` (the same `meta` a read returns) while keeping
+/// client-supplied `meta` members, on both the type-level and the
+/// patient-compartment export paths.
+#[tokio::test]
+async fn bulk_export_lines_carry_server_meta() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    // Compartment membership is decided from the CompartmentDefinition (#1122),
+    // and a bare `S3Backend` carries no spec parameters, so the Observation
+    // compartment would be empty without loading them first.
+    {
+        let loader = crate::search::SearchParameterLoader::new(FhirVersion::default());
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let mut registry = backend.tenant_registries().base().write();
+        for param in loader.load_embedded().unwrap() {
+            let _ = registry.register(param);
+        }
+        for param in loader.load_from_spec_file(&data_dir).unwrap() {
+            let _ = registry.register(param);
+        }
+    }
+    let tag = json!({"system": "http://example.org/tags", "code": "keep-me"});
+
+    let created = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1", "meta": {"tag": [tag.clone()]}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let updated = backend
+        .update(
+            &tenant,
+            &created,
+            json!({
+                "resourceType": "Patient",
+                "id": "p1",
+                "meta": {"tag": [tag.clone()]},
+                "active": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.version_id(), "2");
+    let observation = backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "o1",
+                "status": "final",
+                "code": {"text": "x"},
+                "subject": {"reference": "Patient/p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let assert_meta = |line: &str, version: &str, stored: &crate::types::StoredResource| {
+        let value: Value = serde_json::from_str(line).expect("NDJSON line is JSON");
+        let meta = &value["meta"];
+        assert_eq!(meta["versionId"], version, "line: {line}");
+        let last_updated = meta["lastUpdated"].as_str().expect("meta.lastUpdated");
+        assert_eq!(
+            last_updated,
+            stored
+                .last_modified()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "line: {line}"
+        );
+        assert!(last_updated.ends_with('Z'), "UTC with Z: {last_updated}");
+        assert_eq!(meta, &stored.content_with_meta()["meta"], "line: {line}");
+    };
+    let only_line = |lines: &[String]| {
+        assert_eq!(lines.len(), 1, "lines: {lines:?}");
+        lines[0].clone()
+    };
+
+    let request = ExportRequest::system();
+    let patient_line = only_line(
+        &backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&patient_line, "2", &updated);
+    let patient_json: Value = serde_json::from_str(&patient_line).unwrap();
+    assert_eq!(patient_json["meta"]["tag"], json!([tag.clone()]));
+    let obs_line = only_line(
+        &backend
+            .fetch_export_batch(&tenant, &request, "Observation", None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&obs_line, "1", &observation);
+
+    let request = ExportRequest::patient();
+    let patients = vec!["p1".to_string()];
+    let patient_line = only_line(
+        &backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &patients, None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&patient_line, "2", &updated);
+    let patient_json: Value = serde_json::from_str(&patient_line).unwrap();
+    assert_eq!(patient_json["meta"]["tag"], json!([tag]));
+    let obs_line = only_line(
+        &backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Observation", &patients, None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&obs_line, "1", &observation);
+}
+
+/// #1558: the REST kick-off marks a submission complete right after
+/// registering its manifest when the client said submissionStatus=completed;
+/// the manifest must still ingest, and only new manifests are refused.
+#[tokio::test]
+async fn bulk_submit_completed_at_kickoff_still_ingests_its_manifest() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let submission_id = SubmissionId::new("http://example.org|smoke", "smoke-1");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+    backend
+        .complete_submission(&tenant, &submission_id)
+        .await
+        .unwrap();
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            vec![
+                NdjsonEntry::new(1, "Patient", json!({"resourceType":"Patient","id":"c1"})),
+                NdjsonEntry::new(2, "Patient", json!({"resourceType":"Patient","id":"c2"})),
+            ],
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .expect("a completed submission still ingests the manifests it registered");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.is_success()));
+
+    let refused = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(StorageError::BulkSubmit(
+                BulkSubmitError::InvalidState { .. }
+            ))
+        ),
+        "no new manifest after completion: {refused:?}"
+    );
+}
+
 #[tokio::test]
 async fn bulk_submit_lifecycle_and_processing() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
@@ -938,11 +1789,906 @@ async fn bulk_submit_lifecycle_and_processing() {
     assert_eq!(counts.total, 2);
     assert_eq!(counts.success, 2);
 
-    let completed = backend
+    backend
         .complete_submission(&tenant, &submission_id)
         .await
         .unwrap();
+    let completed = backend
+        .get_submission(&tenant, &submission_id)
+        .await
+        .unwrap()
+        .expect("the completed submission still exists");
     assert_eq!(completed.status, SubmissionStatus::Complete);
+}
+
+/// With no per-entry error cap, entries ingest with bounded concurrency to
+/// overlap their PUT latencies (#945). However the writes interleave, every
+/// entry must be written and the receipts must stay in input (line) order.
+#[tokio::test]
+async fn bulk_submit_concurrent_ingest_preserves_order_and_writes_all() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-conc");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=20)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+            )
+        })
+        .collect();
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            // Default options: max_errors == 0, so the concurrent path runs.
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 20);
+    assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+    // Receipts stay in input order despite the concurrent writes.
+    let lines: Vec<u64> = results.iter().map(|r| r.line_number).collect();
+    assert_eq!(lines, (1..=20).collect::<Vec<u64>>());
+
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!((counts.total, counts.success), (20, 20));
+
+    // Every resource is actually stored.
+    for i in 1..=20 {
+        let read = backend
+            .read(&tenant, "Patient", &format!("p{i}"))
+            .await
+            .unwrap();
+        assert!(read.is_some(), "Patient/p{i} should be stored");
+    }
+}
+
+/// The raw NDJSON archive is one object per batch holding every line (#1429),
+/// not one PUT per entry — the coalescing that drops a PUT per resource.
+#[tokio::test]
+async fn bulk_submit_raw_archive_is_one_object_per_batch() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-raw");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=3)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("r{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    let raw_puts = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/raw/"))
+        .count();
+    assert_eq!(
+        raw_puts, 1,
+        "the three-entry batch must archive its raw NDJSON in one object, not three"
+    );
+
+    // The resources themselves are still all stored.
+    for i in 1..=3 {
+        assert!(
+            backend
+                .read(&tenant, "Patient", &format!("r{i}"))
+                .await
+                .unwrap()
+                .is_some(),
+            "Patient/r{i} should be stored"
+        );
+    }
+}
+
+/// A batch records its rollback changes in one coalesced object, not one PUT
+/// per resource, and `list_changes` still reads every change back (#1429).
+#[tokio::test]
+async fn bulk_submit_change_log_is_one_object_per_batch() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-changes");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=3)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("c{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    let change_puts = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/changes/"))
+        .count();
+    assert_eq!(
+        change_puts, 1,
+        "the three-entry batch must record its changes in one object, not three"
+    );
+
+    let changes = backend
+        .list_changes(&tenant, &submission_id, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.len(),
+        3,
+        "all three changes must be readable back from the coalesced object"
+    );
+}
+
+/// #1429: an ingest batch writes its receipts as one object under `results/`,
+/// not one per line, and the receipt page, counts, and status manifest read the
+/// same set back.
+#[tokio::test]
+async fn bulk_submit_receipts_are_one_object_per_batch() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // Three good lines and one whose resourceType does not match its entry —
+    // a validation-error receipt — so the batch carries both outcomes.
+    let mut entries: Vec<NdjsonEntry> = (1..=3)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("r{i}")}),
+            )
+        })
+        .collect();
+    entries.push(NdjsonEntry::new(
+        4,
+        "Patient",
+        json!({"resourceType": "Observation", "id": "wrong-type"}),
+    ));
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new().with_file_url("http://files/Patient.ndjson"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 4);
+
+    let receipt_puts: Vec<_> = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/results/"))
+        .collect();
+    assert_eq!(
+        receipt_puts.len(),
+        1,
+        "the four-entry batch must write its receipts in one object, not four"
+    );
+    assert!(
+        receipt_puts[0]
+            .key
+            .ends_with("/batch-00000000000000000001.json"),
+        "keyed by the batch's first line: {}",
+        receipt_puts[0].key
+    );
+
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (counts.total, counts.success, counts.validation_error),
+        (4, 3, 1)
+    );
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut lines: Vec<u64> = page.entries.iter().map(|e| e.result.line_number).collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        vec![1, 2, 3, 4],
+        "every receipt of the batch reads back"
+    );
+    let errors = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            Some(BulkEntryOutcome::ValidationError),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(errors.entries.len(), 1);
+    assert_eq!(errors.entries[0].result.line_number, 4);
+
+    backend
+        .complete_submission(&tenant, &submission_id)
+        .await
+        .unwrap();
+    let summary = backend
+        .get_submission(&tenant, &submission_id)
+        .await
+        .unwrap()
+        .expect("submission");
+    assert_eq!(summary.status, SubmissionStatus::Complete);
+    assert_eq!(
+        (
+            summary.total_entries,
+            summary.success_count,
+            summary.error_count
+        ),
+        (4, 3, 1)
+    );
+}
+
+/// The `results/` readers accept both shapes: a coalesced batch array (#1429)
+/// and a legacy per-line receipt object.
+#[tokio::test]
+async fn bulk_submit_receipts_read_batch_and_legacy_objects() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-mixed");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=2)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("b{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    // A legacy per-line receipt, as the ingest wrote them before #1429.
+    let location = backend.tenant_location(&tenant).unwrap();
+    let legacy_key = location.keyspace.submit_result_line_key(
+        &submission_id.submitter,
+        &submission_id.submission_id,
+        &manifest.manifest_id,
+        None,
+        7,
+    );
+    let legacy = BulkEntryResult::success(7, "Patient", "legacy-7", true);
+    backend
+        .put_json_object(
+            &location.bucket,
+            &legacy_key,
+            &serde_json::to_vec(&legacy).unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = page
+        .entries
+        .iter()
+        .filter_map(|e| e.result.resource_id.clone())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["b1", "b2", "legacy-7"]);
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.success, 3);
+}
+
+/// `mark_entries_unindexed` on a coalesced receipt object flips only the
+/// receipts that match, rewrites the object once, and leaves it readable.
+#[tokio::test]
+async fn bulk_submit_unindexed_marking_rewrites_the_receipt_batch_in_place() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-mark");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=4)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("u{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    let puts_before = mock.recorded_puts().len();
+
+    let outcome = json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "exception", "diagnostics": "index write failed"}]});
+    let affected = backend
+        .mark_entries_unindexed(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            &[
+                UnindexedEntry {
+                    resource_type: "Patient".to_string(),
+                    resource_id: "u2".to_string(),
+                    operation_outcome: outcome.clone(),
+                },
+                UnindexedEntry {
+                    resource_type: "Patient".to_string(),
+                    resource_id: "u4".to_string(),
+                    operation_outcome: outcome.clone(),
+                },
+                UnindexedEntry {
+                    resource_type: "Observation".to_string(),
+                    resource_id: "u1".to_string(),
+                    operation_outcome: outcome,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 2, "two receipts match; u1 is a different type");
+    let puts_after = mock.recorded_puts();
+    let receipt_rewrites: Vec<_> = puts_after[puts_before..]
+        .iter()
+        .filter(|put| put.key.contains("/results/"))
+        .collect();
+    assert_eq!(
+        receipt_rewrites.len(),
+        1,
+        "the batch object is rewritten once, not once per receipt"
+    );
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.entries.len(),
+        4,
+        "the rewritten batch still holds all four"
+    );
+    for e in &page.entries {
+        let id = e.result.resource_id.as_deref().unwrap();
+        let flipped = e.result.outcome == BulkEntryOutcome::ProcessingError;
+        assert_eq!(flipped, matches!(id, "u2" | "u4"), "{id}");
+        assert_eq!(e.result.operation_outcome.is_some(), flipped, "{id}");
+    }
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!((counts.success, counts.processing_error), (2, 2));
+}
+
+/// With a per-entry error cap the batch runs serially and, past the cap, the
+/// remaining entries are skipped; the skips ride the same receipt object and
+/// the counts close.
+#[tokio::test]
+async fn bulk_submit_receipt_batch_carries_the_max_errors_skips() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-skips");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // Line 1 good, line 2 a validation error (hits the cap of 1), lines 3-4
+    // skipped.
+    let entries = vec![
+        NdjsonEntry::new(1, "Patient", json!({"resourceType": "Patient", "id": "s1"})),
+        NdjsonEntry::new(
+            2,
+            "Patient",
+            json!({"resourceType": "Observation", "id": "bad"}),
+        ),
+        NdjsonEntry::new(3, "Patient", json!({"resourceType": "Patient", "id": "s3"})),
+        NdjsonEntry::new(4, "Patient", json!({"resourceType": "Patient", "id": "s4"})),
+    ];
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new()
+                .with_max_errors(1)
+                .with_continue_on_error(true),
+        )
+        .await
+        .unwrap();
+    let outcomes: Vec<BulkEntryOutcome> = results.iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            BulkEntryOutcome::Success,
+            BulkEntryOutcome::ValidationError,
+            BulkEntryOutcome::Skipped,
+            BulkEntryOutcome::Skipped
+        ]
+    );
+    assert_eq!(
+        mock.recorded_puts()
+            .iter()
+            .filter(|put| put.key.contains("/results/"))
+            .count(),
+        1
+    );
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            counts.total,
+            counts.success,
+            counts.validation_error,
+            counts.skipped
+        ),
+        (4, 1, 1, 2)
+    );
+    let skipped = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            Some(BulkEntryOutcome::Skipped),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut lines: Vec<u64> = skipped
+        .entries
+        .iter()
+        .map(|e| e.result.line_number)
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec![3, 4]);
+}
+
+/// Two files of one manifest both start at line 1; their receipt batches are
+/// discriminated by `file_url` (#457) so neither overwrites the other.
+#[tokio::test]
+async fn bulk_submit_receipt_batches_are_kept_apart_per_file() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-files");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    for (file, id) in [
+        ("http://files/a.ndjson", "fa"),
+        ("http://files/b.ndjson", "fb"),
+    ] {
+        backend
+            .process_entries(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                )],
+                &BulkProcessingOptions::new().with_file_url(file),
+            )
+            .await
+            .unwrap();
+    }
+    let keys: HashSet<String> = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/results/"))
+        .map(|put| put.key)
+        .collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "one distinct batch object per file: {keys:?}"
+    );
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.success, 2, "both files' line-1 receipts survive");
+}
+
+/// `load_changes` reads both shapes under the `changes/` prefix: the coalesced
+/// batch array (#1429) and a legacy single-change object — such as one the
+/// rollback trait's `record_change` still writes for composite backends.
+#[tokio::test]
+async fn bulk_submit_change_log_reads_batch_and_legacy_objects() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-mixed");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // A batch writes the coalesced array form.
+    let entries: Vec<NdjsonEntry> = (1..=2)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("m{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    // A single change written through the trait method takes the legacy shape.
+    let legacy = SubmissionChange::create(&manifest.manifest_id, "Observation", "legacy-1", "1");
+    backend
+        .record_change(&tenant, &submission_id, &legacy)
+        .await
+        .unwrap();
+
+    let changes = backend
+        .list_changes(&tenant, &submission_id, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.len(),
+        3,
+        "both the two-change batch object and the one legacy object must be read"
+    );
+    assert!(
+        changes.iter().any(|c| c.resource_id == "legacy-1"),
+        "the legacy single-change object must be read back"
+    );
+    assert!(
+        changes.iter().any(|c| c.resource_id == "m1"),
+        "the coalesced batch changes must be read back"
+    );
+}
+
+/// A batch with two entries for the same resource id is order-dependent
+/// (last write wins), so it ingests serially even with concurrency enabled —
+/// the concurrent path would race them to a non-deterministic result (#945).
+#[tokio::test]
+async fn bulk_submit_same_id_entries_stay_ordered() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-dup");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // Same id, different content: the second entry must be the one that lands.
+    let entries = vec![
+        NdjsonEntry::new(
+            1,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "dup", "gender": "male"}),
+        ),
+        NdjsonEntry::new(
+            2,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "dup", "gender": "female"}),
+        ),
+    ];
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+
+    let stored = backend
+        .read(&tenant, "Patient", "dup")
+        .await
+        .unwrap()
+        .expect("the resource is stored");
+    assert_eq!(
+        stored.content()["gender"],
+        "female",
+        "the last write in the batch must win"
+    );
+}
+
+/// The receipt step walks a manifest's result objects once (#1715).
+///
+/// Each page used to list and read every result object of the manifest, sort
+/// all of its receipts and slice 1,000 of them — 9.65 M receipts took ~210 h.
+/// With more than one listing page of objects (1,040 two-entry batches across
+/// two files), every receipt comes back exactly once, in line order within its
+/// file, and a 1,000-entry page reads only the ~500 objects that hold it.
+#[tokio::test]
+async fn bulk_submit_receipt_pages_walk_the_result_objects_once() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let submission_id = SubmissionId::new("client-a", "sub-single-pass");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    const FILES: [&str; 2] = ["http://provider/a.ndjson", "http://provider/b.ndjson"];
+    const BATCHES_PER_FILE: u64 = 520;
+    for (f, file) in FILES.iter().enumerate() {
+        for batch in 0..BATCHES_PER_FILE {
+            let first = batch * 2 + 1;
+            let entries = (first..first + 2)
+                .map(|line| {
+                    NdjsonEntry::new(
+                        line,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": format!("f{f}-{line:05}")}),
+                    )
+                })
+                .collect();
+            backend
+                .process_entries(
+                    &tenant,
+                    &submission_id,
+                    &manifest.manifest_id,
+                    entries,
+                    &BulkProcessingOptions::new().with_file_url(*file),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let total = (FILES.len() as u64 * BATCHES_PER_FILE * 2) as usize;
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut next = None;
+    let mut pages = 0;
+    loop {
+        let gets_before = mock.get_count();
+        let page = backend
+            .get_entry_results_page(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                None,
+                1000,
+                next.as_ref(),
+            )
+            .await
+            .unwrap();
+        let gets = mock.get_count() - gets_before;
+        assert!(
+            gets <= 501,
+            "page {pages} read {gets} objects for {} receipts",
+            page.entries.len()
+        );
+        seen.extend(
+            page.entries
+                .into_iter()
+                .filter_map(|entry| entry.result.resource_id),
+        );
+        pages += 1;
+        next = page.next;
+        if next.is_none() {
+            break;
+        }
+        assert!(pages < 10, "the traversal must terminate");
+    }
+    assert_eq!(seen.len(), total, "every receipt exactly once");
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), total, "no receipt twice");
+    for f in 0..FILES.len() {
+        let prefix = format!("f{f}-");
+        let in_file: Vec<&String> = seen.iter().filter(|id| id.starts_with(&prefix)).collect();
+        assert!(
+            in_file.windows(2).all(|w| w[0] < w[1]),
+            "file {f} comes back in line order"
+        );
+    }
+
+    // A filter that matches nothing still walks to the end and terminates.
+    let none = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            Some(BulkEntryOutcome::ValidationError),
+            1000,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(none.entries.is_empty());
+    assert!(none.next.is_none());
+
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.success as usize, total);
 }
 
 /// Two output files of one manifest, both starting at line 1, must each keep
@@ -1041,9 +2787,9 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
         );
         next = page.next;
         if page_index < 2 {
-            assert_eq!(
-                next,
-                Some(crate::core::EntryResultContinuation::Offset(page_index + 1))
+            assert!(
+                matches!(next, Some(crate::core::EntryResultContinuation::Listing(_))),
+                "{next:?}"
             );
         } else {
             assert!(
@@ -1066,6 +2812,20 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
             )
             .await
             .is_err()
+    );
+    assert!(
+        backend
+            .get_entry_results_page(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                None,
+                1,
+                Some(&crate::core::EntryResultContinuation::Offset(1))
+            )
+            .await
+            .is_err(),
+        "the offset traversal is gone (#1715)"
     );
     assert!(
         backend
@@ -1113,18 +2873,19 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
         .await
         .unwrap();
     assert!(delegated.entries[0].stored_identity.is_none());
-    assert_eq!(
+    assert!(matches!(
         delegated.next,
-        Some(crate::core::EntryResultContinuation::Offset(1))
-    );
+        Some(crate::core::EntryResultContinuation::Listing(_))
+    ));
 
     // The raw NDJSON archive is discriminated too, so the auditable copy of the
-    // first file's payload is not replaced by the second's.
+    // first file's payload is not replaced by the second's. Coalesced to one
+    // batch object per file (#1429), keyed by the batch's first line.
     let raw_keys: Vec<String> = mock
         .recorded_puts()
         .into_iter()
         .map(|put| put.key)
-        .filter(|key| key.contains("/raw/") && key.ends_with("line-1.ndjson"))
+        .filter(|key| key.contains("/raw/") && key.ends_with("batch-1.ndjson"))
         .collect();
     assert_eq!(raw_keys.len(), 2, "one raw archive put per file");
     assert_ne!(
@@ -1295,6 +3056,120 @@ async fn bulk_submit_stream_and_parallel_manifests_max_errors() {
     assert!(r2.is_ok());
 }
 
+/// Wraps a reader so that `token` is tripped the first time the ingest actually
+/// reads from the stream.
+///
+/// That makes "cancelled mid-manifest" deterministic: the pre-loop check still
+/// sees an un-cancelled token, the first batch is read and committed, and the
+/// between-batches check then sees the cancellation — no sleeps, no races.
+struct CancelOnFirstRead<R> {
+    inner: R,
+    token: CancelToken,
+    tripped: bool,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CancelOnFirstRead<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.tripped {
+            this.tripped = true;
+            this.token.cancel();
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+/// #968: the S3 ingest loop honours the cancel token, both before it starts and
+/// between committed batches.
+#[tokio::test]
+async fn bulk_submit_stream_honours_cancellation() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-cancel", "sub-cancel");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let early = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+    let midway = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let lines: Vec<u8> = (1..=6)
+        .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"s3-cancel-{i}\"}}\n"))
+        .collect::<String>()
+        .into_bytes();
+
+    // Already cancelled when the ingest starts: nothing is read or written.
+    let tripped = CancelToken::new();
+    tripped.cancel();
+    let result = backend
+        .process_ndjson_stream(
+            &tenant,
+            &submission_id,
+            &early.manifest_id,
+            "Patient",
+            Box::new(BufReader::new(Cursor::new(lines.clone()))),
+            &BulkProcessingOptions::new()
+                .with_batch_size(2)
+                .with_cancel(tripped),
+        )
+        .await
+        .unwrap();
+    assert!(result.aborted);
+    assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+    assert_eq!(result.lines_processed, 0);
+    assert_eq!(result.counts.total, 0);
+
+    // Cancelled while streaming: the batch already committed survives, the rest
+    // is never read.
+    let cancel = CancelToken::new();
+    let result = backend
+        .process_ndjson_stream(
+            &tenant,
+            &submission_id,
+            &midway.manifest_id,
+            "Patient",
+            Box::new(BufReader::new(CancelOnFirstRead {
+                inner: Cursor::new(lines),
+                token: cancel.clone(),
+                tripped: false,
+            })),
+            &BulkProcessingOptions::new()
+                .with_batch_size(2)
+                .with_cancel(cancel),
+        )
+        .await
+        .unwrap();
+    assert!(result.aborted);
+    assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+    assert_eq!(result.counts.success, 2, "the committed batch is kept");
+    assert_eq!(result.lines_processed, 2, "the rest was never read");
+    assert!(
+        backend
+            .read(&tenant, "Patient", "s3-cancel-2")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend
+            .read(&tenant, "Patient", "s3-cancel-3")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn tenancy_prefix_and_bucket_modes() {
     let prefix_mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
@@ -1377,8 +3252,86 @@ async fn tenancy_prefix_and_bucket_modes() {
 
     assert!(matches!(
         missing,
-        Err(StorageError::Tenant(TenantError::InvalidTenant { .. }))
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
     ));
+}
+
+/// The map is the provisioning in bucket-per-tenant mode. Registering a tenant
+/// the map does not know would leave a registry record for a tenant whose
+/// every request fails `UnmappedTenant`; the mint point refuses it with the
+/// same error, and the registry stays in step with the map (#1598).
+#[tokio::test]
+async fn bucket_mode_register_tenant_refuses_an_unmapped_tenant() {
+    let mock = Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ]));
+    let backend = make_bucket_backend(mock.clone());
+
+    let refused = backend.register_tenant("tenant-c", Some("Unmapped")).await;
+    assert!(
+        matches!(
+            refused,
+            Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+        ),
+        "unexpected: {refused:?}"
+    );
+    assert!(backend.get_tenant("tenant-c").await.unwrap().is_none());
+    assert_eq!(
+        mock.bucket_object_count("system-bucket"),
+        0,
+        "a refused registration must write nothing"
+    );
+
+    // A mapped tenant still registers, into the system bucket.
+    let record = backend.register_tenant("tenant-a", None).await.unwrap();
+    assert_eq!(record.id, "tenant-a");
+    assert_eq!(backend.get_tenant("tenant-a").await.unwrap(), Some(record));
+}
+
+/// A tenant the map does not name is refused before the "no registry" answer:
+/// without a system bucket the registry is unsupported, but an unmapped tenant
+/// is unmapped either way, and the more specific error wins.
+#[tokio::test]
+async fn bucket_mode_unmapped_tenant_is_refused_even_without_a_registry() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["bucket-a"]));
+    let mut tenant_bucket_map = HashMap::new();
+    tenant_bucket_map.insert("tenant-a".to_string(), "bucket-a".to_string());
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map,
+            default_system_bucket: None,
+        },
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend = S3Backend::with_client(config, mock).expect("backend");
+
+    assert!(matches!(
+        backend.register_tenant("tenant-c", None).await,
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+    ));
+    assert!(matches!(
+        backend.register_tenant("tenant-a", None).await,
+        Err(StorageError::Backend(
+            BackendError::UnsupportedCapability { .. }
+        ))
+    ));
+}
+
+/// `mapped_tenants` is what the binary provisions at startup: the map's keys,
+/// sorted so the registration order (and its log lines) is stable across boots.
+#[test]
+fn mapped_tenants_lists_the_bucket_map_sorted_and_is_empty_in_prefix_mode() {
+    let bucket_backend = make_bucket_backend(Arc::new(MockS3Client::with_buckets(&[])));
+    assert_eq!(
+        bucket_backend.mapped_tenants(),
+        vec!["tenant-a", "tenant-b"]
+    );
+
+    let prefix_backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&[])));
+    assert!(prefix_backend.mapped_tenants().is_empty());
 }
 
 #[tokio::test]
@@ -1424,6 +3377,501 @@ async fn tenant_registry_register_duplicate_fails() {
         duplicate,
         Err(StorageError::Backend(BackendError::QueryError { .. }))
     ));
+}
+
+/// #1228: standalone S3 has no search, which left the SQL Views, SQL Queries
+/// and SQL Export pages empty and every canonical unresolvable. It lists the
+/// SQL-on-FHIR definition types by scan — and nothing else: a filter, or a
+/// clinical type, still answers `UnsupportedCapability`.
+#[tokio::test]
+async fn definition_types_list_by_scan_and_everything_else_stays_unsupported() {
+    use crate::core::search::SearchProvider;
+    use crate::types::{SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue};
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    for (id, url) in [
+        ("vd-1", "http://example.org/vd-1"),
+        ("vd-2", "http://example.org/vd-2"),
+    ] {
+        backend
+            .create(
+                &t,
+                "ViewDefinition",
+                json!({"resourceType": "ViewDefinition", "id": id, "url": url, "resource": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create ViewDefinition");
+    }
+    backend
+        .create(
+            &t,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create Patient");
+
+    // The plain listing of a definition type is served, with a total.
+    let listed = backend
+        .search(&t, &SearchQuery::new("ViewDefinition"))
+        .await
+        .expect("definition listing");
+    assert_eq!(listed.total, Some(2));
+    let mut ids: Vec<&str> = listed.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["vd-1", "vd-2"]);
+
+    // `_count` bounds the page without changing the total.
+    let mut first = SearchQuery::new("ViewDefinition");
+    first.count = Some(1);
+    let page = backend.search(&t, &first).await.expect("bounded listing");
+    assert_eq!(page.resources.items.len(), 1);
+    assert_eq!(page.total, Some(2));
+    assert!(!page.resources.page_info.has_previous);
+    assert!(
+        page.resources.page_info.has_next,
+        "a short page points at the next (#1821)"
+    );
+
+    // `_offset` walks past the first page; the two pages cover both ids once.
+    let mut second = SearchQuery::new("ViewDefinition");
+    second.count = Some(1);
+    second.offset = Some(1);
+    let rest = backend.search(&t, &second).await.expect("offset listing");
+    assert_eq!(rest.resources.items.len(), 1);
+    assert!(rest.resources.page_info.has_previous);
+    assert!(
+        !rest.resources.page_info.has_next,
+        "the last page has no next"
+    );
+    assert_ne!(rest.resources.items[0].id(), page.resources.items[0].id());
+
+    // Past the end: an empty page that still reports the total.
+    let mut beyond = SearchQuery::new("ViewDefinition");
+    beyond.offset = Some(5);
+    let empty = backend
+        .search(&t, &beyond)
+        .await
+        .expect("listing beyond the end");
+    assert!(empty.resources.items.is_empty());
+    assert_eq!(empty.total, Some(2));
+
+    // Another tenant sees none of it.
+    let other = backend
+        .search(&tenant("tenant-b"), &SearchQuery::new("ViewDefinition"))
+        .await
+        .expect("listing");
+    assert_eq!(other.total, Some(0));
+
+    // A filter is a search, and S3 still has none — for the same type too.
+    let mut filtered = SearchQuery::new("ViewDefinition");
+    filtered.parameters.push(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: None,
+        values: vec![SearchValue::new(
+            SearchPrefix::Eq,
+            "http://example.org/vd-1",
+        )],
+        chain: Vec::new(),
+        components: Vec::new(),
+    });
+    for query in [filtered, SearchQuery::new("Patient")] {
+        assert!(
+            matches!(
+                backend.search(&t, &query).await,
+                Err(StorageError::Backend(
+                    BackendError::UnsupportedCapability { .. }
+                ))
+            ),
+            "{} must stay unsupported on standalone S3",
+            query.resource_type
+        );
+    }
+}
+
+/// #1821: the conformance types the Search Parameters and Compartments pages
+/// list are served by scan too, so those pages work on standalone S3.
+#[tokio::test]
+async fn conformance_types_list_by_scan() {
+    use crate::core::search::SearchProvider;
+    use crate::types::SearchQuery;
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    backend
+        .create(
+            &t,
+            "SearchParameter",
+            json!({"resourceType": "SearchParameter", "id": "sp-1", "url": "http://example.org/sp-1",
+                "code": "local", "base": ["Patient"], "type": "token", "expression": "Patient.id", "status": "active"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create SearchParameter");
+    backend
+        .create(
+            &t,
+            "CompartmentDefinition",
+            json!({"resourceType": "CompartmentDefinition", "id": "cd-1", "url": "http://example.org/cd-1",
+                "code": "Patient", "search": true, "status": "active"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create CompartmentDefinition");
+
+    for (resource_type, id) in [
+        ("SearchParameter", "sp-1"),
+        ("CompartmentDefinition", "cd-1"),
+    ] {
+        let listed = backend
+            .search(&t, &SearchQuery::new(resource_type))
+            .await
+            .unwrap_or_else(|e| panic!("{resource_type} listing: {e}"));
+        assert_eq!(listed.total, Some(1), "{resource_type}");
+        assert_eq!(listed.resources.items[0].id(), id);
+    }
+}
+
+/// #1228: the hook the REST layer uses to resolve canonicals without search.
+#[tokio::test]
+async fn resource_scan_hook_returns_the_tenants_live_resources() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    backend
+        .create(
+            &t,
+            "Library",
+            json!({"resourceType": "Library", "id": "lib-1", "url": "http://example.org/Library/lib-1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create Library");
+    backend
+        .create(
+            &t,
+            "Library",
+            json!({"resourceType": "Library", "id": "gone", "url": "http://example.org/Library/gone"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create Library");
+    backend.delete(&t, "Library", "gone").await.expect("delete");
+
+    let scan = backend
+        .resource_scan()
+        .expect("standalone S3 resolves canonicals by scan");
+    let libraries: Vec<Value> = scan
+        .scan_resources(&t, "Library")
+        .await
+        .expect("scan")
+        .map(|r| r.expect("scanned resource"))
+        .collect()
+        .await;
+    let urls: Vec<&str> = libraries
+        .iter()
+        .filter_map(|r| r.get("url").and_then(|u| u.as_str()))
+        .collect();
+    assert_eq!(urls, ["http://example.org/Library/lib-1"]);
+
+    let other_tenant: Vec<Value> = scan
+        .scan_resources(&tenant("tenant-b"), "Library")
+        .await
+        .expect("scan")
+        .map(|r| r.expect("scanned resource"))
+        .collect()
+        .await;
+    assert!(other_tenant.is_empty());
+}
+
+/// Repeated scans of a type do not read its delete tombstones again: the
+/// second scan GETs only the live resource, and a recreated id is read anew.
+#[tokio::test]
+async fn repeated_scans_skip_known_tombstones() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    for id in ["live", "gone-1", "gone-2"] {
+        backend
+            .create(
+                &t,
+                "Library",
+                json!({"resourceType": "Library", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Library");
+    }
+    backend
+        .delete(&t, "Library", "gone-1")
+        .await
+        .expect("delete");
+    backend
+        .delete(&t, "Library", "gone-2")
+        .await
+        .expect("delete");
+
+    let scan = backend.resource_scan().expect("scan hook");
+    let ids = |scan: &Arc<dyn crate::sof::in_process::ResourceScan>| {
+        let scan = scan.clone();
+        let t = t.clone();
+        async move {
+            let mut ids: Vec<String> = scan
+                .scan_resources(&t, "Library")
+                .await
+                .expect("scan")
+                .map(|r| {
+                    r.expect("scanned resource")["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+                .await;
+            ids.sort();
+            ids
+        }
+    };
+
+    // First scan reads all three objects and learns the two tombstones.
+    let before = mock.get_count();
+    assert_eq!(ids(&scan).await, ["live"]);
+    assert_eq!(mock.get_count() - before, 3);
+
+    // Second scan reads only the live one.
+    let before = mock.get_count();
+    assert_eq!(ids(&scan).await, ["live"]);
+    assert_eq!(mock.get_count() - before, 1);
+
+    // Writing a deleted id again rewrites its pointer, so it is read and returned.
+    backend
+        .create_or_update(
+            &t,
+            "Library",
+            "gone-1",
+            json!({"resourceType": "Library", "id": "gone-1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("recreate");
+    assert_eq!(ids(&scan).await, ["gone-1", "live"]);
+}
+
+/// #1823: the in-process SQL-on-FHIR scan lists the type one page at a time
+/// as it is read. The first resource arrives after a single LIST, so a
+/// consumer that stops early (a cancelled export) stops the listing too, and
+/// reading to the end still yields every resource across the pages.
+#[tokio::test]
+async fn the_resource_scan_lists_one_page_at_a_time() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    const RESOURCES: usize = 1_203;
+    for i in 0..RESOURCES {
+        backend
+            .create(
+                &t,
+                "Observation",
+                json!({"resourceType": "Observation", "id": format!("o{i:05}"), "status": "final"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Observation");
+    }
+    let scan = backend
+        .resource_scan()
+        .expect("standalone S3 scans for the in-process runner");
+
+    let lists_before = mock.list_count();
+    let mut first = scan.scan_resources(&t, "Observation").await.expect("scan");
+    first
+        .next()
+        .await
+        .expect("a first resource")
+        .expect("scanned resource");
+    assert_eq!(
+        mock.list_count() - lists_before,
+        1,
+        "the first resource needs one LIST page, not the whole type"
+    );
+    drop(first);
+
+    let lists_before = mock.list_count();
+    let all: Vec<Value> = scan
+        .scan_resources(&t, "Observation")
+        .await
+        .expect("scan")
+        .map(|r| r.expect("scanned resource"))
+        .collect()
+        .await;
+    assert_eq!(all.len(), RESOURCES, "every resource, across the pages");
+    assert!(
+        mock.list_count() - lists_before > 1,
+        "the type spans several LIST pages"
+    );
+}
+
+/// Creates Patients `p1` and `p2` and returns the backend, the mock, the tenant
+/// and the S3 key of `p1`'s `current.json`, for the object-read failure tests.
+async fn two_patients_for_scan() -> (S3Backend, Arc<MockS3Client>, TenantContext, String) {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    for id in ["p1", "p2"] {
+        backend
+            .create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Patient");
+    }
+    let p1_key = mock
+        .keys("test-bucket")
+        .into_iter()
+        .find(|key| key.ends_with("/Patient/p1/current.json"))
+        .expect("p1's current.json key");
+    (backend, mock, t, p1_key)
+}
+
+/// #2048: an object whose read is unavailable (the S3 client has already retried
+/// a failed body read) ends the scan with an `Unavailable` error, so the REST
+/// layer answers 503 rather than 500.
+#[tokio::test]
+async fn a_scan_whose_object_read_is_unavailable_fails_as_unavailable() {
+    use crate::core::sof_runner::SofError;
+
+    let (backend, mock, t, p1_key) = two_patients_for_scan().await;
+    mock.fail_gets_at(
+        &p1_key,
+        S3ClientError::Unavailable(
+            "failed to read object body after 3 attempts: streaming error".to_string(),
+        ),
+    );
+
+    let results: Vec<Result<Value, SofError>> = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan")
+        .scan_resources(&t, "Patient")
+        .await
+        .expect("scan")
+        .collect()
+        .await;
+
+    let error = results
+        .into_iter()
+        .find_map(Result::err)
+        .expect("the unreadable object fails the scan");
+    match error {
+        SofError::Unavailable(message) => {
+            assert!(message.contains("after 3 attempts"), "message: {message}")
+        }
+        other => panic!("expected SofError::Unavailable, got {other:?}"),
+    }
+}
+
+/// #2048: an object read that fails for any other reason is still a server fault
+/// (500), not a retryable 503.
+#[tokio::test]
+async fn a_scan_whose_object_read_fails_internally_stays_a_storage_error() {
+    use crate::core::sof_runner::SofError;
+
+    let (backend, mock, t, p1_key) = two_patients_for_scan().await;
+    mock.fail_gets_at(&p1_key, S3ClientError::Internal("boom".to_string()));
+
+    let results: Vec<Result<Value, SofError>> = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan")
+        .scan_resources(&t, "Patient")
+        .await
+        .expect("scan")
+        .collect()
+        .await;
+
+    let error = results
+        .into_iter()
+        .find_map(Result::err)
+        .expect("the failing object fails the scan");
+    assert!(
+        matches!(error, SofError::Storage(_)),
+        "expected SofError::Storage, got {error:?}"
+    );
+}
+
+/// #2048: the by-id read reports an unavailable object as unavailable too.
+#[tokio::test]
+async fn read_resources_reports_an_unavailable_object_as_unavailable() {
+    use crate::core::sof_runner::SofError;
+
+    let (backend, mock, t, p1_key) = two_patients_for_scan().await;
+    mock.fail_gets_at(
+        &p1_key,
+        S3ClientError::Unavailable("failed to read object body".to_string()),
+    );
+
+    let error = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan")
+        .read_resources(&t, "Patient", &["p1".to_string()])
+        .await
+        .expect_err("the unreadable object fails the read");
+    assert!(
+        matches!(error, SofError::Unavailable(_)),
+        "expected SofError::Unavailable, got {error:?}"
+    );
+}
+
+/// #1453: the by-id half of the scan hook. The in-process SoF runner uses it
+/// to build a compartment filter without draining the Patient/Group
+/// collections, so it must fetch exactly the ids asked for, skip deleted and
+/// absent ones, and stay tenant-scoped.
+#[tokio::test]
+async fn resource_scan_reads_named_resources_by_id() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    for id in ["p1", "p2", "gone"] {
+        backend
+            .create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Patient");
+    }
+    backend.delete(&t, "Patient", "gone").await.expect("delete");
+
+    let scan = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan");
+    let ids = ["p1", "gone", "absent"].map(str::to_string);
+
+    let found = scan
+        .read_resources(&t, "Patient", &ids)
+        .await
+        .expect("read by id");
+    let mut found_ids: Vec<&str> = found
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+        .collect();
+    found_ids.sort();
+    assert_eq!(
+        found_ids,
+        ["p1"],
+        "only the live, named resource is returned"
+    );
+
+    let other_tenant = scan
+        .read_resources(&tenant("tenant-b"), "Patient", &ids)
+        .await
+        .expect("read by id");
+    assert!(other_tenant.is_empty(), "reads must not cross tenants");
 }
 
 #[tokio::test]
@@ -2290,7 +4738,7 @@ async fn settings_key_is_tenant_independent_and_outside_the_fhir_keyspace() {
     // relies on — it does NOT depend on tenant-ID validation.
     let hostile = keyspace.with_tenant_prefix("_system.user-settings");
     assert!(!key.starts_with(&hostile.resources_prefix()));
-    assert!(!key.starts_with(&hostile.history_type_prefix("Patient")));
+    assert!(!key.starts_with(&hostile.history_root_prefix()));
     let benign = keyspace.with_tenant_prefix("default");
     assert!(!key.starts_with(&benign.resources_prefix()));
 }
@@ -2705,6 +5153,7 @@ async fn list_tenants_survives_tenants_named_after_control_plane_namespaces() {
         "history",
         "bulk",
         "_system.user-settings",
+        "_system.login-sessions",
     ] {
         let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
         let backend = make_prefix_backend(mock);
@@ -2851,6 +5300,1054 @@ async fn count_by_tenant_discovers_data_without_registration() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1672 — tenant discovery: presence without exhaustive counts
+// ---------------------------------------------------------------------------
+
+/// Presence evidence, the only kind S3 discovery reports.
+fn present() -> TenantDataEvidence {
+    TenantDataEvidence::Present {
+        basis: PresenceBasis::ResourceObjects,
+    }
+}
+
+/// The discovered ids, in the order the backend reported them.
+fn discovered_ids(discovery: &TenantDiscovery) -> Vec<String> {
+    discovery.tenants.iter().map(|t| t.id.clone()).collect()
+}
+
+/// A request limited to `max_requests` LIST round trips.
+fn budget(max_requests: u32, resume: Option<DiscoveryCursor>) -> DiscoveryRequest {
+    DiscoveryRequest {
+        max_requests: NonZeroU32::new(max_requests),
+        resume,
+    }
+}
+
+async fn create_patient(backend: &S3Backend, tenant_id: &str, id: &str) {
+    backend
+        .create(
+            &tenant(tenant_id),
+            "Patient",
+            json!({"resourceType":"Patient","id":id}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+}
+
+/// Raw keys for `resources` resources of one tenant in the real layout: the
+/// current pointer, one history version and the two history index events, so
+/// four objects per resource as a single create writes.
+fn tenant_resource_keys(segment_prefix: &str, resources: usize) -> Vec<String> {
+    (0..resources)
+        .flat_map(|i| {
+            [
+                format!("{segment_prefix}resources/Patient/p{i:05}/current.json"),
+                format!("{segment_prefix}resources/Patient/p{i:05}/_history/1.json"),
+                format!("{segment_prefix}history/type/Patient/1700000000000_p{i:05}_1.json"),
+                format!("{segment_prefix}history/system/1700000000000_Patient_p{i:05}_1.json"),
+            ]
+        })
+        .collect()
+}
+
+/// The LIST calls recorded since `before` (an index into `recorded_lists`).
+fn lists_since(mock: &MockS3Client, before: usize) -> Vec<RecordedList> {
+    mock.recorded_lists()[before..].to_vec()
+}
+
+/// Live, updated and tombstoned data, unregistered data and tombstone-only
+/// data are all present; a registered tenant with no data is not; and no
+/// number is ever reported.
+#[tokio::test]
+async fn discover_tenants_reports_presence_without_counts() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+
+    // tenant-a: live, updated and deleted resources.
+    let a = tenant("tenant-a");
+    create_patient(&backend, "tenant-a", "p1").await;
+    create_patient(&backend, "tenant-a", "p2").await;
+    let p2 = backend.read(&a, "Patient", "p2").await.unwrap().unwrap();
+    backend
+        .update(
+            &a,
+            &p2,
+            json!({"resourceType":"Patient","id":"p2","active":true}),
+        )
+        .await
+        .unwrap();
+    create_patient(&backend, "tenant-a", "p3").await;
+    backend.delete(&a, "Patient", "p3").await.unwrap();
+    // tenant-b: data with no registration.
+    create_patient(&backend, "tenant-b", "q1").await;
+    // tenant-c: registered, no data.
+    backend.register_tenant("tenant-c", None).await.unwrap();
+    // tenant-d: only a delete tombstone left.
+    create_patient(&backend, "tenant-d", "r1").await;
+    backend
+        .delete(&tenant("tenant-d"), "Patient", "r1")
+        .await
+        .unwrap();
+
+    let gets_before = mock.get_count();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(
+        discovered_ids(&discovery),
+        vec!["tenant-a", "tenant-b", "tenant-d"]
+    );
+    assert!(
+        discovery.tenants.iter().all(|t| t.evidence == present()),
+        "presence is never reported as a count: {:?}",
+        discovery.tenants
+    );
+    assert_eq!(mock.get_count(), gets_before, "discovery issues no GETs");
+}
+
+/// #330 through the new seam: deregistering keeps the data discoverable until
+/// it is purged.
+#[tokio::test]
+async fn discover_tenants_survives_deregistration_until_purge() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    backend.register_tenant("acme", None).await.unwrap();
+    create_patient(&backend, "acme", "p1").await;
+    assert!(backend.deregister_tenant("acme").await.unwrap());
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovered_ids(&discovery), vec!["acme"]);
+
+    backend.purge_tenant_data("acme").await.unwrap();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert!(discovery.tenants.is_empty(), "{:?}", discovery.tenants);
+}
+
+/// The registry and the control-plane groups never surface as tenants, and
+/// the exclusion is structural (no `resources/` subtree), not by name: legacy
+/// tenants literally named after those namespaces are still found.
+#[tokio::test]
+async fn discover_tenants_excludes_control_plane_groups_structurally() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+
+    backend.register_tenant("acme", None).await.unwrap();
+    backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    mock.seed_keys(
+        "test-bucket",
+        [
+            "_system.bulk-submit/queue/tenant-a/s1.json",
+            "_system.login-sessions/session/abc.json",
+            "tenants/stray-object.json",
+        ],
+    );
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert!(
+        discovery.tenants.is_empty(),
+        "control-plane groups must not become tenants: {:?}",
+        discovery.tenants
+    );
+
+    // A tenant named after a namespace writes under `<name>/resources/`.
+    for hostile in ["tenants", "_system.user-settings", "_system.bulk-submit"] {
+        create_patient(&backend, hostile, "p1").await;
+    }
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        discovered_ids(&discovery),
+        vec!["_system.bulk-submit", "_system.user-settings", "tenants"]
+    );
+}
+
+/// The work is one delimiter page plus one `MaxKeys=1` probe per group, the
+/// same for 10 or 2,000 resources per tenant; `count_by_tenant` (unchanged)
+/// pages through every object instead.
+#[tokio::test]
+async fn discover_tenants_does_not_walk_resource_pages() {
+    let mut discovery_lists = Vec::new();
+    for resources in [10, 2_000] {
+        let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+        for t in ["tenant-a", "tenant-b", "tenant-c"] {
+            mock.seed_keys(
+                "test-bucket",
+                tenant_resource_keys(&format!("{t}/"), resources),
+            );
+        }
+        let backend = make_prefix_backend(mock.clone());
+
+        let before = mock.recorded_lists().len();
+        let discovery = backend
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .unwrap();
+        let lists = lists_since(&mock, before);
+        assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+        assert_eq!(
+            discovered_ids(&discovery),
+            vec!["tenant-a", "tenant-b", "tenant-c"]
+        );
+        assert_eq!(
+            lists[0],
+            RecordedList {
+                prefix: String::new(),
+                delimiter: Some("/".to_string()),
+                start_after: None,
+                max_keys: Some(1000),
+            }
+        );
+        for (probe, t) in lists[1..].iter().zip(["tenant-a", "tenant-b", "tenant-c"]) {
+            assert_eq!(
+                probe,
+                &RecordedList {
+                    prefix: format!("{t}/resources/"),
+                    delimiter: None,
+                    start_after: None,
+                    max_keys: Some(1),
+                }
+            );
+        }
+        discovery_lists.push(lists.len());
+
+        let before = mock.list_count();
+        let counts = backend.count_by_tenant().await.unwrap();
+        assert_eq!(counts.len(), 3);
+        let count_lists = mock.list_count() - before;
+        if resources == 2_000 {
+            // 4,000 `resources/` objects per tenant at 1,000 per page.
+            assert_eq!(count_lists, 1 + 3 * 4);
+        }
+    }
+    assert_eq!(
+        discovery_lists,
+        vec![4, 4],
+        "discovery cost must not grow with resources per tenant"
+    );
+}
+
+/// More than 1,000 groups: an unbounded call pages the delimiter listing to
+/// completion, and a budgeted walk resumes slice by slice to exactly the same
+/// set, each slice within its budget.
+#[tokio::test]
+async fn discover_tenants_paginates_beyond_1000_groups_and_resumes() {
+    const GROUPS: usize = 1_500;
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let expected: Vec<String> = (0..GROUPS).map(|i| format!("tenant-{i:04}")).collect();
+    for id in &expected {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    let backend = make_prefix_backend(mock.clone());
+    // Registered-only tenants and control-plane groups ride along unseen.
+    backend
+        .register_tenant("registered-only", None)
+        .await
+        .unwrap();
+    backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+
+    let before = mock.recorded_lists().len();
+    let full = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(full.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&full), expected);
+    let lists = lists_since(&mock, before);
+    let pages = lists.iter().filter(|l| l.delimiter.is_some()).count();
+    // 1,500 tenant groups + `_system.user-settings/` + `tenants/` = 1,502
+    // groups: two pages, and one probe per group.
+    assert_eq!(pages, 2);
+    assert_eq!(lists.len(), 2 + 1_502);
+    assert!(
+        lists
+            .iter()
+            .filter(|l| l.delimiter.is_none())
+            .all(|l| l.max_keys == Some(1)),
+        "every probe is bounded to one key"
+    );
+
+    const BUDGET: u32 = 300;
+    let mut resume = None;
+    let mut seen = Vec::new();
+    let mut slices = 0;
+    loop {
+        slices += 1;
+        assert!(slices < 20, "the walk must terminate");
+        let before = mock.recorded_lists().len();
+        let slice = backend
+            .discover_tenants(&budget(BUDGET, resume.take()))
+            .await
+            .unwrap();
+        let spent = lists_since(&mock, before).len();
+        assert!(spent <= BUDGET as usize, "slice spent {spent} > {BUDGET}");
+        seen.extend(discovered_ids(&slice));
+        match slice.coverage {
+            DiscoveryCoverage::Partial {
+                resume: Some(cursor),
+            } => resume = Some(cursor),
+            DiscoveryCoverage::Complete => break,
+            other => panic!("unexpected coverage {other:?}"),
+        }
+    }
+    assert!(slices > 5, "a 300-request budget needs several slices");
+    assert_eq!(
+        seen, expected,
+        "no duplicates and no omissions across slices"
+    );
+}
+
+/// The resume cursor skips the whole last group, even though S3's
+/// `StartAfter` would list a group again when given its own prefix.
+#[tokio::test]
+async fn discover_tenants_resume_skips_the_last_group_entirely() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["a", "a0", "b"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 3));
+    }
+    let backend = make_prefix_backend(mock.clone());
+
+    // One page plus one probe: the first group only.
+    let first = backend.discover_tenants(&budget(2, None)).await.unwrap();
+    assert_eq!(discovered_ids(&first), vec!["a"]);
+    let DiscoveryCoverage::Partial {
+        resume: Some(cursor),
+    } = first.coverage
+    else {
+        panic!("expected a resumable partial, got {:?}", first.coverage);
+    };
+    assert_eq!(cursor.as_str(), "a/");
+
+    let before = mock.recorded_lists().len();
+    let rest = backend
+        .discover_tenants(&budget(10, Some(cursor)))
+        .await
+        .unwrap();
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+    // `a0/` sorts right after every `a/…` key and must not be skipped.
+    assert_eq!(discovered_ids(&rest), vec!["a0", "b"]);
+    assert_eq!(
+        lists_since(&mock, before)[0].start_after.as_deref(),
+        Some("a0"),
+        "resumes past every `a/…` key"
+    );
+}
+
+/// A budget that ends exactly at the last group completes without an extra
+/// request, and a budget below one page plus one probe still makes progress.
+#[tokio::test]
+async fn discover_tenants_budget_edges() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["t1", "t2", "t3"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    let backend = make_prefix_backend(mock.clone());
+
+    let before = mock.recorded_lists().len();
+    let exact = backend.discover_tenants(&budget(4, None)).await.unwrap();
+    assert_eq!(exact.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&exact), vec!["t1", "t2", "t3"]);
+    assert_eq!(lists_since(&mock, before).len(), 4);
+
+    let before = mock.recorded_lists().len();
+    let tiny = backend.discover_tenants(&budget(1, None)).await.unwrap();
+    assert_eq!(discovered_ids(&tiny), vec!["t1"]);
+    assert_eq!(
+        tiny.coverage,
+        DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new("t1/"))
+        }
+    );
+    assert_eq!(
+        lists_since(&mock, before).len(),
+        2,
+        "a budget of 1 is raised to the 2 requests progress needs"
+    );
+}
+
+/// A probe page with no key but a continuation token (S3 over a run of delete
+/// markers on a versioned bucket) proves nothing: the probe follows the token
+/// until a key appears or the listing ends, one request per page.
+#[tokio::test]
+async fn discover_tenants_follows_an_empty_truncated_probe() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["t1", "t2", "t3"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    // Only delete markers left under `gone/resources/`: no tenant data.
+    mock.seed_keys(
+        "test-bucket",
+        ["gone/history/system/1700000000000_Patient_p1_1.json"],
+    );
+    mock.empty_truncated_pages_at("t2/resources/", 3);
+    mock.empty_truncated_pages_at("gone/resources/", 2);
+    let backend = make_prefix_backend(mock.clone());
+
+    let before = mock.recorded_lists().len();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&discovery), vec!["t1", "t2", "t3"]);
+    let lists = lists_since(&mock, before);
+    let probes_of = |prefix: &str| lists.iter().filter(|l| l.prefix == prefix).count();
+    assert_eq!(probes_of("t2/resources/"), 4, "3 empty pages, then the key");
+    assert_eq!(
+        probes_of("gone/resources/"),
+        3,
+        "2 empty pages, then the end"
+    );
+    assert_eq!(probes_of("t1/resources/"), 1);
+    assert!(
+        lists
+            .iter()
+            .filter(|l| l.delimiter.is_none())
+            .all(|l| l.max_keys == Some(1)),
+        "every probe page is bounded to one key"
+    );
+}
+
+/// When the budget runs out while a probe has only seen empty truncated
+/// pages, that group is unknown: the slice is `Partial`, never `Complete`,
+/// and resuming probes the group again and finds its data.
+#[tokio::test]
+async fn discover_tenants_budget_exhausted_mid_probe_resumes_at_that_group() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["a", "b", "c"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    mock.empty_truncated_pages_at("b/resources/", 3);
+    let backend = make_prefix_backend(mock.clone());
+
+    // One page plus the three first probes: `b` is still undecided.
+    let before = mock.recorded_lists().len();
+    let first = backend.discover_tenants(&budget(4, None)).await.unwrap();
+    assert_eq!(lists_since(&mock, before).len(), 4);
+    assert_eq!(
+        discovered_ids(&first),
+        vec!["a"],
+        "nothing past the undecided group is reported"
+    );
+    assert_eq!(
+        first.coverage,
+        DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new("a/"))
+        }
+    );
+
+    // The undecided group is the first of the slice: no progress, same cursor.
+    let stalled = backend
+        .discover_tenants(&budget(2, Some(DiscoveryCursor::new("a/"))))
+        .await
+        .unwrap();
+    assert!(stalled.tenants.is_empty(), "{:?}", stalled.tenants);
+    assert_eq!(
+        stalled.coverage,
+        DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new("a/"))
+        }
+    );
+
+    // Enough budget to follow `b`'s probe: page + 2 probes + 3 follow-ups.
+    let before = mock.recorded_lists().len();
+    let rest = backend
+        .discover_tenants(&budget(10, Some(DiscoveryCursor::new("a/"))))
+        .await
+        .unwrap();
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&rest), vec!["b", "c"]);
+    let lists = lists_since(&mock, before);
+    assert_eq!(lists.len(), 6);
+    assert_eq!(lists[0].start_after.as_deref(), Some("a0"));
+}
+
+/// An undecided probe of the very first group resumes from the start of the
+/// walk: a cursor, not `None` (which would mean "cannot resume").
+#[tokio::test]
+async fn discover_tenants_undecided_first_group_resumes_from_the_start() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["a", "b"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    mock.empty_truncated_pages_at("a/resources/", 1);
+    let backend = make_prefix_backend(mock.clone());
+
+    let first = backend.discover_tenants(&budget(2, None)).await.unwrap();
+    assert!(first.tenants.is_empty(), "{:?}", first.tenants);
+    let DiscoveryCoverage::Partial {
+        resume: Some(cursor),
+    } = first.coverage
+    else {
+        panic!("expected a resumable partial, got {:?}", first.coverage);
+    };
+
+    let before = mock.recorded_lists().len();
+    let rest = backend
+        .discover_tenants(&budget(10, Some(cursor)))
+        .await
+        .unwrap();
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&rest), vec!["a", "b"]);
+    assert_eq!(
+        lists_since(&mock, before)[0].start_after,
+        None,
+        "restarts the delimiter listing from the root"
+    );
+}
+
+/// Bucket-per-tenant has no shared bucket to enumerate: the answer is
+/// `Unsupported`, never an empty store, and no LIST is issued.
+#[tokio::test]
+async fn discover_tenants_bucket_mode_is_unsupported() {
+    let mock = Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ]));
+    let backend = make_bucket_backend(mock.clone());
+    create_patient(&backend, "tenant-a", "p1").await;
+
+    let before = mock.list_count();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        discovery,
+        TenantDiscovery::unsupported("s3-bucket-per-tenant-discovery")
+    );
+    assert_ne!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(mock.list_count(), before, "no account-bucket enumeration");
+}
+
+/// Only groups under the configured global prefix are tenants; every LIST
+/// stays inside it.
+#[tokio::test]
+async fn discover_tenants_honours_the_global_prefix() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::PrefixPerTenant {
+            bucket: "test-bucket".to_string(),
+        },
+        prefix: Some("/hfs-data/".to_string()),
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend = S3Backend::with_client(config, mock.clone()).expect("backend");
+    create_patient(&backend, "acme", "p1").await;
+    // Another deployment sharing the bucket, and a stray tenant at the root.
+    mock.seed_keys("test-bucket", tenant_resource_keys("other-hfs/beta/", 1));
+    mock.seed_keys("test-bucket", tenant_resource_keys("stray/", 1));
+
+    let before = mock.recorded_lists().len();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&discovery), vec!["acme"]);
+    assert!(
+        lists_since(&mock, before)
+            .iter()
+            .all(|l| l.prefix.starts_with("hfs-data/")),
+        "every LIST stays under the global prefix"
+    );
+
+    // The cursor is relative to the prefix, and resuming stays inside it.
+    create_patient(&backend, "beta", "p1").await;
+    let first = backend.discover_tenants(&budget(2, None)).await.unwrap();
+    assert_eq!(discovered_ids(&first), vec!["acme"]);
+    let DiscoveryCoverage::Partial { resume } = first.coverage else {
+        panic!("expected partial");
+    };
+    assert_eq!(resume, Some(DiscoveryCursor::new("acme/")));
+    let rest = backend.discover_tenants(&budget(10, resume)).await.unwrap();
+    assert_eq!(discovered_ids(&rest), vec!["beta"]);
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+}
+
+/// A failed delimiter page or a failed probe fails the call: never an empty
+/// or partial success.
+#[tokio::test]
+async fn discover_tenants_propagates_list_errors() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    for id in ["tenant-a", "tenant-b", "tenant-c"] {
+        create_patient(&backend, id, "p1").await;
+    }
+
+    mock.fail_lists_at(
+        "tenant-b/resources/",
+        S3ClientError::Unavailable("access denied: AccessDenied".to_string()),
+    );
+    let err = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .expect_err("a failed probe is a discovery error");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "{err:?}"
+    );
+
+    mock.fail_lists_at(
+        "",
+        S3ClientError::Unavailable("connection failed".to_string()),
+    );
+    let err = backend
+        .discover_tenants(&budget(5, None))
+        .await
+        .expect_err("a failed delimiter page is a discovery error");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "{err:?}"
+    );
+
+    // A missing bucket is an error too, never an empty store.
+    let missing = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&[])));
+    assert!(
+        missing
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .is_err()
+    );
+}
+
+/// Known identity limits (pre-existing, shared with `count_by_tenant`; see
+/// `discover_tenant_groups`): ids are the raw top-level key segment.
+///
+/// - A hierarchical tenant `acme/research` stores under
+///   `acme/research/resources/`, which the probe of `acme/resources/` cannot
+///   see: it is never discovered on its own, and its parent group only when
+///   the parent holds data itself.
+/// - An id the keyspace escapes is reported as its stored segment, not
+///   decoded: `/acme` as `%2Facme`, `acme/resources` as `acme%2Fresources`.
+///
+/// Discovery must lose nothing `count_by_tenant` finds.
+#[tokio::test]
+async fn discover_tenants_documents_nested_and_escaped_identity_limits() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    create_patient(&backend, "acme/research", "p1").await;
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        discovery.tenants.is_empty(),
+        "limit: a nested tenant with data only under its own prefix is not \
+         discovered ({:?})",
+        discovery.tenants
+    );
+    assert!(backend.count_by_tenant().await.unwrap().is_empty());
+
+    create_patient(&backend, "acme", "p1").await;
+    create_patient(&backend, "/acme", "p1").await;
+    create_patient(&backend, "acme/resources", "p1").await;
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    // Key order: `%` and then `acme%` sort before `acme/`.
+    assert_eq!(
+        discovered_ids(&discovery),
+        vec!["%2Facme", "acme%2Fresources", "acme"],
+        "escaped ids surface as their stored segment; `acme/research` is \
+         still only visible through `acme`"
+    );
+
+    let mut counted: Vec<String> = backend
+        .count_by_tenant()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    counted.sort();
+    let mut discovered = discovered_ids(&discovery);
+    discovered.sort();
+    assert_eq!(counted, discovered, "no new identity loss");
+}
+
+/// An `S3Api` implementor that keeps the trait's default
+/// `list_common_prefixes_page`, delegating everything else to the mock.
+struct DefaultPageClient(Arc<MockS3Client>);
+
+#[async_trait]
+impl S3Api for DefaultPageClient {
+    async fn head_bucket(&self, bucket: &str) -> Result<(), S3ClientError> {
+        self.0.head_bucket(bucket).await
+    }
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<ObjectMetadata>, S3ClientError> {
+        self.0.head_object(bucket, key).await
+    }
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<ObjectData>, S3ClientError> {
+        self.0.get_object(bucket, key).await
+    }
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<ObjectMetadata, S3ClientError> {
+        self.0
+            .put_object(bucket, key, body, content_type, if_match, if_none_match)
+            .await
+    }
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3ClientError> {
+        self.0.delete_object(bucket, key).await
+    }
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
+        self.0
+            .list_objects(bucket, prefix, continuation, max_keys)
+            .await
+    }
+    async fn list_common_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>, S3ClientError> {
+        self.0.list_common_prefixes(bucket, prefix, delimiter).await
+    }
+}
+
+/// The default `list_common_prefixes_page` body (kept for implementors that
+/// predate it) pages exactly like a native single-request listing, and a
+/// backend over such a client discovers the same tenants.
+#[tokio::test]
+async fn default_delimited_page_matches_the_native_listing() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    mock.seed_keys(
+        "test-bucket",
+        [
+            "root/a.json",
+            "root/b/x.json",
+            "root/b/y/z.json",
+            "root/c.json",
+            "root/d/x.json",
+            "root/e.json",
+            "elsewhere/f/x.json",
+        ],
+    );
+    let default = DefaultPageClient(mock.clone());
+
+    for (start_after, max_keys) in [
+        (None, None),
+        (None, Some(2)),
+        (Some("root/b0"), Some(2)),
+        (Some("root/c.json"), Some(1)),
+        (Some("root/e.json"), None),
+    ] {
+        let native = mock
+            .list_common_prefixes_page("test-bucket", "root/", "/", start_after, max_keys)
+            .await
+            .unwrap();
+        let emulated = default
+            .list_common_prefixes_page("test-bucket", "root/", "/", start_after, max_keys)
+            .await
+            .unwrap();
+        let keys = |page: &DelimitedListPage| {
+            (
+                page.common_prefixes.clone(),
+                page.items.iter().map(|i| i.key.clone()).collect::<Vec<_>>(),
+                page.is_truncated,
+            )
+        };
+        assert_eq!(
+            keys(&emulated),
+            keys(&native),
+            "start_after={start_after:?} max_keys={max_keys:?}"
+        );
+    }
+
+    let seeded = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["tenant-a", "tenant-b"] {
+        seeded.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 2));
+    }
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::PrefixPerTenant {
+            bucket: "test-bucket".to_string(),
+        },
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend =
+        S3Backend::with_client(config, Arc::new(DefaultPageClient(seeded))).expect("backend");
+    let discovery = backend.discover_tenants(&budget(2, None)).await.unwrap();
+    assert_eq!(discovered_ids(&discovery), vec!["tenant-a"]);
+    let DiscoveryCoverage::Partial { resume } = discovery.coverage else {
+        panic!("expected partial");
+    };
+    let rest = backend.discover_tenants(&budget(2, resume)).await.unwrap();
+    assert_eq!(discovered_ids(&rest), vec!["tenant-b"]);
+}
+
+/// D24: the registry read lists direct children only, so a large legacy
+/// tenant named `tenants` costs it no LIST of that tenant's data, while the
+/// #271 guarantees (no phantom rows, corrupt records skipped) still hold.
+#[tokio::test]
+async fn list_tenants_does_not_list_a_tenant_named_tenants() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    // 2,500 resources = 10,000 objects under `tenants/`.
+    mock.seed_keys("test-bucket", tenant_resource_keys("tenants/", 2_500));
+    mock.seed_keys("test-bucket", ["tenants/not-a-record.json"]);
+    let backend = make_prefix_backend(mock.clone());
+    let acme = backend.register_tenant("acme", None).await.unwrap();
+
+    let before = mock.recorded_lists().len();
+    let listed = backend.list_tenants().await.unwrap();
+    assert_eq!(listed, vec![acme]);
+    let lists = lists_since(&mock, before);
+    assert_eq!(
+        lists,
+        vec![RecordedList {
+            prefix: "tenants/".to_string(),
+            delimiter: Some("/".to_string()),
+            start_after: None,
+            max_keys: Some(1000),
+        }],
+        "one delimited page, not a walk of the hostile tenant's 10,000 objects"
+    );
+}
+
+/// The registry read pages past 1,000 direct children.
+#[tokio::test]
+async fn list_tenants_pages_through_more_than_1000_records() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    for i in 0..1_005 {
+        backend
+            .register_tenant(&format!("t{i:04}"), None)
+            .await
+            .unwrap();
+    }
+    // Nested data under the registry prefix sorts between the records.
+    mock.seed_keys("test-bucket", tenant_resource_keys("tenants/", 1));
+
+    let before = mock.recorded_lists().len();
+    let listed = backend.list_tenants().await.unwrap();
+    assert_eq!(listed.len(), 1_005);
+    let lists = lists_since(&mock, before);
+    assert_eq!(lists.len(), 2);
+    assert!(lists[1].start_after.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1912 — tenant-scoped existence probe
+// ---------------------------------------------------------------------------
+
+/// #1912: `tenant_has_resources` is one `MaxKeys=1` LIST under the tenant's
+/// own `resources/` prefix — no GETs, no cross-tenant enumeration — and
+/// answers as `count_by_tenant` did, delete tombstones included.
+#[tokio::test]
+async fn tenant_has_resources_is_one_max_keys_1_list_of_the_tenant_prefix() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+
+    // Plenty of other tenants' data: the probe must not walk any of it.
+    for other in ["other-1", "other-2", "tenant-a-x"] {
+        for i in 0..3 {
+            backend
+                .create(
+                    &tenant(other),
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    create_patient(&backend, "tenant-a", "p1").await;
+
+    let (lists, gets) = (mock.list_count(), mock.get_count());
+    let recorded = mock.recorded_lists().len();
+    assert!(
+        backend
+            .tenant_has_resources(&tenant("tenant-a"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(mock.list_count() - lists, 1, "exactly one LIST");
+    assert_eq!(mock.get_count() - gets, 0, "no per-object GETs");
+    assert_eq!(
+        lists_since(&mock, recorded),
+        vec![RecordedList {
+            prefix: "tenant-a/resources/".to_string(),
+            delimiter: None,
+            start_after: None,
+            max_keys: Some(1),
+        }],
+        "a MaxKeys=1 LIST under the tenant's own resources prefix"
+    );
+
+    // A delete tombstone is still purgeable data, as in `count_by_tenant`.
+    backend
+        .create(
+            &tenant("tomb"),
+            "Observation",
+            json!({"resourceType":"Observation","id":"o1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .delete(&tenant("tomb"), "Observation", "o1")
+        .await
+        .unwrap();
+    assert!(backend.tenant_has_resources(&tenant("tomb")).await.unwrap());
+
+    // Registered but empty, never seen, and purged: no data.
+    backend.register_tenant("tenant-c", None).await.unwrap();
+    assert!(
+        !backend
+            .tenant_has_resources(&tenant("tenant-c"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !backend
+            .tenant_has_resources(&tenant("ghost"))
+            .await
+            .unwrap()
+    );
+    backend.purge_tenant_data("tomb").await.unwrap();
+    assert!(!backend.tenant_has_resources(&tenant("tomb")).await.unwrap());
+
+    // Every answer above matches the cross-tenant aggregate's.
+    let counts: HashMap<String, u64> = backend
+        .count_by_tenant()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    for (id, expected) in [
+        ("tenant-a", true),
+        ("tenant-c", false),
+        ("ghost", false),
+        ("tomb", false),
+    ] {
+        assert_eq!(counts.get(id).is_some_and(|n| *n > 0), expected, "{id}");
+    }
+}
+
+/// #1912 on #1672's probe: an empty but truncated page (S3 over a run of
+/// delete markers on a versioned bucket) proves nothing, so the tenant probe
+/// follows the token until a key appears or the listing ends — the same
+/// answer `discover_tenants` gives for that tenant.
+#[tokio::test]
+async fn tenant_has_resources_follows_an_empty_truncated_probe() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    mock.seed_keys("test-bucket", tenant_resource_keys("t2/", 1));
+    // Only history left under `gone/`: no resource objects.
+    mock.seed_keys(
+        "test-bucket",
+        ["gone/history/system/1700000000000_Patient_p1_1.json"],
+    );
+    mock.empty_truncated_pages_at("t2/resources/", 3);
+    mock.empty_truncated_pages_at("gone/resources/", 2);
+    let backend = make_prefix_backend(mock.clone());
+
+    let before = mock.recorded_lists().len();
+    assert!(backend.tenant_has_resources(&tenant("t2")).await.unwrap());
+    assert!(!backend.tenant_has_resources(&tenant("gone")).await.unwrap());
+    let lists = lists_since(&mock, before);
+    let probes_of = |prefix: &str| lists.iter().filter(|l| l.prefix == prefix).count();
+    assert_eq!(probes_of("t2/resources/"), 4, "3 empty pages, then the key");
+    assert_eq!(
+        probes_of("gone/resources/"),
+        3,
+        "2 empty pages, then the end"
+    );
+    assert!(
+        lists.iter().all(|l| l.max_keys == Some(1)),
+        "every probe page is bounded to one key"
+    );
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovered_ids(&discovery), vec!["t2"]);
+}
+
+/// #1912: bucket-per-tenant mode discovers no tenants through
+/// `count_by_tenant`, so the tenant-scoped probe answers `false` there too —
+/// the admin `DELETE` keeps its old answer — without touching S3.
+#[tokio::test]
+async fn tenant_has_resources_in_bucket_per_tenant_mode_matches_its_empty_discovery() {
+    let mock = Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ]));
+    let backend = make_bucket_backend(mock.clone());
+    create_patient(&backend, "tenant-a", "p1").await;
+    assert!(backend.count_by_tenant().await.unwrap().is_empty());
+
+    let lists = mock.list_count();
+    assert!(
+        !backend
+            .tenant_has_resources(&tenant("tenant-a"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !backend
+            .tenant_has_resources(&tenant("unmapped"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        mock.list_count(),
+        lists,
+        "no LIST in bucket-per-tenant mode"
+    );
+}
+
 // ── Tenancy capability declaration (issue #369) ──────────────────────────────
 //
 // S3 is the one backend whose tenant-placement topology is a property of the
@@ -2933,6 +6430,321 @@ fn tenant_location_matches_the_declared_tenancy_topology() {
     );
 }
 
+/// Conditional create is the one conditional interaction S3 serves —
+/// identifier-scoped, by scan (#1435). Update, delete and patch still refuse,
+/// and what the declaration says is what the methods do (#1384).
+#[tokio::test]
+async fn only_conditional_create_is_declared_and_served() {
+    use crate::core::{ConditionalInteraction, ConditionalStorage, PatchFormat};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let patient = json!({"resourceType": "Patient", "active": true});
+
+    assert!(backend.supports_conditional(ConditionalInteraction::Create));
+    for interaction in [
+        ConditionalInteraction::Update,
+        ConditionalInteraction::Delete,
+        ConditionalInteraction::Patch,
+    ] {
+        assert!(!backend.supports_conditional(interaction), "{interaction}");
+    }
+
+    let refused = |capability: &str, err: crate::error::StorageError| match err {
+        crate::error::StorageError::Backend(
+            crate::error::BackendError::UnsupportedCapability { capability: c, .. },
+        ) => assert_eq!(c, capability),
+        other => panic!("{capability}: expected UnsupportedCapability, got {other:?}"),
+    };
+    refused(
+        "conditional_update",
+        backend
+            .conditional_update(
+                &tenant,
+                "Patient",
+                patient,
+                "active=true",
+                true,
+                FhirVersion::R4,
+                &crate::core::EntityTagPrecondition::Absent,
+            )
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        "conditional_delete",
+        backend
+            .conditional_delete(
+                &tenant,
+                "Patient",
+                "active=true",
+                &crate::core::EntityTagPrecondition::Absent,
+            )
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        "conditional_patch",
+        backend
+            .conditional_patch(
+                &tenant,
+                "Patient",
+                "active=true",
+                &PatchFormat::MergePatch(json!({"active": false})),
+                &crate::core::EntityTagPrecondition::Absent,
+            )
+            .await
+            .unwrap_err(),
+    );
+}
+
+fn mrn_patient(value: &str) -> Value {
+    json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": value}],
+        "active": true
+    })
+}
+
+/// The bulk-load idempotency case: the first `If-None-Exist` on an identifier
+/// creates, every later one answers the resource it created, and the
+/// criteria are read as token search reads them.
+#[tokio::test]
+async fn conditional_create_by_identifier_creates_once_and_then_matches() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let criteria = "identifier=http%3A%2F%2Fexample.org%2Fmrn%7C123";
+
+    let created = match backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            mrn_patient("123"),
+            criteria,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Created(stored) => stored,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    for again in [criteria, "identifier=123", "identifier=999,123"] {
+        match backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("123"),
+                again,
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap()
+        {
+            ConditionalCreateResult::Exists(stored) => {
+                assert_eq!(stored.id(), created.id(), "{again}")
+            }
+            other => panic!("{again}: expected Exists, got {other:?}"),
+        }
+    }
+
+    // A different system, or "no system", is a different identifier.
+    for elsewhere in ["identifier=http://other|123", "identifier=|123"] {
+        assert!(
+            matches!(
+                backend
+                    .conditional_create(
+                        &tenant,
+                        "Patient",
+                        mrn_patient("123"),
+                        elsewhere,
+                        FhirVersion::R4,
+                    )
+                    .await
+                    .unwrap(),
+                ConditionalCreateResult::Created(_)
+            ),
+            "{elsewhere}"
+        );
+    }
+}
+
+/// Two live resources under one identifier are the 412 the client gets; a
+/// deleted one no longer counts.
+#[tokio::test]
+async fn conditional_create_reports_multiple_matches_and_ignores_deleted_ones() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let first = backend
+        .create(&tenant, "Patient", mrn_patient("dup"), FhirVersion::R4)
+        .await
+        .unwrap();
+    let second = backend
+        .create(&tenant, "Patient", mrn_patient("dup"), FhirVersion::R4)
+        .await
+        .unwrap();
+    let criteria = "identifier=dup";
+
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("dup"),
+                criteria,
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::MultipleMatches(2)
+    ));
+
+    backend
+        .delete(&tenant, "Patient", first.id())
+        .await
+        .unwrap();
+    match backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            mrn_patient("dup"),
+            criteria,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Exists(stored) => assert_eq!(stored.id(), second.id()),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+
+    backend
+        .delete(&tenant, "Patient", second.id())
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("dup"),
+                criteria,
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
+}
+
+/// `_id` criteria read the objects they name, and an `identifier` beside
+/// them still has to hold.
+#[tokio::test]
+async fn conditional_create_by_id_reads_the_named_objects() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let existing = backend
+        .create(&tenant, "Patient", mrn_patient("1"), FhirVersion::R4)
+        .await
+        .unwrap();
+
+    let by_id = format!("_id={}", existing.id());
+    match backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            mrn_patient("1"),
+            &by_id,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Exists(stored) => assert_eq!(stored.id(), existing.id()),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                "_id=absent",
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
+    let with_other_identifier = format!("_id={}&identifier=other", existing.id());
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                &with_other_identifier,
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
+}
+
+/// A criterion the scan cannot evaluate is refused before anything is read or
+/// written, and so are criteria that only shape a response: they leave nothing
+/// to match on, and the create would go ahead unconditionally (#1542).
+#[tokio::test]
+async fn conditional_create_refuses_criteria_a_scan_cannot_evaluate() {
+    use crate::core::ConditionalStorage;
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(Arc::clone(&mock));
+    let tenant = tenant("tenant-a");
+    let puts_before = mock.put_count();
+
+    // `_format=json` alone leaves nothing to match on (#1542).
+    for criteria in [
+        "active=true",
+        "identifier:exact=1",
+        "identifier=",
+        "_format=json",
+    ] {
+        let err = backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                criteria,
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::StorageError::Search(_)),
+            "{criteria}: {err:?}"
+        );
+    }
+    assert_eq!(
+        mock.put_count(),
+        puts_before,
+        "a refused create writes nothing"
+    );
+}
+
 /// A transaction bundle must be refused outright, and refused *before* any
 /// object is written.
 ///
@@ -2995,6 +6807,85 @@ async fn transaction_bundle_is_refused_without_writing_anything() {
 }
 
 // ===========================================================================
+// HTTP 409 ConditionalRequestConflict (#2047)
+//
+// AWS answers a conditional write that collides with another conditional write
+// in flight on the same key with a 409, not a 412. It is transient and says
+// nothing about the stored state, so it must never be reported as a lost
+// precondition (AlreadyExists / VersionConflict).
+// ===========================================================================
+
+#[test]
+fn conditional_conflict_maps_to_unavailable_not_query_error() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    match backend.map_client_error(S3ClientError::ConditionalConflict("busy".to_string())) {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            assert!(message.contains("409"), "message was: {message}");
+            assert!(message.contains("busy"), "message was: {message}");
+        }
+        other => panic!("expected Unavailable (503), got {other:?}"),
+    }
+}
+
+/// A 409 on a resource write is a retryable 503, not a conflict: the resource
+/// paths turn `PreconditionFailed` into `AlreadyExists`/`VersionConflict`, and
+/// a 409 must never be reported as one (nothing is known about stored state).
+#[tokio::test]
+async fn a_409_on_a_resource_write_is_unavailable_not_a_conflict() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    create_patient(&backend, "tenant-a", "p1").await;
+
+    // The current pointer, whichever key layout the backend writes.
+    let current_keys: Vec<String> = mock
+        .keys("test-bucket")
+        .into_iter()
+        .filter(|k| k.contains("/resources/Patient/") && k.ends_with("/p1/current.json"))
+        .collect();
+    assert_eq!(current_keys.len(), 1, "keys were: {current_keys:?}");
+    let current_key = &current_keys[0];
+
+    let read = backend
+        .read(&t, "Patient", "p1")
+        .await
+        .expect("read")
+        .expect("p1 exists");
+
+    mock.conflict_puts_at(current_key, 1);
+    let err = backend
+        .update(
+            &t,
+            &read,
+            json!({"resourceType":"Patient","id":"p1","active":false}),
+        )
+        .await
+        .expect_err("a 409 must fail the update");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "an update meeting a 409 must be Unavailable, not a version conflict: {err:?}"
+    );
+
+    mock.conflict_puts_at(current_key, 1);
+    let err = backend
+        .delete(&t, "Patient", "p1")
+        .await
+        .expect_err("a 409 must fail the delete");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "a delete meeting a 409 must be Unavailable, not an optimistic-lock failure: {err:?}"
+    );
+
+    // Neither refused write landed.
+    let after = backend
+        .read(&t, "Patient", "p1")
+        .await
+        .expect("read")
+        .expect("p1 still exists");
+    assert_eq!(after.version_id(), "1");
+}
+
+// ===========================================================================
 // $bulk-submit job store
 //
 // S3 hosts the REST worker's job state itself — leases compare-and-swapped
@@ -3007,8 +6898,32 @@ async fn transaction_bundle_is_refused_without_writing_anything() {
 mod bulk_submit_worker {
     use super::*;
 
+    mod release_contract {
+        use crate as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/release_contract.rs"
+        ));
+    }
+
+    /// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+    #[tokio::test]
+    async fn release_requeues_and_fences_out_a_zombie() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        release_contract::release_requeues_and_fences_out_a_zombie(&backend, &tenant("tenant-a"))
+            .await;
+    }
+
+    /// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+    #[tokio::test]
+    async fn release_after_abort_is_a_no_op() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        release_contract::release_after_abort_is_a_no_op(&backend, &tenant("tenant-a")).await;
+    }
+
     use std::time::Duration;
 
+    use crate::core::bulk_export_worker::LeaseError;
     use crate::core::bulk_export_worker::WorkerId;
     use crate::core::bulk_submit::{ManifestStatus, SubmissionManifest};
     use crate::core::bulk_submit_worker::{
@@ -3037,6 +6952,45 @@ mod bulk_submit_worker {
             .await
             .expect("add manifest");
         (id, manifest.manifest_id)
+    }
+
+    /// A synchronous `process_entries` call holds its manifest in `processing`
+    /// with no lease until it settles the terminal status on its way out. No
+    /// worker may claim it in that window (#1530). The SQL and MongoDB suites
+    /// pin the same rule through `tests/bulk_submit/claim_contract.rs`; S3 needs
+    /// its own test because the window closes before the call returns.
+    #[tokio::test]
+    async fn an_unleased_processing_manifest_is_not_claimable() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (id, in_flight) = seed(&backend, &t).await;
+        let location = backend.tenant_location(&t).expect("location");
+        backend
+            .mutate_manifest_state(&location, &id, &in_flight, |state| {
+                state.manifest.status = ManifestStatus::Processing;
+            })
+            .await
+            .expect("mark processing");
+        let queued = backend
+            .add_manifest(&t, &id, Some("https://provider.example/queued.json"), None)
+            .await
+            .expect("add manifest")
+            .manifest_id;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("the pending manifest queued behind it stays claimable");
+        assert_eq!(lease.manifest_id, queued);
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                .await
+                .expect("claim")
+                .is_none(),
+            "a processing manifest with no lease must not be claimable"
+        );
     }
 
     #[tokio::test]
@@ -3135,6 +7089,201 @@ mod bulk_submit_worker {
             .expect("the live lease survives");
     }
 
+    /// #968: an abort settles the manifest's outcome, so a worker that finishes
+    /// immediately afterwards must lose rather than flip `failed` to
+    /// `completed`.
+    /// Stands in for the lease keeper, whose heartbeat lands while a batch is
+    /// being written: `batch_committed` fires after the batch's entries are
+    /// stored and before `process_entries` writes the manifest counters.
+    struct MidBatch<F>(F);
+
+    #[async_trait::async_trait]
+    impl<F> crate::core::bulk_submit::BatchCommitObserver for MidBatch<F>
+    where
+        F: Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync,
+    {
+        async fn batch_committed(&self, _: &crate::core::bulk_submit::BatchCommitted<'_>) {
+            (self.0)().await;
+        }
+    }
+
+    fn one_patient(line: u64, id: &str) -> Vec<NdjsonEntry> {
+        vec![NdjsonEntry::new(
+            line,
+            "Patient",
+            json!({"resourceType": "Patient", "id": id}),
+        )]
+    }
+
+    /// #1229: `process_entries` read the manifest state before the batch and
+    /// wrote that whole copy back after it, lease fields included. On S3 a
+    /// 1,000-entry batch outlasts a heartbeat interval, so every renewal that
+    /// landed during a batch was rolled back; two batches in, the stored expiry
+    /// was in the past and the other in-process worker reclaimed a manifest
+    /// whose holder was alive — once a minute for a whole import.
+    #[tokio::test]
+    async fn a_batch_does_not_roll_back_a_lease_renewed_while_it_ran() {
+        let backend = Arc::new(make_prefix_backend(Arc::new(MockS3Client::with_buckets(
+            &["test-bucket"],
+        ))));
+        let t = tenant("tenant-a");
+        let (id, manifest_id) = seed(&backend, &t).await;
+
+        // Expired the moment it is taken: only a renewal keeps it alive, which
+        // is exactly the position a long batch puts a lease in.
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), Duration::from_secs(0))
+            .await
+            .expect("claim")
+            .expect("claimable");
+        let renewing = crate::core::bulk_submit_worker::ManifestLease {
+            lease_duration: lease_duration(),
+            ..lease.clone()
+        };
+
+        let keeper = Arc::clone(&backend);
+        let held = renewing.clone();
+        let options =
+            BulkProcessingOptions::new().with_batch_observer(Arc::new(MidBatch(move || {
+                let keeper = Arc::clone(&keeper);
+                let held = held.clone();
+                Box::pin(async move {
+                    keeper
+                        .heartbeat(&held)
+                        .await
+                        .expect("the holder renews mid-batch");
+                }) as futures::future::BoxFuture<'static, ()>
+            })));
+        let results = backend
+            .process_entries(&t, &id, &manifest_id, one_patient(1, "p1"), &options)
+            .await
+            .expect("ingest");
+        assert!(results[0].is_success());
+
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                .await
+                .expect("claim")
+                .is_none(),
+            "the batch's manifest write rolled the renewed lease back to its pre-batch expiry, \
+             so a second worker reclaimed a manifest whose holder is alive (#1229)"
+        );
+        backend
+            .heartbeat(&renewing)
+            .await
+            .expect("the holder still holds its lease after the batch");
+
+        // The batch's own share of the state did land.
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.total_entries, 1);
+        assert_eq!(manifest.processed_entries, 1);
+        assert_eq!(manifest.status, ManifestStatus::Processing);
+    }
+
+    /// The other half of #1229: the same whole-object write could undo a
+    /// reclaim. A worker fenced out mid-batch must not hand the manifest back
+    /// to itself when its batch ends.
+    #[tokio::test]
+    async fn a_batch_that_outlives_its_lease_does_not_undo_the_reclaim() {
+        let backend = Arc::new(make_prefix_backend(Arc::new(MockS3Client::with_buckets(
+            &["test-bucket"],
+        ))));
+        let t = tenant("tenant-a");
+        let (id, manifest_id) = seed(&backend, &t).await;
+
+        let stale = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), Duration::from_secs(0))
+            .await
+            .expect("claim")
+            .expect("claimable");
+
+        let fresh = Arc::new(tokio::sync::Mutex::new(None));
+        let claimer = Arc::clone(&backend);
+        let slot = Arc::clone(&fresh);
+        let options =
+            BulkProcessingOptions::new().with_batch_observer(Arc::new(MidBatch(move || {
+                let claimer = Arc::clone(&claimer);
+                let slot = Arc::clone(&slot);
+                Box::pin(async move {
+                    let lease = claimer
+                        .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                        .await
+                        .expect("claim")
+                        .expect("an expired lease is reclaimable");
+                    *slot.lock().await = Some(lease);
+                }) as futures::future::BoxFuture<'static, ()>
+            })));
+        backend
+            .process_entries(&t, &id, &manifest_id, one_patient(1, "p1"), &options)
+            .await
+            .expect("ingest");
+
+        let fresh = fresh.lock().await.clone().expect("worker-2 claimed");
+        assert!(fresh.fencing_token > stale.fencing_token);
+        backend
+            .heartbeat(&fresh)
+            .await
+            .expect("the new holder keeps the manifest after the old holder's batch ends");
+        let lost = backend
+            .heartbeat(&stale)
+            .await
+            .expect_err("the fenced-out worker stays fenced out");
+        assert!(format!("{lost:?}").contains("LeaseLost"), "got {lost:?}");
+    }
+
+    #[tokio::test]
+    async fn an_abort_beats_a_late_worker_verdict() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (id, _manifest_id) = seed(&backend, &t).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+        backend
+            .mark_manifest_processing(&lease)
+            .await
+            .expect("mark processing");
+
+        backend
+            .abort_submission(&t, &id, "user cancelled")
+            .await
+            .expect("abort");
+
+        for verdict in [
+            backend
+                .finish_manifest(&lease)
+                .await
+                .err()
+                .map(|e| format!("{e:?}")),
+            backend
+                .fail_manifest(&lease, "worker gave up")
+                .await
+                .err()
+                .map(|e| format!("{e:?}")),
+        ] {
+            let message = verdict.expect("a verdict after an abort must fail");
+            assert!(
+                message.contains("LeaseLost"),
+                "expected LeaseLost, got {message}"
+            );
+        }
+
+        let manifests = backend.list_manifests(&t, &id).await.expect("manifests");
+        assert_eq!(
+            manifests[0].status,
+            ManifestStatus::Failed,
+            "the abort's verdict stands"
+        );
+    }
+
     #[tokio::test]
     async fn fetch_params_round_trip_to_the_worker_view() {
         let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
@@ -3192,6 +7341,72 @@ mod bulk_submit_worker {
         assert_eq!(view.import_directives, import);
         assert_eq!(view.metadata, metadata);
         assert_eq!(view.fhir_version, FhirVersion::R4);
+    }
+
+    /// A file the worker walked to its end is recorded on the manifest state
+    /// and read back by the run that reclaims it (#1610). Recording is fenced
+    /// and idempotent.
+    #[tokio::test]
+    async fn completed_output_files_survive_a_reclaim() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (_id, _manifest_id) = seed(&backend, &t).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+        for url in [
+            "https://provider.example/b.ndjson",
+            "https://provider.example/a.ndjson",
+            "https://provider.example/a.ndjson",
+        ] {
+            backend
+                .record_output_file_done(&lease, url)
+                .await
+                .expect("record a completed file");
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider.example/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider.example/b.ndjson".to_string(),
+            "https://provider.example/a.ndjson".to_string(),
+        ];
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .expect("worker view")
+                .completed_output_files,
+            expected
+        );
+
+        assert!(
+            SubmitClaimStrategy::release(&backend, lease)
+                .await
+                .expect("release")
+        );
+        let reclaimed = backend
+            .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("released manifests are claimable");
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .expect("worker view")
+                .completed_output_files,
+            expected
+        );
     }
 
     #[tokio::test]
@@ -3799,5 +8014,1381 @@ mod bulk_submit_worker {
             artifacts.iter().any(|f| f.file_type == "error"),
             "the malformed line must surface in the error artifact, got {artifacts:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP 409 ConditionalRequestConflict on the compare-and-swap writes (#2047)
+    //
+    // AWS refuses a conditional PUT that collides with another write in flight
+    // on the same key with a 409. Nothing was written, so every loop below must
+    // re-read and retry it exactly as it does a lost race (412).
+    // -----------------------------------------------------------------------
+
+    /// How many puts the mock has received for exactly `key` so far.
+    fn puts_on(mock: &MockS3Client, key: &str) -> usize {
+        mock.recorded_puts()
+            .iter()
+            .filter(|put| put.key == key)
+            .count()
+    }
+
+    /// A seeded submission with one manifest, the mock behind it, and the S3
+    /// key of that manifest's state object.
+    struct Seeded {
+        mock: Arc<MockS3Client>,
+        backend: S3Backend,
+        id: SubmissionId,
+        manifest_id: String,
+        manifest_key: String,
+        location: crate::backends::s3::backend::TenantLocation,
+    }
+
+    async fn seeded_with_manifest_key(t: &TenantContext) -> Seeded {
+        let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+        let backend = make_prefix_backend(mock.clone());
+        let (id, manifest_id) = seed(&backend, t).await;
+        let location = backend.tenant_location(t).expect("location");
+        let manifest_key =
+            location
+                .keyspace
+                .submit_manifest_key(&id.submitter, &id.submission_id, &manifest_id);
+        Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key,
+            location,
+        }
+    }
+
+    #[tokio::test]
+    async fn mutate_manifest_state_retries_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+        let before = puts_on(&mock, &key);
+
+        mock.conflict_puts_at(&key, 2);
+        backend
+            .mutate_manifest_state(&location, &id, &manifest_id, |state| {
+                state.manifest.processed_entries += 1;
+            })
+            .await
+            .expect("two 409s are retried and the third attempt lands");
+
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(
+            manifest.processed_entries, 1,
+            "the change must be applied exactly once"
+        );
+        let attempts: Vec<_> = mock
+            .recorded_puts()
+            .into_iter()
+            .filter(|put| put.key == key)
+            .skip(before)
+            .collect();
+        assert_eq!(attempts.len(), 3, "two conflicts and the write that landed");
+        assert!(
+            attempts.iter().all(|put| put.if_match.is_some()),
+            "every attempt is a compare-and-swap: {attempts:?}"
+        );
+    }
+
+    /// The #2047 scenario: a leased manifest ingesting a batch while AWS answers
+    /// 409 to the status write that opens the batch and to the counter write
+    /// that closes it. Before the fix the first 409 failed the whole batch.
+    #[tokio::test]
+    async fn process_entries_completes_through_409s_on_the_manifest_state() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+        let before = puts_on(&mock, &key);
+
+        // The pre-batch status write meets one 409 ...
+        mock.conflict_puts_at(&key, 1);
+        // ... and so does the post-batch counter write, armed once the batch's
+        // entries are stored.
+        let arming = Arc::clone(&mock);
+        let armed_key = key.clone();
+        let options =
+            BulkProcessingOptions::new().with_batch_observer(Arc::new(MidBatch(move || {
+                arming.conflict_puts_at(&armed_key, 1);
+                Box::pin(async {}) as futures::future::BoxFuture<'static, ()>
+            })));
+
+        let results = backend
+            .process_entries(&t, &id, &manifest_id, one_patient(1, "p1"), &options)
+            .await
+            .expect("ingest must ride out the 409s");
+        assert!(results[0].is_success());
+
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.total_entries, 1);
+        assert_eq!(
+            manifest.processed_entries, 1,
+            "the retried counter write must not double-count"
+        );
+        assert_eq!(
+            manifest.status,
+            ManifestStatus::Processing,
+            "a leased manifest's terminal status belongs to the worker"
+        );
+        assert_eq!(
+            puts_on(&mock, &key) - before,
+            4,
+            "status write + its 409, counter write + its 409"
+        );
+        // The holder still holds the lease.
+        backend.heartbeat(&lease).await.expect("lease intact");
+    }
+
+    #[tokio::test]
+    async fn fenced_writes_retry_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .heartbeat(&lease)
+            .await
+            .expect("heartbeat rides out a 409");
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .add_manifest_progress(&lease, 3, 1, 4)
+            .await
+            .expect("progress rides out a 409");
+        let manifest = backend
+            .get_manifest(&t, &id, &manifest_id)
+            .await
+            .expect("get manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.processed_entries, 3);
+        assert_eq!(manifest.failed_entries, 1);
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .finish_manifest(&lease)
+            .await
+            .expect("finish rides out a 409");
+        assert_eq!(
+            backend.list_manifests(&t, &id).await.expect("manifests")[0].status,
+            ManifestStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_cas_retries_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            location,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+        let state_key = location
+            .keyspace
+            .submit_state_key(&id.submitter, &id.submission_id);
+        let before = puts_on(&mock, &state_key);
+
+        mock.conflict_puts_at(&state_key, 1);
+        backend
+            .set_submission_kickoff_meta(
+                &t,
+                &id,
+                Some("client-subject"),
+                "https://hfs.example/$bulk-submit",
+                true,
+            )
+            .await
+            .expect("kickoff meta rides out a 409");
+
+        let attempts: Vec<_> = mock
+            .recorded_puts()
+            .into_iter()
+            .filter(|put| put.key == state_key)
+            .skip(before)
+            .collect();
+        assert_eq!(attempts.len(), 2, "one conflict and the write that landed");
+        assert!(
+            attempts.iter().all(|put| put.if_match.is_some()),
+            "every attempt is a compare-and-swap: {attempts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_params_retry_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+
+        mock.conflict_puts_at(&key, 1);
+        backend
+            .set_manifest_fetch_params(
+                &t,
+                &id,
+                &manifest_id,
+                ManifestFetchParams {
+                    fhir_base_url: Some("https://provider.example/fhir"),
+                    output_format: None,
+                    file_request_headers: &[],
+                    oauth_metadata_urls: &[],
+                    file_encryption_key: None,
+                    import_directives: &[],
+                    metadata: &[],
+                },
+            )
+            .await
+            .expect("fetch params ride out a 409");
+
+        let (state, _) = backend
+            .load_manifest_for_cas(&location, &id, &manifest_id)
+            .await
+            .expect("load")
+            .expect("manifest exists");
+        assert_eq!(
+            state.fhir_base_url.as_deref(),
+            Some("https://provider.example/fhir")
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_manifest_by_url_retries_a_409_conflict() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+        backend
+            .set_manifest_fetch_params(
+                &t,
+                &id,
+                &manifest_id,
+                ManifestFetchParams {
+                    fhir_base_url: Some("https://provider.example/fhir"),
+                    output_format: None,
+                    file_request_headers: &[],
+                    oauth_metadata_urls: &[],
+                    file_encryption_key: None,
+                    import_directives: &[],
+                    metadata: &[],
+                },
+            )
+            .await
+            .expect("fetch params");
+
+        mock.conflict_puts_at(&key, 1);
+        let superseded = backend
+            .replace_manifest_by_url(&t, &id, "https://provider.example/manifest.json")
+            .await
+            .expect("replace rides out a 409");
+        assert_eq!(superseded, vec![manifest_id.clone()]);
+
+        assert_eq!(
+            backend.list_manifests(&t, &id).await.expect("manifests")[0].status,
+            ManifestStatus::Replaced,
+            "the Replaced write must land, not be silently dropped"
+        );
+        let (state, _) = backend
+            .load_manifest_for_cas(&location, &id, &manifest_id)
+            .await
+            .expect("load")
+            .expect("manifest exists");
+        assert_eq!(
+            state.fhir_base_url.as_deref(),
+            Some("https://provider.example/fhir"),
+            "the retry re-reads, so it keeps what the manifest already carried"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_moves_past_a_409_on_its_claim_write() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            manifest_key: key,
+            ..
+        } = seeded_with_manifest_key(&t).await;
+
+        mock.conflict_puts_at(&key, 1);
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+                .await
+                .expect("a 409 on the claim write is a lost claim, not an error")
+                .is_none()
+        );
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("the manifest stayed queued and is claimable on the next poll");
+        assert_eq!(lease.fencing_token, 1);
+    }
+
+    /// A conflict that never clears gives up after a bounded number of attempts
+    /// with the usual diagnosable error. Time is paused so the backoffs
+    /// auto-advance instead of really sleeping.
+    #[tokio::test(start_paused = true)]
+    async fn a_persistent_409_gives_up_after_bounded_attempts() {
+        let t = tenant("tenant-a");
+        let Seeded {
+            mock,
+            backend,
+            id,
+            manifest_id,
+            manifest_key: key,
+            location,
+        } = seeded_with_manifest_key(&t).await;
+        let before = puts_on(&mock, &key);
+
+        mock.conflict_puts_at(&key, usize::MAX);
+        let err = backend
+            .mutate_manifest_state(&location, &id, &manifest_id, |state| {
+                state.manifest.processed_entries += 1;
+            })
+            .await
+            .expect_err("a conflict that never clears must fail");
+        match err {
+            StorageError::Backend(BackendError::Internal { message, .. }) => {
+                assert!(
+                    message.contains("compare-and-swap attempts"),
+                    "message was: {message}"
+                );
+            }
+            other => panic!("expected the exhaustion error, got {other:?}"),
+        }
+        assert_eq!(
+            puts_on(&mock, &key) - before,
+            crate::backends::s3::submit_worker::CAS_ATTEMPTS,
+            "the loop must be bounded"
+        );
+    }
+}
+
+/// #1250: on `s3-es` the next page is fetched while the current one is sent
+/// to Elasticsearch. The page read lists and GETs `current.json` objects that
+/// no reindex writer touches, so every cursor may run ahead, and the ahead
+/// fetch is the serial fetch: same resources, same order, same cursor.
+#[tokio::test]
+async fn reindex_source_prefetches_every_cursor_with_the_serial_page() {
+    use crate::search::reindex::{ReindexSource, ResourcePage};
+
+    fn ids(page: &ResourcePage) -> Vec<String> {
+        page.resources.iter().map(|r| r.id().to_string()).collect()
+    }
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let tenant = tenant("tenant-a");
+    for i in 1..=5 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create");
+    }
+    assert!(backend.may_prefetch_page("2"));
+
+    let first = backend
+        .fetch_resources_page(&tenant, "Patient", None, 2)
+        .await
+        .expect("page 1");
+    let cursor = first.next_cursor.clone().expect("three more resources");
+    let serial = backend
+        .fetch_resources_page(&tenant, "Patient", Some(&cursor), 2)
+        .await
+        .expect("serial page 2");
+    let ahead = backend
+        .fetch_resources_page_ahead(&tenant, "Patient", &cursor, 2, 0)
+        .await
+        .expect("ahead page 2")
+        .expect("S3 never declines an ahead fetch");
+    assert_eq!(ids(&ahead), ids(&serial));
+    assert_eq!(ids(&ahead), ["p3", "p4"]);
+    assert_eq!(ahead.next_cursor, serial.next_cursor);
+}
+
+// ============================================================================
+// Keyspace layouts (#1502): V1 flat vs V2 sharded, resolved per tenant from a
+// marker object.
+// ============================================================================
+
+mod keyspace_layouts {
+    use super::*;
+    use crate::backends::s3::keyspace::{KeyspaceLayout, shard_segment};
+    use crate::core::PurgableStorage;
+    use crate::core::history::{
+        InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+    };
+    use crate::search::reindex::ReindexSource;
+
+    const BUCKET: &str = "test-bucket";
+
+    fn backend_with_default(mock: Arc<MockS3Client>, default: KeyspaceLayout) -> S3Backend {
+        let config = S3BackendConfig {
+            tenancy_mode: S3TenancyMode::PrefixPerTenant {
+                bucket: BUCKET.to_string(),
+            },
+            validate_buckets_on_startup: false,
+            default_keyspace_layout: default,
+            ..Default::default()
+        };
+        S3Backend::with_client(config, mock).expect("backend")
+    }
+
+    fn marker_key(tenant_id: &str) -> String {
+        format!("{tenant_id}/history/_keyspace.json")
+    }
+
+    async fn stamp(mock: &MockS3Client, tenant_id: &str, body: &[u8]) {
+        mock.put_object(
+            BUCKET,
+            &marker_key(tenant_id),
+            body.to_vec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn mock() -> Arc<MockS3Client> {
+        Arc::new(MockS3Client::with_buckets(&[BUCKET]))
+    }
+
+    fn v2_current_key(tenant_id: &str, resource_type: &str, id: &str) -> String {
+        format!(
+            "{tenant_id}/resources/{resource_type}/{}/{id}/current.json",
+            shard_segment(id)
+        )
+    }
+
+    fn keys_with(mock: &MockS3Client, needle: &str) -> Vec<String> {
+        mock.keys(BUCKET)
+            .into_iter()
+            .filter(|k| k.contains(needle))
+            .collect()
+    }
+
+    async fn create_one(
+        backend: &S3Backend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) {
+        backend
+            .create(
+                tenant,
+                resource_type,
+                json!({"resourceType": resource_type, "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A stamped marker decides the layout whatever the configured default is.
+    #[tokio::test]
+    async fn a_stamped_marker_wins_over_the_configured_default() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        stamp(&mock, "tenant-b", &KeyspaceLayout::V1.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let a = tenant("tenant-a");
+        let b = tenant("tenant-b");
+
+        create_one(&backend, &a, "Patient", "p1").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&v2_current_key("tenant-a", "Patient", "p1"))
+        );
+
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        create_one(&backend, &b, "Patient", "p1").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&"tenant-b/resources/Patient/p1/current.json".to_string())
+        );
+    }
+
+    /// An unknown marker version is an error, never a guess, and nothing is
+    /// written under either layout.
+    #[tokio::test]
+    async fn an_unknown_marker_version_is_refused() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", b"{\"layout\":3}").await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        let puts_before = mock.put_count();
+
+        assert!(matches!(
+            backend.read(&t, "Patient", "p1").await,
+            Err(StorageError::Backend(_))
+        ));
+        assert!(matches!(
+            backend
+                .create(
+                    &t,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"p1"}),
+                    FhirVersion::default(),
+                )
+                .await,
+            Err(StorageError::Backend(_))
+        ));
+        assert_eq!(mock.put_count(), puts_before);
+    }
+
+    /// With the default `V1`, resolving costs one GET once per tenant: no
+    /// probe, no marker write, and the answer is cached.
+    #[tokio::test]
+    async fn a_v1_default_reads_the_marker_once_and_never_writes_it() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert_eq!(mock.list_count(), 0);
+        assert_eq!(mock.put_count(), 0);
+        let gets = mock.get_count();
+        assert_eq!(gets, 2, "marker GET plus the resource GET");
+
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert_eq!(
+            mock.get_count(),
+            gets + 1,
+            "only the resource GET: layout is cached"
+        );
+
+        create_one(&backend, &t, "Patient", "p1").await;
+        assert!(keys_with(&mock, "_keyspace.json").is_empty());
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&"tenant-a/resources/Patient/p1/current.json".to_string())
+        );
+    }
+
+    /// A read of an empty tenant under a `V2` default probes `resources/` and
+    /// `history/` with MaxKeys=1 and writes nothing.
+    #[tokio::test]
+    async fn an_empty_tenant_is_not_stamped_by_a_read() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        let t = tenant("tenant-a");
+
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert_eq!(mock.put_count(), 0);
+        let probes: Vec<_> = mock
+            .recorded_lists()
+            .into_iter()
+            .map(|l| (l.prefix, l.max_keys))
+            .collect();
+        assert_eq!(
+            probes,
+            vec![
+                ("tenant-a/resources/".to_string(), Some(1)),
+                ("tenant-a/history/".to_string(), Some(1)),
+            ]
+        );
+        // And a count or listing does not stamp it either.
+        assert_eq!(backend.count(&t, Some("Patient")).await.unwrap(), 0);
+        assert!(keys_with(&mock, "_keyspace.json").is_empty());
+    }
+
+    /// The first write to an empty tenant stamps the default with a
+    /// conditional PUT; afterwards a write is exactly three PUTs and none goes
+    /// to `history/system/`.
+    #[tokio::test]
+    async fn the_first_write_stamps_v2_and_a_v2_write_is_three_puts() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        let t = tenant("tenant-a");
+
+        create_one(&backend, &t, "Patient", "p1").await;
+        let puts = mock.recorded_puts();
+        assert_eq!(puts.len(), 4, "marker + current + version + type event");
+        assert_eq!(puts[0].key, marker_key("tenant-a"));
+        assert_eq!(puts[0].if_none_match.as_deref(), Some("*"));
+        assert_eq!(
+            mock.object_body(BUCKET, &marker_key("tenant-a")).unwrap(),
+            KeyspaceLayout::V2.marker_body()
+        );
+
+        let before = mock.put_count();
+        create_one(&backend, &t, "Patient", "p2").await;
+        assert_eq!(mock.put_count() - before, 3);
+        assert!(keys_with(&mock, "/history/system/").is_empty());
+        let keys = mock.keys(BUCKET);
+        assert!(keys.contains(&v2_current_key("tenant-a", "Patient", "p2")));
+        assert!(keys.contains(&format!(
+            "tenant-a/resources/Patient/{}/p2/_history/1.json",
+            shard_segment("p2")
+        )));
+        assert!(keys.iter().any(|k| k.starts_with(&format!(
+            "tenant-a/history/type/Patient/{}/",
+            shard_segment("p2")
+        ))));
+        assert!(backend.read(&t, "Patient", "p2").await.unwrap().is_some());
+    }
+
+    /// Losing the marker create race adopts the winner's layout, even a
+    /// different one.
+    #[tokio::test]
+    async fn a_lost_marker_race_adopts_the_winners_layout() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        let t = tenant("tenant-a");
+        mock.steal_once(
+            BUCKET,
+            &marker_key("tenant-a"),
+            KeyspaceLayout::V1.marker_body(),
+        );
+
+        create_one(&backend, &t, "Patient", "p1").await;
+        assert_eq!(
+            mock.object_body(BUCKET, &marker_key("tenant-a")).unwrap(),
+            KeyspaceLayout::V1.marker_body()
+        );
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&"tenant-a/resources/Patient/p1/current.json".to_string())
+        );
+        assert!(!keys_with(&mock, "/history/system/").is_empty());
+    }
+
+    /// A tenant that predates the marker stays flat under a `V2` default, with
+    /// no marker written, and its existing resources stay reachable.
+    #[tokio::test]
+    async fn a_legacy_tenant_without_a_marker_stays_v1_under_a_v2_default() {
+        let mock = mock();
+        let legacy = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        create_one(&legacy, &t, "Patient", "p0").await;
+
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        assert!(backend.read(&t, "Patient", "p0").await.unwrap().is_some());
+        create_one(&backend, &t, "Patient", "p1").await;
+        let keys = mock.keys(BUCKET);
+        assert!(keys.contains(&"tenant-a/resources/Patient/p1/current.json".to_string()));
+        assert!(keys_with(&mock, "_keyspace.json").is_empty());
+        // Another tenant in the same bucket is still new, hence V2.
+        create_one(&backend, &tenant("tenant-b"), "Patient", "p1").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&v2_current_key("tenant-b", "Patient", "p1"))
+        );
+    }
+
+    /// Type and system history work on `V2` with no system index: the system
+    /// feed is served from `history/type/` and the marker never shows in it.
+    #[tokio::test]
+    async fn v2_type_and_system_history() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        let created = create_spaced_patients(&backend, &t, 5).await;
+        create_one(&backend, &t, "Observation", "o0").await;
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        let page = backend
+            .history_type(&t, "Patient", &history_page_params(3, 0))
+            .await
+            .unwrap();
+        assert_eq!(history_ids(&page), ["p4", "p3", "p2"]);
+        assert_eq!(page.page_info.total, Some(5));
+        let page = backend
+            .history_type(&t, "Patient", &history_page_params(3, 3))
+            .await
+            .unwrap();
+        assert_eq!(history_ids(&page), ["p1", "p0"]);
+        assert_eq!(backend.history_type_count(&t, "Patient").await.unwrap(), 5);
+
+        let page = backend
+            .history_system(&t, &history_page_params(4, 0))
+            .await
+            .unwrap();
+        assert_eq!(history_ids(&page), ["o1", "o0", "p4", "p3"]);
+        assert_eq!(page.page_info.total, Some(7));
+        assert_eq!(backend.history_system_count(&t).await.unwrap(), 7);
+        assert_eq!(page.items[2].timestamp, created[4].last_modified());
+
+        let instance = backend
+            .history_instance(&t, "Patient", "p1", &history_page_params(10, 0))
+            .await
+            .unwrap();
+        assert_eq!(history_ids(&instance), ["p1"]);
+    }
+
+    /// The same system feed over a flat tenant still reads `history/system/`.
+    #[tokio::test]
+    async fn v1_system_history_still_reads_the_system_index() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        create_spaced_patients(&backend, &t, 3).await;
+        create_one(&backend, &t, "Observation", "o0").await;
+
+        assert_eq!(backend.history_system_count(&t).await.unwrap(), 4);
+        let before = mock.recorded_lists().len();
+        backend
+            .history_system(&t, &history_page_params(10, 0))
+            .await
+            .unwrap();
+        assert!(
+            lists_since(&mock, before)
+                .iter()
+                .all(|l| l.prefix == "tenant-a/history/system/")
+        );
+    }
+
+    fn v2_object_keys(tenant_id: &str, resource_type: &str, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| v2_current_key(tenant_id, resource_type, &format!("r{i:05}")))
+            .collect()
+    }
+
+    /// A small type is one LIST, as in the flat layout; a type past the first
+    /// page fans out over the 256 shards and still returns every key in
+    /// listing order.
+    #[tokio::test]
+    async fn a_type_listing_fans_out_only_past_the_first_page() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        mock.seed_keys(BUCKET, v2_object_keys("tenant-a", "Condition", 3));
+        mock.seed_keys(BUCKET, v2_object_keys("tenant-a", "Patient", 1100));
+        let location = backend.resource_location(&t).await.unwrap();
+
+        let before = mock.recorded_lists().len();
+        let small = backend
+            .list_current_keys(&location, Some("Condition"))
+            .await
+            .unwrap();
+        assert_eq!(small.len(), 3);
+        let lists = lists_since(&mock, before);
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].prefix, "tenant-a/resources/Condition/");
+
+        let before = mock.recorded_lists().len();
+        let big = backend
+            .list_current_keys(&location, Some("Patient"))
+            .await
+            .unwrap();
+        assert_eq!(big.len(), 1100);
+        let mut sorted = big.clone();
+        sorted.sort();
+        assert_eq!(big, sorted, "shard order concatenates to listing order");
+        let lists = lists_since(&mock, before);
+        assert_eq!(lists[0].prefix, "tenant-a/resources/Patient/");
+        let shard_lists: HashSet<_> = lists[1..].iter().map(|l| l.prefix.clone()).collect();
+        assert_eq!(shard_lists.len(), 256);
+        assert!(shard_lists.contains("tenant-a/resources/Patient/00/"));
+        assert!(shard_lists.contains("tenant-a/resources/Patient/ff/"));
+    }
+
+    /// `purge` of one id on `V2` removes that id's current, versions and type
+    /// events and nothing of its neighbours'.
+    #[tokio::test]
+    async fn v2_purge_removes_one_resource_only() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        create_one(&backend, &t, "Patient", "p1").await;
+        create_one(&backend, &t, "Patient", "p2").await;
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        backend.purge(&t, "Patient", "p1").await.unwrap();
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert!(backend.read(&t, "Patient", "p2").await.unwrap().is_some());
+        assert_eq!(backend.history_type_count(&t, "Patient").await.unwrap(), 1);
+        assert_eq!(backend.history_system_count(&t).await.unwrap(), 2);
+        assert!(
+            keys_with(&mock, &format!("/{}/p1/", shard_segment("p1")))
+                .iter()
+                .all(|k| !k.contains("/resources/"))
+        );
+        assert!(matches!(
+            backend.purge(&t, "Patient", "p1").await,
+            Err(StorageError::Resource(ResourceError::NotFound { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn v2_purge_all_removes_a_whole_type() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        for id in ["p1", "p2", "p3"] {
+            create_one(&backend, &t, "Patient", id).await;
+        }
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        assert_eq!(backend.purge_all(&t, "Patient").await.unwrap(), 3);
+        assert_eq!(backend.count(&t, Some("Patient")).await.unwrap(), 0);
+        assert_eq!(backend.count(&t, Some("Observation")).await.unwrap(), 1);
+        assert_eq!(backend.history_system_count(&t).await.unwrap(), 1);
+        assert!(keys_with(&mock, "/Patient/").is_empty());
+    }
+
+    /// The marker is the tenant's keyspace identity: a tenant purge removes the
+    /// data and keeps it, so the tenant is re-used under the same layout.
+    #[tokio::test]
+    async fn purge_tenant_data_keeps_the_marker() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        let t = tenant("tenant-a");
+        create_one(&backend, &t, "Patient", "p1").await;
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        assert_eq!(backend.purge_tenant_data("tenant-a").await.unwrap(), 2);
+        assert_eq!(mock.keys(BUCKET), vec![marker_key("tenant-a")]);
+
+        // A second instance that cached nothing, with a different default,
+        // still resolves the stamped layout.
+        let other = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        create_one(&other, &t, "Patient", "p9").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&v2_current_key("tenant-a", "Patient", "p9"))
+        );
+    }
+
+    /// Purging a legacy flat tenant under a `V2` default pins it to `V1`, so a
+    /// later write cannot silently start a V2 layout beside other instances'
+    /// flat objects.
+    #[tokio::test]
+    async fn purging_a_legacy_tenant_under_a_v2_default_pins_v1() {
+        let mock = mock();
+        let legacy = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        create_one(&legacy, &tenant("tenant-a"), "Patient", "p0").await;
+
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        assert_eq!(backend.purge_tenant_data("tenant-a").await.unwrap(), 1);
+        assert_eq!(
+            mock.object_body(BUCKET, &marker_key("tenant-a")).unwrap(),
+            KeyspaceLayout::V1.marker_body()
+        );
+        create_one(&backend, &tenant("tenant-a"), "Patient", "p1").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&"tenant-a/resources/Patient/p1/current.json".to_string())
+        );
+    }
+
+    /// Reindex reads a `V2` tenant through offset cursors over the sorted key
+    /// list: every resource exactly once, and types discovered through the shard
+    /// segment.
+    #[tokio::test]
+    async fn v2_reindex_walks_every_resource_once_with_cursors() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        let ids: Vec<String> = (0..7).map(|i| format!("p{i}")).collect();
+        for id in &ids {
+            create_one(&backend, &t, "Patient", id).await;
+        }
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        assert_eq!(
+            backend.list_resource_types(&t).await.unwrap(),
+            ["Observation", "Patient"]
+        );
+        assert_eq!(backend.count_resources(&t, "Patient").await.unwrap(), 7);
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = backend
+                .fetch_resources_page(&t, "Patient", cursor.as_deref(), 3)
+                .await
+                .unwrap();
+            seen.extend(page.resources.iter().map(|r| r.id().to_string()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let mut expected = ids.clone();
+        expected.sort_by_key(|id| (shard_segment(id), id.clone()));
+        assert_eq!(seen, expected);
+    }
+}
+
+/// #2063: the S3 read fan-outs share one backend-wide `GetObject` budget
+/// (`HFS_S3_SCAN_CONCURRENCY`) instead of each fanning out on its own.
+mod scan_read_limit {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Decrements the in-flight gauge when dropped, so a GET that is aborted
+    /// mid-flight still leaves it.
+    struct InFlight<'a>(&'a AtomicUsize);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// An `S3Api` that counts the `GetObject`s in flight and keeps each one
+    /// open for `delay`, so overlapping GETs are observable. Everything else
+    /// delegates to the mock.
+    ///
+    /// [`Self::stall_all_but`] makes every GET except those for one resource
+    /// hang until it is dropped, so a test can hold GETs open at a chosen
+    /// moment.
+    struct GaugedGetClient {
+        inner: Arc<MockS3Client>,
+        delay: Duration,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        /// `Some(id)`: a GET for any key without `/{id}/` never completes.
+        stall_all_but: std::sync::Mutex<Option<String>>,
+    }
+
+    impl GaugedGetClient {
+        /// From now on, GETs for every resource but `id` block until the GET
+        /// is dropped (they are never released otherwise).
+        fn stall_all_but(&self, id: &str) {
+            *self.stall_all_but.lock().unwrap() = Some(id.to_string());
+        }
+
+        fn is_stalled(&self, key: &str) -> bool {
+            self.stall_all_but
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|id| !key.contains(&format!("/{id}/")))
+        }
+    }
+
+    #[async_trait]
+    impl S3Api for GaugedGetClient {
+        async fn head_bucket(&self, bucket: &str) -> Result<(), S3ClientError> {
+            self.inner.head_bucket(bucket).await
+        }
+        async fn head_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<Option<ObjectMetadata>, S3ClientError> {
+            self.inner.head_object(bucket, key).await
+        }
+        async fn get_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<Option<ObjectData>, S3ClientError> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let _leave = InFlight(&self.in_flight);
+            if self.is_stalled(key) {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(self.delay).await;
+            self.inner.get_object(bucket, key).await
+        }
+        async fn put_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            body: Vec<u8>,
+            content_type: Option<&str>,
+            if_match: Option<&str>,
+            if_none_match: Option<&str>,
+        ) -> Result<ObjectMetadata, S3ClientError> {
+            self.inner
+                .put_object(bucket, key, body, content_type, if_match, if_none_match)
+                .await
+        }
+        async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3ClientError> {
+            self.inner.delete_object(bucket, key).await
+        }
+        async fn list_objects(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            continuation: Option<&str>,
+            max_keys: Option<i32>,
+        ) -> Result<ListObjectsResult, S3ClientError> {
+            self.inner
+                .list_objects(bucket, prefix, continuation, max_keys)
+                .await
+        }
+        async fn list_objects_after(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            start_after: &str,
+            continuation: Option<&str>,
+            max_keys: Option<i32>,
+        ) -> Result<ListObjectsResult, S3ClientError> {
+            self.inner
+                .list_objects_after(bucket, prefix, start_after, continuation, max_keys)
+                .await
+        }
+        async fn list_common_prefixes(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            delimiter: &str,
+        ) -> Result<Vec<String>, S3ClientError> {
+            self.inner
+                .list_common_prefixes(bucket, prefix, delimiter)
+                .await
+        }
+        async fn list_common_prefixes_page(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            delimiter: &str,
+            start_after: Option<&str>,
+            max_keys: Option<i32>,
+        ) -> Result<DelimitedListPage, S3ClientError> {
+            self.inner
+                .list_common_prefixes_page(bucket, prefix, delimiter, start_after, max_keys)
+                .await
+        }
+        async fn presign_get(
+            &self,
+            bucket: &str,
+            key: &str,
+            ttl: Duration,
+        ) -> Result<String, S3ClientError> {
+            self.inner.presign_get(bucket, key, ttl).await
+        }
+    }
+
+    /// A `PrefixPerTenant` backend with `scan_concurrency = limit` over a
+    /// [`GaugedGetClient`] whose GETs each take 10 ms.
+    fn gauged_backend(limit: usize) -> (S3Backend, Arc<GaugedGetClient>) {
+        let client = Arc::new(GaugedGetClient {
+            inner: Arc::new(MockS3Client::with_buckets(&["test-bucket"])),
+            delay: Duration::from_millis(10),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            stall_all_but: std::sync::Mutex::new(None),
+        });
+        let config = S3BackendConfig {
+            tenancy_mode: S3TenancyMode::PrefixPerTenant {
+                bucket: "test-bucket".to_string(),
+            },
+            validate_buckets_on_startup: false,
+            scan_concurrency: limit,
+            ..Default::default()
+        };
+        let backend = S3Backend::with_client(config, client.clone()).expect("backend");
+        (backend, client)
+    }
+
+    /// Creates `p00`, `p01`, ... and forgets the GETs the writes made.
+    async fn seed_patients(
+        backend: &S3Backend,
+        client: &GaugedGetClient,
+        t: &TenantContext,
+        n: usize,
+    ) {
+        for i in 0..n {
+            backend
+                .create(
+                    t,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i:02}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .expect("create Patient");
+        }
+        client.peak.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn backend_read_limit_defaults_to_32_and_is_shared_by_clones() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        assert_eq!(backend.scan_concurrency(), 32);
+        assert_eq!(backend.scan_limit.available_permits(), 32);
+        assert!(Arc::ptr_eq(
+            &backend.clone().scan_limit,
+            &backend.scan_limit
+        ));
+    }
+
+    /// Acceptance criterion 3: the read setting does not touch the write
+    /// fan-out that startup seeding and bulk writes use.
+    #[test]
+    fn write_concurrency_is_independent_of_scan_concurrency() {
+        let (backend, _client) = gauged_backend(4);
+        assert_eq!(backend.scan_concurrency(), 4);
+        assert_eq!(ResourceStorage::bulk_write_concurrency(&backend), 32);
+    }
+
+    /// Acceptance criterion 2: scans and a by-id read running at once never
+    /// have more GETs in flight than the limit. Without the shared budget each
+    /// of the four scans and the read would fan out to 3 on its own, 15 in all.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_scans_share_one_read_limit() {
+        let (backend, client) = gauged_backend(3);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 24).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let ids: Vec<String> = (0..10).map(|i| format!("p{i:02}")).collect();
+        let one_scan = || {
+            let scan = scan.clone();
+            let t = t.clone();
+            async move {
+                scan.scan_resources(&t, "Patient")
+                    .await
+                    .expect("scan")
+                    .collect::<Vec<_>>()
+                    .await
+            }
+        };
+
+        let (a, b, c, d, read) = tokio::join!(
+            one_scan(),
+            one_scan(),
+            one_scan(),
+            one_scan(),
+            scan.read_resources(&t, "Patient", &ids),
+        );
+        for scanned in [a, b, c, d] {
+            assert_eq!(scanned.len(), 24);
+            assert!(scanned.iter().all(|r| r.is_ok()), "{scanned:?}");
+        }
+        assert_eq!(read.expect("read by id").len(), 10);
+
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 3,
+            "peak {peak} GETs in flight exceeds the limit of 3"
+        );
+        assert!(peak >= 2, "peak {peak}: the test never overlapped any GETs");
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_limit.available_permits(), 3);
+    }
+
+    /// The setting really bounds a single call, and a limit of one still lets
+    /// the scan finish.
+    #[tokio::test(start_paused = true)]
+    async fn scan_concurrency_one_serialises_and_still_completes() {
+        let (backend, client) = gauged_backend(1);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 10).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let scanned = scan
+            .scan_resources(&t, "Patient")
+            .await
+            .expect("scan")
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(scanned.len(), 10);
+        assert!(scanned.iter().all(|r| r.is_ok()), "{scanned:?}");
+        assert_eq!(client.peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// Deadlock regression. The in-process SQL-on-FHIR runner stops polling its
+    /// scan stream while it resolves a batch's references and while it waits on
+    /// a full channel, and the resolve (or the compartment filter) reads by id
+    /// through the same backend. If the permit were taken in the fan-out's own
+    /// future, two paused scans would keep the whole budget while that nested
+    /// read queued for a permit that never frees (the semaphore hands released
+    /// permits to queued waiters even when nothing polls them), and this read
+    /// would end in `Elapsed`. Each GET runs on its own task, so it finishes and
+    /// returns its permit whatever the scan's consumer does.
+    #[tokio::test(start_paused = true)]
+    async fn paused_scans_do_not_hold_the_read_limit() {
+        let (backend, client) = gauged_backend(2);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 10).await;
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let mut first = scan.scan_resources(&t, "Patient").await.expect("scan");
+        let mut second = scan.scan_resources(&t, "Patient").await.expect("scan");
+        first.next().await.expect("an item").expect("scanned");
+        second.next().await.expect("an item").expect("scanned");
+        // Both streams are now left unpolled, as the runner leaves them.
+
+        let ids = ["p00", "p01", "p02"].map(str::to_string);
+        let read = tokio::time::timeout(
+            Duration::from_secs(30),
+            scan.read_resources(&t, "Patient", &ids),
+        )
+        .await
+        .expect("a by-id read must not wait on permits that paused scans hold")
+        .expect("read by id");
+        assert_eq!(read.len(), 3);
+
+        for stream in [first, second] {
+            let rest = stream.collect::<Vec<_>>().await;
+            assert_eq!(rest.len(), 9, "the rest of the scan still arrives");
+            assert!(rest.iter().all(|r| r.is_ok()), "{rest:?}");
+        }
+    }
+
+    /// A scan that is dropped half-way aborts the GETs it has in flight, and
+    /// the permits come back.
+    ///
+    /// Every GET except the first resource's hangs forever (the gauged client's
+    /// `stall_all_but`), so when the stream is dropped at least one GET is
+    /// still blocked, holding a permit. Each GET runs on its own task: only
+    /// the abort-on-drop guard stops that task, so without it the blocked GET
+    /// and its permit would never be given back, however long we wait.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_scan_returns_its_permits() {
+        let (backend, client) = gauged_backend(2);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 10).await;
+        client.stall_all_but("p00");
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let mut stream = scan.scan_resources(&t, "Patient").await.expect("scan");
+        stream.next().await.expect("an item").expect("scanned");
+
+        // The setup holds: a stalled GET is open and owns a permit.
+        assert!(
+            client.in_flight.load(Ordering::SeqCst) >= 1,
+            "no GET was blocked when the stream was dropped"
+        );
+        assert!(backend.scan_limit.available_permits() < 2);
+
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_limit.available_permits(), 2);
+    }
+
+    /// The other read fan-outs (type count, the live scan behind conditional
+    /// create and SearchParameter reloads, type and instance `_history`) draw
+    /// on the same budget as the SQL-on-FHIR scans.
+    #[tokio::test(start_paused = true)]
+    async fn other_read_fan_outs_share_the_scan_limit() {
+        let (backend, client) = gauged_backend(2);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 12).await;
+        for i in 0..3 {
+            backend
+                .create_or_update(
+                    &t,
+                    "Patient",
+                    "p00",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "p00",
+                        "name": [{"family": format!("v{i}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .expect("update Patient");
+        }
+        client.peak.store(0, Ordering::SeqCst);
+
+        let scan = backend.resource_scan().expect("scan hook");
+        let type_params = HistoryParams {
+            pagination: Pagination {
+                count: 100,
+                mode: PaginationMode::Offset(0),
+            },
+            ..HistoryParams::new()
+        };
+        let instance_params = HistoryParams::new();
+        let (scanned, counted, live, type_history, instance_history) = tokio::join!(
+            async {
+                scan.scan_resources(&t, "Patient")
+                    .await
+                    .expect("scan")
+                    .collect::<Vec<_>>()
+                    .await
+            },
+            backend.count(&t, Some("Patient")),
+            backend.scan_live_resources(&t, "Patient"),
+            backend.history_type(&t, "Patient", &type_params),
+            backend.history_instance(&t, "Patient", "p00", &instance_params),
+        );
+
+        assert_eq!(scanned.len(), 12);
+        assert!(scanned.iter().all(|r| r.is_ok()), "{scanned:?}");
+        assert_eq!(counted.expect("count"), 12);
+        assert_eq!(live.expect("live scan").len(), 12);
+        // 12 creates and 3 updates; deletes are excluded, so every index body
+        // is read to find out.
+        assert_eq!(type_history.expect("type history").items.len(), 15);
+        // p00: the create and the three updates.
+        assert_eq!(instance_history.expect("instance history").items.len(), 4);
+
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 2,
+            "peak {peak} GETs in flight exceeds the limit of 2"
+        );
+        assert!(peak >= 2, "peak {peak}: the test never overlapped any GETs");
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.scan_limit.available_permits(), 2);
     }
 }

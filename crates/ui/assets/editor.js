@@ -8,14 +8,21 @@
  *
  * What the script does:
  *   1. fetches the resource from the ordinary FHIR API,
- *   2. hands the document to the server with whatever the user just did,
- *   3. swaps in the HTML the server hands back,
- *   4. saves it again through the ordinary FHIR API.
+ *   2. has the server render the editor body once for that document,
+ *   3. mounts the JSON pane and the guided form over it
+ *      (`resource-json-editor.js`, which pairs the CodeMirror editor with the
+ *      guided form through `editor-pair.js` / `editor-form.js` -- the same
+ *      loop the Resources modal and View Definitions use, so every form
+ *      interaction and every JSON edit round-trips there, not here),
+ *   4. saves the JSON pane's document through the ordinary FHIR API.
  *
- * The document lives in a hidden field inside the fragment the server renders.
- * It is the single copy. Nothing here derives from it, so nothing here can lose
- * a key it did not understand -- which is the failure mode of every schema-driven
- * editor we surveyed for #264.
+ * The body is rendered whole only once per document; afterwards just the
+ * guided-form card is swapped and the JSON pane is never replaced (loading a
+ * version or installing the saved document goes through the editor as one
+ * undoable transaction). The JSON pane's text (`#editor-source`) is the single
+ * copy of the document. Nothing here derives from it, so nothing here can lose
+ * a key it did not understand -- which is the failure mode of every
+ * schema-driven editor we surveyed for #264.
  */
 (function () {
   "use strict";
@@ -32,202 +39,215 @@
   var root = document.getElementById("editor");
   if (!root || !window.fetch) return;
 
+  /* Replaced by every full render (`HfsResourceJsonEditor.render`), so always
+   * read it through this variable. */
   var body = document.getElementById("editor-body");
+  /* `{ view, pair, textarea }` of the mounted JSON pane (`null` pair without
+   * editor-pair.js). */
+  var session = { view: null, pair: null, textarea: null };
+  var JsonEditor = window.HfsResourceJsonEditor;
   var status = document.getElementById("editor-status");
   var subject = document.getElementById("editor-subject");
   var messages = root.dataset;
 
+  /* Unsaved-changes tracking (#1240): opt in lazily, once the document is in
+   * scope, so `read` never runs before the fragment it reads exists. */
+  var unsaved = null;
+  function trackUnsaved() {
+    if (unsaved || !window.HfsUnsaved) return;
+    unsaved = window.HfsUnsaved.track({
+      root: root,
+      checkOnExit: true,
+      read: readWithPending,
+      cue: root.querySelector(".editor__actions"),
+    });
+  }
+
   var resourceType = messages.type;
   var resourceId = messages.id;
+  var confirmed = null;
+  var saving = false;
+  var deleting = false;
+  var ready = false;
+  var canonicalPending = null;
+  var editRevision = 0;
+  var rawReplacement = null;
+  /* True while a document is installed into the editor from code (a version,
+   * the saved canonical): that is not an edit by the user. */
+  var applying = false;
+  var saveButton = document.getElementById("editor-save");
+  var deleteButton = document.getElementById("editor-delete");
+  function updateActions() {
+    saveButton.disabled = saving || deleting || !ready;
+    if (saving) saveButton.setAttribute("aria-busy", "true");
+    else saveButton.removeAttribute("aria-busy");
+    deleteButton.hidden = !confirmed;
+    deleteButton.disabled = saving || deleting;
+    if (deleting) deleteButton.setAttribute("aria-busy", "true");
+    else deleteButton.removeAttribute("aria-busy");
+    body.inert = saving || deleting || !!canonicalPending;
+  }
+  /* While nothing is confirmed, the header says where the document will be
+   * saved when it carries a valid id (#1751); empty otherwise. */
+  function refreshSubject() {
+    if (confirmed || resourceId) return;
+    var doc;
+    try { doc = JSON.parse(currentDocument()); } catch (invalidJson) { doc = null; }
+    var text = window.HfsSaveTarget.notice(resourceType, doc, messages.msgSaveTarget || "{target}");
+    subject.classList.toggle("subject--target", !!text);
+    subject.textContent = "";
+    if (!text) return;
+    var label = resourceType + "/" + doc.id;
+    var at = text.indexOf(label);
+    var code = document.createElement("code");
+    code.textContent = label;
+    subject.appendChild(document.createTextNode(text.slice(0, at)));
+    subject.appendChild(code);
+    subject.appendChild(document.createTextNode(text.slice(at + label.length)));
+  }
+  function confirmIdentity(resource) {
+    if (!resource || resource.resourceType !== resourceType ||
+        !/^[A-Za-z0-9.-]{1,64}$/.test(resource.id || "")) return;
+    confirmed = { type: resourceType, id: resource.id, url: resource.url, code: resource.code };
+    resourceId = resource.id;
+    subject.classList.remove("subject--target");
+    subject.textContent = resourceType + "/" + resourceId +
+      (resource.meta && resource.meta.lastUpdated
+        ? " · " + new Date(resource.meta.lastUpdated).toLocaleString() : "");
+    updateActions();
+  }
+  /* Capture phase: this must run before `editor-pair.js`'s own listener on
+   * the plain textarea schedules its sync, so the version it captures already
+   * includes this edit. */
+  root.addEventListener("input", function (event) {
+    if (applying || !event.target.matches("[data-set], #editor-source")) return;
+    var isSource = event.target.id === "editor-source";
+    if (isSource) refreshSubject();
+    var projection = body.querySelector("#editor-pretty");
+    // The guided form handing its own projection to the editor is not an
+    // edit: the text equals what the server just rendered.
+    if (isSource && projection && event.target.value === projection.value) {
+      rawReplacement = null;
+      return;
+    }
+    editRevision++;
+    window.HfsEditorAdd.invalidateRefresh(body);
+    rawReplacement = null;
+    if (isSource) {
+      var replacement = window.HfsEditorAdd.canonicalDocument(event.target.value);
+      var previous = projection ? window.HfsEditorAdd.canonicalDocument(projection.value) : null;
+      // Unparseable text is not a replacement; Save reports it normally.
+      if (replacement !== null && replacement !== previous) {
+        rawReplacement = { doc: event.target.value, version: window.HfsEditorAdd.documentVersion(body) };
+      }
+    }
+  }, true);
+
+  /* Once an explicitly authored replacement is the current projection, later
+   * formatting edits must not resurrect a superseded failed mutation (#1751). */
+  new MutationObserver(function () {
+    if (!rawReplacement || rawReplacement.version !== window.HfsEditorAdd.documentVersion(body)) return;
+    var projected = body.querySelector("#editor-doc");
+    if (projected && window.HfsEditorAdd.canonicalDocument(projected.value) ===
+        window.HfsEditorAdd.canonicalDocument(rawReplacement.doc)) {
+      window.HfsEditorAdd.supersedeCompletedMutations(body);
+    }
+  }).observe(root, { childList: true, subtree: true });
+  updateActions();
 
   function say(text, kind) {
     status.textContent = text || "";
     status.className = "editor__status" + (kind ? " editor__status--" + kind : "");
   }
 
-  /* ---- the round trip -------------------------------------------------- */
-
-  /* Posts the document plus one mutation, and swaps in the re-rendered body.
-   * `op` is empty for a plain re-render (first load, or after a source edit). */
-  function send(op, fields) {
-    /* URLSearchParams, not FormData: fetch sends FormData as multipart, and the
-     * server takes an urlencoded form. */
-    var form = new URLSearchParams();
-    form.set("doc", currentDocument());
-    form.set("op", op || "");
-    Object.keys(fields || {}).forEach(function (key) {
-      form.set(key, fields[key]);
-    });
-
-    return fetch("/ui/editor/render", { method: "POST", body: form })
-      .then(function (response) {
-        return response.text();
-      })
-      .then(function (html) {
-        var state = captureUiState();
-        body.innerHTML = html;
-        applyView();
-        restoreUiState(state);
-      });
+  /* A successful save is confirmed by the "Unsaved changes" pill going away,
+   * not by visible text (#1649). `announce` hands the words to assistive
+   * technology through the page's visually hidden live region; emptying it
+   * first makes a repeated save re-announce instead of leaving identical
+   * text in place. */
+  var announcer = document.getElementById("editor-announce");
+  function announce(text) {
+    if (!announcer) return;
+    announcer.textContent = "";
+    window.setTimeout(function () {
+      if (root.isConnected) announcer.textContent = text || "";
+    }, 50);
   }
 
-  /* ---- keeping the user's place across the swap (#547) ------------------ */
+  /* ---- the document ---------------------------------------------------- */
 
-  /* The whole body re-renders on every mutation; without this, each round
-   * trip destroyed the focused field, the caret, any open add-picker with
-   * its filter text, and the tree's scroll position. Captured at response
-   * time — where the user is *now*, not where they were at request time. */
-  function captureUiState() {
-    var state = { focus: null, pickers: [], scroll: 0, rawOpen: false };
-    var raw = body.querySelector("#editor-json-raw");
-    state.rawOpen = !!(raw && !raw.hidden);
-    var tree = body.querySelector(".editor-tree");
-    if (tree) state.scroll = tree.scrollTop;
-    var active = document.activeElement;
-    if (active && body.contains(active) && active.dataset && active.dataset.set) {
-      state.focus = {
-        path: active.dataset.set,
-        start: active.selectionStart,
-        end: active.selectionEnd,
-      };
-    }
-    body.querySelectorAll("details.editor-add[open]").forEach(function (box) {
-      var row = box.closest("[data-path]");
-      var filter = box.querySelector(".editor-add__filter");
-      state.pickers.push({
-        path: row ? row.dataset.path : "",
-        filter: filter ? filter.value : "",
-        focusFilter: filter === document.activeElement,
-      });
-    });
-    return state;
-  }
-
-  function rowByPath(path) {
-    if (!path) return body;
-    var rows = body.querySelectorAll("[data-path]");
-    for (var i = 0; i < rows.length; i++) {
-      if (rows[i].dataset.path === path) return rows[i];
-    }
-    return null;
-  }
-
-  function inputByPath(path) {
-    var inputs = body.querySelectorAll("[data-set]");
-    for (var i = 0; i < inputs.length; i++) {
-      if (inputs[i].dataset.set === path) return inputs[i];
-    }
-    return null;
-  }
-
-  function restoreUiState(state) {
-    // Raw mode survives the swap: the fresh textarea already carries the
-    // updated document, so a guided edit refreshes the JSON in place instead
-    // of kicking the user back to the fold view.
-    if (state.rawOpen) {
-      var raw = body.querySelector("#editor-json-raw");
-      var viewEl = body.querySelector("#json-view");
-      var toggle = body.querySelector("#editor-json-edit");
-      if (raw && viewEl) {
-        raw.hidden = false;
-        viewEl.hidden = true;
-        if (toggle) toggle.classList.add("editor-json__act--on");
-      }
-    }
-    state.pickers.forEach(function (saved) {
-      var row = rowByPath(saved.path);
-      if (!row) return;
-      var box = row.querySelector("details.editor-add");
-      if (!box) return;
-      box.setAttribute("open", "");
-      var filter = box.querySelector(".editor-add__filter");
-      if (filter && saved.filter) {
-        filter.value = saved.filter;
-        filter.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      if (saved.focusFilter && filter) filter.focus();
-    });
-
-    // The server names the node the mutation created; the caret goes there.
-    // Otherwise it returns to the field that was focused before the swap.
-    var formEl = body.querySelector("#editor-form");
-    var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
-    var target = createdPath ? inputByPath(createdPath) : null;
-    if (target) {
-      target.focus();
-      if (target.select) target.select();
-    } else if (state.focus) {
-      target = inputByPath(state.focus.path);
-      if (target) {
-        target.focus();
-        if (target.setSelectionRange && state.focus.start !== null) {
-          try {
-            target.setSelectionRange(state.focus.start, state.focus.end);
-          } catch (ignored) {}
-        }
-      }
-    }
-
-    var tree = body.querySelector(".editor-tree");
-    if (tree) tree.scrollTop = state.scroll;
-  }
-
-  /* The in-flight document. Normally the server's fragment (the hidden field),
-     but while the raw editor is open its textarea is the source of truth — the
-     field only catches up when you toggle "Edit raw" back off, so a Save typed
-     directly in raw mode must read the textarea. */
+  /* The JSON pane's text is the single copy; the guided form follows it. */
   function currentDocument() {
-    var raw = document.getElementById("editor-json-raw");
     var source = document.getElementById("editor-source");
-    if (raw && !raw.hidden && source) return source.value;
+    if (source) return source.value;
     var field = document.getElementById("editor-doc");
     return field ? field.value : "{}";
+  }
+
+  function readWithPending() {
+    return window.HfsUnsaved.withPending(currentDocument(), body);
+  }
+
+  /* The whole body, rendered once for `text` and mounted. Also the fallback
+   * when editor-pair.js is not there to swap the form in place. */
+  function renderFull(text) {
+    window.HfsEditorAdd.invalidateRefresh(body);
+    return JsonEditor.render(body, text).then(function (rendered) {
+      body = rendered.body;
+      session = rendered.session;
+      if (!session.pair) window.HfsEditorAdd.attach(body);
+      updateActions();
+      refreshSubject();
+      return true;
+    }).catch(function (error) { console.debug("Editor render failed", error); return false; });
+  }
+
+  /* Puts `text` into the editor as one undoable transaction and refreshes the
+   * guided form for it. Resolves true when both show it. */
+  function showDocument(text) {
+    rawReplacement = null;
+    if (!session.pair) return renderFull(text);
+    applying = true;
+    var shown;
+    try { shown = JsonEditor.apply(session, text); } finally { applying = false; }
+    return shown.then(function (ok) {
+      refreshSubject();
+      if (unsaved) unsaved.check();
+      return ok;
+    });
+  }
+
+  /* The validation render a Save runs before writing: the guided form for
+   * exactly `text`, without touching the editor. */
+  function validateDocument(text) {
+    window.HfsEditorAdd.invalidateRefresh(body);
+    if (!session.pair) return renderFull(text);
+    // A pending JSON -> form sync would supersede this render.
+    session.pair.host.beforeMutation();
+    return JsonEditor.project(session, text);
   }
 
   /* ---- loading --------------------------------------------------------- */
 
   function load() {
-    if (!resourceId) {
-      // A new, empty resource of the requested type. Seed the hidden field the
-      // fragment will replace, then render it.
-      var seed = new URLSearchParams();
-      seed.set("doc", JSON.stringify({ resourceType: resourceType }));
-      seed.set("op", "");
-      return fetch("/ui/editor/render", { method: "POST", body: seed })
-        .then(function (r) { return r.text(); })
-        .then(function (html) { body.innerHTML = html; applyView(); });
-    }
-    return fetch("/" + resourceType + "/" + resourceId, {
-      headers: fhirHeaders(),
-    })
-      .then(function (response) {
-        if (!response.ok) throw new Error(String(response.status));
-        return response.json();
-      })
-      .then(function (resource) {
-        subject.textContent =
-          resourceType +
-          "/" +
-          (resource.id || "") +
-          (resource.meta && resource.meta.lastUpdated
-            ? " · " + new Date(resource.meta.lastUpdated).toLocaleString()
-            : "");
+    var resource = resourceId
+      ? fetch("/" + resourceType + "/" + resourceId, { headers: fhirHeaders() })
+          .then(function (response) {
+            if (!response.ok) throw new Error(String(response.status));
+            return response.json();
+          })
+      : Promise.resolve({ resourceType: resourceType });
+    return resource.then(function (doc) {
+      return renderFull(JSON.stringify(doc)).then(function (rendered) {
+        if (!rendered) throw new Error(messages.msgLoadError);
+        if (resourceId) confirmIdentity(doc);
+        ready = true;
+        updateActions();
+        trackUnsaved();
+        if (unsaved) unsaved.reset();
         loadVersions();
-        return renderDocument(resource);
-      })
-      .catch(function () {
-        say(messages.msgLoadError, "error");
       });
-  }
-
-  /* Renders a document into the editor body (JSON + form). */
-  function renderDocument(resource) {
-    var form = new URLSearchParams();
-    form.set("doc", JSON.stringify(resource));
-    form.set("op", "");
-    return fetch("/ui/editor/render", { method: "POST", body: form })
-      .then(function (r) { return r.text(); })
-      .then(function (html) { body.innerHTML = html; applyView(); });
+    }).catch(function () { if (root.isConnected) say(messages.msgLoadError, "error"); });
   }
 
   /* ---- version history panel ------------------------------------------- */
@@ -241,7 +261,7 @@
     })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (bundle) {
-        renderVersions((bundle && bundle.entry) || []);
+        if (root.isConnected) renderVersions((bundle && bundle.entry) || []);
       })
       .catch(function () {});
   }
@@ -284,155 +304,17 @@
       row.appendChild(meta);
       // Load this version into the editor.
       row.addEventListener("click", function () {
-        renderDocument(resource);
+        if (saving) return;
+        showDocument(JSON.stringify(resource, null, 2));
         subject.textContent = resourceType + "/" + resourceId + " · v" + version;
       });
       versionsHost.appendChild(row);
     });
   }
 
-  /* ---- raw JSON editing ------------------------------------------------- */
-
-  function applyView() {
-    /* No-op retained as the render hook the round trip calls after a swap. */
-  }
-
   root.addEventListener("click", function (event) {
-    /* Raw-edit toggle: swap the fold view for the textarea and back. */
-    if (event.target.id === "editor-json-edit") {
-      var raw = document.getElementById("editor-json-raw");
-      var viewEl = document.getElementById("json-view");
-      if (!raw || !viewEl) return;
-      if (raw.hidden) {
-        raw.hidden = false;
-        viewEl.hidden = true;
-        event.target.classList.add("editor-json__act--on");
-      } else {
-        // Leaving raw: the text becomes the document, and the form re-renders.
-        // Close the pane before the round trip — the state capture during the
-        // swap keeps raw mode alive, and this is the one re-render that must
-        // read as "the user left raw mode".
-        var source = document.getElementById("editor-source");
-        var field = document.getElementById("editor-doc");
-        if (source && field) field.value = source.value;
-        raw.hidden = true;
-        viewEl.hidden = false;
-        event.target.classList.remove("editor-json__act--on");
-        send("");
-      }
-      return;
-    }
-
-    /* ---- structural mutations: each is one round trip ------------------ */
-
-    var add = event.target.closest("[data-add]");
-    if (add) {
-      send("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" });
-      return;
-    }
-
-    var remove = event.target.closest("[data-remove]");
-    if (remove) {
-      send("remove", { path: remove.dataset.remove });
-      return;
-    }
-
-    var extension = event.target.closest("[data-extension]");
-    if (extension) {
-      var panel = extension.closest(".editor-add__ext");
-      var url = extension.dataset.url || (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
-      send("extension", { path: extension.dataset.extension, url: url });
-      return;
-    }
-
     if (event.target.id === "editor-save") save();
     if (event.target.id === "editor-delete") remove_resource();
-  });
-
-  /* A value[x]: the user picks the type, the server creates the branch. */
-  root.addEventListener("change", function (event) {
-    var choose = event.target.closest("[data-choose]");
-    if (choose && choose.value) {
-      send("choose", {
-        path: choose.dataset.choose,
-        name: choose.dataset.declarer,
-        arm: choose.value,
-      });
-    }
-  });
-
-  /* Primitive edits do not round-trip per keystroke -- only on blur, when the
-   * value is settled. The server re-validates, so the error appears where the
-   * mistake is. */
-  root.addEventListener(
-    "blur",
-    function (event) {
-      var input = event.target.closest("[data-set]");
-      if (!input) return;
-      // An unchanged value needs no round trip -- tabbing through fields
-      // must not re-render the panel (#547).
-      if (input.value === input.defaultValue) return;
-      send("set", { path: input.dataset.set, value: input.value });
-    },
-    true
-  );
-
-
-  /* Live $expand picker (#365): bound inputs carry data-vs-url; typing
-   * debounces a request to the UI's terminology proxy and fills a per-row
-   * datalist. 204 (no server configured) leaves the plain input alone. */
-  var expandTimer = null;
-  var expandSeq = 0;
-  var liveListSeq = 0;
-  body.addEventListener("input", function (event) {
-    var input = event.target.closest("[data-vs-url]");
-    if (!input) return;
-    clearTimeout(expandTimer);
-    expandTimer = setTimeout(function () {
-      var seq = ++expandSeq;
-      fetch(
-        "/ui/editor/expand?url=" +
-          encodeURIComponent(input.dataset.vsUrl) +
-          "&filter=" +
-          encodeURIComponent(input.value),
-        { credentials: "same-origin" },
-      )
-        .then(function (r) { return r.status === 200 ? r.json() : null; })
-        .then(function (data) {
-          if (!data || seq !== expandSeq) return;
-          var listId = input.getAttribute("list");
-          if (!listId) {
-            listId = "vs-live-" + (++liveListSeq);
-            input.setAttribute("list", listId);
-          }
-          var list = document.getElementById(listId);
-          if (!list) {
-            list = document.createElement("datalist");
-            list.id = listId;
-            input.parentElement.appendChild(list);
-          }
-          list.textContent = "";
-          data.codes.forEach(function (item) {
-            var opt = document.createElement("option");
-            opt.value = item.code;
-            if (item.display) opt.label = item.display;
-            list.appendChild(opt);
-          });
-        })
-        .catch(function () {});
-    }, 300);
-  });
-
-  /* Typeahead over the "add" list -- the only thing here that is purely
-   * cosmetic, and the only thing that would be silly to round-trip. */
-  root.addEventListener("input", function (event) {
-    var filter = event.target.closest(".editor-add__filter");
-    if (!filter) return;
-    var needle = filter.value.trim().toLowerCase();
-    var panel = filter.closest(".editor-add__panel");
-    panel.querySelectorAll("[data-add-name]").forEach(function (item) {
-      item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) === -1;
-    });
   });
 
   /* ---- saving ---------------------------------------------------------- */
@@ -479,85 +361,150 @@
     row.classList.add("editor-row--error");
   }
 
-  function save() {
-    var doc = currentDocument();
-    var parsed;
+  async function save() {
+    if (saving || deleting || !ready) return;
+    // Commit the focused primitive before capturing the document. Structural
+    // edits already reserved by the click share the same mutation queue.
+    var authored = rawReplacement && rawReplacement.version === window.HfsEditorAdd.documentVersion(body)
+      ? rawReplacement : null;
+    var active = document.activeElement;
+    if (!canonicalPending && !authored && active && body.contains(active) && active.matches("[data-set]")) active.blur();
+    saving = true;
+    updateActions();
+    var revision = editRevision;
     try {
-      parsed = JSON.parse(doc);
-    } catch (error) {
-      say(messages.msgSaveInvalid || String(error), "error");
-      return;
-    }
-
-    // Validate the exact document being saved by re-rendering it (this also
-    // commits a raw edit), then refuse to persist a new version while the
-    // editor reports any issue — an invalid resource must not reach history.
-    send("").then(function () {
-      var form = document.getElementById("editor-form");
-      var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
-      if (errors > 0) {
-        say(messages.msgSaveBlocked, "error");
+      // A committed response remains recoverable if its projection failed.
+      // Retry projection before any further write, keeping the old view inert.
+      if (canonicalPending) {
+        if (!await showDocument(JSON.stringify(canonicalPending, null, 2))) { say(messages.msgLoadError, "error"); return; }
+        canonicalPending = null;
+        if (unsaved) unsaved.reset();
+        refreshReturnLinks();
+        say("");
+        announce(messages.msgSaved);
         return;
       }
-
-      var isNew = !parsed.id;
-      var url = "/" + resourceType + (isNew ? "" : "/" + parsed.id);
-
-      fetch(url, {
-        method: isNew ? "POST" : "PUT",
+      try {
+        await window.HfsEditorAdd.whenMutationsSettled(body);
+      } catch (error) {
+        if (!authored || authored.version !== window.HfsEditorAdd.documentVersion(body) ||
+            !window.HfsEditorAdd.supersedeCompletedMutations(body)) throw error;
+      }
+      if (authored && authored.version !== window.HfsEditorAdd.documentVersion(body)) authored = null;
+      if (!root.isConnected || editRevision !== revision) return;
+      var doc = authored ? authored.doc : currentDocument();
+      var parsed;
+      try { parsed = JSON.parse(doc); }
+      catch (error) { say(messages.msgSaveInvalid || String(error), "error"); return; }
+      window.HfsEditorAdd.invalidateRefresh(body);
+      var rendered = await validateDocument(doc);
+      if (!rendered || editRevision !== revision) { say(messages.msgLoadError, "error"); return; }
+      var form = body.querySelector("#editor-form");
+      var errors = form ? Number(form.dataset.errorCount) : NaN;
+      if (!Number.isFinite(errors) || errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
+      var target = window.HfsSaveTarget.forCreate(resourceType, parsed);
+      if (!confirmed && target.method === "PUT" && window.HfsSaveTarget.isValidId(target.id)) {
+        // Creating over an id that already exists would silently add a version
+        // (#1751). `saving` is already true, so a double click starts no second
+        // probe or dialog. A failed probe never blocks the save.
+        var exists = false;
+        try {
+          var probe = await fetch(target.url + "?_elements=id", { method: "GET", headers: fhirHeaders() });
+          exists = window.HfsSaveTarget.existsFromStatus(probe.status);
+        } catch (probeError) { exists = false; }
+        if (exists && !await window.HfsConfirm.ask(
+          String(messages.msgIdExists).replace("{target}", resourceType + "/" + target.id),
+          { confirmLabel: messages.msgIdExistsConfirm },
+        )) return;
+        if (!root.isConnected || editRevision !== revision) return;
+      }
+      var response = await fetch(target.url, {
+        method: target.method,
         headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
         body: doc,
-      })
-        .then(function (response) {
-          return response.json().then(function (payload) {
-            return { ok: response.ok, payload: payload };
-          });
-        })
-        .then(function (result) {
-          if (!result.ok) {
-            // The server refused it. Show its OperationOutcome, not our guess —
-            // and anchor each issue to its row exactly like live errors (#366).
-            // Rows still carry the live pass's error count, which this does not
-            // touch: a refused save must stay retryable once you fix the field.
-            var issues = (result.payload && result.payload.issue) || [];
-            issues.forEach(function (issue) {
-              var text =
-                issue.diagnostics || (issue.details && issue.details.text) || "";
-              expressionsOf(issue).forEach(function (expr) {
-                anchor(rowFor(expr), text);
-              });
-            });
-            var first = issues[0];
-            say(
-              (first && (first.diagnostics || (first.details && first.details.text))) ||
-                "",
-              "error"
-            );
-            return;
-          }
-          say(messages.msgSaved, "ok");
-          if (result.payload && result.payload.id && !parsed.id) {
-            resourceId = result.payload.id;
-          }
-        })
-        .catch(function (error) {
-          say(String(error), "error");
+      });
+      var payload = await response.json();
+      if (!root.isConnected) return;
+      if (!response.ok) {
+        var issues = (payload && payload.issue) || [];
+        issues.forEach(function (issue) {
+          var text = issue.diagnostics || (issue.details && issue.details.text) || "";
+          expressionsOf(issue).forEach(function (expr) { anchor(rowFor(expr), text); });
         });
-    });
+        var first = issues[0];
+        say((first && (first.diagnostics || (first.details && first.details.text))) || String(response.status), "error");
+        return;
+      }
+      // The response, rather than an authored id, confirms persistence. Install
+      // that canonical document before resetting the dirty baseline.
+      confirmIdentity(payload);
+      canonicalPending = payload;
+      if (editRevision !== revision || !await showDocument(JSON.stringify(payload, null, 2))) {
+        say(messages.msgLoadError, "error");
+        return;
+      }
+      canonicalPending = null;
+      say("");
+      announce(messages.msgSaved);
+      if (unsaved) unsaved.reset();
+      refreshReturnLinks();
+      loadVersions();
+    } catch (error) {
+      if (root.isConnected) say(String(error), "error");
+    } finally {
+      saving = false;
+      updateActions();
+    }
+  }
+
+  function returnDestination(identity, deleted) {
+    var target = new URL(messages.returnTo, window.location.origin);
+    if (target.pathname === "/ui/search-parameters" && identity.type === "SearchParameter") {
+      target.searchParams.set("refresh", "1");
+      if (deleted && identity.url && target.searchParams.get("sel") === identity.url) target.searchParams.delete("sel");
+    }
+    if (target.pathname === "/ui/compartments" && identity.type === "CompartmentDefinition") {
+      target.searchParams.set("refresh", "1");
+      if (deleted && identity.code && target.searchParams.get("def") === identity.code) target.searchParams.delete("def");
+    }
+    return target.pathname + target.search + target.hash;
+  }
+
+  function refreshReturnLinks() {
+    if (!confirmed) return;
+    var href = returnDestination(confirmed, false);
+    document.getElementById("editor-back").setAttribute("href", href);
+    document.getElementById("editor-cancel").setAttribute("href", href);
   }
 
   function remove_resource() {
-    var parsed = JSON.parse(currentDocument() || "{}");
-    if (!parsed.id) return;
-    if (!window.confirm(messages.msgConfirmDelete)) return;
-
-    fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE", headers: fhirHeaders() })
-      .then(function (response) {
-        if (response.ok) window.location.href = "/ui/queries";
-      })
-      .catch(function (error) {
-        say(String(error), "error");
-      });
+    if (!confirmed || saving || deleting) return;
+    var identity = confirmed;
+    /* The shared in-page confirmation (#1667), not the browser's own box. */
+    window.HfsConfirm.ask(messages.msgConfirmDelete, { danger: true }).then(function (ok) {
+      if (!ok || saving || deleting) return;
+      deleting = true;
+      updateActions();
+      fetch("/" + identity.type + "/" + identity.id, { method: "DELETE", headers: fhirHeaders() })
+        .then(function (response) {
+          if (!root.isConnected) return;
+          if (!response.ok) {
+            deleting = false;
+            updateActions();
+            say(String(response.status), "error");
+            return;
+          }
+          // Navigating away: `deleting` stays up so the controls stay inert.
+          if (window.HfsUnsaved) window.HfsUnsaved.suspend();
+          window.location.href = returnDestination(identity, true);
+        })
+        .catch(function (error) {
+          if (!root.isConnected) return;
+          deleting = false;
+          updateActions();
+          say(String(error), "error");
+        });
+    });
   }
 
   load();

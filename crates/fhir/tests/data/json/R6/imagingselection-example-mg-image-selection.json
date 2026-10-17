@@ -1,38 +1,31 @@
 {
   "resourceType": "ImagingSelection",
   "id": "example-mg-image-selection",
+  "status": "available",
   "category": [
     {
       "coding": [
         {
-          "code": "128181",
           "system": "http://dicom.nema.org/resources/ontology/DCM",
+          "code": "128181",
           "display": "Diagnostic Source Images"
         }
       ]
     }
   ],
-  "code": {
-    "coding": [
-      {
-        "code": "121080",
-        "system": "http://dicom.nema.org/resources/ontology/DCM",
-        "display": "Best illustration of finding"
-      }
-    ]
-  },
-  "bodySite": [
-    {
-      "reference": {
-        "reference": "BodyStructure/breast-mass"
-      }
-    }
-  ],
-  "status": "available",
   "modality": {
     "coding": [
       {
         "code": "MG"
+      }
+    ]
+  },
+  "code": {
+    "coding": [
+      {
+        "system": "http://dicom.nema.org/resources/ontology/DCM",
+        "code": "121080",
+        "display": "Best illustration of finding"
       }
     ]
   },
@@ -43,6 +36,13 @@
   "studyUid": "1.2.276.0.7230010.3.1.2.2471810486.202606031209.11234567",
   "seriesUid": "1.2.276.0.7230010.3.1.3.2471810486.202606031209.11234567.1",
   "seriesNumber": 3,
+  "bodySite": [
+    {
+      "reference": {
+        "reference": "BodyStructure/breast-mass"
+      }
+    }
+  ],
   "meta": {
     "tag": [
       {

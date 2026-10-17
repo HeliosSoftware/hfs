@@ -93,6 +93,9 @@
     }
   ],
   "order": 2,
+  "network": {
+    "reference": "Organization/hl7pay"
+  },
   "costToBeneficiary": [
     {
       "type": {

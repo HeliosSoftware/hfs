@@ -26,20 +26,31 @@ done
 # list the upstream `tests/` directory and `curl` anything missing locally.
 ```
 
+## Specification examples
+
+`examples/` holds the example ViewDefinitions published with the specification
+itself (not part of the conformance suite above), also copied byte-for-byte:
+
+- **Upstream source:** <https://github.com/HL7/sql-on-fhir/tree/main/input/resources/viewdefinition>
+  (`ViewDefinition-*.json`; CC0). Last synced at `e3e1d3c` (3.0.0-ballot).
+- `examples/test-bundle.json` is ours — a small bundle with one resource per
+  example — and is the only hand-written file in that directory.
+
+`crates/sof/tests/spec_examples.rs` lints and runs every example; it fails if a
+newly synced example has no test.
+
 ## Who runs these
 
 - `crates/sof/tests/test_runner_integration.rs` — runs every fixture against the
   in-memory `run_view_definition` engine and asserts **all** pass.
 - In-DB runners, each running every fixture against a real backend via the REST
-  endpoint with a `PASS_FLOOR` ratchet (some fixtures exercise constructs a given
-  in-DB compiler does not yet cover):
-  - `crates/rest/tests/sof_conformance.rs` — SQLite (in-memory, no Docker; floor 132).
-  - `crates/rest/tests/sof_conformance_postgres.rs` — PostgreSQL via testcontainers (floor 132).
-  - `crates/rest/tests/sof_conformance_mongodb.rs` — MongoDB via testcontainers (floor 132).
+  endpoint with a `PASS_FLOOR` ratchet:
+  - `crates/rest/tests/sof_conformance.rs` — SQLite (in-memory, no Docker; floor 144).
+  - `crates/rest/tests/sof_conformance_postgres.rs` — PostgreSQL via testcontainers (floor 144).
+  - `crates/rest/tests/sof_conformance_mongodb.rs` — MongoDB via testcontainers (floor 144).
 
-  All three in-DB suites share the same floor (132) and the same 12 failing
-  fixtures: nested/sibling `repeat` and `unionAll` nested inside another
-  `select`, which no in-DB compiler covers yet.
+  All three in-DB suites share the same floor (144, the whole corpus). The test
+  only asserts `passed >= floor`, so read the `FAIL` lines in the output.
 
 ## Notes
 
@@ -61,6 +72,5 @@ execution engine:
 | MongoDB | in-DB aggregation | full (`$unwind … includeArrayIndex` for forEach; `$function` pre-order traversal for repeat) |
 | Elasticsearch | — | no SOF runner; SOF is not served on ES |
 
-Across all in-DB backends, 8 of the 9 `row_index.json` fixtures pass; the 9th
-(`%rowIndex in unionAll inside forEach`) depends on the orthogonal, pre-existing
-"unionAll nested inside another select" gap.
+Across all in-DB backends, all 9 `row_index.json` fixtures pass, including
+`%rowIndex in unionAll inside forEach`.

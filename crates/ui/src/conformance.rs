@@ -24,6 +24,25 @@ use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
+tokio::task_local! {
+    static REQUEST_AUTHORIZATION: Option<String>;
+}
+
+/// Runs `fut` with `authorization` as the credential of every self-call it
+/// makes, in place of the outbound service credential (#1671): the browser's
+/// own `Authorization`, else the signed-in session's bearer — the order
+/// #1480 set for the export jobs. `None` keeps the service credential.
+pub async fn with_request_authorization<F: std::future::Future>(
+    authorization: Option<String>,
+    fut: F,
+) -> F::Output {
+    REQUEST_AUTHORIZATION.scope(authorization, fut).await
+}
+
+fn request_authorization() -> Option<String> {
+    REQUEST_AUTHORIZATION.try_with(Clone::clone).ok().flatten()
+}
+
 /// Who is asking on the loopback self-call that backs `$sql-export` (#833):
 /// the effective tenant, and — when the browser sent one — the
 /// `Authorization` header verbatim.
@@ -346,14 +365,21 @@ pub trait ConformanceSource: Send + Sync {
         Err("$sql-export is not available from this source".to_string())
     }
 
-    /// The completion manifest `Parameters` of a finished job (#649).
-    async fn sql_export_manifest(&self, job_id: &str, caller: &Caller) -> Result<Value, String> {
+    /// The completion manifest `Parameters` of a finished job (#649). The
+    /// error also carries the subject a failed result names (#1800).
+    async fn sql_export_manifest(
+        &self,
+        job_id: &str,
+        caller: &Caller,
+    ) -> Result<Value, SqlExportFailure> {
         let _ = (job_id, caller);
-        Err("$sql-export is not available from this source".to_string())
+        Err("$sql-export is not available from this source"
+            .to_string()
+            .into())
     }
 
     /// Runs `GET {type}?{params}&_count={count}&_offset={offset}` and returns
-    /// the resulting page plus whether the server advertised a `next` link.
+    /// the resulting page plus whether further matches are available.
     /// Unlike [`fetch`](ConformanceSource::fetch), which pulls the whole
     /// collection into memory, this issues exactly one request per page so a
     /// page can filter and paginate server-side (#741).
@@ -383,16 +409,58 @@ pub trait ConformanceSource: Send + Sync {
         let _ = (resource_type, id, version, tenant);
         Err("reading a resource by id is not available from this source".to_string())
     }
+
+    /// Whether `{resource_type}/{id}` currently exists on the server:
+    /// `Ok(true)` on a 2xx, `Ok(false)` only on a definitive `404` or
+    /// `410`, and `Err` for anything else (network failure, 5xx, auth, a
+    /// non-default FHIR version) — so a caller can never mistake an outage
+    /// for a deletion (#1014).
+    async fn resource_exists(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<bool, String> {
+        let _ = (resource_type, id, version, tenant);
+        Err("checking a resource by id is not available from this source".to_string())
+    }
 }
 
 /// One page of a server-side search (#741): the resources that page holds,
-/// plus whether the server advertised a `next` link — the UI uses this to
+/// plus whether the response indicates further matches — the UI uses this to
 /// decide whether to render a "next" control without fetching an extra page
 /// just to find out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchPage {
     pub resources: Vec<Value>,
     pub has_next: bool,
+    /// Search parameters the request sent that the server did not apply.
+    /// Under lenient handling a server leaves an ignored parameter out of the
+    /// Bundle's `self` link (and reports it in a `search.mode = outcome`
+    /// entry), so this is every sent name missing from that link. Empty when
+    /// the response carries no `self` link (#1722).
+    pub unapplied: Vec<String>,
+}
+
+/// Why [`ConformanceSource::sql_export_manifest`] produced no manifest
+/// (#1800): the message the job records as its `error`, plus the subject the
+/// failed result's `OperationOutcome` attributes the failure to
+/// (`issue[0].expression[0]`), when it names one. A transport or parse
+/// failure carries no subject.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SqlExportFailure {
+    pub message: String,
+    pub subject: Option<String>,
+}
+
+impl From<String> for SqlExportFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            subject: None,
+        }
+    }
 }
 
 /// What a `$sql-export` status poll answered (#649).
@@ -480,6 +548,23 @@ impl HttpConformanceSource {
         }
     }
 
+    /// The request's own credential when one is in scope
+    /// ([`with_request_authorization`]), else the outbound service
+    /// credential.
+    async fn credential(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        match request_authorization() {
+            Some(authorization) => Ok(request.header("Authorization", authorization)),
+            None => self
+                .outbound_auth
+                .authorize(request, &self.base_url)
+                .await
+                .map_err(|e| format!("outbound auth failed: {e}")),
+        }
+    }
+
     /// A request with the tenant header and outbound auth applied.
     async fn authorized(
         &self,
@@ -491,10 +576,7 @@ impl HttpConformanceSource {
         } else {
             request.header("X-Tenant-ID", tenant)
         };
-        self.outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))
+        self.credential(request).await
     }
 
     /// A request with the caller's tenant and credentials applied — the one
@@ -518,11 +600,7 @@ impl HttpConformanceSource {
         };
         match &caller.authorization {
             Some(authorization) => Ok(request.header("Authorization", authorization)),
-            None => self
-                .outbound_auth
-                .authorize(request, &self.base_url)
-                .await
-                .map_err(|e| format!("outbound auth failed: {e}")),
+            None => self.credential(request).await,
         }
     }
 
@@ -588,11 +666,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let request = self.credential(request).await?;
         let response = request
             .send()
             .await
@@ -638,11 +712,7 @@ impl ConformanceSource for HttpConformanceSource {
             if !tenant.is_empty() {
                 request = request.header("X-Tenant-ID", tenant);
             }
-            let request = self
-                .outbound_auth
-                .authorize(request, &self.base_url)
-                .await
-                .map_err(|e| format!("outbound auth failed: {e}"))?;
+            let request = self.credential(request).await?;
             let response = request
                 .send()
                 .await
@@ -718,11 +788,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let request = self.credential(request).await?;
         let response = request
             .send()
             .await
@@ -797,9 +863,19 @@ impl ConformanceSource for HttpConformanceSource {
         let mut resources = extract_bundle_resources(&bundle);
         let overflow = resources.len() > count;
         resources.truncate(count);
+        // A server may cap _count below the requested overflow size. S3's
+        // definition scans still report Bundle.total but no next link, so use
+        // the effective page length to avoid treating that partial catalog as
+        // complete. A pending total with an empty page keeps has_next true;
+        // callers collecting a full catalog can reject the lack of progress.
+        let pending_total = bundle
+            .get("total")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > offset.saturating_add(resources.len()) as u64);
         Ok(SearchPage {
             resources,
-            has_next: overflow || next_link(&bundle).is_some(),
+            has_next: overflow || next_link(&bundle).is_some() || pending_total,
+            unapplied: unapplied_params(&bundle, params),
         })
     }
 
@@ -841,6 +917,48 @@ impl ConformanceSource for HttpConformanceSource {
             .map_err(|e| format!("parsing {resource_type}/{id} failed: {e}"))
     }
 
+    /// `GET {base}/{resource_type}/{id}` on the loopback base, without
+    /// parsing the body — a definitive `404`/`410` answers `Ok(false)`,
+    /// success answers `Ok(true)`, and anything else (including the same
+    /// non-default-version degradation [`read_resource`](Self::read_resource)
+    /// applies) is an `Err` so the caller never confuses an outage with a
+    /// deletion (#1014).
+    async fn resource_exists(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<bool, String> {
+        if version != self.default_version {
+            return Err(format!(
+                "checking {resource_type}/{id} reads stored data, which holds the server default (FHIR {}); switch the sidebar back to check this resource",
+                self.default_version.as_str(),
+            ));
+        }
+        let url = format!("{}/{resource_type}/{id}", self.base_url);
+        let request = self.client.get(&url).header(
+            "Accept",
+            format!(
+                "application/fhir+json; fhirVersion={}",
+                version.as_mime_param()
+            ),
+        );
+        let request = self.authorized(request, tenant).await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(true)
+        } else if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+            Ok(false)
+        } else {
+            Err(format!("{url} returned {status}"))
+        }
+    }
+
     async fn save_resource(
         &self,
         resource_type: &str,
@@ -867,11 +985,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let request = self.credential(request).await?;
         let response = request
             .send()
             .await
@@ -909,7 +1023,11 @@ impl ConformanceSource for HttpConformanceSource {
         self.export_cancel(job_id, caller).await
     }
 
-    async fn sql_export_manifest(&self, job_id: &str, caller: &Caller) -> Result<Value, String> {
+    async fn sql_export_manifest(
+        &self,
+        job_id: &str,
+        caller: &Caller,
+    ) -> Result<Value, SqlExportFailure> {
         self.export_manifest(job_id, caller).await
     }
 }
@@ -1033,7 +1151,11 @@ impl HttpConformanceSource {
         }
     }
 
-    async fn export_manifest(&self, job_id: &str, caller: &Caller) -> Result<Value, String> {
+    async fn export_manifest(
+        &self,
+        job_id: &str,
+        caller: &Caller,
+    ) -> Result<Value, SqlExportFailure> {
         let url = format!("{}/export/{job_id}/result", self.base_url);
         let response = self
             .authorized_for(self.client.get(&url), caller)
@@ -1050,7 +1172,10 @@ impl HttpConformanceSource {
             let detail = outcome_diagnostics(&body)
                 .map(|d| format!(": {d}"))
                 .unwrap_or_default();
-            return Err(format!("the result endpoint returned {status}{detail}"));
+            return Err(SqlExportFailure {
+                message: format!("the result endpoint returned {status}{detail}"),
+                subject: outcome_expression(&body),
+            });
         }
         Ok(body)
     }
@@ -1061,7 +1186,10 @@ impl HttpConformanceSource {
 /// integer parameters [`HttpConformanceSource::export_status`] reads this
 /// way. `None` when the name is absent or its value isn't a `valueInteger`
 /// that fits a `u32` (the server never sends a negative subject count).
-fn parameter_integer(params: &[Value], name: &str) -> Option<u32> {
+///
+/// `pub(crate)`: `crate::bulk_export::poll_job` reuses this to read the
+/// `$export` status poll's own `typesDone`/`typesTotal` parameters (#961).
+pub(crate) fn parameter_integer(params: &[Value], name: &str) -> Option<u32> {
     params
         .iter()
         .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
@@ -1073,7 +1201,10 @@ fn parameter_integer(params: &[Value], name: &str) -> Option<u32> {
 /// One `valueString` parameter of a `Parameters` resource's `parameter`
 /// array, by name (#853) — `currentSubject` is the only string parameter
 /// [`HttpConformanceSource::export_status`] reads this way.
-fn parameter_string(params: &[Value], name: &str) -> Option<String> {
+///
+/// `pub(crate)`: `crate::bulk_export::poll_job` reuses this to read the
+/// `$export` status poll's own `currentType` parameter (#961).
+pub(crate) fn parameter_string(params: &[Value], name: &str) -> Option<String> {
     params
         .iter()
         .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
@@ -1097,7 +1228,56 @@ fn outcome_diagnostics(outcome: &Value) -> Option<String> {
     })
 }
 
+/// The first issue's first `expression` of an OperationOutcome: where a
+/// failed `$sql-export` result names the subject that failed (#1800).
+fn outcome_expression(outcome: &Value) -> Option<String> {
+    outcome
+        .get("issue")?
+        .get(0)?
+        .get("expression")?
+        .get(0)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// The `next` page URL of a searchset Bundle, if any.
+/// The names in `params` that the Bundle's `self` link leaves out — the
+/// parameters the server ignored (#1722). A response without a `self` link
+/// says nothing either way and yields none.
+fn unapplied_params(bundle: &Value, params: &[(String, String)]) -> Vec<String> {
+    let Some(self_url) = bundle
+        .get("link")
+        .and_then(Value::as_array)
+        .and_then(|links| {
+            links
+                .iter()
+                .find(|l| l.get("relation").and_then(Value::as_str) == Some("self"))
+        })
+        .and_then(|l| l.get("url"))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let query = self_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let applied: Vec<String> = form_urlencoded::parse(query.as_bytes())
+        .map(|(name, _)| name.into_owned())
+        .collect();
+    params
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| !applied.iter().any(|a| a == *name))
+        .cloned()
+        .collect()
+}
+
+/// Whether a self-fetch failed because the server cannot search that type at
+/// all (`501 Not Implemented`), as opposed to an auth or network failure, so
+/// the page can name the real cause (#1821).
+pub(crate) fn is_not_implemented(error: &str) -> bool {
+    error.contains(" returned 501")
+}
+
 fn next_link(bundle: &Value) -> Option<String> {
     bundle
         .get("link")?
@@ -1168,7 +1348,7 @@ pub struct StaticConformanceSource {
     metadata: Option<Value>,
     sql_rows: Option<Result<Vec<Value>, String>>,
     export_status: SqlExportStatus,
-    export_manifest: Option<Result<Value, String>>,
+    export_manifest: Option<Result<Value, SqlExportFailure>>,
     export_calls: Arc<Mutex<Vec<RecordedExportCall>>>,
     saved_resources: Arc<Mutex<Vec<Value>>>,
     sql_run_calls: Arc<Mutex<Vec<Value>>>,
@@ -1176,6 +1356,9 @@ pub struct StaticConformanceSource {
     /// order — parallel to `sql_run_calls`, so a test can pair up call `i`'s
     /// subject with call `i`'s bindings (#841).
     sql_run_bindings_calls: Arc<Mutex<Vec<Vec<SqlExportParameter>>>>,
+    /// Ignore `name:contains` and report it unapplied, the way standalone S3
+    /// answers a definition search by scan (#1722).
+    ignores_name_filter: bool,
 }
 
 impl StaticConformanceSource {
@@ -1192,7 +1375,15 @@ impl StaticConformanceSource {
             saved_resources: Arc::new(Mutex::new(Vec::new())),
             sql_run_calls: Arc::new(Mutex::new(Vec::new())),
             sql_run_bindings_calls: Arc::new(Mutex::new(Vec::new())),
+            ignores_name_filter: false,
         }
+    }
+
+    /// Makes `search_page` ignore `name:contains` and report it in
+    /// [`SearchPage::unapplied`], as standalone S3 does (#1722).
+    pub fn ignoring_name_filter(mut self) -> Self {
+        self.ignores_name_filter = true;
+        self
     }
 
     /// The resources `save_resource` has received so far, in call order —
@@ -1267,7 +1458,13 @@ impl StaticConformanceSource {
 
     /// Seeds what `sql_export_manifest()` answers (#649).
     pub fn with_export_manifest(mut self, outcome: Result<Value, String>) -> Self {
-        self.export_manifest = Some(outcome);
+        self.export_manifest = Some(outcome.map_err(SqlExportFailure::from));
+        self
+    }
+
+    /// Seeds a failed result that names `failure.subject` (#1800).
+    pub fn with_export_failure(mut self, failure: SqlExportFailure) -> Self {
+        self.export_manifest = Some(Err(failure));
         self
     }
 
@@ -1410,11 +1607,15 @@ impl ConformanceSource for StaticConformanceSource {
         Ok(())
     }
 
-    async fn sql_export_manifest(&self, _job_id: &str, caller: &Caller) -> Result<Value, String> {
+    async fn sql_export_manifest(
+        &self,
+        _job_id: &str,
+        caller: &Caller,
+    ) -> Result<Value, SqlExportFailure> {
         self.record_export_call("manifest", caller, &[], None);
         self.export_manifest
             .clone()
-            .unwrap_or_else(|| Err("no manifest seeded".to_string()))
+            .unwrap_or_else(|| Err("no manifest seeded".to_string().into()))
     }
 
     /// Filters and paginates the seeded resources in memory. Implements the
@@ -1441,13 +1642,18 @@ impl ConformanceSource for StaticConformanceSource {
             .cloned()
             .unwrap_or_default();
 
+        let mut unapplied = Vec::new();
         if let Some((_, needle)) = params.iter().find(|(name, _)| name == "name:contains") {
-            let needle = needle.to_lowercase();
-            resources.retain(|r| {
-                r.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| n.to_lowercase().contains(&needle))
-            });
+            if self.ignores_name_filter {
+                unapplied.push("name:contains".to_string());
+            } else {
+                let needle = needle.to_lowercase();
+                resources.retain(|r| {
+                    r.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.to_lowercase().contains(&needle))
+                });
+            }
         }
 
         if let Some((_, url)) = params.iter().find(|(name, _)| name == "url") {
@@ -1477,6 +1683,7 @@ impl ConformanceSource for StaticConformanceSource {
         Ok(SearchPage {
             resources: page,
             has_next,
+            unapplied,
         })
     }
 
@@ -1498,6 +1705,26 @@ impl ConformanceSource for StaticConformanceSource {
             })
             .cloned()
             .ok_or_else(|| format!("no {resource_type} with id {id}"))
+    }
+
+    /// Whether a seeded resource with matching `id` exists in `self.map`
+    /// (#1014) — the static double's equivalent of the HTTP source's
+    /// 404/410 distinction, without any request to make.
+    async fn resource_exists(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: FhirVersion,
+        _tenant: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .map
+            .get(&(resource_type.to_string(), version))
+            .is_some_and(|resources| {
+                resources
+                    .iter()
+                    .any(|r| r.get("id").and_then(Value::as_str) == Some(id))
+            }))
     }
 
     /// Echoes the resource back with an id, so the save handler's redirect
@@ -1530,6 +1757,26 @@ impl ConformanceSource for StaticConformanceSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unapplied_params_are_the_ones_the_self_link_drops() {
+        let params = vec![
+            ("_sort".to_string(), "name".to_string()),
+            ("name:contains".to_string(), "pat".to_string()),
+        ];
+        let ignored = serde_json::json!({"link": [
+            {"relation": "self", "url": "http://h/ViewDefinition?_sort=name"},
+        ]});
+        assert_eq!(
+            unapplied_params(&ignored, &params),
+            vec!["name:contains".to_string()]
+        );
+        let applied = serde_json::json!({"link": [
+            {"relation": "self", "url": "http://h/ViewDefinition?_sort=name&name%3Acontains=pat"},
+        ]});
+        assert!(unapplied_params(&applied, &params).is_empty());
+        assert!(unapplied_params(&serde_json::json!({}), &params).is_empty());
+    }
 
     #[test]
     fn next_link_finds_the_next_relation() {
@@ -1677,7 +1924,7 @@ mod tests {
     /// `_count` (one over the page, so a further page shows up as an
     /// overflow row even from a server that issues no `next` link — MongoDB
     /// on a parameter sort) and `_offset`, and derives `has_next` from that
-    /// overflow or the response Bundle's `next` link (present or absent).
+    /// overflow, the response Bundle's `next` link, or its pending total.
     #[tokio::test]
     async fn http_search_page_sends_params_count_offset_and_reports_has_next() {
         use axum::extract::Query;
@@ -1740,6 +1987,70 @@ mod tests {
             .await
             .expect("search succeeds");
         assert!(!second.has_next, "no next link on the last page");
+    }
+
+    /// #1576: HFS_MAX_PAGE_SIZE can prevent the requested overflow row from
+    /// arriving. Bundle.total still proves that a capped, linkless page has
+    /// more matches; offsets must follow its effective length, not _count.
+    #[tokio::test]
+    async fn http_search_page_uses_total_for_capped_linkless_pages() {
+        use axum::extract::Query;
+        use axum::{Router, routing::get};
+        use std::collections::HashMap;
+
+        async fn page(Query(q): Query<HashMap<String, String>>) -> axum::Json<Value> {
+            let offset = q["_offset"].parse::<usize>().unwrap();
+            assert_eq!(q["_count"], "501");
+            let entries: Vec<Value> = if q.contains_key("empty") {
+                Vec::new()
+            } else {
+                (0..6)
+                    .skip(offset)
+                    .take(2)
+                    .map(|index| serde_json::json!({"resource": {"id": index.to_string()}}))
+                    .collect()
+            };
+            axum::Json(serde_json::json!({
+                "resourceType": "Bundle", "type": "searchset", "total": 6, "entry": entries,
+            }))
+        }
+
+        let app = Router::new().route("/ViewDefinition", get(page));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        for (offset, has_next) in [(0, true), (2, true), (4, false), (6, false)] {
+            let page = source
+                .search_page("ViewDefinition", &[], 500, offset, FhirVersion::R4, "")
+                .await
+                .unwrap();
+            assert_eq!(page.resources.len(), if offset == 6 { 0 } else { 2 });
+            assert_eq!(page.has_next, has_next, "offset={offset}");
+        }
+        let empty = source
+            .search_page(
+                "ViewDefinition",
+                &[("empty".into(), "1".into())],
+                500,
+                0,
+                FhirVersion::R4,
+                "",
+            )
+            .await
+            .unwrap();
+        assert!(empty.resources.is_empty());
+        assert!(
+            empty.has_next,
+            "pending total must not certify an empty catalog"
+        );
+        server.abort();
     }
 
     /// #741: the tenant header rides `search_page` and `read_resource` the
@@ -1870,6 +2181,110 @@ mod tests {
             .await
             .expect_err("404 surfaces as an Err");
         assert!(missing.contains("404"), "{missing}");
+    }
+
+    /// #1014: `resource_exists` maps a 2xx to `Ok(true)`, a definitive
+    /// 404/410 to `Ok(false)`, and anything else (a 500 here) to `Err` —
+    /// the distinction the "Recently used" existence sweep relies on to
+    /// never mistake an outage for a deletion.
+    #[tokio::test]
+    async fn resource_exists_maps_2xx_404_410_and_failures() {
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::{Router, routing::get};
+
+        async fn get_one(Path(id): Path<String>) -> axum::response::Response {
+            match id.as_str() {
+                "vd-1" => axum::Json(serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "id": "vd-1"
+                }))
+                .into_response(),
+                "gone-404" => StatusCode::NOT_FOUND.into_response(),
+                "gone-410" => StatusCode::GONE.into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+
+        let app = Router::new().route("/ViewDefinition/{id}", get(get_one));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "vd-1", FhirVersion::R4, "")
+                .await,
+            Ok(true)
+        );
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "gone-404", FhirVersion::R4, "")
+                .await,
+            Ok(false)
+        );
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "gone-410", FhirVersion::R4, "")
+                .await,
+            Ok(false)
+        );
+        let err = source
+            .resource_exists("ViewDefinition", "broken", FhirVersion::R4, "")
+            .await
+            .expect_err("a 500 is not a definitive answer");
+        assert!(err.contains("500"), "{err}");
+    }
+
+    /// #1014: a non-default version degrades the same way `read_resource`
+    /// does — no request is made, storage only holds the server default.
+    #[cfg(feature = "R4B")]
+    #[tokio::test]
+    async fn resource_exists_refuses_a_non_default_version() {
+        let source = HttpConformanceSource::new(
+            "http://127.0.0.1:1".to_string(),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        let err = source
+            .resource_exists("ViewDefinition", "vd-1", FhirVersion::R4B, "")
+            .await
+            .expect_err("non-default version has no stored data to check");
+        assert!(err.contains(FhirVersion::R4.as_str()), "{err}");
+    }
+
+    /// #1014: the static double reports a seeded id as existing and an
+    /// unseeded one as gone, without ever erroring.
+    #[tokio::test]
+    async fn static_source_resource_exists_reports_seeded_ids() {
+        let source = StaticConformanceSource::empty().with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![serde_json::json!({ "resourceType": "ViewDefinition", "id": "vd-1" })],
+        );
+
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "vd-1", FhirVersion::R4, "")
+                .await,
+            Ok(true)
+        );
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "missing", FhirVersion::R4, "")
+                .await,
+            Ok(false)
+        );
     }
 
     /// #741: the static double's `name:contains` filter is case-insensitive,
@@ -2073,6 +2488,62 @@ mod tests {
         assert_eq!(job, "Bearer user-token::<none>");
     }
 
+    /// #1671: a self-call made inside [`with_request_authorization`] carries
+    /// that credential instead of the outbound service token; outside it, or
+    /// with `None` in scope, the service token applies as before.
+    #[tokio::test]
+    async fn listing_self_calls_carry_the_request_credential_when_one_is_in_scope() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+
+        async fn search(headers: HeaderMap) -> axum::Json<Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            axum::Json(serde_json::json!({
+                "resourceType": "Bundle", "type": "searchset",
+                "entry": [{"resource": {"resourceType": "ViewDefinition", "id": "vd1", "name": auth}}]
+            }))
+        }
+
+        let app = axum::Router::new().route("/ViewDefinition", get(search));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::StaticBearerOutboundAuthProvider::new("service-token")),
+            FhirVersion::R4,
+            None,
+        );
+        let sent = |page: SearchPage| page.resources[0]["name"].as_str().unwrap().to_string();
+
+        let page = source
+            .search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a")
+            .await
+            .expect("search succeeds");
+        assert_eq!(sent(page), "Bearer service-token");
+
+        let page = with_request_authorization(
+            Some("Bearer session-token".to_string()),
+            source.search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a"),
+        )
+        .await
+        .expect("search succeeds");
+        assert_eq!(sent(page), "Bearer session-token");
+
+        let page = with_request_authorization(
+            None,
+            source.search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a"),
+        )
+        .await
+        .expect("search succeeds");
+        assert_eq!(sent(page), "Bearer service-token");
+    }
+
     /// #833: `export_status` maps every self-call outcome to the right
     /// variant — `202`/`303`/`404` unchanged, and everything else (401, 500,
     /// …) to `Unavailable` with a short cause naming the status, rather than
@@ -2249,6 +2720,67 @@ mod tests {
                 "job {id} should report no subject progress"
             );
         }
+    }
+
+    /// #1800: a failed result's `issue[0].expression[0]` names the subject
+    /// that failed and rides on the error beside the unchanged message; an
+    /// outcome without `expression` yields no subject.
+    #[tokio::test]
+    async fn export_manifest_reads_the_failed_subject_from_the_outcome_expression() {
+        use axum::extract::Path;
+        use axum::http::StatusCode as AxStatus;
+        use axum::routing::get;
+
+        async fn result(Path(id): Path<String>) -> (AxStatus, axum::Json<Value>) {
+            let mut issue = serde_json::json!({
+                "severity": "error",
+                "code": "processing",
+                "diagnostics": format!(
+                    "Export job '{id}' failed: The export failed because of a server error; see the server log for job {id}."
+                ),
+            });
+            if id == "fault" {
+                issue["expression"] = serde_json::json!(["patients_flat"]);
+            }
+            (
+                AxStatus::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [issue]
+                })),
+            )
+        }
+
+        let app = axum::Router::new().route("/export/{id}/result", get(result));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        let caller = Caller::default();
+
+        let failure = source
+            .sql_export_manifest("fault", &caller)
+            .await
+            .expect_err("a 500 result is an error");
+        assert_eq!(failure.subject, Some("patients_flat".to_string()));
+        assert!(failure.message.contains("500"), "{}", failure.message);
+        assert!(
+            failure.message.contains("server log"),
+            "{}",
+            failure.message
+        );
+
+        let failure = source
+            .sql_export_manifest("plain", &caller)
+            .await
+            .expect_err("a 500 result is an error");
+        assert_eq!(failure.subject, None);
     }
 
     /// #841: a live-preview binding rides `$sql-run`'s own `parameters`

@@ -76,6 +76,7 @@ terminology-no-results = No se encontraron conceptos coincidentes.
 action-search = Buscar
 action-save = Guardar
 action-cancel = Cancelar
+action-back = Volver
 action-retry = Reintentar
 
 ## Errores (refleja el texto de OperationOutcome; véase docs/multi-language.md §5)
@@ -147,6 +148,33 @@ tenants-delete-confirm = ¿Dar de baja el tenant «{ $id }»? Sus datos se conse
 tenants-row-provisioning = Aprovisionando… puede tardar un momento.
 tenants-row-failed = No se pudo aprovisionar el tenant.
 tenants-dismiss = Descartar
+tenants-stat-total-sub-partial = { $count ->
+    [one] { $count } registrado · descubrimiento incompleto
+   *[other] { $count } registrados · descubrimiento incompleto
+}
+tenants-stat-resources-sub-stale = en todos los tenants · puede estar desactualizado
+tenants-stat-pending = Contando…
+tenants-stat-unavailable = No disponible en este momento
+tenants-stat-unsupported = No disponible en este almacenamiento
+tenants-counts-pending = Contando los recursos de todos los tenants…
+tenants-counts-refreshing = Actualizando los recuentos; se muestran los de { $time }.
+tenants-counts-ready = Recuento de recursos: { $time }.
+tenants-counts-partial = Recuento de recursos: { $time }, pero no se pudieron comprobar todos los tenants.
+tenants-counts-stale = Los recuentos de { $time } pueden estar desactualizados: falló el último recuento.
+tenants-counts-unavailable = Los recuentos de recursos no están disponibles en este momento.
+tenants-counts-unsupported = Este almacenamiento no puede contar los recursos de cada tenant.
+tenants-counts-presence = Este almacenamiento indica qué tenants tienen datos, no cuántos recursos.
+tenants-counts-approx-pointers = Los recuentos son aproximados: punteros de almacenamiento, recursos eliminados incluidos.
+tenants-counts-approx-index = Los recuentos vienen del índice de búsqueda y pueden ir por detrás de las últimas escrituras.
+tenants-counts-refresh = Actualizar
+tenants-count-pending = Contando…
+tenants-count-unknown = Desconocido
+tenants-count-unsupported = No se cuenta en este almacenamiento
+tenants-count-unavailable = Recuento no disponible
+tenants-count-present = tiene datos
+tenants-count-present-note = Tiene datos; este almacenamiento no los cuenta
+tenants-count-stale = puede estar desactualizado
+tenants-count-approx = aproximado, no es un recuento exacto de recursos vivos
 
 tenant-heading = Tenants
 tenant-all = Todos los tenants
@@ -183,7 +211,23 @@ chart-sample-note = Datos de muestra: esta build no tiene proveedor de métricas
 chart-pending-note = Todavía se están recopilando las cifras en vivo de este intervalo. No se grafica nada hasta que lleguen: no se muestran números de relleno.
 chart-pending-empty = Esperando las cifras en vivo…
 chart-pending-retry = Reintentar ahora
-chart-partial-note = Algunas cifras no se pudieron leer del almacenamiento y se muestran como cero. Recarga para volver a intentarlo.
+# #1078: cifras medidas, pero contadas a partir de contadores de escritura en
+# memoria, no de una lectura exacta del almacenamiento. Etiqueta, no aviso.
+chart-approximate-note = Aproximado: contado a partir de las escrituras recientes y aún en conciliación con el almacenamiento.
+chart-approximate-history-note = Aproximado: contado a partir de las escrituras recientes y aún en conciliación con el almacenamiento. Una línea discontinua muestra solo las escrituras registradas desde que los contadores se leyeron del almacenamiento; su historial anterior aún se está cargando.
+chart-legend-history-loading = cargando historial
+chart-counts-unsupported = Los recuentos de recursos no están disponibles para este backend de almacenamiento.
+chart-counts-unsupported-note = Este backend de almacenamiento no puede contar los recursos almacenados, por lo que no se muestran totales ni gráfico. Esto no significa que el tenant esté vacío.
+# #1078: cuándo se leyeron las cifras de la página. $time es una hora UTC,
+# precedida de la fecha cuando no es de hoy (p. ej. "14:02:31 UTC").
+chart-as-of = Última lectura: { $time }.
+search-index-rebuilding = Reconstruyendo el índice de búsqueda: { $percent } % ({ $processed } de { $total } recursos). Las búsquedas pueden omitir recursos almacenados hasta que termine.
+search-index-rebuilding-counting = Reconstruyendo el índice de búsqueda. Las búsquedas pueden omitir recursos almacenados hasta que termine.
+search-index-rebuild-failed = { $errors ->
+    [one] La última reconstrucción del índice de búsqueda dejó un recurso sin indexar. Las búsquedas no lo encuentran hasta que una reconstrucción termine bien; GET $reindex-status/{ $job } indica cuál.
+   *[other] La última reconstrucción del índice de búsqueda dejó { $count } recursos sin indexar. Las búsquedas no los encuentran hasta que una reconstrucción termine bien; GET $reindex-status/{ $job } indica cuáles.
+  }
+search-index-rebuild-failed-job = La última reconstrucción del índice de búsqueda falló antes de terminar. Las búsquedas pueden omitir recursos almacenados hasta que una reconstrucción termine bien; GET $reindex-status/{ $job } indica el motivo.
 chart-table-toggle = Ver como tabla
 chart-table-when = Momento
 chart-focus-series = Enfocar esta serie
@@ -207,12 +251,24 @@ history-tab-type = Feed por tipo
 history-tab-system = Feed del sistema
 history-versions-label = Versiones
 history-current = actual
+history-op-create = creado
+history-op-update = actualizado
+history-op-patch = parcheado
+history-op-delete = eliminado
+history-op-version = versión
 history-from = Desde
 history-to = Hasta
 history-show-metadata = Mostrar cambios de metadatos
 history-empty = Carga un recurso y elige dos versiones para comparar.
 history-load-error = No se pudo cargar el historial de ese recurso.
 history-not-found = No hay historial para ese recurso — revisa el tipo y el id.
+history-feed-resource = Recurso
+history-feed-version = Versión
+history-feed-interaction = Interacción
+history-feed-when = Cuándo
+history-feed-more = Cargar más
+history-feed-empty = Todavía no hay entradas de historial.
+history-feed-error = No se pudo cargar el historial.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } cambio de metadatos oculto
@@ -223,34 +279,19 @@ history-only-metadata = Entre estas versiones solo cambiaron los metadatos.
 history-identical = Estas dos versiones son idénticas.
 history-deleted = { $version } es una eliminación — no hay contra qué comparar.
 history-parse-error = No se pudieron leer esas versiones como JSON.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Consultas guardadas
-
-queries-heading = Consultas guardadas
-queries-lede = Guarda consultas de búsqueda FHIR por tipo de recurso, ordenadas por su última ejecución. Se guardan en tu configuración de usuario y te siguen entre dispositivos.
-queries-add-heading = Guardar una consulta
-queries-type-label = Tipo de recurso
-queries-type-placeholder = p. ej. Patient
-queries-name-label = Nombre
-queries-name-placeholder = p. ej. Smith en Boston
-queries-query-label = Cadena de consulta
-queries-query-placeholder = p. ej. name=smith&address-city=Boston
-queries-empty = Aún no hay consultas guardadas. Guarda una arriba para empezar.
-queries-never-run = Nunca ejecutada
 queries-run = Ejecutar
-queries-rename = Renombrar
 queries-delete = Eliminar
-queries-rename-prompt = Nuevo nombre
-queries-confirm-delete = ¿Eliminar «{ $name }»?
-queries-unavailable = Las consultas guardadas no están disponibles: el backend de almacenamiento de este servidor no admite configuración por usuario.
 
 ## Visor de SearchParameters (#238)
 
 sp-heading = Parámetros de búsqueda
 sp-lede = Explora los parámetros con los que este servidor resuelve las búsquedas, filtrados por tipo de recurso base. Los parámetros almacenados se pueden crear, editar y eliminar; el registro recoge los cambios por tenant.
 sp-version-label = Versión FHIR
-sp-spec-missing = No se encontró el bundle completo de la especificación (search-parameters-*.json) en el directorio de datos — solo se muestran los parámetros mínimos embebidos.
+sp-degraded = Los parámetros de búsqueda no se pudieron cargar de este servidor en este momento — la auto-llamada a /SearchParameter falló (con autenticación habilitada esto suele significar que el token de servicio saliente falta o es inválido). La página reintenta en la siguiente petición.
+sp-degraded-unsupported = Los parámetros de búsqueda no se pueden listar en este almacenamiento: la llamada a /SearchParameter respondió 501 Not Implemented porque el backend no tiene búsqueda para este tipo.
+sp-empty = Este servidor no tiene parámetros de búsqueda guardados para esta versión de FHIR, así que no hay nada que listar.
 sp-rail-label = Filtro de recursos
 sp-rail-search = Filtrar tipos
 sp-rail-recent = Usados recientemente
@@ -311,6 +352,8 @@ cmp-lede = Las definiciones de compartment con las que este servidor enruta las 
 cmp-rail-label = Definiciones de compartment
 cmp-rail-heading = Compartimentos
 cmp-degraded = Las definiciones de compartimento no se pudieron cargar de este servidor en este momento — la auto-llamada a /CompartmentDefinition falló (con autenticación habilitada esto suele significar que el token de servicio saliente falta o es inválido). La página reintenta en la siguiente petición.
+cmp-degraded-unsupported = Las definiciones de compartimento no se pueden listar en este almacenamiento: la llamada a /CompartmentDefinition respondió 501 Not Implemented porque el backend no tiene búsqueda para este tipo.
+cmp-empty = Este servidor no tiene definiciones de compartimento guardadas para esta versión de FHIR, así que no hay nada que listar.
 cmp-rail-note = Las definiciones son recursos almacenados, sembrados desde la especificación FHIR al arrancar. Las ediciones y eliminaciones aquí son por tenant.
 cmp-tabs-label = Secciones del compartment
 cmp-tab-definition = Definición
@@ -350,7 +393,6 @@ cmp-result-fanout-note = Los tipos excluidos se omiten, no fallan — el fan-out
 queries-builder-heading = Constructor de búsquedas
 queries-url-label = URL de búsqueda FHIR
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edita la URL GET directamente o mediante las filas de abajo — se mantienen sincronizadas. Ejecutar corre la búsqueda aquí mismo y la registra en Recientes; ponle un nombre para conservarla en la lista.
 queries-recent = Recientes
 queries-recent-heading = Búsquedas recientes
 queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
@@ -366,6 +408,7 @@ queries-match-is = es
 queries-or = + o
 plain-pill = En lenguaje claro
 plain-find = Buscar registros de {"{type}"}
+plain-read = Abrir {"{type}"} {"{id}"}
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = y
@@ -377,6 +420,7 @@ plain-include = Devolviendo también el {"{param}"} de cada {"{type}"}{"{target}
 plain-revinclude = Más cada {"{type}"} cuyo {"{param}"} apunta aquí
 plain-iterate = (repetidamente)
 plain-count = Mostrando {"{n}"} por página
+plain-unknown-param = "{"{param}"}" no es un parámetro de búsqueda de {"{type}"}
 plain-sort = Ordenado por {"{sort}"}
 plain-verb-is = es
 plain-verb-contains = contiene
@@ -429,13 +473,23 @@ queries-has-via = enlazado vía
 queries-has-where = donde su
 queries-add-has = ⧉ Filtrar un recurso que enlaza aquí
 queries-param-placeholder = parámetro
+queries-param-none = Ningún parámetro coincide
+queries-param-unknown = No es un parámetro de búsqueda de {"{type}"}. Elige uno de la lista.
 queries-value-placeholder = valor
 queries-results = Resultados
 queries-results-total = { $count } resultados
+queries-results-total-partial = { $count }+ resultados
 queries-results-included = { $count } incluidos
 queries-results-empty = Sin resultados.
 queries-searching = Buscando…
+queries-search-elapsed = { $seconds } segundos transcurridos
+queries-search-cancel = Cancelar
+queries-search-slow = Esta búsqueda está tardando más de lo esperado. Puedes seguir esperando o cancelarla.
+queries-search-keep-waiting = Seguir esperando
+queries-results-previous = Resultados anteriores
 queries-col-updated = Actualizado
+queries-copy-id = Copiar id
+queries-copied = Copiado
 queries-prev = Anterior
 queries-next = Siguiente
 queries-results-fetch-error = No se pudieron cargar los resultados desde { $origin }. Revise HFS_BASE_URL e inténtelo de nuevo.
@@ -483,12 +537,37 @@ editor-save = Guardar cambios
 editor-delete = Eliminar
 editor-remove = Quitar este nodo
 editor-saved = Guardado.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Se guardará como { $target }
+editor-id-exists = { $target } ya existe. Al guardar se agregará una nueva versión.
+editor-id-exists-confirm = Guardar nueva versión
+# Shared unsaved-changes tracker (#1240): the pill next to a Save button and
+# the confirm shown for in-page closes (a modal, an addbox disclosure).
+unsaved-changes = Cambios sin guardar
+unsaved-discard-confirm = Hay cambios sin guardar. ¿Descartarlos y cerrar?
+unsaved-leave-confirm = Hay cambios sin guardar. ¿Descartarlos y salir de esta página?
+unsaved-leave-action = Descartar y salir
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirmar
 editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
-editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
+editor-source-hint = Edita aquí o en el formulario guiado: los dos muestran siempre el mismo documento.
+editor-format = Formatear
+editor-format-title = Formatear el documento (Shift+Alt+F)
+editor-format-invalid = Corrige los errores de sintaxis del JSON antes de formatear.
 
 editor-add = Añadir elemento
+editor-add-close = Cerrar
+editor-add-added = añadido
+editor-add-undo = Deshacer
+editor-collection-add = Añadir
+editor-add-undo-pending = Deshacer no está disponible mientras se actualiza el formulario.
+editor-add-undo-unavailable = Deshacer ya no está disponible porque el documento cambió.
+editor-update-failed = No se pudo actualizar el formulario. Reintenta el campo modificado antes de añadir o eliminar un elemento.
+editor-add-elements = Elementos
+editor-add-extensions = Extensiones
 editor-must-support-badge = MS
 editor-binding-hint = Ligado a un value set — los códigos salen de él; se muestra la fuerza
 editor-legend-live = Se comprueba al escribir: estructura, cardinalidad, bindings requeridos
@@ -497,10 +576,11 @@ vd-form-legend-live = Se comprueba al escribir: estructura, cardinalidad, bindin
 vd-form-invalid-chip = JSON no válido
 lib-form-legend-live = Se comprueba al escribir: estructura, cardinalidad, bindings requeridos
 lib-form-legend-save = Se comprueba al guardar: tipo de Library de SQL on FHIR y el adjunto SQL
+lib-form-legend-content = El adjunto SQL (content) no aparece aquí: se edita en la tarjeta SQL de abajo
 editor-deferred-badge = al guardar
 editor-deferred-hint = Los códigos se verifican contra el value set al guardar (y en vivo en el picker si hay servidor de terminología configurado)
 editor-must-support-hint = Must-support: se espera que los consumidores de este perfil manejen este elemento
-editor-add-filter = Filtrar elementos
+editor-add-filter = Filtrar elementos y extensiones
 editor-add-another = añadir otro
 editor-pick-type = Elige un tipo…
 editor-extension-url = URL de la extensión
@@ -523,7 +603,6 @@ editor-primitive-extension-hint = Este valor lleva extensiones propias (un herma
 editor-collapse-all = Colapsar todo
 editor-expand-all = Expandir todo
 json-view-toggle-fold = Alternar sección JSON
-editor-edit-raw = Editar crudo
 editor-versions = Versiones
 editor-versions-none = Sin versiones anteriores.
 ## Historial y versiones (#236)
@@ -545,6 +624,7 @@ resources-tab-edit = Editar
 resources-tab-history = Historial
 resources-types-heading = Tipos de recurso
 rail-all-types-heading = Todos los tipos
+rail-count-approximate = Aproximado: contado a partir de las escrituras recientes y aún en conciliación con el almacenamiento.
 
 queries-saved-group = Guardadas
 
@@ -588,7 +668,6 @@ bulk-import-new = Nueva submission
 bulk-import-create-title = Crear Bulk Submission
 bulk-import-field-name = Nombre de la submission
 bulk-import-auth = Autenticación
-bulk-import-auth-hint = Cómo autenticarse ante el servidor receptor.
 bulk-import-auth-none = Ninguna
 bulk-import-auth-none-hint = No se enviará cabecera de autorización.
 bulk-import-auth-backend = Autenticación backend services
@@ -616,6 +695,8 @@ bulk-import-status-in-progress = En curso
 bulk-import-status-stopped = Detenida
 bulk-import-status-completed = Completada
 bulk-import-status-failed = Fallido
+bulk-import-status-error = El último cambio de estado no llegó al receptor de datos, así que esta submission sigue igual: inténtelo de nuevo. ({ $detail })
+bulk-import-status-pending = El último cambio de estado no llegó al receptor de datos; se conserva y se reenviará automáticamente mientras esta página siga abierta. ({ $detail })
 bulk-import-detail-recipient = Receptor de datos
 bulk-import-detail-id = ID de submission
 bulk-import-detail-submitter = Remitente
@@ -645,6 +726,11 @@ bulk-import-result = Resultado
 bulk-import-result-finished = Procesamiento terminado a las
 bulk-import-result-outputs = Archivos de salida
 bulk-import-result-errors = Archivos de error
+bulk-import-result-warnings = Avisos
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } recurso marcado con avisos (p. ej., en reindexación para búsqueda)
+   *[other] { $count } recursos marcados con avisos (p. ej., en reindexación para búsqueda)
+}
 ui-cancel = Cancelar
 ui-close = Cerrar
 ui-combobox-selected-label = Elementos seleccionados
@@ -654,6 +740,11 @@ ui-combobox-removed = Quitado
 ui-combobox-loading = Cargando sugerencias…
 ui-combobox-results-updated = Sugerencias disponibles:
 ui-combobox-error = No se pudieron cargar las sugerencias. Inténtalo de nuevo.
+ui-combobox-name-now = ahora { $name }
+ui-combobox-footer-total = { $count } coincidencias · desplázate para ver más
+ui-combobox-footer-more = Hay más coincidencias · desplázate para ver más
+ui-combobox-footer-end = Fin de los resultados
+ui-combobox-loading-more = Cargando más coincidencias…
 editor-orphans-title = Estos problemas aún no tienen campo — añada los elementos para corregirlos
 editor-hint-date = FHIR date: YYYY, YYYY-MM o YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD o un timestamp completo con zona horaria (2024-05-17T14:30:00+02:00)
@@ -704,7 +795,7 @@ bulk-export-scope = ¿Qué desea exportar?
 bulk-export-scope-system = Todo
 bulk-export-scope-system-hint = El servidor completo — cada tipo de recurso que seleccione abajo.
 bulk-export-scope-patient = Pacientes
-bulk-export-scope-patient-hint = Cada paciente y los registros que le pertenecen. Nada ajeno a pacientes.
+bulk-export-scope-patient-hint = Todos los pacientes, o solo los que elijas, con los registros que les pertenecen. Nada ajeno a pacientes.
 bulk-export-scope-group = Grupo
 bulk-export-scope-group-hint = Solo los miembros de una cohorte ya definida.
 bulk-export-field-group-id = ID del grupo
@@ -735,13 +826,19 @@ bulk-export-field-since-custom = Instante personalizado
 bulk-export-since-invalid = Ingresa un instante FHIR válido, como 2026-08-01T00:00:00Z.
 bulk-export-field-until = Hasta
 bulk-export-field-until-hint = Límite superior opcional. RFC 3339, p. ej. 2026-08-01T00:00:00Z.
+bulk-export-until-before-since = «Hasta» no puede ser anterior a «Desde».
 bulk-export-window-since = Desde
 bulk-export-window-until = Hasta
 bulk-export-start = Iniciar exportación
-bulk-export-running = en curso
 bulk-export-clear = Limpiar
-bulk-export-files-word = archivos
-bulk-export-exports-word = exportaciones
+bulk-export-files-count = { $count ->
+    [one] { $count } archivo
+   *[other] { $count } archivos
+}
+bulk-export-summary-count = { $count ->
+    [one] { $count } exportación
+   *[other] { $count } exportaciones
+} · { $running } en curso
 bulk-export-none = Aún no hay exportaciones. Use Nueva exportación para iniciar una.
 bulk-export-status-in-progress = En curso
 bulk-export-status-complete = Completada
@@ -749,19 +846,33 @@ bulk-export-status-failed = Fallida
 bulk-export-status-cancelled = Cancelada
 bulk-export-progress = Progreso
 bulk-export-progress-waiting = Esperando el primer reporte de estado…
+bulk-export-writing = Escribiendo { $name }
+bulk-export-types-progress = { $done } de { $total } tipos
 bulk-export-files = Archivos
 bulk-export-finished-in = terminada en
 bulk-export-error = Error
 bulk-export-cancel = Cancelar
+bulk-export-cancel-refused = El servidor rechazó la cancelación:
 bulk-export-retry = Reintentar
+bulk-export-run-again = Volver a ejecutar
 bulk-export-download-all = Descargar todos los recursos
 bulk-export-download-all-aria = Descargar todos los recursos de { $name }
+bulk-export-view-files = Ver archivos
+bulk-export-more-actions = Más acciones
 bulk-export-delete = Eliminar
 bulk-export-delete-aria = Eliminar la exportación { $name }
 bulk-export-delete-warning = ¿Eliminar { $name } y sus archivos de salida del servidor? Esta acción no se puede deshacer.
 bulk-export-delete-confirm = Eliminar exportación
 bulk-export-delete-cancel = Conservar exportación
 bulk-export-delete-error = No se pudo eliminar la exportación de forma segura. Se conservó la tarjeta para que pueda volver a intentarlo.
+bulk-export-detail-job-heading = Trabajo
+bulk-export-detail-field-scope = Alcance
+bulk-export-detail-field-started = Iniciado
+bulk-export-detail-field-duration = Duración
+bulk-export-detail-outputs-heading = Archivos de salida
+bulk-export-detail-col-type = Tipo de recurso
+bulk-export-detail-col-files = Archivos
+bulk-export-detail-outputs-empty = La exportación no produjo archivos de salida.
 
 # Página CapabilityStatement (#653)
 cap-title = Declaración de capacidades
@@ -845,6 +956,8 @@ vd-saved = Guardado.
 vd-run-failed = No se pudo ejecutar la vista.
 vd-save = Guardar
 vd-duplicate = Duplicar
+sql-duplicate-read-failed = No se pudieron comprobar los artefactos existentes antes de duplicar: { $reason }
+sql-duplicate-incomplete = No se pudieron comprobar todos los artefactos existentes. La copia no se guardó; inténtelo de nuevo cuando se pueda leer el catálogo completo.
 vd-delete = Eliminar
 vd-delete-confirm = ¿Eliminar la definición de vista «{ $name }»? Esta acción no se puede deshacer.
 vd-delete-failed = No se pudo eliminar la definición de vista.
@@ -854,6 +967,7 @@ vd-results-heading = Resultados
 vd-results-empty = La vista no produjo filas.
 vd-results-meta = { $rows } filas · { $ms } ms
 vd-results-stale = última ejecución exitosa
+vd-results-running = Ejecutando consulta…
 vd-pagination-label = Páginas de definiciones de vistas
 vd-page-prev = Anterior
 vd-page-next = Siguiente
@@ -882,6 +996,7 @@ vd-lint-multiple-iteration-directives = Un select solo puede establecer una de f
 vd-lint-select-without-output = Un select debe tener al menos uno de column, select o unionAll
 vd-lint-fhirpath-syntax = Sintaxis FHIRPath: { $detail }
 vd-lint-undeclared-constant = Constante no declarada "%{ $name }"
+vd-lint-unknown-resource-type = Tipo de recurso desconocido "{ $found }"
 vd-fix-rename-key = Renombrar a "{ $to }"
 vd-fix-remove-key = Quitar "{ $key }"
 vd-fix-set-string = Establecer en "{ $value }"
@@ -891,6 +1006,10 @@ vd-fix-set-string = Establecer en "{ $value }"
 ## elemento de completado de una clave estructural obligatoria, añadido a su
 ## texto `detail` en el cliente (nunca lo envía `/complete`, que no traduce).
 vd-complete-required = obligatorio
+
+## `data-msg-quickfix` de `#vd-editor-grid`: el nombre accesible del menú de
+## arreglos rápidos que Ctrl+. abre junto al cursor cuando aplican varios.
+vd-quickfix-menu = Arreglos rápidos
 
 ## Aviso de guardado con errores del editor de ViewDefinition (#821):
 ## `vd-editor.js` elige cuál de estos renderiza `data-msg-save-errors-one`/
@@ -919,6 +1038,9 @@ sql-queries-filter = Filtrar consultas
 sql-views-filter = Filtrar vistas
 sql-queries-rail-empty = Aún no hay consultas.
 sql-views-rail-empty = Aún no hay vistas.
+sql-rail-no-match = Sin resultados para «{ $filter }».
+sql-rail-clear-filter = Quitar el filtro
+sql-rail-selection-filtered = No aparece en la lista filtrada por «{ $filter }».
 sql-queries-empty-title = Aún no hay consultas SQL
 sql-views-empty-title = Aún no hay vistas SQL
 sql-queries-empty-lede = Escribe tu primera consulta con «Crear nueva». Se ejecuta contra las tablas planas de cada view definition activa.
@@ -931,11 +1053,12 @@ sql-queries-run-failed = No se pudo ejecutar la consulta.
 sql-views-run-failed = No se pudo ejecutar la vista.
 lib-degraded = No se pudo cargar la lista de bibliotecas.
 lib-run-hint = Se ejecuta mientras escribes: los resultados siguen el SQL actual, esté guardado o no
+lib-sql-attachment-unreadable = Adjunto SQL ilegible: la tarjeta SQL conserva su último texto legible; escribir aquí lo repara
 lib-delete-confirm = ¿Eliminar «{ $name }»? Esta acción no se puede deshacer.
 lib-delete-failed = No se pudo eliminar la biblioteca.
 lib-details-heading = Detalles
 lib-details-json-heading = Library (JSON)
-lib-details-json-note = El adjunto SQL se edita en la tarjeta SQL de abajo y no forma parte de esta vista.
+lib-details-json-note = El adjunto SQL (content[].data) forma parte de este documento. La tarjeta SQL de abajo edita el mismo adjunto.
 lib-details-new-lede = Cámbiale el nombre y haz que relatedArtifact[0] apunte a una ViewDefinition que exista.
 lib-save-wrong-kind = El tipo de Library de SQL on FHIR debe ser «{ $code }» para guardarla aquí.
 lib-save-view-parameters = Un SQL View no puede declarar parámetros (perfil SQLView, Library.parameter 0..0). Quita parameter[] en Detalles.
@@ -961,26 +1084,19 @@ lib-run-unknown-table-more = Tabla desconocida { $name } — línea { $line }.
 ## Panel de tablas (#842, ambos tipos) — Reads from / Used by / Columns
 
 lib-tables-heading = Lee de
-lib-tables-col-alias = Alias
-lib-tables-col-target = Lee de
 lib-tables-no-alias = (sin etiqueta)
 lib-tables-empty = Aún no hay tablas declaradas.
-lib-tables-note = Cada tabla que la consulta SQL lee, como entradas relatedArtifact depends-on: el alias a la izquierda, la ViewDefinition o SQL View a la que resuelve a la derecha.
-lib-tables-remove = Quitar
 lib-tables-kind-view-definition = ViewDefinition
 lib-tables-target-not-found = No encontrado
 lib-tables-target-not-found-detail = Ninguna ViewDefinition ni SQL View responde a { $resource }. Corrige el canónico en Details o quita la fila.
 lib-tables-target-not-a-table = No es una tabla
 lib-tables-target-not-a-table-detail = Solo se puede leer una ViewDefinition o una SQL View.
-lib-tables-add-toggle = Añadir tabla
 lib-tables-add-table-label = Tabla
-lib-tables-add-table-placeholder = Buscar view definitions y SQL views
-lib-tables-add-table-hint = Escribe para buscar por nombre, o elige de la lista.
+lib-tables-add-table-placeholder = Añadir una tabla…
 lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} o Library/{"{"}id{"}"}
-lib-tables-add-table-fallback-hint = Introduce una referencia a una ViewDefinition o una SQL View.
 lib-tables-alias-label = Alias
-lib-tables-alias-hint = Por defecto, el nombre del artefacto
 lib-tables-add-submit = Añadir
+lib-tables-add-hint = Busca una view definition o SQL view; el alias toma su nombre por defecto.
 lib-tables-add-error-required = Elige una view definition o una SQL view
 lib-tables-add-error-alias-required = El alias es obligatorio
 lib-tables-add-error-alias-invalid = El alias debe coincidir con ^[A-Za-z][A-Za-z0-9_]*$
@@ -989,6 +1105,8 @@ lib-tables-options-empty = Sin coincidencias.
 lib-tables-unknown = Tabla desconocida
 lib-tables-unknown-detail = Se usa en el SQL pero no está declarada. Elige una view definition o SQL view, o corrige el nombre.
 lib-tables-declare = Declarar { $name }
+lib-tables-declare-short = Declarar
+lib-tables-remove-row = Quitar { $alias }
 
 lib-used-by-heading = Usado por
 lib-used-by-empty = Nada lo usa todavía.
@@ -1060,9 +1178,8 @@ sql-export-since-invalid = Ingresa un instante FHIR válido, como 2026-08-01T00:
 sql-export-patient-invalid = Ingresa solo IDs lógicos de Patient válidos, separados por comas o saltos de línea.
 sql-export-group-invalid = Ingresa solo IDs lógicos de Group válidos, separados por comas o saltos de línea.
 sql-export-advanced = Avanzado
-sql-export-advanced-meta = id de seguimiento · encabezado CSV
 sql-export-field-tracking-id = Id de seguimiento
-sql-export-field-tracking-id-hint = Se repite en el manifiesto de finalización como clientTrackingId.
+sql-export-field-tracking-id-hint = Etiqueta opcional para tus propios registros, válida para cualquier formato. Se muestra en el detalle de la exportación y se devuelve como clientTrackingId al terminar.
 sql-export-tracking-id-too-long = El id de seguimiento debe tener 200 caracteres o menos.
 sql-export-field-header = Incluir una fila de encabezado
 sql-export-field-header-hint = (solo CSV — se ignora para otros formatos)
@@ -1073,8 +1190,10 @@ sql-export-new = Nueva exportación SQL
 sql-export-unavailable = El backend de almacenamiento no aloja el settings store; no se pueden rastrear los trabajos de exportación SQL.
 sql-export-none = Aún no hay exportaciones SQL. Use Nueva exportación SQL para iniciar una.
 sql-export-store-error = La exportación se inició, pero no se pudo agregar a esta lista. Id del trabajo:
-sql-export-exports-word = exportaciones
-sql-export-running = en curso
+sql-export-summary-count = { $count ->
+    [one] { $count } exportación
+   *[other] { $count } exportaciones
+} · { $running } en curso
 sql-export-select-subject = Seleccione al menos un elemento.
 sql-export-unknown-subject = Uno o más elementos seleccionados ya no están disponibles. Actualice la página e inténtelo de nuevo.
 sql-export-cancelled-reason = el servidor ya no conoce este trabajo
@@ -1147,7 +1266,6 @@ sql-export-detail-col-output = Salida
 sql-export-detail-col-subject = Elemento
 sql-export-detail-col-files = Archivos
 sql-export-detail-outputs-empty = El trabajo no produjo archivos de salida.
-sql-export-file-fallback = Archivo { $n }
 
 ## #837: valores de parámetros por SQL Query en el formulario de SQL Export
 sql-export-param-count = { $count ->
@@ -1781,3 +1899,15 @@ hts-home-chart-hint-series-all = todas las clases de estado
 hts-home-chart-hint-series-2xx = solo respuestas 2xx
 hts-home-chart-hint-series-4xx = solo respuestas 4xx
 hts-home-chart-hint-series-5xx = solo respuestas 5xx
+
+## Autenticación solo con bearer (#1560): auth activa, sin inicio de sesión de navegador
+auth-bearer-only = La autenticación está habilitada en este servidor, pero no hay un inicio de sesión de navegador configurado. Las páginas que llaman a la API FHIR desde el navegador — Recursos, Batch / Transaction, consultas guardadas y preferencias — se rechazan con 401. Configura HFS_UI_LOGIN_CLIENT_ID para habilitar el inicio de sesión, o usa la API directamente con un token bearer.
+batch-sign-in-required = Este servidor no tiene un inicio de sesión de navegador configurado, así que esta página no puede autenticar la petición. Configura HFS_UI_LOGIN_CLIENT_ID para ejecutar bundles desde aquí.
+batch-too-large = El bundle supera el tamaño que acepta este servidor. Divídelo en bundles más pequeños o aumenta HFS_MAX_BODY_SIZE en el servidor.
+batch-connection-dropped = La conexión se cerró antes de que el servidor respondiera. Si tu sesión ha caducado, vuelve a iniciar sesión; también puede que el bundle supere el tamaño que acepta este servidor.
+
+# SQL Library selection and unavailable collection states (#1884).
+sql-library-select-title = Selecciona una consulta o vista
+sql-library-select-lede = Elige un elemento de la lista o crea uno nuevo.
+sql-library-unavailable-title = La selección no está disponible
+sql-library-unavailable-lede = No se pudieron verificar las consultas y vistas disponibles.

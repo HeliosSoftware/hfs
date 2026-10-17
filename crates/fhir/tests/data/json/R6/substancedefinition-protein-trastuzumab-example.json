@@ -92,6 +92,47 @@
       "preferred": false
     }
   ],
+  "relationship": [
+    {
+      "substanceDefinitionReference": {
+        "reference": "SubstanceDefinition/her2",
+        "display": "Receptor tyrosine-protein kinase erbB-2 (HER2)"
+      },
+      "type": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/substance-relationship-type",
+            "code": "TherapeuticTarget",
+            "display": "Therapeutic target"
+          }
+        ]
+      },
+      "amountQuantity": {
+        "value": 0.1,
+        "unit": "nM",
+        "system": "http://unitsofmeasure.org",
+        "code": "nmol/L"
+      },
+      "measurementType": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/substance-measurement-type",
+            "code": "kd",
+            "display": "Kd"
+          }
+        ]
+      },
+      "interaction": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/substance-interaction-type",
+            "code": "binding",
+            "display": "Binding"
+          }
+        ]
+      }
+    }
+  ],
   "protein": {
     "sequenceType": {
       "coding": [
@@ -165,47 +206,6 @@
       }
     ]
   },
-  "relationship": [
-    {
-      "substanceDefinitionReference": {
-        "reference": "SubstanceDefinition/her2",
-        "display": "Receptor tyrosine-protein kinase erbB-2 (HER2)"
-      },
-      "type": {
-        "coding": [
-          {
-            "system": "http://hl7.org/fhir/substance-relationship-type",
-            "code": "TherapeuticTarget",
-            "display": "Therapeutic target"
-          }
-        ]
-      },
-      "interaction": {
-        "coding": [
-          {
-            "system": "http://hl7.org/fhir/substance-interaction-type",
-            "code": "binding",
-            "display": "Binding"
-          }
-        ]
-      },
-      "measurementType": {
-        "coding": [
-          {
-            "system": "http://hl7.org/fhir/substance-measurement-type",
-            "code": "kd",
-            "display": "Kd"
-          }
-        ]
-      },
-      "amountQuantity": {
-        "value": 0.1,
-        "unit": "nM",
-        "system": "http://unitsofmeasure.org",
-        "code": "nmol/L"
-      }
-    }
-  ],
   "meta": {
     "tag": [
       {

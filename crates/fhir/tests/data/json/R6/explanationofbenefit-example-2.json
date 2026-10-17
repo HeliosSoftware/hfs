@@ -54,6 +54,9 @@
       }
     }
   ],
+  "request": {
+    "reference": "MedicationRequest/medrx002"
+  },
   "facility": {
     "reference": "Location/1"
   },

@@ -2,7 +2,7 @@
  * Resources workspace (#282): the Edit Resource modal, and "Create new".
  *
  * The search, the type rail, and the results table are the same components the
- * Search page uses (saved-queries.js), so this script owns only the modal: it
+ * Search page uses (search-builder.js), so this script owns only the modal: it
  * opens on a result click, loads the resource into the schema-driven editor
  * (the same /ui/editor/render the Editor page posts to), and wires Save, Delete,
  * and the version-history diff over the ordinary FHIR API. Nothing here talks to
@@ -27,9 +27,98 @@
   var messages = modal.dataset;
   var subject = document.getElementById("resource-modal-subject");
   var status = document.getElementById("resource-modal-status");
+  /* Replaced by every full render (`HfsResourceJsonEditor.render`) and on
+   * close, so always read it through this variable. */
   var editorBody = document.getElementById("resource-editor-body");
+  /* `{ view, pair, textarea }` of the mounted JSON pane (`null` pair without
+   * editor-pair.js). */
+  var editor = { view: null, pair: null, textarea: null };
+  var JsonEditor = window.HfsResourceJsonEditor;
 
   var current = { type: "", id: "" };
+
+  /* The header line. `setSubject` is the plain form (`Type/id`, `Type · new`);
+   * while a new resource is being created `refreshSubject` swaps it for the
+   * "will be saved as" notice when the document carries a valid id (#1751). */
+  function setSubject(text) {
+    subject.classList.remove("subject--target");
+    subject.textContent = text;
+  }
+
+  function refreshSubject() {
+    if (current.id || !current.type) return;
+    var doc = currentDoc();
+    var text = window.HfsSaveTarget.notice(current.type, doc, messages.msgSaveTarget || "{target}");
+    if (!text) { setSubject(current.type + " \u00b7 new"); return; }
+    var at = text.indexOf(current.type + "/" + doc.id);
+    var code = document.createElement("code");
+    code.textContent = current.type + "/" + doc.id;
+    subject.textContent = "";
+    subject.appendChild(document.createTextNode(text.slice(0, at)));
+    subject.appendChild(code);
+    subject.appendChild(document.createTextNode(text.slice(at + code.textContent.length)));
+    subject.classList.add("subject--target");
+  }
+
+  /* The body element is swapped on every render, so listen on the modal. */
+  modal.addEventListener("input", function (event) {
+    if (event.target.id === "editor-source") refreshSubject();
+  });
+
+  /* Pending edits (#1240): a guided-form `[data-set]` control only
+   * round-trips through the guided-form loop (editor-form.js) on blur, so
+   * the JSON pane alone lags a keystroke behind what is actually on screen.
+   * One "path=value" line per control whose value has moved from what it
+   * loaded with — a `select`'s loaded state is its `defaultSelected` option,
+   * every other control's is `defaultValue`. Same shape as editor.js's own
+   * `pendingEdits`, over the modal's own editor body. */
+  function pendingEdits(container) {
+    var lines = "";
+    var fields = container.querySelectorAll("[data-set]");
+    for (var i = 0; i < fields.length; i++) {
+      var el = fields[i];
+      var path = el.dataset.set;
+      if (!path) continue;
+      if (el.tagName === "SELECT") {
+        var selected = el.options[el.selectedIndex];
+        if (selected && !selected.defaultSelected) lines += path + "=" + el.value + "\n";
+      } else if ("defaultValue" in el) {
+        if (el.value !== el.defaultValue) lines += path + "=" + el.value + "\n";
+      }
+    }
+    return lines;
+  }
+
+  /* The unsaved-changes tracker's own `read` (#1240): the document text plus
+   * any pending edit. With one pending, the whole string no longer parses as
+   * JSON, so it always differs from the last clean baseline — a pending edit
+   * is dirty by definition — until it either commits (the next render
+   * replaces #editor-doc and clears it) or is retyped back to its loaded
+   * value.
+   *
+   * A hidden modal always reads "" — a `change`/`blur` the × click itself
+   * causes can still schedule the tracker's own rAF-coalesced `check()`
+   * *after* `closeModal()` runs when mousedown and click land in the same
+   * frame (a fast click, a tap, Playwright's own click), so that check must
+   * see the closed modal as clean rather than re-reading a pending field the
+   * user can no longer act on — `closeModal()` resets the baseline to this
+   * same "" for exactly that reason. */
+  function readWithPending() {
+    if (modal.hidden) return "";
+    var pending = pendingEdits(editorBody);
+    return currentDocText() + (pending ? "\n--pending--\n" + pending : "");
+  }
+
+  /* Unsaved-changes tracking (#1240): one tracker for the modal's whole
+   * lifetime — `openResource`/`openNew` reset its baseline once each render
+   * lands, the editor's own mutation events re-check it on every swap. */
+  var unsaved = window.HfsUnsaved
+    ? window.HfsUnsaved.track({
+        root: modal,
+        read: readWithPending,
+        cue: modal.querySelector(".modal__actions"),
+      })
+    : null;
 
   /* ---- open / close ---------------------------------------------------- */
 
@@ -39,19 +128,47 @@
     showTab("edit");
     status.textContent = "";
     status.className = "modal__status";
+    // The clicked result id keeps focus and hover behind the modal; let the
+    // shared tooltip (resource-filter.js) hide its full-id bubble (#1770).
+    document.dispatchEvent(new CustomEvent("hfs:modal-open"));
   }
   function closeModal() {
     modal.hidden = true;
     document.body.style.overflow = "";
+    // A hidden modal is never dirty (#1240): reset (not markClean) so the
+    // baseline itself becomes "" — readWithPending() already reads "" while
+    // hidden, so a check() already queued (or the late round trip of a blur
+    // this same close caused) lands on baseline "" === read "" and computes
+    // clean no matter when it actually runs.
+    if (unsaved) unsaved.reset();
+    // Drop the editor with its listeners; the next open mounts a fresh one.
+    resetEditorBody();
+  }
+
+  // #1240: ask before discarding the modal's edits. The answer comes back
+  // asynchronously from the shared in-page confirmation (#1667); a clean
+  // modal resolves at once.
+  function closeAskingFirst() {
+    var asked = window.HfsUnsaved ? window.HfsUnsaved.confirmDiscard(modal) : Promise.resolve(true);
+    asked.then(function (discard) {
+      if (discard && !modal.hidden) closeModal();
+    });
   }
 
   modal.addEventListener("click", function (event) {
-    if (event.target.closest("[data-modal-close]")) closeModal();
+    if (event.target.closest("[data-modal-close]")) closeAskingFirst();
     var tab = event.target.closest("[data-modal-tab]");
     if (tab) showTab(tab.dataset.modalTab);
   });
   document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape" && !modal.hidden) closeModal();
+    if (event.key === "Escape" && !modal.hidden) {
+      // preventDefault: a confirmation opened inside this keydown would
+      // otherwise be dismissed by the very same Escape (the browser's own
+      // <dialog> close handling runs after the listeners), answering "cancel"
+      // before the user sees it (#1667).
+      event.preventDefault();
+      closeAskingFirst();
+    }
   });
 
   function showTab(name) {
@@ -68,223 +185,76 @@
 
   /* ---- load a resource into the embedded editor ------------------------ */
 
+  /* The editor inside the modal is the same fragment the Editor page uses,
+   * mounted by the shared `resource-json-editor.js`: the JSON pane is the
+   * code editor and `editor-pair.js` / `editor-form.js` run every form
+   * interaction. This script only renders the body for a document and reads
+   * the document back for Save. */
+  var renderSeq = 0;
+
+  /* An empty body element in place of the current one, so no listener of the
+   * mounted editor outlives it. */
+  function resetEditorBody() {
+    renderSeq++;
+    if (window.HfsCombobox) window.HfsCombobox.destroy(editorBody);
+    JsonEditor.destroy(editorBody);
+    var fresh = document.createElement(editorBody.tagName);
+    fresh.id = editorBody.id;
+    fresh.className = editorBody.className;
+    editorBody.replaceWith(fresh);
+    editorBody = fresh;
+    editor = { view: null, pair: null, textarea: null };
+  }
+
+  /* Resolves true once rendered and mounted, false on failure, undefined when
+   * a newer render superseded this one. */
+  function renderFull(text) {
+    var seq = ++renderSeq;
+    window.HfsEditorAdd.invalidateRefresh(editorBody);
+    return JsonEditor.render(editorBody, text, function () { return seq !== renderSeq; })
+      .then(function (rendered) {
+        if (!rendered) return undefined;
+        editorBody = rendered.body;
+        editor = rendered.session;
+        if (!editor.pair) window.HfsEditorAdd.attach(editorBody);
+        refreshSubject();
+        return true;
+      })
+      .catch(function (error) { console.debug("Resource editor render failed", error); return false; });
+  }
+
   function renderEditor(resource) {
-    return editorSend("", { doc: JSON.stringify(resource) });
+    return renderFull(JSON.stringify(resource));
   }
 
-  /* The editor inside the modal is the same fragment the Editor page uses, but
-   * editor.js is bound to that page's ids — so the interactions live here,
-   * scoped to the modal body. Each structural edit posts the whole document
-   * plus the op and swaps the body, exactly as the Editor page does. */
-  function editorSend(op, fields) {
-    var form = new URLSearchParams();
-    var docField = editorBody.querySelector("#editor-doc");
-    form.set("doc", (fields && fields.doc) || (docField ? docField.value : "{}"));
-    form.set("op", op || "");
-    Object.keys(fields || {}).forEach(function (k) {
-      if (k !== "doc") form.set(k, fields[k]);
-    });
-    return fetch("/ui/editor/render", { method: "POST", body: form })
-      .then(function (r) { return r.text(); })
-      .then(function (html) {
-        var state = captureEditorState();
-        editorBody.innerHTML = html;
-        restoreEditorState(state);
-      });
+  /* Installs the saved canonical document into the editor as one undoable
+   * transaction and refreshes the form (a full render without editor-pair.js). */
+  function showDocument(text) {
+    if (!editor.pair) return renderFull(text);
+    return JsonEditor.apply(editor, text).then(function (ok) { refreshSubject(); return ok; });
   }
 
-  /* Keeps the user's place across the modal editor's full re-render (#547):
-   * the focused field and caret, any open add-picker with its filter text,
-   * and the tree scroll. The server marks the node a mutation created via
-   * data-focus on #editor-form; the caret goes there first. */
-  function captureEditorState() {
-    var state = { focus: null, pickers: [], scroll: 0, rawOpen: false };
-    var rawPane = editorBody.querySelector("#editor-json-raw");
-    state.rawOpen = !!(rawPane && !rawPane.hidden);
-    var tree = editorBody.querySelector(".editor-tree");
-    if (tree) state.scroll = tree.scrollTop;
-    var active = document.activeElement;
-    if (active && editorBody.contains(active) && active.dataset && active.dataset.set) {
-      state.focus = { path: active.dataset.set, start: active.selectionStart, end: active.selectionEnd };
-    }
-    editorBody.querySelectorAll("details.editor-add[open]").forEach(function (box) {
-      var row = box.closest("[data-path]");
-      var filter = box.querySelector(".editor-add__filter");
-      state.pickers.push({
-        path: row ? row.dataset.path : "",
-        filter: filter ? filter.value : "",
-        focusFilter: filter === document.activeElement,
-      });
-    });
-    return state;
+  /* The validation render Save runs: the guided form for exactly `text`. */
+  function validateDocument(text) {
+    window.HfsEditorAdd.invalidateRefresh(editorBody);
+    if (!editor.pair) return renderFull(text);
+    editor.pair.host.beforeMutation();
+    return JsonEditor.project(editor, text);
   }
-
-  function editorNodeBy(attr, path) {
-    var nodes = editorBody.querySelectorAll("[" + attr + "]");
-    for (var i = 0; i < nodes.length; i++) {
-      if (nodes[i].getAttribute(attr) === path) return nodes[i];
-    }
-    return null;
-  }
-
-  function restoreEditorState(state) {
-    // Raw mode survives the swap: the fresh textarea already carries the
-    // updated document, so a guided edit refreshes the JSON in place instead
-    // of kicking the user back to the fold view.
-    if (state.rawOpen) {
-      var rawPane = editorBody.querySelector("#editor-json-raw");
-      var viewEl = editorBody.querySelector("#json-view");
-      var toggle = editorBody.querySelector("#editor-json-edit");
-      if (rawPane && viewEl) {
-        rawPane.hidden = false;
-        viewEl.hidden = true;
-        if (toggle) toggle.classList.add("editor-json__act--on");
-      }
-    }
-    state.pickers.forEach(function (saved) {
-      var row = saved.path ? editorNodeBy("data-path", saved.path) : editorBody;
-      if (!row) return;
-      var box = row.querySelector("details.editor-add");
-      if (!box) return;
-      box.setAttribute("open", "");
-      var filter = box.querySelector(".editor-add__filter");
-      if (filter && saved.filter) {
-        filter.value = saved.filter;
-        filter.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      if (saved.focusFilter && filter) filter.focus();
-    });
-
-    var formEl = editorBody.querySelector("#editor-form");
-    var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
-    var target = createdPath ? editorNodeBy("data-set", createdPath) : null;
-    if (target) {
-      target.focus();
-      if (target.select) target.select();
-    } else if (state.focus) {
-      target = editorNodeBy("data-set", state.focus.path);
-      if (target) {
-        target.focus();
-        if (target.setSelectionRange && state.focus.start !== null) {
-          try { target.setSelectionRange(state.focus.start, state.focus.end); } catch (ignored) {}
-        }
-      }
-    }
-
-    var tree = editorBody.querySelector(".editor-tree");
-    if (tree) tree.scrollTop = state.scroll;
-  }
-
-  /* Delegated editor interactions within the modal body. */
-  editorBody.addEventListener("click", function (event) {
-    if (event.target.id === "editor-json-edit") {
-      var raw = editorBody.querySelector("#editor-json-raw");
-      var viewEl = editorBody.querySelector("#json-view");
-      if (!raw || !viewEl) return;
-      if (raw.hidden) { raw.hidden = false; viewEl.hidden = true; event.target.classList.add("editor-json__act--on"); }
-      else {
-        // Same as the standalone page: close the pane before the round trip
-        // so the raw-mode persistence reads this re-render as leaving raw.
-        var src = editorBody.querySelector("#editor-source");
-        var fld = editorBody.querySelector("#editor-doc");
-        if (src && fld) fld.value = src.value;
-        raw.hidden = true;
-        viewEl.hidden = false;
-        event.target.classList.remove("editor-json__act--on");
-        editorSend("");
-      }
-      return;
-    }
-    var add = event.target.closest("[data-add]");
-    if (add) { editorSend("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" }); return; }
-    var rm = event.target.closest("[data-remove]");
-    if (rm) { editorSend("remove", { path: rm.dataset.remove }); return; }
-    var ext = event.target.closest("[data-extension]");
-    if (ext) {
-      var panel = ext.closest(".editor-add__ext");
-      var url = ext.dataset.url || (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
-      editorSend("extension", { path: ext.dataset.extension, url: url });
-    }
-  });
-
-
-  /* Live $expand picker (#365): bound inputs carry data-vs-url; typing
-   * debounces a request to the UI's terminology proxy and fills a per-row
-   * datalist. 204 (no server configured) leaves the plain input alone. */
-  var expandTimer = null;
-  var expandSeq = 0;
-  var liveListSeq = 0;
-  editorBody.addEventListener("input", function (event) {
-    var input = event.target.closest("[data-vs-url]");
-    if (!input) return;
-    clearTimeout(expandTimer);
-    expandTimer = setTimeout(function () {
-      var seq = ++expandSeq;
-      fetch(
-        "/ui/editor/expand?url=" +
-          encodeURIComponent(input.dataset.vsUrl) +
-          "&filter=" +
-          encodeURIComponent(input.value),
-        { credentials: "same-origin" },
-      )
-        .then(function (r) { return r.status === 200 ? r.json() : null; })
-        .then(function (data) {
-          if (!data || seq !== expandSeq) return;
-          var listId = input.getAttribute("list");
-          if (!listId) {
-            listId = "vs-live-" + (++liveListSeq);
-            input.setAttribute("list", listId);
-          }
-          var list = document.getElementById(listId);
-          if (!list) {
-            list = document.createElement("datalist");
-            list.id = listId;
-            input.parentElement.appendChild(list);
-          }
-          list.textContent = "";
-          data.codes.forEach(function (item) {
-            var opt = document.createElement("option");
-            opt.value = item.code;
-            if (item.display) opt.label = item.display;
-            list.appendChild(opt);
-          });
-        })
-        .catch(function () {});
-    }, 300);
-  });
-
-  editorBody.addEventListener("change", function (event) {
-    var choose = event.target.closest("[data-choose]");
-    if (choose && choose.value) {
-      editorSend("choose", { path: choose.dataset.choose, name: choose.dataset.declarer, arm: choose.value });
-    }
-  });
-
-  editorBody.addEventListener("blur", function (event) {
-    var input = event.target.closest("[data-set]");
-    if (!input) return;
-    // An unchanged value needs no round trip (#547).
-    if (input.value === input.defaultValue) return;
-    editorSend("set", { path: input.dataset.set, value: input.value });
-  }, true);
-
-  editorBody.addEventListener("input", function (event) {
-    var filter = event.target.closest(".editor-add__filter");
-    if (!filter) return;
-    var needle = filter.value.trim().toLowerCase();
-    filter.closest(".editor-add__panel").querySelectorAll("[data-add-name]").forEach(function (item) {
-      item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) < 0;
-    });
-  });
 
   function openResource(type, id) {
     current = { type: type, id: id };
-    subject.textContent = type + "/" + id;
+    setSubject(type + "/" + id);
     openModal();
+    if (window.HfsCombobox) window.HfsCombobox.destroy(editorBody);
     editorBody.innerHTML = "";
     fetch("/" + type + "/" + id, { headers: fhirHeaders() })
       .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
       .then(renderEditor)
+      .then(function (ok) {
+        if (ok === false) say(messages.msgLoadError, "error");
+        if (unsaved) unsaved.reset();
+      })
       .catch(function () { say(messages.msgLoadError, "error"); });
   }
 
@@ -295,21 +265,25 @@
       root.dataset.createTarget !== type
     ) return;
     current = { type: type, id: "" };
-    subject.textContent = type + " · " + "new";
+    setSubject(type + " · " + "new");
     openModal();
+    if (window.HfsCombobox) window.HfsCombobox.destroy(editorBody);
     editorBody.innerHTML = "";
-    renderEditor({ resourceType: type });
+    renderEditor({ resourceType: type }).then(function () { if (unsaved) unsaved.reset(); });
   }
 
   /* Clicking a result row opens it. The href remains the server-provided
    * public URL, which may include a path prefix or tenant segment. Use the
-   * trusted resource identity attached by saved-queries.js instead of parsing
+   * trusted resource identity attached by search-builder.js instead of parsing
    * that deployment-specific URL. The results live in the content column, not
-   * under `root` (the type panel), so the listener is on the document. */
+   * under `root` (the type panel), so the listener is on the document.
+   * row-navigation.js (#1106) turns a click anywhere in the row into a click
+   * on this id link, so this capture-phase interceptor opens the modal for
+   * whole-row clicks too. */
   document.addEventListener(
     "click",
     function (event) {
-      var link = event.target.closest("#query-results-body a.url");
+      var link = event.target.closest("#query-results-body a.result-id");
       if (!link) return;
       var type = link.dataset.resourceType || "";
       var id = link.dataset.resourceId || "";
@@ -332,66 +306,116 @@
 
   /* ---- save / delete --------------------------------------------------- */
 
-  function currentDoc() {
-    // When the raw editor is open its textarea is the source of truth: the
-    // hidden #editor-doc only catches up when you toggle "Edit raw" back off,
-    // so a Save typed directly in raw mode must read the textarea itself.
-    var raw = editorBody.querySelector("#editor-json-raw");
+  // The JSON pane's text is the single copy of the document.
+  function currentDocText() {
     var source = editorBody.querySelector("#editor-source");
-    if (raw && !raw.hidden && source) {
-      try { return JSON.parse(source.value); } catch (e) { return null; }
-    }
+    if (source) return source.value;
     var field = editorBody.querySelector("#editor-doc");
-    if (!field) return null;
-    try { return JSON.parse(field.value); } catch (e) { return null; }
+    return field ? field.value : "{}";
+  }
+
+  function currentDoc() {
+    try { return JSON.parse(currentDocText()); } catch (e) { return null; }
+  }
+
+  /* Creating with an id that already belongs to a resource would silently add
+   * a version to it (#1751): probe first and ask. Resolves true to go on with
+   * the write. A failed probe never blocks the save. Runs inside Save's busy
+   * window, so a double click cannot start a second probe or dialog. */
+  function confirmCreateOverExisting(target) {
+    if (current.id || target.method !== "PUT" || !window.HfsSaveTarget.isValidId(target.id)) {
+      return Promise.resolve(true);
+    }
+    return fetch(target.url + "?_elements=id", { method: "GET", headers: fhirHeaders() })
+      .then(function (r) { return window.HfsSaveTarget.existsFromStatus(r.status); })
+      .catch(function () { return false; })
+      .then(function (exists) {
+        if (!exists) return true;
+        var label = current.type + "/" + target.id;
+        return window.HfsConfirm.ask(
+          String(messages.msgIdExists).replace("{target}", label),
+          { confirmLabel: messages.msgIdExistsConfirm },
+        );
+      });
   }
 
   document.getElementById("resource-save").addEventListener("click", function () {
-    var doc = currentDoc();
-    if (!doc) { say(messages.msgSaveInvalid, "error"); return; }
-    // Validate the exact document being saved by re-rendering it (this also
-    // commits a raw edit and leaves raw mode), then block the save if the
-    // editor reports any issue — an invalid resource must not be persisted.
-    editorSend("", { doc: JSON.stringify(doc) }).then(function () {
-      var form = editorBody.querySelector("#editor-form");
-      var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
-      if (errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
-      var creating = !current.id;
-      var url = creating ? "/" + current.type : "/" + current.type + "/" + current.id;
-      fetch(url, {
-        method: creating ? "POST" : "PUT",
-        headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
-        body: JSON.stringify(doc),
-      })
-        .then(function (r) {
-          return r.json().then(function (body) { return { ok: r.ok, body: body }; });
-        })
-        .then(function (res) {
-          if (!res.ok) { say(outcomeText(res.body), "error"); return; }
-          current.id = res.body.id || current.id;
-          subject.textContent = current.type + "/" + current.id;
-          say(messages.msgSaved, "ok");
-          renderEditor(res.body);
-          // The results table behind the modal is now stale — let it catch up.
-          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
-        })
-        .catch(function () { say(messages.msgLoadError, "error"); });
-    });
+    // The whole chain runs under the shared busy state (#1750): repeat clicks
+    // are dropped until it settles, whatever the outcome.
+    var saveButton = document.getElementById("resource-save");
+    var deleteButton = document.getElementById("resource-delete");
+    window.hfsBusy.during([saveButton], function () {
+      // A guided-form field commits on blur, which the click on Save itself
+      // causes: let that round trip land in the JSON pane before reading it.
+      return window.HfsEditorAdd.whenMutationsSettled(editorBody).then(function () {
+        var doc = currentDoc();
+        if (!doc) { say(messages.msgSaveInvalid, "error"); return; }
+        // Validate the exact document being saved by re-rendering the form
+        // for it, then block the save if the editor reports any issue — an
+        // invalid resource must not be persisted.
+        return validateDocument(JSON.stringify(doc)).then(function (rendered) {
+          if (!rendered) { say(messages.msgLoadError, "error"); return; }
+          var form = editorBody.querySelector("#editor-form");
+          var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
+          if (errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
+          var target = current.id
+            ? { method: "PUT", url: "/" + current.type + "/" + current.id }
+            : window.HfsSaveTarget.forCreate(current.type, doc);
+          return confirmCreateOverExisting(target).then(function (go) {
+            if (!go) return;
+            return fetch(target.url, {
+              method: target.method,
+              headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
+              body: JSON.stringify(doc),
+            })
+              .then(function (r) {
+                return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+              })
+              .then(function (res) {
+                if (!res.ok) { say(outcomeText(res.body), "error"); return; }
+                current.id = res.body.id || current.id;
+                setSubject(current.type + "/" + current.id);
+                say("");
+                announce(messages.msgSaved);
+                // The results table behind the modal is now stale — let it catch up.
+                document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
+                return showDocument(JSON.stringify(res.body, null, 2)).then(function () { if (unsaved) unsaved.reset(); });
+              })
+              .catch(function () { say(messages.msgLoadError, "error"); });
+          });
+        });
+      }, function () { say(messages.msgLoadError, "error"); });
+    }, { alsoDisable: [deleteButton] });
   });
 
   document.getElementById("resource-delete").addEventListener("click", function () {
-    if (!current.id) { closeModal(); return; }
-    if (!window.confirm(messages.msgConfirmDelete)) return;
-    fetch("/" + current.type + "/" + current.id, { method: "DELETE", headers: fhirHeaders() })
-      .then(function (r) {
-        if (r.ok || r.status === 204) {
-          closeModal();
-          // No full reload: the table and counts refresh in place, keeping
-          // the rail selection and scroll where the user left them.
-          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
-        } else say(String(r.status), "error");
-      })
-      .catch(function () { say(messages.msgLoadError, "error"); });
+    if (!current.id) {
+      closeAskingFirst();
+      return;
+    }
+    // Pin the target now: the shared in-page confirmation (#1667) answers
+    // later, and `current` must not be read again after the user has said yes.
+    var type = current.type;
+    var id = current.id;
+    window.HfsConfirm.ask(messages.msgConfirmDelete, { danger: true }).then(function (confirmed) {
+      if (!confirmed) return;
+      var saveButton = document.getElementById("resource-save");
+      var deleteButton = document.getElementById("resource-delete");
+      window.hfsBusy.during([deleteButton], function () {
+        return fetch("/" + type + "/" + id, { method: "DELETE", headers: fhirHeaders() })
+          .then(function (r) {
+            if (r.ok || r.status === 204) {
+              // The resource no longer exists — nothing to ask about.
+              if (unsaved) unsaved.markClean();
+              closeModal();
+              // No full reload: the table and counts refresh in place, keeping
+              // the rail selection and scroll where the user left them.
+              document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: type } }));
+            } else say(String(r.status), "error");
+          })
+          .catch(function () { say(messages.msgLoadError, "error"); });
+      }, { alsoDisable: [saveButton] });
+    });
   });
 
   /* ---- history tab: version rail + diff (#236) ------------------------- */
@@ -424,8 +448,11 @@
       var resource = entry.resource || {};
       var response = entry.response || {};
       var etag = /"([^"]+)"/.exec(response.etag || "");
+      var meta = resource.meta || {};
       return {
-        versionId: (resource.meta && resource.meta.versionId) || (etag && etag[1]) || "",
+        versionId: meta.versionId || (etag && etag[1]) || "",
+        lastUpdated: meta.lastUpdated || response.lastModified || "",
+        method: opKey(((entry.request || {}).method || "").toUpperCase()),
         resource: resource,
       };
     });
@@ -436,7 +463,19 @@
       var row = document.createElement("button");
       row.type = "button";
       row.className = "history-version" + (i === 0 ? " history-version--current" : "");
-      row.textContent = "v" + v.versionId + (i === 0 ? " · " + historyEl.dataset.msgCurrent : "");
+      row.dataset.index = String(i);
+      var idEl = document.createElement("span");
+      idEl.className = "history-version__id";
+      idEl.textContent = "v" + v.versionId;
+      var whenEl = document.createElement("span");
+      whenEl.className = "history-version__when";
+      whenEl.textContent = shortTime(v.lastUpdated);
+      var kindEl = document.createElement("span");
+      kindEl.className = "history-version__kind history-version__kind--" + v.method;
+      kindEl.textContent = i === 0 ? historyEl.dataset.msgCurrent : opLabel(v.method);
+      row.appendChild(idEl);
+      row.appendChild(whenEl);
+      row.appendChild(kindEl);
       row.addEventListener("click", function () { toSel.value = String(i); fromSel.value = String(Math.min(i + 1, versions.length - 1)); renderDiff(); });
       versionsHost.appendChild(row);
       fromSel.appendChild(opt(i, "v" + v.versionId));
@@ -447,12 +486,48 @@
     renderDiff();
   }
 
+  /* Local date; an unparseable value is shown raw, never as "Invalid Date". */
+  function shortTime(iso) {
+    if (!iso) return "";
+    var date = new Date(iso);
+    return isNaN(date) ? iso : date.toLocaleString();
+  }
+
+  /* POST=create, PUT=update, PATCH=patch, DELETE=delete; same mapping as history.js. */
+  function opKey(method) {
+    if (method === "POST") return "create";
+    if (method === "PUT") return "update";
+    if (method === "PATCH") return "patch";
+    if (method === "DELETE") return "delete";
+    return "version";
+  }
+
+  function opLabel(method) {
+    return historyEl.dataset["msgOp" + method.charAt(0).toUpperCase() + method.slice(1)] || method;
+  }
+
+  /* The two versions being compared get the from/to marker. */
+  function markSelected() {
+    var from = Number(fromSel.value);
+    var to = Number(toSel.value);
+    versionsHost.querySelectorAll(".history-version").forEach(function (row) {
+      var index = Number(row.dataset.index);
+      row.classList.toggle("history-version--from", index === from);
+      row.classList.toggle("history-version--to", index === to);
+    });
+  }
+
   function opt(v, label) { var o = document.createElement("option"); o.value = String(v); o.textContent = label; return o; }
 
   function renderDiff() {
+    if (window.HfsCombobox) {
+      window.HfsCombobox.refresh(fromSel);
+      window.HfsCombobox.refresh(toSel);
+    }
     var from = versions[Number(fromSel.value)];
     var to = versions[Number(toSel.value)];
     if (!from || !to) return;
+    markSelected();
     var body = new URLSearchParams();
     body.set("from", JSON.stringify(from.resource));
     body.set("to", JSON.stringify(to.resource));
@@ -473,6 +548,16 @@
   function say(text, kind) {
     status.textContent = text;
     status.className = "modal__status modal__status--" + (kind || "");
+  }
+  /* The saved confirmation for assistive technology only (#1649); see
+   * editor.js's `announce`. */
+  var announcer = document.getElementById("resource-modal-announce");
+  function announce(text) {
+    if (!announcer) return;
+    announcer.textContent = "";
+    window.setTimeout(function () {
+      announcer.textContent = text || "";
+    }, 50);
   }
   function outcomeText(body) {
     return (

@@ -60,6 +60,7 @@ async fn server(
             jti: None,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             custom_claims: serde_json::Map::new(),
+            ..Default::default()
         };
         app.layer(axum::middleware::from_fn(
             move |mut request: axum::extract::Request, next: Next| {

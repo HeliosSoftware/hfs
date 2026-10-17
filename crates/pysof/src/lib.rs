@@ -201,7 +201,7 @@ fn py_run_view_definition(
 ///     view_definition (dict | str | bytes): ViewDefinition resource as a Python dictionary or JSON text
 ///     bundle (dict | str | bytes): FHIR Bundle resource as a Python dictionary or JSON text
 ///     format (str): Output format ("csv", "csv_with_header", "json", "ndjson", "parquet")
-///     since (str, optional): Filter resources modified after this ISO8601 datetime
+///     since (str, optional): Filter resources modified at or after this ISO8601 datetime
 ///     limit (int, optional): Limit the number of results returned
 ///     page (int, optional): Page number for pagination (1-based)
 ///     fhir_version (str, optional): FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
@@ -617,6 +617,19 @@ fn parse_sof_view_and_bundle(
 
 /// Parses a ViewDefinition input into a version-specific SOF type.
 fn parse_sof_view(view: JsonInput, fhir_version: &str) -> PyResult<SofViewDefinition> {
+    // Validate column tags on the raw JSON first so a bad `ansi/type` tag
+    // (including a non-string value) is reported naming the column.
+    let view = match view {
+        JsonInput::Value(v) => v,
+        other => match parse_json_input::<serde_json::Value>(other) {
+            Ok(v) => v,
+            Err(e) => return Err(json_error_to_py_err(e)),
+        },
+    };
+    if view.is_object() {
+        helios_sof::column_types::resolve_columns(&view).map_err(rust_sof_error_to_py_err)?;
+    }
+    let view = JsonInput::Value(view);
     match fhir_version {
         #[cfg(feature = "R4")]
         "R4" => Ok(SofViewDefinition::R4(
@@ -791,7 +804,7 @@ impl PyRemoteResolveConfig {
 ///     bundle (dict | str | bytes): FHIR Bundle resource.
 ///     format (str): Output format ("csv", "csv_with_header", "json", "ndjson", "parquet").
 ///     remote_config (RemoteResolveConfig): Remote resolution configuration.
-///     since (str, optional): Filter resources modified after this ISO8601 datetime.
+///     since (str, optional): Filter resources modified at or after this ISO8601 datetime.
 ///     limit (int, optional): Limit the number of results.
 ///     page (int, optional): Page number (1-based).
 ///     fhir_version (str, optional): "R4" (default), "R4B", "R5", "R6".

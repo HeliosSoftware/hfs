@@ -64,10 +64,10 @@
             {% endif %}
           </td>
           <td>{% for i in r.interactions %}<span class="tag {{ i.tag_class }}">{{ i.code }}</span> {% endfor %}</td>
-          <td class="col-num">{{ r.search_param_count }}</td>
+          <td class="col-num">{{ i18n.num(r.search_param_count) }}</td>
           {% if show_include_columns %}
-          <td class="col-num">{{ r.include_count }}</td>
-          <td class="col-num">{{ r.revinclude_count }}</td>
+          <td class="col-num">{{ i18n.num(r.include_count) }}</td>
+          <td class="col-num">{{ i18n.num(r.revinclude_count) }}</td>
           {% endif %}
         </tr>
         {% endfor %}

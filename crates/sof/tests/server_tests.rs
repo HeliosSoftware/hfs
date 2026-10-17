@@ -512,7 +512,7 @@ async fn test_post_source_not_implemented() {
 async fn test_patient_filtering_incorrect_format() {
     let server = common::test_server().await;
 
-    // This test demonstrates the issue: incorrect valueReference format
+    // A malformed Reference must not silently widen the run to both patients.
     let body = json!({
         "resourceType": "Parameters",
         "parameter": [
@@ -552,10 +552,7 @@ async fn test_patient_filtering_incorrect_format() {
         ]
     });
 
-    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
-    // `json` as the old stub assumed. Request `application/json`
-    // explicitly so the response is a JSON array, matching this test's
-    // intent.
+    // The response must describe the unusable filter as an OperationOutcome.
     let response = server
         .post("/$sql-run")
         .add_header("Content-Type", "application/json")
@@ -563,17 +560,15 @@ async fn test_patient_filtering_incorrect_format() {
         .json(&body)
         .await;
 
-    assert_eq!(response.status_code(), StatusCode::OK);
-    let json: serde_json::Value = response.json();
-
-    // Without proper patient filter, both patients are returned
-    assert!(json.is_array());
-    let results = json.as_array().unwrap();
-    assert_eq!(
-        results.len(),
-        2,
-        "Both patients returned when filter not parsed"
-    );
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let outcome: serde_json::Value = response.json();
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    assert_eq!(outcome["issue"][0]["code"], "invalid");
+    let details = outcome["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(details.contains("patient"), "{outcome}");
+    assert!(details.contains("no usable reference"), "{outcome}");
 }
 
 #[tokio::test]
@@ -809,7 +804,7 @@ async fn test_since_parameter_filtering() {
     assert!(json.is_array());
     let results = json.as_array().unwrap();
 
-    // Should only return the new patient (updated after 2023-06-01)
+    // Should only return the new patient (updated at or after 2023-06-01)
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"], "new-patient");
     assert_eq!(results[0]["lastUpdated"], "2023-12-01T00:00:00Z");
@@ -875,9 +870,87 @@ async fn test_since_parameter_no_meta() {
     assert!(json.is_array());
     let results = json.as_array().unwrap();
 
-    // Should only return the patient with meta.lastUpdated after _since
+    // Should only return the patient with meta.lastUpdated at or after _since
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"], "patient-with-meta");
+}
+
+/// sof-server `_since` keeps a resource whose meta.lastUpdated equals the instant, in UTC or with an offset (#1803).
+#[tokio::test]
+async fn test_since_parameter_keeps_resource_at_exact_instant() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_since",
+                "valueInstant": "2023-06-01T00:00:00Z"
+            },
+            {
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "before",
+                    "meta": {
+                        "lastUpdated": "2023-05-31T23:59:59.999Z"
+                    }
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "at-utc",
+                    "meta": {
+                        "lastUpdated": "2023-06-01T00:00:00Z"
+                    }
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "at-offset",
+                    "meta": {
+                        "lastUpdated": "2023-06-01T02:00:00+02:00"
+                    }
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/$sql-run")
+        .add_header("Content-Type", "application/json")
+        .add_header("Accept", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let json: serde_json::Value = response.json();
+    let results = json.as_array().unwrap();
+
+    let mut ids: Vec<&str> = results.iter().filter_map(|r| r["id"].as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["at-offset", "at-utc"],
+        "_since is inclusive (at or after)"
+    );
 }
 
 #[tokio::test]
@@ -1107,6 +1180,49 @@ async fn test_invalid_view_definition_returns_422() {
     );
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "OperationOutcome");
+}
+
+/// #640: a column path whose leading identifier is neither a type nor an
+/// element of the resource is a 422 naming the identifier, not a silently
+/// empty column.
+#[tokio::test]
+async fn test_unresolvable_leading_identifier_returns_422() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": "ndjson"},
+            {
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"name": "x", "path": "Bogus.name.family"}]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {"resourceType": "Patient", "id": "p1", "name": [{"family": "Smith"}]}
+            }
+        ]
+    });
+
+    let response = server
+        .post("/$sql-run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "got {} with body: {}",
+        response.status_code(),
+        response.text()
+    );
+    assert!(response.text().contains("Bogus"), "{}", response.text());
 }
 
 /// A `ViewDefinition` with more than one structural problem gets one
@@ -1401,4 +1517,226 @@ async fn test_run_view_definition_arrow_ipc_via_format_param() {
         "application/vnd.apache.arrow.stream"
     );
     assert_arrow_ipc_response(response.as_bytes());
+}
+
+fn reference_parameters_request() -> serde_json::Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "subjectResource", "resource": {
+                "resourceType": "ViewDefinition", "status": "active", "resource": "Patient",
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            }},
+            {"name": "resource", "resource": {"resourceType": "Patient", "id": "p1"}},
+            {"name": "resource", "resource": {"resourceType": "Patient", "id": "p2"}},
+            {"name": "resource", "resource": {"resourceType": "Patient", "id": "p3"}}
+        ]
+    })
+}
+
+#[tokio::test]
+async fn reference_parameters_server_rejects_unusable_body_entries() {
+    let server = common::test_server().await;
+    for name in ["patient", "group"] {
+        for value in [
+            json!({"valueReference": {"identifier": {"system": "urn:s", "value": "v"}}}),
+            json!({"valueReference": {"display": "target"}}),
+            json!({"valueReference": {}}),
+            json!({"valueReference": {"reference": ""}}),
+            json!({"valueString": " \t "}),
+            json!({"valueUri": "Patient/p1"}),
+            json!({"valueIdentifier": {"value": "v"}}),
+            json!({"valueString": 42}),
+            json!({"valueReference": {"reference": 42}}),
+            json!({"valueInteger": 1}),
+            json!({}),
+        ] {
+            let mut entry = value;
+            entry["name"] = json!(name);
+            let mut body = reference_parameters_request();
+            body["parameter"]
+                .as_array_mut()
+                .unwrap()
+                .push(entry.clone());
+            let response = server.post("/$sql-run").json(&body).await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{entry}: {}",
+                response.text()
+            );
+            let outcome: serde_json::Value = response.json();
+            assert_eq!(outcome["resourceType"], "OperationOutcome");
+            assert_eq!(outcome["issue"][0]["code"], "invalid");
+            assert!(outcome.to_string().contains(name), "{outcome}");
+        }
+        // Neither another valid body entry nor a valid query filter may hide
+        // the unusable body value.
+        let mut body = reference_parameters_request();
+        body["parameter"].as_array_mut().unwrap().extend([
+            json!({"name": name, "valueString": "p1"}),
+            json!({"name": name, "valueReference": {"identifier": {"value": "v"}}}),
+        ]);
+        let response = server
+            .post(&format!("/$sql-run?{name}=p1"))
+            .json(&body)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            response.text()
+        );
+        assert!(response.text().contains(name));
+    }
+}
+
+#[tokio::test]
+async fn reference_parameters_server_normalizes_repeated_patient_and_group_entries() {
+    let server = common::test_server().await;
+    for name in ["patient", "group"] {
+        let mut body = reference_parameters_request();
+        let entries = body["parameter"].as_array_mut().unwrap();
+        let ty = if name == "patient" {
+            "Patient"
+        } else {
+            "Group"
+        };
+        let ids = if name == "patient" {
+            ["p1", "p2"]
+        } else {
+            ["g1", "g2"]
+        };
+        if name == "group" {
+            for (id, patient) in [("g1", "p1"), ("g2", "p2")] {
+                entries.push(json!({"name": "resource", "resource": {
+                    "resourceType": "Group", "id": id, "type": "person", "actual": true,
+                    "member": [{"entity": {"reference": format!("Patient/{patient}")}}]
+                }}));
+            }
+        }
+        entries.extend([
+            json!({"name": name, "valueReference": {"reference": format!(" {ty}/{} ", ids[0])}}),
+            json!({"name": name, "valueString": format!(" {ty}/{} ", ids[1])}),
+        ]);
+        let response = server.post("/$sql-run?_format=json").json(&body).await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let rows: serde_json::Value = response.json();
+        let mut ids: Vec<_> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["p1", "p2"]);
+    }
+}
+
+/// A `$sql-run` body whose single column carries an `ansi/type` tag.
+fn ansi_tag_body(format: &str, path: &str, ty: &str, tag: &str) -> serde_json::Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": format},
+            {
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{
+                        "name": "tagged_col", "path": path, "type": ty,
+                        "tag": [{"name": "ansi/type", "value": tag}]
+                    }]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {"resourceType": "Patient", "id": "p1", "birthDate": "1990-01-01"}
+            }
+        ]
+    })
+}
+
+#[tokio::test]
+async fn test_sql_run_rejects_invalid_ansi_type_tag_naming_the_column() {
+    let server = common::test_server().await;
+    for format in ["json", "ndjson", "csv", "parquet", "arrow"] {
+        for (path, ty, tag) in [
+            ("birthDate", "date", "GEOMETRY"),
+            ("birthDate", "date", "INT"),
+        ] {
+            let response = server
+                .post("/$sql-run")
+                .add_header("Content-Type", "application/json")
+                .json(&ansi_tag_body(format, path, ty, tag))
+                .await;
+            let status = response.status_code();
+            assert!(
+                status.is_client_error(),
+                "{format}/{tag}: expected 4xx, got {status}; body: {}",
+                response.text()
+            );
+            assert!(
+                response.text().contains("tagged_col"),
+                "{format}/{tag}: body must name the column: {}",
+                response.text()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_sql_run_accepts_valid_date_and_double_ansi_type_tags_as_parquet() {
+    let server = common::test_server().await;
+    for (path, ty, tag) in [
+        ("birthDate", "date", "DATE"),
+        ("id.length()", "integer", "DOUBLE PRECISION"),
+    ] {
+        let response = server
+            .post("/$sql-run")
+            .add_header("Content-Type", "application/json")
+            .json(&ansi_tag_body("parquet", path, ty, tag))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{tag}: {}",
+            response.text()
+        );
+        assert!(response.as_bytes().starts_with(b"PAR1"), "{tag}");
+    }
+}
+
+#[tokio::test]
+async fn test_sql_run_rejects_non_string_ansi_type_tag_value_naming_the_column() {
+    let server = common::test_server().await;
+    for format in ["json", "ndjson", "csv", "parquet", "arrow"] {
+        let mut body = ansi_tag_body(format, "birthDate", "date", "DATE");
+        *body
+            .pointer_mut("/parameter/1/resource/select/0/column/0/tag/0/value")
+            .unwrap() = json!(42);
+        let response = server
+            .post("/$sql-run")
+            .add_header("Content-Type", "application/json")
+            .json(&body)
+            .await;
+        let status = response.status_code();
+        assert!(
+            status.is_client_error(),
+            "{format}: expected 4xx, got {status}; body: {}",
+            response.text()
+        );
+        assert!(
+            response.text().contains("tagged_col"),
+            "{format}: body must name the column: {}",
+            response.text()
+        );
+    }
 }

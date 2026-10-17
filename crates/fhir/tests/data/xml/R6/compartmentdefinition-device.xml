@@ -614,11 +614,11 @@ The following resources are never in this compartment:
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/CompartmentDefinition/device"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Base FHIR compartment definition for Device"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-09-14T16:43:45+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>

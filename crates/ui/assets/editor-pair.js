@@ -6,7 +6,7 @@
  *
  * Repartition of responsibilities across the editor family (#840):
  *   - `code-editor.js`   mounts CodeMirror over a `<textarea>`: wrapper,
- *                         aria-label, tabindex, Tab-not-captured, and the
+ *                         aria-label, tabindex, Tab never indenting, and the
  *                         shared JSON token-color preset (`jsonHighlight()`).
  *   - `editor-form.js`   drives the guided-form card's own interactions
  *                         (`[data-add]`/`[data-remove]`/`[data-set]`/... ->
@@ -94,6 +94,11 @@
  * construction, this file does nothing (or backs out cleanly) and the
  * caller's own textarea fallback keeps working exactly as it would without
  * this file at all.
+ *
+ * `rangeOfPath(state, path[, CM])` is exported too (#1756): the `{from, to}`
+ * range, key included, of a dotted path in an `EditorState`'s JSON syntax
+ * tree, or `null` when the path does not resolve. The row cross-highlight
+ * uses it, and so does the resource editor's validation line markers.
  *
  * `minimalChange` is exported for its own unit test
  * (`crates/ui/e2e/unit/editor-pair.test.cjs`) via the same UMD-ish shape
@@ -243,6 +248,21 @@
     return resolveBySegments(tree, doc, dottedSegments(path));
   }
 
+  /* The range a dotted path occupies in an `EditorState`'s JSON document:
+   * from the start of its own key (its enclosing Property, not just its
+   * value) through the end of its value; an array item has no key, so its
+   * node's own bounds are used. `null` when the path does not resolve
+   * against the document's current shape. `CM` defaults to the page's
+   * `window.HfsCodeMirror`; the unit test passes the bundle explicitly. */
+  function rangeOfPath(state, path, CM) {
+    CM = CM || (typeof window !== "undefined" ? window.HfsCodeMirror : null);
+    if (!CM) return null;
+    var node = resolveByDottedPath(CM.syntaxTree(state), state.doc, path);
+    if (!node) return null;
+    var property = node.parent && node.parent.name === "Property" ? node.parent : null;
+    return { from: property ? property.from : node.from, to: node.to };
+  }
+
   /* ---- mount --------------------------------------------------------------- */
 
   function mount(options) {
@@ -295,11 +315,10 @@
 
       /* ---- row <-> editor cross-highlight ----------------------------------
        *
-       * `.editor-row--hit` already exists (the Resource Editor's own
-       * `editor-sync.js` set it long before this pairing did); the JSON side
-       * has no equivalent to reach for, because a CodeMirror `EditorView`
-       * has no server-rendered `.json-line[data-jpath]` line the way the
-       * Resource Editor's raw JSON view does. A line decoration is CM6's own
+       * `.editor-row--hit` already exists (the form-side mark
+       * predates this pairing); the JSON side has no equivalent to reach
+       * for, because a CodeMirror `EditorView` has no server-rendered
+       * per-node line markup to toggle a class on. A line decoration is CM6's own
        * notion of "paint this line": a `StateField` holding the current
        * decoration set, replaced wholesale on every `HighlightEffect` and
        * reset to none the moment the document itself changes - a line range
@@ -309,8 +328,7 @@
        *
        * `hitKey` below is the single source of truth for which one of the
        * two directions (if either) is currently painted, the same
-       * mutually-exclusive "one hit at a time" model `editor-sync.js` uses
-       * for its own `__hitKey` - hovering a row clears a prior
+       * mutually-exclusive "one hit at a time" model - hovering a row clears a prior
        * cursor-driven row mark before painting the editor, and vice versa.
        */
       var HighlightEffect = CM.StateEffect.define();
@@ -344,11 +362,7 @@
        * most often), so the caller paints nothing rather than a stale or
        * wrong range. */
       var nodeLineRange = function (path) {
-        var tree = CM.syntaxTree(view.state);
-        var node = resolveByDottedPath(tree, view.state.doc, path);
-        if (!node) return null;
-        var property = node.parent && node.parent.name === "Property" ? node.parent : null;
-        return { from: property ? property.from : node.from, to: node.to };
+        return rangeOfPath(view.state, path, CM);
       };
 
       /* Editor -> row: the dotted path of the node the cursor sits in,
@@ -403,10 +417,9 @@
       };
 
       /* Container-only reveal (`.editor-tree`'s own scroll, never the
-       * page's) - the same shape as `editor-sync.js`'s own `reveal`, kept
-       * as its own small copy here rather than imported: that file stays
-       * untouched, and importing one six-line helper across a page
-       * boundary is not worth the coupling. */
+       * page's) - a small self-contained helper, kept local rather than
+       * shared: importing one six-line helper across a page boundary is not
+       * worth the coupling. */
       var revealRow = function (row) {
         var tree = grid.querySelector(".editor-tree");
         if (!tree || !row || tree.scrollHeight <= tree.clientHeight) return;
@@ -420,9 +433,9 @@
       /* Clears whichever of the two directions is currently painted - a
        * no-op, no dispatch included, once nothing is. */
       var clearHighlight = function () {
+        clearTimeout(selectionTimer);
         if (hitKey === null) return;
         hitKey = null;
-        clearTimeout(selectionTimer);
         view.dispatch({ effects: HighlightEffect.of(CM.Decoration.none) });
         grid.querySelectorAll(".editor-row--hit").forEach(function (row) {
           row.classList.remove("editor-row--hit");
@@ -454,6 +467,7 @@
       var handleRowEnter = function (event) {
         var row = event.target.closest ? event.target.closest(".editor-row[data-path]") : null;
         if (!row || !grid.contains(row)) return;
+        clearTimeout(selectionTimer);
         var key = "r:" + row.dataset.path;
         if (hitKey === key) return;
         clearHighlight();
@@ -476,6 +490,9 @@
       var handleSelectionUpdate = function () {
         clearTimeout(selectionTimer);
         selectionTimer = setTimeout(function () {
+          // Guided focus owns its reveal until the user returns to JSON.
+          var active = document.activeElement;
+          if (active && grid.contains(active) && active.closest(".editor-row[data-path]")) return;
           var path;
           try {
             path = nodePathAtCursor();
@@ -509,6 +526,10 @@
           highlightField,
           CM.EditorView.updateListener.of(handleCmUpdate),
           CM.EditorView.updateListener.of(function (update) {
+            if (isFormOriginated(update)) {
+              clearTimeout(selectionTimer);
+              return;
+            }
             if (update.selectionSet || update.docChanged) handleSelectionUpdate();
           }),
         ]),
@@ -518,11 +539,12 @@
       // moving the cursor in the editor lights the row back; `grid` (not
       // `document`) is the delegation root, since a pairing has no
       // standalone-editor or Resources-modal sibling to share a
-      // document-level listener with the way `editor-sync.js` does.
+      // document-level listener with.
       grid.addEventListener("mouseover", handleRowEnter);
       grid.addEventListener("focusin", handleRowEnter);
       grid.addEventListener("mouseout", handleRowLeave);
       grid.addEventListener("focusout", handleRowLeave);
+      view.dom.addEventListener("focusin", handleSelectionUpdate);
     }
 
     /* ---- the host contract -------------------------------------------
@@ -541,6 +563,8 @@
           setDoc: function (text) {
             var change = minimalChange(view.state.doc.toString(), text);
             if (change) {
+              clearTimeout(selectionTimer);
+              hitKey = null;
               view.dispatch({
                 changes: { from: change.from, to: change.to, insert: change.insert },
                 effects: FormOriginEffect.of(true),
@@ -562,6 +586,7 @@
           },
         };
     if (options.fields) host.fields = options.fields;
+    host.beforeMutation = function () { clearTimeout(syncTimer); };
 
     formApi = EditorForm.attach(grid, host);
 
@@ -584,6 +609,8 @@
      * mutation. Always parses; the try/catch is cheaper than trusting that
      * invariant blindly across a future change on either side. */
     function rememberSynced(text) {
+      clearTimeout(syncTimer);
+      if (window.HfsEditorAdd) window.HfsEditorAdd.invalidateRefresh(grid);
       try {
         lastSynced = JSON.stringify(JSON.parse(text));
       } catch (alwaysValid) {
@@ -640,7 +667,9 @@
      * having no transaction to tag an origin onto. */
     function scheduleSync(text) {
       clearTimeout(syncTimer);
+      var version = window.HfsEditorAdd ? window.HfsEditorAdd.documentVersion(grid) : 0;
       syncTimer = setTimeout(function () {
+        if (window.HfsEditorAdd && version !== window.HfsEditorAdd.documentVersion(grid)) return;
         var parsed;
         try {
           parsed = JSON.parse(text);
@@ -656,19 +685,21 @@
       }, 600);
     }
 
-    function handleCmUpdate(update) {
-      if (!update.docChanged) return;
-      var formOriginated = update.transactions.some(function (tr) {
+    function isFormOriginated(update) {
+      return update.transactions.some(function (tr) {
         return tr.effects.some(function (effect) {
           return effect.is(FormOriginEffect);
         });
       });
-      if (formOriginated) return;
+    }
+
+    function handleCmUpdate(update) {
+      if (!update.docChanged || isFormOriginated(update)) return;
       scheduleSync(update.state.doc.toString());
     }
 
     return { formApi: formApi, host: host };
   }
 
-  return { minimalChange: minimalChange, mount: mount };
+  return { minimalChange: minimalChange, rangeOfPath: rangeOfPath, mount: mount };
 });

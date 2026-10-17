@@ -6,7 +6,7 @@ This file provides guidance to Codex when working with code in this repository.
 
 ### Workspace Structure
 
-The project is a Rust workspace with 17 crates (16 default-members; `pysof` excluded from the default build):
+The project is a Rust workspace with 22 crates (21 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table had drifted from the workspace (missing `helios-fhir-validator`, `helios-observability`, `helios-ui`, `helios-ui-chrome`, `helios-hts-ui`, and the `validator-cli` binary); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
 
 | Crate | Description |
 |-------|-------------|
@@ -15,6 +15,7 @@ The project is a Rust workspace with 17 crates (16 default-members; `pysof` excl
 | **`helios-fhir-macro`** | Procedural macros for FHIR functionality. |
 | **`helios-fhirpath`** | FHIRPath expression language - parser (chumsky), evaluator, CLI tool, and HTTP server. |
 | **`helios-fhirpath-support`** | Shared support utilities for FHIRPath. |
+| **`helios-fhir-validator`** | FHIR resource validation - FHIR Schema based structural/profile engine, SD->schema converter, embedded core packs (R4-R6), deferred FHIRPath-constraint and terminology-binding effects. Configured via `HFS_VALIDATION_*`. |
 | **`helios-serde`** | JSON and XML serialization for FHIR resources (`xml` feature flag). |
 | **`helios-serde-support`** | Shared serde helpers. |
 | **`helios-rest`** | FHIR RESTful API layer (Axum) - handlers, middleware, extractors, multi-tenancy routing. |
@@ -26,6 +27,10 @@ The project is a Rust workspace with 17 crates (16 default-members; `pysof` excl
 | **`helios-audit`** | Audit logging - FHIR AuditEvent with IHE BALP profiles; pluggable sinks (database, file, CloudWatch, S3). Configured via `HFS_AUDIT_*`. |
 | **`helios-subscriptions`** | FHIR topic-based Subscriptions engine - rest-hook, websocket, email, and messaging channels. Configured via `HFS_SUBSCRIPTION(S)_*`. |
 | **`helios-cds-hooks`** | CDS Hooks protocol types and async service trait (HL7 CDS Hooks v3.0.0-ballot). Standalone library. |
+| **`helios-observability`** | Shared observability wiring (uptime, Prometheus `/metrics`, OTLP traces) for Helios servers. |
+| **`helios-ui`** (`crates/ui`) | Optional server-rendered HTMX web UI for HFS - Askama templates, vendored/pinned htmx, vanilla JS assets, no SPA framework and no runtime CDN. |
+| **`helios-ui-chrome`** (`crates/ui-chrome`) | Shared Askama chrome partials for the HFS and HTS web UIs - the topbar account menu and Capability Statement projection, so `helios-ui` and `helios-hts-ui` link the same markup instead of each keeping a copy. |
+| **`helios-hts-ui`** (`crates/hts-ui`) | Optional server-rendered HTMX administrative UI for the Helios Terminology Server (HTS), built on `helios-ui-chrome`. |
 | **`pysof`** | Python bindings (PyO3/maturin) for SQL-on-FHIR. Excluded from default workspace build. |
 
 ### Binaries
@@ -39,6 +44,7 @@ The project is a Rust workspace with 17 crates (16 default-members; `pysof` excl
 | `sof-server` | helios-sof | SQL-on-FHIR HTTP server |
 | `config-advisor` | helios-persistence | Storage configuration advisor |
 | `hts` | helios-hts | FHIR Terminology Server (HTS) |
+| `validator-cli` | helios-fhir-validator | FHIR resource validator CLI (`cli` feature) |
 
 ### Key Design Patterns
 
@@ -64,7 +70,7 @@ Core functionality is defined through traits, allowing version-independent logic
 Storage backends implement a progressive trait hierarchy:
 ```
 ResourceStorage -> VersionedStorage -> InstanceHistoryProvider -> TypeHistoryProvider -> SystemHistoryProvider
-ResourceStorage -> SearchProvider -> MultiTypeSearchProvider / ChainedSearchProvider / IncludeProvider
+ResourceStorage -> SearchProvider -> MultiTypeSearchProvider / IncludeProvider
 ResourceStorage -> TransactionProvider -> BundleProvider
 ```
 
@@ -80,13 +86,14 @@ Detailed operational guidance lives in Codex project skills under `.agents/skill
 (and Claude Code skills under `.claude/skills/`).
 Use those skills instead of expanding this always-loaded file.
 
-General skills:
-
-- `fhir-developer` - Anthropic FHIR R4 developer skill (resources, cardinality, coding systems, REST/SMART, OperationOutcome). Use for generic FHIR/HL7 API modeling; compose with the HFS-specific skills below for runtime behavior.
+`.agents/skills` is a byte-for-byte mirror of `.claude/skills`. Edit both together and check with `diff -r .agents/skills .claude/skills` (no output means in sync).
 
 HFS skills:
 
+- `$fhir-developer` - Anthropic FHIR R4 developer skill (resources, cardinality, coding systems, REST/SMART, OperationOutcome). Use for generic FHIR/HL7 API modeling; compose with the HFS-specific skills below for runtime behavior.
 - `$run-hfs-server` - HFS server runtime, storage backends, multi-tenancy, compression, and API endpoints.
+- `$run-hts-server` - HTS terminology server runtime, env vars, and terminology-seed bootstrap.
+- `$run-hfs-and-hts` - Start HFS and HTS together for local dev, wired via HFS_TERMINOLOGY_SERVER/FHIRPATH_TERMINOLOGY_SERVER.
 - `$work-with-fhirpath` - FHIRPath CLI, server, expressions, terminology integration, and tests.
 - `$work-with-sof` - SQL-on-FHIR, ViewDefinition processing, `sof-cli`, `sof-server`, and parquet output.
 - `$work-with-pysof` - Python bindings under `crates/pysof`, maturin setup, API usage, and pysof tests.
@@ -96,6 +103,10 @@ HFS skills:
 - `$work-with-audit` - FHIR AuditEvent logging, IHE BALP, audit sinks, and `HFS_AUDIT_*` config.
 - `$work-with-subscriptions` - Topic-based Subscriptions engine, channels (rest-hook/websocket/email/messaging), and config.
 - `$work-with-cds-hooks` - CDS Hooks protocol types and async service trait for clinical decision support.
+- `$work-with-ui` - The `crates/ui` web UI: Askama templates, htmx fragments, `/ui` routes, vendored assets, i18n, and the Rust + Playwright test rings.
+- `$hts-api-skill` - Reference for building UI on the HTS HTTP API: routes, content negotiation, OperationOutcome rendering, the `HFS_TERMINOLOGY_SERVER` proxy pattern, and client gaps.
+- `$create-issue` - File a GitHub issue describing work to be done, and stop there; never implements the fix.
+- `$work-with-book` - Writing and editing pages of the mdBook documentation site under `book/`: format conventions, page template, link check, local build, and tag-only publishing.
 - `$bulk-data-export` - FHIR Bulk Data Access `$export` jobs, manifests, output storage, and behavior notes.
 - `$bulk-data-submit` - FHIR Bulk Data Submit `$bulk-submit` ingestion, status, OAuth, JWE, and worker settings.
 - `$docker-and-release` - Docker image builds and release workflow.
@@ -120,6 +131,9 @@ export CARGO_BUILD_JOBS=4
 - Enable trace logging: `RUST_LOG=trace cargo run`
 - FHIRPath expressions can be tested independently via CLI
 - HFS server: `HFS_LOG_LEVEL=debug cargo run --bin hfs`
+
+### Windows and worktree notes
+See `CLAUDE.md` -> "Windows and worktree notes" (the only place they live; do not copy them here).
 
 ## Important Notes
 

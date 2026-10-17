@@ -40,9 +40,10 @@ async fn seeding_is_idempotent_and_discoverable() {
     let backend = create_backend();
     let data_dir = workspace_data_dir();
 
-    let first = seed_spec_compartment_definitions(&backend, FhirVersion::R4, &data_dir, "default")
-        .await
-        .expect("first seed");
+    let first =
+        seed_spec_compartment_definitions(&backend, FhirVersion::R4, &data_dir, "default", None)
+            .await
+            .expect("first seed");
     // R4 ships 5 compartments (Device, Encounter, Patient, Practitioner,
     // RelatedPerson); questionnaire is excluded.
     assert_eq!(first.created, 5);
@@ -63,9 +64,10 @@ async fn seeding_is_idempotent_and_discoverable() {
     assert_eq!(patient.content()["code"], json!("Patient"));
 
     // A second boot takes the fast path and writes nothing.
-    let second = seed_spec_compartment_definitions(&backend, FhirVersion::R4, &data_dir, "default")
-        .await
-        .expect("second seed");
+    let second =
+        seed_spec_compartment_definitions(&backend, FhirVersion::R4, &data_dir, "default", None)
+            .await
+            .expect("second seed");
     assert_eq!(second.created, 0);
     assert_eq!(second.failed, 0);
 
@@ -84,7 +86,7 @@ async fn seed_tenant_conformance_seeds_both_sets() {
     let backend = create_backend();
     let data_dir = workspace_data_dir();
 
-    let outcome = seed_tenant_conformance(&backend, FhirVersion::R4, &data_dir, "acme").await;
+    let outcome = seed_tenant_conformance(&backend, FhirVersion::R4, &data_dir, "acme", None).await;
     assert_eq!(outcome.failed, 0);
 
     let sp = backend
@@ -126,7 +128,7 @@ async fn seeding_reports_existing_and_never_clobbers() {
         .expect("pre-create under a spec id");
 
     let outcome =
-        seed_spec_compartment_definitions(&backend, FhirVersion::R4, &data_dir, "default")
+        seed_spec_compartment_definitions(&backend, FhirVersion::R4, &data_dir, "default", None)
             .await
             .expect("seed over a present spec id");
     assert!(
@@ -153,10 +155,15 @@ async fn seeding_with_missing_bundle_is_a_noop() {
     let backend = create_backend();
     let empty_dir = tempfile::tempdir().expect("temp data dir");
 
-    let outcome =
-        seed_spec_compartment_definitions(&backend, FhirVersion::R4, empty_dir.path(), "default")
-            .await
-            .expect("seed with no bundle");
+    let outcome = seed_spec_compartment_definitions(
+        &backend,
+        FhirVersion::R4,
+        empty_dir.path(),
+        "default",
+        None,
+    )
+    .await
+    .expect("seed with no bundle");
     assert_eq!(outcome.created, 0);
     assert_eq!(outcome.failed, 0);
 }

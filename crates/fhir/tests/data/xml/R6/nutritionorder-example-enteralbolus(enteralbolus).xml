@@ -25,6 +25,10 @@ Tube feedings are given in boluses several times a day   edited by Eric Haas Hea
     <display value="Inpatient"/>
   </encounter>
   <dateTime value="2014-09-17"/>
+  <requester>
+    <reference value="Practitioner/example"/>
+    <display value="Dr Adam Careful"/>
+  </requester>
   <allergyIntolerance>
     <reference value="AllergyIntolerance/example"/>
     <display value="Cashew Nuts"/>
@@ -52,6 +56,17 @@ Tube feedings are given in boluses several times a day   edited by Eric Haas Hea
         </coding>
       </concept>
     </type>
+    <type>
+      <concept>
+        <coding>
+          <!-- EH:  bolus tube feeding instruction in text -->
+          <system value="http://snomed.info/sct"/>
+          <code value="442991000124104"/>
+          <display value="Adult high protein formula"/>
+        </coding>
+      </concept>
+    </type>
+    <productName value="Acme High Protein Formula"/>
     <caloricDensity>
       <value value="1.5"/>
       <unit value="calories per milliliter"/>
@@ -85,6 +100,24 @@ Tube feedings are given in boluses several times a day   edited by Eric Haas Hea
         <code value="mL"/>
       </quantity>
     </administration>
+    <maxVolumeToAdminister>
+      <value value="1440"/>
+      <unit value="milliliter/day"/>
+      <system value="http://unitsofmeasure.org"/>
+      <code value="mL/d"/>
+    </maxVolumeToAdminister>
     <administrationInstruction value="240 mls every 4hrs"/>
   </enteralFormula>
+  <additive>
+    <modularType>
+      <concept>
+        <coding>
+          <system value="http://terminology.hl7.org/CodeSystem/entformula-additive"/>
+          <code value="lipid"/>
+          <display value="Lipid"/>
+        </coding>
+      </concept>
+    </modularType>
+    <productName value="Acme Lipid Additive"/>
+  </additive>
 </NutritionOrder>

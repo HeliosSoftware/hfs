@@ -37,26 +37,40 @@
 //!
 //! Two entries sharing the same canonical `url`, or an entry whose resource
 //! has no `url` at all, can never be matched unambiguously and are rejected
-//! with `400 Bad Request` here, before the graph is even walked.
+//! with `400 Bad Request` here, before the graph is even walked. So is a
+//! request with more than 256 `context` entries
+//! ([`MAX_CONTEXT_ENTRIES`](input_limits::MAX_CONTEXT_ENTRIES)), counted before
+//! any of them is collected.
+
+use std::collections::HashSet;
 
 use serde_json::Value;
 
-use super::references::canonical_matches;
+use super::input_limits;
+use super::references::split_canonical_version;
 use crate::error::RestError;
 
 /// Extracts inline supporting artifacts from a `Parameters` body.
 ///
-/// Each `context` parameter carries one inline resource. Matching is by
-/// canonical `url` against `relatedArtifact.resource` (see
-/// [`canonical_matches`]); there is no name-based fallback, so an artifact
-/// without a `url` can never match a dependency and is rejected outright, as
-/// is a second entry that collides with an already-collected one on `url`.
+/// Each `context` parameter carries one inline resource, and a request may
+/// carry at most [`MAX_CONTEXT_ENTRIES`](input_limits::MAX_CONTEXT_ENTRIES).
+/// Matching is by canonical `url` against `relatedArtifact.resource` (see
+/// [`canonical_matches`](super::references::canonical_matches)); there is no
+/// name-based fallback, so an artifact without a `url` can never match a
+/// dependency and is rejected outright, as is a second entry that collides
+/// with an already-collected one on `url`.
 pub(super) fn extract_table_source_views(body: &Value) -> Result<Vec<Value>, RestError> {
     let entries = body
         .get("parameter")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+
+    let count = entries
+        .iter()
+        .filter(|p| p.get("name").and_then(|n| n.as_str()) == Some("context"))
+        .count();
+    input_limits::check_context_entries(count)?;
 
     let mut out: Vec<Value> = Vec::new();
     for p in &entries {
@@ -76,7 +90,14 @@ pub(super) fn extract_table_source_views(body: &Value) -> Result<Vec<Value>, Res
         }
     }
 
-    for (i, artifact) in out.iter().enumerate() {
+    // Linear form of the pairwise `canonical_matches(prior, url)` rule: an
+    // earlier entry collides when its own `url` equals this entry's canonical
+    // part and, if this entry's `url` pins a version, its `version` equals that
+    // pin. An unpinned entry therefore collides with any earlier `url`; a
+    // pinned one only with an earlier `(url, version)` pair.
+    let mut urls: HashSet<&str> = HashSet::new();
+    let mut versioned: HashSet<(&str, &str)> = HashSet::new();
+    for artifact in &out {
         let Some(url) = artifact.get("url").and_then(|v| v.as_str()) else {
             return Err(RestError::BadRequest {
                 message: "each `context` entry's resource must declare a canonical `url`; \
@@ -84,7 +105,12 @@ pub(super) fn extract_table_source_views(body: &Value) -> Result<Vec<Value>, Res
                     .to_string(),
             });
         };
-        if out[..i].iter().any(|prior| canonical_matches(prior, url)) {
+        let (canonical, pin) = split_canonical_version(url);
+        let duplicate = match &pin {
+            None => urls.contains(canonical.as_str()),
+            Some(v) => versioned.contains(&(canonical.as_str(), v.as_str())),
+        };
+        if duplicate {
             return Err(RestError::BadRequest {
                 message: format!(
                     "duplicate `context` entry for canonical URL '{url}'; each URL may be \
@@ -92,6 +118,10 @@ pub(super) fn extract_table_source_views(body: &Value) -> Result<Vec<Value>, Res
                      ambiguous"
                 ),
             });
+        }
+        urls.insert(url);
+        if let Some(version) = artifact.get("version").and_then(|v| v.as_str()) {
+            versioned.insert((url, version));
         }
     }
 
@@ -177,5 +207,90 @@ mod tests {
         };
         assert!(message.contains("duplicate"), "{message}");
         assert!(message.contains("http://example.org/vd/dup"), "{message}");
+    }
+
+    fn context_entry(url: &str) -> Value {
+        json!({"name": "context", "resource": {
+            "resourceType": "ViewDefinition",
+            "url": url
+        }})
+    }
+
+    #[test]
+    fn at_most_256_context_entries_are_accepted() {
+        let at_limit = params(
+            (0..256)
+                .map(|i| context_entry(&format!("http://example.org/vd/{i}")))
+                .collect(),
+        );
+        assert_eq!(extract_table_source_views(&at_limit).unwrap().len(), 256);
+
+        let over = params(
+            (0..257)
+                .map(|i| context_entry(&format!("http://example.org/vd/{i}")))
+                .collect(),
+        );
+        let RestError::BadRequest { message } = extract_table_source_views(&over).unwrap_err()
+        else {
+            panic!("expected 400");
+        };
+        assert!(message.contains("256"), "{message}");
+        assert!(message.contains("context"), "{message}");
+    }
+
+    #[test]
+    fn a_version_pinned_url_collides_only_with_a_matching_earlier_version() {
+        let earlier = json!({"name": "context", "resource": {
+            "resourceType": "ViewDefinition",
+            "url": "http://example.org/vd/a",
+            "version": "1"
+        }});
+
+        let pinned_to_same = params(vec![
+            earlier.clone(),
+            context_entry("http://example.org/vd/a|1"),
+        ]);
+        let RestError::BadRequest { message } =
+            extract_table_source_views(&pinned_to_same).unwrap_err()
+        else {
+            panic!("expected 400");
+        };
+        assert!(message.contains("duplicate"), "{message}");
+
+        let pinned_to_other = params(vec![earlier, context_entry("http://example.org/vd/a|2")]);
+        assert_eq!(
+            extract_table_source_views(&pinned_to_other).unwrap().len(),
+            2
+        );
+    }
+    /// The linear duplicate check must reject exactly the pairs the pairwise
+    /// `canonical_matches(earlier, later_url)` rule would.
+    #[test]
+    fn linear_duplicate_check_matches_the_pairwise_canonical_rule() {
+        let candidates = [
+            json!({"resourceType": "ViewDefinition", "url": "http://e.org/vd/a"}),
+            json!({"resourceType": "ViewDefinition", "url": "http://e.org/vd/a", "version": "1"}),
+            json!({"resourceType": "ViewDefinition", "url": "http://e.org/vd/a", "version": "2"}),
+            json!({"resourceType": "ViewDefinition", "url": "http://e.org/vd/a|1"}),
+            json!({"resourceType": "ViewDefinition", "url": "http://e.org/vd/a@1"}),
+            json!({"resourceType": "ViewDefinition", "url": "http://e.org/vd/a@1", "version": "1"}),
+            json!({"resourceType": "ViewDefinition", "url": "http://e.org/vd/b"}),
+        ];
+
+        for (i, earlier) in candidates.iter().enumerate() {
+            for (j, later) in candidates.iter().enumerate() {
+                let body = params(vec![
+                    json!({"name": "context", "resource": earlier}),
+                    json!({"name": "context", "resource": later}),
+                ]);
+                let later_url = later["url"].as_str().unwrap();
+                let expected = super::super::references::canonical_matches(earlier, later_url);
+                assert_eq!(
+                    extract_table_source_views(&body).is_err(),
+                    expected,
+                    "pair ({i}, {j}): {earlier} then {later}"
+                );
+            }
+        }
     }
 }

@@ -51,7 +51,7 @@
         <tr>
           <td>ADT_A04.MSH (Message Header)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Bundle</td>
           <td>MSH[Bundle]</td>
@@ -63,7 +63,7 @@
         <tr>
           <td>ADT_A04.MSH (Message Header)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>MessageHeader[1]</td>
           <td>MSH[MessageHeader]</td>
@@ -75,7 +75,7 @@
         <tr>
           <td>ADT_A04.MSH (Message Header)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Provenance[1]</td>
           <td>MSH[Provenance]</td>
@@ -87,7 +87,7 @@
         <tr>
           <td>ADT_A04.SFT (Software Segment)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>MessageHeader[1]</td>
           <td>SFT[MessageHeader]</td>
@@ -99,7 +99,7 @@
         <tr>
           <td>ADT_A04.EVN (Event Type)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Provenance[3]</td>
           <td>EVN[Provenance]</td>
@@ -111,7 +111,7 @@
         <tr>
           <td>ADT_A04.PID (Patient Identification)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
           <td>PID[Patient]</td>
@@ -123,7 +123,7 @@
         <tr>
           <td>ADT_A04.PD1 (Additional Demographics)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
           <td>PD1[Patient]</td>
@@ -135,7 +135,7 @@
         <tr>
           <td>ADT_A04:follow:PID.ARV (Access Restrictions)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
           <td>ARV[Patient]</td>
@@ -147,7 +147,7 @@
         <tr>
           <td>ADT_A04:follow:PID.ROL (Role)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
           <td>ROL[Patient-PractitionerRole]</td>
@@ -159,7 +159,7 @@
         <tr>
           <td>ADT_A04:follow:PID.ROL (Role)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>RelatedPerson[1]</td>
           <td>ROL[RelatedPerson]</td>
@@ -171,7 +171,7 @@
         <tr>
           <td>ADT_A04.NEXT_OF_KIN.NK1 (Next of Kin / Associated Parties)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>RelatedPerson[2]</td>
           <td>NK1[RelatedPerson]</td>
@@ -183,7 +183,7 @@
         <tr>
           <td>ADT_A04.NEXT_OF_KIN.NK1 (Next of Kin / Associated Parties)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
           <td>NK1[Patient]</td>
@@ -195,7 +195,7 @@
         <tr>
           <td>ADT_A04.PV1 (Patient Visit)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
           <td>PV1[Encounter]</td>
@@ -207,7 +207,7 @@
         <tr>
           <td>ADT_A04.PV1 (Patient Visit)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
           <td>PV1[Patient]</td>
@@ -219,7 +219,7 @@
         <tr>
           <td>ADT_A04.PV2 (Patient Visit - Additional Info.)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
           <td>PV2[Encounter]</td>
@@ -231,7 +231,7 @@
         <tr>
           <td>ADT_A04:follow:PV1.ARV (Access Restrictions)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
           <td>ARV[Encounter]</td>
@@ -243,7 +243,7 @@
         <tr>
           <td>ADT_A04.ROL (Role)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
           <td>ROL[Encounter-PractitionerRole]</td>
@@ -255,7 +255,7 @@
         <tr>
           <td>ADT_A04.OBSERVATIONADT_A04.OBX (Observation/Result)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Observation</td>
           <td>OBX[Observation]</td>
@@ -267,7 +267,7 @@
         <tr>
           <td>ADT_A04.OBSERVATIONADT_A04.OBX (Observation/Result)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Observation</td>
           <td>OBX[Observation-Component]</td>
@@ -279,7 +279,7 @@
         <tr>
           <td>ADT_A04.AL1 (Allergy Information)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>AllergyIntolerance</td>
           <td>AL1[AllergyIntolerance]</td>
@@ -291,7 +291,7 @@
         <tr>
           <td>ADT_A04.DG1 (Diagnosis Information)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Condition</td>
           <td>DG1[Condition]</td>
@@ -303,7 +303,7 @@
         <tr>
           <td>ADT_A04.DG1 (Diagnosis Information)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
           <td>DG1[Encounter]</td>
@@ -315,7 +315,7 @@
         <tr>
           <td>ADT_A04.DG1 (Diagnosis Information)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
           <td>DG1[Encounter]</td>
@@ -327,7 +327,7 @@
         <tr>
           <td>ADT_A04.DG1 (Diagnosis Information)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>EpisodeOfCare[1]</td>
           <td>DG1[EpisodeOfCare]</td>
@@ -339,7 +339,7 @@
         <tr>
           <td>ADT_A04.PROCEDUREADT_A04.PR1 (Procedures)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Procedure</td>
           <td>PR1[Procedure]</td>
@@ -351,7 +351,7 @@
         <tr>
           <td>ADT_A04.INSURANCEADT_A04.IN1 (Insurance)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Coverage[1]</td>
           <td>IN1[Coverage]</td>
@@ -363,7 +363,7 @@
         <tr>
           <td>ADT_A04.INSURANCEADT_A04.IN2 (Insurance Additional Info.)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Coverage[1]</td>
           <td>IN2[Coverage]</td>
@@ -375,7 +375,7 @@
         <tr>
           <td>ADT_A04.INSURANCEADT_A04.IN3 (Insurance Additional Info - Cert.)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Coverage[1]</td>
           <td>IN3[Coverage]</td>
@@ -395,7 +395,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.14.2"/>
   </identifier>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="MessageADT_A04toBundle"/>
   <title value="MessageADT_ A04to Bundle"/>
   <status value="active"/>

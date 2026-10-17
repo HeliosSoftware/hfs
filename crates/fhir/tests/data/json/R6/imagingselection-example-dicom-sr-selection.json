@@ -18,6 +18,7 @@
       "value": "RNKZPSBNZLNADAZV"
     }
   },
+  "issued": "2011-01-01T11:01:20+03:00",
   "basedOn": [
     {
       "type": "ServiceRequest",
@@ -40,7 +41,6 @@
       "reference": "ServiceRequest/example"
     }
   ],
-  "issued": "2011-01-01T11:01:20+03:00",
   "derivedFrom": {
     "type": "ImagingStudy",
     "identifier": {

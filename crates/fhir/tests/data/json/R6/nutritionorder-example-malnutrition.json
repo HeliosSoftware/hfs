@@ -41,6 +41,17 @@
   },
   "supplement": [
     {
+      "type": {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "442921000124101",
+              "display": "Adult standard formula"
+            }
+          ]
+        }
+      },
       "schedule": {
         "timing": [
           {

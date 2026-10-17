@@ -20,11 +20,6 @@ use tower::ServiceExt;
 // ── PostgreSQL shared container for HTTP tests ─────────────────────────────────
 
 #[cfg(feature = "postgres")]
-const HTTP_PG_LABEL_KEY: &str = "io.helios.hts.test-pool";
-#[cfg(feature = "postgres")]
-const HTTP_PG_LABEL_VALUE: &str = "hts-http-pg";
-
-#[cfg(feature = "postgres")]
 static PG_HTTP_CONTAINER: std::sync::OnceLock<
     testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
 > = std::sync::OnceLock::new();
@@ -32,29 +27,22 @@ static PG_HTTP_CONTAINER: std::sync::OnceLock<
 #[cfg(feature = "postgres")]
 static PG_HTTP_URL: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
-/// Force-remove any PostgreSQL testcontainer started by this test binary when
+/// Force-remove the PostgreSQL testcontainer started by this test binary when
 /// the process exits. `static` values are never dropped, so `ContainerAsync`'s
 /// async cleanup never runs; this atexit hook does it synchronously via the
 /// `docker` CLI instead.
 #[cfg(feature = "postgres")]
 #[ctor::dtor]
 fn cleanup_http_pg_container() {
-    let filter = format!("label={HTTP_PG_LABEL_KEY}={HTTP_PG_LABEL_VALUE}");
-    let Ok(listing) = std::process::Command::new("docker")
-        .args(["ps", "-aq", "--filter", &filter])
-        .output()
-    else {
+    let Some(container) = PG_HTTP_CONTAINER.get() else {
         return;
     };
-    let ids = String::from_utf8_lossy(&listing.stdout);
-    for id in ids.split_whitespace() {
-        let _ = std::process::Command::new("docker")
-            .args(["rm", "-f", id])
-            .output();
-    }
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", container.id()])
+        .output();
 }
 
-/// Start a labeled Postgres testcontainer, retrying transient failures.
+/// Start a Postgres testcontainer, retrying transient failures.
 ///
 /// Why: the testcontainers postgres image's wait-for-log strategy occasionally
 /// hits `EndOfStream` before the "ready" line on hosts where initdb emits a
@@ -73,12 +61,7 @@ async fn start_http_postgres_for_test()
         // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
         // the backend sends as a startup option, so PG 11 rejects every
         // connection FATAL. The rest of the repo runs 16.
-        match Postgres::default()
-            .with_tag("16-alpine")
-            .with_label(HTTP_PG_LABEL_KEY, HTTP_PG_LABEL_VALUE)
-            .start()
-            .await
-        {
+        match Postgres::default().with_tag("16-alpine").start().await {
             Ok(c) => return c,
             Err(e) => {
                 eprintln!("postgres container start attempt {attempt}/3 failed: {e:?}");
@@ -99,10 +82,8 @@ async fn start_http_postgres_for_test()
 pub async fn pg_http_url() -> &'static str {
     PG_HTTP_URL
         .get_or_init(|| async {
-            // Tag with a label so the `#[ctor::dtor]` above can find and
-            // force-remove the container at process exit. Without this, the
-            // static would hold the `ContainerAsync` until process exit, but
-            // `Drop` is never called on statics → container leaks.
+            // The static keeps the container alive until process exit. Its
+            // destructor removes this container by ID because statics are not dropped.
             let container = start_http_postgres_for_test().await;
 
             let port = container

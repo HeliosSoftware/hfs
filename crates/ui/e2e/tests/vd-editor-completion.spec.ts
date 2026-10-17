@@ -10,6 +10,7 @@
 // Every document is a plain template string, never `JSON.stringify` — see
 // that sibling file's own module doc comment for why (`VdEditor.
 // setCursorAfter`/`nthIndexOf` need exact, known offsets).
+import type { Page } from "@playwright/test";
 import { expect, test } from "../pages/fixtures";
 import { VdEditor } from "../pages/vd-editor";
 
@@ -72,6 +73,93 @@ test("accepting a key completion inserts its skeleton with valid surrounding com
   // it — typing continues straight into the value.
   await page.keyboard.type("z");
   expect(JSON.parse(await ed.doc()).select[0].column[1].path).toBe("z");
+});
+
+// Tab accepts the highlighted completion only while the popup is open
+// (`acceptCompletionOnTab` in `code-editor.js`); with no popup it moves focus
+// on, and it never indents.
+test.describe("Tab and the completion popup", () => {
+  /** Opens the key popup in the second column of COLUMN_MISSING_PATH_DOC. */
+  async function openKeyPopup(page: Page, ed: VdEditor) {
+    await ed.setDoc(COLUMN_MISSING_PATH_DOC);
+    await ed.setCursorAfter(COLUMN_MISSING_PATH_DOC, '"extra"');
+    await page.keyboard.press("Control+Space");
+    await expect(ed.completionPopup).toBeVisible();
+  }
+
+  test("Tab inserts the highlighted option, closes the popup and keeps focus in the editor", async ({
+    page,
+  }) => {
+    await page.goto("/ui/sql/view-definitions?vd=new");
+    const ed = new VdEditor(page);
+    await openKeyPopup(page, ed);
+    await expect(ed.optionByLabel("path")).toHaveAttribute("aria-selected", "true");
+    // Clear the library's 75ms initial interaction delay.
+    await page.waitForTimeout(100);
+    await page.keyboard.press("Tab");
+
+    expect(JSON.parse(await ed.doc()).select[0].column[1]).toEqual({ name: "extra", path: "" });
+    await expect(ed.completionPopup).toHaveCount(0);
+    await expect(ed.cmContent).toBeFocused();
+  });
+
+  test("ArrowDown then Tab inserts the second option, not the first", async ({ page }) => {
+    await page.goto("/ui/sql/view-definitions?vd=new");
+    const ed = new VdEditor(page);
+    await openKeyPopup(page, ed);
+    const options = ed.completionOptions;
+    expect(await options.count()).toBeGreaterThan(1);
+    const second = (await options.nth(1).locator(".cm-completionLabel").innerText()).trim();
+    await page.waitForTimeout(100);
+    await page.keyboard.press("ArrowDown");
+    await expect(options.nth(1)).toHaveAttribute("aria-selected", "true");
+    await page.keyboard.press("Tab");
+
+    const column = JSON.parse(await ed.doc()).select[0].column[1];
+    expect(Object.keys(column)).toContain(second);
+    expect(Object.keys(column)).not.toContain("path");
+    await expect(ed.cmContent).toBeFocused();
+  });
+
+  test("with the popup closed Tab moves focus to Cancel and leaves the document unchanged", async ({
+    page,
+  }) => {
+    await page.goto("/ui/sql/view-definitions?vd=new");
+    const ed = new VdEditor(page);
+    await ed.setDoc(COLUMN_MISSING_PATH_DOC);
+    // Inside the plain `"Patient"` string: no completion context, no popup.
+    await ed.setCursorAfter(COLUMN_MISSING_PATH_DOC, '"resource": "Patient"');
+    await expect(ed.completionPopup).toHaveCount(0);
+    await page.keyboard.press("Tab");
+
+    await expect(page.locator("#vd-editor-cancel")).toBeFocused();
+    expect(await ed.doc()).toBe(COLUMN_MISSING_PATH_DOC);
+  });
+
+  test("Escape closes the popup and the next Tab moves on (no keyboard trap)", async ({ page }) => {
+    await page.goto("/ui/sql/view-definitions?vd=new");
+    const ed = new VdEditor(page);
+    await openKeyPopup(page, ed);
+    await page.keyboard.press("Escape");
+    await expect(ed.completionPopup).toHaveCount(0);
+    await page.keyboard.press("Tab");
+
+    await expect(page.locator("#vd-editor-cancel")).toBeFocused();
+    expect(await ed.doc()).toBe(COLUMN_MISSING_PATH_DOC);
+  });
+
+  test("Tab pressed right after the popup opens never moves focus out of the editor", async ({
+    page,
+  }) => {
+    await page.goto("/ui/sql/view-definitions?vd=new");
+    const ed = new VdEditor(page);
+    await openKeyPopup(page, ed);
+    // No wait: whether the library's initial interaction delay swallows the
+    // accept or not, the popup is on screen, so focus must stay put.
+    await page.keyboard.press("Tab");
+
+    await expect(ed.cmContent).toBeFocused();
+  });
 });
 
 test("FHIRPath completion after a dot offers the resolved type's own elements", async ({

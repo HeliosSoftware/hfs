@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider, WriteKind};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
@@ -18,6 +18,7 @@ use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
@@ -59,22 +60,38 @@ pub async fn create_handler<S>(
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync,
 {
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
-    admit_resource_type(&resource_type, &resource, fhir_version).map_err(|error| {
-        RestError::BadRequest {
-            message: error.to_string(),
+    admit_resource_type(&resource_type, &resource, fhir_version)?;
+
+    // A `patient/` scope creates inside the launch patient's compartment only
+    // (#1618): the submitted payload must reference the launch patient through
+    // a compartment parameter. A conditional create is refused outright — its
+    // `If-None-Exist` match could be another patient's resource, which the
+    // response would then disclose.
+    if compartment.is_confined() {
+        if conditional.if_none_exist().is_some() {
+            return Err(compartment.outside_compartment(
+                "a conditional create is not available under a patient/ scope: the If-None-Exist match cannot be confined to the launch patient's compartment".to_string(),
+            ));
         }
-    })?;
+        compartment.assert_member(
+            || state.storage().search_param_registry(tenant.context()),
+            fhir_version,
+            &resource,
+            "create",
+        )?;
+    }
 
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
@@ -113,8 +130,12 @@ where
         .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
         .await?;
 
+    // #1014: an unknown ViewDefinition.resource is rejected on every write.
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
     // Check for conditional create
     if let Some(search_params) = conditional.if_none_exist() {
+        super::conditional_support::require_create(state.storage())?;
         debug!(search_params = %search_params, "Processing conditional create");
 
         let result = state
@@ -131,6 +152,15 @@ where
         use helios_persistence::core::ConditionalCreateResult;
         return match result {
             ConditionalCreateResult::Created(stored) => {
+                // Counted, but conditional writes announce nothing.
+                super::write_event::report(
+                    &state,
+                    tenant.context(),
+                    fhir_version,
+                    &resource_type,
+                    1,
+                    None,
+                );
                 // Stored StructureDefinitions feed the tenant's profile
                 // registry.
                 if resource_type == "StructureDefinition" {
@@ -210,6 +240,17 @@ where
         .storage()
         .create(tenant.context(), &resource_type, resource, fhir_version)
         .await?;
+    super::write_event::report(
+        &state,
+        tenant.context(),
+        fhir_version,
+        &resource_type,
+        1,
+        Some(super::write_event::stored_notice(
+            WriteKind::Create,
+            &stored,
+        )),
+    );
 
     // Stored StructureDefinitions feed the tenant's profile registry.
     if resource_type == "StructureDefinition" {
@@ -228,18 +269,6 @@ where
         id = %stored.id(),
         "Resource created"
     );
-
-    // Emit subscription event
-    #[cfg(feature = "subscriptions")]
-    if let Some(engine) = state.subscription_engine() {
-        super::subscription_event::emit_subscription_event(
-            engine,
-            tenant.context(),
-            &stored,
-            fhir_version,
-            helios_subscriptions::ResourceEventType::Create,
-        );
-    }
 
     build_create_response(
         StatusCode::CREATED,
@@ -286,18 +315,11 @@ fn build_create_response(
                     }
                 }]
             });
-            format_resource_response(status, header_map, &outcome, format).map_err(|_| {
-                RestError::InternalError {
-                    message: "Failed to serialize response".to_string(),
-                }
-            })
+            format_resource_response(status, header_map, &outcome, format)
         }
         _ => {
             // Default: return=representation
             format_resource_response(status, header_map, &stored.content_with_meta(), format)
-                .map_err(|_| RestError::InternalError {
-                    message: "Failed to serialize response".to_string(),
-                })
         }
     }
 }
@@ -318,9 +340,6 @@ fn build_existing_response(
             header_map,
             &stored.content_with_meta(),
             format,
-        )
-        .map_err(|_| RestError::InternalError {
-            message: "Failed to serialize response".to_string(),
-        }),
+        ),
     }
 }

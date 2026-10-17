@@ -272,7 +272,7 @@ test("emphasis variants cannot declare geometry and the retired accent variant s
 });
 
 test("shared query-builder actions stay 30px while their inputs keep the field scale", async ({ page }) => {
-  for (const route of ["/ui/resources", "/ui/search", "/ui/queries"]) {
+  for (const route of ["/ui/resources", "/ui/search"]) {
     await page.goto(route, { waitUntil: "networkidle" });
     const form = page.locator("#saved-query-form");
     await expect(form, `${route} should render the shared query builder`).toBeVisible();
@@ -283,10 +283,6 @@ test("shared query-builder actions stay 30px while their inputs keep the field s
     await expect(form.locator("#query-copy")).toHaveCSS("padding-left", "0px");
     await expect(form.locator(".query-builder__url")).toHaveCSS("height", "38px");
 
-    if (route === "/ui/queries") {
-      await expect(form.locator("[data-intent='save']")).toHaveCSS("height", "30px");
-      await expect(form.locator("input[name='name']")).toHaveCSS("height", "36px");
-    }
   }
 
   for (const theme of ["light", "dark"] as const) {
@@ -294,9 +290,9 @@ test("shared query-builder actions stay 30px while their inputs keep the field s
       await page.setViewportSize({ width, height: 800 });
       await page.goto("/ui");
       await page.evaluate((selected) => localStorage.setItem("hfs-theme", selected), theme);
-      await page.goto("/ui/queries", { waitUntil: "networkidle" });
+      await page.goto("/ui/resources", { waitUntil: "networkidle" });
       await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
-      for (const control of ["#query-copy", ".query-recent__toggle", "[data-intent='run']", "[data-intent='save']"]) {
+      for (const control of ["#query-copy", ".query-recent__toggle", "[data-intent='run']"]) {
         await expect(page.locator(`#saved-query-form ${control}`)).toHaveCSS("height", "30px");
       }
     }
@@ -675,3 +671,37 @@ for (const viewport of [
     }
   });
 }
+
+// #1759: in the light theme a card must be told apart from the page by its
+// border (and carry a shadow), not rely on white-on-near-white.
+test("light theme: a card's border contrasts with the page background and it has a shadow", async ({
+  page,
+}) => {
+  await page.goto("/ui");
+  await page.evaluate(() => localStorage.setItem("hfs-theme", "light"));
+  await page.goto("/ui/resources", { waitUntil: "networkidle" });
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+
+  const { border, page_bg, shadow } = await page.evaluate(() => {
+    const card = document.querySelector(".card") as HTMLElement;
+    const style = getComputedStyle(card);
+    const probe = document.createElement("span");
+    probe.style.color = getComputedStyle(document.documentElement).getPropertyValue("--bg-content").trim();
+    document.body.appendChild(probe);
+    const bg = getComputedStyle(probe).color;
+    probe.remove();
+    return { border: style.borderTopColor, page_bg: bg, shadow: style.boxShadow };
+  });
+
+  const channels = (css: string) => (css.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number);
+  const luminance = (css: string) => {
+    const [r, g, b] = channels(css).map((v) => {
+      const c = v / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const [hi, lo] = [luminance(page_bg), luminance(border)].sort((a, b) => b - a);
+  expect((hi + 0.05) / (lo + 0.05)).toBeGreaterThan(1.3);
+  expect(shadow).not.toBe("none");
+});

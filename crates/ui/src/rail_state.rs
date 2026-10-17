@@ -1,5 +1,5 @@
-//! Server-side state for the eight sidebar "rails" (Resources, Search, Saved
-//! Queries, Search Parameters, Compartments, View Definitions, SQL Queries,
+//! Server-side state for the seven sidebar "rails" (Resources, Search,
+//! Search Parameters, Compartments, View Definitions, SQL Queries,
 //! SQL Views): per user, per tenant, per page, what was picked most recently
 //! and what the very last pick was.
 //!
@@ -76,7 +76,7 @@ use serde_json::{Map, Value};
 /// server itself would keep) all take it from here.
 pub(crate) const MAX_RECENT: usize = 5;
 
-/// One of the eight pages that carries rail state, and the JSON key its
+/// One of the seven pages that carries rail state, and the JSON key its
 /// record lives under in `rails.<page>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RailPage {
@@ -84,8 +84,6 @@ pub(crate) enum RailPage {
     Resources,
     /// The Search page's type rail (#255, #541).
     Search,
-    /// The Saved Queries page's type rail (#234, #541).
-    Queries,
     /// The SearchParameter viewer's type rail (#238) — the only page that uses
     /// [`RailState::select_all`]'s `last: ""` "All types" state.
     SearchParameters,
@@ -106,7 +104,6 @@ impl RailPage {
         match self {
             Self::Resources => "resources",
             Self::Search => "search",
-            Self::Queries => "queries",
             Self::SearchParameters => "searchParameters",
             Self::Compartments => "compartments",
             Self::ViewDefinitions => "viewDefinitions",
@@ -129,7 +126,7 @@ pub(crate) struct RailEntry {
 
 impl RailEntry {
     /// A recent entry carrying only its id — what every "type" rail
-    /// (Resources, Search, Saved Queries, Search Parameters) writes. Their
+    /// (Resources, Search, Search Parameters) writes. Their
     /// live rail always has the item and the id doubles as the label, so no
     /// snapshot is needed.
     pub(crate) fn id_only(id: impl Into<String>) -> Self {
@@ -271,7 +268,8 @@ impl RailState {
     /// The type rails never call this: a stale type is simply hidden by
     /// [`Self::resolve_recents`]'s `is_valid` filter, never written away,
     /// since a stale `last` already falls back to the page default in
-    /// silence. The SQL rails prune on a stale explicit selection's click.
+    /// silence. The SQL rails prune on a stale explicit selection's click,
+    /// and on the existence sweep [`Self::prune_gone`] runs at render (#1014).
     pub(crate) fn prune(&self, id: &str) -> Option<Self> {
         let in_recent = self.recent.iter().any(|e| e.id == id);
         let is_last = self.last.as_deref() == Some(id);
@@ -286,6 +284,25 @@ impl RailState {
                 self.recent.clone()
             },
         })
+    }
+
+    /// Applies the outcome of an existence sweep over `recent`: every id whose
+    /// verdict is `Ok(false)` (the server answered 404/410) is pruned;
+    /// `Ok(true)` and `Err(_)` (unverifiable: outage, auth, other version)
+    /// keep the entry. `None` when nothing changed, so the caller persists
+    /// only on a real prune (#1014).
+    pub(crate) fn prune_gone(&self, verdicts: &[(String, Result<bool, String>)]) -> Option<Self> {
+        let mut current: Option<Self> = None;
+        for (id, verdict) in verdicts {
+            if !matches!(verdict, Ok(false)) {
+                continue;
+            }
+            let base = current.as_ref().unwrap_or(self);
+            if let Some(next) = base.prune(id) {
+                current = Some(next);
+            }
+        }
+        current
     }
 
     /// Resolves `recent`, in order, against a rail's currently-live items
@@ -360,6 +377,31 @@ pub(crate) struct ResolvedRailEntry {
     pub(crate) current: bool,
 }
 
+/// Case-insensitive "contains" of a rail's filter box text, the one predicate
+/// every rail uses to narrow both its list and its "Recently used" group
+/// (#1275). An empty filter keeps everything.
+pub(crate) fn matches_rail_filter(text: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    filter.is_empty() || text.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// Narrows resolved recents to the rail's own filter: an entry stays when
+/// `on_list` says the filtered list already shows it, or when its label
+/// matches `filter`. The first arm keeps a recent from vanishing while the
+/// list still shows it (the server's `name:contains` can be laxer than
+/// [`matches_rail_filter`]); the second lets an entry the list does not
+/// carry (another page) surface from its stored snapshot when it matches.
+pub(crate) fn retain_matching_recents(
+    entries: &mut Vec<ResolvedRailEntry>,
+    filter: &str,
+    on_list: impl Fn(&str) -> bool,
+) {
+    if filter.trim().is_empty() {
+        return;
+    }
+    entries.retain(|entry| on_list(&entry.id) || matches_rail_filter(&entry.label, filter));
+}
+
 /// The per-user settings document [`crate::resolve_prefs`] already fetched for
 /// this request, stamped into request extensions so every subsequent handler
 /// can read a rail's state without another [`SettingsStore`] round trip.
@@ -402,6 +444,78 @@ impl RequestSettings {
             .get("rails")
             .and_then(|rails| rails.get(page.key()));
         RailState::from_raw(raw)
+    }
+
+    /// The sanitized [`DashboardSelection`] the Home chart last stored, scoped
+    /// to `tenant` — the fallback the dashboard reads when the request carries
+    /// no explicit `?types=` selection. Like [`rail`](Self::rail), pure
+    /// in-memory navigation over the already-fetched document.
+    pub(crate) fn dashboard(&self, tenant: &str) -> DashboardSelection {
+        let Some(document) = &self.document else {
+            return DashboardSelection::default();
+        };
+        let projected = project_for_tenant(document, tenant);
+        DashboardSelection::from_raw(projected.get("dashboard"))
+    }
+}
+
+/// The maximum number of charted types kept in the stored selection. Mirrors
+/// `CHART_MAX_SERIES` in `lib.rs` (the chart's palette/legend cap): storing more
+/// than the chart can ever draw is pointless, and it bounds the settings value.
+const DASHBOARD_MAX_TYPES: usize = 6;
+
+/// The Home "FHIR resources over time" chart selection persisted per user and
+/// per tenant under the settings document's `dashboard` key (#1358): the charted
+/// resource types and the time window slug (`1h`/`24h`/`30d`). Both fields are
+/// optional on read — an absent or malformed value reads as the empty default,
+/// which the dashboard treats as "no stored selection" and falls through to the
+/// provider default.
+///
+/// The "View all resources" toggle is deliberately **not** persisted: it is a
+/// transient exploration mode (it offers every spec type, not the tenant's
+/// stored set), and silently restoring it on every visit to Home would surprise
+/// the user and change the established default-off behavior. Only the two things
+/// a user actually curates — which types, over what window — are remembered.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct DashboardSelection {
+    /// Charted resource type names, already sanitized (ASCII-alphanumeric,
+    /// capped at [`DASHBOARD_MAX_TYPES`]). Empty means "nothing stored".
+    pub(crate) types: Vec<String>,
+    /// The time-window slug, if one was stored. `None` means "use the default".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) window: Option<String>,
+}
+
+impl DashboardSelection {
+    /// Reads and sanitizes a stored `dashboard` value, tolerating anything a
+    /// hand-edit or an older schema might hold: unknown fields are ignored,
+    /// non-string / non-alphanumeric type names are dropped, and the type list
+    /// is de-duplicated and capped. Never errors — a malformed value is the
+    /// empty default.
+    fn from_raw(raw: Option<&Value>) -> Self {
+        let Some(obj) = raw.and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let mut seen = HashSet::new();
+        let types: Vec<String> = obj
+            .get("types")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .filter(|t| seen.insert(t.to_string()))
+                    .take(DASHBOARD_MAX_TYPES)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let window = obj
+            .get("window")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Self { types, window }
     }
 }
 
@@ -480,6 +594,37 @@ pub(crate) async fn persist(
     }
 }
 
+/// Writes the Home chart's `selection` to the settings document's `dashboard`
+/// key, scoped to `tenant` (#1358). Same best-effort, last-write-wins,
+/// no-precondition contract as [`persist`]: a `None` store is a silent no-op, a
+/// store error is logged and swallowed, and the tenant scoping is applied by
+/// [`scope_merge_patch`] so the value lands under `byTenant.<tenant>.dashboard`.
+pub(crate) async fn persist_dashboard(
+    settings: &Option<Arc<dyn SettingsStore>>,
+    user_key: &str,
+    tenant: &str,
+    selection: &DashboardSelection,
+) {
+    let Some(store) = settings else {
+        return;
+    };
+
+    let value = match serde_json::to_value(selection) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to serialize dashboard selection");
+            return;
+        }
+    };
+    let mut patch = Map::new();
+    patch.insert("dashboard".to_string(), value);
+    let patch = scope_merge_patch(Value::Object(patch), tenant);
+
+    if let Err(error) = store.patch_settings(user_key, patch, None).await {
+        tracing::warn!(tenant, error = %error, "failed to persist dashboard selection");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +679,100 @@ mod tests {
 
         let other = settings.rail(RailPage::Resources, "gamma");
         assert_eq!(other, RailState::default());
+    }
+
+    #[test]
+    fn dashboard_selection_reads_the_tenant_subtree_and_sanitizes() {
+        let document = json!({
+            "byTenant": {
+                "acme": {"dashboard": {
+                    "types": ["Patient", "bad name", "Observation", "Patient", "Enc$", "A", "B", "C", "D", "E"],
+                    "window": "24h"
+                }},
+                "beta": {"dashboard": {"types": ["Condition"], "window": "1h"}}
+            }
+        });
+        let settings = RequestSettings {
+            user_key: "l2:".to_string(),
+            document: Some(document),
+            version: 1,
+        };
+        let acme = settings.dashboard("acme");
+        // Non-alphanumeric names dropped, duplicate Patient collapsed, capped at 6.
+        assert_eq!(
+            acme.types,
+            vec!["Patient", "Observation", "A", "B", "C", "D"]
+        );
+        assert_eq!(acme.window.as_deref(), Some("24h"));
+
+        // Another tenant's selection is not visible here.
+        let gamma = settings.dashboard("gamma");
+        assert_eq!(gamma, DashboardSelection::default());
+    }
+
+    #[test]
+    fn dashboard_selection_from_a_malformed_value_is_empty() {
+        // Absent document, wrong-typed value, and a non-object all read empty.
+        let none = RequestSettings {
+            user_key: "l2:".to_string(),
+            document: None,
+            version: 0,
+        };
+        assert_eq!(none.dashboard("acme"), DashboardSelection::default());
+
+        let settings = RequestSettings {
+            user_key: "l2:".to_string(),
+            document: Some(json!({"byTenant": {"acme": {"dashboard": "nonsense"}}})),
+            version: 0,
+        };
+        assert_eq!(settings.dashboard("acme"), DashboardSelection::default());
+    }
+
+    #[tokio::test]
+    async fn persist_dashboard_writes_a_tenant_scoped_patch_and_nothing_else() {
+        let store = Arc::new(mock_store::MockSettingsStore::default());
+        // Pre-existing content on another tenant, and this tenant's rails, must
+        // survive untouched.
+        store
+            .patch_settings(
+                "l2:",
+                json!({"theme": "dark", "byTenant": {
+                    "acme": {"rails": {"resources": {"last": "Patient", "recent": []}}},
+                    "beta": {"dashboard": {"types": ["X"]}}
+                }}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let settings: Option<Arc<dyn SettingsStore>> = Some(store.clone());
+        let selection = DashboardSelection {
+            types: vec!["Patient".to_string(), "Observation".to_string()],
+            window: Some("30d".to_string()),
+        };
+        persist_dashboard(&settings, "l2:", "acme", &selection).await;
+
+        let document = store.get_settings("l2:").await.unwrap().unwrap().document;
+        assert_eq!(
+            document["byTenant"]["acme"]["dashboard"],
+            json!({"types": ["Patient", "Observation"], "window": "30d"})
+        );
+        assert_eq!(
+            document["byTenant"]["acme"]["rails"]["resources"]["last"], "Patient",
+            "the same tenant's rails must be untouched"
+        );
+        assert_eq!(
+            document["byTenant"]["beta"]["dashboard"]["types"][0], "X",
+            "another tenant's dashboard must be untouched"
+        );
+        assert_eq!(document["theme"], "dark");
+    }
+
+    #[tokio::test]
+    async fn persist_dashboard_is_a_silent_no_op_with_no_settings_store() {
+        let settings: Option<Arc<dyn SettingsStore>> = None;
+        // Must not panic.
+        persist_dashboard(&settings, "l2:", "acme", &DashboardSelection::default()).await;
     }
 
     /// A pre-#313 legacy document with `rails` at the top level is read
@@ -778,7 +1017,79 @@ mod tests {
         assert_eq!(state.prune("Patient"), None);
     }
 
+    #[test]
+    fn prune_gone_drops_only_the_ids_the_server_declared_gone() {
+        let state = RailState {
+            last: Some("b".to_string()),
+            recent: vec![
+                RailEntry::id_only("a"),
+                RailEntry::id_only("b"),
+                RailEntry::id_only("c"),
+            ],
+        };
+        let verdicts = vec![
+            ("a".to_string(), Ok(true)),
+            ("b".to_string(), Ok(false)),
+            ("c".to_string(), Err("boom".to_string())),
+        ];
+        let next = state.prune_gone(&verdicts).expect("b was pruned");
+        assert_eq!(next.last, None);
+        assert_eq!(
+            next.recent,
+            vec![RailEntry::id_only("a"), RailEntry::id_only("c")]
+        );
+    }
+
+    #[test]
+    fn prune_gone_is_a_no_op_without_a_gone_verdict() {
+        let state = RailState {
+            last: Some("a".to_string()),
+            recent: vec![RailEntry::id_only("a"), RailEntry::id_only("c")],
+        };
+        let verdicts = vec![
+            ("a".to_string(), Ok(true)),
+            ("c".to_string(), Err("boom".to_string())),
+        ];
+        assert_eq!(state.prune_gone(&verdicts), None);
+    }
+
     // ── Resolving recents against the live rail ──────────────────────────
+
+    #[test]
+    fn matches_rail_filter_is_case_insensitive_and_empty_keeps_all() {
+        assert!(matches_rail_filter("Patient_Demographics", "demo"));
+        assert!(matches_rail_filter("anything", ""));
+        assert!(!matches_rail_filter("observation_flat", "patient"));
+        // Surrounding whitespace is not part of the term (the client trims too).
+        assert!(matches_rail_filter("patient_demographics", "  patient "));
+        assert!(matches_rail_filter("anything", "   "));
+    }
+
+    #[test]
+    fn retain_matching_recents_keeps_listed_or_label_matching_entries() {
+        let entry = |id: &str, label: &str| ResolvedRailEntry {
+            id: id.to_string(),
+            label: label.to_string(),
+            meta: None,
+            href: String::new(),
+            count: None,
+            current: false,
+        };
+        let all = vec![entry("a", "alpha"), entry("b", "beta"), entry("c", "gamma")];
+        let mut kept = all.clone();
+        retain_matching_recents(&mut kept, "", |_| false);
+        assert_eq!(kept.len(), 3, "an empty filter keeps everything");
+        // "a" is on the list despite not matching; "c" matches off-list.
+        let mut kept = all.clone();
+        retain_matching_recents(&mut kept, "GAM", |id| id == "a");
+        assert_eq!(
+            kept.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        let mut kept = all;
+        retain_matching_recents(&mut kept, "zzz", |_| false);
+        assert!(kept.is_empty());
+    }
 
     #[test]
     fn resolve_recents_prefers_live_data_over_the_snapshot() {
@@ -969,17 +1280,21 @@ mod tests {
             compartments: Arc::new(crate::compartments::CompartmentCatalog::new(source.clone())),
             conformance: source,
             tenants: None,
+            tenant_inventory: None,
             provisioning: Default::default(),
             data_dir: None,
             public_base_url: "http://localhost:8080".to_string(),
             self_base_url: "http://localhost:8080".to_string(),
+            outbound_auth: Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
             tenant_path_routing: false,
             fhir_version: helios_fhir::FhirVersion::R4,
             default_tenant: "default".to_string(),
             terminology: None,
             settings,
             bulk_provider: None,
+            write_observer: None,
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            login: None,
         }
     }
 

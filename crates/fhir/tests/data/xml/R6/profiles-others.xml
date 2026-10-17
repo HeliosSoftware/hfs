@@ -3,7 +3,7 @@
 <Bundle xmlns="http://hl7.org/fhir">
   <id value="profiles-others"/>
   <meta>
-    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
+    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
   </meta>
   <type value="collection"/>
   <entry>
@@ -29,7 +29,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1229"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="FamilyMemberHistoryForGeneticsAnalysis"/>
         <title value="Family member history for genetics analysis"/>
         <status value="draft"/>
@@ -43,7 +43,7 @@
           </telecom>
         </contact>
         <description value="Adds additional information to a family member history supporting both the capture of mother/father relationships as well as additional observations necessary to enable genetics-based risk analysis for patients"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -71,7 +71,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="FamilyMemberHistory">
             <path value="FamilyMemberHistory"/>
@@ -117,7 +117,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -264,7 +264,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -581,7 +581,7 @@
               </extension>
               <strength value="required"/>
               <description value="A code that identifies the status of the family history record."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/history-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -1778,7 +1778,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1318"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="ProvenanceRelevantHistory"/>
         <title value="Provenance  Relevant  History"/>
         <status value="active"/>
@@ -1792,7 +1792,7 @@
           </telecom>
         </contact>
         <description value="This profile is provided for guidance purposes only.  There is no expectation that implementers must adhere to this profile.  It is included in the specification to help implementers understand how they might use Provenance to satisfy the typical needs envisioned by the 'relevantHistory' elements found in various Event and Request resources.&#xD;&#xA;&#xD;&#xA;This profile identifies the data elements most likely to be relevant to implementers who are using Provenance to convey the `relevant history` of a resource, as discussed in the [request pattern](request.html#history).  For the purposes of this profile, mustSupport should be interpreted as 'SHOULD be considered for population and SHOULD be understood by consumers.'  Implementers are not obligated to handle all of these element and are not prohibited from also making use of additional data elements"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -1825,7 +1825,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Provenance">
             <path value="Provenance"/>
@@ -1875,7 +1875,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -2008,7 +2008,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -3567,7 +3567,7 @@
               </extension>
               <strength value="required"/>
               <description value="How an entity was used in an activity."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -3823,7 +3823,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1461"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationvitalsignsbase"/>
         <title value="Vital Signs Base Profile"/>
         <status value="draft"/>
@@ -3837,7 +3837,7 @@
           </telecom>
         </contact>
         <description value="FHIR Vital Signs Base Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -3875,7 +3875,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -3930,7 +3930,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -4116,7 +4116,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -4556,7 +4556,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -4673,7 +4673,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -6856,7 +6856,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1458"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationvitalspanel"/>
         <title value="Observation Vital Signs Panel Profile"/>
         <status value="draft"/>
@@ -6870,7 +6870,7 @@
           </telecom>
         </contact>
         <description value="FHIR Vital Signs Panel Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -6908,7 +6908,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -6963,7 +6963,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -7149,7 +7149,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -7589,7 +7589,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -7706,7 +7706,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -9765,7 +9765,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1466"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationresprate"/>
         <title value="Observation Respiratory Rate Profile"/>
         <status value="draft"/>
@@ -9779,7 +9779,7 @@
           </telecom>
         </contact>
         <description value="FHIR Respiratory Rate Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -9817,7 +9817,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -9872,7 +9872,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -10064,7 +10064,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -10504,7 +10504,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -10621,7 +10621,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -12757,7 +12757,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1457"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationoxygensat"/>
         <title value="Observation Oxygen Saturation Profile"/>
         <status value="draft"/>
@@ -12771,7 +12771,7 @@
           </telecom>
         </contact>
         <description value="FHIR Oxygen Saturation Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -12809,7 +12809,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -12864,7 +12864,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -13056,7 +13056,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -13496,7 +13496,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -13613,7 +13613,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -15749,7 +15749,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1454"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationheartrate"/>
         <title value="Observation Heart Rate Profile"/>
         <status value="draft"/>
@@ -15763,7 +15763,7 @@
           </telecom>
         </contact>
         <description value="FHIR Heart Rate Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -15801,7 +15801,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -15856,7 +15856,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -16048,7 +16048,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -16488,7 +16488,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -16605,7 +16605,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -18741,7 +18741,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1467"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationheadcircum"/>
         <title value="Observation Head Circumference Profile"/>
         <status value="draft"/>
@@ -18755,7 +18755,7 @@
           </telecom>
         </contact>
         <description value="FHIR Head Circumference Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -18793,7 +18793,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -18848,7 +18848,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -19040,7 +19040,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -19480,7 +19480,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -19597,7 +19597,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -21733,7 +21733,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1459"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationbp"/>
         <title value="Observation Blood Pressure Profile"/>
         <status value="draft"/>
@@ -21747,7 +21747,7 @@
           </telecom>
         </contact>
         <description value="FHIR Blood Pressure Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -21785,7 +21785,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -21840,7 +21840,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -22026,7 +22026,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -22466,7 +22466,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -22583,7 +22583,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -25681,7 +25681,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1465"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationbodyweight"/>
         <title value="Observation Body Weight Profile"/>
         <status value="draft"/>
@@ -25695,7 +25695,7 @@
           </telecom>
         </contact>
         <description value="FHIR Body Weight Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -25733,7 +25733,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -25788,7 +25788,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -25980,7 +25980,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -26420,7 +26420,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -26537,7 +26537,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -28673,7 +28673,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1455"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationbodytemp"/>
         <title value="Observation Body Temperature Profile"/>
         <status value="draft"/>
@@ -28687,7 +28687,7 @@
           </telecom>
         </contact>
         <description value="FHIR Body Temperature Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -28725,7 +28725,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -28780,7 +28780,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -28972,7 +28972,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -29412,7 +29412,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -29529,7 +29529,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -31665,7 +31665,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1463"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationbodyheight"/>
         <title value="Observation Body Height Profile"/>
         <status value="draft"/>
@@ -31679,7 +31679,7 @@
           </telecom>
         </contact>
         <description value="FHIR Body Height Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -31717,7 +31717,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -31772,7 +31772,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -31964,7 +31964,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -32404,7 +32404,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -32521,7 +32521,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -34657,7 +34657,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1464"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="Observationbmi"/>
         <title value="Observation Body Mass Index Profile"/>
         <status value="draft"/>
@@ -34671,7 +34671,7 @@
           </telecom>
         </contact>
         <description value="FHIR Body Mass Index (BMI) Profile"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -34709,7 +34709,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Observation">
             <path value="Observation"/>
@@ -34764,7 +34764,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -34956,7 +34956,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -35396,7 +35396,7 @@
               </extension>
               <strength value="required"/>
               <description value="The type of TriggeredBy Observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="rim"/>
@@ -35513,7 +35513,7 @@
               </extension>
               <strength value="required"/>
               <description value="Codes providing the status of an observation."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -37647,7 +37647,7 @@
           <system value="urn:ietf:rfc:3986"/>
           <value value="urn:oid:2.16.840.1.113883.4.642.5.1175"/>
         </identifier>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="ProfileForCatalog"/>
         <title value="Profile for  Catalog"/>
         <status value="draft"/>
@@ -37661,7 +37661,7 @@
           </telecom>
         </contact>
         <description value="A set of resources composed into a single coherent clinical statement with clinical attestation"/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="workflow"/>
           <uri value="http://hl7.org/fhir/workflow"/>
@@ -37694,7 +37694,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Composition">
             <path value="Composition"/>
@@ -37741,7 +37741,7 @@
                 <valueBoolean value="true"/>
               </extension>
               <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+                <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
               </extension>
               <key value="dom-6"/>
               <severity value="warning"/>
@@ -37878,7 +37878,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -38289,7 +38289,7 @@
               </extension>
               <strength value="required"/>
               <description value="The workflow status of the composition."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/composition-status|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/composition-status|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="workflow"/>
@@ -40603,14 +40603,14 @@
           <valueString value="#### Complete Summary of the Mandatory Requirements&#xD;&#xD;1.  One code in `Observation.code` which must have&#xD;    -   a fixed `Observation.code.coding.system`=**'http ://loinc.org'**&#xD;    -   a fixed  `Observation.code.coding.code`= **'29463-7'**&#xD;    -   Other additional Codings are allowed in `Observation.code`- e.g. more specific LOINC&#xD;        Codes, SNOMED CT concepts, system specific codes. All codes&#xD;        SHALL have an system value&#xD;1. Either one Observation.valueQuantity or, if there is no value, one code in Observation.DataAbsentReason&#xD;   - Each Observation.valueQuantity must have:&#xD;     - One numeric value in Observation.valueQuantity.value&#xD;     - a fixed Observation.valueQuantity.system=&quot;http://unitsofmeasure.org&quot;&#xD;     - a UCUM unit code in Observation.valueQuantity.code = **'kg', 'g', or '[lb_av]'**"/>
         </extension>
         <url value="http://hl7.org/fhir/StructureDefinition/history-bundle"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="HistoryBundle"/>
         <title value="History bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-07-17T03:44:13+00:00"/>
+        <date value="2026-09-14T16:43:45+00:00"/>
         <description value="This profile holds all the requirements and constraints related to a FHIR history bundle."/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="v2"/>
           <uri value="http://hl7.org/v2"/>
@@ -40638,7 +40638,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Bundle">
             <path value="Bundle"/>
@@ -40896,7 +40896,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -40986,7 +40986,7 @@
               </extension>
               <strength value="required"/>
               <description value="Indicates the purpose of a bundle - how it is intended to be used."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="w5"/>
@@ -41216,7 +41216,7 @@
             <isSummary value="true"/>
             <binding>
               <strength value="required"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.link.url">
@@ -41650,7 +41650,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.search.score">
@@ -41848,7 +41848,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.request.url">
@@ -42632,7 +42632,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:put.search.score">
@@ -42831,7 +42831,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:put.request.url">
@@ -43615,7 +43615,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:post.search.score">
@@ -43814,7 +43814,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:post.request.url">
@@ -44598,7 +44598,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:get.search.score">
@@ -44797,7 +44797,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:get.request.url">
@@ -45581,7 +45581,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:delete.search.score">
@@ -45780,7 +45780,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:delete.request.url">
@@ -46564,7 +46564,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:patch.search.score">
@@ -46762,7 +46762,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:patch.request.url">
@@ -47329,12 +47329,12 @@
           <valueCode value="fhir"/>
         </extension>
         <url value="http://hl7.org/fhir/StructureDefinition/search-set-bundle"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="SearchSetBundle"/>
         <title value="Search Set Bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-07-17T03:44:13+00:00"/>
+        <date value="2026-09-14T16:43:45+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -47343,7 +47343,7 @@
           </telecom>
         </contact>
         <description value="This profile holds all the requirements and constraints related to a FHIR search bundle."/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="v2"/>
           <uri value="http://hl7.org/v2"/>
@@ -47371,7 +47371,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Bundle">
             <path value="Bundle"/>
@@ -47629,7 +47629,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -47719,7 +47719,7 @@
               </extension>
               <strength value="required"/>
               <description value="Indicates the purpose of a bundle - how it is intended to be used."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="w5"/>
@@ -47949,7 +47949,7 @@
             <isSummary value="true"/>
             <binding>
               <strength value="required"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.link.url">
@@ -48383,7 +48383,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.search.score">
@@ -48581,7 +48581,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.request.url">
@@ -49366,7 +49366,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:operationOutcome.search.score">
@@ -49564,7 +49564,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:operationOutcome.request.url">
@@ -50348,7 +50348,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:other.search.score">
@@ -50546,7 +50546,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:other.request.url">
@@ -51044,12 +51044,12 @@
           <valueCode value="fhir"/>
         </extension>
         <url value="http://hl7.org/fhir/StructureDefinition/subscription-notification-bundle"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="SubscriptionNotificationBundle"/>
         <title value="Subscription Notification bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-07-17T03:44:13+00:00"/>
+        <date value="2026-09-14T16:43:45+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -51058,7 +51058,7 @@
           </telecom>
         </contact>
         <description value="This profile holds all the requirements and constraints related to a Subscription Notification Bundle."/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="v2"/>
           <uri value="http://hl7.org/v2"/>
@@ -51086,7 +51086,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Bundle">
             <path value="Bundle"/>
@@ -51344,7 +51344,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -51434,7 +51434,7 @@
               </extension>
               <strength value="required"/>
               <description value="Indicates the purpose of a bundle - how it is intended to be used."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="w5"/>
@@ -51664,7 +51664,7 @@
             <isSummary value="true"/>
             <binding>
               <strength value="required"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.link.url">
@@ -52098,7 +52098,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.search.score">
@@ -52296,7 +52296,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.request.url">
@@ -53080,7 +53080,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:first.search.score">
@@ -53278,7 +53278,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:first.request.url">
@@ -54062,7 +54062,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:other.search.score">
@@ -54260,7 +54260,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:other.request.url">
@@ -54752,12 +54752,12 @@
           <valueCode value="fhir"/>
         </extension>
         <url value="http://hl7.org/fhir/StructureDefinition/batch-bundle"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="BatchBundle"/>
         <title value="Batch bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-07-17T03:44:13+00:00"/>
+        <date value="2026-09-14T16:43:45+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -54766,7 +54766,7 @@
           </telecom>
         </contact>
         <description value="This profile holds all the requirements and constraints related to a FHIR batch bundle."/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="v2"/>
           <uri value="http://hl7.org/v2"/>
@@ -54794,7 +54794,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Bundle">
             <path value="Bundle"/>
@@ -55052,7 +55052,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -55142,7 +55142,7 @@
               </extension>
               <strength value="required"/>
               <description value="Indicates the purpose of a bundle - how it is intended to be used."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="w5"/>
@@ -55372,7 +55372,7 @@
             <isSummary value="true"/>
             <binding>
               <strength value="required"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.link.url">
@@ -55806,7 +55806,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.search.score">
@@ -56004,7 +56004,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.request.url">
@@ -56788,7 +56788,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:put.search.score">
@@ -56987,7 +56987,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:put.request.url">
@@ -57771,7 +57771,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:post.search.score">
@@ -57970,7 +57970,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:post.request.url">
@@ -58754,7 +58754,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:get.search.score">
@@ -58953,7 +58953,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:get.request.url">
@@ -59737,7 +59737,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:delete.search.score">
@@ -59936,7 +59936,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:delete.request.url">
@@ -60720,7 +60720,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:patch.search.score">
@@ -60919,7 +60919,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:patch.request.url">
@@ -61703,7 +61703,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:head.search.score">
@@ -61902,7 +61902,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:head.request.url">
@@ -62519,12 +62519,12 @@
           <valueCode value="fhir"/>
         </extension>
         <url value="http://hl7.org/fhir/StructureDefinition/batch-response-bundle"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="BatchResponseBundle"/>
         <title value="Batch response bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-07-17T03:44:13+00:00"/>
+        <date value="2026-09-14T16:43:45+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -62533,7 +62533,7 @@
           </telecom>
         </contact>
         <description value="This profile holds all the requirements and constraints related to a FHIR batch response."/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="v2"/>
           <uri value="http://hl7.org/v2"/>
@@ -62561,7 +62561,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Bundle">
             <path value="Bundle"/>
@@ -62819,7 +62819,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -62909,7 +62909,7 @@
               </extension>
               <strength value="required"/>
               <description value="Indicates the purpose of a bundle - how it is intended to be used."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="w5"/>
@@ -63139,7 +63139,7 @@
             <isSummary value="true"/>
             <binding>
               <strength value="required"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.link.url">
@@ -63564,7 +63564,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.search.score">
@@ -63762,7 +63762,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.request.url">
@@ -64215,12 +64215,12 @@
           <valueCode value="fhir"/>
         </extension>
         <url value="http://hl7.org/fhir/StructureDefinition/transaction-bundle"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="TransactionBundle"/>
         <title value="Transaction bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-07-17T03:44:13+00:00"/>
+        <date value="2026-09-14T16:43:45+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -64229,7 +64229,7 @@
           </telecom>
         </contact>
         <description value="This profile holds all the requirements and constraints related to a FHIR transaction."/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="v2"/>
           <uri value="http://hl7.org/v2"/>
@@ -64257,7 +64257,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Bundle">
             <path value="Bundle"/>
@@ -64515,7 +64515,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -64605,7 +64605,7 @@
               </extension>
               <strength value="required"/>
               <description value="Indicates the purpose of a bundle - how it is intended to be used."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="w5"/>
@@ -64835,7 +64835,7 @@
             <isSummary value="true"/>
             <binding>
               <strength value="required"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.link.url">
@@ -65269,7 +65269,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.search.score">
@@ -65467,7 +65467,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.request.url">
@@ -66251,7 +66251,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:put.search.score">
@@ -66450,7 +66450,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:put.request.url">
@@ -67234,7 +67234,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:post.search.score">
@@ -67433,7 +67433,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:post.request.url">
@@ -68217,7 +68217,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:get.search.score">
@@ -68416,7 +68416,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:get.request.url">
@@ -69200,7 +69200,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:delete.search.score">
@@ -69399,7 +69399,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:delete.request.url">
@@ -70183,7 +70183,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:patch.search.score">
@@ -70382,7 +70382,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:patch.request.url">
@@ -71166,7 +71166,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:head.search.score">
@@ -71365,7 +71365,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry:head.request.url">
@@ -71982,12 +71982,12 @@
           <valueCode value="fhir"/>
         </extension>
         <url value="http://hl7.org/fhir/StructureDefinition/transaction-response-bundle"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="TransactionResponseBundle"/>
         <title value="Transaction response bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-07-17T03:44:13+00:00"/>
+        <date value="2026-09-14T16:43:45+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -71996,7 +71996,7 @@
           </telecom>
         </contact>
         <description value="This profile holds all the requirements and constraints related to a FHIR transaction response."/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="v2"/>
           <uri value="http://hl7.org/v2"/>
@@ -72024,7 +72024,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Bundle">
             <path value="Bundle"/>
@@ -72282,7 +72282,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -72372,7 +72372,7 @@
               </extension>
               <strength value="required"/>
               <description value="Indicates the purpose of a bundle - how it is intended to be used."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="w5"/>
@@ -72602,7 +72602,7 @@
             <isSummary value="true"/>
             <binding>
               <strength value="required"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.link.url">
@@ -73027,7 +73027,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.search.score">
@@ -73225,7 +73225,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.request.url">
@@ -73678,12 +73678,12 @@
           <valueCode value="fhir"/>
         </extension>
         <url value="http://hl7.org/fhir/StructureDefinition/document-bundle"/>
-        <version value="6.0.0-ballot4"/>
+        <version value="6.0.0-snapshot1"/>
         <name value="DocumentBundle"/>
         <title value="Document bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-07-17T03:44:13+00:00"/>
+        <date value="2026-09-14T16:43:45+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -73692,7 +73692,7 @@
           </telecom>
         </contact>
         <description value="This profile holds all the requirements and constraints related to a FHIR document."/>
-        <fhirVersion value="6.0.0-ballot4"/>
+        <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
           <identity value="v2"/>
           <uri value="http://hl7.org/v2"/>
@@ -73720,7 +73720,7 @@
         <derivation value="constraint"/>
         <snapshot>
           <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-            <valueString value="6.0.0-ballot4"/>
+            <valueString value="6.0.0-snapshot1"/>
           </extension>
           <element id="Bundle">
             <path value="Bundle"/>
@@ -73978,7 +73978,7 @@
               </extension>
               <strength value="required"/>
               <description value="IETF language tag for a human language"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
               <additional>
                 <purpose value="starter"/>
                 <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -74118,7 +74118,7 @@
               </extension>
               <strength value="required"/>
               <description value="Identifies the purpose for this identifier, if known ."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="v2"/>
@@ -74378,7 +74378,7 @@
               </extension>
               <strength value="required"/>
               <description value="Indicates the purpose of a bundle - how it is intended to be used."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1"/>
             </binding>
             <mapping>
               <identity value="w5"/>
@@ -74609,7 +74609,7 @@
             <isSummary value="true"/>
             <binding>
               <strength value="required"/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.link.url">
@@ -75034,7 +75034,7 @@
               </extension>
               <strength value="required"/>
               <description value="Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.search.score">
@@ -75232,7 +75232,7 @@
               </extension>
               <strength value="required"/>
               <description value="HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details."/>
-              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4"/>
+              <valueSet value="http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1"/>
             </binding>
           </element>
           <element id="Bundle.entry.request.url">

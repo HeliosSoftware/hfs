@@ -108,7 +108,7 @@
       <span class="stat__label">{{ chrome.i18n.t("hts-home-tile-loaded-systems") }}</span>
       <span class="stat__value">
         {%- match cards.loaded_system_count() -%}
-          {%- when Some(n) -%}{{ n }}
+          {%- when Some(n) -%}{{ chrome.i18n.num(n) }}
           {%- when None -%}&mdash;
         {%- endmatch -%}
       </span>
@@ -117,7 +117,7 @@
           alone rather than claiming a misleading zero. -#}
       {%- match cards.bundled_data_mib() -%}
         {%- when Some(mib) -%}
-          <span class="stat__sub">{{ chrome.i18n.t_arg("hts-home-tile-loaded-systems-sub", "mib", mib.to_string()) }}</span>
+          <span class="stat__sub">{{ chrome.i18n.t_arg("hts-home-tile-loaded-systems-sub", "mib", *mib) }}</span>
         {%- when None -%}
           <span class="stat__sub">{{ chrome.i18n.t("hts-home-tile-loaded-systems-hint") }}</span>
       {%- endmatch -%}
@@ -127,14 +127,14 @@
       <span class="stat__label">{{ chrome.i18n.t("hts-home-tile-requests") }}</span>
       <span class="stat__value">
         {%- match cards.requests_total -%}
-          {%- when Some(n) -%}{{ n }}
+          {%- when Some(n) -%}{{ chrome.i18n.num(n) }}
           {%- when None -%}&mdash;
         {%- endmatch -%}
       </span>
       {#- Average latency, folded in from its own tile. -#}
       {%- match cards.avg_latency_ms -%}
         {%- when Some(ms) -%}
-          <span class="stat__sub">{{ chrome.i18n.t_arg("hts-home-tile-requests-sub", "ms", format!("{:.1}", ms)) }}</span>
+          <span class="stat__sub">{{ chrome.i18n.t_arg("hts-home-tile-requests-sub", "ms", chrome.i18n.dec(ms, 1)) }}</span>
         {%- when None -%}
           <span class="stat__sub">{{ chrome.i18n.t("hts-home-tile-metrics-hint") }}</span>
       {%- endmatch -%}

@@ -80,6 +80,7 @@ terminology-no-results = No matching concepts found.
 action-search = Search
 action-save = Save
 action-cancel = Cancel
+action-back = Back
 action-retry = Retry
 
 ## Errors (mirrors OperationOutcome text; see docs/multi-language.md §5)
@@ -150,6 +151,33 @@ tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept un
 tenants-row-provisioning = Provisioning… this may take a moment.
 tenants-row-failed = Could not provision the tenant.
 tenants-dismiss = Dismiss
+tenants-stat-total-sub-partial = { $count ->
+    [one] { $count } registered · discovery incomplete
+   *[other] { $count } registered · discovery incomplete
+}
+tenants-stat-resources-sub-stale = across all tenants · may be out of date
+tenants-stat-pending = Counting…
+tenants-stat-unavailable = Not available right now
+tenants-stat-unsupported = Not available on this storage
+tenants-counts-pending = Counting resources across tenants…
+tenants-counts-refreshing = Updating resource counts; showing counts from { $time }.
+tenants-counts-ready = Resources counted at { $time }.
+tenants-counts-partial = Resources counted at { $time }, but not every tenant could be checked.
+tenants-counts-stale = Counts from { $time } may be out of date: the latest count failed.
+tenants-counts-unavailable = Resource counts are not available right now.
+tenants-counts-unsupported = This storage cannot count resources per tenant.
+tenants-counts-presence = This storage reports which tenants hold data, not how many resources.
+tenants-counts-approx-pointers = Counts are approximate: storage pointers, deleted resources included.
+tenants-counts-approx-index = Counts come from the search index and may lag recent writes.
+tenants-counts-refresh = Refresh
+tenants-count-pending = Counting…
+tenants-count-unknown = Not known
+tenants-count-unsupported = Not counted on this storage
+tenants-count-unavailable = Count unavailable
+tenants-count-present = has data
+tenants-count-present-note = Holds data; this storage does not count it
+tenants-count-stale = may be out of date
+tenants-count-approx = approximate, not an exact count of live resources
 
 tenant-heading = Tenants
 tenant-all = All tenants
@@ -186,7 +214,32 @@ chart-sample-note = Sample data: this build has no live metrics provider, so the
 chart-pending-note = Still gathering the live figures for this window. Nothing is charted until they arrive — no placeholder numbers are shown.
 chart-pending-empty = Waiting for the live figures…
 chart-pending-retry = Retry now
-chart-partial-note = Some figures could not be read from storage and are shown as zero. Reload to try again.
+# #1078: measured, but counted from in-memory write counters rather than an
+# exact storage read. A label, not a warning.
+chart-approximate-note = Approximate: counted from recent writes and still being reconciled with storage.
+chart-approximate-history-note = Approximate: counted from recent writes and still being reconciled with storage. A dashed line shows only the writes recorded since the counters were read from storage; its earlier history is still loading.
+chart-legend-history-loading = history loading
+# #1078: the storage backend cannot count resources at all (e.g. an S3
+# primary). Shown in the chart area; the notice line below explains it.
+chart-counts-unsupported = Resource counts are not available for this storage backend.
+chart-counts-unsupported-note = This storage backend cannot count stored resources, so no totals or chart are shown. This does not mean the tenant is empty.
+# #1078: when the figures on the page were read. $time is a UTC time,
+# prefixed with the date when it is not today (e.g. "14:02:31 UTC").
+chart-as-of = As of { $time }.
+# #1065: a search-index rebuild ($reindex) is running for this tenant. Stored
+# resources stay readable by id, but searches can miss them until it finishes.
+# $percent is a whole number; $processed and $total are resource counts.
+search-index-rebuilding = Search index rebuilding — { $percent }% ({ $processed } of { $total } resources). Searches may miss stored resources until it finishes.
+# The same, before the rebuild has counted the resources it will process.
+search-index-rebuilding-counting = Search index rebuilding. Searches may miss stored resources until it finishes.
+# #1125: the tenant's most recent search-index rebuild ended with resources
+# left unindexed. $errors is a resource count; $job is the rebuild job id.
+search-index-rebuild-failed = { $errors ->
+    [one] The last search index rebuild left one resource unindexed. Searches miss it until a rebuild succeeds; GET $reindex-status/{ $job } says which one.
+   *[other] The last search index rebuild left { $count } resources unindexed. Searches miss them until a rebuild succeeds; GET $reindex-status/{ $job } lists which ones.
+  }
+# The same, when the rebuild failed as a whole before naming any resource.
+search-index-rebuild-failed-job = The last search index rebuild failed before it finished. Searches may miss stored resources until a rebuild succeeds; GET $reindex-status/{ $job } says why.
 chart-table-toggle = View as Table
 chart-table-when = Time
 chart-focus-series = Focus this series
@@ -210,12 +263,24 @@ history-tab-type = Type Feed
 history-tab-system = System Feed
 history-versions-label = Versions
 history-current = current
+history-op-create = created
+history-op-update = updated
+history-op-patch = patched
+history-op-delete = deleted
+history-op-version = version
 history-from = From
 history-to = To
 history-show-metadata = Show metadata changes
 history-empty = Load a resource, then pick two versions to compare.
 history-load-error = Could not load that resource's history.
 history-not-found = No history for that resource — check the type and id.
+history-feed-resource = Resource
+history-feed-version = Version
+history-feed-interaction = Interaction
+history-feed-when = When
+history-feed-more = Load more
+history-feed-empty = No history entries yet.
+history-feed-error = Could not load the history feed.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } metadata change hidden
@@ -226,34 +291,19 @@ history-only-metadata = Only metadata changed between these versions.
 history-identical = These two versions are identical.
 history-deleted = { $version } is a deletion — there is nothing to diff against.
 history-parse-error = Those versions could not be read as JSON.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Saved Queries
-
-queries-heading = Saved Queries
-queries-lede = Keep FHIR search queries per resource type, sorted by when you last ran them. Saved to your user settings, so they roam across devices.
-queries-add-heading = Save a Query
-queries-type-label = Resource type
-queries-type-placeholder = e.g. Patient
-queries-name-label = Name
-queries-name-placeholder = e.g. Smiths in Boston
-queries-query-label = Query string
-queries-query-placeholder = e.g. name=smith&address-city=Boston
-queries-empty = No saved queries yet. Save one above to get started.
-queries-never-run = Never run
 queries-run = Run
-queries-rename = Rename
 queries-delete = Delete
-queries-rename-prompt = New name
-queries-confirm-delete = Delete "{ $name }"?
-queries-unavailable = Saved queries are unavailable: this server's storage backend does not support per-user settings.
 
 ## SearchParameter viewer (#238)
 
 sp-heading = Search Parameters
 sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
-sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory — only the minimal embedded fallback parameters are shown.
+sp-degraded = Search parameters could not be loaded from this server right now — the self-call to /SearchParameter failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
+sp-degraded-unsupported = Search parameters cannot be listed on this storage backend — the self-call to /SearchParameter answered 501 Not Implemented because the backend has no search for this type.
+sp-empty = No search parameters are stored on this server for this FHIR version, so there is nothing to list.
 sp-rail-label = Resource filter
 sp-rail-search = Filter types
 sp-rail-recent = Recently used
@@ -314,6 +364,8 @@ cmp-lede = The compartment definitions this server routes /{"{"}compartment{"}"}
 cmp-rail-label = Compartment definitions
 cmp-rail-heading = Compartments
 cmp-degraded = Compartment definitions could not be loaded from this server right now — the self-call to /CompartmentDefinition failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
+cmp-degraded-unsupported = Compartment definitions cannot be listed on this storage backend — the self-call to /CompartmentDefinition answered 501 Not Implemented because the backend has no search for this type.
+cmp-empty = No compartment definitions are stored on this server for this FHIR version, so there is nothing to list.
 cmp-rail-note = Definitions are stored resources, seeded from the FHIR spec at startup. Edits and deletions here are tenant-scoped.
 cmp-tabs-label = Compartment sections
 cmp-tab-definition = Definition
@@ -353,7 +405,6 @@ cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out 
 queries-builder-heading = Search Builder
 queries-url-label = FHIR search URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edit the GET URL directly or through the rows below — they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
 queries-recent = Recent
 queries-recent-heading = Recent Searches
 queries-recent-empty = No recent searches yet — Run one to record it here.
@@ -369,6 +420,7 @@ queries-match-is = is
 queries-or = + or
 plain-pill = In plain English
 plain-find = Find {"{type}"} records
+plain-read = Open {"{type}"} {"{id}"}
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = and
@@ -380,6 +432,7 @@ plain-include = Also returning the {"{param}"} of each {"{type}"}{"{target}"}
 plain-revinclude = Plus every {"{type}"} whose {"{param}"} points here
 plain-iterate = (repeatedly)
 plain-count = Showing {"{n}"} per page
+plain-unknown-param = "{"{param}"}" is not a search parameter for {"{type}"}
 plain-sort = Sorted by {"{sort}"}
 plain-verb-is = is
 plain-verb-contains = contains
@@ -432,13 +485,23 @@ queries-has-via = linked via
 queries-has-where = where its
 queries-add-has = ⧉ Filter a resource that links here
 queries-param-placeholder = parameter
+queries-param-none = No matching parameters
+queries-param-unknown = Not a search parameter for {"{type}"}. Pick one from the list.
 queries-value-placeholder = value
 queries-results = Results
 queries-results-total = { $count } results
+queries-results-total-partial = { $count }+ results
 queries-results-included = { $count } included
 queries-results-empty = No results.
 queries-searching = Searching…
+queries-search-elapsed = { $seconds } seconds elapsed
+queries-search-cancel = Cancel
+queries-search-slow = This search is taking longer than expected. You can keep waiting or cancel it.
+queries-search-keep-waiting = Keep waiting
+queries-results-previous = Previous results
 queries-col-updated = Updated
+queries-copy-id = Copy id
+queries-copied = Copied
 queries-prev = Previous
 queries-next = Next
 queries-results-fetch-error = Could not load results from { $origin }. Check HFS_BASE_URL and try again.
@@ -486,12 +549,37 @@ editor-save = Save Changes
 editor-delete = Delete
 editor-remove = Remove This Node
 editor-saved = Saved.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Will be saved as { $target }
+editor-id-exists = { $target } already exists. Saving will add a new version of it.
+editor-id-exists-confirm = Save new version
+# Shared unsaved-changes tracker (#1240): the pill next to a Save button and
+# the confirm shown for in-page closes (a modal, an addbox disclosure).
+unsaved-changes = Unsaved changes
+unsaved-discard-confirm = You have unsaved changes. Discard them and close?
+unsaved-leave-confirm = You have unsaved changes. Discard them and leave this page?
+unsaved-leave-action = Discard and leave
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirm
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
-editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
+editor-source-hint = Edit here or in the guided form: both always show the same document.
+editor-format = Format
+editor-format-title = Format the document (Shift+Alt+F)
+editor-format-invalid = Fix the JSON syntax errors before formatting.
 
 editor-add = Add Element
+editor-add-close = Close
+editor-add-added = added
+editor-add-undo = Undo
+editor-collection-add = Add
+editor-add-undo-pending = Undo is unavailable while the form is updating.
+editor-add-undo-unavailable = Undo is no longer available after the document changed.
+editor-update-failed = The form update failed. Retry the changed field before adding or removing an element.
+editor-add-elements = Elements
+editor-add-extensions = Extensions
 editor-must-support-badge = MS
 editor-binding-hint = Bound to a value set — codes come from it; strength shown
 editor-legend-live = Checked as you type: structure, cardinality, required bindings
@@ -507,16 +595,19 @@ vd-form-legend-live = Checked as you type: structure, cardinality, required bind
 # states ("No issues.", "3 issues"), never the longer editor-invalid-json
 # sentence.
 vd-form-invalid-chip = Invalid JSON
-# SQL Query / SQL View's own two-line legend (#840): Save there gates the
-# SQL on FHIR Library type and the SQL attachment, not the generic
+# SQL Query / SQL View's own three-line legend (#840/#1233): Save there
+# gates the SQL on FHIR Library type and the SQL attachment, not the generic
 # constraints/terminology promise `editor-legend-save` makes — a promise
-# `HFS_VALIDATION_MODE` off (the default) would make false.
+# `HFS_VALIDATION_MODE` off (the default) would make false. The third line
+# says where that attachment is actually edited, since this guided form
+# never lists it (`hidden=["content"]`).
 lib-form-legend-live = Checked as you type: structure, cardinality, required bindings
 lib-form-legend-save = Checked on save: SQL on FHIR Library type and the SQL attachment
+lib-form-legend-content = The SQL attachment (content) is not listed here: edit it in the SQL card below
 editor-deferred-badge = on save
 editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
-editor-add-filter = Filter elements
+editor-add-filter = Filter elements and extensions
 editor-add-another = add another
 editor-pick-type = Pick a type…
 editor-extension-url = Extension URL
@@ -539,7 +630,6 @@ editor-primitive-extension-hint = This value carries extensions of its own (a `_
 editor-collapse-all = Collapse all
 editor-expand-all = Expand all
 json-view-toggle-fold = Toggle JSON section
-editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
 
@@ -560,6 +650,9 @@ resources-tab-edit = Edit
 resources-tab-history = History
 resources-types-heading = Resource Types
 rail-all-types-heading = All Types
+# #1078: a type rail count from a snapshot counted from recent writes, not yet
+# reconciled with storage. Hover title and screen-reader text of the "≈" count.
+rail-count-approximate = Approximate: counted from recent writes and still being reconciled with storage.
 
 queries-saved-group = Saved
 
@@ -603,7 +696,6 @@ bulk-import-new = New Submission
 bulk-import-create-title = Create Bulk Submission
 bulk-import-field-name = Submission name
 bulk-import-auth = Authentication
-bulk-import-auth-hint = How to authenticate to the recipient server.
 bulk-import-auth-none = None
 bulk-import-auth-none-hint = No authorization header will be sent.
 bulk-import-auth-backend = Backend services authentication
@@ -631,6 +723,15 @@ bulk-import-status-in-progress = In Progress
 bulk-import-status-stopped = Stopped
 bulk-import-status-completed = Completed
 bulk-import-status-failed = Failed
+# Persistent banner on a submission whose last Abort / Mark completed never
+# reached the Data Recipient (#968): the submission is still running and the
+# button can simply be pressed again. { $detail } is the recipient's own
+# untranslated diagnosis — an HTTP status and reason, or a transport error.
+bulk-import-status-error = The last status change did not reach the Data Recipient, so this submission is unchanged — try again. ({ $detail })
+# The same banner while the change is still queued (#998): the recipient
+# never answered (as opposed to refusing), so the request is kept and re-sent
+# from the status card's own refresh for as long as this page stays open.
+bulk-import-status-pending = The last status change did not reach the Data Recipient; it is kept and will be re-sent automatically while this page is open. ({ $detail })
 bulk-import-detail-recipient = Data Recipient
 bulk-import-detail-id = Submission ID
 bulk-import-detail-submitter = Submitter
@@ -660,6 +761,11 @@ bulk-import-result = Result
 bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
+bulk-import-result-warnings = Warnings
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } resource flagged with warnings (e.g. being re-indexed for search)
+   *[other] { $count } resources flagged with warnings (e.g. being re-indexed for search)
+}
 ui-cancel = Cancel
 ui-close = Close
 ui-combobox-selected-label = Selected items
@@ -669,6 +775,11 @@ ui-combobox-removed = Removed
 ui-combobox-loading = Loading suggestions…
 ui-combobox-results-updated = Suggestions available:
 ui-combobox-error = Suggestions could not be loaded. Try again.
+ui-combobox-name-now = now { $name }
+ui-combobox-footer-total = { $count } matches · scroll for more
+ui-combobox-footer-more = More matches · scroll for more
+ui-combobox-footer-end = End of results
+ui-combobox-loading-more = Loading more matches…
 editor-orphans-title = These issues have no field yet — add the elements to fix them
 editor-hint-date = FHIR date: YYYY, YYYY-MM, or YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD, or a full timestamp with timezone (2024-05-17T14:30:00+02:00)
@@ -719,7 +830,7 @@ bulk-export-scope = What are you exporting?
 bulk-export-scope-system = Everything
 bulk-export-scope-system-hint = The whole server — every resource type you select below.
 bulk-export-scope-patient = Patients
-bulk-export-scope-patient-hint = Every patient and the records that belong to them. Nothing patient-unrelated.
+bulk-export-scope-patient-hint = Every patient, or only the ones you pick, with the records that belong to them. Nothing patient-unrelated.
 bulk-export-scope-group = Group
 bulk-export-scope-group-hint = Just the members of a cohort you've already defined.
 bulk-export-field-group-id = Group ID
@@ -750,13 +861,19 @@ bulk-export-field-since-custom = Custom instant
 bulk-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
 bulk-export-field-until = Until
 bulk-export-field-until-hint = Optional upper bound. RFC 3339, e.g. 2026-08-01T00:00:00Z.
+bulk-export-until-before-since = Until must not be earlier than Since.
 bulk-export-window-since = Since
 bulk-export-window-until = Until
 bulk-export-start = Start Export
-bulk-export-running = running
 bulk-export-clear = Clear
-bulk-export-files-word = files
-bulk-export-exports-word = exports
+bulk-export-files-count = { $count ->
+    [one] { $count } file
+   *[other] { $count } files
+}
+bulk-export-summary-count = { $count ->
+    [one] { $count } export
+   *[other] { $count } exports
+} · { $running } running
 bulk-export-none = No exports yet. Use New Export to start one.
 bulk-export-status-in-progress = In progress
 bulk-export-status-complete = Complete
@@ -764,19 +881,33 @@ bulk-export-status-failed = Failed
 bulk-export-status-cancelled = Cancelled
 bulk-export-progress = Progress
 bulk-export-progress-waiting = Waiting for the first status report…
+bulk-export-writing = Writing { $name }
+bulk-export-types-progress = { $done } of { $total } types
 bulk-export-files = Files
 bulk-export-finished-in = finished in
 bulk-export-error = Error
 bulk-export-cancel = Cancel
+bulk-export-cancel-refused = The server refused the cancel:
 bulk-export-retry = Retry
+bulk-export-run-again = Run again
 bulk-export-download-all = Download All Resources
 bulk-export-download-all-aria = Download all resources from { $name }
+bulk-export-view-files = View files
+bulk-export-more-actions = More actions
 bulk-export-delete = Delete
 bulk-export-delete-aria = Delete export { $name }
 bulk-export-delete-warning = Delete { $name } and its output files from the server? This cannot be undone.
 bulk-export-delete-confirm = Delete export
 bulk-export-delete-cancel = Keep export
 bulk-export-delete-error = The export could not be deleted safely. Its card was kept so you can try again.
+bulk-export-detail-job-heading = Job
+bulk-export-detail-field-scope = Scope
+bulk-export-detail-field-started = Started
+bulk-export-detail-field-duration = Duration
+bulk-export-detail-outputs-heading = Output files
+bulk-export-detail-col-type = Resource type
+bulk-export-detail-col-files = Files
+bulk-export-detail-outputs-empty = The export produced no output files.
 
 # CapabilityStatement page (#653)
 cap-title = Capability Statement
@@ -860,6 +991,8 @@ vd-saved = Saved.
 vd-run-failed = Could not run the view.
 vd-save = Save
 vd-duplicate = Duplicate
+sql-duplicate-read-failed = Could not check existing artifacts before duplicating: { $reason }
+sql-duplicate-incomplete = Could not check all existing artifacts. The copy was not saved; try again after the catalog can be fully read.
 vd-delete = Delete
 vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
 vd-delete-failed = Could not delete the view definition.
@@ -873,6 +1006,7 @@ vd-results-meta = { $rows } rows · { $ms } ms
 # #752: the results meta after a failed run — the previous table stays on
 # screen, relabelled.
 vd-results-stale = last successful run
+vd-results-running = Running query…
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next
@@ -901,6 +1035,7 @@ vd-lint-multiple-iteration-directives = A select may set at most one of forEach,
 vd-lint-select-without-output = A select must have at least one of column, select, or unionAll
 vd-lint-fhirpath-syntax = FHIRPath syntax: { $detail }
 vd-lint-undeclared-constant = Undeclared constant "%{ $name }"
+vd-lint-unknown-resource-type = Unknown resource type "{ $found }"
 vd-fix-rename-key = Rename to "{ $to }"
 vd-fix-remove-key = Remove "{ $key }"
 vd-fix-set-string = Set to "{ $value }"
@@ -910,6 +1045,10 @@ vd-fix-set-string = Set to "{ $value }"
 ## structural key's completion item carries, appended to its `detail` text
 ## client-side (never sent by `/complete` itself, which is not locale-aware).
 vd-complete-required = required
+
+## `data-msg-quickfix` on `#vd-editor-grid`: the accessible name of the quick-fix
+## menu Ctrl+. opens next to the cursor when several fixes apply.
+vd-quickfix-menu = Quick fixes
 
 ## ViewDefinition editor save-with-errors confirmation (#821): `vd-editor.js`
 ## picks whichever of these renders `#vd-editor-grid`'s own
@@ -940,6 +1079,9 @@ sql-queries-filter = Filter queries
 sql-views-filter = Filter views
 sql-queries-rail-empty = No queries yet.
 sql-views-rail-empty = No views yet.
+sql-rail-no-match = No matches for “{ $filter }”.
+sql-rail-clear-filter = Clear the filter
+sql-rail-selection-filtered = Not in the list filtered by “{ $filter }”.
 sql-queries-empty-title = No SQL queries yet
 sql-views-empty-title = No SQL views yet
 sql-queries-empty-lede = Write your first query with Create New. It runs against the flat tables of every active view definition.
@@ -954,13 +1096,21 @@ lib-degraded = The library list could not be loaded.
 # The SQL card's "runs as you type" legend (#839) — shared verbatim by SQL
 # Queries and SQL Views, unlike the headings/failure prefix above.
 lib-run-hint = Runs as you type — results follow the current SQL, saved or not
+# The SQL card's own notice (#1233), shown next to the legend above only
+# while the Details JSON's `application/sql` attachment does not decode
+# (invalid base64, non-UTF-8 bytes, or a missing `data`) — the card keeps
+# showing its last readable text rather than clearing it, and typing there
+# repairs the attachment. `sql-library-sync.js` is the only thing that ever
+# shows it; the server always paints it hidden.
+lib-sql-attachment-unreadable = SQL attachment unreadable: the SQL card keeps its last readable text; typing here repairs it
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
-# Details section (#840): the Library minus its SQL attachment, edited as
-# JSON (left) and through the guided form (right).
+# Details section (#840): the full stored Library (SQL attachment
+# included, #1233), edited as JSON (left) and through the guided form
+# (right).
 lib-details-heading = Details
 lib-details-json-heading = Library (JSON)
-lib-details-json-note = The SQL attachment is edited in the SQL card below and is not part of this view.
+lib-details-json-note = The SQL attachment (content[].data) is part of this document. The SQL card below edits the same attachment.
 # Shown only for `?lib=new`, under the Details heading — closes the #839
 # follow-up asking for a hint about the starter's `change-me` placeholder.
 lib-details-new-lede = Rename it and point relatedArtifact[0] at a ViewDefinition that exists.
@@ -1014,15 +1164,11 @@ lib-run-unknown-table-more = Unknown table { $name } — line { $line }.
 ## Tables panel (#842, both kinds) — Reads from / Used by / Columns
 
 lib-tables-heading = Reads from
-lib-tables-col-alias = Alias
-lib-tables-col-target = Reads from
 # The `<code>` cell's own placeholder for a `relatedArtifact[depends-on]`
 # entry with no `label` at all — a malformed document, most commonly one
 # hand-edited in Details.
 lib-tables-no-alias = (no label)
 lib-tables-empty = No tables declared yet.
-lib-tables-note = Every table the SQL reads, as relatedArtifact depends-on entries: alias on the left, the view definition or SQL view it resolves to on the right.
-lib-tables-remove = Remove
 # The resolved-target chip text. "SQL View" reuses `sql-views-chip` — the
 # same chip the title row and *Used by* already show for that kind.
 lib-tables-kind-view-definition = ViewDefinition
@@ -1030,15 +1176,15 @@ lib-tables-target-not-found = Not found
 lib-tables-target-not-found-detail = No ViewDefinition or SQL View answers to { $resource }. Fix the canonical in Details or remove the row.
 lib-tables-target-not-a-table = Not a table
 lib-tables-target-not-a-table-detail = Only a ViewDefinition or a SQL View can be read.
-lib-tables-add-toggle = Add table
 lib-tables-add-table-label = Table
-lib-tables-add-table-placeholder = Search view definitions and SQL views
-lib-tables-add-table-hint = Type to search by name, or pick from the list.
+# The always-visible add row's own search field placeholder (#1238).
+lib-tables-add-table-placeholder = Add a table…
 lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} or Library/{"{"}id{"}"}
-lib-tables-add-table-fallback-hint = Enter a ViewDefinition or SQL View reference.
 lib-tables-alias-label = Alias
-lib-tables-alias-hint = Defaults to the artifact's name
 lib-tables-add-submit = Add
+# The add row's own single help line (#1238) — the only hint the row
+# carries; the combobox's own `hint`/`fallback-hint` are passed empty.
+lib-tables-add-hint = Search a view definition or SQL view; the alias defaults to its name.
 # `add-table`'s own validation messages (#842), in the order they are
 # checked.
 lib-tables-add-error-required = Pick a view definition or SQL view
@@ -1054,6 +1200,13 @@ lib-tables-options-empty = No matches.
 lib-tables-unknown = Unknown table
 lib-tables-unknown-detail = Used in the SQL but not declared. Pick a view definition or SQL view, or fix the name.
 lib-tables-declare = Declare { $name }
+# The row's own visible *Declare* button text (#1238) — the accessible
+# name carries the table's own name instead (`lib-tables-declare`).
+lib-tables-declare-short = Declare
+# The row's own icon *Remove* button's accessible name (#1238) — `$alias`
+# is the alias exactly as the `<code>` cell shows it, including the
+# `lib-tables-no-alias` placeholder when the row has none.
+lib-tables-remove-row = Remove { $alias }
 
 lib-used-by-heading = Used by
 lib-used-by-empty = Nothing uses this yet.
@@ -1125,9 +1278,8 @@ sql-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:
 sql-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
 sql-export-group-invalid = Enter only valid logical Group IDs, separated by commas or new lines.
 sql-export-advanced = Advanced
-sql-export-advanced-meta = tracking id · CSV header
 sql-export-field-tracking-id = Tracking id
-sql-export-field-tracking-id-hint = Echoed in the completion manifest as clientTrackingId.
+sql-export-field-tracking-id-hint = Optional label for your own records, for any format. Shown on the export's details page and returned as clientTrackingId when the export completes.
 sql-export-tracking-id-too-long = Tracking id must be 200 characters or fewer.
 sql-export-field-header = Include a header row
 sql-export-field-header-hint = (CSV only — ignored for other formats)
@@ -1138,8 +1290,10 @@ sql-export-new = New SQL Export
 sql-export-unavailable = The storage backend does not host the settings store, so SQL export jobs cannot be tracked.
 sql-export-none = No SQL exports yet. Use New SQL Export to start one.
 sql-export-store-error = The export started, but could not be added to this list. Job id:
-sql-export-exports-word = exports
-sql-export-running = running
+sql-export-summary-count = { $count ->
+    [one] { $count } export
+   *[other] { $count } exports
+} · { $running } running
 sql-export-select-subject = Select at least one subject.
 sql-export-unknown-subject = One or more selected subjects are no longer available. Refresh the page and try again.
 sql-export-cancelled-reason = the server no longer knows this job
@@ -1212,7 +1366,6 @@ sql-export-detail-col-output = Output
 sql-export-detail-col-subject = Subject
 sql-export-detail-col-files = Files
 sql-export-detail-outputs-empty = The job produced no output files.
-sql-export-file-fallback = File { $n }
 
 ## #837: per-SQL-Query parameter values on the SQL Export builder
 sql-export-param-count = { $count ->
@@ -1864,3 +2017,15 @@ hts-home-chart-hint-series-all = all status classes
 hts-home-chart-hint-series-2xx = 2xx responses only
 hts-home-chart-hint-series-4xx = 4xx responses only
 hts-home-chart-hint-series-5xx = 5xx responses only
+
+## Bearer-only authentication (#1560): auth is on, no browser sign-in configured
+auth-bearer-only = Authentication is enabled on this server, but no browser sign-in is configured. Pages that call the FHIR API from the browser — Resources, Batch / Transaction, saved queries and preferences — are refused with 401. Set HFS_UI_LOGIN_CLIENT_ID to enable the sign-in, or use the API directly with a bearer token.
+batch-sign-in-required = This server has no browser sign-in configured, so this page cannot authenticate the request. Set HFS_UI_LOGIN_CLIENT_ID to execute bundles from here.
+batch-too-large = The bundle is larger than this server accepts. Split it into smaller bundles, or raise HFS_MAX_BODY_SIZE on the server.
+batch-connection-dropped = The connection closed before the server answered. If your session has expired, sign in again; the bundle may also be larger than this server accepts.
+
+# SQL Library selection and unavailable collection states (#1884).
+sql-library-select-title = Select a query or view
+sql-library-select-lede = Choose an item from the list or create a new one.
+sql-library-unavailable-title = The selection is unavailable
+sql-library-unavailable-lede = The available queries and views could not be verified.

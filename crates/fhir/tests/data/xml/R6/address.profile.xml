@@ -262,15 +262,18 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status">
     <valueCode value="normative"/>
   </extension>
+  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version">
+    <valueCode value="6.0.0-snapshot1"/>
+  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Address"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Address"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-09-14T16:43:45+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -293,7 +296,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Need to be able to record postal addresses, along with notes about their use."/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <mapping>
     <identity value="v2"/>
     <uri value="http://hl7.org/v2"/>
@@ -458,7 +461,7 @@
         </extension>
         <strength value="required"/>
         <description value="The use of an address (home / work / etc.)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/address-use|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/address-use|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -510,7 +513,7 @@
         </extension>
         <strength value="required"/>
         <description value="The type of an address (physical / postal)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/address-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/address-type|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -916,7 +919,7 @@
         </extension>
         <strength value="required"/>
         <description value="The use of an address (home / work / etc.)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/address-use|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/address-use|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -955,7 +958,7 @@
         </extension>
         <strength value="required"/>
         <description value="The type of an address (physical / postal)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/address-type|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/address-type|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="v2"/>

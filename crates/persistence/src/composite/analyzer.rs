@@ -271,7 +271,7 @@ impl QueryAnalyzer {
                         "_has:{}:{}:{}",
                         reverse_chain.source_type,
                         reverse_chain.reference_param,
-                        reverse_chain.search_param
+                        reverse_chain.terminal_param_as_written()
                     ),
                     param_type: SearchParamType::Special,
                     modifier: None,

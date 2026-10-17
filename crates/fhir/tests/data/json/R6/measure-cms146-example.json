@@ -158,7 +158,7 @@
           },
           "description": "Outpatient, telephone, virtual encounter (i.e., e-visit or virtual check-in), or emergency department (ED) visits with a diagnosis of pharyngitis or tonsillitis from January 1 to December 28 of the measurement period and an antibiotic order on or three days after the episode date among patients 3 years or older",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "InitialPopulation"
           }
         },
@@ -174,7 +174,7 @@
           },
           "description": "A group A streptococcus test in the seven-day period from three days prior to the episode date through three days after the episode date",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Numerator"
           }
         },
@@ -190,7 +190,7 @@
           },
           "description": "Equals Initial Population",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Denominator"
           }
         },
@@ -206,7 +206,7 @@
           },
           "description": "Exclude pharyngitis episodes when the patient had hospice care for any part of the measurement period.\\n\\nExclude pharyngitis episodes when the patient had a comorbid condition during the 12 months prior to or on the episode date.\\n\\nExclude pharyngitis episodes where the patient is taking antibiotics in the 30 days prior to the episode date.\\n\\nExclude pharyngitis episodes where the patient had a competing diagnosis on or three days after the episode date.",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "DenominatorExclusion"
           }
         }
@@ -219,7 +219,7 @@
           },
           "description": "3-9 years",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "AgesUpToNine"
           }
         },
@@ -230,7 +230,7 @@
           },
           "description": "10 years or older",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "AgesTenPlus"
           }
         },

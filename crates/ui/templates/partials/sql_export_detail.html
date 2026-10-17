@@ -117,7 +117,7 @@
       <div class="card-head">
         <h3><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("sql-export-detail-job-heading") }}</h3>
       </div>
-      <div class="card__body kv-grid kv-grid--flush">
+      <div class="card__body kv-grid kv-grid--flush kv-grid--facts">
         <div class="detail__field">
           <span>{{ i18n.t("sql-export-detail-field-job-id") }}</span>
           <div>{% if detail.job_id.is_empty() %}—{% else %}<code>{{ detail.job_id }}</code>{% endif %}</div>
@@ -161,7 +161,7 @@
         <h3>
           <span class="icon">{% include "icons/import.svg" %}</span>
           {{ i18n.t("sql-export-detail-outputs-heading") }}
-          <span class="toolbar__count">{{ detail.output_count }}</span>
+          <span class="toolbar__count">{{ i18n.num(detail.output_count) }}</span>
         </h3>
       </div>
       <div class="table-wrap">
@@ -181,7 +181,7 @@
               <td>
                 <div class="job-card__files">
                   {% for file in row.files %}
-                  <a href="{{ file.href }}" download>
+                  <a href="{{ file.href }}" download="{{ file.label }}">
                     <span class="icon">{% include "icons/import.svg" %}</span>{{ file.label }}
                   </a>
                   {% endfor %}

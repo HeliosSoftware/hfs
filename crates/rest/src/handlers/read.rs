@@ -10,13 +10,14 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{ResourceStorage, SearchProvider};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirContentType, negotiate_format};
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::headers::ResourceHeaders;
 use crate::responses::subsetting::{SummaryMode, apply_elements, apply_summary};
@@ -50,17 +51,19 @@ use crate::state::AppState;
 /// Host: fhir.example.com
 /// Accept: application/fhir+json
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub async fn read_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     req_headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -77,6 +80,15 @@ where
 
     match resource {
         Some(stored) => {
+            // A `patient/` scope reads the launch patient's compartment only
+            // (#1618); decided on the stored payload before anything about the
+            // resource — version, ETag, body — reaches the client.
+            compartment.assert_member(
+                || state.storage().search_param_registry(tenant.context()),
+                stored.fhir_version(),
+                stored.content(),
+                "read",
+            )?;
             // If client requested specific version, verify match
             if let Some(requested) = version.accept_version() {
                 if stored.fhir_version() != requested {
@@ -175,11 +187,7 @@ where
                 "Returning resource"
             );
 
-            format_resource_response(StatusCode::OK, headers, &content, negotiated.format).map_err(
-                |_| RestError::InternalError {
-                    message: "Failed to serialize response".to_string(),
-                },
-            )
+            format_resource_response(StatusCode::OK, headers, &content, negotiated.format)
         }
         None => {
             debug!(
@@ -213,11 +221,12 @@ pub async fn head_read_handler<S>(
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -234,6 +243,13 @@ where
 
     match resource {
         Some(stored) => {
+            // As for GET: the compartment check comes before any header (#1618).
+            compartment.assert_member(
+                || state.storage().search_param_registry(tenant.context()),
+                stored.fhir_version(),
+                stored.content(),
+                "read",
+            )?;
             // If client requested specific version, verify match
             if let Some(requested) = version.accept_version() {
                 if stored.fhir_version() != requested {

@@ -74,6 +74,7 @@
 //! 5. **Result propagation**: Returns `EvaluationResult` collections
 
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
+use crate::terminology_functions::TerminologySession;
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike};
 use helios_fhir::{FhirResource, FhirVersion};
 use helios_fhirpath_support::{
@@ -85,6 +86,54 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// How the evaluator reports a leading identifier that is neither a known FHIR
+/// type (in any enabled version) nor an element of the context resource.
+///
+/// `Patient.name` evaluated against an Observation is *not* affected: `Patient`
+/// is a known type, and cross-type silence is what makes multi-type union
+/// expressions work. Only names such as `Bogus` in `Bogus.meta.source` are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnresolvedIdentifierPolicy {
+    /// Evaluate to empty without any report.
+    Ignore,
+    /// Evaluate to empty and emit a `tracing::warn!`, once per
+    /// (identifier, context type) pair.
+    #[default]
+    Warn,
+    /// Fail the evaluation with an `EvaluationError::SemanticError`.
+    Error,
+}
+
+/// Upper bound on remembered (identifier, context type) pairs for warn-once, so
+/// identifiers coming from user-authored expressions cannot grow it unboundedly.
+const MAX_WARNED_IDENTIFIERS: usize = 1024;
+
+fn warn_unresolved_identifier_once(name: &str, ctx_type: &str) {
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let mut warned = WARNED.get_or_init(Default::default).lock();
+    if warned.len() < MAX_WARNED_IDENTIFIERS
+        && warned.insert((name.to_string(), ctx_type.to_string()))
+    {
+        tracing::warn!(
+            identifier = name,
+            context_type = ctx_type,
+            "FHIRPath leading identifier '{}' is not a known type or an element of '{}'; evaluating to empty",
+            name,
+            ctx_type
+        );
+    }
+}
+
+/// Whether a leading identifier names the context resource: either its own
+/// type (case-insensitive) or an abstract base it conforms to (`Resource`,
+/// `DomainResource`; case-sensitive so `resource` still means the element).
+fn leading_type_matches(name: &str, ctx_type: &str) -> bool {
+    name.eq_ignore_ascii_case(ctx_type)
+        || (crate::resource_type::is_abstract_resource_base(name)
+            && crate::resource_type::resource_conforms_to_base(ctx_type, name))
+}
 
 /// Evaluation context for FHIRPath expressions
 ///
@@ -142,6 +191,11 @@ pub struct EvaluationContext {
     /// When enabled, operations like first(), last(), etc. on unordered collections will error
     pub check_ordered_functions: bool,
 
+    /// What to do when a leading identifier is neither a known FHIR type nor an
+    /// element of the context resource (e.g. `Bogus.meta.source`).
+    /// See [`UnresolvedIdentifierPolicy`].
+    pub unresolved_identifier_policy: UnresolvedIdentifierPolicy,
+
     /// Holds the current accumulator value for the aggregate() function's $total variable
     /// Used to pass the current aggregation result between iterations
     pub current_aggregate_total: Option<EvaluationResult>,
@@ -165,6 +219,12 @@ pub struct EvaluationContext {
     /// server. See [`get_terminology_server_url`](Self::get_terminology_server_url).
     pub terminology_server_url: Option<String>,
 
+    /// Per-evaluation terminology cache and `FHIRPATH_TERMINOLOGY_MAX_CALLS` budget.
+    ///
+    /// Shared with clones and child contexts (lambdas), and dropped with them, so
+    /// the cache lives no longer than the evaluation that filled it.
+    pub(crate) terminology_session: Arc<TerminologySession>,
+
     /// Debug tracer for step-by-step evaluation tracing.
     /// When set (gated by FHIRPATH_DEBUG_TRACE env var), records every evaluate() step.
     pub debug_tracer: Option<Arc<Mutex<crate::debug_trace::DebugTracer>>>,
@@ -181,11 +241,13 @@ impl Clone for EvaluationContext {
             this: self.this.clone(),
             is_strict_mode: self.is_strict_mode,
             check_ordered_functions: self.check_ordered_functions,
+            unresolved_identifier_policy: self.unresolved_identifier_policy,
             current_aggregate_total: self.current_aggregate_total.clone(),
             current_index: self.current_index,
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // New trace outputs for clone
             parent_context: self.parent_context.clone(),
             terminology_server_url: self.terminology_server_url.clone(),
+            terminology_session: Arc::clone(&self.terminology_session), // Share cache and budget across clones
             debug_tracer: self.debug_tracer.clone(), // Share the same tracer across clones
         }
     }
@@ -245,11 +307,13 @@ impl EvaluationContext {
             this,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
-            current_aggregate_total: None,  // Initialize aggregate total
-            current_index: None,            // Initialize current index
+            unresolved_identifier_policy: UnresolvedIdentifierPolicy::default(),
+            current_aggregate_total: None, // Initialize aggregate total
+            current_index: None,           // Initialize current index
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
-            parent_context: None,           // No parent context by default
-            terminology_server_url: None,   // No terminology server by default
+            parent_context: None,          // No parent context by default
+            terminology_server_url: None,  // No terminology server by default
+            terminology_session: Arc::default(),
             debug_tracer: None,
         }
     }
@@ -278,11 +342,13 @@ impl EvaluationContext {
             this,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
-            current_aggregate_total: None,  // Initialize aggregate total
-            current_index: None,            // Initialize current index
+            unresolved_identifier_policy: UnresolvedIdentifierPolicy::default(),
+            current_aggregate_total: None, // Initialize aggregate total
+            current_index: None,           // Initialize current index
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
-            parent_context: None,           // No parent context by default
-            terminology_server_url: None,   // No terminology server by default
+            parent_context: None,          // No parent context by default
+            terminology_server_url: None,  // No terminology server by default
+            terminology_session: Arc::default(),
             debug_tracer: None,
         }
     }
@@ -308,11 +374,13 @@ impl EvaluationContext {
             this: None,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
-            current_aggregate_total: None,  // Initialize aggregate total
-            current_index: None,            // Initialize current index
+            unresolved_identifier_policy: UnresolvedIdentifierPolicy::default(),
+            current_aggregate_total: None, // Initialize aggregate total
+            current_index: None,           // Initialize current index
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
-            parent_context: None,           // No parent context by default
-            terminology_server_url: None,   // No terminology server by default
+            parent_context: None,          // No parent context by default
+            terminology_server_url: None,  // No terminology server by default
+            terminology_session: Arc::default(),
             debug_tracer: None,
         }
     }
@@ -391,6 +459,13 @@ impl EvaluationContext {
     /// * `check` - Whether to enable ordered function checking
     pub fn set_check_ordered_functions(&mut self, check: bool) {
         self.check_ordered_functions = check;
+    }
+
+    /// Sets how an unresolvable leading identifier is reported.
+    ///
+    /// See [`UnresolvedIdentifierPolicy`]. Child contexts and clones inherit it.
+    pub fn set_unresolved_identifier_policy(&mut self, policy: UnresolvedIdentifierPolicy) {
+        self.unresolved_identifier_policy = policy;
     }
 
     /// Sets the 'this' context for direct evaluation
@@ -549,12 +624,14 @@ impl EvaluationContext {
             this: self.this.clone(),
             is_strict_mode: self.is_strict_mode,
             check_ordered_functions: self.check_ordered_functions,
+            unresolved_identifier_policy: self.unresolved_identifier_policy,
             current_aggregate_total: self.current_aggregate_total.clone(),
             current_index: self.current_index, // Inherit current index from parent
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // New trace outputs for child
             parent_context: Some(Box::new(self.clone())), // Clone entire parent context
             terminology_server_url: self.terminology_server_url.clone(), // Inherit terminology server from parent
-            debug_tracer: self.debug_tracer.clone(),                     // Share tracer with child
+            terminology_session: Arc::clone(&self.terminology_session), // Share cache and budget with child
+            debug_tracer: self.debug_tracer.clone(),                    // Share tracer with child
         }
     }
 
@@ -651,6 +728,26 @@ impl EvaluationContext {
             .clone()
             .or_else(|| std::env::var("FHIRPATH_TERMINOLOGY_SERVER").ok())
             .filter(|url| !url.trim().is_empty())
+    }
+
+    /// Returns this context's terminology session: the cache of terminology lookups and
+    /// the `FHIRPATH_TERMINOLOGY_MAX_CALLS` budget.
+    ///
+    /// Clones and child contexts share it. Pass it to
+    /// [`set_terminology_session`](Self::set_terminology_session) on other contexts to put
+    /// them on the same session.
+    pub fn terminology_session(&self) -> Arc<TerminologySession> {
+        Arc::clone(&self.terminology_session)
+    }
+
+    /// Replaces this context's terminology session with `session`.
+    ///
+    /// Each context starts with its own session. A caller that builds several contexts for
+    /// one request (one per resource, say) gives them all the same session so the request
+    /// answers repeated lookups once and stays within one
+    /// `FHIRPATH_TERMINOLOGY_MAX_CALLS` budget.
+    pub fn set_terminology_session(&mut self, session: Arc<TerminologySession>) {
+        self.terminology_session = session;
     }
 }
 
@@ -788,7 +885,7 @@ pub fn evaluate(
                 if let Some(EvaluationResult::String(ctx_type, _, _)) = obj_map.get("resourceType")
                 {
                     // The parser ensures initial_name is cleaned of backticks.
-                    if initial_name.eq_ignore_ascii_case(ctx_type) {
+                    if leading_type_matches(initial_name, ctx_type) {
                         // The initial identifier matches the context type.
                         // The expression resolves to the context item itself.
                         return Ok(global_context_item);
@@ -956,7 +1053,7 @@ pub fn evaluate(
                 && let Some(this_item) = context.this.as_ref()
                 && let EvaluationResult::Object { map: this_map, .. } = this_item
                 && let Some(EvaluationResult::String(ctx_type, _, _)) = this_map.get("resourceType")
-                && initial_name.eq_ignore_ascii_case(ctx_type)
+                && leading_type_matches(initial_name, ctx_type)
             {
                 return evaluate_invocation(this_item, invocation, context, current_item);
             }
@@ -1440,7 +1537,7 @@ fn evaluate_with_context(
         } = &global_context_item
         {
             if let Some(EvaluationResult::String(ctx_type, _, _)) = obj_map.get("resourceType") {
-                if initial_name.eq_ignore_ascii_case(ctx_type) {
+                if leading_type_matches(initial_name, ctx_type) {
                     return Ok((global_context_item, context));
                 }
             }
@@ -1710,16 +1807,44 @@ fn evaluate_term(
                     // Check if it matches the resourceType of the base_context
                     if let EvaluationResult::Object {
                         map: obj_map,
-                        type_info: None,
+                        type_info,
                     } = base_context.as_ref()
-                    {
-                        if let Some(EvaluationResult::String(ctx_type, _, _)) =
+                        && let Some(EvaluationResult::String(ctx_type, _, _)) =
                             obj_map.get("resourceType")
+                    {
+                        // The parser ensures 'name' is cleaned of backticks if it was a delimited identifier.
+                        // The concrete-type match keeps its untyped-only guard; abstract
+                        // bases (`Resource.`, `DomainResource.`) also resolve typed resources.
+                        if (type_info.is_none() && name.eq_ignore_ascii_case(ctx_type))
+                            || (crate::resource_type::is_abstract_resource_base(name)
+                                && crate::resource_type::resource_conforms_to_base(ctx_type, name))
                         {
-                            // The parser ensures 'name' is cleaned of backticks if it was a delimited identifier.
-                            if name.eq_ignore_ascii_case(ctx_type) {
-                                return Ok(base_context.into_owned());
+                            return Ok(base_context.into_owned());
+                        }
+
+                        // Unresolvable leading identifier: capitalized, not an element,
+                        // not a known type in any enabled version. Cold path only.
+                        if context.unresolved_identifier_policy
+                            != UnresolvedIdentifierPolicy::Ignore
+                            && name.starts_with(|c: char| c.is_ascii_uppercase())
+                            && !obj_map.contains_key(name.as_str())
+                            && !crate::resource_type::is_known_type_name_any_version(name)
+                            && crate::polymorphic_access::access_polymorphic_element(
+                                obj_map,
+                                name.as_str(),
+                                context.fhir_version,
+                            )
+                            .is_none()
+                        {
+                            if context.unresolved_identifier_policy
+                                == UnresolvedIdentifierPolicy::Error
+                            {
+                                return Err(EvaluationError::SemanticError(format!(
+                                    "Unknown identifier '{}': not a known type or an element of '{}'.",
+                                    name, ctx_type
+                                )));
                             }
+                            warn_unresolved_identifier_once(name, ctx_type);
                         }
                     }
                 }
@@ -3607,7 +3732,7 @@ fn call_function(
         }
         "distinct" => {
             // Delegate to the dedicated function in distinct_functions.rs
-            crate::distinct_functions::distinct_function(invocation_base)
+            crate::distinct_functions::distinct_function(invocation_base, context)
         }
         "skip" => {
             // Validate argument count
@@ -3901,6 +4026,14 @@ fn call_function(
             Ok(match invocation_base {
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Collection { .. } => unreachable!(),
+                // A complex value has no string representation, so the result is
+                // empty -- except a FHIR Quantity, which converts like System.Quantity.
+                EvaluationResult::Object { map, type_info } => {
+                    match fhir_quantity_from_object(map, type_info.as_ref()) {
+                        Some(quantity) => EvaluationResult::string(quantity.to_string_value()),
+                        None => EvaluationResult::Empty,
+                    }
+                }
                 single_item => EvaluationResult::string(single_item.to_string_value()),
             })
         }
@@ -6482,13 +6615,14 @@ fn call_function(
             crate::resolve_function::resolve_function(invocation_base, context)
         }
         "hasValue" => {
-            // hasValue() returns true if the element is a primitive with an actual value
-            // Returns false if element is empty or is a primitive with extensions but no value
+            // hasValue() returns true only if the element is a primitive with an actual value.
+            // Every Object is false: valued primitives convert to primitive variants, so an
+            // Object is either a complex type (never has a value, even with content) or a
+            // primitive with id/extensions but no value.
             match invocation_base {
-                EvaluationResult::Empty => Ok(EvaluationResult::boolean(false)),
-                obj @ EvaluationResult::Object { .. } => Ok(EvaluationResult::boolean(
-                    !obj.is_valueless_primitive_element(),
-                )),
+                EvaluationResult::Empty | EvaluationResult::Object { .. } => {
+                    Ok(EvaluationResult::boolean(false))
+                }
                 _ => Ok(EvaluationResult::boolean(true)),
             }
         }
@@ -8515,7 +8649,7 @@ fn compare_inequality(
 
 /// Compares two values for equality - Returns Result now
 #[allow(clippy::only_used_in_recursion)]
-fn compare_equality(
+pub(crate) fn compare_equality(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
@@ -8629,9 +8763,22 @@ fn compare_equality(
                     EvaluationResult::Quantity(val_l, unit_l, _, _),
                     EvaluationResult::Quantity(val_r, unit_r, _, _),
                 ) => {
-                    if unit_l == unit_r {
+                    // Calendar years/months and UCUM definite years/months are
+                    // equivalent, but cannot be compared for strict equality.
+                    // Check before UCUM conversion erases that distinction.
+                    if matches!(
+                        (unit_l.as_str(), unit_r.as_str()),
+                        ("year" | "years" | "month" | "months", "a" | "mo")
+                            | ("a" | "mo", "year" | "years" | "month" | "months")
+                    ) {
+                        EvaluationResult::Empty
+                    } else if unit_l == unit_r {
                         // Same unit, direct comparison
                         EvaluationResult::boolean(val_l == val_r)
+                    } else if crate::ucum::is_calendar_vs_ucum_year_or_month(unit_l, unit_r) {
+                        // Calendar years/months are not comparable to UCUM 'a'/'mo'
+                        // for equality (they are for equivalence): `1 year = 1 'a'` is empty.
+                        EvaluationResult::Empty
                     } else if crate::ucum::units_are_comparable(unit_l, unit_r) {
                         // Different but comparable units, convert and compare
                         match crate::ucum::convert_units(*val_r, unit_r, unit_l) {
@@ -9287,4 +9434,35 @@ fn extract_potential_polymorphic_base(field_name: &str) -> String {
     }
 
     field_name.to_string()
+}
+
+/// Reads a FHIR Quantity (or a profile of it, such as Age or Duration) held as
+/// an object into a `System.Quantity`. Uses the UCUM `code` when present and
+/// the display `unit` otherwise. Any other object yields `None`.
+fn fhir_quantity_from_object(
+    map: &HashMap<String, EvaluationResult>,
+    type_info: Option<&TypeInfoResult>,
+) -> Option<EvaluationResult> {
+    const QUANTITY_TYPES: &[&str] = &[
+        "Quantity",
+        "Age",
+        "Count",
+        "Distance",
+        "Duration",
+        "SimpleQuantity",
+        "MoneyQuantity",
+    ];
+    if !type_info.is_some_and(|t| QUANTITY_TYPES.contains(&t.name.as_str())) {
+        return None;
+    }
+    let value = match map.get("value")? {
+        EvaluationResult::Decimal(d, _, _) => *d,
+        EvaluationResult::Integer(i, _, _) => Decimal::from(*i),
+        _ => return None,
+    };
+    let unit = match map.get("code").or_else(|| map.get("unit")) {
+        Some(EvaluationResult::String(u, _, _)) => u.clone(),
+        _ => "1".to_string(),
+    };
+    Some(EvaluationResult::Quantity(value, unit, None, None))
 }

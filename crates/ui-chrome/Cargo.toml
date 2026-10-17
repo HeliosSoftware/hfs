@@ -39,3 +39,11 @@ url = "2"
 # `path=` / `offset=` / `limit=` query string. Already in the workspace lock
 # as a transitive dependency of both host crates.
 form_urlencoded = "1"
+
+# `number`'s Fluent formatter (`FluentBundle::set_formatter`) learns its
+# bundle's locale through the bundle's own memoizer. The same versions
+# `fluent-templates` already pulls into both host crates — the formatter's
+# signature must name exactly their types.
+fluent-bundle = "0.16"
+intl-memoizer = "0.5"
+unic-langid = "0.9"

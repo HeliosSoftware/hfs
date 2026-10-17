@@ -1,11 +1,20 @@
 import { test, expect } from "../../pages/fixtures";
+import { SqlExportLifecycle } from "../../pages/sql-export-lifecycle";
 import {
   createResource,
   createResources,
   createSqlQueryLibrary,
+  deleteByNamePrefix,
   deleteResources,
   waitSearchable,
 } from "../../pages/api";
+import {
+  LOAD_SUBJECTS,
+  cancelSqlExportJobs,
+  deleteLoadPatients,
+  loadViewDefinition,
+  seedLoadPatients,
+} from "../../pages/sql-export-load";
 
 // This file runs in the `nojs` project (javaScriptEnabled: false): htmx,
 // sql-export.js, and every `data-*` handler are inert here — the Active SQL
@@ -22,13 +31,14 @@ import {
 // A `$sql-export` job over a single tiny ViewDefinition finishes in well
 // under 100ms — before the redirect that lands on the list even renders —
 // so there is no reliable way to observe it in-progress, let alone catch it
-// with Cancel. Padding the job with this many trivial subjects (a single
-// self-search round trip apiece) buys a window measured in seconds, long
-// enough for a real interaction, without ever waiting on a fixed clock:
-// every wait below still polls actual DOM/network state.
-const PADDING_SUBJECTS = 200;
+// with Cancel. One request may carry at most 64 `subject` entries (#1705), so
+// each job carries `LOAD_SUBJECTS` of them and gets its run time from the
+// work each one does (pages/sql-export-load.ts: a wide ViewDefinition over
+// many Patients), a window measured in seconds, long enough for a real
+// interaction, without ever waiting on a fixed clock: every wait below still
+// polls actual DOM/network state.
 
-// Every padding `ViewDefinition` the test below seeds gets its id pushed
+// Every load `ViewDefinition` the test below seeds gets its id pushed
 // here, then deleted in this file's own `afterEach`. Left behind, a
 // `ViewDefinition` is a real, tenant-visible resource that
 // `/ui/sql/view-definitions` lists with no filter of its own — it becomes
@@ -37,18 +47,57 @@ const PADDING_SUBJECTS = 200;
 // the full mechanism).
 let seededViewDefinitionIds: string[] = [];
 
+// The per-run name prefix of every load batch, swept by name in this
+// file's own `afterEach` on top of the ids above: a `createResources` chunk
+// whose request fails outright (a 408 on the ES composites) never reports its
+// ids while the server may still commit it (#1070).
+let seededViewDefinitionPrefixes: string[] = [];
+
 // Same reasoning as `seededViewDefinitionIds` above, for the `Library`
 // sql-query subject the failed-job detail test below seeds.
 let seededLibraryIds: string[] = [];
 
+// The Patients the load subjects run over: the ids per chunk as they land,
+// and the per-run family-name prefix swept on top of them.
+let seededPatientIds: string[] = [];
+let seededPatientPrefixes: string[] = [];
+
+test.beforeEach(async ({ request }) => {
+  // Other specs can leave jobs in the shared user's settings. Count assertions
+  // need an empty baseline even when this file runs after those specs.
+  const response = await request.patch("/_user/settings", {
+    headers: { "Content-Type": "application/json" },
+    data: { sqlExport: null },
+  });
+  expect(response.ok()).toBe(true);
+});
+
 test.afterEach(async ({ request }) => {
+  // Stop any job the test left running before its source data is deleted.
+  await cancelSqlExportJobs(request);
+
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
   await deleteResources(request, "ViewDefinition", ids);
 
+  const prefixes = seededViewDefinitionPrefixes;
+  seededViewDefinitionPrefixes = [];
+  for (const prefix of prefixes) {
+    await deleteByNamePrefix(request, "ViewDefinition", prefix);
+  }
+
   const libraryIds = seededLibraryIds;
   seededLibraryIds = [];
   await deleteResources(request, "Library", libraryIds);
+
+  const patientIds = seededPatientIds;
+  seededPatientIds = [];
+  await deleteResources(request, "Patient", patientIds);
+  const patientPrefixes = seededPatientPrefixes;
+  seededPatientPrefixes = [];
+  for (const prefix of patientPrefixes) {
+    await deleteLoadPatients(request, prefix);
+  }
 
   // The jobs this test starts live in the per-user settings document under
   // `byTenant.<tenant>.sqlExport.jobs` (crates/ui/src/sql_export.rs); the
@@ -66,24 +115,33 @@ test.afterEach(async ({ request }) => {
 });
 
 test("SQL Export lifecycle works without JavaScript", async ({ page, request, sqlExport }) => {
-  // Two padded jobs, each needing its own genuinely observable in-progress
-  // window (see PADDING_SUBJECTS above).
+  // Two load jobs, each needing its own genuinely observable in-progress
+  // window (see LOAD_SUBJECTS above).
   test.setTimeout(120_000);
 
-  async function startPaddedExport(name: string): Promise<void> {
+  // Real rows for every load ViewDefinition to run over, seeded once for
+  // both jobs.
+  const patientPrefix = `NojsSqlExportLoad${Date.now()}x`;
+  seededPatientPrefixes.push(patientPrefix);
+  const lastPatientId = await seedLoadPatients(request, patientPrefix, (chunkIds) =>
+    seededPatientIds.push(...chunkIds),
+  );
+  await waitSearchable(request, "Patient", lastPatientId);
+
+  async function startLoadExport(name: string): Promise<void> {
+    // `name` already carries a per-run `Date.now()` stamp. Registered before
+    // the batch starts and per chunk as it lands, so a failure partway
+    // through still leaves `afterEach` able to clean up every load row.
+    seededViewDefinitionPrefixes.push(`${name}_`);
     const ids = await createResources(
       request,
-      Array.from({ length: PADDING_SUBJECTS }, (_, i) => ({
+      Array.from({ length: LOAD_SUBJECTS }, (_, i) => ({
         type: "ViewDefinition",
-        body: {
-          name: `${name}_${i}`,
-          status: "active",
-          resource: "Patient",
-          select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
-        },
+        body: loadViewDefinition(`${name}_${i}`),
       })),
+      undefined,
+      (chunkIds) => seededViewDefinitionIds.push(...chunkIds),
     );
-    seededViewDefinitionIds.push(...ids);
 
     await sqlExport.gotoNew();
     const checkboxes = ids
@@ -100,7 +158,7 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
   }
 
   const cancelledName = `nojs_sql_export_cancel_${Date.now()}`;
-  await startPaddedExport(cancelledName);
+  await startLoadExport(cancelledName);
   let cancelledCard = sqlExport.card(cancelledName);
   await expect(cancelledCard).toBeVisible();
   await expect(cancelledCard.locator(".tag")).toHaveText("In progress");
@@ -117,9 +175,12 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
   await expect(page).toHaveURL(/\/ui\/sql\/export$/);
   cancelledCard = sqlExport.card(cancelledName);
   await expect(cancelledCard.locator(".tag")).toHaveText("Cancelled");
+  await expect(sqlExport.lede).toHaveText("1 export · 0 running");
+  await expect(page.locator("#sql-export-summary")).toHaveCount(1);
+  await expect(page.locator("#sql-export-summary")).not.toHaveAttribute("hx-swap-oob", /.+/);
 
   const completedName = `nojs_sql_export_complete_${Date.now()}`;
-  await startPaddedExport(completedName);
+  await startLoadExport(completedName);
   let completedCard = sqlExport.card(completedName);
   await expect(completedCard).toBeVisible();
   await expect(completedCard.locator(".tag")).toHaveText("In progress");
@@ -135,6 +196,7 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
       { timeout: 30_000, intervals: [500, 1_000, 2_000] },
     )
     .toBe("Complete");
+  await expect(sqlExport.lede).toHaveText("2 exports · 0 running");
 
   // Remove from list lives behind the overflow's native `<details>`
   // disclosure — no JS needed to open it — and is itself a plain form.
@@ -148,7 +210,7 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
 // never runs in this project: the builder has to stay exactly as the server
 // renders it — every subject row visible, the table's tools and the header
 // select-all both `hidden` — and a subject checked by hand (a real click,
-// not the `evaluateAll` instrumentation the padded scenario above needs)
+// not the `evaluateAll` instrumentation the load scenario above needs)
 // still starts the job through a plain form post.
 test("the subjects table's tools stay hidden, and a subject checked by hand still starts the job", async ({
   page,
@@ -224,14 +286,21 @@ test("a completed job's detail page lists its outputs and download pills without
   await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
   const row = page.locator(".data-table tbody tr").filter({ hasText: vdName });
   await expect(row).toHaveCount(1);
-  await expect(row.locator(".job-card__files a")).toHaveCount(1);
+  const pill = row.locator(".job-card__files a");
+  await expect(pill).toHaveCount(1);
+  // #1717: the file name is server-rendered into `download=`, so it needs no
+  // script either; unnamed, the job is named after its (already
+  // filesystem-safe) subject.
+  await expect(pill).toHaveAttribute("download", `${vdName}.ndjson`);
+  await expect(pill).toHaveText(`${vdName}.ndjson`);
 });
 
 // #836: without sql-export-form.js, the CSV header switch never hides
 // itself and the Patients/Groups comboboxes never enhance past their plain
 // fallback textareas — both still have to work, and their values still have
-// to reach the job and its detail page. `<details>` is a native element, so
-// opening "Advanced" needs no script either.
+// to reach the job and its detail page. The header switch sits under the
+// Format choices, outside "Advanced" (#1716), so it is reachable without
+// opening that disclosure.
 test("the CSV header switch is visible without JavaScript, and the Patients/Groups fallback textareas submit references shown in the detail", async ({
   page,
   request,
@@ -266,7 +335,9 @@ test("the CSV header switch is visible without JavaScript, and the Patients/Grou
   });
 
   await sqlExport.gotoNew();
-  await sqlExport.openAdvanced();
+  await expect(sqlExport.advancedDetails).not.toHaveAttribute("open");
+  await expect(sqlExport.advancedDetails.locator('input[name="header"]')).toHaveCount(0);
+  await expect(sqlExport.headerOption).toBeVisible();
   await expect(sqlExport.headerLabel).toBeVisible();
   await expect(sqlExport.headerCheckbox).toBeEnabled();
   await expect(sqlExport.headerCheckbox).toBeChecked();
@@ -434,4 +505,63 @@ test("Retry on a failed job's detail page works without JavaScript", async ({
   await page.getByRole("button", { name: "Retry" }).click();
   await expect(page).toHaveURL(/\/ui\/sql\/export$/);
   await expect(sqlExport.card(queryName)).toHaveCount(2);
+});
+
+// #1645: terminal menus have usable plain-form actions even though their
+// Copy job id button must remain explicitly hidden without page scripts.
+for (const state of ["Complete", "Failed", "Cancelled"] as const) {
+  test(`Copy job id remains hidden without JavaScript in ${state} list and detail`, async ({ browser }) => {
+    test.skip(Boolean(process.env.HFS_E2E_BASE_URL) && !SqlExportLifecycle.available,
+      "Controlled status polling requires a local HFS binary, unavailable in the external backend container");
+    const runtime = new SqlExportLifecycle();
+    try {
+      await runtime.start(browser, { noJS: true });
+      const sql = runtime.sqlExport;
+      await sql.gotoNew();
+      await sql.subjectCheckbox(state === "Failed" ? runtime.brokenSubject : runtime.subject).check();
+      await sql.startButton.click();
+      const card = sql.page.locator(".job-card");
+      await expect(card.locator(".tag")).toHaveText("In progress");
+      const backendId = (await card.locator("[data-copy-job-id]").getAttribute("data-copy-job-id"))!;
+      await expect(card.locator("details.menu")).toBeHidden();
+      await expect(card.locator("[data-copy-job-id]")).toHaveAttribute("hidden", "");
+      runtime.release(backendId, state === "Cancelled" ? "missing" : "real");
+      await expect.poll(async () => {
+        await sql.page.reload();
+        return card.locator(".tag").innerText();
+      }, { timeout: 30_000 }).toBe(state);
+      await card.locator("summary").click();
+      await expect(card.locator("[data-copy-job-id]")).toBeHidden();
+      await expect(card.locator("[data-copy-job-id]")).toHaveAttribute("hidden", "");
+      await card.locator(".job-card__name a").click();
+      const detail = sql.page.locator("#job-detail");
+      await expect(detail.locator(".page-head__action > .tag")).toHaveText(state);
+      await detail.locator("summary").click();
+      await expect(detail.locator("[data-copy-job-id]")).toBeHidden();
+      await expect(detail.locator("[data-copy-job-id]")).toHaveAttribute("hidden", "");
+    } finally { await runtime.stop(); }
+  });
+}
+
+test("Since native fallback preserves a rejected Custom instant without JavaScript", async ({ page, request, sqlExport }) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: `nojs_since_${Date.now()}`, status: "active", resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await sqlExport.gotoNew();
+  await expect(sqlExport.sincePreset).toBeVisible();
+  await expect(sqlExport.sincePreset).toBeEnabled();
+  await expect(sqlExport.sinceCustom).toBeEnabled();
+  await sqlExport.sincePreset.selectOption("custom");
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.sinceCustom.fill("2026-02-31T00:00:00Z");
+  await sqlExport.startButton.click();
+  await expect(sqlExport.sincePreset).toBeVisible();
+  await expect(sqlExport.sincePreset).toHaveValue("custom");
+  await expect(sqlExport.sinceCustom).toHaveValue("2026-02-31T00:00:00Z");
+  await expect(sqlExport.sinceCustomError).toBeVisible();
+  const settings = await (await request.get("/_user/settings")).json();
+  expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
 });

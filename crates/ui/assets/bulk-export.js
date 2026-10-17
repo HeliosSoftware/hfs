@@ -1,6 +1,6 @@
-/* Progressive enhancement for the Bulk Export builder (#792, #793). The
-   server-rendered form remains usable without JavaScript: individual resource
-   types and Custom instant stay enabled for native narrowing. */
+/* Progressive enhancement for the Bulk Export builder (#792, #793).
+   The server-rendered form remains usable without JavaScript: individual
+   resource types and Custom instant stay enabled for native narrowing. */
 (function () {
   "use strict";
 
@@ -16,6 +16,8 @@
   var sincePreset = form.querySelector('select[name="since_preset"]');
   var sinceCustom = form.querySelector('input[name="since_custom"]');
   var sinceCustomError = form.querySelector("#bulk-export-since-custom-error");
+  var untilInput = form.querySelector('input[name="until"]');
+  var untilError = form.querySelector("#bulk-export-until-error");
   var scopeRadios = Array.prototype.slice.call(form.querySelectorAll('input[name="scope"]'));
   var patientCombobox = form.querySelector(".combobox--scope-patient");
   var validationStarted = form.getAttribute("data-validation-started") === "true";
@@ -57,8 +59,7 @@
     nameHeading.textContent = nameInput.value.trim() || defaultHeading;
   }
 
-  function isValidFhirInstant(value) {
-    var pattern = sinceCustom && sinceCustom.getAttribute("data-pattern");
+  function isValidFhirInstant(value, pattern) {
     if (!pattern || !new RegExp("^(?:" + pattern + ")$").test(value)) return false;
 
     var parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-](\d{2}):(\d{2}))$/.exec(
@@ -95,9 +96,42 @@
     var invalid = false;
     if (sincePreset && sinceCustom && sincePreset.value === "custom") {
       var value = sinceCustom.value.trim();
-      invalid = Boolean(value && !isValidFhirInstant(value));
+      var pattern = sinceCustom.getAttribute("data-pattern");
+      invalid = Boolean(value && !isValidFhirInstant(value, pattern));
     }
     setFieldError(sinceCustom, sinceCustomError, invalid);
+    return !invalid;
+  }
+
+  // Lower bound Since resolves to, in epoch milliseconds, or NaN when it is
+  // open or not yet valid. Mirrors the server's preset arithmetic.
+  function sinceBound() {
+    if (!sincePreset) return NaN;
+    var days = { day: 1, week: 7, month: 28 }[sincePreset.value];
+    if (days) return Date.now() - days * 86400000;
+    if (sincePreset.value !== "custom" || !sinceCustom) return NaN;
+    var value = sinceCustom.value.trim();
+    if (!value || !isValidFhirInstant(value, sinceCustom.getAttribute("data-pattern"))) return NaN;
+    return Date.parse(value);
+  }
+
+  // Until has no preset: it is validated whenever it is non-empty, and must
+  // not fall before Since, which would make the export window empty (#1271).
+  function validateUntil() {
+    var invalid = false;
+    var message = untilError && untilError.getAttribute("data-invalid-message");
+    if (untilInput) {
+      var value = untilInput.value.trim();
+      var pattern = untilInput.getAttribute("data-pattern");
+      if (value && !isValidFhirInstant(value, pattern)) {
+        invalid = true;
+      } else if (value && Date.parse(value) < sinceBound()) {
+        invalid = true;
+        message = untilError && untilError.getAttribute("data-order-message");
+      }
+    }
+    if (invalid && message) untilError.textContent = message;
+    setFieldError(untilInput, untilError, invalid);
     return !invalid;
   }
 
@@ -158,10 +192,14 @@
     sinceCustom.disabled = sincePreset.value !== "custom";
   }
 
+  function patientScopeSelected() {
+    var patientScope = form.querySelector('input[name="scope"][value="patient"]');
+    return Boolean(patientScope && patientScope.checked);
+  }
+
   function synchronizePatientScope() {
     if (!patientCombobox) return;
-    var patientScope = form.querySelector('input[name="scope"][value="patient"]');
-    var active = Boolean(patientScope && patientScope.checked);
+    var active = patientScopeSelected();
     var input = patientCombobox.querySelector('[role="combobox"]');
     if (input) input.disabled = !active;
     patientCombobox.querySelectorAll("[data-combobox-selected-input]").forEach(function (selected) {
@@ -178,6 +216,17 @@
   synchronizeSince();
   synchronizePatientScope();
 
+  // Clear belongs to the Resource types card. Reveal it only once its
+  // handler is ready; without JavaScript the native checkboxes stay usable.
+  var clearTypes = form.querySelector("[data-clear-types]");
+  if (clearTypes && allTypes) {
+    clearTypes.addEventListener("click", function () {
+      allTypes.checked = false;
+      synchronizeTypes(true);
+    });
+    clearTypes.hidden = false;
+  }
+
   if (allTypes) {
     allTypes.addEventListener("change", function () {
       synchronizeTypes(!allTypes.checked);
@@ -193,12 +242,23 @@
   if (sincePreset) {
     sincePreset.addEventListener("change", function () {
       synchronizeSince();
-      if (validationStarted) validateSince();
+      if (validationStarted) {
+        validateSince();
+        validateUntil();
+      }
     });
   }
   if (sinceCustom) {
     sinceCustom.addEventListener("input", function () {
-      if (validationStarted) validateSince();
+      if (validationStarted) {
+        validateSince();
+        validateUntil();
+      }
+    });
+  }
+  if (untilInput) {
+    untilInput.addEventListener("input", function () {
+      if (validationStarted) validateUntil();
     });
   }
   scopeRadios.forEach(function (scope) {
@@ -212,12 +272,15 @@
     validationStarted = true;
     var nameValid = validateName();
     var sinceValid = validateSince();
-    if (!nameValid || !sinceValid) {
+    var untilValid = validateUntil();
+    if (!nameValid || !sinceValid || !untilValid) {
       event.preventDefault();
       if (!nameValid && nameInput) {
         nameInput.focus();
       } else if (!sinceValid && sinceCustom) {
         sinceCustom.focus();
+      } else if (!untilValid && untilInput) {
+        untilInput.focus();
       }
       return;
     }
@@ -260,6 +323,7 @@
       synchronizePatientScope();
       setFieldError(nameInput, nameError, false);
       setFieldError(sinceCustom, sinceCustomError, false);
+      setFieldError(untilInput, untilError, false);
     }, 0);
   });
 })();

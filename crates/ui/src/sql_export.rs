@@ -34,7 +34,7 @@
 //! |---|---|
 //! | `Running { progress, subjects_total, subjects_done, current_subject }` | stays `in-progress`; all four updated (or cleared) verbatim; `pollError` cleared |
 //! | `Done` + manifest `Ok` | `complete`; `outputs` recorded; `progress`/subject counts cleared; `finishedAt` stamped |
-//! | `Done` + manifest `Err` | `failed`; `error` recorded; `progress`/subject counts cleared; `finishedAt` stamped |
+//! | `Done` + manifest `Err` | `failed`; `error` and, when the result names one, `failedSubject` recorded; `progress`/subject counts cleared; `finishedAt` stamped |
 //! | `Unknown` (404) | `cancelled`; `error` set to a fixed, translated reason; `progress`/subject counts cleared; `finishedAt` stamped |
 //! | `Unavailable(message)` | stays `in-progress`; `pollError` set; `progress`/subject counts untouched |
 //!
@@ -107,8 +107,11 @@ pub(crate) struct ManifestOutput {
     pub locations: Vec<String>,
 }
 
-/// Every `output` parameter of the manifest, in manifest order.
-pub(crate) fn manifest_outputs(manifest: &Value) -> Vec<ManifestOutput> {
+/// Every `output` parameter of the manifest, in manifest order. Each
+/// location goes through [`same_origin_location`] against the server's public
+/// base URL (`public_base_url`, i.e. `HFS_BASE_URL`), so this server's own
+/// links become same-origin paths and any other link is kept verbatim.
+pub(crate) fn manifest_outputs(manifest: &Value, public_base_url: &str) -> Vec<ManifestOutput> {
     manifest
         .get("parameter")
         .and_then(Value::as_array)
@@ -136,7 +139,7 @@ pub(crate) fn manifest_outputs(manifest: &Value) -> Vec<ManifestOutput> {
                                     part.get("name").and_then(Value::as_str) == Some("location")
                                 })
                                 .filter_map(|part| part.get("valueUri").and_then(Value::as_str))
-                                .map(same_origin_location)
+                                .map(|location| same_origin_location(location, public_base_url))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -147,25 +150,65 @@ pub(crate) fn manifest_outputs(manifest: &Value) -> Vec<ManifestOutput> {
         .unwrap_or_default()
 }
 
-/// Rewrites an absolute `location` to a same-origin path (RFC 3986
-/// path + query, dropping scheme/host/port): $sql-export's completion
-/// manifest bakes in whatever `HFS_BASE_URL` the server was configured
-/// with, which does not necessarily match the host and port the browser is
-/// actually talking to (a reverse proxy, or simply a different port in
-/// development) — but the UI and the FHIR API are served by the same
-/// process, so a path-only link always resolves correctly regardless of
-/// what the manifest's advertised base URL says (#833). Left unchanged when
-/// `location` does not parse as an absolute URL (it is already a bare path,
-/// or something this UI does not understand) — never invented, never
-/// dropped.
-fn same_origin_location(location: &str) -> String {
-    match reqwest::Url::parse(location) {
-        Ok(url) => match url.query() {
-            Some(query) => format!("{}?{query}", url.path()),
-            None => url.path().to_string(),
-        },
-        Err(_) => location.to_string(),
+/// Shapes one manifest `location` into the link the job page renders.
+///
+/// - **This server's own link (#833):** reduced to a same-origin path (RFC
+///   3986 path + query, dropping scheme/host/port). $sql-export's completion
+///   manifest bakes in whatever `HFS_BASE_URL` the server was configured
+///   with, which does not necessarily match the host and port the browser is
+///   actually talking to (a reverse proxy, or simply a different port in
+///   development) — but the UI and the FHIR API are served by the same
+///   process, so a path-only link always resolves correctly regardless of
+///   what the manifest's advertised base URL says.
+/// - **An off-server `http(s)` link (#2050):** returned unchanged, as the
+///   exact input string. An S3 pre-signed GET URL from `HFS_EXPORT_SINK=s3`
+///   (virtual-hosted or path-style), or a MinIO endpoint, points at a
+///   different service and only works on its own host — stripping the host
+///   sends the browser to HFS, which 404s — and re-serialising it could
+///   re-encode the query and invalidate the signature.
+/// - **A non-`http(s)` absolute scheme** keeps the path-only rewrite, so a
+///   foreign scheme (`javascript:` and so on) never becomes a navigable
+///   `href`.
+/// - **A value that does not parse as an absolute URL** (it is already a
+///   bare path, or something this UI does not understand) is left as-is —
+///   never invented, never dropped.
+fn same_origin_location(location: &str, public_base_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(location) else {
+        return location.to_string();
+    };
+    if matches!(url.scheme(), "http" | "https") && !is_this_server(&url, public_base_url) {
+        return location.to_string();
     }
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
+/// Whether `url` points at this HFS: the same origin as `public_base_url`
+/// (`HFS_BASE_URL` as mounted, `WebState::public_base_url`) and a path that
+/// is the base's own path or segment-wise under it.
+///
+/// Same origin means scheme, host and effective port, so `https://h:443`
+/// equals `https://h`. The path check is segment-wise, so a `/fhir` base
+/// claims `/fhir/export/...` and `/fhir/acme/export/...` but not
+/// `/fhirx/...` or `/minio/...`. This is exactly the set of links
+/// `server_routed_download_url` (`helios-rest`'s export sink) builds, tenant
+/// segment included. An unparseable base claims nothing.
+fn is_this_server(url: &reqwest::Url, public_base_url: &str) -> bool {
+    let Ok(base) = reqwest::Url::parse(public_base_url) else {
+        return false;
+    };
+    if url.origin() != base.origin() {
+        return false;
+    }
+    let base_path = base.path().trim_end_matches('/');
+    base_path.is_empty()
+        || url.path() == base_path
+        || url
+            .path()
+            .strip_prefix(base_path)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -266,8 +309,8 @@ pub struct JobOutput {
     pub locations: Vec<String>,
 }
 
-fn job_outputs(manifest: &Value) -> Vec<JobOutput> {
-    manifest_outputs(manifest)
+fn job_outputs(manifest: &Value, public_base_url: &str) -> Vec<JobOutput> {
+    manifest_outputs(manifest, public_base_url)
         .into_iter()
         .map(|output| JobOutput {
             name: output.name,
@@ -329,6 +372,12 @@ pub struct ExportJob {
     /// `cancelled` (e.g. the 404 reaper explanation).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// The output name of the subject the server's failed result attributed
+    /// the failure to, i.e. its `OperationOutcome.issue[0].expression` (#1800).
+    /// Empty in any other state, for a kick-off failure, or when the result
+    /// named no subject; a record persisted before #1800 deserializes empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failed_subject: String,
     /// The most recent *transient* poll problem (`Unavailable`); cleared on
     /// the next successful poll. Distinct from `error`: the job stays
     /// `in-progress` while this is set.
@@ -444,6 +493,7 @@ fn job_merge_value(job: &ExportJob) -> Value {
         "subjectsTotal": job.subjects_total,
         "currentSubject": optional_string(&job.current_subject),
         "error": optional_string(&job.error),
+        "failedSubject": optional_string(&job.failed_subject),
         "pollError": optional_string(&job.poll_error),
         "startedAt": job.started_at,
         "finishedAt": optional_string(&job.finished_at),
@@ -638,8 +688,9 @@ fn subject_output_names(subjects: &[JobSubject]) -> Vec<String> {
 fn export_request(job: &ExportJob) -> SqlExportRequest {
     // The output name is the subject's display name (the card already shows
     // the same name) rather than the reference's id segment (#833): the
-    // manifest's output name is what Files shows and what a downloaded shard
-    // is named after, and a UUID id is meaningless there.
+    // manifest's output name is what the Output column shows and part of
+    // what a downloaded file is named after (download_file_name, #1717),
+    // and a UUID id is meaningless there.
     // subject_output_names() disambiguates two subjects that happen to share
     // a display name.
     let names = subject_output_names(&job.subjects);
@@ -717,16 +768,17 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, caller: &Caller, i18n: 
         {
             Ok(manifest) => {
                 job.status = "complete".to_string();
-                job.outputs = job_outputs(&manifest);
+                job.outputs = job_outputs(&manifest, &state.public_base_url);
                 job.progress.clear();
                 job.clear_subject_progress();
                 job.poll_error.clear();
                 job.error.clear();
                 job.finished_at = now_stamp();
             }
-            Err(message) => {
+            Err(failure) => {
                 job.status = "failed".to_string();
-                job.error = message;
+                job.error = failure.message;
+                job.failed_subject = failure.subject.unwrap_or_default();
                 job.progress.clear();
                 job.clear_subject_progress();
                 job.poll_error.clear();
@@ -1159,8 +1211,7 @@ struct ExportListPage {
     i18n: I18n,
     active_page: &'static str,
     available: bool,
-    total: usize,
-    running: usize,
+    summary: ExportSummary,
     cards: Vec<JobCard>,
     /// The just-kicked-off job's server id, carried through the `start`
     /// redirect when the kick-off succeeded but this UI's own settings-store
@@ -1357,6 +1408,7 @@ fn subject_rows(
 /// nothing checked, every "Narrow it down" filter empty, and the header
 /// checkbox on (#836).
 struct NewFormState {
+    caller_path: Option<String>,
     name: String,
     format: String,
     selected: Vec<String>,
@@ -1389,6 +1441,7 @@ struct NewFormState {
 impl Default for NewFormState {
     fn default() -> Self {
         Self {
+            caller_path: None,
             name: String::new(),
             format: "ndjson".to_string(),
             selected: Vec::new(),
@@ -1556,6 +1609,8 @@ fn is_valid_time(value: &str) -> bool {
 #[derive(Template)]
 #[template(path = "pages/sql-export-new.html")]
 struct ExportNewPage {
+    new_view_href: String,
+    new_query_href: String,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -1580,9 +1635,11 @@ struct ExportNewPage {
     since_preset: String,
     since_custom: String,
     since_custom_error: Option<String>,
-    /// "Advanced" (#836): the tracking id field's value/error, the header
-    /// checkbox's rendered state, and whether the disclosure starts open —
-    /// `true` the moment either field carries something worth showing.
+    /// "Advanced" (#836): the tracking id field's value/error and whether
+    /// the disclosure starts open — `true` the moment that field carries
+    /// something worth showing. `header_checked` is the CSV header switch's
+    /// rendered state; it sits under the format choice, not in "Advanced"
+    /// (#1716).
     client_tracking_id: String,
     client_tracking_id_error: Option<String>,
     header_checked: bool,
@@ -1590,10 +1647,29 @@ struct ExportNewPage {
 }
 
 #[derive(Template)]
-#[template(path = "partials/sql_export_card.html")]
+#[template(path = "partials/sql_export_card_response.html")]
 struct JobCardFragment {
     i18n: I18n,
     card: JobCard,
+    summary: Option<ExportSummary>,
+}
+
+/// Counts for the complete user/tenant list, without polling sibling jobs.
+struct ExportSummary {
+    total: usize,
+    running: usize,
+    oob: bool,
+}
+
+fn export_summary(jobs: &serde_json::Map<String, Value>, oob: bool) -> ExportSummary {
+    ExportSummary {
+        total: jobs.len(),
+        running: jobs
+            .values()
+            .filter(|value| parse_job(value).status == "in-progress")
+            .count(),
+        oob,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,7 +1705,7 @@ pub(crate) async fn list(
     let jobs = if available {
         let user_key = settings_user_key(principal.as_deref());
         let snapshot = load_jobs(&state, &user_key, &rt.id).await;
-        let caller = Caller::from_request(&headers, &rt.id);
+        let caller = crate::login::caller_for(&state, &headers, &rt.id).await;
         refresh_in_progress_jobs(&state, &user_key, &rt.id, &caller, &i18n, snapshot).await
     } else {
         Default::default()
@@ -1639,10 +1715,6 @@ pub(crate) async fn list(
         .map(|(id, value)| (id.clone(), parse_job(value)))
         .collect();
     entries.sort_by(|a, b| b.1.started_at.cmp(&a.1.started_at));
-    let running = entries
-        .iter()
-        .filter(|(_, job)| job.status == "in-progress")
-        .count();
     let cards = entries
         .iter()
         .map(|(id, job)| job_card(&i18n, id, job))
@@ -1652,8 +1724,7 @@ pub(crate) async fn list(
         i18n,
         active_page: "sql-export",
         available,
-        total: entries.len(),
-        running,
+        summary: export_summary(&jobs, false),
         cards,
         store_error: query.store_error,
     })
@@ -1686,6 +1757,12 @@ pub(crate) async fn new_page(
         &rt,
         None,
         NewFormState {
+            caller_path: Some(
+                query
+                    .as_ref()
+                    .map(|q| format!("/ui/sql/export/new?{q}"))
+                    .unwrap_or_else(|| "/ui/sql/export/new".to_string()),
+            ),
             selected,
             ..Default::default()
         },
@@ -1731,14 +1808,18 @@ async fn render_new_page(
     } else {
         i18n.t("sql-export-field-groups-hint-r4")
     };
-    // Open the moment either "Advanced" field carries something worth
-    // showing: a tracking id, its error, or a header box the submission
-    // actually unchecked (#836) — never merely because the checkbox sits at
-    // its own default `true`.
-    let advanced_open = !form.client_tracking_id.is_empty()
-        || errors.client_tracking_id.is_some()
-        || !form.header_checked;
+    // Open the moment "Advanced"'s one field carries something worth
+    // showing: a tracking id or its error (#836). The CSV header switch sits
+    // with the format choice, not in "Advanced" (#1716), so it never opens
+    // the card.
+    let advanced_open = !form.client_tracking_id.is_empty() || errors.client_tracking_id.is_some();
+    let origin = crate::sql_editor_path("/ui/sql/export/new", "", "", form.caller_path.as_deref());
     render(ExportNewPage {
+        new_view_href: crate::navigation::with_return(
+            "/ui/sql/view-definitions?vd=new",
+            Some(&origin),
+        ),
+        new_query_href: crate::navigation::with_return("/ui/sql/queries?lib=new", Some(&origin)),
         status: current_status(state, version, rt),
         i18n,
         active_page: "sql-export",
@@ -1841,6 +1922,7 @@ pub(crate) async fn start(
     // literal at each of seven call sites would otherwise dwarf the actual
     // validation logic.
     let conserved_form = || NewFormState {
+        caller_path: None,
         name: name.clone(),
         format: format.clone(),
         selected: refs.clone(),
@@ -2003,7 +2085,7 @@ pub(crate) async fn start(
     // when `Some`" rule.
     let header = (format == "csv").then_some(header_present);
 
-    let caller = Caller::from_request(&headers, &rt.id);
+    let caller = crate::login::caller_for(&state, &headers, &rt.id).await;
     let mut job = ExportJob {
         name,
         subjects,
@@ -2113,7 +2195,7 @@ async fn retry_or_rerun(
     if !eligible(&original.status) {
         return Redirect::to("/ui/sql/export").into_response();
     }
-    let caller = Caller::from_request(headers, tenant);
+    let caller = crate::login::caller_for(state, headers, tenant).await;
     resubmit(state, &user_key, tenant, &caller, &original).await
 }
 
@@ -2136,7 +2218,7 @@ pub(crate) async fn cancel(
     if let Some(original) = snapshot.jobs.get(&id) {
         let mut job = parse_job(original);
         if job.status == "in-progress" {
-            let caller = Caller::from_request(&headers, &rt.id);
+            let caller = crate::login::caller_for(&state, &headers, &rt.id).await;
             let _ = state
                 .conformance
                 .sql_export_cancel(&job.job_id, &caller)
@@ -2227,13 +2309,16 @@ pub(crate) async fn card(
 ) -> Response {
     let i18n = I18n::new(locale);
     let user_key = settings_user_key(principal.as_deref());
-    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    let mut snapshot = match load_jobs_checked(&state, &user_key, &rt.id).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let Some(original) = snapshot.jobs.get(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let mut job = parse_job(original);
     if job.status == "in-progress" {
-        let caller = Caller::from_request(&headers, &rt.id);
+        let caller = crate::login::caller_for(&state, &headers, &rt.id).await;
         poll_job(&state, &mut job, &caller, &i18n).await;
         let _ = store_job_conditionally(
             &state,
@@ -2245,10 +2330,23 @@ pub(crate) async fn card(
             MemberExpectation::Unchanged(original),
         )
         .await;
+        // Card and summary must describe the persisted result, including a
+        // concurrent cancel/delete. A failed read must leave the old polling
+        // element intact so a subsequent tick can recover.
+        snapshot = match load_jobs_checked(&state, &user_key, &rt.id).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        let Some(persisted) = snapshot.jobs.get(&id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        job = parse_job(persisted);
     }
+    let summary = (job.status != "in-progress").then(|| export_summary(&snapshot.jobs, true));
     render(JobCardFragment {
         card: job_card(&i18n, &id, &job),
         i18n,
+        summary,
     })
 }
 
@@ -2286,7 +2384,12 @@ struct SubjectTag {
 }
 
 /// One download link in an Output row's Files column: the label shown next
-/// to the download icon, and the `href` — already same-origin (#833).
+/// to the download icon — also the link's `download` file name, see
+/// [`download_file_name`] (#1717) — and the `href`: a same-origin path for
+/// this server's own links (#833), or the manifest's URL verbatim for
+/// off-server links such as S3 pre-signed URLs (#2050). A cross-origin
+/// `download` attribute is ignored by browsers, so an S3 file saves under its
+/// object name rather than the label.
 struct FileLink {
     label: String,
     href: String,
@@ -2318,7 +2421,7 @@ fn format_timestamp_minutes(stamp: &str) -> String {
 
 /// `YYYY-MM-DD HH:MM:SS UTC` — the Job card's Started field, the one place
 /// seconds are shown. Empty when `stamp` does not parse.
-fn format_timestamp_seconds(stamp: &str) -> String {
+pub(crate) fn format_timestamp_seconds(stamp: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(stamp)
         .map(|parsed| {
             parsed
@@ -2349,21 +2452,123 @@ fn resolve_output_subject(job: &ExportJob, output_name: &str) -> Option<SubjectT
         })
 }
 
-/// `location`'s last path segment, query dropped — the label shown next to
-/// each download link. Falls back to the translated "File n" (`n` 1-based
-/// within the output's own shards) when nothing usable can be derived (an
-/// empty path, or a location ending in `/`).
-fn file_label(i18n: &I18n, location: &str, n: usize) -> String {
-    let without_query = location.split('?').next().unwrap_or(location);
-    match without_query.rsplit('/').next() {
-        Some(segment) if !segment.is_empty() => segment.to_string(),
-        _ => i18n.t_arg("sql-export-file-fallback", "n", n.to_string()),
+/// The longest a download name's stem may be, in characters, extension
+/// excluded — comfortably inside every common filesystem's 255-byte limit.
+const DOWNLOAD_STEM_MAX_CHARS: usize = 100;
+
+/// The most of a download name's stem an output name may take, so a long
+/// job name and a long output name both stay recognizable.
+const DOWNLOAD_OUTPUT_MAX_CHARS: usize = 50;
+
+/// Device names Windows reserves whatever the extension (`con.csv` cannot
+/// be created there).
+const WINDOWS_RESERVED_STEMS: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// `raw` made safe as a file-name stem on Windows, macOS and Linux (#1717):
+/// lowercased and folded to ASCII (accents dropped, `ß` → `ss`, …) — a
+/// Chromium running under a non-UTF-8 locale discards a non-ASCII
+/// `download=` name outright and saves the file as plain `download`; every
+/// run of characters other than an ASCII letter or digit, `-`, `_` or `.`
+/// (whitespace, path separators, `: * ? " < > |`, control characters,
+/// [`card_name`]'s ` · ` separator and ` +N` suffix, letters with no ASCII
+/// folding) becomes a single `-`; repeated `-` collapse; leading and
+/// trailing `.`, `-` and `_` are trimmed (no hidden dotfile, no trailing dot
+/// Windows drops), before and after capping at `max_chars`. Empty when
+/// nothing usable is left.
+fn sanitize_file_stem(raw: &str, max_chars: usize) -> String {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    const TRIMMED: [char; 3] = ['.', '-', '_'];
+    let mut folded = String::with_capacity(raw.len());
+    for c in raw
+        .nfkd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+    {
+        match c {
+            'ß' => folded.push_str("ss"),
+            'æ' => folded.push_str("ae"),
+            'œ' => folded.push_str("oe"),
+            'ø' => folded.push('o'),
+            'đ' => folded.push('d'),
+            'ł' => folded.push('l'),
+            'þ' => folded.push_str("th"),
+            _ => folded.push(c),
+        }
     }
+    let mut stem = String::with_capacity(folded.len());
+    for c in folded.chars() {
+        let kept = c.is_ascii_alphanumeric() || TRIMMED.contains(&c);
+        let c = if kept { c } else { '-' };
+        if c == '-' && stem.ends_with('-') {
+            continue;
+        }
+        stem.push(c);
+    }
+    let capped: String = stem.trim_matches(TRIMMED).chars().take(max_chars).collect();
+    capped.trim_matches(TRIMMED).to_string()
+}
+
+/// The extension a downloaded file gets: `format`'s own, mirroring the
+/// server's mapping, or — for a format this UI does not know — whatever
+/// extension `location`'s last path segment carries, sanitized. `ndjson`,
+/// the server's own default, when neither yields one.
+fn download_extension(format: &str, location: &str) -> String {
+    if matches!(format, "ndjson" | "csv" | "json" | "parquet") {
+        return format.to_string();
+    }
+    let path = location.split('?').next().unwrap_or(location);
+    let segment = path.rsplit('/').next().unwrap_or(path);
+    segment
+        .rsplit_once('.')
+        .map(|(_, ext)| sanitize_file_stem(ext, 16))
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "ndjson".to_string())
+}
+
+/// The file name shard `n` (1-based) of `output` is shown and downloaded
+/// as (#1717), instead of the server's storage key (`shard-N.ext`): the
+/// job's [`card_name`], then `_<output name>` when the job has more than one
+/// output, then `_<n>` when this output has more than one shard, then the
+/// format's extension — each part run through [`sanitize_file_stem`]. A
+/// job whose name sanitizes to nothing falls back to
+/// `sql-export-<job id prefix>`, and a stem Windows reserves gets the same
+/// `sql-export-` prefix.
+fn download_file_name(job: &ExportJob, output: &JobOutput, n: usize, location: &str) -> String {
+    let mut suffix = String::new();
+    if job.outputs.len() > 1 {
+        let output_stem = sanitize_file_stem(&output.name, DOWNLOAD_OUTPUT_MAX_CHARS);
+        if !output_stem.is_empty() {
+            suffix.push('_');
+            suffix.push_str(&output_stem);
+        }
+    }
+    if output.locations.len() > 1 {
+        suffix.push_str(&format!("_{n}"));
+    }
+    let budget = DOWNLOAD_STEM_MAX_CHARS - suffix.chars().count();
+    let mut stem = sanitize_file_stem(&card_name(job), budget);
+    if stem.is_empty() {
+        let id = sanitize_file_stem(&job.job_id, 8);
+        stem = if id.is_empty() {
+            "sql-export".to_string()
+        } else {
+            format!("sql-export-{id}")
+        };
+    }
+    stem.push_str(&suffix);
+    let device = stem.split('.').next().unwrap_or(&stem);
+    if WINDOWS_RESERVED_STEMS.contains(&device) {
+        stem.insert_str(0, "sql-export-");
+    }
+    format!("{stem}.{}", download_extension(&job.format, location))
 }
 
 /// Every row of the Output files table, in the record's own `outputs`
 /// order — the manifest order [`poll_job`] persisted, not submission order.
-fn build_output_rows(i18n: &I18n, job: &ExportJob) -> Vec<OutputRow> {
+fn build_output_rows(job: &ExportJob) -> Vec<OutputRow> {
     job.outputs
         .iter()
         .map(|output| OutputRow {
@@ -2374,7 +2579,7 @@ fn build_output_rows(i18n: &I18n, job: &ExportJob) -> Vec<OutputRow> {
                 .iter()
                 .enumerate()
                 .map(|(index, location)| FileLink {
-                    label: file_label(i18n, location, index + 1),
+                    label: download_file_name(job, output, index + 1, location),
                     href: location.clone(),
                 })
                 .collect(),
@@ -2382,13 +2587,15 @@ fn build_output_rows(i18n: &I18n, job: &ExportJob) -> Vec<OutputRow> {
         .collect()
 }
 
-/// A `failed` job's notice: the server's own error message either names a
-/// subject this UI can point to, or does not — a generic failure never
-/// invents a cause.
+/// A `failed` job's notice: the server either names a subject this UI can
+/// point to, or does not — a generic failure never invents a cause.
 enum FailureNotice {
-    /// `error` contained `view '<name>'`/`query '<name>'` and `<name>`
-    /// matched one of the job's disambiguated output names: the subject's
-    /// name, and the remainder of the message after `'<name>': `.
+    /// The subject came from `failed_subject` (#1800) first, else from the
+    /// `view '<name>'`/`query '<name>'` pattern in `error`; either way the
+    /// name matched one of the job's disambiguated output names. The
+    /// remainder is the message after `'<name>': ` when `error` still carries
+    /// that prefix, else the whole `error` minus one trailing period (the
+    /// template adds its own).
     Subject(String, String),
     /// No match — a kick-off failure, or a message this UI does not
     /// recognize. The raw error, untouched.
@@ -2417,14 +2624,34 @@ fn failed_subject(error: &str, subjects: &[JobSubject]) -> Option<(String, Strin
         .then(|| (name.to_string(), rest.to_string()))
 }
 
-/// [`FailureNotice`] for `job`, `None` outside `failed`.
+/// [`FailureNotice`] for `job`, `None` outside `failed`. The structured
+/// `failed_subject` (#1800) is used first, provided it matches one of the
+/// job's disambiguated output names; the `view '<name>'`/`query '<name>'`
+/// parse of `error` is the fallback for a result that named no subject.
 fn failure_notice(job: &ExportJob) -> Option<FailureNotice> {
     if job.status != "failed" {
         return None;
     }
-    Some(match failed_subject(&job.error, &job.subjects) {
-        Some((name, rest)) => FailureNotice::Subject(name, rest),
-        None => FailureNotice::Generic(job.error.clone()),
+    let parsed = failed_subject(&job.error, &job.subjects);
+    let attributed = (!job.failed_subject.is_empty()
+        && subject_output_names(&job.subjects).contains(&job.failed_subject))
+    .then(|| job.failed_subject.clone());
+    Some(match (attributed, parsed) {
+        // A 4xx message still carries `view '<name>': <reason>`: keep the reason.
+        (Some(name), Some((parsed_name, rest))) if parsed_name == name => {
+            FailureNotice::Subject(name, rest)
+        }
+        // A server fault's message is generic: show it whole, minus the
+        // period the template adds back.
+        (Some(name), _) => FailureNotice::Subject(
+            name,
+            job.error
+                .strip_suffix('.')
+                .unwrap_or(&job.error)
+                .to_string(),
+        ),
+        (None, Some((name, rest))) => FailureNotice::Subject(name, rest),
+        (None, None) => FailureNotice::Generic(job.error.clone()),
     })
 }
 
@@ -2620,7 +2847,7 @@ fn build_job_detail(i18n: &I18n, id: &str, job: &ExportJob) -> JobDetail {
             })
             .collect(),
         output_count: job.outputs.iter().map(|o| o.locations.len()).sum(),
-        outputs: build_output_rows(i18n, job),
+        outputs: build_output_rows(job),
     }
 }
 
@@ -2676,7 +2903,7 @@ async fn load_detail(
     let original = snapshot.jobs.get(id)?;
     let mut job = parse_job(original);
     if job.status == "in-progress" {
-        let caller = Caller::from_request(headers, tenant);
+        let caller = crate::login::caller_for(state, headers, tenant).await;
         poll_job(state, &mut job, &caller, i18n).await;
         let _ = store_job_conditionally(
             state,
@@ -2764,11 +2991,12 @@ mod tests {
                 ]},
             ]
         });
-        let outputs = manifest_outputs(&manifest);
+        let outputs = manifest_outputs(&manifest, "http://s");
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].name, "patients");
-        // Locations come back rewritten to same-origin paths — exercised on
-        // its own terms by same_origin_location's tests below.
+        // Locations under this server's own base URL come back rewritten to
+        // same-origin paths — exercised on its own terms by
+        // same_origin_location's tests below.
         assert_eq!(
             outputs[0].locations,
             [
@@ -2779,21 +3007,142 @@ mod tests {
         assert_eq!(outputs[1].locations, ["/export/job-1/obs-0.csv"]);
     }
 
+    /// An S3 virtual-hosted pre-signed GET URL as `HFS_EXPORT_SINK=s3`
+    /// produces it. The `%2F` in the credential proves nothing is re-encoded.
+    const S3_VIRTUAL_HOSTED_PRESIGNED: &str = "https://my-bucket.s3.us-east-2.amazonaws.com/exports/job-1/shard-0.ndjson?x-id=GetObject&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20261014%2Fus-east-2%2Fs3%2Faws4_request&X-Amz-Date=20261014T120000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=0123abcd";
+
     #[test]
-    fn same_origin_location_strips_scheme_host_and_port_but_keeps_the_query() {
-        assert_eq!(
-            same_origin_location("http://localhost:8080/export/job-1/patients-0.csv"),
-            "/export/job-1/patients-0.csv"
-        );
-        assert_eq!(
-            same_origin_location("https://hfs.example.com/export/job-1/x.csv?sig=abc&exp=1"),
-            "/export/job-1/x.csv?sig=abc&exp=1"
-        );
+    fn manifest_outputs_keeps_off_server_locations_verbatim() {
+        let manifest = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "exportId", "valueString": "job-1"},
+                {"name": "output", "part": [
+                    {"name": "name", "valueString": "patients"},
+                    {"name": "location", "valueUri": S3_VIRTUAL_HOSTED_PRESIGNED},
+                ]},
+            ]
+        });
+        let outputs = manifest_outputs(&manifest, "http://localhost:8080");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].name, "patients");
+        assert_eq!(outputs[0].locations, [S3_VIRTUAL_HOSTED_PRESIGNED]);
+    }
+
+    #[test]
+    fn same_origin_location_rewrites_this_servers_own_links_to_a_path() {
+        // (base, location, expected)
+        let cases = [
+            // Plain base, no query.
+            (
+                "http://localhost:8080",
+                "http://localhost:8080/export/job-1/patients-0.csv",
+                "/export/job-1/patients-0.csv",
+            ),
+            // The advertised host differs from the browser's (#833); the
+            // query is kept.
+            (
+                "https://hfs.example.com",
+                "https://hfs.example.com/export/job-1/x.csv?sig=abc&exp=1",
+                "/export/job-1/x.csv?sig=abc&exp=1",
+            ),
+            // Default port and host case are normalised.
+            (
+                "https://hfs.example.com",
+                "https://HFS.example.com:443/export/job-1/x.csv",
+                "/export/job-1/x.csv",
+            ),
+            // Port-only base (the different-port case).
+            (
+                "http://localhost:8081",
+                "http://localhost:8081/export/job-1/x.csv",
+                "/export/job-1/x.csv",
+            ),
+            // Proxy path prefix.
+            (
+                "https://proxy.example/fhir",
+                "https://proxy.example/fhir/export/job-1/x.csv",
+                "/fhir/export/job-1/x.csv",
+            ),
+            // Tenant segment under the base.
+            (
+                "https://proxy.example/fhir",
+                "https://proxy.example/fhir/acme/export/job-1/x.csv",
+                "/fhir/acme/export/job-1/x.csv",
+            ),
+        ];
+        for (base, location, expected) in cases {
+            assert_eq!(
+                same_origin_location(location, base),
+                expected,
+                "base {base}, location {location}"
+            );
+        }
         // Already a bare path (or anything else that does not parse as an
-        // absolute URL): left exactly as-is.
+        // absolute URL): left exactly as-is, for any base.
+        for base in ["http://localhost:8080", "https://proxy.example/fhir", ""] {
+            assert_eq!(
+                same_origin_location("/export/job-1/patients-1.csv", base),
+                "/export/job-1/patients-1.csv"
+            );
+        }
+    }
+
+    #[test]
+    fn same_origin_location_keeps_an_s3_virtual_hosted_presigned_url_verbatim() {
+        for base in ["http://localhost:8080", "https://hfs.example.com"] {
+            assert_eq!(
+                same_origin_location(S3_VIRTUAL_HOSTED_PRESIGNED, base),
+                S3_VIRTUAL_HOSTED_PRESIGNED,
+                "base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_origin_location_keeps_an_s3_path_style_presigned_url_verbatim() {
+        let presigned = "https://s3.us-east-2.amazonaws.com/my-bucket/exports/job-1/shard-0.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=0123abcd";
         assert_eq!(
-            same_origin_location("/export/job-1/patients-1.csv"),
-            "/export/job-1/patients-1.csv"
+            same_origin_location(presigned, "http://localhost:8080"),
+            presigned
+        );
+    }
+
+    #[test]
+    fn same_origin_location_keeps_other_off_server_http_urls_verbatim() {
+        // (base, location)
+        let cases = [
+            // MinIO on the same host but a different port.
+            (
+                "http://localhost:8080",
+                "http://localhost:9000/hfs-exports/exports/job-1/shard-0.ndjson?X-Amz-Signature=abc",
+            ),
+            // Same origin, outside the base path.
+            (
+                "https://proxy.example/fhir",
+                "https://proxy.example/minio/b/exports/job-1/x.csv?X-Amz-Signature=abc",
+            ),
+            // Segment boundary: `/fhirx` is not under `/fhir`.
+            (
+                "https://proxy.example/fhir",
+                "https://proxy.example/fhirx/export/job-1/x.csv",
+            ),
+        ];
+        for (base, location) in cases {
+            assert_eq!(
+                same_origin_location(location, base),
+                location,
+                "base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_origin_location_never_keeps_a_non_http_scheme_verbatim() {
+        // Today's path-only rewrite, never the `javascript:` href.
+        assert_eq!(
+            same_origin_location("javascript:alert(1)", "http://localhost:8080"),
+            "alert(1)"
         );
     }
 
@@ -2908,6 +3257,7 @@ mod tests {
         assert_eq!(value["subjectsTotal"], Value::Null);
         assert_eq!(value["currentSubject"], Value::Null);
         assert_eq!(value["error"], Value::Null);
+        assert_eq!(value["failedSubject"], Value::Null);
         assert_eq!(value["pollError"], Value::Null);
         assert_eq!(value["finishedAt"], Value::Null);
         assert_eq!(value["outputs"], Value::Null);
@@ -3086,14 +3436,206 @@ mod tests {
     }
 
     #[test]
-    fn file_label_uses_the_last_path_segment_without_the_query_and_falls_back_to_file_n() {
-        let i18n = I18n::from_tag("en").unwrap();
+    fn sanitize_file_stem_keeps_only_filesystem_safe_characters() {
+        let max = DOWNLOAD_STEM_MAX_CHARS;
         assert_eq!(
-            file_label(&i18n, "/export/job-1/patients-0.csv?sig=abc", 1),
-            "patients-0.csv"
+            sanitize_file_stem("Patient demographics Q3", max),
+            "patient-demographics-q3"
         );
-        assert_eq!(file_label(&i18n, "/export/job-1/", 3), "File 3");
-        assert_eq!(file_label(&i18n, "", 1), "File 1");
+        // Path separators, Windows-invalid characters and control characters
+        // all collapse into one `-` per run.
+        assert_eq!(
+            sanitize_file_stem("a/b\\c:d*e?f\"g<h>i|j\tk\nl\u{7}m", max),
+            "a-b-c-d-e-f-g-h-i-j-k-l-m"
+        );
+        assert_eq!(
+            sanitize_file_stem("Q3 / 2026 :  final", max),
+            "q3-2026-final"
+        );
+        // card_name's own ` · ` separator and ` +N` suffix.
+        assert_eq!(
+            sanitize_file_stem("patients · encounters · obs +2", max),
+            "patients-encounters-obs-2"
+        );
+        // Existing `-`, `_` and `.` survive; repeated `-` collapse.
+        assert_eq!(
+            sanitize_file_stem("v1.2_final--copy", max),
+            "v1.2_final-copy"
+        );
+        // No hidden dotfile, no trailing dot or separator.
+        assert_eq!(sanitize_file_stem("..hidden report.", max), "hidden-report");
+        assert_eq!(sanitize_file_stem("_-_x_-_", max), "x");
+        // Accented letters fold to ASCII; ligatures spell out; a script with
+        // no ASCII folding is just another unsafe run.
+        assert_eq!(
+            sanitize_file_stem("Pacientes Año Über", max),
+            "pacientes-ano-uber"
+        );
+        assert_eq!(
+            sanitize_file_stem("Straße Ærø Łódź", max),
+            "strasse-aero-lodz"
+        );
+        assert_eq!(sanitize_file_stem("患者 Q3", max), "q3");
+        // Nothing usable left.
+        assert_eq!(sanitize_file_stem(" / : · ... ", max), "");
+        assert_eq!(sanitize_file_stem("", max), "");
+    }
+
+    #[test]
+    fn sanitize_file_stem_caps_the_length_and_retrims_after_the_cut() {
+        let long = "a".repeat(250);
+        assert_eq!(sanitize_file_stem(&long, 100).chars().count(), 100);
+        // Cutting right after a separator must not leave it dangling.
+        assert_eq!(sanitize_file_stem("abcd efgh", 5), "abcd");
+        // Capped after folding: `ñ` is one `n`, not two characters.
+        assert_eq!(sanitize_file_stem(&"ñ".repeat(10), 4), "nnnn");
+    }
+
+    fn named_job(name: &str, format: &str, outputs: Vec<JobOutput>) -> ExportJob {
+        ExportJob {
+            job_id: "0f3c9a7e-5b21-4d8a-9c3e-1a2b3c4d5e6f".to_string(),
+            name: name.to_string(),
+            format: format.to_string(),
+            outputs,
+            ..Default::default()
+        }
+    }
+
+    fn output(name: &str, shards: usize) -> JobOutput {
+        JobOutput {
+            name: name.to_string(),
+            locations: (0..shards)
+                .map(|i| format!("/export/job-1/shard-{i}.bin?sig=abc"))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn download_file_name_is_the_job_name_alone_for_a_single_output_single_shard_job() {
+        let job = named_job(
+            "Patient demographics Q3",
+            "ndjson",
+            vec![output("patients", 1)],
+        );
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 1, &out.locations[0]),
+            "patient-demographics-q3.ndjson"
+        );
+    }
+
+    #[test]
+    fn download_file_name_adds_the_output_and_shard_only_when_there_is_more_than_one() {
+        let job = named_job(
+            "Monthly flat files",
+            "parquet",
+            vec![output("encounter_counts", 1), output("patients", 2)],
+        );
+        let names: Vec<String> = job
+            .outputs
+            .iter()
+            .flat_map(|o| {
+                o.locations
+                    .iter()
+                    .enumerate()
+                    .map(|(i, loc)| download_file_name(&job, o, i + 1, loc))
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "monthly-flat-files_encounter_counts.parquet",
+                "monthly-flat-files_patients_1.parquet",
+                "monthly-flat-files_patients_2.parquet",
+            ]
+        );
+
+        // One output, several shards: no output name, just the shard.
+        let job = named_job("Flat", "csv", vec![output("patients", 2)]);
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 2, &out.locations[1]),
+            "flat_2.csv"
+        );
+    }
+
+    #[test]
+    fn download_file_name_falls_back_to_the_subjects_then_the_job_id() {
+        // Unnamed: card_name's subject-derived name, sanitized.
+        let mut job = named_job("", "json", vec![output("a", 1)]);
+        job.subjects = vec![
+            subject("Patients flat", "view-definition"),
+            subject("Encounter counts", "sql-query"),
+        ];
+        let out = job.outputs[0].clone();
+        assert_eq!(
+            download_file_name(&job, &out, 1, &out.locations[0]),
+            "patients-flat-encounter-counts.json"
+        );
+
+        // A name that sanitizes to nothing: the job id's first 8 characters.
+        job.name = " ... / · ".to_string();
+        assert_eq!(
+            download_file_name(&job, &out, 1, &out.locations[0]),
+            "sql-export-0f3c9a7e.json"
+        );
+
+        // ...and no job id either.
+        job.job_id.clear();
+        assert_eq!(
+            download_file_name(&job, &out, 1, &out.locations[0]),
+            "sql-export.json"
+        );
+    }
+
+    #[test]
+    fn download_file_name_prefixes_a_windows_reserved_stem() {
+        let job = named_job("CON", "csv", vec![output("a", 1)]);
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 1, &out.locations[0]),
+            "sql-export-con.csv"
+        );
+        let job = named_job("nul.backup", "csv", vec![output("a", 1)]);
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 1, &out.locations[0]),
+            "sql-export-nul.backup.csv"
+        );
+        // Only an exact device name is reserved.
+        let job = named_job("console", "csv", vec![output("a", 1)]);
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 1, &out.locations[0]),
+            "console.csv"
+        );
+    }
+
+    #[test]
+    fn download_file_name_keeps_the_suffix_within_the_length_cap() {
+        let job = named_job(
+            &"x".repeat(300),
+            "ndjson",
+            vec![output(&"o".repeat(300), 12), output("b", 1)],
+        );
+        let out = &job.outputs[0];
+        let name = download_file_name(&job, out, 12, &out.locations[11]);
+        let stem = name.strip_suffix(".ndjson").expect("extension");
+        assert_eq!(stem.chars().count(), DOWNLOAD_STEM_MAX_CHARS);
+        assert!(stem.ends_with(&format!("_{}_12", "o".repeat(DOWNLOAD_OUTPUT_MAX_CHARS))));
+    }
+
+    #[test]
+    fn download_extension_follows_the_format_then_the_location() {
+        for format in ["ndjson", "csv", "json", "parquet"] {
+            assert_eq!(download_extension(format, "/export/j/shard-0.bin"), format);
+        }
+        assert_eq!(
+            download_extension("tsv", "/export/j/shard-0.TSV?sig=a.b"),
+            "tsv"
+        );
+        assert_eq!(download_extension("tsv", "/export/j/shard-0"), "ndjson");
+        assert_eq!(download_extension("", ""), "ndjson");
     }
 
     #[test]
@@ -3122,8 +3664,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let i18n = I18n::from_tag("en").unwrap();
-        let rows = build_output_rows(&i18n, &job);
+        let rows = build_output_rows(&job);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "encounters");
         assert_eq!(rows[0].subject.as_ref().unwrap().kind_label, "SQL Query");
@@ -3134,8 +3675,13 @@ mod tests {
             "ViewDefinition"
         );
         assert_eq!(rows[1].files.len(), 2);
-        assert_eq!(rows[1].files[0].label, "patients-0.csv");
-        assert_eq!(rows[1].files[1].label, "patients-1.csv");
+        // Unnamed job with no stored format (the location gives `.csv`):
+        // card_name's subject names, then the output name (two outputs),
+        // then the 1-based shard (two shards).
+        assert_eq!(rows[0].files[0].label, "patients-encounters_encounters.csv");
+        assert_eq!(rows[1].files[0].label, "patients-encounters_patients_1.csv");
+        assert_eq!(rows[1].files[1].label, "patients-encounters_patients_2.csv");
+        assert_eq!(rows[1].files[1].href, "/export/job-1/patients-1.csv");
     }
 
     #[test]
@@ -3215,6 +3761,42 @@ mod tests {
         assert!(matches!(
             failure_notice(&job),
             Some(FailureNotice::Subject(name, _)) if name == "v03_counts"
+        ));
+    }
+
+    #[test]
+    fn failure_notice_names_the_subject_a_server_fault_result_attributes_the_failure_to() {
+        let mut job = ExportJob {
+            status: "failed".to_string(),
+            subjects: vec![subject("patients_flat", "view-definition")],
+            error: "the result endpoint returned 500 Internal Server Error: Export job 'abc' failed: The export failed because of a server error; see the server log for job abc.".to_string(),
+            ..Default::default()
+        };
+        // The message alone cannot be attributed: today's behaviour.
+        match failure_notice(&job) {
+            Some(FailureNotice::Generic(e)) => assert_eq!(e, job.error),
+            _ => panic!("expected the generic notice"),
+        }
+        job.failed_subject = "patients_flat".to_string();
+        match failure_notice(&job) {
+            Some(FailureNotice::Subject(name, rest)) => {
+                assert_eq!(name, "patients_flat");
+                assert_eq!(rest, job.error.strip_suffix('.').unwrap());
+            }
+            _ => panic!("expected the subject notice"),
+        }
+        job.failed_subject = "unrelated".to_string();
+        assert!(matches!(
+            failure_notice(&job),
+            Some(FailureNotice::Generic(_))
+        ));
+        // A 4xx message keeps its specific remainder.
+        job.failed_subject = "patients_flat".to_string();
+        job.error = "the result endpoint returned 422 Unprocessable Entity: Export job 'abc' failed: view 'patients_flat': invalid FHIRPath expression".to_string();
+        assert!(matches!(
+            failure_notice(&job),
+            Some(FailureNotice::Subject(name, rest))
+                if name == "patients_flat" && rest == "invalid FHIRPath expression"
         ));
     }
 

@@ -23,6 +23,14 @@ mod sof_run_tests {
     /// Wires the SQLite in-DB SOF runner into AppState — there is no
     /// in-process runner for the handler to fall back to.
     async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
+        create_test_server_with(|_| {}).await
+    }
+
+    /// Like [`create_test_server`], but lets the caller adjust the
+    /// `ServerConfig` (built from `for_testing()`) before the server starts.
+    async fn create_test_server_with(
+        configure: impl FnOnce(&mut ServerConfig),
+    ) -> (TestServer, Arc<SqliteBackend>) {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -32,7 +40,8 @@ mod sof_run_tests {
             .sof_runner()
             .expect("SqliteBackend must provide an in-DB SOF runner");
 
-        let config = ServerConfig::for_testing();
+        let mut config = ServerConfig::for_testing();
+        configure(&mut config);
         let state =
             helios_rest::AppState::new(Arc::clone(&backend), config).with_sof_runner(runner);
         let app = helios_rest::routing::fhir_routes::create_routes(state);
@@ -990,6 +999,54 @@ mod sof_run_tests {
         }
     }
 
+    /// A `resource` that names no compiled-in FHIR resource type
+    /// (`DiagnosticCode::UnknownResourceType`, #1014) is rejected by the
+    /// same pre-execution lint gate as any other structural problem: 422,
+    /// `OperationOutcome`, `code-invalid`. Previously this reached the
+    /// storage-backed compiler and produced zero rows instead of an error.
+    #[tokio::test]
+    async fn sql_run_rejects_an_inline_view_with_an_unknown_resource_type() {
+        let (server, _backend) = create_test_server().await;
+
+        let bad_view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Nope",
+            "status": "draft",
+            "select": [
+                { "column": [{ "name": "id", "path": "id" }] }
+            ]
+        });
+
+        let parameters_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": bad_view},
+            ]
+        });
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&parameters_body)
+            .await;
+
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value =
+            serde_json::from_str(&response.text()).expect("422 body must be valid JSON");
+        assert_eq!(body["resourceType"], "OperationOutcome");
+
+        let issues = body["issue"].as_array().expect("issue must be an array");
+        assert!(
+            issues.iter().any(|issue| issue["code"] == "code-invalid"
+                && issue["details"]["coding"][0]["code"] == "unknown-resource-type"),
+            "{issues:?}"
+        );
+    }
+
     /// A lint-clean inline ViewDefinition is unaffected by the new
     /// pre-execution lint gate (#821) and still runs to completion.
     #[tokio::test]
@@ -1105,6 +1162,236 @@ mod sof_run_tests {
     // Filter tests — `_since`, `patient`, `group`
     // =========================================================================
 
+    /// The in-DB runner's Parquet output is typed from the ViewDefinition
+    /// (#569): the request succeeds, is a Parquet file, and carries the
+    /// declared column names. The schema itself is asserted in the
+    /// `parquet_schema` / `test_parquet_column_types` tests of helios-sof.
+    #[tokio::test]
+    async fn test_run_indb_parquet_is_typed_from_the_view_definition() {
+        let (server, backend) = create_test_server_with_indb().await;
+        seed_patient(&backend, "p-parquet-1", "Typed").await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "patient_id", "type": "string"},
+                {"path": "active", "name": "is_active", "type": "boolean"}
+            ]}]
+        });
+        let response = server
+            .post("/$sql-run?_format=parquet")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&view)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let bytes = response.as_bytes().to_vec();
+        assert_eq!(&bytes[..4], b"PAR1");
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"patient_id"));
+        assert!(has(b"is_active"));
+    }
+
+    /// The Parquet schema follows the spec's default type table (#569):
+    /// `decimal` stays a string, `integer64` is Int64 and `instant` is a UTC
+    /// timestamp, read back from the bytes the in-DB runner produced.
+    #[tokio::test]
+    async fn test_run_indb_parquet_schema_follows_the_spec_type_table() {
+        use arrow_schema_check::*;
+
+        let (server, backend) = create_test_server_with_indb().await;
+        backend
+            .create(
+                &test_tenant(),
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o-parquet-types",
+                    "status": "final",
+                    "code": {"text": "t"},
+                    "effectiveInstant": "2024-03-05T10:20:30+02:00",
+                    "valueQuantity": {"value": 1.50},
+                    "component": [{"code": {"text": "c"}, "valueInteger": 5000000000i64}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("failed to seed observation");
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "obs_id", "type": "string"},
+                {"path": "valueQuantity.value", "name": "dec", "type": "decimal"},
+                {"path": "effectiveInstant", "name": "inst", "type": "instant"},
+                {"path": "component.first().valueInteger", "name": "big", "type": "integer64"}
+            ]}]
+        });
+        let response = server
+            .post("/$sql-run?_format=parquet")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&view)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let types = read_column_types(response.as_bytes().to_vec());
+        assert_eq!(types["obs_id"], "Utf8");
+        assert_eq!(types["dec"], "Utf8", "decimal is CHARACTER VARYING");
+        assert_eq!(types["big"], "Int64", "integer64 is BIGINT");
+        assert!(
+            types["inst"].starts_with("Timestamp(") && types["inst"].contains("UTC"),
+            "instant is TIMESTAMP WITH TIME ZONE, got {}",
+            types["inst"]
+        );
+    }
+
+    /// Reads the Arrow schema out of Parquet bytes (via the `parquet` crate's
+    /// Arrow reader) as `column name -> DataType debug string`.
+    mod arrow_schema_check {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::collections::HashMap;
+
+        pub fn read_column_types(bytes: Vec<u8>) -> HashMap<String, String> {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+                .expect("response is a readable Parquet file");
+            builder
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), format!("{:?}", f.data_type())))
+                .collect()
+        }
+    }
+
+    /// An unknown `ansi/type` tag is rejected deliberately, not ignored.
+    #[tokio::test]
+    async fn test_run_rejects_an_unknown_ansi_type_tag() {
+        let (server, backend) = create_test_server_with_indb().await;
+        seed_patient(&backend, "p-tag-1", "Tagged").await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "patient_id", "type": "string",
+                 "tag": [{"name": "ansi/type", "value": "NOT A TYPE"}]}
+            ]}]
+        });
+        let response = server
+            .post("/$sql-run?_format=parquet")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&view)
+            .await;
+        assert!(
+            response.status_code().is_client_error(),
+            "{}: {}",
+            response.status_code(),
+            response.text()
+        );
+    }
+
+    /// An unparsable `_since` is a `400` naming the parameter and the value,
+    /// as `$export` answers, never a silently dropped filter (#1550).
+    #[tokio::test]
+    async fn test_run_rejects_an_unparsable_since_with_400() {
+        let (server, backend) = create_test_server_with_indb().await;
+        seed_patient(&backend, "p-since-bad", "Any").await;
+
+        let flat_view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "patient_id", "type": "string"}]}]
+        });
+
+        for path in [
+            "/$sql-run?_format=ndjson&_since=yesterday",
+            "/$sql-run?_format=json&_since=yesterday&_limit=3",
+        ] {
+            let response = server
+                .post(path)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&flat_view)
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{path}: {}",
+                response.text()
+            );
+            let outcome: Value = response.json();
+            assert_eq!(outcome["resourceType"], "OperationOutcome");
+            let text = outcome["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(text.contains("_since"), "{path}: {text}");
+            assert!(text.contains("yesterday"), "{path}: {text}");
+        }
+
+        // The inline-resources path parses the same parameter.
+        let inline = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": flat_view},
+                {"name": "resource", "resource": {"resourceType": "Patient", "id": "inline-1"}}
+            ]
+        });
+        let response = server
+            .post("/$sql-run?_format=ndjson&_since=yesterday")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&inline)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "inline: {}",
+            response.text()
+        );
+        let outcome: Value = response.json();
+        let text = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            text.contains("_since") && text.contains("yesterday"),
+            "{text}"
+        );
+    }
+
     /// `_since` returns only resources whose `last_updated` is at or after the given instant.
     #[tokio::test]
     async fn test_run_view_definition_since_filter() {
@@ -1158,6 +1445,68 @@ mod sof_run_tests {
         assert_eq!(
             rows[0]["patient_id"], "p-since-2",
             "expected p-since-2 in the result: {rows:?}"
+        );
+    }
+
+    /// The inline-resources path keeps a resource whose `meta.lastUpdated` equals `_since`
+    /// (at or after, as the in-DB runners do), whether the stamp is written in UTC or with an
+    /// offset, and drops one without `meta.lastUpdated` (#1803).
+    #[tokio::test]
+    async fn test_inline_run_since_keeps_a_resource_updated_exactly_at_since() {
+        let (server, _backend) = create_test_server().await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "patient_id", "type": "string"}]}]
+        });
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": view},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "before",
+                    "meta": {"lastUpdated": "2023-12-31T23:59:59.999Z"}
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "at-utc",
+                    "meta": {"lastUpdated": "2024-01-01T00:00:00Z"}
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "at-offset",
+                    "meta": {"lastUpdated": "2024-01-01T05:00:00+05:00"}
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "no-meta"
+                }}
+            ]
+        });
+
+        // ndjson is a flat format, so the inline path filters twice (JSON helper, then the
+        // typed bundle filter); both must be inclusive for the equal-instant rows to survive.
+        let response = server
+            .post("/$sql-run?_format=ndjson&_since=2024-01-01T00:00:00Z")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let mut ids: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r["patient_id"].as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["at-offset", "at-utc"],
+            "_since is at-or-after; resources without meta.lastUpdated are excluded: {rows:?}"
         );
     }
 
@@ -1287,6 +1636,51 @@ mod sof_run_tests {
         );
     }
 
+    /// #1701: a `group` that resolves to no Patient refs (empty group,
+    /// Device-only group, missing group) selects nothing; it must not fall
+    /// back to an unfiltered run.
+    #[tokio::test]
+    async fn test_run_view_definition_group_without_patient_members_returns_no_rows() {
+        let (server, backend) = create_test_server_with_indb().await;
+
+        let tenant = test_tenant();
+        let resources = [
+            json!({"resourceType": "Patient", "id": "p-a", "active": true}),
+            json!({"resourceType": "Patient", "id": "p-b", "active": true}),
+            json!({"resourceType": "Group", "id": "g-empty", "type": "person", "actual": true}),
+            json!({
+                "resourceType": "Group",
+                "id": "g-devices",
+                "type": "device",
+                "actual": true,
+                "member": [{"entity": {"reference": "Device/d1"}}]
+            }),
+        ];
+        for res in resources {
+            let rt = res["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, res, FhirVersion::R4)
+                .await
+                .expect("failed to seed resource");
+        }
+
+        for group in ["Group/g-empty", "Group/g-devices", "Group/missing"] {
+            let response = server
+                .post(&format!("/$sql-run?_format=ndjson&group={group}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&patient_view_definition())
+                .await;
+            response.assert_status(StatusCode::OK);
+            let text = response.text();
+            let rows = text.lines().filter(|l| !l.trim().is_empty()).count();
+            assert_eq!(rows, 0, "group={group} must select nothing: {text}");
+        }
+    }
+
     // =========================================================================
     // Uncompilable view → 422 (no in-process fallback exists)
     // =========================================================================
@@ -1326,6 +1720,90 @@ mod sof_run_tests {
             .await;
 
         response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_run_computed_unnest_nul_returns_422() {
+        let (server, backend) = create_test_server().await;
+        backend
+            .create(
+                &test_tenant(),
+                "Patient",
+                json!({
+                    "resourceType": "Patient", "id": "computed-focus", "name": [{"family": "Smith"}],
+                    "extension": [{"url": "ab", "valueString": "yes"}, {"url": "a\0b", "valueString": "yes"}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed patient");
+
+        for iteration in ["forEach", "forEachOrNull"] {
+            for (path, status) in [
+                ("extension('ab').where(true).exists()", StatusCode::OK),
+                (
+                    "extension('a\\u0000b').where(true).exists()",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ),
+                (
+                    "extension('a\0b').where(true).exists()",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ),
+            ] {
+                let view = json!({
+                    "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+                    "where": [{"path": path}],
+                    "select": [{iteration: "name", "column": [{"path": "family", "name": "family"}]}]
+                });
+                let response = server
+                    .post("/$sql-run?_format=json")
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/fhir+json"),
+                    )
+                    .json(&view)
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    status,
+                    "{iteration} {path:?}: {}",
+                    response.text()
+                );
+                let body: Value = response.json();
+                if status == StatusCode::OK {
+                    assert_eq!(body, json!([{"family": "Smith"}]));
+                } else {
+                    assert_eq!(body["resourceType"], "OperationOutcome");
+                    assert!(
+                        body["issue"][0]["details"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("NUL"),
+                        "{body}"
+                    );
+                }
+            }
+        }
+
+        // Non-path forEach sources were already refused before emitting SQL.
+        // Preserve that boundary instead of widening the compiler's coverage.
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"forEach": "name.where(use = 'a\\u0000b').family",
+                "column": [{"path": "$this", "name": "family"}]}]
+        });
+        let response = server
+            .post("/$sql-run?_format=json")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&view)
+            .await;
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(response.text().contains("must be a simple JSON path"));
     }
 
     // =========================================================================
@@ -1446,6 +1924,93 @@ mod sof_run_tests {
         let families: Vec<&str> = rows.iter().filter_map(|r| r["family"].as_str()).collect();
         assert!(families.contains(&"InlineA"));
         assert!(families.contains(&"InlineB"));
+    }
+
+    // =========================================================================
+    // X-HFS-Runner header (opt-in via HFS_SOF_RUNNER_HEADER)
+    // =========================================================================
+
+    /// The three response paths that can carry `x-hfs-runner`: streaming
+    /// ndjson, a buffered format, and the inline-resources (in-process) path.
+    /// Returns the header value of each, in that order.
+    async fn runner_headers(server: &TestServer) -> [Option<String>; 3] {
+        let header_of = |response: &axum_test::TestResponse| {
+            response
+                .headers()
+                .get("x-hfs-runner")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        let streaming = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        streaming.assert_status(StatusCode::OK);
+
+        let buffered = server
+            .post("/$sql-run?_format=csv&header=true")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        buffered.assert_status(StatusCode::OK);
+
+        let inline_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": patient_view_definition()},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "inline-a",
+                    "name": [{"family": "InlineA"}]
+                }}
+            ]
+        });
+        let inline = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&inline_body)
+            .await;
+        inline.assert_status(StatusCode::OK);
+
+        [
+            header_of(&streaming),
+            header_of(&buffered),
+            header_of(&inline),
+        ]
+    }
+
+    /// By default `$sql-run` does not disclose the runner (and so the storage
+    /// backend) in a response header.
+    #[tokio::test]
+    async fn sql_run_omits_the_runner_header_by_default() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-runner-off", "Quiet").await;
+
+        assert_eq!(runner_headers(&server).await, [None, None, None]);
+    }
+
+    /// `HFS_SOF_RUNNER_HEADER` turns the `x-hfs-runner` header back on.
+    #[tokio::test]
+    async fn sql_run_names_the_runner_when_hfs_sof_runner_header_is_on() {
+        let (server, backend) = create_test_server_with(|c| c.sof_runner_header = true).await;
+        seed_patient(&backend, "pt-runner-on", "Loud").await;
+
+        assert_eq!(
+            runner_headers(&server).await,
+            [
+                Some("sqlite-indb".to_string()),
+                Some("sqlite-indb".to_string()),
+                Some("in-process".to_string()),
+            ]
+        );
     }
 
     // =========================================================================
@@ -2036,5 +2601,301 @@ mod sof_run_tests {
             1,
             "an unrelated unknown parameter must not block the run: {rows:?}"
         );
+    }
+
+    /// More than 1000 `patient` plus `group` values is a 400 naming the limit.
+    #[tokio::test]
+    async fn test_run_more_than_1000_patient_values_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let mut params =
+            vec![json!({"name": "subjectResource", "resource": patient_view_definition()})];
+        for i in 0..1001 {
+            params.push(json!({"name": "patient",
+                "valueReference": {"reference": format!("Patient/p{i}")}}));
+        }
+        let body = json!({"resourceType": "Parameters", "parameter": params});
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("1000"), "{text}");
+    }
+    /// The limit counts `patient` plus `group` together.
+    #[tokio::test]
+    async fn test_run_patient_plus_group_values_over_1000_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let mut params =
+            vec![json!({"name": "subjectResource", "resource": patient_view_definition()})];
+        for i in 0..501 {
+            params.push(json!({"name": "patient",
+                "valueReference": {"reference": format!("Patient/p{i}")}}));
+        }
+        for i in 0..500 {
+            params.push(json!({"name": "group",
+                "valueReference": {"reference": format!("Group/g{i}")}}));
+        }
+        let body = json!({"resourceType": "Parameters", "parameter": params});
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("1000"), "{text}");
+    }
+
+    /// The limit also applies to `patient` values carried in the query string.
+    #[tokio::test]
+    async fn test_run_more_than_1000_query_string_patient_values_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "subjectResource", "resource": patient_view_definition()}
+        ]});
+        let refs: Vec<String> = (0..1001).map(|i| format!("Patient/p{i}")).collect();
+        let path = format!("/$sql-run?_format=ndjson&patient={}", refs.join(","));
+
+        let response = server
+            .post(&path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("1000"), "{text}");
+    }
+    #[tokio::test]
+    async fn reference_parameters_hfs_rejects_unusable_entries_for_every_view_path() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "One").await;
+        seed_patient(&backend, "p2", "Two").await;
+        seed_view_definition(&backend, "refs-view", None, None).await;
+        for mode in ["inline-resources", "inline-view", "stored-view"] {
+            for name in ["patient", "group"] {
+                for value in [
+                    json!({"valueReference": {"identifier": {"system": "urn:s", "value": "v"}}}),
+                    json!({"valueReference": {"display": "target"}}),
+                    json!({"valueReference": {}}),
+                    json!({"valueReference": {"reference": ""}}),
+                    json!({"valueString": " \t "}),
+                    json!({"valueUri": "Patient/p1"}),
+                    json!({"valueIdentifier": {"value": "v"}}),
+                    json!({"valueInteger": 1}),
+                    json!({}),
+                ] {
+                    let mut entry = value;
+                    entry["name"] = json!(name);
+                    let subject = if mode == "stored-view" {
+                        json!({"name": "subjectReference", "valueReference": {"reference": "ViewDefinition/refs-view"}})
+                    } else {
+                        json!({"name": "subjectResource", "resource": patient_view_definition()})
+                    };
+                    let mut entries = vec![subject, entry.clone()];
+                    if mode == "inline-resources" {
+                        entries.push(json!({"name": "resource", "resource": {"resourceType": "Patient", "id": "inline-1"}}));
+                    }
+                    let body = json!({"resourceType": "Parameters", "parameter": entries});
+                    let response = server
+                        .post("/$sql-run")
+                        .add_header(X_TENANT_ID, "test-tenant")
+                        .json(&body)
+                        .await;
+                    assert_eq!(
+                        response.status_code(),
+                        StatusCode::BAD_REQUEST,
+                        "{mode}/{entry}: {}",
+                        response.text()
+                    );
+                    let outcome: Value = response.json();
+                    assert_eq!(outcome["resourceType"], "OperationOutcome");
+                    assert_eq!(outcome["issue"][0]["code"], "invalid");
+                    assert!(
+                        outcome["issue"][0]["details"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains(name),
+                        "{outcome}"
+                    );
+                }
+            }
+        }
+        for name in ["patient", "group"] {
+            let body = json!({"resourceType": "Parameters", "parameter": [
+                {"name": "subjectResource", "resource": patient_view_definition()},
+                {"name": name, "valueString": "p1"},
+                {"name": name, "valueReference": {"identifier": {"value": "v"}}}
+            ]});
+            let response = server
+                .post(&format!("/$sql-run?{name}=p1"))
+                .add_header(X_TENANT_ID, "test-tenant")
+                .json(&body)
+                .await;
+            response.assert_status(StatusCode::BAD_REQUEST);
+            assert!(response.text().contains(name));
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_parameters_hfs_normalizes_repeated_filters_on_inline_and_stored_runs() {
+        let (server, backend) = create_test_server().await;
+        for (id, family) in [("p1", "One"), ("p2", "Two"), ("p3", "Three")] {
+            seed_patient(&backend, id, family).await;
+        }
+        for (id, patient) in [("g1", "p1"), ("g2", "p2")] {
+            backend
+                .create(
+                    &test_tenant(),
+                    "Group",
+                    json!({
+                        "resourceType": "Group", "id": id, "type": "person", "actual": true,
+                        "member": [{"entity": {"reference": format!("Patient/{patient}")}}]
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        for inline in [false, true] {
+            for name in ["patient", "group"] {
+                let ty = if name == "patient" {
+                    "Patient"
+                } else {
+                    "Group"
+                };
+                let ids = if name == "patient" {
+                    ["p1", "p2"]
+                } else {
+                    ["g1", "g2"]
+                };
+                let mut entries = vec![
+                    json!({"name": "subjectResource", "resource": patient_view_definition()}),
+                    json!({"name": name, "valueReference": {"reference": format!(" {ty}/{} ", ids[0])}}),
+                    json!({"name": name, "valueString": format!(" {ty}/{} ", ids[1])}),
+                ];
+                if inline {
+                    for id in ["p1", "p2", "p3"] {
+                        entries.push(json!({"name": "resource", "resource": {"resourceType": "Patient", "id": id}}));
+                    }
+                    for (id, patient) in [("g1", "p1"), ("g2", "p2")] {
+                        entries.push(json!({"name": "resource", "resource": {
+                            "resourceType": "Group", "id": id, "type": "person", "actual": true,
+                            "member": [{"entity": {"reference": format!("Patient/{patient}")}}]
+                        }}));
+                    }
+                }
+                let body = json!({"resourceType": "Parameters", "parameter": entries});
+                let response = server
+                    .post("/$sql-run?_format=json")
+                    .add_header(X_TENANT_ID, "test-tenant")
+                    .json(&body)
+                    .await;
+                response.assert_status(StatusCode::OK);
+                let rows: Value = response.json();
+                let mut actual: Vec<_> = rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["patient_id"].as_str().unwrap())
+                    .collect();
+                actual.sort_unstable();
+                assert_eq!(actual, ["p1", "p2"], "inline={inline}, {name}: {rows}");
+            }
+        }
+    }
+
+    // =========================================================================
+    // Streamed parquet / arrow
+    // =========================================================================
+
+    async fn run_columnar(format: &str, patients: usize) -> axum_test::TestResponse {
+        let (server, backend) = create_test_server().await;
+        for i in 0..patients {
+            seed_patient(&backend, &format!("pt-{i:03}"), &format!("Family{i}")).await;
+        }
+        server
+            .post(&format!("/$sql-run?_format={format}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await
+    }
+
+    /// Stored data run as `_format=parquet` is streamed (chunked, no
+    /// `Content-Length`) and decodes to every seeded row.
+    #[tokio::test]
+    async fn test_run_stored_data_parquet_streams_and_decodes() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let response = run_columnar("parquet", 120).await;
+        response.assert_status(StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/vnd.apache.parquet"
+        );
+        assert!(
+            headers
+                .get("content-disposition")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("output.parquet"))
+        );
+        let bytes = response.as_bytes().clone();
+        assert!(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"));
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).expect("valid parquet");
+        let names: Vec<String> = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, ["patient_id", "family"]);
+        let total: usize = builder
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(total, 120);
+    }
+
+    /// Stored data run as `_format=arrow` decodes with the IPC stream reader.
+    #[tokio::test]
+    async fn test_run_stored_data_arrow_streams_and_decodes() {
+        let response = run_columnar("arrow", 120).await;
+        response.assert_status(StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/vnd.apache.arrow.stream"
+        );
+        let reader = arrow::ipc::reader::StreamReader::try_new(
+            std::io::Cursor::new(response.as_bytes().to_vec()),
+            None,
+        )
+        .expect("valid arrow stream");
+        let total: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(total, 120);
     }
 }

@@ -214,6 +214,7 @@ fn server_with_principal(scopes: &str) -> (TestServer, Arc<SqliteBackend>) {
         jti: None,
         expires_at: Utc::now() + chrono::Duration::hours(1),
         custom_claims: serde_json::Map::new(),
+        ..Default::default()
     };
 
     let app = helios_rest::routing::fhir_routes::create_routes(state).layer(
@@ -236,7 +237,7 @@ fn server_with_principal(scopes: &str) -> (TestServer, Arc<SqliteBackend>) {
 /// when the search index is dropped.
 ///
 /// Counts `Bundle.entry` rather than reading `Bundle.total`: `total` is only
-/// populated when the caller asks for it (`_total`), and is `null` otherwise —
+/// populated when the caller asks for it (`_total`), and absent otherwise —
 /// which would read as "no matches" for every search and make this helper
 /// useless as an assertion.
 async fn search_matches(server: &TestServer) -> usize {
@@ -424,20 +425,32 @@ async fn test_reindex_rebuilds_the_search_index() {
 
     // The rebuild runs in the background, so poll rather than assuming.
     let mut final_status = String::new();
+    let mut final_body = Value::Null;
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let status = server.get(&format!("/$reindex-status/{job_id}")).await;
         if status.status_code() != StatusCode::OK {
             continue;
         }
-        let state =
-            param_string(&status.json::<Value>(), "status", "valueCode").unwrap_or_default();
+        let body = status.json::<Value>();
+        let state = param_string(&body, "status", "valueCode").unwrap_or_default();
         if state == "completed" || state == "failed" || state == "cancelled" {
             final_status = state;
+            final_body = body;
             break;
         }
     }
     assert_eq!(final_status, "completed", "reindex job did not complete");
+
+    // A finished job reports when it started and completed, so its duration
+    // can be read from the status alone.
+    let instant = |name: &str| {
+        let value = param_string(&final_body, name, "valueDateTime")
+            .unwrap_or_else(|| panic!("{name} missing from a completed job's status"));
+        chrono::DateTime::parse_from_rfc3339(&value)
+            .unwrap_or_else(|e| panic!("{name} is not an RFC 3339 instant ({value}): {e}"))
+    };
+    assert!(instant("completedAt") >= instant("startedAt"));
 
     assert_eq!(
         search_matches(&server).await,
@@ -553,4 +566,261 @@ async fn test_reindex_type_route_is_reachable() {
         .post("/Patient/$reindex")
         .await
         .assert_status(StatusCode::ACCEPTED);
+}
+
+/// Reindex `start` audit events. The start event is recorded before the
+/// kick-off returns, so its absence after a rejected request means no job was
+/// started.
+fn reindex_starts(sink: &CollectorSink) -> usize {
+    sink.by_operation("reindex")
+        .iter()
+        .filter(|e| detail_map(e).get("phase").map(String::as_str) == Some("start"))
+        .count()
+}
+
+/// A body that is not JSON, or is too large to read, must not start a reindex
+/// with the defaults.
+#[tokio::test]
+async fn test_reindex_rejects_a_malformed_or_oversized_body() {
+    let (server, backend, sink) = server_with_ops();
+    seed(&backend, "p1").await;
+
+    let truncated =
+        r#"{"resourceType":"Parameters","parameter":[{"name":"clearExisting","valueBoolean":true}"#;
+    let oversized = " ".repeat(64 * 1024 + 1);
+    let cases = [
+        (truncated, "invalid JSON in reindex request body"),
+        (oversized.as_str(), "failed to read reindex request body"),
+    ];
+    for path in ["/$reindex", "/Patient/$reindex"] {
+        for (body, message) in cases {
+            let response = server.post(path).text(body).await;
+            response.assert_status(StatusCode::BAD_REQUEST);
+            assert!(
+                response.text().contains(message),
+                "{path}: {}",
+                response.text()
+            );
+        }
+    }
+    assert_eq!(
+        reindex_starts(&sink),
+        0,
+        "a rejected body must not start a job"
+    );
+
+    // The collector does see a job that really starts.
+    server
+        .post("/Patient/$reindex")
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    assert_eq!(reindex_starts(&sink), 1);
+}
+
+/// Polls `$reindex-status` until the job is terminal and returns its body.
+async fn wait_for_reindex(server: &TestServer, job_id: &str) -> Value {
+    for _ in 0..100 {
+        let status = server.get(&format!("/$reindex-status/{job_id}")).await;
+        if status.status_code() == StatusCode::OK {
+            let body = status.json::<Value>();
+            let state = param_string(&body, "status", "valueCode").unwrap_or_default();
+            if ["completed", "failed", "cancelled"].contains(&state.as_str()) {
+                return body;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("reindex job {job_id} did not finish");
+}
+
+fn reindex_parameters(parameter: Value) -> String {
+    json!({ "resourceType": "Parameters", "parameter": parameter }).to_string()
+}
+
+/// Each invalid `idStart` / `idEnd` / `clearOnly` combination is 400 before a
+/// job starts (#1739).
+#[tokio::test]
+async fn test_reindex_rejects_invalid_id_range_and_clear_only_parameters() {
+    let (server, backend, sink) = server_with_ops();
+    seed(&backend, "p1").await;
+
+    let cases = [
+        (
+            "/$reindex",
+            json!([{ "name": "idStart", "valueString": "4" }]),
+            "exactly one resource type",
+        ),
+        (
+            "/$reindex",
+            json!([{ "name": "idEnd", "valueString": "8" }]),
+            "exactly one resource type",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([
+                { "name": "idStart", "valueString": "8" },
+                { "name": "idEnd", "valueString": "4" }
+            ]),
+            "idStart must be less than idEnd",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([{ "name": "idStart", "valueString": "" }]),
+            "cannot be empty",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([{ "name": "idEnd", "valueInteger": 8 }]),
+            "idEnd requires valueString",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([
+                { "name": "idStart", "valueString": "4" },
+                { "name": "clearExisting", "valueBoolean": true }
+            ]),
+            "cannot be combined with clearExisting",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([
+                { "name": "idStart", "valueString": "4" },
+                { "name": "clearOnly", "valueBoolean": true }
+            ]),
+            "cannot be combined with clearOnly",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([{ "name": "clearOnly", "valueString": "true" }]),
+            "clearOnly requires valueBoolean",
+        ),
+    ];
+    for (path, parameter, message) in cases {
+        let response = server.post(path).text(reindex_parameters(parameter)).await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert!(
+            response.text().contains(message),
+            "{path}: {}",
+            response.text()
+        );
+    }
+    assert_eq!(
+        reindex_starts(&sink),
+        0,
+        "a rejected request must not start a job"
+    );
+}
+
+/// SQLite reindexes an id range (#1767): only the type's resources with an id
+/// in `[idStart, idEnd)` are counted and rebuilt.
+#[tokio::test]
+async fn test_reindex_id_range_rebuilds_only_ids_in_range() {
+    let (server, backend, sink) = server_with_ops();
+    for id in ["p1", "q1", "r1"] {
+        seed(&backend, id).await;
+    }
+
+    for (range, expected) in [
+        (
+            json!([
+                { "name": "idStart", "valueString": "p2" },
+                { "name": "idEnd", "valueString": "r" }
+            ]),
+            1,
+        ),
+        (json!([{ "name": "idStart", "valueString": "q" }]), 2),
+        (json!([{ "name": "idEnd", "valueString": "p1" }]), 0),
+    ] {
+        let kickoff = server
+            .post("/Patient/$reindex")
+            .text(reindex_parameters(range.clone()))
+            .await;
+        kickoff.assert_status(StatusCode::ACCEPTED);
+        let job_id =
+            param_string(&kickoff.json::<Value>(), "jobId", "valueString").expect("job id");
+        let status = wait_for_reindex(&server, &job_id).await;
+        assert_eq!(
+            param_string(&status, "status", "valueCode").as_deref(),
+            Some("completed"),
+            "{range}: {status}"
+        );
+        let integer = |name: &str| {
+            status["parameter"]
+                .as_array()
+                .and_then(|parameters| parameters.iter().find(|p| p["name"] == name))
+                .and_then(|p| p["valueInteger"].as_u64())
+        };
+        assert_eq!(integer("total"), Some(expected), "{range}: {status}");
+        assert_eq!(integer("processed"), Some(expected), "{range}: {status}");
+    }
+    assert_eq!(reindex_starts(&sink), 3);
+}
+
+/// `clearOnly` on one type clears that type's index, rebuilds nothing, and
+/// leaves other types searchable (#1739).
+#[tokio::test]
+async fn test_reindex_clear_only_clears_one_type_without_rebuilding() {
+    let (server, backend, _sink) = server_with_ops();
+    seed(&backend, "p1").await;
+    backend
+        .create(
+            &tenant(),
+            "Organization",
+            json!({"resourceType": "Organization", "id": "o1", "name": "Purgeable"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed organization");
+    let organizations = || async {
+        let response = server.get("/Organization?name=Purgeable").await;
+        response.assert_status_ok();
+        response.json::<Value>()["entry"]
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    assert_eq!(search_matches(&server).await, 1);
+    assert_eq!(organizations().await, 1);
+
+    let kickoff = server
+        .post("/Patient/$reindex")
+        .text(reindex_parameters(
+            json!([{ "name": "clearOnly", "valueBoolean": true }]),
+        ))
+        .await;
+    kickoff.assert_status(StatusCode::ACCEPTED);
+    let job_id = param_string(&kickoff.json::<Value>(), "jobId", "valueString").expect("job id");
+    let status = wait_for_reindex(&server, &job_id).await;
+
+    assert_eq!(
+        param_string(&status, "status", "valueCode").as_deref(),
+        Some("completed"),
+        "{status}"
+    );
+    let integer = |name: &str| {
+        status["parameter"]
+            .as_array()
+            .and_then(|parameters| parameters.iter().find(|p| p["name"] == name))
+            .and_then(|p| p["valueInteger"].as_u64())
+    };
+    assert_eq!(integer("total"), Some(0));
+    assert_eq!(integer("processed"), Some(0));
+    assert_eq!(
+        search_matches(&server).await,
+        0,
+        "the Patient index stays cleared"
+    );
+    assert_eq!(organizations().await, 1, "other types stay searchable");
+}
+
+/// The scope check comes before the body is read: a caller without the scope
+/// is refused with 403 whatever it sends.
+#[tokio::test]
+async fn test_reindex_scope_is_checked_before_the_body() {
+    let (server, _backend) = server_with_principal("system/Patient.cruds");
+
+    server
+        .post("/Patient/$reindex")
+        .text("{not-json")
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
 }

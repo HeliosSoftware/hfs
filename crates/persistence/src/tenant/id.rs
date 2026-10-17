@@ -47,8 +47,8 @@ pub const MAX_TENANT_ID_LEN: usize = 64;
 /// the shared-tenant sentinel past a check that only compares the whole id.
 ///
 /// Kept in sync with `backends::s3::keyspace::S3Keyspace`, which owns
-/// `tenants/`, `resources/`, `history/`, `bulk/`, `_system.user-settings/`, and
-/// `_system.bulk-submit/`.
+/// `tenants/`, `resources/`, `history/`, `bulk/`, `_system.user-settings/`,
+/// `_system.login-sessions/`, and `_system.bulk-submit/`.
 /// Each of those is *also* safe structurally — a tenant so named writes to a
 /// `resources/`/`history/` **sub**-prefix, which can never equal a control-plane
 /// leaf — so this list is defence in depth, not the proof. Do not delete the
@@ -60,6 +60,7 @@ pub const RESERVED_TENANT_SEGMENTS: &[&str] = &[
     "history",
     "bulk",
     "_system.user-settings",
+    "_system.login-sessions",
     "_system.bulk-submit",
     // Relative-path segments. No backend resolves `..`, but a tenant id flows
     // into object keys and filesystem-shaped paths, where a normalising

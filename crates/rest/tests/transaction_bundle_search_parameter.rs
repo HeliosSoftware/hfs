@@ -21,6 +21,10 @@ use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum_test::TestServer;
 use serde_json::{Value, json};
 
+#[cfg(feature = "postgres")]
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
 const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
 
 fn nickname_search_parameter() -> Value {
@@ -171,22 +175,29 @@ mod postgres_tests {
     use helios_rest::ServerConfig;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use testcontainers::ImageExt;
     use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, ImageExt};
     use testcontainers_modules::postgres::Postgres;
 
-    async fn server() -> TestServer {
+    /// Returns the server together with its container; the caller must keep
+    /// the container alive for the whole test so `Drop` removes it afterwards.
+    async fn server() -> (TestServer, ContainerAsync<Postgres>) {
         let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
         // Pin the major version. testcontainers-modules defaults to
         // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC the
         // backend sends as a startup option, so PG 11 rejects every connection
         // FATAL ("db error" from the pool). The rest of the repo runs 16.
-        let container = Postgres::default()
-            .with_tag("16-alpine")
-            .with_label("github.run_id", &run_id)
-            .start()
-            .await
-            .expect("failed to start PostgreSQL container");
+        // The cleanup label is a backstop: if `Drop` never runs (e.g. the
+        // process exits mid-test), the `container_cleanup` exit hook still
+        // removes the container.
+        let container = super::container_cleanup::with_cleanup_label(
+            Postgres::default()
+                .with_tag("16-alpine")
+                .with_label("github.run_id", &run_id),
+        )
+        .start()
+        .await
+        .expect("failed to start PostgreSQL container");
 
         let port = container
             .get_host_port_ipv4(5432)
@@ -219,10 +230,6 @@ mod postgres_tests {
             .await
             .expect("create PostgreSQL backend");
         backend.init_schema().await.expect("init schema");
-        // Container is intentionally leaked for the lifetime of the test
-        // process; each test gets its own container to avoid cross-test
-        // tenant-registry interference within one `SharedPg`-style pool.
-        std::mem::forget(container);
 
         let server_config = ServerConfig {
             base_url: "http://localhost:8080".to_string(),
@@ -231,12 +238,12 @@ mod postgres_tests {
         };
         let state = helios_rest::AppState::new(Arc::new(backend), server_config);
         let app = helios_rest::routing::fhir_routes::create_routes(state);
-        TestServer::new(app).expect("create test server")
+        (TestServer::new(app).expect("create test server"), container)
     }
 
     #[tokio::test]
     async fn postgres_transaction_bundle_search_parameter_takes_effect_immediately() {
-        let server = server().await;
+        let (server, _container) = server().await;
         assert_search_parameter_takes_effect_immediately(&server).await;
     }
 }

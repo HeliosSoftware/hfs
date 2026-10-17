@@ -56,7 +56,20 @@
           "code": "LNV"
         }
       ]
-    }
+    },
+    "bodyStructure": [
+      {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "49852007",
+              "display": "Structure of median cubital vein (body structure)"
+            }
+          ]
+        }
+      }
+    ]
   },
   "container": [
     {

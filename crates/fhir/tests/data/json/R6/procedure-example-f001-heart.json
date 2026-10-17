@@ -47,6 +47,19 @@
       }
     }
   ],
+  "bodyStructure": [
+    {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "17401000",
+            "display": "Heart valve structure"
+          }
+        ]
+      }
+    }
+  ],
   "outcome": [
     {
       "concept": {

@@ -22,6 +22,10 @@
     <display value="Inpatient"/>
   </encounter>
   <dateTime value="2014-09-17"/>
+  <requester>
+    <reference value="Practitioner/example"/>
+    <display value="Dr Adam Careful"/>
+  </requester>
   <allergyIntolerance>
     <reference value="AllergyIntolerance/example"/>
     <display value="Cashew Nuts"/>

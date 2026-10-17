@@ -173,6 +173,12 @@ fn merged_elements(
         out.extend(merged_elements(resolver, &type_schema, seen));
     }
 
+    // A recursive element (`Questionnaire.item.item`, ViewDefinition's nested
+    // `select`) takes the elements of the element it references.
+    if let Some(target) = referenced_element(resolver, schema, seen) {
+        out.extend(merged_elements(resolver, &target, seen));
+    }
+
     if let Some(elements) = &schema.elements {
         for (name, element) in elements {
             out.insert(name.clone(), Arc::clone(element));
@@ -180,6 +186,20 @@ fn merged_elements(
     }
 
     out
+}
+
+/// The element schema an `elementReference` points at, if it resolves and
+/// has not been visited on this walk (a reference cycle stops here).
+fn referenced_element(
+    resolver: &dyn SchemaResolver,
+    schema: &FhirSchema,
+    seen: &mut HashSet<String>,
+) -> Option<Arc<FhirSchema>> {
+    let segments = schema.element_reference.as_deref()?;
+    if !seen.insert(segments.join(".")) {
+        return None;
+    }
+    crate::engine::resolve_element_reference(resolver, segments)
 }
 
 /// The names required on this node, gathered across the same layers.
@@ -209,6 +229,9 @@ fn merged_required(
         && !type_schema.is_primitive()
     {
         out.extend(merged_required(resolver, &type_schema, seen));
+    }
+    if let Some(target) = referenced_element(resolver, schema, seen) {
+        out.extend(merged_required(resolver, &target, seen));
     }
     if let Some(required) = &schema.required {
         out.extend(required.iter().cloned());
@@ -1486,6 +1509,39 @@ mod tests {
         // itself — proof `merged_elements`'s base-chain walk backs this too.
         assert!(names.contains(&"id"), "{names:?}");
         assert!(names.contains(&"extension"), "{names:?}");
+    }
+
+    #[test]
+    fn recursive_elements_offer_the_elements_they_reference() {
+        let registry = registry();
+        // ViewDefinition's nested `select` and `unionAll` reference
+        // `ViewDefinition.select` by canonical URL; Questionnaire's nested
+        // `item` references `Questionnaire.item` by `#` path.
+        for (root, path) in [
+            ("ViewDefinition", &["select", "select"][..]),
+            ("ViewDefinition", &["select", "unionAll"][..]),
+            (
+                "ViewDefinition",
+                &["select", "select", "unionAll", "select"][..],
+            ),
+        ] {
+            let children = element_children(registry.as_ref(), root, path).expect("resolves");
+            let names = child_names(&children);
+            for name in [
+                "column",
+                "forEach",
+                "forEachOrNull",
+                "repeat",
+                "select",
+                "unionAll",
+            ] {
+                assert!(names.contains(&name), "{root}.{path:?}: {names:?}");
+            }
+        }
+        let children =
+            element_children(registry.as_ref(), "Questionnaire", &["item", "item"]).unwrap();
+        let names = child_names(&children);
+        assert!(names.contains(&"linkId"), "{names:?}");
     }
 
     #[test]

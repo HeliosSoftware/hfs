@@ -111,11 +111,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Narrative"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Narrative"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-09-14T16:43:45+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -137,7 +137,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <mapping>
     <identity value="rim"/>
     <uri value="http://hl7.org/v3"/>
@@ -271,7 +271,7 @@
         </extension>
         <strength value="required"/>
         <description value="The status of a resource narrative."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/narrative-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/narrative-status|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -345,7 +345,7 @@
         </extension>
         <strength value="required"/>
         <description value="The status of a resource narrative."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/narrative-status|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/narrative-status|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>

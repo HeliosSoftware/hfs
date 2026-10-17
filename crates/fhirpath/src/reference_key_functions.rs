@@ -100,6 +100,31 @@ pub fn get_reference_key_function(
     };
 
     match invocation_base {
+        // A repeating Reference element (e.g. Encounter.episodeOfCare) arrives as a
+        // collection, even when it holds a single item: map over the items and drop
+        // the ones that yield no key.
+        EvaluationResult::Collection {
+            items,
+            has_undefined_order,
+            ..
+        } => {
+            let mut keys = Vec::new();
+            for item in items {
+                match get_reference_key_function(item, args)? {
+                    EvaluationResult::Empty => {}
+                    key => keys.push(key),
+                }
+            }
+            Ok(match keys.len() {
+                0 => EvaluationResult::Empty,
+                1 => keys.remove(0),
+                _ => EvaluationResult::Collection {
+                    items: keys,
+                    has_undefined_order: *has_undefined_order,
+                    type_info: None,
+                },
+            })
+        }
         EvaluationResult::Object { map, .. } => {
             // Look for the reference field
             if let Some(reference_value) = map.get("reference") {
@@ -217,6 +242,58 @@ mod tests {
         let wrong_type_filter = EvaluationResult::String("Observation".to_string(), None, None);
         let result = get_reference_key_function(&reference, &[wrong_type_filter]).unwrap();
 
+        assert!(matches!(result, EvaluationResult::Empty));
+    }
+
+    #[test]
+    fn test_get_reference_key_function_on_collection() {
+        let reference = |value: &str| {
+            let mut map = HashMap::new();
+            map.insert(
+                "reference".to_string(),
+                EvaluationResult::String(value.to_string(), None, None),
+            );
+            EvaluationResult::Object {
+                map,
+                type_info: None,
+            }
+        };
+        let collection = |items| EvaluationResult::Collection {
+            items,
+            has_undefined_order: false,
+            type_info: None,
+        };
+        let filter = EvaluationResult::String("EpisodeOfCare".to_string(), None, None);
+
+        // A single-item collection yields the bare key
+        let single = collection(vec![reference("EpisodeOfCare/eoc1")]);
+        let result = get_reference_key_function(&single, std::slice::from_ref(&filter)).unwrap();
+        assert!(matches!(result, EvaluationResult::String(ref key, _, _) if key == "eoc1"));
+
+        // Items that do not match the type filter are dropped
+        let mixed = collection(vec![
+            reference("EpisodeOfCare/eoc1"),
+            reference("Patient/p1"),
+            reference("EpisodeOfCare/eoc2"),
+        ]);
+        let result = get_reference_key_function(&mixed, std::slice::from_ref(&filter)).unwrap();
+        match result {
+            EvaluationResult::Collection { items, .. } => {
+                let keys: Vec<_> = items
+                    .iter()
+                    .map(|item| match item {
+                        EvaluationResult::String(key, _, _) => key.as_str(),
+                        _ => panic!("Expected string item"),
+                    })
+                    .collect();
+                assert_eq!(keys, ["eoc1", "eoc2"]);
+            }
+            _ => panic!("Expected collection result"),
+        }
+
+        // Nothing matching yields Empty
+        let none = collection(vec![reference("Patient/p1")]);
+        let result = get_reference_key_function(&none, &[filter]).unwrap();
         assert!(matches!(result, EvaluationResult::Empty));
     }
 

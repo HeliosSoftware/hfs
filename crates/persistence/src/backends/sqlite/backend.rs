@@ -133,6 +133,9 @@ pub struct SqliteBackend {
     pool: Pool<SqliteConnectionManager>,
     config: SqliteBackendConfig,
     is_memory: bool,
+    /// The `-wal` file next to a file database, watched by WAL maintenance
+    /// without taking a pooled connection (#2025). `None` in memory.
+    wal_path: Option<std::path::PathBuf>,
     /// Per-tenant search parameter registries: a shared base (embedded + spec +
     /// custom) plus each tenant's stored (POSTed) overlay, built lazily.
     registries: Arc<TenantSearchRegistries>,
@@ -274,6 +277,10 @@ impl SqliteBackend {
             BackendCapability::Include,
             BackendCapability::Revinclude,
             BackendCapability::InDbSofRunner,
+            BackendCapability::ConditionalCreate,
+            BackendCapability::ConditionalUpdate,
+            BackendCapability::ConditionalDelete,
+            BackendCapability::ConditionalPatch,
             BackendCapability::SharedSchema,
         ]
     }
@@ -322,6 +329,7 @@ impl SqliteBackend {
         // them directly without dialect-specific shimming.
         let busy_timeout_ms = config.busy_timeout_ms;
         let enable_foreign_keys = config.enable_foreign_keys;
+        let enable_wal = config.enable_wal;
         let manager = manager.with_init(move |conn| {
             conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64))?;
             // The write path runs its statements through `prepare_cached`, so
@@ -359,6 +367,22 @@ impl SqliteBackend {
             // took 417/s -> 501/s on the multi-row branch (commit -> 0.55 ms).
             // Cost: the -wal file grows to ~200 MiB under sustained writes.
             conn.execute_batch("PRAGMA wal_autocheckpoint = 50000;")?;
+            // synchronous=NORMAL is SQLite's recommended durability level for
+            // WAL: it fsyncs the WAL only at checkpoint instead of on every
+            // commit, which is where the bulk-ingest write path spent ~45% of
+            // its wall (#947). It stays corruption-safe in WAL — a crash can
+            // lose only transactions committed since the last checkpoint, never
+            // the database itself. Applied only when WAL is on: NORMAL under a
+            // rollback journal is not crash-safe, and an in-memory database
+            // never fsyncs anyway.
+            if enable_wal && !is_memory {
+                conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+                // Without a limit the -wal file keeps its high-water size
+                // after every reset: once concurrent writes had grown it to
+                // 36 GB it stayed there, and every start rebuilt its index
+                // (#2025). With it, SQLite truncates the file at each reset.
+                conn.execute_batch("PRAGMA journal_size_limit = 268435456;")?;
+            }
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
@@ -484,10 +508,16 @@ impl SqliteBackend {
             );
         }
 
+        let wal_path = (!is_memory).then(|| {
+            let mut wal = path.as_ref().as_os_str().to_owned();
+            wal.push("-wal");
+            std::path::PathBuf::from(wal)
+        });
         let backend = Self {
             pool,
             config,
             is_memory,
+            wal_path,
             registries,
         };
 
@@ -581,6 +611,16 @@ impl SqliteBackend {
     /// completion on the blocking thread and keeps holding its pooled
     /// connection until it does. Expensive scans must therefore still be
     /// bounded at the query level, not by racing a timeout against them.
+    ///
+    /// The same holds earlier on: a future dropped while its task is still
+    /// waiting in `pool.get()` does not withdraw the work. The task goes on
+    /// waiting, and when a connection frees up it acquires it and runs the
+    /// closure with nobody left to read the result. SQLite's `busy_timeout`
+    /// does not help here either: it bounds how long a statement waits for a
+    /// lock, not how long a statement runs once it has one. The storage tests
+    /// `abandoned_run_blocking_keeps_its_connection_until_the_closure_ends` and
+    /// `run_blocking_abandoned_while_acquiring_still_runs_its_closure` pin both
+    /// halves (#1827).
     ///
     /// # Diagnostics
     ///
@@ -696,6 +736,11 @@ impl SqliteBackend {
         }
 
         Ok(())
+    }
+
+    /// The `-wal` file of a file database, `None` in memory.
+    pub(super) fn wal_path(&self) -> Option<&std::path::Path> {
+        self.wal_path.as_deref()
     }
 
     /// Returns whether this is an in-memory database.
@@ -974,6 +1019,35 @@ mod tests {
         let backend = SqliteBackend::in_memory().unwrap();
         backend.init_schema().unwrap();
         backend.init_schema().unwrap(); // Should be idempotent
+    }
+
+    #[test]
+    fn file_backend_uses_synchronous_normal_under_wal() {
+        // NORMAL is only crash-safe paired with WAL, so this rides on a real
+        // file-backed (WAL) backend rather than the in-memory one, whose
+        // connections never fsync anyway (#947).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.db");
+        let backend = SqliteBackend::with_config(&path, SqliteBackendConfig::default()).unwrap();
+        backend.init_schema().unwrap();
+
+        let conn = backend.get_connection().unwrap();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            journal.to_lowercase(),
+            "wal",
+            "file backend should be in WAL"
+        );
+        // synchronous: 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA.
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            synchronous, 1,
+            "a WAL file backend should use synchronous=NORMAL"
+        );
     }
 
     #[test]

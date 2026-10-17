@@ -45,7 +45,6 @@
   <preferredReportName value="Creatine Kinase, MB and Relative Percent"/>
   <!-- Panel-level qualified value for cardiac assessment -->
   <qualifiedValue>
-    <condition/>
     <context>
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/referencerange-meaning"/>
@@ -53,8 +52,9 @@
         <display value="Normal Range"/>
       </coding>
     </context>
+    <condition value="Myocardial infarction"/>
     <rangeCategory value="reference"/>
-    <validCodedValueSet/>
+    <validCodedValueSet value="http://hl7.org/fhir/ValueSet/observation-status"/>
   </qualifiedValue>
   <!-- Component 1: Total Creatine Kinase -->
   <component>
@@ -73,7 +73,6 @@
       <display value="U/L"/>
     </permittedUnit>
     <qualifiedValue>
-      <condition/>
       <context>
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/referencerange-meaning"/>
@@ -81,6 +80,7 @@
           <display value="Normal Range"/>
         </coding>
       </context>
+      <condition value="Myocardial infarction"/>
       <rangeCategory value="reference"/>
       <range>
         <low>
@@ -115,7 +115,6 @@
       <display value="ng/mL"/>
     </permittedUnit>
     <qualifiedValue>
-      <condition/>
       <context>
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/referencerange-meaning"/>
@@ -123,6 +122,7 @@
           <display value="Normal Range"/>
         </coding>
       </context>
+      <condition value="Myocardial infarction"/>
       <rangeCategory value="reference"/>
       <range>
         <low>
@@ -157,7 +157,6 @@
       <display value="%"/>
     </permittedUnit>
     <qualifiedValue>
-      <condition/>
       <context>
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/referencerange-meaning"/>
@@ -165,6 +164,7 @@
           <display value="Normal Range"/>
         </coding>
       </context>
+      <condition value="Myocardial infarction"/>
       <rangeCategory value="reference"/>
       <range>
         <low>

@@ -107,13 +107,17 @@ pub use upstream::{
 /// [`Chrome::user_menu`].
 ///
 /// The `helios-ui-chrome` crate that #799 introduced owns **markup only**. The
-/// reach across into `../ui/assets` therefore stays exactly as it is: moving
+/// reach across into `../ui/assets` (via the `ui-assets` symlink, so the
+/// published tarball carries the bytes) therefore stays exactly as it is: moving
 /// the CSS, the vendored htmx and the JS behind a crate boundary is gated on
 /// #543, which has to settle asset *ownership* first. Until then this embed is
 /// the single source of those bytes for both binaries, and nothing here is
 /// waiting on a later phase.
 #[derive(Clone, RustEmbed)]
-#[folder = "../ui/assets"]
+// `build.rs` sets the cfg when the `ui-assets` symlink did not materialize as
+// a directory (Windows checkout without `core.symlinks`, #1257).
+#[cfg_attr(not(helios_workspace_ui_assets), folder = "ui-assets")]
+#[cfg_attr(helios_workspace_ui_assets, folder = "../ui/assets")]
 struct Assets;
 
 /// Shared router state: values that are constant for the process lifetime.

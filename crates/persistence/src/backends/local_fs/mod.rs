@@ -1,7 +1,10 @@
 //! Local-filesystem [`ExportOutputStore`] for single-instance bulk export.
 //!
 //! Writes NDJSON output parts under `{root}/{tenant}/{job_id}/` and serves
-//! download URLs through HFS itself (`requires_access_token = true`).
+//! download URLs through HFS itself. Whether those URLs need the kickoff access
+//! token is set at construction (`true` when auth is enabled, `false` when it is
+//! not) rather than assumed, so the manifest's `requiresAccessToken` matches
+//! what the file endpoint actually enforces (#1269).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,18 +28,33 @@ pub struct LocalFsOutputStore {
     root: PathBuf,
     /// Base URL used to construct HFS-served download URLs.
     base_url: String,
+    /// Whether the HFS-served download URLs require the kickoff access token —
+    /// advertised to clients as the manifest's `requiresAccessToken` (#1269).
+    requires_access_token: bool,
 }
 
 impl LocalFsOutputStore {
     /// Creates a new local-filesystem output store.
     ///
     /// `root` is the directory under which `{tenant}/{job_id}/...` is created;
-    /// `base_url` is the HFS base URL used for download links.
+    /// `base_url` is the HFS base URL used for download links. The download URLs
+    /// require an access token by default; call
+    /// [`with_access_token_required`](Self::with_access_token_required) to set it
+    /// from the deployment's auth state.
     pub fn new(root: impl Into<PathBuf>, base_url: impl Into<String>) -> Self {
         Self {
             root: root.into(),
             base_url: base_url.into(),
+            requires_access_token: true,
         }
+    }
+
+    /// Sets whether the served download URLs require the kickoff access token.
+    /// Pass the deployment's auth-enabled state: with auth off the file endpoint
+    /// serves without a token, so the manifest must not claim one is needed.
+    pub fn with_access_token_required(mut self, required: bool) -> Self {
+        self.requires_access_token = required;
+        self
     }
 
     /// The directory holding all parts for a single job.
@@ -134,7 +152,7 @@ impl ExportOutputStore for LocalFsOutputStore {
                 "{}/export-file/{}/{}-{}",
                 base, key.job_id, key.resource_type, key.part_index
             ),
-            requires_access_token: true,
+            requires_access_token: self.requires_access_token,
         })
     }
 
@@ -159,13 +177,58 @@ impl ExportOutputStore for LocalFsOutputStore {
     }
 }
 
+/// How many times a job-directory removal is attempted when a concurrent
+/// writer keeps it non-empty. A running export worker adds at most one part
+/// between the cancel and its next batch gate, so a handful of short retries
+/// outlasts it.
+const REMOVE_DIR_ATTEMPTS: usize = 20;
+const REMOVE_DIR_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 /// Removes a directory if it exists; a missing directory is `Ok`.
 async fn delete_dir_idempotent(dir: &Path) -> StorageResult<()> {
-    match tokio::fs::remove_dir_all(dir).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io_err(format!("remove_dir_all {}: {e}", dir.display()))),
+    remove_dir_all_retrying(dir, REMOVE_DIR_ATTEMPTS, |d| {
+        tokio::fs::remove_dir_all(d.to_path_buf())
+    })
+    .await
+}
+
+/// Removes `dir` and everything under it with `remove`. A missing directory
+/// is `Ok`. A part finalized into the directory while it is being walked
+/// makes the final `rmdir` fail with `DirectoryNotEmpty` (or, on Windows, a
+/// part still open fails with a sharing violation); that is retried up
+/// to `attempts` times, pausing [`REMOVE_DIR_RETRY_DELAY`] between attempts.
+/// Any other failure is returned at once.
+async fn remove_dir_all_retrying<F, Fut>(
+    dir: &Path,
+    attempts: usize,
+    mut remove: F,
+) -> StorageResult<()>
+where
+    F: FnMut(&Path) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match remove(dir).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if is_transient_remove_error(&e) && attempt < attempts => {
+                tokio::time::sleep(REMOVE_DIR_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(io_err(format!("remove_dir_all {}: {e}", dir.display()))),
+        }
     }
+}
+
+/// Whether a failed removal is the writer race and worth retrying: the final
+/// `rmdir` found a part landed after the walk (`DirectoryNotEmpty`), or, on
+/// Windows, a part the writer still holds open could not be deleted
+/// (`ERROR_SHARING_VIOLATION`, os error 32, which std leaves uncategorized).
+fn is_transient_remove_error(e: &std::io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || (cfg!(windows) && e.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
 }
 
 #[cfg(test)]
@@ -229,6 +292,30 @@ mod tests {
         // Idempotent: deleting again is fine.
         store.delete_job_outputs(&tenant, &job).await.unwrap();
         assert!(store.open_reader(&key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn download_url_reflects_the_configured_token_requirement() {
+        let job = ExportJobId::new();
+        let key = test_key(&job);
+
+        // Default (auth enabled): the served URL needs the kickoff token.
+        let store = LocalFsOutputStore::new("/unused", "http://localhost:8080");
+        let url = store
+            .download_url(&key, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(url.requires_access_token);
+
+        // Auth disabled: the file endpoint serves without a token, so the
+        // manifest must not claim one is required (#1269).
+        let store = LocalFsOutputStore::new("/unused", "http://localhost:8080")
+            .with_access_token_required(false);
+        let url = store
+            .download_url(&key, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(!url.requires_access_token);
     }
 
     #[tokio::test]
@@ -441,5 +528,115 @@ mod tests {
         assert_eq!(state.paths_at_drop, Some((true, false)));
         assert!(!store.tmp_path(&key).exists());
         assert!(store.part_path(&key).exists());
+    }
+
+    fn not_empty() -> io::Error {
+        io::Error::new(io::ErrorKind::DirectoryNotEmpty, "Directory not empty")
+    }
+
+    /// The cancel race: a worker finalizes a part while the handler walks the
+    /// job directory, so the first removal reports `DirectoryNotEmpty`. The
+    /// next attempt finds the directory quiet and removes it.
+    #[tokio::test]
+    async fn remove_dir_retries_when_a_concurrent_writer_keeps_it_non_empty() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let result = remove_dir_all_retrying(Path::new("/job"), 5, move |_| {
+            let seen = Arc::clone(&seen);
+            async move {
+                let mut n = seen.lock().unwrap();
+                *n += 1;
+                if *n < 3 { Err(not_empty()) } else { Ok(()) }
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "the removal should succeed once the directory is quiet"
+        );
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    /// The retries are bounded: a directory that never empties is reported
+    /// after exactly `attempts` removals, naming the directory.
+    #[tokio::test]
+    async fn remove_dir_gives_up_after_the_attempt_budget() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let err = remove_dir_all_retrying(Path::new("/busy"), 4, move |_| {
+            let seen = Arc::clone(&seen);
+            async move {
+                *seen.lock().unwrap() += 1;
+                Err(not_empty())
+            }
+        })
+        .await
+        .expect_err("a directory that never empties is an error");
+        assert_eq!(*calls.lock().unwrap(), 4);
+        assert!(err.to_string().contains("/busy"), "{err}");
+        assert!(err.to_string().contains("Directory not empty"), "{err}");
+    }
+
+    /// Only the race is retried. A missing directory is success on the first
+    /// call and any other failure is returned without a second attempt.
+    #[tokio::test]
+    async fn remove_dir_does_not_retry_other_outcomes() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let missing = remove_dir_all_retrying(Path::new("/gone"), 5, move |_| {
+            let seen = Arc::clone(&seen);
+            async move {
+                *seen.lock().unwrap() += 1;
+                Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
+            }
+        })
+        .await;
+        assert!(missing.is_ok());
+        assert_eq!(*calls.lock().unwrap(), 1);
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let denied = remove_dir_all_retrying(Path::new("/denied"), 5, move |_| {
+            let seen = Arc::clone(&seen);
+            async move {
+                *seen.lock().unwrap() += 1;
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            }
+        })
+        .await;
+        assert!(denied.is_err());
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    /// End to end on a real directory: files keep landing in the job
+    /// directory while it is being removed, as a worker's parts do, and every
+    /// removal still returns `Ok`.
+    #[tokio::test]
+    async fn delete_job_outputs_survives_parts_landing_during_the_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalFsOutputStore::new(tmp.path(), "http://localhost:8080");
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let job = ExportJobId::from_string("racing");
+        let dir = store.job_dir(tenant.tenant_id().as_str(), &job);
+
+        let writer_dir = dir.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            for i in 0..200 {
+                // Windows refuses to recreate a directory that is still
+                // pending deletion (ERROR_ALREADY_EXISTS); the writer only
+                // needs to keep landing files where it can.
+                let _ = std::fs::create_dir_all(&writer_dir);
+                let _ = std::fs::write(
+                    writer_dir.join(format!("output-Patient-{i}-1.ndjson")),
+                    b"{}\n",
+                );
+            }
+        });
+        for _ in 0..50 {
+            store.delete_job_outputs(&tenant, &job).await.unwrap();
+        }
+        writer.await.unwrap();
+        store.delete_job_outputs(&tenant, &job).await.unwrap();
+        assert!(!dir.exists(), "the last sweep leaves no directory behind");
     }
 }

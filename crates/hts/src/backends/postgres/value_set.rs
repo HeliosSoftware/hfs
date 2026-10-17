@@ -14,8 +14,8 @@ use crate::types::{
     ValidateCodeResponse,
 };
 
-use super::PostgresTerminologyBackend;
 use super::code_system::build_synthetic_resource;
+use super::{PostgresTerminologyBackend, error_chain};
 
 // ── Iter 7k+: process-global cache for the closure COUNT(*) query ──────────
 // `SELECT COUNT(*) FROM concept_closure WHERE (system_id, ancestor_code) =
@@ -279,7 +279,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         let mut compose_is_enumerated = false;
         let all_codes: Vec<ExpansionContains> = if let Some(url) = req.url.as_deref() {
@@ -385,7 +385,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             &[&system_id, &root_code, &prefix_limit],
                         )
                         .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
                     let complete = rows.len() <= CLOSURE_PREFIX_LEN;
                     let prefix: Vec<(String, Option<String>)> = rows
@@ -409,7 +409,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 &[&system_id, &root_code],
                             )
                             .await
-                            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                         let c: i64 = total_row.get(0);
                         c.max(0) as u32
                     };
@@ -814,7 +814,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                         &[&system_id_isa, &root_code_isa],
                                     )
                                     .await
-                                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                                 let c: i64 = total_row.get(0);
                                 let c = c.max(0) as u32;
                                 closure_count_put(&system_id_isa, &root_code_isa, c);
@@ -853,7 +853,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             let rows = client
                                 .query(page_sql, &[&system_id_isa, &root_code_isa, &limit, &offset])
                                 .await
-                                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
                             let contains: Vec<ExpansionContains> = rows
                                 .into_iter()
@@ -1035,7 +1035,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         Ok(lookup_value_set_version(&client, url).await)
     }
 
@@ -1064,7 +1064,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         // ?fhir_vs URLs: a persisted stub VS with one of those canonical URLs
         // would expand to zero codes and force result=false for every input —
@@ -1748,6 +1748,14 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         )
     }
 
+    async fn count(
+        &self,
+        _ctx: &TenantContext,
+        query: ResourceSearchQuery,
+    ) -> Result<u64, HtsError> {
+        self.count_search_matches("value_sets", query).await
+    }
+
     /// Search ValueSet resources by query parameters.
     ///
     /// `url`, `version`, and `status` use exact matching. `name` and `title`
@@ -1767,7 +1775,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
         if !string_search.is_empty() {
             return super::search_resources(
@@ -1805,7 +1813,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 ],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -1863,7 +1871,7 @@ async fn resolve_value_set_versioned(
     let rows = client
         .query(&sql, &[&url, &date])
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     if rows.is_empty() {
         let qualified = match version {
@@ -1904,7 +1912,7 @@ async fn fetch_cache(
             &[&vs_id],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -2363,7 +2371,7 @@ async fn compute_expansion_inner_body(
                             &[&system_id, &code],
                         )
                         .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?
+                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
                     {
                         Some(r) => r,
                         None => continue,
@@ -2414,7 +2422,7 @@ async fn compute_expansion_inner_body(
                             &[&system_id, &parent_code],
                         )
                         .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                     for row in child_rows {
                         let child_code: String = row.get(0);
                         let child_display: Option<String> = row.get(1);
@@ -2450,7 +2458,7 @@ async fn compute_expansion_inner_body(
                         &[&system_id],
                     )
                     .await
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                 code_rows
                     .into_iter()
                     .map(|row| ExpansionContains {
@@ -2674,7 +2682,7 @@ async fn compute_expansion_inner_body(
                             &[&exc_system_id],
                         )
                         .await
-                        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
                     rows.into_iter().map(|r| r.get::<_, String>(0)).collect()
                 };
                 for code in codes_to_deny {
@@ -2858,11 +2866,10 @@ async fn pg_expand_vs_reference(
 ///   root (including the root itself).
 /// - `regex`: POSIX ERE match against `code` or `display` via PG's `~`.
 ///
-/// Unsupported ops (`descendent-of`, `descendant-of`, `generalizes`, `in`
-/// multi-value, `not-in`, `exists`, `child-of`, …) currently emit a
-/// `tracing::warn!` and contribute an empty set to the AND, which collapses
-/// the include. TODO: parity — these are handled in SQLite via
-/// [`crates::hts::backends::sqlite::value_set::apply_compose_filters`].
+/// Also supported: `descendent-of`, `child-of`, `!=`, `is-not-a`,
+/// `generalizes`, and comma-separated `in` / `not-in`. Unknown ops (e.g.
+/// `exists`) emit a `tracing::warn!` and contribute an empty set to the AND,
+/// which collapses the include.
 async fn apply_compose_filters_pg(
     client: &tokio_postgres::Client,
     system_url: &str,
@@ -2939,6 +2946,21 @@ async fn apply_compose_filters_pg(
             "in" if !value.contains(',') => {
                 pg_filter_property_eq(client, system_url, system_id, property, value).await?
             }
+            // Multi-value `in`: union of the per-value equality matches.
+            "in" => {
+                let mut union: Vec<(String, Option<String>)> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for v in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    for (code, display) in
+                        pg_filter_property_eq(client, system_url, system_id, property, v).await?
+                    {
+                        if seen.insert(code.clone()) {
+                            union.push((code, display));
+                        }
+                    }
+                }
+                union
+            }
             "is-a" => pg_filter_is_a(client, system_url, system_id, value).await?,
             // `descendent-of` is `is-a` minus the root itself — strict subtree.
             // The IG `other/dual-filter` fixture uses
@@ -2959,9 +2981,33 @@ async fn apply_compose_filters_pg(
             "not-in" if !value.contains(',') => {
                 pg_filter_property_ne(client, system_url, system_id, property, value).await?
             }
+            // Multi-value `not-in`: every concept whose property is none of
+            // the listed values (concepts lacking the property pass).
+            "not-in" => {
+                let mut acc: Option<Vec<(String, Option<String>)>> = None;
+                for v in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    let ne =
+                        pg_filter_property_ne(client, system_url, system_id, property, v).await?;
+                    acc = Some(match acc {
+                        None => ne,
+                        Some(prev) => {
+                            let keep: HashSet<&str> = ne.iter().map(|(c, _)| c.as_str()).collect();
+                            prev.into_iter()
+                                .filter(|(c, _)| keep.contains(c.as_str()))
+                                .collect()
+                        }
+                    });
+                }
+                acc.unwrap_or_default()
+            }
+            // `is-not-a`: every concept of the system minus the closure of the
+            // root (root included).
+            "is-not-a" => pg_filter_is_not_a(client, system_url, system_id, value).await?,
+            // `generalizes`: the concept itself plus all of its ancestors.
+            "generalizes" => pg_filter_generalizes(client, system_url, system_id, value).await?,
             other => {
-                // TODO: parity — SQLite also handles descendent-of/generalizes/
-                // exists/multi-value-in. Treat them as empty set so the
+                // TODO: parity — SQLite also handles exists. Treat unknown
+                // ops as the empty set so the
                 // include collapses (rather than panicking or accidentally
                 // returning every concept).
                 tracing::warn!(
@@ -3055,7 +3101,7 @@ async fn pg_filter_property_eq(
             &[&system_id, &property_aliases, &value],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -3092,7 +3138,7 @@ async fn pg_filter_property_ne(
             &[&system_id, &property_aliases, &value],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -3134,7 +3180,74 @@ async fn pg_filter_is_a(
             &[&system_id, &root_code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// `is-not-a`: every concept in `system_id` except `root_code` and its
+/// descendants.
+async fn pg_filter_is_not_a(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    root_code: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    if root_code.is_empty() {
+        return Err(HtsError::VsInvalid(format!(
+            "The system {system_url} filter with property = concept, op = is-not-a has no value"
+        )));
+    }
+
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concepts c
+              WHERE c.system_id = $1
+                AND NOT EXISTS (
+                    SELECT 1 FROM concept_closure cc
+                     WHERE cc.system_id = $1
+                       AND cc.ancestor_code = $2
+                       AND cc.descendant_code = c.code
+                )",
+            &[&system_id, &root_code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// `generalizes`: `code` itself plus every ancestor (closure rows where
+/// `code` is the descendant).
+async fn pg_filter_generalizes(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    code: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    if code.is_empty() {
+        return Err(HtsError::VsInvalid(format!(
+            "The system {system_url} filter with property = concept, op = generalizes has no value"
+        )));
+    }
+
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concept_closure cc
+               JOIN concepts c ON c.system_id = $1 AND c.code = cc.ancestor_code
+              WHERE cc.system_id = $1 AND cc.descendant_code = $2",
+            &[&system_id, &code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -3167,7 +3280,7 @@ async fn pg_filter_child_of(
             &[&system_id, &parent_code],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(rows
         .into_iter()
@@ -3201,7 +3314,7 @@ async fn pg_filter_regex(
                     &[&system_id, &anchored_sql],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             Ok(rows
                 .into_iter()
                 .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
@@ -3215,7 +3328,7 @@ async fn pg_filter_regex(
                     &[&system_id, &anchored_sql],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
             Ok(rows
                 .into_iter()
                 .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
@@ -3246,7 +3359,7 @@ async fn pg_filter_regex(
                     &[&system_id, &property],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
             // A concept may have multiple values for the same property; keep
             // it if any value matches. Dedupe by code in case more than one
@@ -3288,7 +3401,7 @@ async fn resolve_compose_system_id(
     let rows = client
         .query(&sql, &[&url])
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     let candidates: Vec<(String, Option<String>)> = rows
         .into_iter()
@@ -3356,7 +3469,7 @@ async fn find_cs_for_implicit_vs(
             &[&vs_url, &date],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     rows.into_iter()
         .next()
@@ -3398,7 +3511,7 @@ async fn build_hierarchical_expansion(
         let rows = client
             .query(&sql, &[sys_url])
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         if let Some(row) = rows.into_iter().next() {
             system_id_map.insert(sys_url.clone(), row.get(0));
         }
@@ -3414,7 +3527,7 @@ async fn build_hierarchical_expansion(
                 &[sys_id],
             )
             .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
         for row in edge_rows {
             let parent_code: String = row.get(0);
@@ -3482,14 +3595,14 @@ async fn populate_cache(
     let tx = client
         .transaction()
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     tx.execute(
         "DELETE FROM value_set_expansions WHERE value_set_id = $1",
         &[&vs_id],
     )
     .await
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     // Bulk-insert via UNNEST over four parallel arrays. Replaces 5,975
     // per-row roundtrips with one query for a typical VSAC VS — measurable
@@ -3517,12 +3630,12 @@ async fn populate_cache(
             &[&vs_id, &systems, &codes_arr, &displays, &versions],
         )
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     }
 
     tx.commit()
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
     Ok(())
 }
@@ -3659,7 +3772,7 @@ async fn resolve_system_id_pg(
     let row = client
         .query_opt(&sql, &[&cs_url])
         .await
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
     Ok(row.map(|r| r.get::<_, String>(0)))
 }
 
@@ -3700,7 +3813,7 @@ async fn validate_fhir_vs(
                     &[&system_id, &code],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
             Ok(row.map(|r| ExpansionContains {
                 system: cs_url.to_owned(),
@@ -3730,7 +3843,7 @@ async fn validate_fhir_vs(
                     &[&system_id, &root_code, &code],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
                 .get(0);
 
             if !is_member {
@@ -3743,7 +3856,7 @@ async fn validate_fhir_vs(
                     &[&system_id, &code],
                 )
                 .await
-                .map_err(|e| HtsError::StorageError(e.to_string()))?
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
                 .and_then(|r| r.get::<_, Option<String>>(0));
 
             Ok(Some(ExpansionContains {
@@ -5016,6 +5129,20 @@ async fn compose_page_fast_pg(
         _ => return Ok(None),
     };
 
+    // Excludes are applied purely by (system, code) below, so anything that
+    // is not an enumerated `concept[]` list (filter, valueSet, whole system)
+    // needs the real expansion engine.
+    if let Some(excl) = compose["exclude"].as_array() {
+        for exc in excl {
+            let has_concepts = exc["concept"].as_array().is_some_and(|c| !c.is_empty());
+            let has_filter = exc["filter"].as_array().is_some_and(|f| !f.is_empty());
+            let has_vs = exc["valueSet"].as_array().is_some_and(|v| !v.is_empty());
+            if !has_concepts || has_filter || has_vs {
+                return Ok(None);
+            }
+        }
+    }
+
     // Bail on anything that needs a real expansion engine.
     for inc in includes {
         if inc["concept"].as_array().is_none() {
@@ -5112,7 +5239,7 @@ async fn compose_page_fast_pg(
                         &[&sid, &code],
                     )
                     .await
-                    .map_err(|e| HtsError::StorageError(e.to_string()))?
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?
                     .and_then(|r| r.get::<_, Option<String>>(0))
             } else {
                 None

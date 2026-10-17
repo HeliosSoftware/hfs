@@ -13,16 +13,27 @@
 //!
 //! If the configured backend provides no runner at all, the
 //! `$viewdefinition-run` handler returns `501 Not Implemented`. Inline
-//! `resource:` parameters are materialised into a transient in-memory SQLite
-//! backend so they reuse the same in-DB pipeline.
+//! `resource:` parameters bypass the runner: the REST layer evaluates them
+//! with the in-process `helios-sof` FHIRPath engine.
 //!
 //! The handler layer streams the result rows directly into the HTTP response.
+//!
+//! Every runner streams rows from a spawned task (`tokio::spawn` or
+//! `spawn_blocking`) that owns the channel's sender. Runners must start that
+//! task and hand its `JoinHandle` to [`watch_row_producer`] so a panic or
+//! cancellation inside the task surfaces as an `Err` item on the stream
+//! instead of silently looking like a clean end of stream.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
+use helios_sof::arrow::record_batch::RecordBatch;
 use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::warn;
 
 use crate::tenant::TenantContext;
 
@@ -31,6 +42,12 @@ use crate::tenant::TenantContext;
 /// Per the SQL-on-FHIR v2 spec, `patient` and `group` are `0..*` — supplying
 /// multiple values must include resources matching ANY of them (union of the
 /// corresponding compartments).
+///
+/// `patient`, `group` and `_since` apply to every scan of the resources table:
+/// each `unionAll` branch, each `repeat` seed and join-back. A non-empty
+/// `group` that resolves to no Patient members, with no `patient`, selects
+/// nothing. A view whose scans cannot all take the filters is an error, never
+/// an unfiltered run.
 #[derive(Debug, Clone, Default)]
 pub struct ViewFilters {
     /// Restrict to resources belonging to these patients (FHIR references,
@@ -43,6 +60,8 @@ pub struct ViewFilters {
     pub group: Vec<String>,
 
     /// Include only resources last-modified at or after this instant (RFC 3339).
+    /// Every runner compares inclusively, and a resource with no last-modified
+    /// time is excluded.
     pub since: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Maximum number of output rows to return (across all pages).
@@ -85,16 +104,101 @@ pub enum SofError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// The storage backend is unreachable or failing transiently (throttling, a
+    /// dropped connection, an object body that could not be read after
+    /// retries). The handler layer maps this variant to `503 Service Unavailable`
+    /// (#2048).
+    #[error("storage unavailable: {0}")]
+    Unavailable(String),
+
     /// A backend-level SQL or driver error.
     #[error("backend error: {0}")]
     Backend(String),
+
+    /// A batch of resources references more distinct resources than the runner
+    /// may read for `resolve()`. The handler layer maps this variant to a
+    /// `422 Unprocessable Entity` OperationOutcome.
+    #[error("too many references to resolve: {0}")]
+    ResolutionLimit(String),
 
     /// The view run was cancelled (e.g. client disconnected, export job cancelled).
     #[error("view run cancelled")]
     Cancelled,
 }
 
+impl SofError {
+    /// Converts a storage error from a resource read or scan.
+    ///
+    /// A transient backend failure (`Unavailable`, `ConnectionFailed`,
+    /// `PoolExhausted`) becomes [`SofError::Unavailable`], so the handler can
+    /// answer `503` rather than `500`. Every other error becomes
+    /// [`SofError::Storage`] with the error's text, as before.
+    ///
+    /// This is the same classification the CRUD path applies
+    /// (`BackendError::Unavailable` answers `503` there too), so it also covers
+    /// what a backend reports as unavailable besides an exhausted retry: a
+    /// dispatch failure or timeout, throttling, and an S3 misconfiguration
+    /// (access denied, a bucket that is missing or not accessible).
+    pub fn from_storage(err: crate::error::StorageError) -> Self {
+        if err.is_unavailable() {
+            SofError::Unavailable(err.to_string())
+        } else {
+            SofError::Storage(err.to_string())
+        }
+    }
+}
+
+/// Sender half of a runner's row channel.
+pub type RowSender = mpsc::Sender<Result<ViewRow, SofError>>;
+
+/// A pinned, heap-allocated, `Send + 'static` stream of Arrow record batches.
+///
+/// Returned by [`SofRunner::run_view_columnar`]. Every batch has the same
+/// schema; column names and order are the view's output columns.
+pub type BatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, SofError>> + Send + 'static>>;
+
+/// Sender half of a runner's record-batch channel.
+pub type BatchSender = mpsc::Sender<Result<RecordBatch, SofError>>;
+
+/// Watches a spawned row producer and reports its death on the channel.
+///
+/// Generic over the channel's item: [`RowSender`] for row streams,
+/// [`BatchSender`] for columnar ones.
+///
+/// `producer` is the `JoinHandle` of the task (`tokio::spawn` or
+/// `spawn_blocking`) that owns the channel's original `Sender`; `tx` is a
+/// clone of that sender kept outside the task. If the task ends with a
+/// `JoinError` (panic or cancellation), an
+/// `Err(SofError::Backend("row producer failed: …"))` is sent through `tx`
+/// and a `warn!` names the runner; if it ends normally, nothing is sent.
+/// Because `tx` stays alive until the outcome is known, the receiver only
+/// observes end-of-stream after the producer's fate has been reported —
+/// a partial row set can never look like a complete one.
+pub fn watch_row_producer<T: Send + 'static>(
+    runner: &'static str,
+    tx: mpsc::Sender<Result<T, SofError>>,
+    producer: JoinHandle<()>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = producer.await {
+            warn!(
+                runner,
+                error = %e,
+                "SoF row producer ended before finishing its stream"
+            );
+            let _ = tx
+                .send(Err(SofError::Backend(format!("row producer failed: {e}"))))
+                .await;
+        }
+    });
+}
+
 /// Abstraction over in-process and in-DB SQL-on-FHIR execution strategies.
+///
+/// For row order, collection cells and preview limits by backend and view
+/// shape, see the [HFS stored-data ordering contract].
+///
+/// [HFS stored-data ordering contract]: https://heliossoftware.github.io/hfs/ch06-sql-on-fhir.html#hfs-stored-data-ordering
 ///
 /// # Object safety
 ///
@@ -134,6 +238,191 @@ pub trait SofRunner: Send + Sync {
         filters: ViewFilters,
     ) -> Result<RowStream, SofError>;
 
+    /// Execute a ViewDefinition and return its rows as Arrow record batches,
+    /// built straight from database values without the JSON step.
+    ///
+    /// `Ok(None)` means this runner has no columnar path, or not for this
+    /// view; the caller must use [`run_view`](Self::run_view). The default
+    /// returns `Ok(None)`, so existing runners and wrappers keep working, and
+    /// a wrapper that does not forward this method silently takes the row path.
+    ///
+    /// [`SofError::Uncompilable`] is returned synchronously, as for `run_view`.
+    /// `Ok(Some(stream))` that ends without a batch means the view produced
+    /// no rows; its schema is not known then.
+    async fn run_view_columnar(
+        &self,
+        _tenant: &TenantContext,
+        _view_definition: Value,
+        _filters: ViewFilters,
+    ) -> Result<Option<BatchStream>, SofError> {
+        Ok(None)
+    }
+
     /// Returns a human-readable name for this runner (used in logs and diagnostics).
     fn runner_name(&self) -> &'static str;
+
+    /// A runner for one export job, or `None` when this runner has nothing to
+    /// share between the subjects of a job.
+    ///
+    /// An export job runs many views one after another, and a runner that
+    /// reads a type by scanning storage (S3) would scan it once per view. The
+    /// runner returned here may keep what it read for the life of the job, so
+    /// views over the same type read it once and the job sees one snapshot.
+    ///
+    /// A runner may also return a differently configured clone for the job
+    /// because an export, unlike a preview, reads a whole type: the PostgreSQL
+    /// runner reads each view in keyset pages over the resource id, so no
+    /// statement sorts or holds the entire type, and its rows come out in
+    /// bytewise id order (not `(last_updated, id)`) without a single snapshot
+    /// across pages.
+    fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    use super::*;
+
+    /// Creates a row channel and its `ReceiverStream` wrapper, mirroring the
+    /// buffer size and stream construction every real runner uses.
+    fn channel() -> (RowSender, RowStream) {
+        let (tx, rx) = mpsc::channel(8);
+        (tx, Box::pin(ReceiverStream::new(rx)))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_producer_yields_error_item_then_end_of_stream() {
+        let (tx, mut stream) = channel();
+        let producer_tx = tx.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            for i in 0..3 {
+                if producer_tx.blocking_send(Ok(json!({"n": i}))).is_err() {
+                    return;
+                }
+            }
+            panic!("boom");
+        });
+        watch_row_producer("test-runner", tx, producer);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for i in 0..3 {
+                let item = stream.next().await.expect("expected row");
+                assert!(matches!(&item, Ok(v) if *v == json!({"n": i})));
+            }
+            let error_item = stream.next().await.expect("expected error item");
+            match error_item {
+                Err(SofError::Backend(m)) => {
+                    assert!(m.contains("row producer failed"), "unexpected message: {m}");
+                }
+                other => panic!("expected SofError::Backend, got {other:?}"),
+            }
+            assert!(stream.next().await.is_none());
+        })
+        .await
+        .expect("stream consumption must not hang");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_producer_yields_error_item() {
+        let (tx, mut stream) = channel();
+        let producer_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            let _ = producer_tx.send(Ok(json!({"n": 0}))).await;
+            // Hold `producer_tx` open while pending so the channel closes
+            // only when the task is aborted, not on its own.
+            std::future::pending::<()>().await;
+        });
+        let abort_handle = producer.abort_handle();
+        watch_row_producer("test-runner", tx, producer);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let first = stream.next().await.expect("expected first row");
+            assert!(matches!(&first, Ok(v) if *v == json!({"n": 0})));
+
+            abort_handle.abort();
+
+            let error_item = stream.next().await.expect("expected error item");
+            match error_item {
+                Err(SofError::Backend(m)) => {
+                    assert!(m.contains("cancelled"), "unexpected message: {m}");
+                }
+                other => panic!("expected SofError::Backend, got {other:?}"),
+            }
+            assert!(stream.next().await.is_none());
+        })
+        .await
+        .expect("stream consumption must not hang");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_producer_ends_stream_without_error() {
+        let (tx, mut stream) = channel();
+        let producer_tx = tx.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            for i in 0..2 {
+                if producer_tx.blocking_send(Ok(json!({"n": i}))).is_err() {
+                    return;
+                }
+            }
+        });
+        watch_row_producer("test-runner", tx, producer);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let first = stream.next().await;
+            assert!(matches!(&first, Some(Ok(v)) if *v == json!({"n": 0})));
+            let second = stream.next().await;
+            assert!(matches!(&second, Some(Ok(v)) if *v == json!({"n": 1})));
+            let end = stream.next().await;
+            assert!(end.is_none());
+        })
+        .await
+        .expect("stream consumption must not hang");
+    }
+
+    /// A transient backend failure keeps its unavailability so the handler can
+    /// answer 503; every other storage error stays a `Storage` error with the
+    /// same text as before (#2048).
+    #[test]
+    fn storage_errors_keep_their_unavailability() {
+        use crate::error::{BackendError, StorageError};
+
+        let transient = [
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name: "s3".to_string(),
+                message: "x".to_string(),
+            }),
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: "s3".to_string(),
+                message: "x".to_string(),
+            }),
+            StorageError::Backend(BackendError::PoolExhausted {
+                backend_name: "s3".to_string(),
+            }),
+        ];
+        for err in transient {
+            let text = err.to_string();
+            match SofError::from_storage(err) {
+                SofError::Unavailable(m) => assert!(m.contains(&text), "lost the text: {m}"),
+                other => panic!("expected SofError::Unavailable, got {other:?}"),
+            }
+        }
+
+        let internal = StorageError::Backend(BackendError::Internal {
+            backend_name: "s3".to_string(),
+            message: "boom".to_string(),
+            source: None,
+        });
+        let text = internal.to_string();
+        match SofError::from_storage(internal) {
+            SofError::Storage(m) => assert_eq!(m, text),
+            other => panic!("expected SofError::Storage, got {other:?}"),
+        }
+    }
 }

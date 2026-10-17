@@ -1,7 +1,8 @@
 //! Patch interaction handler.
 //!
 //! Implements the FHIR [patch interaction](https://hl7.org/fhir/http.html#patch):
-//! `PATCH [base]/[type]/[id]`
+//! `PATCH [base]/[type]/[id]`, and its conditional form
+//! `PATCH [base]/[type]?[search-params]`.
 //!
 //! Supports multiple patch formats:
 //! - JSON Patch (RFC 6902) - application/json-patch+json
@@ -15,7 +16,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, PatchFormat, ResourceStorage};
+use helios_persistence::core::{ConditionalStorage, PatchFormat, ResourceStorage, SearchProvider};
 use serde_json::Value;
 use tracing::debug;
 
@@ -24,6 +25,7 @@ use crate::extractors::TenantExtractor;
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
 
@@ -50,17 +52,19 @@ use crate::state::AppState;
 /// - `404 Not Found` - Resource does not exist
 /// - `412 Precondition Failed` - If-Match condition not met
 /// - `415 Unsupported Media Type` - Unknown patch format
+#[allow(clippy::too_many_arguments)]
 pub async fn patch_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     headers: HeaderMap,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     body: Bytes,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
@@ -95,6 +99,16 @@ where
             id: id.clone(),
         })?;
 
+    // A `patient/` scope patches inside the launch patient's compartment only
+    // (#1618): the resource must be in it now, and must still be in it after
+    // the patch (checked below, once the patched content exists).
+    compartment.assert_member(
+        || state.storage().search_param_registry(tenant.context()),
+        existing.fhir_version(),
+        existing.content(),
+        "patch",
+    )?;
+
     // Check the If-Match precondition (RFC 9110 §13.1.1).
     //
     // List-aware: satisfied when ANY supplied entity-tag matches. A malformed
@@ -116,23 +130,47 @@ where
         });
     }
 
-    // Apply the patch
-    let patched_content = apply_patch(existing.content(), &patch_format)?;
+    // Apply the patch: the applier `PATCH [type]?criteria` uses inside the
+    // storage layer (#1406). It refuses a patch that changes `resourceType` or
+    // `id`.
+    let patched_content = helios_persistence::core::apply_patch_for_version(
+        existing.content(),
+        &patch_format,
+        existing.fhir_version(),
+    )?;
 
-    // Validate that resourceType wasn't changed
-    if let Some(body_type) = patched_content.get("resourceType").and_then(|v| v.as_str()) {
-        if body_type != resource_type {
-            return Err(RestError::BadRequest {
-                message: "Cannot change resourceType via patch".to_string(),
-            });
-        }
-    }
+    // The patch may not move the resource out of the compartment (#1618).
+    compartment.assert_member(
+        || state.storage().search_param_registry(tenant.context()),
+        existing.fhir_version(),
+        &patched_content,
+        "patch",
+    )?;
+
+    state
+        .validation()
+        .check_write(
+            tenant.tenant_id(),
+            existing.fhir_version(),
+            &resource_type,
+            &patched_content,
+        )
+        .await?;
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &patched_content)?;
 
     // Update the resource
     let stored = state
         .storage()
         .update(tenant.context(), &existing, patched_content)
         .await?;
+
+    if resource_type == "StructureDefinition" {
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
+            stored.fhir_version(),
+            stored.content(),
+        );
+    }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
 
@@ -143,17 +181,17 @@ where
         "Resource patched"
     );
 
-    // Emit subscription event
-    #[cfg(feature = "subscriptions")]
-    if let Some(engine) = state.subscription_engine() {
-        super::subscription_event::emit_subscription_event(
-            engine,
-            tenant.context(),
+    super::write_event::report(
+        &state,
+        tenant.context(),
+        stored.fhir_version(),
+        &resource_type,
+        0,
+        Some(super::write_event::stored_notice(
+            helios_persistence::core::WriteKind::Update,
             &stored,
-            stored.fhir_version(),
-            helios_subscriptions::ResourceEventType::Update,
-        );
-    }
+        )),
+    );
 
     build_patch_response(&stored, headers, &prefer).map(|mut response| {
         response
@@ -169,28 +207,71 @@ where
 
 /// Conditional patch handler.
 ///
-/// Patches a resource based on search criteria.
+/// Patches the one resource a search selects, instead of one named by id.
 ///
 /// # HTTP Request
 ///
 /// `PATCH [base]/[type]?[search-params]`
+///
+/// The criteria go through the pipeline every conditional interaction shares
+/// (`helios_persistence::search::conditional`): the raw query, decoded once,
+/// unknown parameters and empty values refused.
+///
+/// # Response
+///
+/// FHIR R4, R4B and R5 word the three outcomes identically
+/// ([conditional patch](https://hl7.org/fhir/R4/http.html#patch)): "No matches:
+/// The server returns a 404 Not Found"; "One Match: The server performs the
+/// update against the matching resource"; "Multiple matches: The server returns
+/// a 412 Precondition Failed error".
+///
+/// - `200 OK` - the single match was patched
+/// - `400 Bad Request` - no criteria, criteria that cannot be evaluated, or an
+///   invalid patch document
+/// - `404 Not Found` - nothing matched; nothing is created
+/// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
+/// - `412 Precondition Failed` - more than one resource matched, or `If-Match`
+///   was supplied and is not satisfied
+/// - `415 Unsupported Media Type` - unknown patch format
+/// - `501 Not Implemented` - storage without conditional patch (S3 on its own)
+///
+/// # `If-Match`
+///
+/// Honoured, as on conditional update and delete (#1381; it was refused with
+/// `400` before). [`ConditionalStorage::conditional_patch`] evaluates it
+/// against the one resource the criteria resolve to and hands that same row to
+/// the compare-and-swap that writes the patched content, so a writer landing in
+/// between ends in `409`, never in a patch over a version the client did not
+/// name. A malformed value fails the precondition. With no match the answer
+/// stays `404` — what `PATCH [type]/[id]` answers for a missing resource,
+/// `If-Match` or not — and nothing is written.
+#[allow(clippy::too_many_arguments)]
 pub async fn conditional_patch_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     headers: HeaderMap,
     tenant: TenantExtractor,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    conditional: ConditionalHeaders,
     prefer: PreferHeader,
     body: Bytes,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
-    let search_params: String = query
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
+    super::conditional_support::require_patch(state.storage())?;
+
+    // AuditEvent resources are immutable — block write operations
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "PATCH".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
+
+    // The raw query, as written: every occurrence of a repeated parameter
+    // (#1321), decoded once by the shared criteria builder (#1322).
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,
@@ -199,6 +280,20 @@ where
         "Processing conditional patch request"
     );
 
+    // `PATCH /Patient` names neither an instance nor criteria. The backend
+    // would answer "no match", and a 404 for a missing id or query string
+    // sends the client looking for a resource that was never named.
+    if helios_persistence::search::parse_conditional_criteria(&search_params).is_empty() {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "PATCH {resource_type} names no resource: use PATCH {resource_type}/[id], or \
+                 PATCH {resource_type}?[search parameters] for a conditional patch"
+            ),
+        });
+    }
+
+    let if_match = super::update::conditional_if_match(&conditional)?;
+
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -206,19 +301,52 @@ where
 
     let patch_format = parse_patch_format(content_type, &body)?;
 
-    let result = state
+    let prepared = state
         .storage()
-        .conditional_patch(
+        .prepare_conditional_patch(
             tenant.context(),
             &resource_type,
             &search_params,
             &patch_format,
+            if_match,
         )
-        .await?;
+        .await
+        .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
 
-    use helios_persistence::core::ConditionalPatchResult;
-    match result {
-        ConditionalPatchResult::Patched(stored) => {
+    use helios_persistence::core::ConditionalPatchPreparation;
+    match prepared {
+        ConditionalPatchPreparation::Ready { current, patched } => {
+            state
+                .validation()
+                .check_write(
+                    tenant.tenant_id(),
+                    current.fhir_version(),
+                    &resource_type,
+                    &patched,
+                )
+                .await?;
+            super::sof::reject_unknown_view_definition_resource(&resource_type, &patched)?;
+            let stored = state
+                .storage()
+                .update(tenant.context(), &current, patched)
+                .await
+                .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
+            if resource_type == "StructureDefinition" {
+                state.validation().upsert_stored_profile(
+                    tenant.tenant_id(),
+                    stored.fhir_version(),
+                    stored.content(),
+                );
+            }
+            // Conditional writes announce nothing.
+            super::write_event::report(
+                &state,
+                tenant.context(),
+                stored.fhir_version(),
+                &resource_type,
+                0,
+                None,
+            );
             let headers = ResourceHeaders::from_stored(&stored, &state);
             build_patch_response(&stored, headers, &prefer).map(|mut response| {
                 response
@@ -234,11 +362,11 @@ where
                 response
             })
         }
-        ConditionalPatchResult::NoMatch => Err(RestError::NotFound {
+        ConditionalPatchPreparation::NoMatch => Err(RestError::NotFound {
             resource_type,
             id: "conditional".to_string(),
         }),
-        ConditionalPatchResult::MultipleMatches(count) => Err(RestError::MultipleMatches {
+        ConditionalPatchPreparation::MultipleMatches(count) => Err(RestError::MultipleMatches {
             operation: "patch".to_string(),
             count,
         }),
@@ -268,36 +396,6 @@ fn parse_patch_format(content_type: &str, body: &Bytes) -> RestResult<PatchForma
         Err(RestError::UnsupportedMediaType {
             content_type: content_type.to_string(),
         })
-    }
-}
-
-/// Applies a patch to a resource.
-fn apply_patch(resource: &Value, patch: &PatchFormat) -> RestResult<Value> {
-    match patch {
-        PatchFormat::JsonPatch(operations) => {
-            let patch: json_patch::Patch =
-                serde_json::from_value(operations.clone()).map_err(|e| RestError::BadRequest {
-                    message: format!("Invalid JSON Patch: {}", e),
-                })?;
-
-            let mut resource = resource.clone();
-            json_patch::patch(&mut resource, &patch).map_err(|e| RestError::BadRequest {
-                message: format!("Failed to apply JSON Patch: {}", e),
-            })?;
-
-            Ok(resource)
-        }
-        PatchFormat::MergePatch(merge_doc) => {
-            let mut resource = resource.clone();
-            json_patch::merge(&mut resource, merge_doc);
-            Ok(resource)
-        }
-        PatchFormat::FhirPathPatch(_params) => {
-            // FHIRPath Patch is more complex and requires FHIRPath evaluation
-            Err(RestError::NotImplemented {
-                feature: "FHIRPath Patch".to_string(),
-            })
-        }
     }
 }
 

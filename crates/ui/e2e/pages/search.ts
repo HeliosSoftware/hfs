@@ -18,6 +18,17 @@ export class SearchPage {
     await this.page.goto(`/ui/search${q}`, { waitUntil: "networkidle" });
   }
 
+  /** Open the shared visual builder without changing the NL page's default. */
+  async gotoBuilder(type?: string): Promise<void> {
+    await this.goto(type);
+    await this.showBuilder();
+  }
+
+  async showBuilder(): Promise<void> {
+    const mode = this.modeButton("builder");
+    if (await mode.count()) await mode.click();
+  }
+
   get typeList(): Locator {
     return this.page.locator("#type-rail-list");
   }
@@ -25,6 +36,9 @@ export class SearchPage {
   // recently-used clones live in the sibling group above the scroller.
   railItem(type: string): Locator {
     return this.page.locator(`#type-rail-list > [data-type='${type}']`);
+  }
+  get railFilter(): Locator {
+    return this.page.locator("#type-rail-filter");
   }
   /** The "Recently used" group (#754/#755, server-rendered per page): hidden
    * until this page's own `rails.search.recent` has at least one entry. */

@@ -2,6 +2,15 @@
 //!
 //! These tests verify the SQLite backend implementation against the actual API.
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
+#[path = "reindex/resource_scoped_clear.rs"]
+mod resource_scoped_clear;
+
+#[path = "reindex/id_range.rs"]
+mod id_range;
+
 use std::path::PathBuf;
 
 use helios_fhir::FhirVersion;
@@ -18,17 +27,674 @@ use helios_persistence::core::{
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
-fn create_backend() -> SqliteBackend {
-    // Configure with data directory to load spec SearchParameters
-    // CARGO_MANIFEST_DIR for tests is crates/persistence
-    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
+
+#[tokio::test]
+async fn sqlite_large_id_set_search_count_cursor_not_and_tenant() {
+    let backend = create_backend();
+    large_id_set_suite::large_id_set_search_count_cursor_not_and_tenant(
+        &backend,
+        "large-id-set-sqlite",
+    )
+    .await;
+    large_id_set_suite::wide_chain_and_nested_has(&backend, "wide-chain-sqlite").await;
+}
+
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
+/// #1912: the tenant-scoped existence probe answers as `count_by_tenant` did.
+#[tokio::test]
+async fn sqlite_tenant_has_resources_matches_discovery() {
+    let backend = create_backend();
+    tenant_existence_suite::tenant_has_resources_matches_discovery(&backend, "exist", false).await;
+    tenant_existence_suite::child_data_is_not_the_parents(&backend, "exist").await;
+}
+
+/// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
+/// relative to this file, the same arrangement the other backends' binaries
+/// use for their shared suites.
+#[path = "search/conditional_criteria_suite.rs"]
+mod conditional_criteria_suite;
+
+/// #1312: criteria whose values begin with comparator letters (`family=Neal`,
+/// `identifier=ne123`) name the right resource, and never an unrelated one.
+#[tokio::test]
+async fn sqlite_conditional_criteria_with_prefix_like_values() {
+    let backend = create_backend();
+    conditional_criteria_suite::prefix_like_criteria_name_the_right_resource(
+        &backend,
+        "cond-criteria-1312",
+        true,
+    )
+    .await;
+}
+
+/// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
+/// `#[path]` arrangement.
+#[path = "search/contained_suite.rs"]
+mod contained_suite;
+
+#[path = "search/sql_composite_slots_suite.rs"]
+mod sql_composite_slots_suite;
+
+/// #1362: a repeated parameter under `_contained` is a conjunction on one
+/// contained resource.
+#[tokio::test]
+async fn sqlite_contained_repeated_parameters_are_anded() {
+    let backend = create_backend();
+    contained_suite::repeated_parameters_are_anded(&backend, "contained-repeated-1362").await;
+}
+
+/// #1363: `_`-parameters, composites and modifiers are applied under
+/// `_contained`, or refused by name — never dropped.
+#[tokio::test]
+async fn sqlite_contained_criteria_are_applied_or_rejected() {
+    let backend = create_backend();
+    contained_suite::criteria_are_applied_or_rejected(&backend, "contained-criteria-1363").await;
+}
+
+/// #1383: `_contained` alone is every contained resource of the type;
+/// `_total`, `search_count` and paging agree; compartment membership is
+/// applied; `_has`, `_list` and chains are refused by name.
+#[tokio::test]
+async fn sqlite_contained_unconstrained_and_out_of_band_constraints() {
+    let backend = create_backend();
+    contained_suite::unconstrained_and_out_of_band_constraints(&backend, "contained-gaps-1383")
+        .await;
+}
+
+/// #1407: `_sort` under `_contained` is applied or refused by name, and a
+/// contained resource with nothing indexed but its id is still found.
+#[tokio::test]
+async fn sqlite_contained_sort_and_id_only_contained() {
+    let backend = create_backend();
+    contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
+}
+
+/// #1407: `reference:identifier` under `_contained` resolves the reference's
+/// top-level target.
+#[tokio::test]
+async fn sqlite_contained_reference_identifier_resolves_the_target() {
+    let backend = create_backend();
+    contained_suite::reference_identifier_resolves_the_target(&backend, "contained-ident-1407")
+        .await;
+}
+
+/// #1407: repeated SQL composites retain axis and entity identity.
+#[tokio::test]
+async fn sqlite_contained_repeated_type_composite_slots_pair_entities() {
+    let backend = create_backend();
+    sql_composite_slots_suite::repeated_slots_and_entity_pairing(
+        &backend,
+        "contained-same-type-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_contained_composite_custom_families_and_per_type_ordinals() {
+    let backend = create_backend();
+    sql_composite_slots_suite::custom_unfolded_families(&backend, "contained-custom-1407", true)
+        .await;
+}
+
+#[tokio::test]
+async fn sqlite_composite_missing_legacy_slots_preserve_presence() {
+    use helios_persistence::core::SearchProvider;
+    use helios_persistence::types::{ContainedMode, SearchParamType};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hfs1407-presence.db");
+    let backend = SqliteBackend::with_config(
+        &path,
+        SqliteBackendConfig {
+            data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    backend.init_schema().unwrap();
+    let tenant = create_tenant("composite-missing-legacy");
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            sql_composite_slots_suite::observation("present", &["A"], &["B"]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({"resourceType":"Observation","id":"absent","status":"final"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(conn.execute("UPDATE search_index SET composite_slot=NULL WHERE tenant_id=?1 AND param_name='code-value-concept'", [tenant.tenant_id().as_str()]).unwrap(), 2);
+    sql_composite_slots_suite::ordinary_composite_missing_is_presence_only(
+        &backend,
+        &tenant,
+        "code-value-concept",
+        &[SearchParamType::Token, SearchParamType::Token],
+        &["present"],
+        &["absent"],
+    )
+    .await;
+    let mut positional =
+        sql_composite_slots_suite::pair_query("no-match$no-match", ContainedMode::Off);
+    positional.count = Some(0);
+    for result in [
+        backend.search(&tenant, &positional).await.map(|_| ()),
+        backend.search_count(&tenant, &positional).await.map(|_| ()),
+        backend.search_ids(&tenant, &positional).await.map(|_| ()),
+    ] {
+        assert!(result.unwrap_err().to_string().contains("$reindex"));
+    }
+}
+
+#[tokio::test]
+async fn sqlite_composite_missing_fresh_unsupported_shapes_are_presence_only() {
+    use helios_persistence::types::SearchParamType;
+    sql_composite_slots_suite::fresh_unsupported_composite_presence(
+        &create_backend(),
+        "sqlite-presence-shapes",
+        &[
+            (SearchParamType::Reference, 2),
+            (SearchParamType::Uri, 2),
+            (SearchParamType::Token, 256),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_contained_composite_slot_256_is_named_unsupported() {
+    use helios_persistence::core::SearchProvider;
+    use helios_persistence::types::{ContainedMode, SearchParamType, SearchQuery};
+    let backend = create_backend();
+    let tenant = create_tenant("sqlite-slot-overflow");
+    let raw = vec!["A"; 256].join("$");
+    for mode in [ContainedMode::Off, ContainedMode::On, ContainedMode::Both] {
+        for count in [Some(0), Some(10)] {
+            let mut query = SearchQuery::new("Observation");
+            query.contained = mode;
+            query.count = count;
+            query.parameters.push(sql_composite_slots_suite::composite(
+                "slot-overflow",
+                &vec![SearchParamType::Token; 256],
+                &[&raw],
+            ));
+            for result in [
+                backend.search(&tenant, &query).await.map(|_| ()),
+                backend.search_count(&tenant, &query).await.map(|_| ()),
+                backend.search_ids(&tenant, &query).await.map(|_| ()),
+            ] {
+                let message = result.unwrap_err().to_string();
+                assert!(
+                    message.contains("slot-overflow") && message.contains("unsupported repeated"),
+                    "{message}"
+                );
+                assert!(!message.contains("$reindex"), "{message}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sqlite_composite_legacy_scopes_reindex_and_conditional_transactions() {
+    use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider, SearchProvider};
+    use helios_persistence::types::{ContainedMode, SearchQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hfs1407-slots.db");
+    let config = SqliteBackendConfig {
+        data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+        ..Default::default()
+    };
+    let backend = SqliteBackend::with_config(&path, config).unwrap();
+    backend.init_schema().unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let operation = ReindexOperation::new(
+        std::sync::Arc::new(backend.clone()),
+        backend.tenant_registries().clone(),
+    );
+    for (label, top_old, contained_old) in [
+        ("top", true, false),
+        ("contained", false, true),
+        ("both", true, true),
+    ] {
+        let tenant = create_tenant(&format!("legacy1407-{label}"));
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                sql_composite_slots_suite::observation("original", &["A"], &["B"]),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.create(&tenant,"Patient",json!({"resourceType":"Patient","id":"container","contained":[sql_composite_slots_suite::observation("inside",&["A"],&["B"])]}),FhirVersion::default()).await.unwrap();
+        conn.execute("UPDATE search_index SET composite_slot=NULL WHERE tenant_id=?1 AND param_name='code-value-concept' AND ((is_contained=0 AND ?2) OR (is_contained=1 AND ?3))",rusqlite::params![tenant.tenant_id().as_str(),top_old,contained_old]).unwrap();
+        for mode in [ContainedMode::Off, ContainedMode::On, ContainedMode::Both] {
+            let blocked = match mode {
+                ContainedMode::Off => top_old,
+                ContainedMode::On => contained_old,
+                ContainedMode::Both => top_old || contained_old,
+            };
+            let mut query = sql_composite_slots_suite::pair_query("no-match$no-match", mode);
+            query.count = Some(0);
+            for result in [
+                backend.search(&tenant, &query).await.map(|_| ()),
+                backend.search_count(&tenant, &query).await.map(|_| ()),
+                backend.search_ids(&tenant, &query).await.map(|_| ()),
+            ] {
+                if blocked {
+                    let error = result
+                        .expect_err("relevant old parameter requires reindex before count-zero");
+                    assert!(error.to_string().contains("code-value-concept"));
+                    assert!(error.to_string().contains("$reindex"));
+                } else {
+                    result.expect("old rows from another representation do not block");
+                }
+            }
+        }
+        let explain = |contained: bool| {
+            let type_column = if contained {
+                "contained_type"
+            } else {
+                "resource_type"
+            };
+            let scope = if contained { 1 } else { 0 };
+            let index = if contained {
+                "idx_search_contained_composite_legacy"
+            } else {
+                "idx_search_composite_legacy"
+            };
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let hint = if exists {
+                format!(" INDEXED BY {index}")
+            } else {
+                String::new()
+            };
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM search_index{hint} WHERE tenant_id=?1 AND {type_column}=?2 AND param_name=?3 AND is_contained={scope} AND composite_group IS NOT NULL AND composite_slot IS NULL LIMIT 1"
+            );
+            let rows = conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map(
+                    rusqlite::params![
+                        tenant.tenant_id().as_str(),
+                        "Observation",
+                        "code-value-concept"
+                    ],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let index = if contained {
+                "idx_search_contained_composite_legacy"
+            } else {
+                "idx_search_composite_legacy"
+            };
+            assert!(rows.contains(index), "{rows}");
+            assert!(!rows.contains("SCAN search_index"), "{rows}");
+            eprintln!("{label} contained={contained} probe: {rows}");
+        };
+        explain(false);
+        explain(true);
+        if contained_old {
+            let definition:String=conn.query_row("SELECT sql FROM sqlite_master WHERE name='idx_search_contained_composite_legacy'",[],|row|row.get(0)).unwrap();
+            conn.execute("DROP INDEX idx_search_contained_composite_legacy", [])
+                .unwrap();
+            let query =
+                sql_composite_slots_suite::pair_query("no-match$no-match", ContainedMode::On);
+            let error = backend.search(&tenant, &query).await.unwrap_err();
+            assert!(
+                error.to_string().contains("$reindex"),
+                "missing partial retains the guard during bulk rebuild: {error}"
+            );
+            conn.execute(&definition, []).unwrap();
+            explain(true);
+        }
+        let conditional = |value: &str| BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".into(),
+            resource: Some(sql_composite_slots_suite::observation(
+                "incoming",
+                &["A"],
+                &["B"],
+            )),
+            if_none_exist: Some(format!("code-value-concept={value}")),
+            ..Default::default()
+        };
+        if top_old {
+            let error = backend
+                .conditional_create(
+                    &tenant,
+                    "Observation",
+                    sql_composite_slots_suite::observation("conditional", &["A"], &["B"]),
+                    "code-value-concept=A$B",
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("$reindex"));
+            let error = backend
+                .process_transaction(
+                    &tenant,
+                    vec![
+                        BundleEntry {
+                            method: BundleMethod::Post,
+                            url: "Patient".into(),
+                            resource: Some(json!({"resourceType":"Patient","id":"rolled-back"})),
+                            ..Default::default()
+                        },
+                        conditional("A$B"),
+                    ],
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("$reindex"), "{error}");
+            assert!(
+                backend
+                    .read(&tenant, "Patient", "rolled-back")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .read(&tenant, "Observation", "conditional")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let request = if top_old && !contained_old {
+            ReindexRequest::all().clear_existing()
+        } else {
+            ReindexRequest::all()
+        };
+        assert_eq!(request.clear_existing, top_old && !contained_old);
+        run_reindex_to_completion(&operation, &tenant, request).await;
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM search_index WHERE tenant_id=?1 AND param_name='code-value-concept' AND composite_group IS NOT NULL AND composite_slot IS NULL",[tenant.tenant_id().as_str()],|row|row.get::<_,i64>(0)).unwrap(),0);
+        for mode in [ContainedMode::Off, ContainedMode::On, ContainedMode::Both] {
+            let expected = match mode {
+                ContainedMode::Off => vec!["original"],
+                ContainedMode::On => vec!["container"],
+                ContainedMode::Both => vec!["container", "original"],
+            };
+            sql_composite_slots_suite::assert_ids(
+                &backend,
+                &tenant,
+                &sql_composite_slots_suite::pair_query("A$B", mode),
+                &expected,
+            )
+            .await;
+            sql_composite_slots_suite::assert_ids(
+                &backend,
+                &tenant,
+                &sql_composite_slots_suite::pair_query("B$A", mode),
+                &[],
+            )
+            .await;
+        }
+        explain(false);
+        explain(true);
+        let reused = backend
+            .process_transaction(&tenant, vec![conditional("A$B")], FhirVersion::default())
+            .await
+            .unwrap();
+        assert_eq!(reused.entries[0].status, 200);
+        assert!(
+            reused.entries[0]
+                .location
+                .as_deref()
+                .unwrap()
+                .contains("Observation/original")
+        );
+        let created = backend
+            .process_transaction(&tenant, vec![conditional("B$A")], FhirVersion::default())
+            .await
+            .unwrap();
+        assert_eq!(created.entries[0].status, 201);
+        eprintln!(
+            "{label}: legacy scopes rejected before writes; tenant reindex completed (clear_existing={}); A$B reused/B$A created",
+            top_old && !contained_old
+        );
+    }
+    // The guard is bounded by tenant, searched type, parameter and group.
+    let clean = create_tenant("legacy1407-clean");
+    backend
+        .create(
+            &clean,
+            "Observation",
+            sql_composite_slots_suite::observation("clean", &["A"], &["B"]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let unrelated = create_tenant("another-tenant");
+    for scope in [&clean, &unrelated] {
+        backend
+            .create(
+                scope,
+                "Patient",
+                json!({"resourceType":"Patient","id":"orphan"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                scope,
+                "Observation",
+                sql_composite_slots_suite::observation("orphan", &["Z"], &["Z"]),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    conn.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,composite_group,value_token_code) VALUES (?1,'Patient','orphan','code-value-concept',1,'A'), (?1,'Observation','orphan','another-param',1,'A'), (?1,'Observation','orphan','code-value-concept',NULL,'A'), ('another-tenant','Observation','orphan','code-value-concept',1,'A')",[clean.tenant_id().as_str()]).unwrap();
+    conn.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,composite_group,value_token_code,is_contained,contained_type,contained_local_id) VALUES (?1,'Patient','orphan','code-value-concept',1,'A',1,'Patient','other-type'), (?1,'Patient','orphan','another-param',1,'A',1,'Observation','other-param'), ('another-tenant','Patient','orphan','code-value-concept',1,'A',1,'Observation','other-tenant')",[clean.tenant_id().as_str()]).unwrap();
+    sql_composite_slots_suite::assert_ids(
+        &backend,
+        &clean,
+        &sql_composite_slots_suite::pair_query("A$B", ContainedMode::Off),
+        &["clean"],
+    )
+    .await;
+    sql_composite_slots_suite::assert_ids(
+        &backend,
+        &clean,
+        &sql_composite_slots_suite::pair_query("A$B", ContainedMode::On),
+        &[],
+    )
+    .await;
+    sql_composite_slots_suite::assert_ids(
+        &backend,
+        &clean,
+        &sql_composite_slots_suite::pair_query("A$B", ContainedMode::Both),
+        &["clean"],
+    )
+    .await;
+    // Mixed old composites do not need positional information.
+    let mut mixed = sql_composite_slots_suite::observation("mixed", &["A"], &["B"]);
+    mixed["valueQuantity"] = json!({"value":9});
+    backend
+        .create(&clean, "Observation", mixed, FhirVersion::default())
+        .await
+        .unwrap();
+    conn.execute("UPDATE search_index SET composite_slot=NULL WHERE tenant_id=?1 AND param_name='code-value-quantity'",[clean.tenant_id().as_str()]).unwrap();
+    let mut query = SearchQuery::new("Observation");
+    query.parameters.push(sql_composite_slots_suite::composite(
+        "code-value-quantity",
+        &[
+            helios_persistence::types::SearchParamType::Token,
+            helios_persistence::types::SearchParamType::Quantity,
+        ],
+        &["A$gt5"],
+    ));
+    sql_composite_slots_suite::assert_ids(&backend, &clean, &query, &["mixed"]).await;
+}
+
+#[tokio::test]
+async fn sqlite_contained_composites_pair_within_one_resource() {
+    let backend = create_backend();
+    contained_suite::contained_composites_pair_within_one_resource(
+        &backend,
+        "contained-mixed-1407",
+    )
+    .await;
+}
+
+/// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_if_match_suite.rs"]
+mod conditional_if_match_suite;
+
+/// #1381: `If-Match` is evaluated against the resource the criteria resolve
+/// to, on conditional update, delete and patch.
+#[tokio::test]
+async fn sqlite_conditional_writes_honour_if_match() {
+    let backend = create_backend();
+    conditional_if_match_suite::if_match_is_evaluated_against_the_resolved_match(
+        &backend,
+        "cond-if-match-1381",
+        true,
+    )
+    .await;
+}
+
+/// #1381: of several writers holding the same `If-Match`, one writes.
+///
+/// File-backed, like the race suite below: the conditional search yields
+/// (#1930), so the writers interleave, and on the shared-cache `:memory:`
+/// database a search that meets another writer's table lock fails at once
+/// with `SQLITE_LOCKED` — `busy_timeout` does not cover shared-cache locks.
+#[tokio::test]
+async fn sqlite_conditional_writers_with_the_same_if_match_admit_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = create_file_backend(&dir);
+    conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
+        &backend,
+        "cond-if-match-race-1381",
+    )
+    .await;
+}
+
+/// The backend-agnostic race suite for version-aware writes (#1404, #1405).
+/// Same `#[path]` arrangement.
+#[path = "search/versioned_write_race_suite.rs"]
+mod versioned_write_race_suite;
+
+/// A file-backed (WAL) backend with the default pool — what `hfs` runs in
+/// production. Several pooled connections on several runtime threads is the
+/// configuration in which SQLite writers really interleave; the shared-cache
+/// `:memory:` database serialises them at the table lock instead.
+fn create_file_backend(dir: &tempfile::TempDir) -> SqliteBackend {
+    let config = SqliteBackendConfig {
+        data_dir: Some(spec_data_dir()),
+        ..Default::default()
+    };
+    let backend = SqliteBackend::with_config(dir.path().join("race.db"), config)
+        .expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to initialize schema");
+    backend
+}
+
+/// #1404: of several writers holding the same version, one `update` writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_updates_from_the_same_version_admit_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_updates_from_the_same_version_admit_one(
+        backend,
+        "update-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: an update and a versioned delete of the same version: one wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_update_and_versioned_delete_admit_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_update_and_versioned_delete_admit_one(
+        backend,
+        "delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: an update racing an unconditional delete leaves a contiguous history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_update_and_plain_delete_stay_consistent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
+        backend,
+        "plain-delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #1404: `delete_versioned` compares and deletes in one step.
+#[tokio::test]
+async fn sqlite_versioned_delete_is_a_compare_and_swap() {
+    let backend = create_backend();
+    versioned_write_race_suite::versioned_delete_is_a_compare_and_swap(&backend, "delete-cas-1404")
+        .await;
+}
+
+/// The backend-agnostic conditional patch suite (#1406). Same `#[path]`
+/// arrangement.
+#[path = "search/conditional_patch_suite.rs"]
+mod conditional_patch_suite;
+
+/// #1406: conditional patch is the trait's provided implementation over the
+/// backend's criteria resolver and the shared patch applier.
+#[tokio::test]
+async fn sqlite_conditional_patch() {
+    let backend = create_backend();
+    conditional_patch_suite::conditional_patch_resolves_gates_applies_and_swaps(
+        &backend,
+        "cond-patch-1406",
+    )
+    .await;
+}
+
+/// The repo's `data/` directory, where the spec SearchParameters live.
+/// CARGO_MANIFEST_DIR for tests is crates/persistence.
+fn spec_data_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .map(|p| p.join("data"))
-        .unwrap_or_else(|| PathBuf::from("data"));
+        .unwrap_or_else(|| PathBuf::from("data"))
+}
 
+fn create_backend() -> SqliteBackend {
+    // Configure with data directory to load spec SearchParameters
     let config = SqliteBackendConfig {
-        data_dir: Some(data_dir),
+        data_dir: Some(spec_data_dir()),
         ..Default::default()
     };
     let backend =
@@ -569,6 +1235,16 @@ async fn test_count_by_tenant() {
 
     assert_eq!(backend.count(&tenant_a, Some("Patient")).await.unwrap(), 3);
     assert_eq!(backend.count(&tenant_b, Some("Patient")).await.unwrap(), 2);
+
+    // The cross-tenant aggregate through the public trait agrees (#1827).
+    let by_tenant: std::collections::HashMap<String, u64> = backend
+        .count_by_tenant()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(by_tenant.get("tenant-a"), Some(&3));
+    assert_eq!(by_tenant.get("tenant-b"), Some(&2));
 }
 
 // ============================================================================
@@ -1980,6 +2656,87 @@ async fn test_search_reference_subject() {
     assert!(ids.contains(&"obs-2"));
 }
 
+/// A `Type/id` reference search must not match a *different* resource whose
+/// id merely extends the searched id. FHIR ids may contain `-` and `.`, which
+/// sort below `'/'` and `'0'` in SQLite's BINARY collation, so a naive
+/// `[base, base || '0')` index range (PR #1030) wrongly captured `Patient/123-4`
+/// and `Patient/123.5` for `subject=Patient/123`. The predicate must still be
+/// version-agnostic (match `Patient/123/_history/<v>`).
+#[tokio::test]
+async fn test_search_by_reference_does_not_match_extended_sibling_ids() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    // Every stored reference shares the "Patient/123" prefix; only the first
+    // two are the same resource.
+    let refs = [
+        ("obs-base", "Patient/123"),
+        ("obs-versioned", "Patient/123/_history/2"),
+        ("obs-dash", "Patient/123-4"),
+        ("obs-dot", "Patient/123.5"),
+        ("obs-digit", "Patient/1234"),
+        ("obs-zero", "Patient/1230"),
+        ("obs-dash-versioned", "Patient/123-4/_history/1"),
+        ("obs-short", "Patient/12"),
+    ];
+    for (id, reference) in refs {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "subject": {"reference": reference},
+                    "code": {"coding": [{"code": "8867-4"}]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let search = |value: &str| {
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    let result = backend
+        .search(&tenant, &search("Patient/123"))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["obs-base", "obs-versioned"],
+        "subject=Patient/123 must match only Patient/123 and its _history versions"
+    );
+
+    // The siblings are themselves searchable, exactly.
+    let result = backend
+        .search(&tenant, &search("Patient/123-4"))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["obs-dash", "obs-dash-versioned"]);
+
+    let result = backend
+        .search(&tenant, &search("Patient/123.5"))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids, vec!["obs-dot"]);
+}
+
 #[tokio::test]
 async fn test_patient_compartment_export_observation_without_since() {
     let backend = create_backend();
@@ -2510,6 +3267,8 @@ async fn test_reindex_operation_cancel() {
 struct SpyReindexTarget {
     written: std::sync::Mutex<Vec<String>>,
     cleared: std::sync::atomic::AtomicUsize,
+    /// The scope of every clear: `None` for the whole tenant, else the types.
+    cleared_scopes: std::sync::Mutex<Vec<Option<Vec<String>>>>,
 }
 
 #[async_trait::async_trait]
@@ -2538,8 +3297,20 @@ impl ReindexTarget for SpyReindexTarget {
 
     async fn clear_search_index(
         &self,
-        _tenant: &TenantContext,
+        tenant: &TenantContext,
     ) -> helios_persistence::error::StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        _tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> helios_persistence::error::StorageResult<u64> {
+        self.cleared_scopes
+            .lock()
+            .unwrap()
+            .push(resource_types.map(<[String]>::to_vec));
         self.cleared
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(0)
@@ -2603,6 +3374,217 @@ async fn test_reindex_fans_out_to_every_target() {
         secondary.cleared.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "clear_existing must clear the secondary index too"
+    );
+    assert_eq!(
+        *secondary.cleared_scopes.lock().unwrap(),
+        [Some(vec!["Patient".to_string()])],
+        "a Patient-scoped run must clear only Patient in the secondary (#1624)"
+    );
+}
+
+/// Runs `request` on `op` and waits for it to complete cleanly.
+async fn run_reindex_to_completion(
+    op: &ReindexOperation,
+    tenant: &TenantContext,
+    request: ReindexRequest,
+) {
+    let job_id = op.start(tenant.clone(), request, None).await.unwrap();
+    for _ in 0..200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        let progress = op.get_progress(&job_id).await.unwrap();
+        match progress.status {
+            ReindexStatus::Completed => {
+                assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+                return;
+            }
+            ReindexStatus::Failed | ReindexStatus::Cancelled => {
+                panic!(
+                    "reindex ended {:?}: {:?}",
+                    progress.status, progress.error_message
+                )
+            }
+            _ => {}
+        }
+    }
+    panic!("reindex timed out");
+}
+
+fn count_index_rows(path: &std::path::Path, table: &str) -> i64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+/// #1125: `sqlite-es` wires the offloaded SQLite primary as a reindex writer
+/// next to Elasticsearch. The rebuild must reach the secondary for every
+/// resource while leaving SQLite's `search_index` and FTS tables exactly as
+/// they were — no dead rows written, none accumulated across reruns, and
+/// `clearExisting` not reaching into an index nothing reads.
+#[tokio::test]
+async fn test_reindex_leaves_offloaded_sqlite_index_untouched_when_wired_as_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fhir.db");
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))
+        .unwrap_or_else(|| PathBuf::from("data"));
+    let tenant = create_tenant("test-tenant");
+
+    // Index some resources locally first, so "untouched" is observable.
+    {
+        let local = SqliteBackend::with_config(
+            &path,
+            SqliteBackendConfig {
+                data_dir: Some(data_dir.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        local.init_schema().unwrap();
+        for i in 1..=3 {
+            local
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("p{i}"),
+                        "name": [{"family": "Offload"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let index_rows = count_index_rows(&path, "search_index");
+    let fts_rows = count_index_rows(&path, "resource_fts");
+    assert!(
+        index_rows > 0 && fts_rows > 0,
+        "precondition: indexed locally"
+    );
+
+    let offloaded = SqliteBackend::with_config(
+        &path,
+        SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            search_offloaded: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    offloaded.init_schema().unwrap();
+    let offloaded = Arc::new(offloaded);
+    let secondary = Arc::new(SpyReindexTarget::default());
+    let op = ReindexOperation::with_parts(
+        offloaded.clone(),
+        vec![offloaded.clone(), secondary.clone()],
+        offloaded.tenant_registries().clone(),
+    );
+
+    for run in 1..=2 {
+        run_reindex_to_completion(
+            &op,
+            &tenant,
+            ReindexRequest::for_types(vec!["Patient"]).clear_existing(),
+        )
+        .await;
+        assert_eq!(
+            secondary.written.lock().unwrap().len(),
+            3 * run,
+            "run {run}: every resource must still reach the secondary"
+        );
+        assert_eq!(
+            count_index_rows(&path, "search_index"),
+            index_rows,
+            "run {run}: an offloaded primary must not gain or lose search_index rows"
+        );
+        assert_eq!(
+            count_index_rows(&path, "resource_fts"),
+            fts_rows,
+            "run {run}: an offloaded primary must not gain or lose FTS rows"
+        );
+    }
+}
+
+/// The id-scoped lookup a retry of failed resources uses (#1125): only live
+/// resources of the requested type come back, duplicates and unknown ids are
+/// harmless, and a list longer than one `IN (...)` batch is fully covered.
+#[tokio::test]
+async fn test_reindex_fetch_resources_by_ids() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+    for i in 1..=5 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({"resourceType": "Observation", "id": "p4", "status": "final"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend.delete(&tenant, "Patient", "p5").await.unwrap();
+    // Same ids in another tenant must not leak in.
+    let other = create_tenant("other-tenant");
+    backend
+        .create(
+            &other,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p3"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // 1,200 ids spanning several batches, the real ones at the edges and in
+    // the middle, plus a duplicate and a deleted resource.
+    let mut ids: Vec<String> = (0..1200).map(|k| format!("missing-{k}")).collect();
+    ids[0] = "p1".to_string();
+    ids[640] = "p3".to_string();
+    ids[1199] = "p4".to_string();
+    ids.push("p1".to_string());
+    ids.push("p5".to_string());
+
+    let mut found: Vec<(String, String)> = backend
+        .fetch_resources_by_ids(&tenant, "Patient", &ids)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            assert_eq!(r.tenant_id().as_str(), "test-tenant");
+            (r.resource_type().to_string(), r.id().to_string())
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("Patient".to_string(), "p1".to_string()),
+            ("Patient".to_string(), "p3".to_string()),
+            ("Patient".to_string(), "p4".to_string()),
+        ]
+    );
+
+    assert!(
+        backend
+            .fetch_resources_by_ids(&tenant, "Patient", &[])
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -2753,6 +3735,7 @@ async fn test_conditional_update_with_identifier() {
             "identifier=http://hospital.org/mrn|MRN-UPDATE-1",
             false,
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -2790,6 +3773,7 @@ async fn test_conditional_update_with_upsert() {
             "identifier=http://hospital.org/mrn|MRN-UPSERT-1",
             true, // upsert=true
             FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -2822,6 +3806,7 @@ async fn test_conditional_delete_with_identifier() {
             &tenant,
             "Patient",
             "identifier=http://hospital.org/mrn|MRN-DELETE-1",
+            &helios_persistence::core::EntityTagPrecondition::Absent,
         )
         .await
         .unwrap();
@@ -4401,4 +5386,75 @@ mod last_updated_millisecond_precision {
             }
         }
     }
+}
+
+mod release_contract {
+    use helios_persistence as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/release_contract.rs"
+    ));
+}
+
+/// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+#[tokio::test]
+async fn test_bulk_submit_release_requeues_and_fences_out_a_zombie() {
+    release_contract::release_requeues_and_fences_out_a_zombie(
+        &create_backend(),
+        &create_tenant("submit-release"),
+    )
+    .await;
+}
+
+/// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+#[tokio::test]
+async fn test_bulk_submit_release_after_abort_is_a_no_op() {
+    release_contract::release_after_abort_is_a_no_op(
+        &create_backend(),
+        &create_tenant("submit-release-abort"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_scoped_clear_preserves_other_types_and_tenants() {
+    scoped_clear::assert_scoped_clear(&create_backend()).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_resource_scoped_clear_preserves_other_resources() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_range_bounds_counts_and_pages() {
+    id_range::assert_ranged_source_bounds_counts_and_pages(Arc::new(create_backend())).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_ranges_follow_byte_order() {
+    id_range::assert_ranges_follow_byte_order(Arc::new(create_backend())).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_ranges_run_in_sequence_cover_a_type_once() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    id_range::assert_ranges_cover_a_type_once(backend, registries, false).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_ranges_run_concurrently_cover_a_type_once() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    id_range::assert_ranges_cover_a_type_once(backend, registries, true).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_range_with_a_write_during_the_run() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    id_range::assert_ranged_run_with_a_write_during_it(backend, registries).await;
 }

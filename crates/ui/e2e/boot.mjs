@@ -137,6 +137,29 @@ const child = spawn(bin, [], {
     // 400-line fixture in bulk-submit-ingest.spec.ts to ~20 movements. Lowering
     // this is what let that fixture shrink 5x without losing a single sample.
     HFS_BULK_SUBMIT_BATCH_SIZE: "20",
+    // Home dashboard cadences (#1078), tuned so dashboard.spec.ts watches the
+    // figures move and settle in seconds instead of sitting through production
+    // timings. pages/dashboard.ts (DASH_KNOBS) mirrors these values and sizes
+    // every wait from them, so change both together; an exported variable of
+    // the same name overrides a value on both sides.
+    //
+    // The production reconcile runs every 30s, and approximate figures only
+    // turn exact on a pass that starts after the last write, so a test waiting
+    // for a quiet tenant to settle spent up to 90s doing nothing. 3s lets a
+    // settle land in a few seconds. The pass bounds its own storage cost (see
+    // RECONCILE_DUTY_FACTOR in crates/rest/src/dashboard.rs), so a short
+    // interval does not load the suite's other tests.
+    HFS_DASHBOARD_RECONCILE_SECS: process.env.HFS_DASHBOARD_RECONCILE_SECS || "3",
+    // An open page re-requests its figures every 5s while they move and every
+    // 10s once settled; a test waiting for a write to reach the page waits one
+    // tick. 2s and 3s make that wait a few seconds. Not 1s: DashboardPage.goto
+    // and several specs navigate with `networkidle`, which needs 500ms without
+    // a request, and a 1s poll leaves no such gap once a debug build on a busy
+    // machine takes more than half a second to answer a tick. The settled tick
+    // stays longer than the moving one so the two cadences read differently on
+    // the page (`data-dash-refresh`).
+    HFS_DASHBOARD_REFRESH_SECS: process.env.HFS_DASHBOARD_REFRESH_SECS || "2",
+    HFS_DASHBOARD_IDLE_REFRESH_SECS: process.env.HFS_DASHBOARD_IDLE_REFRESH_SECS || "3",
     ...authEnv,
   },
 });

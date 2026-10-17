@@ -11,16 +11,20 @@
       "valueCode": "normative"
     },
     {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version",
+      "valueCode": "6.0.0-snapshot1"
+    },
+    {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
       "valueCode": "fhir"
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/DataRequirement",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-snapshot1",
   "name": "DataRequirement",
   "status": "active",
   "experimental": false,
-  "date": "2026-07-17T03:44:13+00:00",
+  "date": "2026-09-14T16:43:45+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -52,7 +56,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot4",
+  "fhirVersion": "6.0.0-snapshot1",
   "mapping": [
     {
       "identity": "rim",
@@ -229,7 +233,7 @@
           ],
           "strength": "required",
           "description": "List of FHIR types (resources, data types).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-snapshot1"
         }
       },
       {
@@ -1047,7 +1051,7 @@
           ],
           "strength": "required",
           "description": "Possible comparators for the valueFilter element.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-snapshot1"
         }
       },
       {
@@ -1317,7 +1321,7 @@
           ],
           "strength": "required",
           "description": "The possible sort directions, ascending or descending.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-snapshot1"
         }
       }
     ]
@@ -1362,7 +1366,7 @@
           ],
           "strength": "required",
           "description": "List of FHIR types (resources, data types).",
-          "valueSet": "http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-snapshot1"
         }
       },
       {
@@ -1682,7 +1686,7 @@
           ],
           "strength": "required",
           "description": "Possible comparators for the valueFilter element.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-snapshot1"
         }
       },
       {
@@ -1789,7 +1793,7 @@
           ],
           "strength": "required",
           "description": "The possible sort directions, ascending or descending.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-ballot4"
+          "valueSet": "http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-snapshot1"
         }
       }
     ]

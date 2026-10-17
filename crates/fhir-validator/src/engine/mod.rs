@@ -13,6 +13,8 @@ mod primitives;
 pub(crate) mod slicing;
 mod walk;
 
+pub(crate) use walk::resolve_element_reference;
+
 pub use errors::{ErrorKind, Severity, ValidationError};
 pub use path::dotted_to_fhirpath;
 

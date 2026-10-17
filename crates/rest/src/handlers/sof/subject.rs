@@ -30,8 +30,12 @@
 //!
 //! A subject that cannot be resolved yields `404 Not Found`: it is the thing the
 //! operation is about, so the operation cannot proceed without it. This is
-//! distinct from an unresolvable `patient` or `group`, which merely *scopes* the
-//! data and yields `400 Bad Request` (see operations-common.html#filter-resolution-errors).
+//! distinct from `patient` or `group`, which merely *scope* the data. For
+//! `$sql-export`, an unusable value is a `400 Bad Request` naming the
+//! parameter, and a usable reference to a missing Patient/Group is a
+//! `404 Not Found` (#1701). For `$sql-run`, a reference that matches nothing,
+//! including a missing or empty Group, selects no rows (see
+//! operations-common.html#filter-resolution-errors).
 
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::tenant::TenantContext;

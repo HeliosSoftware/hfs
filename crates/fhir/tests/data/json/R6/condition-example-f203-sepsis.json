@@ -50,6 +50,19 @@
       }
     ]
   },
+  "bodyStructure": [
+    {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "281158006",
+            "display": "Pulmonary vascular structure"
+          }
+        ]
+      }
+    }
+  ],
   "subject": {
     "reference": "Patient/f201",
     "display": "Roel"

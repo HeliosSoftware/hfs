@@ -32,40 +32,30 @@ use tokio::sync::OnceCell;
 // process-level static and force-remove the container via an atexit hook
 // (`#[ctor::dtor]`) since `static` values are never dropped.
 
-const INTEGRATION_PG_LABEL_KEY: &str = "io.helios.hts.test-pool";
-const INTEGRATION_PG_LABEL_VALUE: &str = "hts-integration-pg";
-
 static CONTAINER: OnceLock<ContainerAsync<Postgres>> = OnceLock::new();
 static DB_URL: OnceCell<String> = OnceCell::const_new();
 
 /// Force-remove the shared PostgreSQL testcontainer at process exit.
 /// `static CONTAINER` is never dropped, so its async cleanup never runs;
-/// this synchronous `docker rm -f` by label is the backstop.
+/// this synchronous `docker rm -f` by ID is the backstop.
 #[ctor::dtor]
 fn cleanup_integration_pg_container() {
-    let filter = format!("label={INTEGRATION_PG_LABEL_KEY}={INTEGRATION_PG_LABEL_VALUE}");
-    let Ok(listing) = std::process::Command::new("docker")
-        .args(["ps", "-aq", "--filter", &filter])
-        .output()
-    else {
+    let Some(container) = CONTAINER.get() else {
         return;
     };
-    let ids = String::from_utf8_lossy(&listing.stdout);
-    for id in ids.split_whitespace() {
-        let _ = std::process::Command::new("docker")
-            .args(["rm", "-f", id])
-            .output();
-    }
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", container.id()])
+        .output();
 }
 
-/// Start a labeled Postgres testcontainer, retrying transient failures.
+/// Start a Postgres testcontainer, retrying transient failures.
 ///
 /// Why: the testcontainers postgres image's wait-for-log strategy occasionally
 /// hits `EndOfStream` before the "ready" line on hosts where initdb emits a
 /// `locale: not found` warning during bootstrap. Retry a few times before
 /// giving up so a single unlucky first-caller doesn't fail an otherwise green
 /// suite.
-async fn start_postgres_for_test(label_key: &str, label_value: &str) -> ContainerAsync<Postgres> {
+async fn start_postgres_for_test() -> ContainerAsync<Postgres> {
     use testcontainers::{ImageExt, runners::AsyncRunner};
     let mut last_err = None;
     for attempt in 1..=3u32 {
@@ -73,12 +63,7 @@ async fn start_postgres_for_test(label_key: &str, label_value: &str) -> Containe
         // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
         // the backend sends as a startup option, so PG 11 rejects every
         // connection FATAL. The rest of the repo runs 16.
-        match Postgres::default()
-            .with_tag("16-alpine")
-            .with_label(label_key, label_value)
-            .start()
-            .await
-        {
+        match Postgres::default().with_tag("16-alpine").start().await {
             Ok(c) => return c,
             Err(e) => {
                 eprintln!("postgres container start attempt {attempt}/3 failed: {e:?}");
@@ -98,8 +83,7 @@ async fn start_postgres_for_test(label_key: &str, label_value: &str) -> Containe
 async fn db_url() -> &'static str {
     DB_URL
         .get_or_init(|| async {
-            let container =
-                start_postgres_for_test(INTEGRATION_PG_LABEL_KEY, INTEGRATION_PG_LABEL_VALUE).await;
+            let container = start_postgres_for_test().await;
 
             let host = container
                 .get_host()
@@ -179,8 +163,7 @@ async fn backend_name_is_postgres() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supported_systems_empty_initially() {
     // Use a dedicated container to guarantee a truly empty DB.
-    let container =
-        start_postgres_for_test(INTEGRATION_PG_LABEL_KEY, INTEGRATION_PG_LABEL_VALUE).await;
+    let container = start_postgres_for_test().await;
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
@@ -2049,7 +2032,7 @@ LP7786-3.LP10156-0.718-7,3,LP10156-0,718-7,Hemoglobin\r\n";
     let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
     {
         let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-        let opts = zip::write::FileOptions::default();
+        let opts = zip::write::SimpleFileOptions::default();
         zip.start_file("LoincTable.csv", opts).unwrap();
         zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
         zip.start_file("MultiAxialHierarchy.csv", opts).unwrap();
@@ -2335,4 +2318,171 @@ async fn bare_validate_code_prefers_owning_package_over_republished_copy_pg() {
     .await
     .unwrap();
     assert!(!pinned.result, "version=4.0.1 pins the truncated copy");
+}
+
+// ---------------------------------------------------------------------------
+// Compose filter ops used by VCL translation (compose_ops_*)
+// ---------------------------------------------------------------------------
+
+/// Imports a small hierarchy `ROOT > {A > A1, B}` with a `color` property
+/// (A=red, A1=blue, B=green, ROOT unset) and returns the CodeSystem URL.
+async fn compose_ops_setup(backend: &PostgresTerminologyBackend, base: &str, uid: &str) -> String {
+    let cs = format!("{base}cs");
+    let prop = |v: &str| serde_json::json!([{"code": "color", "valueString": v}]);
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
+            "url": cs, "name": "ComposeOps", "status": "active",
+            "content": "complete", "hierarchyMeaning": "is-a",
+            "property": [{"code": "color", "type": "string"}],
+            "concept": [{
+                "code": "ROOT", "display": "Root",
+                "concept": [
+                    {"code": "A", "display": "Alpha", "property": prop("red"),
+                     "concept": [{"code": "A1", "display": "Alpha one", "property": prop("blue")}]},
+                    {"code": "B", "display": "Beta", "property": prop("green")}
+                ]
+            }]
+        }}]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+    cs
+}
+
+async fn compose_ops_expand(
+    backend: &PostgresTerminologyBackend,
+    compose: serde_json::Value,
+    count: Option<u32>,
+) -> Vec<String> {
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                value_set: Some(serde_json::json!({
+                    "resourceType": "ValueSet", "status": "active", "compose": compose
+                })),
+                count,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut codes: Vec<String> = resp.contains.iter().map(|c| c.code.clone()).collect();
+    codes.sort();
+    codes
+}
+
+#[tokio::test]
+async fn compose_ops_is_not_a_excludes_closure_of_root() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-nota");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({"include": [{"system": cs,
+            "filter": [{"property": "concept", "op": "is-not-a", "value": "A"}]}]}),
+        None,
+    )
+    .await;
+    assert_eq!(codes, vec!["B", "ROOT"]);
+}
+
+#[tokio::test]
+async fn compose_ops_generalizes_returns_self_and_ancestors() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-gen");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({"include": [{"system": cs,
+            "filter": [{"property": "concept", "op": "generalizes", "value": "A1"}]}]}),
+        None,
+    )
+    .await;
+    assert_eq!(codes, vec!["A", "A1", "ROOT"]);
+}
+
+#[tokio::test]
+async fn compose_ops_in_multi_value_is_union() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-in");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({"include": [{"system": cs,
+            "filter": [{"property": "color", "op": "in", "value": "red,green"}]}]}),
+        None,
+    )
+    .await;
+    assert_eq!(codes, vec!["A", "B"]);
+}
+
+#[tokio::test]
+async fn compose_ops_not_in_multi_value_excludes_all_listed() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-notin");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({"include": [{"system": cs,
+            "filter": [{"property": "color", "op": "not-in", "value": "red,green"}]}]}),
+        None,
+    )
+    .await;
+    // A1 is blue; ROOT has no color and therefore passes.
+    assert_eq!(codes, vec!["A1", "ROOT"]);
+}
+
+#[tokio::test]
+async fn compose_ops_is_a_with_exclude_filter_and_count() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-exc");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    let codes = compose_ops_expand(
+        &backend,
+        serde_json::json!({
+            "include": [{"system": cs,
+                "filter": [{"property": "concept", "op": "is-a", "value": "ROOT"}]}],
+            "exclude": [{"system": cs,
+                "filter": [{"property": "concept", "op": "is-a", "value": "A"}]}]
+        }),
+        Some(10),
+    )
+    .await;
+    assert_eq!(codes, vec!["B", "ROOT"]);
+}
+
+#[tokio::test]
+async fn compose_ops_enumerated_include_with_whole_system_exclude_and_count() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-fast");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    // Whole-system and filter excludes must not be dropped by the paged
+    // enumerated-concept fast path.
+    let whole = compose_ops_expand(
+        &backend,
+        serde_json::json!({
+            "include": [{"system": cs, "concept": [{"code": "A"}, {"code": "B"}]}],
+            "exclude": [{"system": cs}]
+        }),
+        Some(10),
+    )
+    .await;
+    assert!(whole.is_empty(), "whole-system exclude ignored: {whole:?}");
+
+    let filtered = compose_ops_expand(
+        &backend,
+        serde_json::json!({
+            "include": [{"system": cs, "concept": [{"code": "A"}, {"code": "B"}]}],
+            "exclude": [{"system": cs,
+                "filter": [{"property": "concept", "op": "is-a", "value": "A"}]}]
+        }),
+        Some(10),
+    )
+    .await;
+    assert_eq!(filtered, vec!["B"]);
 }

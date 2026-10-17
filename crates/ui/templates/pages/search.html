@@ -17,7 +17,7 @@
   <!--
     Same flat rail as Resources (#603 follow-up): the "RESOURCE TYPES"
     heading, rounded filter input, and item rows are `.nav-panel`/`.filter-rail`
-    classes shared across Resources, Search, Saved Queries, and Search
+    classes shared across Resources, Search, and Search
     Parameters — no bordered card around it here.
   -->
   <aside class="filter-rail" aria-label="{{ i18n.t("queries-rail-heading") }}"
@@ -29,11 +29,11 @@
              placeholder="{{ i18n.t("queries-rail-filter") }}"
              aria-label="{{ i18n.t("queries-rail-filter") }}">
     </div>
-    {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries) %}{% endcall %}
+    {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, rail_counts_approximate) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
     <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="type-rail-list">
-      {% call rail::rail_items(rail_entries) %}{% endcall %}
+      {% call rail::rail_items(rail_entries, rail_counts_approximate) %}{% endcall %}
     </div>
   </aside>
 
@@ -75,7 +75,7 @@
           <input type="text" id="nl-text" maxlength="500" autocomplete="off"
                  placeholder="{{ i18n.t("search-nl-placeholder") }}"
                  aria-label="{{ i18n.t("search-nl-label") }}">
-          <button class="btn btn--primary" type="button" id="nl-submit">
+          <button class="btn btn--primary btn--busy-slot" type="button" id="nl-submit">
             <span class="icon">{% include "icons/search.svg" %}</span>
             {{ i18n.t("action-search") }}
           </button>
@@ -118,7 +118,10 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 </div>
 
 <script src="/ui/assets/fhir-search-value.js" defer></script>
-<script src="/ui/assets/saved-queries.js" defer></script>
+<script src="/ui/assets/typeahead.js" defer></script>
+<script src="/ui/assets/combobox.js" defer></script>
+<script src="/ui/assets/search-builder.js" defer></script>
+<script src="/ui/assets/row-navigation.js" defer></script>
 {% if nl.configured %}<script src="/ui/assets/nl-search.js" defer></script>{% endif %}
 <script src="/ui/assets/resource-filter.js" defer></script>
 {% endblock %}

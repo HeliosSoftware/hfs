@@ -52,6 +52,45 @@ const TENANCY_CAPABILITIES: [BackendCapability; 3] = [
     BackendCapability::DatabasePerTenant,
 ];
 
+/// The conditional interactions a backend can declare (#1384). The
+/// CapabilityStatement's `rest.resource.conditional*` elements and the REST
+/// layer's `501` are both derived from these, so a false claim here is a false
+/// claim to every client.
+const CONDITIONAL_CAPABILITIES: [BackendCapability; 4] = [
+    BackendCapability::ConditionalCreate,
+    BackendCapability::ConditionalUpdate,
+    BackendCapability::ConditionalDelete,
+    BackendCapability::ConditionalPatch,
+];
+
+/// Asserts a declaration names exactly `expected` among the conditional
+/// interactions. Redundant with the golden lists by construction, and kept
+/// anyway: this is the claim a client acts on, stated once per backend next to
+/// the reason for it.
+fn assert_declares_exactly_these_conditionals(
+    backend: &str,
+    declared: &[BackendCapability],
+    expected: &[BackendCapability],
+) {
+    for capability in CONDITIONAL_CAPABILITIES {
+        assert_eq!(
+            declared.contains(&capability),
+            expected.contains(&capability),
+            "{backend}: '{capability}' is {} but must {}be",
+            if declared.contains(&capability) {
+                "declared"
+            } else {
+                "not declared"
+            },
+            if expected.contains(&capability) {
+                ""
+            } else {
+                "not "
+            },
+        );
+    }
+}
+
 /// Asserts a declaration equals its golden list exactly, naming the difference
 /// in both directions on failure.
 ///
@@ -219,7 +258,27 @@ mod postgres {
                 BackendCapability::Include,
                 BackendCapability::Revinclude,
                 BackendCapability::InDbSofRunner,
+                BackendCapability::ConditionalCreate,
+                BackendCapability::ConditionalUpdate,
+                BackendCapability::ConditionalDelete,
+                BackendCapability::ConditionalPatch,
                 BackendCapability::SharedSchema,
+            ],
+        );
+    }
+
+    /// All four: `conditional_patch` is implemented alongside create / update /
+    /// delete (#1384).
+    #[test]
+    fn postgres_declares_every_conditional_interaction() {
+        assert_declares_exactly_these_conditionals(
+            "postgres",
+            &PostgresBackend::declared_capabilities(),
+            &[
+                BackendCapability::ConditionalCreate,
+                BackendCapability::ConditionalUpdate,
+                BackendCapability::ConditionalDelete,
+                BackendCapability::ConditionalPatch,
             ],
         );
     }
@@ -272,6 +331,10 @@ mod sqlite {
                 BackendCapability::Include,
                 BackendCapability::Revinclude,
                 BackendCapability::InDbSofRunner,
+                BackendCapability::ConditionalCreate,
+                BackendCapability::ConditionalUpdate,
+                BackendCapability::ConditionalDelete,
+                BackendCapability::ConditionalPatch,
                 BackendCapability::SharedSchema,
             ],
         );
@@ -285,6 +348,39 @@ mod sqlite {
     fn sqlite_instance_supports_matches_capabilities() {
         let backend = SqliteBackend::in_memory().expect("in-memory SQLite backend");
         assert_shared_schema_instance_is_consistent("sqlite", &backend);
+    }
+
+    /// All four: `conditional_patch` is implemented alongside create / update /
+    /// delete (#1384).
+    #[test]
+    fn sqlite_declares_every_conditional_interaction() {
+        assert_declares_exactly_these_conditionals(
+            "sqlite",
+            &SqliteBackend::declared_capabilities(),
+            &[
+                BackendCapability::ConditionalCreate,
+                BackendCapability::ConditionalUpdate,
+                BackendCapability::ConditionalDelete,
+                BackendCapability::ConditionalPatch,
+            ],
+        );
+    }
+
+    /// The REST layer reads `ConditionalStorage::supports_conditional`, not the
+    /// capability list: on a real instance the two must be the same answer.
+    #[test]
+    fn sqlite_instance_supports_conditional_matches_its_declaration() {
+        use helios_persistence::core::{Backend, ConditionalInteraction, ConditionalStorage};
+
+        let backend = SqliteBackend::in_memory().expect("in-memory SQLite backend");
+        for interaction in ConditionalInteraction::ALL {
+            assert!(backend.supports_conditional(interaction), "{interaction}");
+            assert_eq!(
+                backend.supports_conditional(interaction),
+                backend.supports(interaction.capability()),
+                "{interaction}"
+            );
+        }
     }
 }
 
@@ -330,6 +426,10 @@ mod mongodb {
                 BackendCapability::BulkSubmitIngest,
                 BackendCapability::BulkSubmitRestWorker,
                 BackendCapability::InDbSofRunner,
+                BackendCapability::ConditionalCreate,
+                BackendCapability::ConditionalUpdate,
+                BackendCapability::ConditionalDelete,
+                BackendCapability::ConditionalPatch,
                 BackendCapability::SharedSchema,
             ],
         );
@@ -343,6 +443,22 @@ mod mongodb {
         let backend =
             MongoBackend::new(MongoBackendConfig::default()).expect("MongoBackend from defaults");
         assert_shared_schema_instance_is_consistent("mongodb", &backend);
+    }
+
+    /// All four: `conditional_patch` is the trait's provided implementation
+    /// over MongoDB's criteria resolver (#1406; it was unimplemented, #1384).
+    #[test]
+    fn mongodb_declares_every_conditional_interaction() {
+        assert_declares_exactly_these_conditionals(
+            "mongodb",
+            &MongoBackend::declared_capabilities(),
+            &[
+                BackendCapability::ConditionalCreate,
+                BackendCapability::ConditionalUpdate,
+                BackendCapability::ConditionalDelete,
+                BackendCapability::ConditionalPatch,
+            ],
+        );
     }
 }
 
@@ -398,6 +514,18 @@ mod elasticsearch {
         let backend =
             ElasticsearchBackend::new(ElasticsearchConfig::default()).expect("ES backend");
         assert_shared_schema_instance_is_consistent("elasticsearch", &backend);
+    }
+
+    /// None: Elasticsearch is a search secondary and does not implement
+    /// `ConditionalStorage`. A composite over it resolves the criteria through
+    /// its `search` and writes to the primary.
+    #[test]
+    fn elasticsearch_declares_no_conditional_interaction() {
+        assert_declares_exactly_these_conditionals(
+            "elasticsearch",
+            &ElasticsearchBackend::declared_capabilities(),
+            &[],
+        );
     }
 }
 
@@ -536,6 +664,7 @@ mod s3 {
                 BackendCapability::CursorPagination,
                 BackendCapability::BulkExport,
                 BackendCapability::BulkSubmitIngest,
+                BackendCapability::ConditionalCreate,
                 BackendCapability::BulkSubmitRestWorker,
                 BackendCapability::SharedSchema,
             ],
@@ -564,6 +693,7 @@ mod s3 {
                 BackendCapability::CursorPagination,
                 BackendCapability::BulkExport,
                 BackendCapability::BulkSubmitIngest,
+                BackendCapability::ConditionalCreate,
                 BackendCapability::DatabasePerTenant,
             ];
             if default_system_bucket.is_some() {
@@ -573,6 +703,25 @@ mod s3 {
                 "s3 (BucketPerTenant)",
                 &S3Backend::declared_capabilities_for(&bucket_mode(default_system_bucket)),
                 &expected,
+            );
+        }
+    }
+
+    /// Conditional create is served identifier-scoped, by scan (#1435), in
+    /// every tenancy mode; update, delete and patch are not, since S3 has no
+    /// search to resolve their criteria with, and every one of those methods
+    /// answers `UnsupportedCapability` (#1384).
+    #[test]
+    fn s3_declares_only_conditional_create() {
+        for mode in [
+            prefix_mode(),
+            bucket_mode(None),
+            bucket_mode(Some("system")),
+        ] {
+            assert_declares_exactly_these_conditionals(
+                "s3",
+                &S3Backend::declared_capabilities_for(&mode),
+                &[BackendCapability::ConditionalCreate],
             );
         }
     }

@@ -10,6 +10,7 @@
   <contained>
     <Substance>
       <id value="sub02"/>
+      <!-- <instance value="false"/> -->
       <code>
         <concept>
           <coding>

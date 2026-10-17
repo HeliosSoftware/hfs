@@ -1683,3 +1683,150 @@ SELECT count(*) FILTER (WHERE value_reference IS NOT NULL) AS reference_rows,
              / NULLIF(count(*) FILTER (WHERE value_reference IS NOT NULL), 0), 1)
          AS bytes_per_row
 FROM search_index WHERE tenant_id = 'default';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BV-BZ. REPEATED PARAMETER (#1416): one membership test over the occurrences'
+-- `INTERSECT`.
+--
+-- `?birthdate=ge1980-01-01&birthdate=lt1990-01-01` is two occurrences of ONE
+-- name. FHIR defines the repeat as an AND of two independent candidate sets.
+-- Built as two `id IN (...)` sublinks (BX/BY) that is two semi-joins, and
+-- PostgreSQL may execute the pair as a nested loop that re-runs one arm's scan
+-- once per candidate from the other: the before-state capture shows
+-- `Index Only Scan using idx_search_date_recent` at 9,000 / 18,000 loops,
+-- 205.7 / 407.4 pages per rescan and 1.9M / 7.4M buffers, against a shipped
+-- 30 s `statement_timeout` the larger corpus cannot finish inside.
+--
+-- Since #1416 the same occurrences build as ONE membership test whose arms are
+-- the occurrences' own selects, joined by `INTERSECT`. Both occurrences sit
+-- inside one set-operation input, so one occurrence's scan can no longer be
+-- parameterized beneath the other and re-run per candidate it produces; the
+-- arms in BV/BW execute once each (check 1).
+--
+-- THIS IS PLAN-SHAPE EVIDENCE, NOT A TIMING BENCHMARK. The millisecond numbers
+-- on a corpus small enough for CI are noise (11.8 ms and 9.4 ms for the same
+-- statement); the durable checks are:
+--   1. BV/BW: every `INTERSECT` arm is an index scan with Actual Loops = 1, so
+--      each arm's index is read once for the whole page / count.
+--   2. BV/BW: `idx_search_date_recent` appears nowhere. That node is the
+--      before-shape rescan; if it is back, so is the regression.
+--   3. BV/BW: buffers means hit + read. Read it against the rows actually
+--      returned and against BX/BY, never against wall time.
+--   4. BZ: the page and the count are the criteria's own answers (run plainly,
+--      not EXPLAINed), not the planner's estimates.
+--   5. BX/BY are the control: the pre-#1416 conjunction, same pass, same cache,
+--      expected to touch hundreds of times the buffers of BV/BW. Read the pair
+--      together; either side alone proves nothing.
+--
+-- SELECT-only: no DDL, no temporary objects, nothing to clean up, safe to
+-- re-run against the benchmark database. The values are literals so the file
+-- runs as-is; the server emits `$1..$4` binds and is otherwise identical (see
+-- docs/postgres-repeated-date-benchmark.md). BV uses the default page size
+-- (`_count=20`, so LIMIT 21); the capture behind those numbers ran the same
+-- statement at `_count=1` (LIMIT 2) and the shape is the same. Tenant, type,
+-- parameter and window are the capture's; change the values, never the shape,
+-- when the corpus differs.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+\echo ''
+\echo '######## BV. REPEATED PARAMETER (#1416) - EMITTED PAGE: one INTERSECT membership, arms evaluated once ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Patient' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                AND param_name = 'birthdate' AND value_date >= '1980-01-01'
+              INTERSECT
+              SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                AND param_name = 'birthdate' AND value_date < '1990-01-01'))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## BW. REPEATED PARAMETER (#1416) - EMITTED COUNT: the `_total=accurate|estimate` statement ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT COUNT(*) FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Patient' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                AND param_name = 'birthdate' AND value_date >= '1980-01-01'
+              INTERSECT
+              SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                AND param_name = 'birthdate' AND value_date < '1990-01-01'));
+
+\echo ''
+\echo '######## BX. BX-BY CONTROL - the pre-#1416 two-membership page, same pass, same cache ########'
+-- Bounded exactly as BT: on the full corpus this is the shape the issue is
+-- about, and a missing measurement is preferable to a stalled capture. A
+-- timeout here is not a failure of the capture; the rescanning node is the
+-- evidence.
+SET statement_timeout = '300s';
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Patient' AND is_deleted = FALSE
+  AND ((id IN (SELECT resource_id FROM search_index
+               WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                 AND param_name = 'birthdate' AND value_date >= '1980-01-01'))
+   AND (id IN (SELECT resource_id FROM search_index
+               WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                 AND param_name = 'birthdate' AND value_date < '1990-01-01')))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## BY. BX COUNTERPART - the same pre-#1416 conjunction as a count ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT COUNT(*) FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Patient' AND is_deleted = FALSE
+  AND ((id IN (SELECT resource_id FROM search_index
+               WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                 AND param_name = 'birthdate' AND value_date >= '1980-01-01'))
+   AND (id IN (SELECT resource_id FROM search_index
+               WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                 AND param_name = 'birthdate' AND value_date < '1990-01-01')));
+RESET statement_timeout;
+
+\echo ''
+\echo '######## BZ. REPEATED PARAMETER - the criteria, not the plan: arms, intersection, page and count ########'
+-- Expect: emitted_count = intersection, both arm sizes >= intersection, and a
+-- page whose ids are the first rows of the intersection in `last_updated DESC,
+-- id ASC` order.
+-- If either arm comes back empty, the window does not partition this corpus:
+-- pick values that both arms match and re-run before reading BX/BY.
+SELECT
+  (SELECT count(DISTINCT resource_id) FROM search_index
+    WHERE tenant_id = 'default' AND resource_type = 'Patient'
+      AND param_name = 'birthdate' AND value_date >= '1980-01-01') AS arm_ge_1980,
+  (SELECT count(DISTINCT resource_id) FROM search_index
+    WHERE tenant_id = 'default' AND resource_type = 'Patient'
+      AND param_name = 'birthdate' AND value_date < '1990-01-01') AS arm_lt_1990,
+  (SELECT count(*) FROM (
+     SELECT resource_id FROM search_index
+      WHERE tenant_id = 'default' AND resource_type = 'Patient'
+        AND param_name = 'birthdate' AND value_date >= '1980-01-01'
+     INTERSECT
+     SELECT resource_id FROM search_index
+      WHERE tenant_id = 'default' AND resource_type = 'Patient'
+        AND param_name = 'birthdate' AND value_date < '1990-01-01') s) AS intersection,
+  (SELECT count(*) FROM resources
+    WHERE tenant_id = 'default' AND resource_type = 'Patient' AND is_deleted = FALSE
+      AND (id IN (SELECT resource_id FROM search_index
+                  WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                    AND param_name = 'birthdate' AND value_date >= '1980-01-01'
+                  INTERSECT
+                  SELECT resource_id FROM search_index
+                  WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                    AND param_name = 'birthdate' AND value_date < '1990-01-01')))
+    AS emitted_count;
+
+SELECT string_agg(id, ',' ORDER BY last_updated DESC, id ASC) AS page_ids
+FROM (SELECT id, last_updated FROM resources
+      WHERE tenant_id = 'default' AND resource_type = 'Patient' AND is_deleted = FALSE
+        AND (id IN (SELECT resource_id FROM search_index
+                    WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                      AND param_name = 'birthdate' AND value_date >= '1980-01-01'
+                    INTERSECT
+                    SELECT resource_id FROM search_index
+                    WHERE tenant_id = 'default' AND resource_type = 'Patient'
+                      AND param_name = 'birthdate' AND value_date < '1990-01-01'))
+      ORDER BY last_updated DESC, id ASC LIMIT 21) s;

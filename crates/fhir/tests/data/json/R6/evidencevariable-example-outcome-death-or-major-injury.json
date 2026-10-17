@@ -96,6 +96,15 @@
       }
     }
   ],
+  "handling": {
+    "coding": [
+      {
+        "system": "https://fevir.net/sevco",
+        "code": "STATO:0000724",
+        "display": "boolean variable"
+      }
+    ]
+  },
   "timing": {
     "contextCode": {
       "text": "impact"

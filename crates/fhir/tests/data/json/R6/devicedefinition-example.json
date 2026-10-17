@@ -7,13 +7,16 @@
       "valueCode": "oo"
     }
   ],
+  "url": "http://hl7.org/fhir/DeviceDefinition/example",
   "identifier": [
     {
       "value": "0"
     }
   ],
+  "version": "1.0.0",
   "status": "active",
   "experimental": true,
+  "publisher": "HL7 International / Orders and Observations",
   "contact": [
     {
       "telecom": [
@@ -24,6 +27,11 @@
       ]
     }
   ],
+  "partNumber": "Part456",
+  "manufacturer": {
+    "reference": "Organization/example"
+  },
+  "modelNumber": "Model123",
   "deviceName": [
     {
       "name": "Example Device Name",
@@ -37,33 +45,16 @@
       }
     }
   ],
-  "deviceVersion": [
+  "conformsTo": [
     {
-      "type": {
+      "category": {
         "coding": [
           {
-            "system": "http://hl7.org/fhir/device-version-type",
-            "code": "hardware"
+            "system": "http://hl7.org/fhir/device-specification-category",
+            "code": "exchange"
           }
         ]
       },
-      "value": "v1.2.3"
-    }
-  ],
-  "url": "http://hl7.org/fhir/DeviceDefinition/example",
-  "hasPart": [
-    {
-      "definitionCanonical": "http://hl7.org/fhir/DeviceDefinition/example-prodspec"
-    }
-  ],
-  "manufacturer": {
-    "reference": "Organization/example"
-  },
-  "modelNumber": "Model123",
-  "partNumber": "Part456",
-  "publisher": "HL7 International / Orders and Observations",
-  "conformsTo": [
-    {
       "specification": {
         "coding": [
           {
@@ -75,15 +66,25 @@
       },
       "version": [
         "3.0"
-      ],
-      "category": {
+      ]
+    }
+  ],
+  "hasPart": [
+    {
+      "definitionCanonical": "http://hl7.org/fhir/DeviceDefinition/example-prodspec"
+    }
+  ],
+  "deviceVersion": [
+    {
+      "type": {
         "coding": [
           {
-            "system": "http://hl7.org/fhir/device-specification-category",
-            "code": "exchange"
+            "system": "http://hl7.org/fhir/device-version-type",
+            "code": "hardware"
           }
         ]
-      }
+      },
+      "value": "v1.2.3"
     }
   ]
 }

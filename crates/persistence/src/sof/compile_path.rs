@@ -25,6 +25,7 @@ use helios_fhirpath::parser::{Expression, Invocation, Literal, Term, TypeSpecifi
 
 use crate::core::sof_runner::SofError;
 
+use super::dialect::is_plain_member_name;
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, RowIndexScope,
     SqlExpr, SqlType, UnaryOp,
@@ -67,6 +68,10 @@ pub struct CompileEnv {
     /// FHIR version for the field-type lookup tables. Defaults to R4 when
     /// the caller doesn't supply one.
     pub fhir_version: FhirVersion,
+    /// FHIR type of each `forEach` / `repeat` focus (`fe1.value`,
+    /// `rec1.node`, …), registered by the view compiler as it builds the
+    /// iteration chain. Foci absent from the map have an unknown type.
+    pub focus_types: HashMap<String, String>,
 }
 
 /// A `ViewDefinition.constant[]` entry resolved to a typed value.
@@ -93,6 +98,7 @@ impl CompileEnv {
             next_where_alias: 0,
             resource_type: String::new(),
             fhir_version: FhirVersion::default_enabled(),
+            focus_types: HashMap::new(),
         }
     }
 
@@ -118,6 +124,10 @@ impl CompileEnv {
 /// element whose FHIR type we don't track at compile time.
 const RESOURCE_ROOT: &str = "r.data";
 
+/// The resource row's `id` column, the SQL form of `getResourceKey()` on the
+/// resource itself.
+pub(super) const RESOURCE_ID_COLUMN: &str = "r.id";
+
 /// Parse `src` and compile it to [`SqlExpr`].
 ///
 /// # Errors
@@ -133,6 +143,60 @@ pub fn compile_fhirpath_expr(src: &str, env: &mut CompileEnv) -> Result<SqlExpr,
     }
     let parsed = parse_expression(trimmed).map_err(|e| SofError::Uncompilable { reason: e })?;
     lower_expression(&parsed, env)
+}
+
+/// Compiles an already-parsed FHIRPath expression (see [`split_for_each_where`]).
+pub(super) fn compile_fhirpath_ast(
+    expr: &Expression,
+    env: &mut CompileEnv,
+) -> Result<SqlExpr, SofError> {
+    lower_expression(expr, env)
+}
+
+/// A `forEach` / `forEachOrNull` path of the shape
+/// `<base>.where(<crit>)[.first() | [N]]`, split on the parsed AST.
+#[derive(Debug)]
+pub(super) struct ForEachWhere {
+    /// Collection the criterion filters.
+    pub base: Expression,
+    /// The `where()` criterion, evaluated against each element of `base`.
+    pub criterion: Expression,
+    /// Trailing `.first()` (`Some(0)`) or integer-literal `[N]` applied to
+    /// the filtered collection.
+    pub index: Option<i64>,
+}
+
+/// Splits a `forEach` source ending in `where(crit)`, optionally followed by
+/// `.first()` or `[N]`, into its parts. Returns `Ok(None)` for any other
+/// shape so the caller lowers the source as a plain path. Works on the parsed
+/// AST, so parentheses and string literals inside the criterion are never
+/// mistaken for the structure around it.
+pub(super) fn split_for_each_where(src: &str) -> Result<Option<ForEachWhere>, SofError> {
+    let parsed = parse_expression(src.trim()).map_err(|e| SofError::Uncompilable { reason: e })?;
+    let (call, index) = match &parsed {
+        Expression::Invocation(base, Invocation::Function(name, args))
+            if name == "first" && args.is_empty() =>
+        {
+            (base.as_ref(), Some(0))
+        }
+        Expression::Indexer(base, idx) => match idx.as_ref() {
+            Expression::Term(Term::Literal(Literal::Integer(n))) => (base.as_ref(), Some(*n)),
+            _ => return Ok(None),
+        },
+        other => (other, None),
+    };
+    match call {
+        Expression::Invocation(base, Invocation::Function(name, args))
+            if name == "where" && args.len() == 1 =>
+        {
+            Ok(Some(ForEachWhere {
+                base: base.as_ref().clone(),
+                criterion: args[0].clone(),
+                index,
+            }))
+        }
+        _ => Ok(None),
+    }
 }
 
 // ============================================================================
@@ -308,10 +372,10 @@ fn lower_literal(lit: &Literal) -> Result<SqlExpr, SofError> {
         Literal::Boolean(b) => SqlExpr::Lit(LitValue::Bool(*b)),
         Literal::Integer(n) => SqlExpr::Lit(LitValue::Int(*n)),
         Literal::Number(d) => SqlExpr::Lit(LitValue::Decimal(d.to_string())),
-        // Strings are bound as parameters in later stages once the env can
-        // allocate; for now treat them as compile-time literals (acceptable
-        // because they're user-controlled but already validated as FHIRPath
-        // string literals by the parser).
+        // String literals are inlined into the SQL text (not bound), and they
+        // are caller-supplied: the emitter renders every one through
+        // `Dialect::string_literal`, which handles quotes and backslashes for
+        // the target dialect.
         Literal::String(s) => SqlExpr::Lit(LitValue::Str(s.clone())),
         Literal::Date(_) | Literal::DateTime(_) | Literal::Time(_) | Literal::Quantity(_, _) => {
             return Err(SofError::Uncompilable {
@@ -326,14 +390,22 @@ fn lower_literal(lit: &Literal) -> Result<SqlExpr, SofError> {
 /// to a field navigation off `env.root_alias`.
 fn lower_root_invocation(inv: &Invocation, env: &mut CompileEnv) -> Result<SqlExpr, SofError> {
     match inv {
-        Invocation::Member(name) => Ok(SqlExpr::JsonPath {
-            root: env.root_alias.clone(),
-            path: JsonPath(vec![PathStep::Field(name.clone())]),
-        }),
+        Invocation::Member(name) => {
+            check_plain_identifier(name, "member name")?;
+            Ok(SqlExpr::JsonPath {
+                root: env.root_alias.clone(),
+                path: JsonPath(vec![PathStep::Field(name.clone())]),
+            })
+        }
         Invocation::This => Ok(SqlExpr::JsonPath {
             root: env.root_alias.clone(),
             path: JsonPath::new(),
         }),
+        // `exists(crit)` against the current (single-element) focus is
+        // `where(crit).exists()`, i.e. the criterion itself.
+        Invocation::Function(name, args) if name == "exists" && args.len() == 1 => {
+            lower_where_exists(None, &args[0], false, env)
+        }
         Invocation::Function(name, args) => {
             // Zero-arg builtins that resolve against the current focus only
             // are unusual at root; defer to call site.
@@ -382,6 +454,14 @@ fn lower_invocation(
         {
             return lower_where_exists(None, &args[0], term == "empty", env);
         }
+    }
+
+    // `<focus>.exists(crit)` is shorthand for `<focus>.where(crit).exists()`.
+    if let Invocation::Function(name, args) = inv
+        && name == "exists"
+        && args.len() == 1
+    {
+        return lower_where_exists(Some(base), &args[0], false, env);
     }
 
     let base_sql = lower_expression(base, env)?;
@@ -618,6 +698,9 @@ fn try_lower_join_aggregate(
         Expression::Invocation(b, Invocation::Member(field)) => (b.as_ref(), field.clone()),
         _ => return Ok(None),
     };
+    // `inner_field` becomes a `PathStep::Field` at emit time without passing
+    // through `extend_path`, so it needs its own check.
+    check_plain_identifier(&inner_field, "member name")?;
     // Separator must be a string literal (or absent → empty).
     let sep = match sep_arg_opt {
         None => String::new(),
@@ -632,7 +715,7 @@ fn try_lower_join_aggregate(
     Ok(Some(SqlExpr::JoinAggregate {
         outer_focus: Box::new(outer_focus),
         outer_alias,
-        inner_field,
+        inner_field: Some(inner_field),
         inner_alias,
         separator: sep,
     }))
@@ -735,6 +818,9 @@ fn lower_indexer(
 /// `where`/`forEach` iter alias) fall back to a parent-free scan via
 /// [`super::field_exists_anywhere`].
 fn extend_path(base: SqlExpr, step: PathStep, env: &CompileEnv) -> Result<SqlExpr, SofError> {
+    if let PathStep::Field(name) = &step {
+        check_plain_identifier(name, "member name")?;
+    }
     match base {
         SqlExpr::JsonPath { root, mut path } => {
             if let PathStep::OfType(type_name) = &step
@@ -768,6 +854,28 @@ fn extend_path(base: SqlExpr, step: PathStep, env: &CompileEnv) -> Result<SqlExp
             reason: format!("cannot extend non-path expression {other:?} with a path step"),
         }),
     }
+}
+
+/// Rejects names that are not plain identifiers (`what` says which kind, for
+/// the error message).
+///
+/// Member names become JSON keys inside SQL string literals, and type names
+/// from `getReferenceKey(T)` become `LIKE` patterns. The FHIRPath parser
+/// accepts backtick-delimited identifiers with arbitrary characters
+/// (`` `a'b` ``, `` `x.y` ``, `` `a"b` ``), none of which is a real FHIR element
+/// or type name, and the two backends disagree about how such keys would be
+/// addressed in a JSON path. Rather than guess, the in-DB runner refuses them;
+/// the dialect layer additionally escapes whatever it is given, as a backstop.
+fn check_plain_identifier(name: &str, what: &str) -> Result<(), SofError> {
+    if is_plain_member_name(name) {
+        return Ok(());
+    }
+    Err(SofError::Uncompilable {
+        reason: format!(
+            "{what} {name:?} is not supported by the in-DB runner: only plain \
+             identifiers ([A-Za-z_][A-Za-z0-9_]*) can be used"
+        ),
+    })
 }
 
 /// Returns true when the FHIR field `variant` (e.g. `valueQuantity`) exists
@@ -817,6 +925,63 @@ fn parent_type_of_last_field(root: &str, path: &JsonPath, env: &CompileEnv) -> O
         }
     }
     Some(parent)
+}
+
+/// FHIR type of the element a SQL `root` points at: the resource itself for
+/// [`RESOURCE_ROOT`], or the registered type of a `forEach` / `repeat` focus.
+pub(super) fn focus_fhir_type(root: &str, env: &CompileEnv) -> Option<String> {
+    if root == RESOURCE_ROOT {
+        (!env.resource_type.is_empty()).then(|| env.resource_type.clone())
+    } else {
+        env.focus_types.get(root).cloned()
+    }
+}
+
+/// Walks `path` from the focus `root` through the FIELD_TYPES table and
+/// returns the FHIR type of the element the whole path lands on (e.g. `code`
+/// for `code.coding[0].code` on `Condition`), plus whether the last field step
+/// is repeating. `None` when the root's type is unknown or any step can't be
+/// resolved.
+pub(super) fn walk_fhir_type(
+    root: &str,
+    path: &JsonPath,
+    env: &CompileEnv,
+) -> Option<(String, bool)> {
+    walk_fhir_type_from(&focus_fhir_type(root, env)?, path, env)
+}
+
+/// [`walk_fhir_type`] starting from a known FHIR type instead of a focus.
+pub(super) fn walk_fhir_type_from(
+    start_type: &str,
+    path: &JsonPath,
+    env: &CompileEnv,
+) -> Option<(String, bool)> {
+    let mut current = start_type.to_string();
+    let mut last_is_array = false;
+    for step in &path.0 {
+        match step {
+            PathStep::Field(name) => {
+                let (ty, is_array) = super::lookup_field_type(env.fhir_version, &current, name)?;
+                current = ty.to_string();
+                last_is_array = is_array;
+            }
+            PathStep::Index(_) => {}
+            PathStep::OfType(t) => current = t.clone(),
+            PathStep::TypeFilter(_) => return None,
+        }
+    }
+    Some((current, last_is_array))
+}
+
+/// FHIR type of the value a column path reads, or `None` when it can't be
+/// resolved *or* when the last field repeats: the SQL then yields the whole
+/// array as JSON text (the lowering only indexes the first field, and drops
+/// a trailing `.first()` index), which must not be decoded as a scalar.
+pub(super) fn fhir_type_of_path(root: &str, path: &JsonPath, env: &CompileEnv) -> Option<String> {
+    match walk_fhir_type(root, path, env)? {
+        (_, true) => None,
+        (ty, false) => Some(ty),
+    }
 }
 
 fn uppercase_first(s: &str) -> String {
@@ -892,8 +1057,14 @@ fn lower_function_call(
             extend_path(focus.clone(), PathStep::OfType(ty), env)
         }
         "getResourceKey" if args.is_empty() => {
-            // Per SoF v2: returns the resource's id. The focus is the
-            // resource document; navigate `id` off it.
+            // Per SoF v2: returns the resource's id. On the resource itself
+            // that is the `id` column, which storage keeps equal to the
+            // document's `id` and which needs no JSON parse; elsewhere
+            // navigate `id` off the focus.
+            if matches!(focus, SqlExpr::JsonPath { root, path } if root == RESOURCE_ROOT && path.0.is_empty())
+            {
+                return Ok(SqlExpr::ColRef(RESOURCE_ID_COLUMN.to_string()));
+            }
             extend_path(focus.clone(), PathStep::Field("id".to_string()), env)
         }
         "getReferenceKey" if args.is_empty() => {
@@ -935,13 +1106,37 @@ fn lower_function_call(
                 else_: Some(Box::new(SqlExpr::Lit(LitValue::Int(0)))),
             })
         }
-        "join" if args.len() <= 1 => {
-            // Scalar focus: `join(sep)` is identity (the lone value is its
-            // own join result). For arrays, lowers to `string_agg` /
-            // `group_concat` over a lateral subquery — added when
-            // collection-flow infrastructure lands.
-            Ok(focus.clone())
-        }
+        "join" if args.len() <= 1 => match focus {
+            // `<path>.join(sep)` relative to the current focus (`line.join`
+            // inside `forEach: "address"`): the `<base>.<field>` shape was
+            // already lifted by `try_lower_join_aggregate`, so here the path
+            // itself is the collection whose elements are joined.
+            SqlExpr::JsonPath { path, .. } if !path.is_empty() => {
+                let separator = match args.first() {
+                    None => String::new(),
+                    Some(Expression::Term(Term::Literal(Literal::String(s)))) => s.clone(),
+                    Some(other) => {
+                        return Err(SofError::Uncompilable {
+                            reason: format!(
+                                "join() separator must be a string literal (got {other:?})"
+                            ),
+                        });
+                    }
+                };
+                let outer_alias = format!("ja{}", env.next_where_alias);
+                env.next_where_alias += 1;
+                Ok(SqlExpr::JoinAggregate {
+                    outer_focus: Box::new(focus.clone()),
+                    outer_alias,
+                    inner_field: None,
+                    inner_alias: String::new(),
+                    separator,
+                })
+            }
+            // Scalar focus (`$this`, a where()-lifted scalar): `join(sep)` is
+            // identity — the lone value is its own join result.
+            _ => Ok(focus.clone()),
+        },
         "extension" if args.len() == 1 => {
             // `<focus>.extension(<url>)` — sugar for filtered-extension
             // navigation. Lifts to a WhereScalar over the focus's
@@ -1002,7 +1197,10 @@ fn lower_function_call(
 /// type literal.
 fn type_name_from_arg(arg: &Expression) -> Result<String, SofError> {
     match arg {
-        Expression::Term(Term::Invocation(Invocation::Member(name))) => Ok(name.clone()),
+        Expression::Term(Term::Invocation(Invocation::Member(name))) => {
+            check_plain_identifier(name, "type name")?;
+            Ok(name.clone())
+        }
         _ => Err(SofError::Uncompilable {
             reason: format!("ofType() argument must be a bare type identifier (got {arg:?})"),
         }),

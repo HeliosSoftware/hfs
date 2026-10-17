@@ -218,7 +218,7 @@
   function renderPreflight(generation) {
     var n = entries().length;
     requestLine.textContent =
-      "POST [base] · Bundle · " + bundle.type + " · " + n + " " + messages.msgEntries;
+      "POST [base] · Bundle · " + bundle.type + " · " + window.HfsNumber.format(n) + " " + messages.msgEntries;
     semantics.textContent =
       bundle.type === "transaction" ? messages.msgSemanticsTransaction : messages.msgSemanticsBatch;
 
@@ -234,7 +234,7 @@
 
       var num = document.createElement("span");
       num.className = "batch-row__num";
-      num.textContent = String(i + 1);
+      num.textContent = window.HfsNumber.format(i + 1);
 
       var method = methodOf(entry);
       var chip = document.createElement("span");
@@ -324,6 +324,14 @@
 
   /* ---- stage 3: execute and report ------------------------------------ */
 
+  function executeFailed(detail) {
+    executeError.textContent = messages.msgRequestFailed + (detail ? " — " + detail : "");
+    executeError.hidden = false;
+  }
+
+  /* The server's body limit, stamped by the shell (#1662). */
+  var MAX_BODY_SIZE = Number(root.dataset.maxBodySize) || 0;
+
   function execute() {
     executeError.hidden = true;
     if (!bundle) {
@@ -331,8 +339,24 @@
       show("upload");
       return;
     }
-    /* The whole footer goes inert (#679): both Execute copies spin, and the
-       Cancels disable with them — a mid-flight Cancel nulled `bundle` and
+    /* Auth on, no browser sign-in (#1560): nothing this page sends can be
+       authenticated, so say why without sending. A large bundle would
+       otherwise be refused mid-upload, and some platforms then report only
+       "Failed to fetch" instead of the 401 (#1662). */
+    if (document.getElementById("auth-bearer-only")) {
+      executeFailed(messages.msgSignInRequired);
+      return;
+    }
+    var payload = JSON.stringify(bundle);
+    /* Over the limit the server answers before reading the body, with the
+       same mid-upload hazard (#1662): refuse here, with the sizes. */
+    var size = new Blob([payload]).size;
+    if (MAX_BODY_SIZE && size > MAX_BODY_SIZE) {
+      executeFailed(messages.msgTooLarge + " (" + size + " > " + MAX_BODY_SIZE + " bytes)");
+      return;
+    }
+    /* The whole footer goes inert (#679): Execute spins, and Cancel
+       disables with it — a mid-flight Cancel nulled `bundle` and
        crashed the settling renderResponse. Busy holds until the outcome is
        rendered, not merely until response headers arrive. */
     hfsBusy.during(
@@ -342,7 +366,7 @@
           method: "POST",
           headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
           credentials: "same-origin",
-          body: JSON.stringify(bundle),
+          body: payload,
         })
           .then(function (response) {
             return response
@@ -351,8 +375,12 @@
               .then(function (body) { renderResponse(response, body); });
           })
           .catch(function (e) {
-            executeError.textContent = messages.msgRequestFailed + " (" + e.message + ")";
-            executeError.hidden = false;
+            /* No response at all: the connection dropped. A server that
+               refuses a request (expired session, over the limit) answers
+               before reading the body, and some platforms then reset the
+               upload and lose that answer (#1662), so name the likely
+               causes rather than only the browser's "Failed to fetch". */
+            executeFailed(messages.msgConnectionDropped + " (" + e.message + ")");
           });
       },
       { alsoDisable: [cancelTopBtn], region: busyRegion, label: messages.msgExecuting }
@@ -378,8 +406,16 @@
       if (body && body.issue && body.issue[0]) {
         diag = body.issue[0].diagnostics || (body.issue[0].details && body.issue[0].details.text) || "";
       }
-      executeError.textContent = messages.msgRequestFailed + (diag ? " — " + diag : "");
-      executeError.hidden = false;
+      // Auth on, no browser sign-in (#1560): the shell notice is the
+      // marker, and the missing setting beats the raw header text.
+      if (response.status === 401 && document.getElementById("auth-bearer-only")) {
+        diag = messages.msgSignInRequired;
+      }
+      // Over HFS_MAX_BODY_SIZE (#1662): the limit, not the parser's wording.
+      if (response.status === 413) {
+        diag = messages.msgTooLarge;
+      }
+      executeFailed(diag);
       return;
     }
 
@@ -393,7 +429,7 @@
 
       var num = document.createElement("span");
       num.className = "batch-row__num";
-      num.textContent = String(i + 1);
+      num.textContent = window.HfsNumber.format(i + 1);
       var method = methodOf(request);
       var chip = document.createElement("span");
       chip.className = "batch-chip batch-chip--" + method.toLowerCase();
@@ -423,11 +459,11 @@
     /* The created count reads in the card head next to the status badge
        (#729); the rest of the tally keeps the summary line, failures above
        all. */
-    createdBadge.textContent = created ? created + " " + messages.msgCreated : "";
+    createdBadge.textContent = created ? window.HfsNumber.format(created) + " " + messages.msgCreated : "";
     var parts = [];
-    if (updated) parts.push(updated + " " + messages.msgUpdated);
-    if (other) parts.push(other + " " + messages.msgOther);
-    if (failed) parts.push(failed + " " + messages.msgFailed);
+    if (updated) parts.push(window.HfsNumber.format(updated) + " " + messages.msgUpdated);
+    if (other) parts.push(window.HfsNumber.format(other) + " " + messages.msgOther);
+    if (failed) parts.push(window.HfsNumber.format(failed) + " " + messages.msgFailed);
     summary.textContent = parts.join(" · ");
     summary.hidden = !parts.length;
 

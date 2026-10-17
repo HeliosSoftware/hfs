@@ -1,12 +1,14 @@
 <!--
   The FHIR query itself: one editable GET URL, and a visual builder whose
   condition / include / result-control rows stay in two-way sync with it.
-  Shared by Saved Queries (#234) and Search (#255) — on the Search page this
+  Shared by Resources (#282) and Search (#255) — on the Search page this
   same strip is where a translated natural-language query lands, which is why
   it is editable and why running it is a separate, explicit click.
 
-  Parameter suggestions come from /ui/queries/params — a server-rendered
+  Parameter suggestions come from /ui/resources/params — a server-rendered
   datalist fed by the SearchParameter registry, swapped per resource type.
+  The datalist is the catalog behind the typeahead of the condition parameter
+  (and the native popup of the other fields).
   The builder rows are hidden until the script hydrates them; the URL input
   alone is the no-JS baseline.
 -->
@@ -44,16 +46,37 @@
              data-msg-recent-group="{{ i18n.t("queries-recent") }}"></div>
       </div>
     </details>
-    <button class="btn btn--primary" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
+    <button class="btn btn--primary btn--busy-slot" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
+  </div>
+
+  <div class="query-search-state">
+    <span class="busy-status" id="query-search-status" role="status" hidden
+          data-msg-searching="{{ i18n.t("queries-searching") }}"
+          data-msg-elapsed="{{ i18n.t_arg("queries-search-elapsed", "seconds", "{seconds}".to_string()) }}">
+      <span class="spinner" aria-hidden="true"></span>
+      <span data-busy-label></span>
+    </span>
+    <span id="query-search-elapsed" role="timer" aria-live="off" hidden></span>
+    <button class="btn" type="button" id="query-search-cancel" hidden>{{ i18n.t("queries-search-cancel") }}</button>
+  </div>
+  <div class="notice query-search-slow" id="query-search-slow" hidden
+       data-msg-slow="{{ i18n.t("queries-search-slow") }}">
+    <p id="query-search-slow-status" role="status" hidden><span data-busy-label></span></p>
+    <div class="toolbar">
+      <button class="btn" type="button" id="query-search-keep-waiting">{{ i18n.t("queries-search-keep-waiting") }}</button>
+      <button class="btn" type="button" id="query-search-slow-cancel">{{ i18n.t("queries-search-cancel") }}</button>
+    </div>
   </div>
 
   <p class="query-plain" id="query-plain" hidden>
     <span class="query-plain__pill">{{ i18n.t("plain-pill") }}</span>
     <span id="query-plain-text"></span>
+    <span class="query-plain__unknown" id="query-plain-unknown" data-template="{{ i18n.t("plain-unknown-param") }}" hidden></span>
   </p>
   <script type="application/json" id="plain-english-msgs">
     {
       "find": "{{ i18n.t("plain-find") }}",
+      "read": "{{ i18n.t("plain-read") }}",
       "clause": "{{ i18n.t("plain-clause") }}",
       "clauseNoValue": "{{ i18n.t("plain-clause-no-value") }}",
       "and": "{{ i18n.t("plain-and") }}",
@@ -100,6 +123,8 @@
   </datalist>
   <div class="builder-sections" id="builder-sections" hidden
        data-msg-param="{{ i18n.t("queries-param-placeholder") }}"
+       data-msg-param-none="{{ i18n.t("queries-param-none") }}"
+       data-msg-param-unknown="{{ i18n.t("queries-param-unknown") }}"
        data-msg-value="{{ i18n.t("queries-value-placeholder") }}"
        data-msg-remove="{{ i18n.t("queries-remove") }}"
        data-msg-chain-into="{{ i18n.t("queries-chain-into") }}"
@@ -143,14 +168,4 @@
     </div>
   </div>
 
-  {% if show_save %}
-  <div class="query-builder__save">
-    <label class="query-form__field query-builder__name">
-      <span>{{ i18n.t("queries-name-label") }}</span>
-      <input name="name" placeholder="{{ i18n.t("queries-name-placeholder") }}">
-    </label>
-    <button class="btn" type="submit" data-intent="save">{{ i18n.t("action-save") }}</button>
-    <p class="query-builder__hint">{{ i18n.t("queries-builder-hint") }}</p>
-  </div>
-  {% endif %}
 </form>

@@ -5,7 +5,90 @@
 //! derives every key shape used by the backend from a common base prefix.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// File name of the layout marker object, directly under `history/`.
+const LAYOUT_MARKER_FILE: &str = "_keyspace.json";
+
+/// Number of hex characters in a V2 shard segment (`16^2 = 256` shards).
+const SHARD_HEX_CHARS: usize = 2;
+
+/// How a tenant's resource and history objects are laid out in S3.
+///
+/// The layout is fixed per tenant by a marker object
+/// ([`S3Keyspace::layout_marker_key`]); it never changes once stamped, because
+/// S3 is the system of record and a derivation change would orphan objects.
+///
+/// | | `V1` (flat, today) | `V2` (sharded) |
+/// |---|---|---|
+/// | current | `resources/{type}/{id}/current.json` | `resources/{type}/{h2}/{id}/current.json` |
+/// | version | `resources/{type}/{id}/_history/{v}.json` | `resources/{type}/{h2}/{id}/_history/{v}.json` |
+/// | type event | `history/type/{type}/{file}` | `history/type/{type}/{h2}/{file}` |
+/// | system event | `history/system/{file}` | none — listed from `history/type/` |
+///
+/// `h2` is the first two lowercase hex characters of `sha256(id)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyspaceLayout {
+    /// Flat per-type prefixes plus a tenant-wide `history/system/` index.
+    V1,
+    /// Resources and type history sharded 256 ways by id hash; no system index.
+    V2,
+}
+
+impl KeyspaceLayout {
+    /// The number stored in the marker object.
+    pub fn version(self) -> u8 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    /// Inverse of [`version`](Self::version); `None` for an unknown version.
+    pub fn from_version(version: u64) -> Option<Self> {
+        match version {
+            1 => Some(Self::V1),
+            2 => Some(Self::V2),
+            _ => None,
+        }
+    }
+
+    /// Parses `v1` / `v2`, case-insensitively and trimmed.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "v1" => Some(Self::V1),
+            "v2" => Some(Self::V2),
+            _ => None,
+        }
+    }
+
+    /// Body of the marker object for this layout.
+    pub fn marker_body(self) -> Vec<u8> {
+        format!("{{\"layout\":{}}}", self.version()).into_bytes()
+    }
+
+    /// Reads a layout out of a marker object body. `None` when the body is not
+    /// a JSON object with a known integer `layout`.
+    pub fn from_marker_body(body: &[u8]) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        Self::from_version(value.get("layout")?.as_u64()?)
+    }
+}
+
+/// The two-hex-character shard segment for `id` (V2 layout).
+pub fn shard_segment(id: &str) -> String {
+    let digest = Sha256::digest(id.as_bytes());
+    let mut shard = hex_digest(&digest[..SHARD_HEX_CHARS / 2]);
+    shard.truncate(SHARD_HEX_CHARS);
+    shard
+}
+
+/// Every shard segment, `00`..`ff`, in lexicographic order.
+fn all_shard_segments() -> impl Iterator<Item = String> {
+    (0..=255u8).map(|byte| format!("{byte:02x}"))
+}
 
 /// Keyspace builder for S3 object paths.
 ///
@@ -98,37 +181,12 @@ impl S3Keyspace {
         Self::new(Some(merged))
     }
 
-    /// Key for the mutable "current" pointer of a resource.
-    ///
-    /// This object is overwritten on every create, update, and delete.
-    pub fn current_resource_key(&self, resource_type: &str, id: &str) -> String {
-        self.join(&["resources", resource_type, id, "current.json"])
-    }
-
-    /// Immutable key for a specific historical version of a resource.
-    pub fn history_version_key(&self, resource_type: &str, id: &str, version_id: &str) -> String {
-        self.join(&[
-            "resources",
-            resource_type,
-            id,
-            "_history",
-            &format!("{}.json", version_id),
-        ])
-    }
-
-    /// Prefix covering all history version objects for a resource.
-    pub fn history_versions_prefix(&self, resource_type: &str, id: &str) -> String {
-        self.join(&["resources", resource_type, id, "_history/"])
-    }
-
     /// Prefix covering all current resource objects across all types.
+    ///
+    /// Resource and history keys below this prefix depend on the tenant's
+    /// layout and are built by [`ResourceKeyspace`].
     pub fn resources_prefix(&self) -> String {
         self.join(&["resources/"])
-    }
-
-    /// Prefix covering all current objects of a specific resource type.
-    pub fn resource_type_prefix(&self, resource_type: &str) -> String {
-        self.join(&["resources", resource_type, "/"])
     }
 
     /// Key for a tenant's registry record — one JSON object per registered
@@ -186,72 +244,33 @@ impl S3Keyspace {
         self.join(&["history/"])
     }
 
-    /// Key for a type-level history index event.
+    /// Key of the per-tenant keyspace layout marker (see [`KeyspaceLayout`]).
     ///
-    /// The filename encodes the event timestamp in milliseconds, resource ID,
-    /// version ID, and a random suffix to prevent key collisions during
-    /// concurrent writes to the same resource.
-    pub fn history_type_event_key(
-        &self,
-        resource_type: &str,
-        timestamp: DateTime<Utc>,
-        id: &str,
-        version_id: &str,
-        suffix: &str,
-    ) -> String {
-        self.join(&[
-            "history",
-            "type",
-            resource_type,
-            &format!(
-                "{}_{}_{}_{}.json",
-                timestamp.timestamp_millis(),
-                sanitize(id),
-                version_id,
-                suffix
-            ),
-        ])
+    /// It lives under `history/` so a tenant sweep of that prefix reaches it
+    /// and no `resources/` probe ever sees it. `purge_tenant_data` must skip it:
+    /// a tenant's layout is immutable once stamped.
+    pub fn layout_marker_key(&self) -> String {
+        self.join(&["history", LAYOUT_MARKER_FILE])
     }
 
-    /// Key for a system-level history index event.
-    ///
-    /// Analogous to `history_type_event_key` but stored under the system
-    /// history prefix so that cross-type queries scan a single directory.
-    pub fn history_system_event_key(
-        &self,
-        resource_type: &str,
-        timestamp: DateTime<Utc>,
-        id: &str,
-        version_id: &str,
-        suffix: &str,
-    ) -> String {
-        self.join(&[
-            "history",
-            "system",
-            &format!(
-                "{}_{}_{}_{}_{}.json",
-                timestamp.timestamp_millis(),
-                sanitize(resource_type),
-                sanitize(id),
-                version_id,
-                suffix
-            ),
-        ])
-    }
-
-    /// Prefix covering all type-level history index events for a resource type.
-    pub fn history_type_prefix(&self, resource_type: &str) -> String {
-        self.join(&["history", "type", resource_type, "/"])
-    }
-
-    /// Prefix covering all system-level history index events.
-    pub fn history_system_prefix(&self) -> String {
-        self.join(&["history", "system/"])
+    /// Binds this keyspace to a resolved [`KeyspaceLayout`], yielding the only
+    /// type that can build resource and history keys.
+    pub fn with_layout(&self, layout: KeyspaceLayout) -> ResourceKeyspace {
+        ResourceKeyspace {
+            keyspace: self.clone(),
+            layout,
+        }
     }
 
     /// Key for the JSON state object of a bulk submission.
     pub fn submit_state_key(&self, submitter: &str, submission_id: &str) -> String {
-        self.join(&["bulk", "submit", submitter, submission_id, "state.json"])
+        self.join(&[
+            "bulk",
+            "submit",
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
+            "state.json",
+        ])
     }
 
     /// Key for a manifest within a bulk submission.
@@ -264,10 +283,10 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "manifests",
-            &format!("{}.json", manifest_id),
+            &format!("{}.json", submit_segment(manifest_id)),
         ])
     }
 
@@ -275,30 +294,40 @@ impl S3Keyspace {
     ///
     /// `file_url` names the manifest output file the line came from; see
     /// [`submit_file_segment`] for why it is part of the key.
-    pub fn submit_raw_line_key(
+    /// Key for the raw NDJSON archive of one ingest batch (chunk) of a file.
+    ///
+    /// One object holds every line of the batch, keyed by the batch's first
+    /// line number so successive chunks of the same file (each a separate
+    /// `process_entries` call) never collide (#1429). `file_url` names the
+    /// manifest output file the lines came from; see [`submit_file_segment`]
+    /// for why it is part of the key (two files' line-1 batches must differ).
+    pub fn submit_raw_batch_key(
         &self,
         submitter: &str,
         submission_id: &str,
         manifest_id: &str,
         file_url: Option<&str>,
-        line: u64,
+        first_line: u64,
     ) -> String {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "raw",
-            manifest_id,
+            &submit_segment(manifest_id),
             &submit_file_segment(file_url),
-            &format!("line-{}.ndjson", line),
+            &format!("batch-{}.ndjson", first_line),
         ])
     }
 
-    /// Key for the processing result of a single NDJSON line.
+    /// Key for the processing result of a single NDJSON line — the legacy
+    /// per-line receipt shape, which the ingest no longer writes (#1429) but
+    /// the readers still accept; kept so the tests can plant one.
     ///
     /// `file_url` names the manifest output file the line came from; see
     /// [`submit_file_segment`] for why it is part of the key.
+    #[cfg(test)]
     pub fn submit_result_line_key(
         &self,
         submitter: &str,
@@ -310,12 +339,40 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "results",
-            manifest_id,
+            &submit_segment(manifest_id),
             &submit_file_segment(file_url),
             &format!("line-{}.json", line),
+        ])
+    }
+
+    /// Key for one ingest batch's coalesced receipts — every entry result the
+    /// batch produced, in a single object rather than one per line (#1429).
+    ///
+    /// Sits under the same `results/<manifest>/` prefix that
+    /// [`Self::submit_result_line_key`] writes and that the receipt readers
+    /// sweep, nested by file and keyed by the batch's first line exactly like
+    /// the raw archive and the change log, so batches of one file never
+    /// collide and two files' batches stay apart (#457).
+    pub fn submit_result_batch_key(
+        &self,
+        submitter: &str,
+        submission_id: &str,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        first_line: u64,
+    ) -> String {
+        self.join(&[
+            "bulk",
+            "submit",
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
+            "results",
+            &submit_segment(manifest_id),
+            &submit_file_segment(file_url),
+            &format!("batch-{:020}.json", first_line),
         ])
     }
 
@@ -329,10 +386,38 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "changes",
-            &format!("{}.json", change_id),
+            &format!("{}.json", submit_segment(change_id)),
+        ])
+    }
+
+    /// Key for one ingest batch's coalesced change log — every change the batch
+    /// recorded, in a single object rather than one per resource (#1429).
+    ///
+    /// Sits under the same `changes/` prefix that [`Self::submit_change_key`]
+    /// writes and that `load_changes` lists, but nested by manifest and file so
+    /// batches never collide: like the raw archive and the entry receipts, the
+    /// key is discriminated by `file_url` (line numbers restart per file, see
+    /// [`submit_file_segment`]) and keyed by the batch's first line.
+    pub fn submit_change_batch_key(
+        &self,
+        submitter: &str,
+        submission_id: &str,
+        manifest_id: &str,
+        file_url: Option<&str>,
+        first_line: u64,
+    ) -> String {
+        self.join(&[
+            "bulk",
+            "submit",
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
+            "changes",
+            &submit_segment(manifest_id),
+            &submit_file_segment(file_url),
+            &format!("batch-{}.json", first_line),
         ])
     }
 
@@ -358,8 +443,8 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "files",
             &format!(
                 "{}.json",
@@ -378,12 +463,24 @@ impl S3Keyspace {
 
     /// Prefix covering the status-manifest artifact rows of a submission.
     pub fn submit_files_prefix(&self, submitter: &str, submission_id: &str) -> String {
-        self.join(&["bulk", "submit", submitter, submission_id, "files/"])
+        self.join(&[
+            "bulk",
+            "submit",
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
+            "files/",
+        ])
     }
 
     /// Prefix covering all objects belonging to a single submission.
     pub fn submit_prefix(&self, submitter: &str, submission_id: &str) -> String {
-        self.join(&["bulk", "submit", submitter, submission_id, "/"])
+        self.join(&[
+            "bulk",
+            "submit",
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
+            "/",
+        ])
     }
 
     /// Key for one entry in the cross-tenant `$bulk-submit` worker index.
@@ -501,6 +598,18 @@ impl S3Keyspace {
         self.join(&["_system.user-settings/"])
     }
 
+    /// Object key for one web UI login session or pending login (#1481):
+    /// `kind` is `session` or `pending`, `id` the opaque random id (URL-safe
+    /// base64, so path-safe and fixed-length by construction).
+    pub fn login_session_key(&self, kind: &str, id: &str) -> String {
+        self.join(&["_system.login-sessions", kind, &format!("{id}.json")])
+    }
+
+    /// Prefix covering every login object of one `kind`, for the sweep.
+    pub fn login_sessions_prefix(&self, kind: &str) -> String {
+        self.join(&["_system.login-sessions", &format!("{kind}/")])
+    }
+
     /// Joins `parts` with `/`, prepending the base prefix when set.
     ///
     /// Trailing slashes are preserved only when the final part itself ends with
@@ -524,6 +633,217 @@ impl S3Keyspace {
             out.push('/');
         }
         out
+    }
+}
+
+/// Resource and history key builder bound to a tenant's resolved
+/// [`KeyspaceLayout`].
+///
+/// Obtained only through [`S3Keyspace::with_layout`], which the backend calls
+/// after reading the tenant's marker, so a resource or history key cannot be
+/// built without the layout having been resolved. Under `V1` every method
+/// produces exactly the key the plain [`S3Keyspace`] method of the same name
+/// does.
+#[derive(Debug, Clone)]
+pub struct ResourceKeyspace {
+    keyspace: S3Keyspace,
+    layout: KeyspaceLayout,
+}
+
+impl ResourceKeyspace {
+    /// The layout these keys follow.
+    pub fn layout(&self) -> KeyspaceLayout {
+        self.layout
+    }
+
+    /// The layout-independent keyspace (marker, bulk, registry, sweep roots).
+    pub fn base(&self) -> &S3Keyspace {
+        &self.keyspace
+    }
+
+    /// Key for the mutable "current" pointer of a resource.
+    pub fn current_resource_key(&self, resource_type: &str, id: &str) -> String {
+        match self.layout {
+            KeyspaceLayout::V1 => {
+                self.keyspace
+                    .join(&["resources", resource_type, id, "current.json"])
+            }
+            KeyspaceLayout::V2 => self.keyspace.join(&[
+                "resources",
+                resource_type,
+                &shard_segment(id),
+                id,
+                "current.json",
+            ]),
+        }
+    }
+
+    /// Immutable key for a specific historical version of a resource.
+    pub fn history_version_key(&self, resource_type: &str, id: &str, version_id: &str) -> String {
+        match self.layout {
+            KeyspaceLayout::V1 => self.keyspace.join(&[
+                "resources",
+                resource_type,
+                id,
+                "_history",
+                &format!("{}.json", version_id),
+            ]),
+            KeyspaceLayout::V2 => self.keyspace.join(&[
+                "resources",
+                resource_type,
+                &shard_segment(id),
+                id,
+                "_history",
+                &format!("{}.json", version_id),
+            ]),
+        }
+    }
+
+    /// Prefix covering all history version objects for one resource.
+    pub fn history_versions_prefix(&self, resource_type: &str, id: &str) -> String {
+        match self.layout {
+            KeyspaceLayout::V1 => {
+                self.keyspace
+                    .join(&["resources", resource_type, id, "_history/"])
+            }
+            KeyspaceLayout::V2 => self.keyspace.join(&[
+                "resources",
+                resource_type,
+                &shard_segment(id),
+                id,
+                "_history/",
+            ]),
+        }
+    }
+
+    /// Prefix covering every object of a resource type, in either layout.
+    pub fn resource_type_prefix(&self, resource_type: &str) -> String {
+        self.keyspace.join(&["resources", resource_type, "/"])
+    }
+
+    /// The prefixes a type-wide listing can fan out over: the type prefix
+    /// itself under `V1`, one prefix per shard (`00`..`ff`, in order) under
+    /// `V2`. Concatenating the listings in this order equals a single listing
+    /// of [`resource_type_prefix`](Self::resource_type_prefix).
+    pub fn resource_shard_prefixes(&self, resource_type: &str) -> Vec<String> {
+        match self.layout {
+            KeyspaceLayout::V1 => vec![self.resource_type_prefix(resource_type)],
+            KeyspaceLayout::V2 => all_shard_segments()
+                .map(|shard| {
+                    self.keyspace
+                        .join(&["resources", resource_type, &shard, "/"])
+                })
+                .collect(),
+        }
+    }
+
+    /// Prefix covering all current objects across all types (layout-independent).
+    pub fn resources_prefix(&self) -> String {
+        self.keyspace.resources_prefix()
+    }
+
+    /// Prefix covering all history objects (layout-independent).
+    pub fn history_root_prefix(&self) -> String {
+        self.keyspace.history_root_prefix()
+    }
+
+    /// Key for a type-level history index event.
+    pub fn history_type_event_key(
+        &self,
+        resource_type: &str,
+        timestamp: DateTime<Utc>,
+        id: &str,
+        version_id: &str,
+        suffix: &str,
+    ) -> String {
+        let file = format!(
+            "{}_{}_{}_{}.json",
+            timestamp.timestamp_millis(),
+            sanitize(id),
+            version_id,
+            suffix
+        );
+        match self.layout {
+            KeyspaceLayout::V1 => self
+                .keyspace
+                .join(&["history", "type", resource_type, &file]),
+            KeyspaceLayout::V2 => {
+                self.keyspace
+                    .join(&["history", "type", resource_type, &shard_segment(id), &file])
+            }
+        }
+    }
+
+    /// Key for a system-level history index event; `None` under `V2`, which
+    /// has no system index (system history is listed from `history/type/`).
+    pub fn history_system_event_key(
+        &self,
+        resource_type: &str,
+        timestamp: DateTime<Utc>,
+        id: &str,
+        version_id: &str,
+        suffix: &str,
+    ) -> Option<String> {
+        match self.layout {
+            KeyspaceLayout::V1 => Some(self.keyspace.join(&[
+                "history",
+                "system",
+                &format!(
+                    "{}_{}_{}_{}_{}.json",
+                    timestamp.timestamp_millis(),
+                    sanitize(resource_type),
+                    sanitize(id),
+                    version_id,
+                    suffix
+                ),
+            ])),
+            KeyspaceLayout::V2 => None,
+        }
+    }
+
+    /// Prefix covering all type-level history events of a resource type.
+    pub fn history_type_prefix(&self, resource_type: &str) -> String {
+        self.keyspace.join(&["history", "type", resource_type, "/"])
+    }
+
+    /// Per-shard prefixes for type-level history (see
+    /// [`resource_shard_prefixes`](Self::resource_shard_prefixes)).
+    pub fn history_type_shard_prefixes(&self, resource_type: &str) -> Vec<String> {
+        match self.layout {
+            KeyspaceLayout::V1 => vec![self.history_type_prefix(resource_type)],
+            KeyspaceLayout::V2 => all_shard_segments()
+                .map(|shard| {
+                    self.keyspace
+                        .join(&["history", "type", resource_type, &shard, "/"])
+                })
+                .collect(),
+        }
+    }
+
+    /// The one type-history prefix that can hold events of resource `id`: its
+    /// shard under `V2`, the whole type prefix under `V1`.
+    pub fn history_type_shard_prefix_for(&self, resource_type: &str, id: &str) -> String {
+        match self.layout {
+            KeyspaceLayout::V1 => self.history_type_prefix(resource_type),
+            KeyspaceLayout::V2 => {
+                self.keyspace
+                    .join(&["history", "type", resource_type, &shard_segment(id), "/"])
+            }
+        }
+    }
+
+    /// Prefix covering the type-level history of every type (`history/type/`).
+    /// Under `V2` this is what system history is served from.
+    pub fn history_types_root_prefix(&self) -> String {
+        self.keyspace.join(&["history", "type/"])
+    }
+
+    /// Prefix covering system-level history events; `None` under `V2`.
+    pub fn history_system_prefix(&self) -> Option<String> {
+        match self.layout {
+            KeyspaceLayout::V1 => Some(self.keyspace.join(&["history", "system/"])),
+            KeyspaceLayout::V2 => None,
+        }
     }
 }
 
@@ -576,6 +896,35 @@ fn hex_digest(digest: &[u8]) -> String {
 /// establishes *identity* or *ownership*: two principals colliding on one key is
 /// a cross-user data leak. See `S3Keyspace::user_settings_key`, which hashes
 /// instead.
+/// Escapes one client-supplied `$bulk-submit` identifier (the submitter,
+/// the submission id, a manifest or change id) into a single S3 key segment.
+///
+/// These keys establish the submission's identity and ownership, so the
+/// mapping must be injective: `%` is escaped first and then the characters a
+/// key path cannot carry — `/` (which would split the segment; a URL system
+/// such as `http://example.org|smoke` also puts a `//` in the key, which
+/// MinIO refuses outright), `\`, and control characters. A segment that is
+/// only dots is escaped too, since `.` and `..` are path components S3
+/// stores refuse. Everything else, including `|`, `:` and Unicode, is kept,
+/// so an identifier with none of those characters produces the same key it
+/// always did.
+fn submit_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            '\\' => out.push_str("%5C"),
+            c if c.is_control() => out.push_str(&format!("%{:02X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    if !out.is_empty() && out.bytes().all(|b| b == b'.') {
+        return out.replace('.', "%2E");
+    }
+    out
+}
+
 fn sanitize(value: &str) -> String {
     value
         .chars()
@@ -606,7 +955,7 @@ fn sanitize(value: &str) -> String {
 /// flat layout. That is deliberate on two counts: it mirrors the SQL backends'
 /// `''` default for the same case, and it leaves entry results written before
 /// this change readable, since they still sit under the `results/<manifest>/`
-/// prefix that `load_entry_results` sweeps recursively.
+/// prefix that the receipt readers sweep recursively.
 fn submit_file_segment(file_url: Option<&str>) -> String {
     match file_url {
         Some(url) if !url.is_empty() => {
@@ -851,13 +1200,17 @@ mod tests {
 
     /// Every key a tenant can write, for prefix-containment checks.
     fn sample_keys(ks: &S3Keyspace) -> Vec<String> {
-        vec![
-            ks.current_resource_key("Patient", "p1"),
-            ks.history_version_key("Patient", "p1", "2"),
-            ks.resource_type_prefix("Patient"),
-            ks.history_system_prefix(),
-            ks.submit_state_key("submitter", "sub-1"),
-        ]
+        let mut keys = vec![ks.submit_state_key("submitter", "sub-1")];
+        for layout in [KeyspaceLayout::V1, KeyspaceLayout::V2] {
+            let rk = ks.with_layout(layout);
+            keys.push(rk.current_resource_key("Patient", "p1"));
+            keys.push(rk.history_version_key("Patient", "p1", "2"));
+            keys.push(rk.resource_type_prefix("Patient"));
+            keys.push(rk.history_type_event_key("Patient", event_time(), "p1", "2", "s"));
+            keys.extend(rk.history_system_prefix());
+        }
+        keys.push(ks.layout_marker_key());
+        keys
     }
 
     /// The prefixes a tenant sweeps on purge / enumerates on list. Anything of
@@ -1145,10 +1498,14 @@ mod tests {
         let prefix = base.tenant_registry_prefix();
         let hostile = base.with_tenant_prefix("tenants");
 
+        let v1 = hostile.with_layout(KeyspaceLayout::V1);
+        let v2 = hostile.with_layout(KeyspaceLayout::V2);
         let data_keys = [
-            hostile.current_resource_key("Patient", "p1"),
-            hostile.history_version_key("Patient", "p1", "1"),
-            hostile.history_system_prefix(),
+            v1.current_resource_key("Patient", "p1"),
+            v1.history_version_key("Patient", "p1", "1"),
+            v1.history_system_prefix().unwrap(),
+            v2.current_resource_key("Patient", "p1"),
+            hostile.layout_marker_key(),
             hostile.resources_prefix(),
             hostile.history_root_prefix(),
         ];
@@ -1225,6 +1582,46 @@ mod tests {
         }
     }
 
+    /// #1556: the submitter is `system|value`, so a URL system used to put
+    /// `//` (and nested path segments) into every key of the submission.
+    #[test]
+    fn submit_keys_escape_client_identifiers_injectively() {
+        let ks = S3Keyspace::new(None);
+        let key = ks.submit_state_key("http://example.org|smoke", "smoke-24");
+        assert_eq!(
+            key,
+            "bulk/submit/http:%2F%2Fexample.org|smoke/smoke-24/state.json"
+        );
+        assert!(!key.contains("//"), "{key}");
+        assert_eq!(
+            ks.submit_state_key("smoke", "s-1"),
+            "bulk/submit/smoke/s-1/state.json"
+        );
+
+        // Two pairs that a raw join would collapse onto one prefix.
+        assert_ne!(ks.submit_prefix("a/b", "c"), ks.submit_prefix("a", "b/c"));
+        assert_ne!(ks.submit_prefix("a%2Fb", "c"), ks.submit_prefix("a/b", "c"));
+        assert!(
+            ks.submit_prefix("a/b", "c")
+                .starts_with("bulk/submit/a%2Fb/c/")
+        );
+
+        for id in ["..", ".", "a\\b", "x\u{1}y"] {
+            let key = ks.submit_state_key("s", id);
+            let segment = key.split('/').nth(3).unwrap();
+            assert!(
+                !segment.contains('\\') && segment != "." && segment != "..",
+                "{key}"
+            );
+        }
+        assert_eq!(submit_segment(".."), "%2E%2E");
+        assert_eq!(submit_segment("a.b"), "a.b");
+
+        let manifest = ks.submit_manifest_key("http://example.org|smoke", "s-1", "m/1");
+        assert!(manifest.ends_with("/manifests/m%2F1.json"), "{manifest}");
+        assert!(!manifest.contains("//"), "{manifest}");
+    }
+
     #[test]
     fn submit_file_keys_distinguish_manifest_and_nullable_resource() {
         let ks = S3Keyspace::new(None);
@@ -1236,6 +1633,184 @@ mod tests {
         assert_ne!(none, other_manifest);
         for key in [none, empty, other_manifest] {
             assert!(key.starts_with("bulk/submit/s/job/files/"));
+        }
+    }
+
+    fn event_time() -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(1_700_000_000_000).unwrap()
+    }
+
+    /// V1 keys are frozen: S3 is the system of record, so any change here makes
+    /// existing objects unreachable. These literals must never be edited.
+    #[test]
+    fn v1_resource_and_history_keys_are_pinned() {
+        let flat = S3Keyspace::new(Some("hfs".to_string())).with_tenant_prefix("acme");
+        let ks = flat.with_layout(KeyspaceLayout::V1);
+        assert_eq!(
+            ks.current_resource_key("Patient", "p1"),
+            "hfs/acme/resources/Patient/p1/current.json"
+        );
+        assert_eq!(
+            ks.history_version_key("Patient", "p1", "2"),
+            "hfs/acme/resources/Patient/p1/_history/2.json"
+        );
+        assert_eq!(
+            ks.history_versions_prefix("Patient", "p1"),
+            "hfs/acme/resources/Patient/p1/_history/"
+        );
+        assert_eq!(
+            ks.resource_type_prefix("Patient"),
+            "hfs/acme/resources/Patient/"
+        );
+        assert_eq!(
+            ks.history_type_event_key("Patient", event_time(), "p 1", "2", "sfx"),
+            "hfs/acme/history/type/Patient/1700000000000_p_1_2_sfx.json"
+        );
+        assert_eq!(
+            ks.history_system_event_key("Patient", event_time(), "p 1", "2", "sfx")
+                .as_deref(),
+            Some("hfs/acme/history/system/1700000000000_Patient_p_1_2_sfx.json")
+        );
+        assert_eq!(
+            ks.history_type_prefix("Patient"),
+            "hfs/acme/history/type/Patient/"
+        );
+        assert_eq!(
+            ks.history_system_prefix().as_deref(),
+            Some("hfs/acme/history/system/")
+        );
+        assert_eq!(ks.resource_shard_prefixes("Patient").len(), 1);
+        assert_eq!(
+            ks.resource_shard_prefixes("Patient")[0],
+            ks.resource_type_prefix("Patient")
+        );
+        assert_eq!(
+            ks.history_type_shard_prefix_for("Patient", "p1"),
+            ks.history_type_prefix("Patient")
+        );
+    }
+
+    #[test]
+    fn shard_segment_is_the_first_two_hex_chars_of_sha256() {
+        // printf p1 | sha256sum -> f6...; abc -> ba...; ab -> fb...
+        assert_eq!(shard_segment("p1"), "f6");
+        assert_eq!(shard_segment("abc"), "ba");
+        assert_eq!(shard_segment("ab"), "fb");
+    }
+
+    #[test]
+    fn v2_resource_keys_insert_the_shard_between_type_and_id() {
+        let ks = S3Keyspace::new(None)
+            .with_tenant_prefix("acme")
+            .with_layout(KeyspaceLayout::V2);
+        assert_eq!(
+            ks.current_resource_key("Patient", "p1"),
+            "acme/resources/Patient/f6/p1/current.json"
+        );
+        assert_eq!(
+            ks.history_version_key("Patient", "p1", "2"),
+            "acme/resources/Patient/f6/p1/_history/2.json"
+        );
+        assert_eq!(
+            ks.history_versions_prefix("Patient", "p1"),
+            "acme/resources/Patient/f6/p1/_history/"
+        );
+        // The type prefix still covers every shard.
+        assert!(
+            ks.current_resource_key("Patient", "p1")
+                .starts_with(&ks.resource_type_prefix("Patient"))
+        );
+    }
+
+    #[test]
+    fn v2_history_is_sharded_by_type_and_has_no_system_index() {
+        let ks = S3Keyspace::new(None)
+            .with_tenant_prefix("acme")
+            .with_layout(KeyspaceLayout::V2);
+        let key = ks.history_type_event_key("Patient", event_time(), "p1", "2", "sfx");
+        assert_eq!(
+            key,
+            "acme/history/type/Patient/f6/1700000000000_p1_2_sfx.json"
+        );
+        assert!(key.starts_with(&ks.history_type_shard_prefix_for("Patient", "p1")));
+        assert!(key.starts_with(&ks.history_type_prefix("Patient")));
+        assert!(key.starts_with(&ks.history_types_root_prefix()));
+        assert_eq!(ks.history_types_root_prefix(), "acme/history/type/");
+        assert_eq!(
+            ks.history_system_event_key("Patient", event_time(), "p1", "2", "sfx"),
+            None
+        );
+        assert_eq!(ks.history_system_prefix(), None);
+    }
+
+    #[test]
+    fn v2_shard_prefixes_are_256_ordered_and_partition_the_type() {
+        let ks = S3Keyspace::new(None)
+            .with_tenant_prefix("acme")
+            .with_layout(KeyspaceLayout::V2);
+        for prefixes in [
+            ks.resource_shard_prefixes("Patient"),
+            ks.history_type_shard_prefixes("Patient"),
+        ] {
+            assert_eq!(prefixes.len(), 256);
+            assert!(prefixes.windows(2).all(|w| w[0] < w[1]));
+            assert!(prefixes.iter().all(|p| p.ends_with('/')));
+        }
+        let first = &ks.resource_shard_prefixes("Patient")[0];
+        assert_eq!(first, "acme/resources/Patient/00/");
+        let last = ks.history_type_shard_prefixes("Patient").pop().unwrap();
+        assert_eq!(last, "acme/history/type/Patient/ff/");
+        // Every V2 object key falls under exactly one shard prefix.
+        let key = ks.current_resource_key("Patient", "p1");
+        let hits = ks
+            .resource_shard_prefixes("Patient")
+            .iter()
+            .filter(|p| key.starts_with(p.as_str()))
+            .count();
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn layout_marker_sits_under_history_and_outside_resources() {
+        let ks = S3Keyspace::new(Some("hfs".to_string())).with_tenant_prefix("acme");
+        let key = ks.layout_marker_key();
+        assert_eq!(key, "hfs/acme/history/_keyspace.json");
+        assert!(key.starts_with(&ks.history_root_prefix()));
+        assert!(!key.starts_with(&ks.resources_prefix()));
+        let v1 = ks.with_layout(KeyspaceLayout::V1);
+        assert!(!key.starts_with(&v1.history_system_prefix().unwrap()));
+        assert!(!key.starts_with(&v1.history_type_prefix("Patient")));
+        assert!(!key.starts_with(&v1.history_types_root_prefix()));
+    }
+
+    #[test]
+    fn layout_marker_body_round_trips_and_refuses_unknown_versions() {
+        for layout in [KeyspaceLayout::V1, KeyspaceLayout::V2] {
+            assert_eq!(
+                KeyspaceLayout::from_marker_body(&layout.marker_body()),
+                Some(layout)
+            );
+        }
+        assert_eq!(KeyspaceLayout::from_marker_body(b"{\"layout\":3}"), None);
+        assert_eq!(KeyspaceLayout::from_marker_body(b"{}"), None);
+        assert_eq!(KeyspaceLayout::from_marker_body(b"not json"), None);
+        assert_eq!(KeyspaceLayout::parse(" V2 "), Some(KeyspaceLayout::V2));
+        assert_eq!(KeyspaceLayout::parse("v3"), None);
+    }
+
+    #[test]
+    fn the_marker_and_v2_keys_stay_inside_the_tenants_sweep_prefixes() {
+        for id in TENANT_ID_CORPUS {
+            let ks = S3Keyspace::new(None).with_tenant_prefix(id);
+            let v2 = ks.with_layout(KeyspaceLayout::V2);
+            let sweeps = sweep_prefixes(&ks);
+            for key in [
+                ks.layout_marker_key(),
+                v2.current_resource_key("Patient", "p1"),
+                v2.history_type_event_key("Patient", event_time(), "p1", "1", "s"),
+            ] {
+                assert!(sweeps.iter().any(|p| key.starts_with(p.as_str())), "{key}");
+            }
         }
     }
 }

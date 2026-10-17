@@ -30,6 +30,17 @@
         <text value="Cholesterol"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="0"/>
+        <comparator value="ad"/>
+        <unit value="mg"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -42,6 +53,17 @@
         <text value="Protein"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="21.88"/>
+        <comparator value="ad"/>
+        <unit value="g"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -54,6 +76,17 @@
         <text value="Vitamin A, IU"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="0"/>
+        <comparator value="ad"/>
+        <unit value="IU"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -66,6 +99,17 @@
         <text value="Vitamin C, total ascorbic acid"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="0"/>
+        <comparator value="ad"/>
+        <unit value="mg"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -78,6 +122,17 @@
         <text value="Sugars, total including NLEA"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="9.38"/>
+        <comparator value="ad"/>
+        <unit value="g"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -90,6 +145,17 @@
         <text value="Carbohydrate, by difference"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="18.75"/>
+        <comparator value="ad"/>
+        <unit value="g"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -102,6 +168,17 @@
         <text value="Fatty acids, total saturated"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="9.38"/>
+        <comparator value="ad"/>
+        <unit value="g"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -114,6 +191,17 @@
         <text value="Niacin"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="12.5"/>
+        <comparator value="ad"/>
+        <unit value="mg"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -126,6 +214,17 @@
         <text value="Fatty acids, total trans"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="0"/>
+        <comparator value="ad"/>
+        <unit value="g"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -138,6 +237,17 @@
         <text value="Sodium, Na"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="469"/>
+        <comparator value="ad"/>
+        <unit value="mg"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -150,6 +260,17 @@
         <text value="Calcium, Ca"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="0"/>
+        <comparator value="ad"/>
+        <unit value="mg"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -162,6 +283,17 @@
         <text value="Total lipid (fat)"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="50"/>
+        <comparator value="ad"/>
+        <unit value="g"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -174,6 +306,17 @@
         <text value="Energy"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="594"/>
+        <comparator value="ad"/>
+        <unit value="kcal"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -186,6 +329,17 @@
         <text value="Iron, Fe"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="1.12"/>
+        <comparator value="ad"/>
+        <unit value="mg"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <nutrient>
     <item>
@@ -198,6 +352,17 @@
         <text value="Fiber, total dietary"/>
       </concept>
     </item>
+    <amountRatio>
+      <numerator>
+        <value value="6.2"/>
+        <comparator value="ad"/>
+        <unit value="g"/>
+      </numerator>
+      <denominator>
+        <value value="1"/>
+        <unit value="spread"/>
+      </denominator>
+    </amountRatio>
   </nutrient>
   <ingredient>
     <item>
@@ -210,6 +375,7 @@
         <text value="peanuts"/>
       </concept>
     </item>
+    <allergen value="true"/>
   </ingredient>
   <ingredient>
     <item>

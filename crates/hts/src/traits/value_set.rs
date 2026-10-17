@@ -28,6 +28,11 @@ pub trait ValueSetOperations: Send + Sync {
         query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError>;
 
+    /// Count the ValueSet resources matching `query`, ignoring `_count` and
+    /// `_offset`. Used for `Bundle.total` and `_summary=count`.
+    async fn count(&self, ctx: &TenantContext, query: ResourceSearchQuery)
+    -> Result<u64, HtsError>;
+
     /// Expand a value set, returning all contained codes.
     ///
     /// The backend checks for a cached expansion first; on cache miss it

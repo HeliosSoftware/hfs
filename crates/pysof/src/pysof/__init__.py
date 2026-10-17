@@ -118,7 +118,7 @@ try:
             view: ViewDefinition resource as a dict, or pre-serialized JSON (str | bytes)
             bundle: FHIR Bundle resource as a dict, or pre-serialized JSON (str | bytes)
             format: Output format ("csv", "csv_with_header", "json", "ndjson", "parquet")
-            since: Filter resources modified after this ISO8601 datetime
+            since: Filter resources modified at or after this ISO8601 datetime
             limit: Limit the number of results returned
             page: Page number for pagination (1-based)
             fhir_version: FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
@@ -222,7 +222,7 @@ try:
             bundle: FHIR Bundle resource as a dict, or pre-serialized JSON (str | bytes)
             format: Output format ("csv", "csv_with_header", "json", "ndjson", "parquet")
             remote_config: A :class:`RemoteResolveConfig` instance
-            since: Filter resources modified after this ISO8601 datetime
+            since: Filter resources modified at or after this ISO8601 datetime
             limit: Limit the number of results returned
             page: Page number for pagination (1-based)
             fhir_version: FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"

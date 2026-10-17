@@ -40,6 +40,9 @@
     </document>
   </relatedArtifact>
   <library value="http://ohie.org/Library/hiv-indicators"/>
+  <!-- <scoring>
+    <coding><code value="cohort"/></coding>
+  </scoring> -->
   <!-- Option 1: Mashup -->
   <group>
     <code>
@@ -54,7 +57,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Newly enrolled on antiretroviral therapy (ART) during measurement period"/>
       </criteria>
     </population>
@@ -66,7 +69,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Age Group/Sex"/>
       </criteria>
     </stratifier>
@@ -84,7 +87,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Newly enrolled on antiretroviral therapy (ART) during measurement period (pregnant and breastfeeding)"/>
       </criteria>
     </population>
@@ -96,7 +99,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Pregnant/Breastfeeding"/>
       </criteria>
     </stratifier>
@@ -115,7 +118,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Receiving antiretroviral therapy (ART) at 12 months after initiating"/>
       </criteria>
     </population>
@@ -128,7 +131,7 @@
           </coding>
         </code>
         <criteria>
-          <language value="text/cql-identifier"/>
+          <language value="text/plain"/>
           <expression value="Age Group"/>
         </criteria>
       </component>
@@ -140,7 +143,7 @@
           </coding>
         </code>
         <criteria>
-          <language value="text/cql-identifier"/>
+          <language value="text/plain"/>
           <expression value="Sex"/>
         </criteria>
       </component>
@@ -159,7 +162,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Receiving antiretroviral therapy (ART) at 12 months after initiating (pregnant and breastfeeding)"/>
       </criteria>
     </population>
@@ -171,7 +174,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Pregnant/Breastfeeding"/>
       </criteria>
     </stratifier>
@@ -189,7 +192,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Initiated antiretroviral therapy (ART) in the 12 months prior to measurement period"/>
       </criteria>
     </population>
@@ -202,7 +205,7 @@
           </coding>
         </code>
         <criteria>
-          <language value="text/cql-identifier"/>
+          <language value="text/plain"/>
           <expression value="Age Group"/>
         </criteria>
         <valueSet value="http://hl7.org/fhir/ValueSet/measure-stratifier-age-range-example"/>
@@ -215,7 +218,7 @@
           </coding>
         </code>
         <criteria>
-          <language value="text/cql-identifier"/>
+          <language value="text/plain"/>
           <expression value="Sex"/>
         </criteria>
       </component>
@@ -234,7 +237,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Antenatal Care Visit or Live Birth during the Measurement Period"/>
       </criteria>
     </population>
@@ -246,7 +249,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="PMTCT HIV Status"/>
       </criteria>
     </stratifier>
@@ -264,7 +267,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Antenatal Care Visit or Live Birth during Measurement Period (HIV Positive)"/>
       </criteria>
     </population>
@@ -282,7 +285,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="HIV-positive, pregnant, and receiving antiretroviral therapy (ART) to reduce the risk of mother-to-child-transmission during pregnancy"/>
       </criteria>
     </population>
@@ -294,7 +297,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="PMTCT ART Status"/>
       </criteria>
     </stratifier>
@@ -312,7 +315,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Living with HIV and on ART with suppressed viral load results (&lt;1000 copies/mL)"/>
       </criteria>
     </population>
@@ -324,7 +327,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Age Group/Sex"/>
       </criteria>
     </stratifier>
@@ -342,7 +345,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Received HIV Testing Services (HTS) and Recevied Test Results"/>
       </criteria>
     </population>
@@ -354,7 +357,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Age Group/Sex/HIV Test Results"/>
       </criteria>
     </stratifier>
@@ -372,7 +375,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="HIV Status Known at First Antenatal Care Visit"/>
       </criteria>
     </population>
@@ -384,7 +387,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="PMTCT HIV Status"/>
       </criteria>
     </stratifier>
@@ -402,7 +405,7 @@
         <text value="cohort"/>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Receiving antiretroviral therapty (ART) and Viral Load Measurement in the past 12 months"/>
       </criteria>
     </population>
@@ -414,7 +417,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Age Group/Sex"/>
       </criteria>
     </stratifier>

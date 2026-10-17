@@ -75,6 +75,21 @@
         </valueReference>
         <exclude value="false"/>
         <description value="fatal intracranial hemorrhage within 7 days"/>
+        <relativeTime>
+          <contextCode>
+            <coding>
+              <system value="http://hl7.org/fhir/evidence-variable-event"/>
+              <code value="study-start"/>
+              <display value="Study Start"/>
+            </coding>
+          </contextCode>
+          <offsetDuration>
+            <value value="7"/>
+            <unit value="days"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="d"/>
+          </offsetDuration>
+        </relativeTime>
       </characteristic>
     </Group>
   </contained>
@@ -98,5 +113,11 @@
       <reference value="#Definition-Group"/>
     </reference>
   </definition>
-  <handling/>
+  <handling>
+    <coding>
+      <system value="https://fevir.net/sevco"/>
+      <code value="STATO:0000090"/>
+      <display value="dichotomous variable"/>
+    </coding>
+  </handling>
 </EvidenceVariable>

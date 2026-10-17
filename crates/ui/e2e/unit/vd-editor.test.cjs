@@ -312,3 +312,58 @@ test("escapeJsonStringContent: backslashes are escaped first, so an escaped quot
   // read as one escaped backslash plus one escaped quote.
   assert.equal(vdEditor.escapeJsonStringContent('\\"'), '\\\\\\"');
 });
+
+// #1757: `groupFixActions` - which diagnostics' actions the Ctrl+. quick-fix
+// menu lists for the current cursor or selection.
+
+const act = (name) => ({ name, apply() {} });
+
+test("groupFixActions: a cursor inside a diagnostic with two actions yields one group with both, in order", () => {
+  const a = act("Rename");
+  const b = act("Remove");
+  const groups = vdEditor.groupFixActions([{ from: 2, to: 9, message: "unknown key", actions: [a, b] }], 5, 5);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].message, "unknown key");
+  assert.deepEqual(groups[0].actions, [a, b]);
+});
+
+test("groupFixActions: a touching diagnostic without actions (missing or empty) yields no group", () => {
+  const groups = vdEditor.groupFixActions(
+    [
+      { from: 0, to: 10, message: "no actions key" },
+      { from: 0, to: 10, message: "empty actions", actions: [] },
+    ],
+    5,
+    5,
+  );
+  assert.deepEqual(groups, []);
+});
+
+test("groupFixActions: a cursor at either end of the range counts as inside; a real selection sharing only a border does not", () => {
+  const d = [{ from: 4, to: 8, message: "m", actions: [act("x")] }];
+  assert.equal(vdEditor.groupFixActions(d, 4, 4).length, 1);
+  assert.equal(vdEditor.groupFixActions(d, 8, 8).length, 1);
+  assert.equal(vdEditor.groupFixActions(d, 0, 4).length, 0);
+  assert.equal(vdEditor.groupFixActions(d, 8, 12).length, 0);
+  assert.equal(vdEditor.groupFixActions(d, 6, 12).length, 1);
+});
+
+test("groupFixActions: two touching diagnostics with actions yield two groups in input order", () => {
+  const groups = vdEditor.groupFixActions(
+    [
+      { from: 0, to: 10, message: "first", actions: [act("a")] },
+      { from: 3, to: 6, message: "second", actions: [act("b")] },
+    ],
+    4,
+    4,
+  );
+  assert.deepEqual(
+    groups.map((g) => g.message),
+    ["first", "second"],
+  );
+});
+
+test("groupFixActions: nothing touching the selection yields an empty array", () => {
+  assert.deepEqual(vdEditor.groupFixActions([{ from: 0, to: 3, message: "m", actions: [act("a")] }], 7, 7), []);
+  assert.deepEqual(vdEditor.groupFixActions([], 0, 0), []);
+});

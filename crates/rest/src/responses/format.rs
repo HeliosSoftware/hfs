@@ -7,19 +7,24 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
+use crate::error::RestError;
 use crate::middleware::content_type::FhirFormat;
 
 /// Builds an HTTP response body from a `serde_json::Value` in the negotiated format.
 ///
 /// - For JSON: serializes directly as JSON
 /// - For XML: converts through a typed FHIR Resource to produce valid FHIR XML
+///
+/// The error is the handler's answer, not a serialization detail to wrap:
+/// a build without the `xml` feature refuses XML with `406 Not Acceptable`,
+/// and only a resource the typed model cannot represent is a `500`.
 #[allow(clippy::result_large_err)]
 pub fn format_resource_response(
     status: StatusCode,
     headers: axum::http::HeaderMap,
     content: &Value,
     format: FhirFormat,
-) -> Result<Response, Response> {
+) -> Result<Response, RestError> {
     match format {
         // `Json` borrows: `&Value` is `Serialize`, so the body is written
         // straight out of the caller's value. Cloning here copied the whole
@@ -28,21 +33,15 @@ pub fn format_resource_response(
         FhirFormat::Json => Ok((status, headers, axum::Json(content)).into_response()),
         #[cfg(feature = "xml")]
         FhirFormat::Xml => {
-            let xml = value_to_xml(content).map_err(|e| {
-                let err = crate::error::RestError::InternalError {
-                    message: format!("Failed to serialize to XML: {}", e),
-                };
-                err.into_response()
+            let xml = value_to_xml(content).map_err(|e| RestError::InternalError {
+                message: format!("Failed to serialize to XML: {}", e),
             })?;
             Ok((status, headers, xml).into_response())
         }
         #[cfg(not(feature = "xml"))]
-        FhirFormat::Xml => {
-            let err = crate::error::RestError::NotAcceptable {
-                message: "XML format is not supported (xml feature not enabled)".to_string(),
-            };
-            Err(err.into_response())
-        }
+        FhirFormat::Xml => Err(RestError::NotAcceptable {
+            message: "XML format is not supported (xml feature not enabled)".to_string(),
+        }),
         FhirFormat::NdJson => {
             // NdJson is typically for bulk operations, not single resource responses
             Ok((status, headers, axum::Json(content)).into_response())

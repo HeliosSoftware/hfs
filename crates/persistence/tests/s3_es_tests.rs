@@ -25,11 +25,16 @@ use helios_persistence::composite::{
     CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage, SyncMode,
 };
 use helios_persistence::core::search::{SearchProvider, SearchResult};
-use helios_persistence::core::{Backend, BackendKind, ResourceStorage};
+use helios_persistence::core::{
+    Backend, BackendKind, CountBasis, DiscoveryCoverage, DiscoveryRequest, PresenceBasis,
+    ResourceStorage, TenantDataEvidence, TenantDiscovery,
+};
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+use helios_persistence::types::{
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
@@ -43,12 +48,18 @@ use testcontainers_modules::elastic_search::ElasticSearch;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+// `SHARED_MINIO` / `SHARED_ES` are statics and never dropped; containers
+// labeled via `with_cleanup_label` are removed by an exit hook instead.
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+use container_cleanup::with_cleanup_label;
+
 // ============================================================================
 // Container setup
 // ============================================================================
 
-const DEFAULT_MINIO_IMAGE: &str = "minio/minio";
-const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
+const DEFAULT_MINIO_IMAGE: &str = "ghcr.io/coollabsio/minio";
+const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-10-15T17-29-55Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
 const DEFAULT_MINIO_ROOT_PASSWORD: &str = "minioadmin";
 
@@ -92,15 +103,17 @@ async fn shared_minio() -> &'static SharedMinio {
             let root_password = std::env::var("MINIO_ROOT_PASSWORD")
                 .unwrap_or_else(|_| DEFAULT_MINIO_ROOT_PASSWORD.to_string());
 
-            let container = GenericImage::new(image, tag)
-                .with_wait_for(WaitFor::message_on_stderr("API:"))
-                .with_exposed_port(9000.tcp())
-                .with_env_var("MINIO_ROOT_USER", root_user.clone())
-                .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
-                .with_cmd(["server", "/data", "--console-address", ":9001"])
-                .start()
-                .await
-                .expect("failed to start MinIO container");
+            let container = with_cleanup_label(
+                GenericImage::new(image, tag)
+                    .with_wait_for(WaitFor::message_on_stderr("API:"))
+                    .with_exposed_port(9000.tcp())
+                    .with_env_var("MINIO_ROOT_USER", root_user.clone())
+                    .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
+                    .with_cmd(["server", "/data", "--console-address", ":9001"]),
+            )
+            .start()
+            .await
+            .expect("failed to start MinIO container");
 
             let host = container
                 .get_host()
@@ -157,13 +170,15 @@ async fn start_es_container() -> testcontainers::ContainerAsync<ElasticSearch> {
     let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
     let mut last_err = None;
     for attempt in 1..=ES_START_ATTEMPTS {
-        match ElasticSearch::default()
-            .with_tag(ES_IMAGE_TAG)
-            .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
-            .with_label("github.run_id", &run_id)
-            .with_startup_timeout(ES_STARTUP_TIMEOUT)
-            .start()
-            .await
+        match with_cleanup_label(
+            ElasticSearch::default()
+                .with_tag(ES_IMAGE_TAG)
+                .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
+                .with_label("github.run_id", &run_id)
+                .with_startup_timeout(ES_STARTUP_TIMEOUT),
+        )
+        .start()
+        .await
         {
             Ok(container) => return container,
             Err(err) => {
@@ -269,6 +284,14 @@ fn build_search_registry() -> Arc<TenantSearchRegistries> {
                 let _ = registry.register(p);
             }
         }
+        // Custom files (e.g. the SQL-on-FHIR `ViewDefinition` params), the
+        // third tier `start_s3_elasticsearch` loads too — without it ES never
+        // indexes `ViewDefinition.name` (#1070).
+        if let Ok((params, _files)) = loader.load_custom_from_directory_with_files(&data_dir) {
+            for p in params {
+                let _ = registry.register(p);
+            }
+        }
     }
     registries
 }
@@ -281,11 +304,25 @@ struct S3EsHarness {
     composite: CompositeStorage,
     #[allow(dead_code)]
     bucket: String,
+    /// The primary itself, for writes that never reach the index.
+    s3: Arc<S3Backend>,
+    /// The search secondary itself, for what the index holds.
+    es: Arc<ElasticsearchBackend>,
 }
 
 async fn make_harness(scope: &str) -> S3EsHarness {
-    let minio = shared_minio().await;
     let es = shared_es().await;
+    make_harness_with_es(scope, format!("http://{}:{}", es.host, es.port), true).await
+}
+
+/// A composite whose Elasticsearch node refuses every connection: the outage
+/// the Tenants inventory must ride out (#1849). Nothing is initialized there.
+async fn make_outage_harness(scope: &str) -> S3EsHarness {
+    make_harness_with_es(scope, "http://127.0.0.1:9".to_string(), false).await
+}
+
+async fn make_harness_with_es(scope: &str, es_node: String, initialize: bool) -> S3EsHarness {
+    let minio = shared_minio().await;
     ensure_minio_env(minio);
 
     let sdk_client = build_sdk_client(minio).await;
@@ -312,10 +349,11 @@ async fn make_harness(scope: &str) -> S3EsHarness {
     // Elasticsearch backend
     let unique_prefix = format!("hfs_{}", Uuid::new_v4().simple());
     let es_config = ElasticsearchConfig {
-        nodes: vec![format!("http://{}:{}", es.host, es.port)],
+        nodes: vec![es_node],
         index_prefix: unique_prefix,
         number_of_replicas: 0,
         refresh_interval: "1ms".to_string(),
+        request_timeout_ms: if initialize { 30_000 } else { 2_000 },
         ..Default::default()
     };
     let search_registry = build_search_registry();
@@ -323,10 +361,12 @@ async fn make_harness(scope: &str) -> S3EsHarness {
         ElasticsearchBackend::with_shared_registry(es_config, search_registry)
             .expect("create ES backend"),
     );
-    es_backend
-        .initialize()
-        .await
-        .expect("initialize ES backend");
+    if initialize {
+        es_backend
+            .initialize()
+            .await
+            .expect("initialize ES backend");
+    }
 
     // Composite. Sync mode must be explicit: the default is Asynchronous,
     // which requires start_sync_workers() (never called here) — without it
@@ -353,9 +393,14 @@ async fn make_harness(scope: &str) -> S3EsHarness {
     let composite = CompositeStorage::new(composite_config, backends)
         .expect("create composite storage")
         .with_search_providers(search_providers)
-        .with_full_primary(s3);
+        .with_full_primary(s3.clone());
 
-    S3EsHarness { composite, bucket }
+    S3EsHarness {
+        composite,
+        bucket,
+        s3,
+        es: es_backend,
+    }
 }
 
 fn tenant(id: &str) -> TenantContext {
@@ -393,6 +438,75 @@ where
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// `ViewDefinition?_sort=name&name:contains=view` — the web UI's SQL-views rail
+/// and Add-table combobox query — returns only the case-insensitive substring
+/// matches, in name order (#1070). The `name` param comes from the custom
+/// `sql-on-fhir-search-parameters.json` file, so this fails if the search
+/// registry skips the custom tier: ES never indexes `ViewDefinition.name`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_es_test_view_definition_name_contains_sorted() {
+    if skip_if_disabled("s3_es_test_view_definition_name_contains_sorted") {
+        return;
+    }
+
+    let harness = make_harness("vd-name-contains").await;
+    let tenant = tenant("s3-es-tenant");
+
+    // Created out of name order so the sort is observable. Names start
+    // lowercase so the expected order is the same whether the backend's
+    // string sort is case-sensitive or not.
+    let mut ids_by_name = HashMap::new();
+    for name in ["beta_VIEW_x", "gamma", "alpha_view"] {
+        let created = harness
+            .composite
+            .create(
+                &tenant,
+                "ViewDefinition",
+                json!({
+                    "resourceType": "ViewDefinition",
+                    "url": format!("http://example.org/ViewDefinition/{name}"),
+                    "name": name,
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"path": "id", "name": "id"}]}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create ViewDefinition should succeed");
+        ids_by_name.insert(name, created.id().to_string());
+    }
+
+    let query = SearchQuery::new("ViewDefinition")
+        .with_parameter(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: Some(SearchModifier::Contains),
+            values: vec![SearchValue::eq("view")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("name").with_param_type(Some(SearchParamType::String)));
+
+    let expected = vec![
+        ids_by_name["alpha_view"].clone(),
+        ids_by_name["beta_VIEW_x"].clone(),
+    ];
+    let ids = |r: &SearchResult| -> Vec<String> {
+        r.resources
+            .items
+            .iter()
+            .map(|res| res.id().to_string())
+            .collect()
+    };
+    let results = search_until(&harness, &tenant, &query, |r| ids(r) == expected).await;
+    assert_eq!(
+        ids(&results),
+        expected,
+        "name:contains=view must return only alpha_view and beta_VIEW_x, sorted by name"
+    );
+}
 
 /// Write a Patient to S3, then verify it appears in ES search by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -845,4 +959,291 @@ async fn s3_es_test_read_after_delete_returns_gone() {
         ),
         "read after delete should return Gone, got: {result:?}"
     );
+}
+
+// ============================================================================
+// Tenant discovery and provenance (#1849)
+// ============================================================================
+//
+// On s3-elasticsearch the Tenants inventory discovers tenants on the S3
+// primary (presence, never a number) while Home totals come from the index.
+// The index can lag, miss a tenant or be down; none of that may hide a tenant
+// that still holds purgeable S3 data, and an index zero is not an S3 zero.
+
+fn discovered(discovery: &TenantDiscovery) -> HashMap<String, TenantDataEvidence> {
+    discovery
+        .tenants
+        .iter()
+        .map(|t| (t.id.clone(), t.evidence.clone()))
+        .collect()
+}
+
+const PRESENT: TenantDataEvidence = TenantDataEvidence::Present {
+    basis: PresenceBasis::ResourceObjects,
+};
+
+/// Live documents the index holds for `tenant`, across its types (`_count`
+/// over the tenant's index pattern, which answers zero when it has none).
+///
+/// This is the index's own `_count`, kept as a check independent of the
+/// aggregation reads Home uses (`count_all_types`), which the test asserts
+/// separately. For a tenant with no index at all, a wildcard pattern that
+/// matches nothing comes back as `200` with `_shards.total: 0` and no
+/// `aggregations`; `_count` answers `count: 0` there, and since #1906 (found
+/// by #1849) the aggregation reads take that answer as an empty tenant too.
+async fn indexed_live(es: &ElasticsearchBackend, tenant: &TenantContext) -> u64 {
+    es.count(tenant, None).await.expect("index count")
+}
+
+/// A tenant written only to S3 (the index never saw it: deferred ingest, a
+/// lagging asynchronous sync, a missing index) and a tenant whose only
+/// resource is deleted (a tombstone in S3, nothing live in the index) both
+/// stay discoverable, as presence. The index answers zero for both. The
+/// composite's Home figures come from the index and are labelled as such:
+/// zero for the tombstone-only tenant, whose index exists, and zero for the
+/// primary-only tenant, whose index does not (the zero-shard answer, #1906;
+/// see [`indexed_live`]).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_es_test_primary_only_and_tombstone_only_tenants_stay_discoverable() {
+    if skip_if_disabled("s3_es_test_primary_only_and_tombstone_only_tenants_stay_discoverable") {
+        return;
+    }
+
+    let harness = make_harness("tenant-discovery").await;
+    let primary_only = tenant("primary-only");
+    let tombstone_only = tenant("tombstone-only");
+    let indexed = tenant("indexed");
+
+    harness
+        .s3
+        .create(
+            &primary_only,
+            "Patient",
+            json!({"resourceType": "Patient", "active": true}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("S3-only create");
+    let doomed = harness
+        .composite
+        .create(
+            &tombstone_only,
+            "Patient",
+            json!({"resourceType": "Patient", "active": true}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+    harness
+        .composite
+        .delete(&tombstone_only, "Patient", doomed.id())
+        .await
+        .expect("delete");
+    harness
+        .composite
+        .create(
+            &indexed,
+            "Patient",
+            json!({"resourceType": "Patient", "active": true}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+
+    // The index: nothing live for the first two, one document for the third.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while indexed_live(&harness.es, &indexed).await == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(indexed_live(&harness.es, &indexed).await, 1);
+    assert_eq!(indexed_live(&harness.es, &primary_only).await, 0);
+    assert_eq!(indexed_live(&harness.es, &tombstone_only).await, 0);
+    assert_eq!(
+        harness.composite.type_count_basis(),
+        Some(CountBasis::IndexedLiveDocuments),
+        "the composite's Home figures are the index's, and say so"
+    );
+    // Home reads the index: for the tombstone-only tenant (whose index
+    // exists) that is zero live documents, while S3 still holds its data.
+    let home: u64 = harness
+        .composite
+        .count_all_types(&tombstone_only)
+        .await
+        .expect("Home counts")
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(home, 0, "the index holds nothing live for the tenant");
+    // For the primary-only tenant no index exists: the cluster answers the
+    // tenant glob with zero shards, which reads as an empty tenant (#1906).
+    let home: u64 = harness
+        .composite
+        .count_all_types(&primary_only)
+        .await
+        .expect("Home counts for a tenant with no index")
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(home, 0, "the index holds nothing for the tenant");
+
+    // Discovery: all three, presence only, from S3.
+    let discovery = harness
+        .composite
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .expect("discovery");
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    let found = discovered(&discovery);
+    for id in ["primary-only", "tombstone-only", "indexed"] {
+        assert_eq!(found.get(id), Some(&PRESENT), "{id}: {found:?}");
+    }
+    // The exhaustive S3 count the admin API keeps counts the tombstone too.
+    let counts: HashMap<String, u64> = harness
+        .composite
+        .count_by_tenant()
+        .await
+        .expect("count_by_tenant")
+        .into_iter()
+        .collect();
+    assert_eq!(counts.get("primary-only"), Some(&1));
+    assert_eq!(counts.get("tombstone-only"), Some(&1));
+    assert_eq!(counts.get("indexed"), Some(&1));
+}
+
+/// Elasticsearch is down. Writes still commit on S3, the registry and
+/// discovery still answer from S3, and only the index's own figures fail.
+/// A purge clears S3 and then reports the index's failure, so the operator
+/// knows to retry, instead of claiming both stores are clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_es_test_tenant_discovery_rides_out_an_index_outage() {
+    if skip_if_disabled("s3_es_test_tenant_discovery_rides_out_an_index_outage") {
+        return;
+    }
+
+    let harness = make_outage_harness("es-outage").await;
+    let during = tenant("written-during-outage");
+
+    harness
+        .composite
+        .register_tenant("registered-empty", None)
+        .await
+        .expect("register on S3");
+    harness
+        .composite
+        .create(
+            &during,
+            "Patient",
+            json!({"resourceType": "Patient", "active": true}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the write commits on S3 while the index is down");
+
+    assert!(
+        harness.composite.count_all_types(&during).await.is_err(),
+        "Home figures come from the index, which is down"
+    );
+    let discovery = harness
+        .composite
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .expect("discovery never touches the index");
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    let found = discovered(&discovery);
+    assert_eq!(found.get("written-during-outage"), Some(&PRESENT));
+    assert!(
+        !found.contains_key("registered-empty"),
+        "registered without data: {found:?}"
+    );
+    let registered: Vec<String> = harness
+        .composite
+        .list_tenants()
+        .await
+        .expect("the registry lives on S3")
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert!(registered.contains(&"registered-empty".to_string()));
+
+    assert!(
+        harness
+            .composite
+            .purge_tenant_data("written-during-outage")
+            .await
+            .is_err(),
+        "the index's purge failure is surfaced"
+    );
+    let after = harness
+        .composite
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .expect("discovery");
+    assert!(
+        !discovered(&after).contains_key("written-during-outage"),
+        "S3 was purged before the index failed"
+    );
+}
+
+/// A purge through the composite clears the tenant from S3 and from the
+/// index: discovery no longer lists it and search no longer finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_es_test_purge_clears_the_tenant_from_both_stores() {
+    if skip_if_disabled("s3_es_test_purge_clears_the_tenant_from_both_stores") {
+        return;
+    }
+
+    let harness = make_harness("tenant-purge").await;
+    let purged = tenant("purged");
+    let kept = tenant("kept");
+    let family = format!("Purged-{}", Uuid::new_v4().simple());
+    for t in [&purged, &kept] {
+        harness
+            .composite
+            .create(
+                t,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": family}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create");
+    }
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "family".to_string(),
+        param_type: SearchParamType::String,
+        modifier: None,
+        values: vec![SearchValue::eq(&family)],
+        chain: vec![],
+        components: vec![],
+    });
+    // Searchable first, so the absence below cannot pass vacuously.
+    search_until(&harness, &purged, &query, |r| !r.resources.items.is_empty()).await;
+
+    assert!(
+        harness
+            .composite
+            .purge_tenant_data("purged")
+            .await
+            .expect("purge")
+            >= 1
+    );
+
+    let found = discovered(
+        &harness
+            .composite
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .expect("discovery"),
+    );
+    assert!(!found.contains_key("purged"), "{found:?}");
+    assert_eq!(found.get("kept"), Some(&PRESENT));
+    let results = search_until(&harness, &purged, &query, |r| r.resources.items.is_empty()).await;
+    assert!(
+        results.resources.items.is_empty(),
+        "the index was purged too"
+    );
+    assert_eq!(indexed_live(&harness.es, &purged).await, 0);
+    let kept_results =
+        search_until(&harness, &kept, &query, |r| !r.resources.items.is_empty()).await;
+    assert_eq!(kept_results.resources.items.len(), 1, "only that tenant");
 }
