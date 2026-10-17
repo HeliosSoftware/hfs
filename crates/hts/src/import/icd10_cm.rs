@@ -146,7 +146,10 @@ fn read_xml_bytes(path: &Path) -> Result<Vec<u8>, HtsError> {
                     .by_index(i)
                     .ok()
                     .map(|e| {
-                        let n = e.name().to_ascii_lowercase();
+                        let Ok(name) = e.name() else {
+                            return false;
+                        };
+                        let n = name.to_ascii_lowercase();
                         n.ends_with(".xml") && n.contains("tabular")
                     })
                     .unwrap_or(false)
@@ -588,7 +591,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("icd10cm_tabular_2025.xml", opts).unwrap();
             zip.write_all(TABULAR_XML.as_bytes()).unwrap();
             zip.finish().unwrap();

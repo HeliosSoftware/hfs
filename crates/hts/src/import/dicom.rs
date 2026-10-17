@@ -155,7 +155,7 @@ fn read_text_from_zip(path: &Path) -> Result<String, HtsError> {
     let best_index = (0..archive.len())
         .find_map(|i| {
             let entry = archive.by_index(i).ok()?;
-            let name = entry.name().to_ascii_lowercase();
+            let name = entry.name().ok()?.to_ascii_lowercase();
             let is_data_file =
                 name.ends_with(".csv") || name.ends_with(".tsv") || name.ends_with(".txt");
             if is_data_file && (name.contains("dicom") || name.contains("dcm")) {

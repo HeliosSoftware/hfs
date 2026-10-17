@@ -187,7 +187,10 @@ fn read_product_txt_from_zip(path: &Path) -> Result<String, HtsError> {
                 .by_index(i)
                 .ok()
                 .map(|e| {
-                    let n = e.name().to_ascii_lowercase();
+                    let Ok(name) = e.name() else {
+                        return false;
+                    };
+                    let n = name.to_ascii_lowercase();
                     n == "product.txt" || n.ends_with("/product.txt")
                 })
                 .unwrap_or(false)
@@ -456,7 +459,7 @@ mod tests {
             let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-                zip.start_file("product.txt", zip::write::FileOptions::default())
+                zip.start_file("product.txt", zip::write::SimpleFileOptions::default())
                     .unwrap();
                 zip.write_all(sample_product_txt().as_bytes()).unwrap();
                 zip.finish().unwrap();

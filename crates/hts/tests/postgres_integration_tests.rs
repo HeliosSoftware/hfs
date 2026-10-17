@@ -2032,7 +2032,7 @@ LP7786-3.LP10156-0.718-7,3,LP10156-0,718-7,Hemoglobin\r\n";
     let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
     {
         let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-        let opts = zip::write::FileOptions::default();
+        let opts = zip::write::SimpleFileOptions::default();
         zip.start_file("LoincTable.csv", opts).unwrap();
         zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
         zip.start_file("MultiAxialHierarchy.csv", opts).unwrap();

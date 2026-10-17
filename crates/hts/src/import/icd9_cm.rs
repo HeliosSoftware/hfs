@@ -219,7 +219,10 @@ fn read_zip_contents(path: &Path) -> Result<Icd9ZipContents, HtsError> {
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
-        let name = entry.name().to_ascii_lowercase();
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
         if !name.ends_with(".txt") {
             continue;
         }
@@ -554,8 +557,11 @@ E800  Railway accidents\n";
             let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-                zip.start_file("CMS32_DESC_LONG_DX.txt", zip::write::FileOptions::default())
-                    .unwrap();
+                zip.start_file(
+                    "CMS32_DESC_LONG_DX.txt",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
                 zip.write_all(content.as_bytes()).unwrap();
                 zip.finish().unwrap();
             }
@@ -567,7 +573,7 @@ E800  Railway accidents\n";
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
                 for (name, content) in entries {
-                    zip.start_file(*name, zip::write::FileOptions::default())
+                    zip.start_file(*name, zip::write::SimpleFileOptions::default())
                         .unwrap();
                     zip.write_all(content.as_bytes()).unwrap();
                 }

@@ -217,7 +217,7 @@ fn read_xml_from_zip(path: &Path) -> Result<String, HtsError> {
     let best_index = (0..archive.len())
         .find_map(|i| {
             let entry = archive.by_index(i).ok()?;
-            let n = entry.name().to_ascii_lowercase();
+            let n = entry.name().ok()?.to_ascii_lowercase();
             if n.ends_with(".xml") && (n.contains("mesh") || n.contains("desc")) {
                 Some(i)
             } else {
