@@ -370,6 +370,146 @@ async fn create_indexes_the_instant_it_returns_as_last_modified() {
     );
 }
 
+/// The document for `Patient/p1` already holds version 1, as left by a
+/// transaction-bundle sync that indexed every write as a create.
+async fn existing_doc_at_version_one(server: &MockServer) {
+    indices_exist(server).await;
+    on(server, "GET", DOC_PATH, |_| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "_index": "hfs_write-stub_patient",
+            "_id": "Patient_p1",
+            "found": true,
+            "_source": { "tenant_id": TENANT, "version_id": "1" }
+        }))
+    })
+    .await;
+    on(server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
+    on(server, "POST", DOC_PATH, |_| indexed()).await;
+}
+
+fn patient_at_version(version: &str) -> Value {
+    let mut patient = plain_patient();
+    patient["meta"] = json!({ "versionId": version });
+    patient
+}
+
+/// A composite secondary indexes the version the primary assigned, so a
+/// search result's `meta.versionId` is one `If-Match` accepts. It used to
+/// index its own previous version plus one, which drifted from the primary's
+/// and made every search-then-update answer 412.
+#[tokio::test]
+async fn mirror_update_indexes_the_primarys_version() {
+    let server = MockServer::start().await;
+    existing_doc_at_version_one(&server).await;
+
+    let (stored, _) = backend(&server)
+        .mirror_update(
+            &tenant(),
+            "Patient",
+            "p1",
+            patient_at_version("4"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the stub accepts the write");
+
+    assert_eq!(stored.version_id(), "4");
+    assert_eq!(indexed_bodies(&server).await[0]["version_id"], json!("4"));
+}
+
+/// The single-document path a resource falls back to when its batch fails.
+#[tokio::test]
+async fn mirror_create_indexes_the_primarys_version() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+
+    let stored = backend(&server)
+        .mirror_create(
+            &tenant(),
+            "Patient",
+            patient_at_version("3"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the stub accepts the write");
+
+    assert_eq!(stored.version_id(), "3");
+    assert_eq!(indexed_bodies(&server).await[0]["version_id"], json!("3"));
+}
+
+/// Standalone, a client-supplied `meta.versionId` does not set the version.
+#[tokio::test]
+async fn create_or_update_keeps_its_own_version_count() {
+    let server = MockServer::start().await;
+    existing_doc_at_version_one(&server).await;
+
+    let (stored, _) = backend(&server)
+        .create_or_update(
+            &tenant(),
+            "Patient",
+            "p1",
+            patient_at_version("9"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the stub accepts the write");
+
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(indexed_bodies(&server).await[0]["version_id"], json!("2"));
+}
+
+/// The batch a transaction bundle's results sync through.
+#[tokio::test]
+async fn mirror_many_indexes_each_resources_primary_version() {
+    let server = MockServer::start().await;
+    indices_exist(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(|request: &Request| {
+            let n = String::from_utf8_lossy(&request.body).lines().count() / 2;
+            let items: Vec<Value> = (0..n)
+                .map(|_| json!({"index": {"status": 200, "result": "updated"}}))
+                .collect();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"took": 1, "errors": false, "items": items}))
+        })
+        .mount(&server)
+        .await;
+
+    let mut second = patient_at_version("6");
+    second["id"] = json!("p2");
+    let results = backend(&server)
+        .mirror_many(
+            &tenant(),
+            "Patient",
+            vec![patient_at_version("3"), second],
+            FhirVersion::default(),
+        )
+        .await;
+
+    let versions: Vec<String> = results
+        .into_iter()
+        .map(|r| r.expect("indexed").version_id().to_string())
+        .collect();
+    assert_eq!(versions, ["3", "6"]);
+    let request = server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .into_iter()
+        .find(|r| r.url.path() == "/_bulk")
+        .expect("one _bulk request");
+    let indexed: Vec<Value> = String::from_utf8_lossy(&request.body)
+        .lines()
+        .skip(1)
+        .step_by(2)
+        .map(|line| serde_json::from_str::<Value>(line).expect("a document line"))
+        .map(|doc| doc["version_id"].clone())
+        .collect();
+    assert_eq!(indexed, [json!("3"), json!("6")]);
+}
+
 /// The issue's case (2): a single write that meets a `503` (then a `429`) is
 /// retried and succeeds. It used to fail after one attempt.
 #[tokio::test]

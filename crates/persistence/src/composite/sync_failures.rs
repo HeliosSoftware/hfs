@@ -619,11 +619,11 @@ impl CompositeStorage {
             match &current {
                 Some(resource) => {
                     backend
-                        .create_or_update(
+                        .mirror_update(
                             tenant,
                             &key.resource_type,
                             &key.resource_id,
-                            resource.content().clone(),
+                            resource.content_with_meta(),
                             resource.fhir_version(),
                         )
                         .await?;

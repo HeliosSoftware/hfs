@@ -1046,7 +1046,7 @@ impl ResourceStorage for CompositeStorage {
             .sync_to_secondaries(SyncEvent::Create {
                 resource_type: resource_type.to_string(),
                 resource_id: stored.id().to_string(),
-                content: stored.content().clone(),
+                content: stored.content_with_meta(),
                 tenant_id: tenant.tenant_id().clone(),
                 fhir_version,
             })
@@ -1091,7 +1091,7 @@ impl ResourceStorage for CompositeStorage {
         let created: Vec<(String, Value)> = results
             .iter()
             .filter_map(|result| result.as_ref().ok())
-            .map(|stored| (stored.id().to_string(), stored.content().clone()))
+            .map(|stored| (stored.id().to_string(), stored.content_with_meta()))
             .collect();
         // `create_many` has no per-entry receipt to correct either — that is
         // `CompositeSubmitJobs::sync_ingested`'s job, which calls
@@ -1138,7 +1138,7 @@ impl ResourceStorage for CompositeStorage {
             SyncEvent::Create {
                 resource_type: resource_type.to_string(),
                 resource_id: id.to_string(),
-                content: stored.content().clone(),
+                content: stored.content_with_meta(),
                 tenant_id: tenant.tenant_id().clone(),
                 fhir_version,
             }
@@ -1146,7 +1146,7 @@ impl ResourceStorage for CompositeStorage {
             SyncEvent::Update {
                 resource_type: resource_type.to_string(),
                 resource_id: id.to_string(),
-                content: stored.content().clone(),
+                content: stored.content_with_meta(),
                 tenant_id: tenant.tenant_id().clone(),
                 version: stored.version_id().to_string(),
                 fhir_version,
@@ -1203,7 +1203,7 @@ impl ResourceStorage for CompositeStorage {
             .sync_to_secondaries(SyncEvent::Update {
                 resource_type: current.resource_type().to_string(),
                 resource_id: current.id().to_string(),
-                content: stored.content().clone(),
+                content: stored.content_with_meta(),
                 tenant_id: tenant.tenant_id().clone(),
                 version: stored.version_id().to_string(),
                 fhir_version: stored.fhir_version(),
@@ -1802,7 +1802,7 @@ impl ConditionalStorage for CompositeStorage {
                         .sync_to_secondaries(SyncEvent::Create {
                             resource_type: resource_type.to_string(),
                             resource_id: created.id().to_string(),
-                            content: created.content().clone(),
+                            content: created.content_with_meta(),
                             tenant_id: tenant.tenant_id().clone(),
                             fhir_version,
                         })
@@ -1837,7 +1837,7 @@ impl ConditionalStorage for CompositeStorage {
                 .sync_to_secondaries(SyncEvent::Create {
                     resource_type: resource_type.to_string(),
                     resource_id: stored.id().to_string(),
-                    content: stored.content().clone(),
+                    content: stored.content_with_meta(),
                     tenant_id: tenant.tenant_id().clone(),
                     fhir_version,
                 })
@@ -1881,7 +1881,7 @@ impl ConditionalStorage for CompositeStorage {
                             .sync_to_secondaries(SyncEvent::Create {
                                 resource_type: resource_type.to_string(),
                                 resource_id: created.id().to_string(),
-                                content: created.content().clone(),
+                                content: created.content_with_meta(),
                                 tenant_id: tenant.tenant_id().clone(),
                                 fhir_version,
                             })
@@ -1915,7 +1915,7 @@ impl ConditionalStorage for CompositeStorage {
                         .sync_to_secondaries(SyncEvent::Update {
                             resource_type: resource_type.to_string(),
                             resource_id: updated.id().to_string(),
-                            content: updated.content().clone(),
+                            content: updated.content_with_meta(),
                             tenant_id: tenant.tenant_id().clone(),
                             version: updated.version_id().to_string(),
                             fhir_version: updated.fhir_version(),
@@ -1957,7 +1957,7 @@ impl ConditionalStorage for CompositeStorage {
                     .sync_to_secondaries(SyncEvent::Create {
                         resource_type: resource_type.to_string(),
                         resource_id: stored.id().to_string(),
-                        content: stored.content().clone(),
+                        content: stored.content_with_meta(),
                         tenant_id: tenant.tenant_id().clone(),
                         fhir_version,
                     })
@@ -1971,7 +1971,7 @@ impl ConditionalStorage for CompositeStorage {
                     .sync_to_secondaries(SyncEvent::Update {
                         resource_type: resource_type.to_string(),
                         resource_id: stored.id().to_string(),
-                        content: stored.content().clone(),
+                        content: stored.content_with_meta(),
                         tenant_id: tenant.tenant_id().clone(),
                         version: stored.version_id().to_string(),
                         fhir_version: stored.fhir_version(),
@@ -2111,7 +2111,7 @@ impl VersionedStorage for CompositeStorage {
             .sync_to_secondaries(SyncEvent::Update {
                 resource_type: resource_type.to_string(),
                 resource_id: id.to_string(),
-                content: stored.content().clone(),
+                content: stored.content_with_meta(),
                 tenant_id: tenant.tenant_id().clone(),
                 version: stored.version_id().to_string(),
                 fhir_version: stored.fhir_version(),

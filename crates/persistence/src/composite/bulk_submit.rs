@@ -218,7 +218,7 @@ impl CompositeSubmitJobs {
                         by_type.last_mut().expect("just pushed")
                     }
                 };
-                group.1.push((resource_id, stored.content().clone()));
+                group.1.push((resource_id, stored.content_with_meta()));
             }
             for ((resource_type, fhir_version), resources) in by_type {
                 attempted += resources.len() as u64;
@@ -899,7 +899,7 @@ impl BulkSubmitRollbackProvider for CompositeSubmitJobs {
                     Ok(Some(stored)) => SyncEvent::Create {
                         resource_type: change.resource_type.clone(),
                         resource_id: change.resource_id.clone(),
-                        content: stored.content().clone(),
+                        content: stored.content_with_meta(),
                         tenant_id: tenant.tenant_id().clone(),
                         fhir_version: stored.fhir_version(),
                     },

@@ -441,6 +441,16 @@ fn merge_composite_component(entry: &mut Value, origin: ValueOrigin<'_>, value: 
     }
 }
 
+/// The `meta.versionId` a composite primary stamped on a resource it mirrors
+/// to this backend.
+fn primary_version(resource: &Value) -> Option<String> {
+    resource
+        .pointer("/meta/versionId")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
 /// The search document for one stored resource. `last_updated` is the
 /// resource's own `meta.lastUpdated` instant — the one the primary store
 /// holds and the one `_lastUpdated` searches and sorts answer from — never
@@ -1064,29 +1074,17 @@ impl ElasticsearchBackend {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl ResourceStorage for ElasticsearchBackend {
-    fn backend_name(&self) -> &'static str {
-        "elasticsearch"
-    }
-
-    async fn readiness_check(&self) -> Result<(), BackendError> {
-        <Self as crate::core::Backend>::health_check(self).await
-    }
-
-    fn bulk_write_concurrency(&self) -> usize {
-        // One index request per resource; ES absorbs parallel writers.
-        8
-    }
-
-    async fn create(
+    /// A single-document create. With `keep_primary_version` (a composite
+    /// secondary) the document takes the resource's own `meta.versionId`,
+    /// the version the primary assigned, instead of version 1.
+    async fn index_new(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource: Value,
         fhir_version: FhirVersion,
+        keep_primary_version: bool,
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Create, resource_type)?;
 
@@ -1098,7 +1096,11 @@ impl ResourceStorage for ElasticsearchBackend {
             .map(String::from)
             .unwrap_or_else(crate::types::new_resource_id);
 
-        let version_id = "1";
+        let version_id = keep_primary_version
+            .then(|| primary_version(&resource))
+            .flatten()
+            .unwrap_or_else(|| "1".to_string());
+        let version_id = version_id.as_str();
 
         // Ensure the resource has correct type and id
         let mut resource = resource;
@@ -1190,12 +1192,17 @@ impl ResourceStorage for ElasticsearchBackend {
     /// cost N refresh waits — the ~1.4k-resource conformance seed took over
     /// twenty minutes and the server never came up — while one bulk request
     /// costs one.
-    async fn create_many(
+    ///
+    /// With `keep_primary_version` (a composite secondary) each document is
+    /// indexed at the resource's own `meta.versionId`, the version the
+    /// primary assigned; otherwise every resource starts at version 1.
+    async fn index_many(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resources: Vec<Value>,
         fhir_version: FhirVersion,
+        keep_primary_version: bool,
     ) -> Vec<StorageResult<StoredResource>> {
         if resources.is_empty() {
             return Vec::new();
@@ -1216,7 +1223,6 @@ impl ResourceStorage for ElasticsearchBackend {
         }
 
         let tenant_id = tenant.tenant_id().as_str();
-        let version_id = "1";
         let extractor = self.tenant_extractor(tenant_id);
         // One instant for the batch: indexed as every document's
         // `last_updated` and returned as each stored resource's
@@ -1229,6 +1235,7 @@ impl ResourceStorage for ElasticsearchBackend {
         // out in a few requests.
         struct Prepared {
             id: String,
+            version_id: String,
             resource: Value,
             docs: Vec<(String, String, Value)>,
         }
@@ -1248,6 +1255,10 @@ impl ResourceStorage for ElasticsearchBackend {
                     );
                     obj.insert("id".to_string(), Value::String(id.clone()));
                 }
+                let version_id = keep_primary_version
+                    .then(|| primary_version(&resource))
+                    .flatten()
+                    .unwrap_or_else(|| "1".to_string());
                 let extracted_values = extractor
                     .extract(&resource, resource_type)
                     .unwrap_or_default();
@@ -1258,7 +1269,7 @@ impl ResourceStorage for ElasticsearchBackend {
                         tenant_id,
                         resource_type,
                         &id,
-                        version_id,
+                        &version_id,
                         now,
                         &resource,
                         fhir_version,
@@ -1280,14 +1291,19 @@ impl ResourceStorage for ElasticsearchBackend {
                             &contained.contained_type,
                             &contained.local_id,
                             &contained.content,
-                            version_id,
+                            &version_id,
                             now,
                             fhir_version,
                             &contained.values,
                         ),
                     ));
                 }
-                Prepared { id, resource, docs }
+                Prepared {
+                    id,
+                    version_id,
+                    resource,
+                    docs,
+                }
             })
             .collect();
 
@@ -1329,7 +1345,7 @@ impl ResourceStorage for ElasticsearchBackend {
                 None => Ok(StoredResource::from_storage(
                     resource_type,
                     &p.id,
-                    version_id,
+                    &p.version_id,
                     tenant.tenant_id().clone(),
                     p.resource,
                     now,
@@ -1341,13 +1357,17 @@ impl ResourceStorage for ElasticsearchBackend {
             .collect()
     }
 
-    async fn create_or_update(
+    /// PUT semantics. With `keep_primary_version` (a composite secondary) the
+    /// document takes the resource's own `meta.versionId`, the version the
+    /// primary assigned, rather than this index's previous version plus one.
+    async fn upsert(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
         resource: Value,
         fhir_version: FhirVersion,
+        keep_primary_version: bool,
     ) -> StorageResult<(StoredResource, bool)> {
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -1413,6 +1433,10 @@ impl ResourceStorage for ElasticsearchBackend {
             }
             None => ("1".to_string(), true),
         };
+        let version_id = keep_primary_version
+            .then(|| primary_version(&resource))
+            .flatten()
+            .unwrap_or(version_id);
 
         // Ensure resource has correct type and id
         let mut resource = resource;
@@ -1485,6 +1509,92 @@ impl ResourceStorage for ElasticsearchBackend {
             ),
             is_new,
         ))
+    }
+}
+
+#[async_trait]
+impl ResourceStorage for ElasticsearchBackend {
+    fn backend_name(&self) -> &'static str {
+        "elasticsearch"
+    }
+
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
+    fn bulk_write_concurrency(&self) -> usize {
+        // One index request per resource; ES absorbs parallel writers.
+        8
+    }
+
+    async fn create(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<StoredResource> {
+        self.index_new(tenant, resource_type, resource, fhir_version, false)
+            .await
+    }
+
+    async fn mirror_create(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<StoredResource> {
+        self.index_new(tenant, resource_type, resource, fhir_version, true)
+            .await
+    }
+
+    /// `_bulk` requests of at most [`BULK_OPS_PER_REQUEST`] operations; see
+    /// [`ElasticsearchBackend::index_many`].
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        self.index_many(tenant, resource_type, resources, fhir_version, false)
+            .await
+    }
+
+    async fn mirror_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        self.index_many(tenant, resource_type, resources, fhir_version, true)
+            .await
+    }
+
+    async fn create_or_update(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<(StoredResource, bool)> {
+        self.upsert(tenant, resource_type, id, resource, fhir_version, false)
+            .await
+    }
+
+    async fn mirror_update(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<(StoredResource, bool)> {
+        self.upsert(tenant, resource_type, id, resource, fhir_version, true)
+            .await
     }
 
     async fn read(

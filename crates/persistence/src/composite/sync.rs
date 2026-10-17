@@ -453,7 +453,7 @@ impl SyncManager {
                     .map(|(_, content)| content.clone())
                     .collect();
                 let results = backend
-                    .create_many(&tenant, &resource_type, contents, fhir_version)
+                    .mirror_many(&tenant, &resource_type, contents, fhir_version)
                     .await;
 
                 let mut synced = 0;
@@ -736,7 +736,7 @@ impl SyncManager {
                     let tenant =
                         TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
                     backend
-                        .create(&tenant, resource_type, content.clone(), *fhir_version)
+                        .mirror_create(&tenant, resource_type, content.clone(), *fhir_version)
                         .await
                         .map(|_| ())
                 }
@@ -751,10 +751,8 @@ impl SyncManager {
                     let tenant =
                         TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
 
-                    // For secondary backends, we do a create_or_update
-                    // since we don't track versions in secondaries
                     backend
-                        .create_or_update(
+                        .mirror_update(
                             &tenant,
                             resource_type,
                             resource_id,
@@ -791,11 +789,11 @@ impl SyncManager {
 
                     for resource in resources {
                         backend
-                            .create_or_update(
+                            .mirror_update(
                                 &tenant,
                                 resource.resource_type(),
                                 resource.id(),
-                                resource.content().clone(),
+                                resource.content_with_meta(),
                                 resource.fhir_version(),
                             )
                             .await?;

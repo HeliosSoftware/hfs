@@ -476,6 +476,53 @@ pub trait ResourceStorage: Send + Sync {
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)>;
 
+    /// [`create_many`](Self::create_many) for resources a composite primary
+    /// has already stored, written to this backend as a secondary. Each
+    /// resource's `meta.versionId` is the version the primary assigned.
+    ///
+    /// The default is `create_many`. A secondary that answers searches from
+    /// its own copy (Elasticsearch) overrides it to keep the primary's
+    /// version, so a search result's `meta.versionId` can be sent back as
+    /// `If-Match`.
+    async fn mirror_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        self.create_many(tenant, resource_type, resources, fhir_version)
+            .await
+    }
+
+    /// [`create`](Self::create) for a resource a composite primary has
+    /// already stored; see [`mirror_many`](Self::mirror_many).
+    async fn mirror_create(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<StoredResource> {
+        self.create(tenant, resource_type, resource, fhir_version)
+            .await
+    }
+
+    /// [`create_or_update`](Self::create_or_update) for a resource a
+    /// composite primary has already stored; see
+    /// [`mirror_many`](Self::mirror_many).
+    async fn mirror_update(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<(StoredResource, bool)> {
+        self.create_or_update(tenant, resource_type, id, resource, fhir_version)
+            .await
+    }
+
     /// Reads a resource by type and ID.
     ///
     /// # Arguments
