@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct PropertyValue {
     /// Property code (e.g. "parent", "inactive", "synonym")
     pub code: String,
-    /// FHIR property type: code | string | boolean | integer | decimal | dateTime
+    /// FHIR property type: code | Coding | string | boolean | integer | decimal | dateTime
     pub value_type: String,
     /// Serialised value (always a string for simplicity; callers cast as needed)
     pub value: String,
