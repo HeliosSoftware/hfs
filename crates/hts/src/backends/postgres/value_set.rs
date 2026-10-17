@@ -2939,7 +2939,17 @@ async fn apply_compose_filters_pg(
         let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
 
+        // `in` / `not-in` on the concept identifier (`concept` / `code`) list
+        // codes, not values of a property named `concept` — the property
+        // lookup below would match nothing. Mirrors SQLite's
+        // `query_property_in` / `is_concept_prop`.
+        let is_concept_prop = property == "concept" || property == "code";
+
         let matches: Vec<(String, Option<String>)> = match op {
+            "in" if is_concept_prop => pg_filter_code_in(client, system_id, value, true).await?,
+            "not-in" if is_concept_prop => {
+                pg_filter_code_in(client, system_id, value, false).await?
+            }
             "=" => pg_filter_property_eq(client, system_url, system_id, property, value).await?,
             // Single-value `in` reduces to equality. Multi-value (comma-
             // separated) `in` is a TODO: parity gap.
@@ -3100,6 +3110,36 @@ async fn pg_filter_property_eq(
                 )",
             &[&system_id, &property_aliases, &value],
         )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// `in` (`include = true`) / `not-in` (`include = false`) on the concept
+/// identifier: the concepts of `system_id` whose code is (or is not) one of
+/// the comma-separated `values`.
+async fn pg_filter_code_in(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    values: &str,
+    include: bool,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    let codes: Vec<&str> = values
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect();
+    let sql = if include {
+        "SELECT code, display FROM concepts WHERE system_id = $1 AND code = ANY($2::text[])"
+    } else {
+        "SELECT code, display FROM concepts WHERE system_id = $1 AND NOT (code = ANY($2::text[]))"
+    };
+    let rows = client
+        .query(sql, &[&system_id, &codes])
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 

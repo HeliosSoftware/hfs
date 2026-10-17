@@ -2491,6 +2491,8 @@ async fn compose_ops_enumerated_include_with_whole_system_exclude_and_count() {
 // Parity with the SQLite unit tests: ICD-10-CM style codes such as `E11.6` are
 // not valid ECL concept ids. PG resolves these filters with closure-table SQL,
 // never the ECL parser, so this pins that it keeps working for dotted codes.
+// The `with_prior_filter` cases also exercise `concept in`, which PG used to
+// treat as a lookup of a property literally named `concept`.
 
 async fn dotted_setup(backend: &PostgresTerminologyBackend, base: &str, uid: &str) -> String {
     let cs = format!("{base}cs-dotted");
@@ -2564,4 +2566,82 @@ async fn dotted_code_generalizes_without_prior_filter() {
     ]))
     .await;
     assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
+}
+
+#[tokio::test]
+async fn dotted_code_is_a_with_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+        {"property": "concept", "op": "is-a", "value": "E11.6"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E11.6", "E11.65"]);
+}
+
+#[tokio::test]
+async fn dotted_code_descendent_of_with_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+        {"property": "concept", "op": "descendent-of", "value": "E11.6"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E11.65"]);
+}
+
+#[tokio::test]
+async fn dotted_code_is_not_a_with_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+        {"property": "concept", "op": "is-not-a", "value": "E11.6"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E10", "E11"]);
+}
+
+#[tokio::test]
+async fn dotted_code_generalizes_with_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+        {"property": "concept", "op": "generalizes", "value": "E11.65"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
+}
+
+#[tokio::test]
+async fn compose_ops_in_on_concept_matches_codes() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-in");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    for (property, value, expected) in [
+        ("concept", "A1,B", vec!["A1", "B"]),
+        ("code", "A1,B", vec!["A1", "B"]),
+        ("concept", "A", vec!["A"]),
+    ] {
+        let codes = compose_ops_expand(
+            &backend,
+            serde_json::json!({"include": [{"system": cs,
+                "filter": [{"property": property, "op": "in", "value": value}]}]}),
+            None,
+        )
+        .await;
+        assert_eq!(codes, expected, "{property} in {value}");
+    }
+}
+
+#[tokio::test]
+async fn compose_ops_not_in_on_concept_excludes_codes() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-notin");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    for (value, expected) in [("A,A1", vec!["B", "ROOT"]), ("B", vec!["A", "A1", "ROOT"])] {
+        let codes = compose_ops_expand(
+            &backend,
+            serde_json::json!({"include": [{"system": cs,
+                "filter": [{"property": "concept", "op": "not-in", "value": value}]}]}),
+            None,
+        )
+        .await;
+        assert_eq!(codes, expected, "concept not-in {value}");
+    }
 }
