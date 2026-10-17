@@ -621,6 +621,7 @@
     }
     var copy = document.getElementById("query-copy");
     if (copy) copy.disabled = writeBlocked;
+    syncPreviousResults();
     if (runBlocked || writeBlocked || builderCompatibilityPending()) return;
     var ready = pendingBuilderConsumers;
     pendingBuilderConsumers = [];
@@ -646,6 +647,7 @@
 
   function noteBuilderUserEdit() {
     builderRevision += 1;
+    syncPreviousResults();
   }
 
   function beginTypeResolution(row, userTransition) {
@@ -2622,6 +2624,28 @@
     previous: document.getElementById("query-results-previous"),
   };
 
+  /* Retained rows belong to the last successful logical query, not its
+   * possibly opaque pager URL or the transport-only _total parameter.
+   * Pending or failed searches keep the existing previous-results cue;
+   * otherwise it follows what Run would request once the builder settles. */
+  function syncPreviousResults() {
+    if (!results || !results.previous) return;
+    if (!lastSearchContext) {
+      results.previous.hidden = true;
+      return;
+    }
+    var candidate = parseSearchUrl(urlInput && urlInput.value);
+    results.previous.hidden = !(
+      activeSearch ||
+      (results.error && !results.error.hidden) ||
+      !candidate ||
+      builderRunBlocked() ||
+      builderWriteBlocked() ||
+      builderHasPendingSerialization() ||
+      requestPath(candidate) !== requestPath(lastSearchContext)
+    );
+  }
+
   /* Compact display heuristics for common FHIR shapes (HumanName,
    * CodeableConcept, Reference, Quantity); everything else is truncated
    * JSON rather than a blank cell. */
@@ -2956,7 +2980,6 @@
     results.body.replaceChildren(prepared.rows);
     results.meta.textContent = prepared.meta;
     results.note.textContent = prepared.note;
-    results.previous.hidden = true;
     var renderedRevision = builderRevision;
     syncCandidateSort();
     if (!PARAM_META[context.type])
@@ -2986,6 +3009,7 @@
     clearResultsError();
     lastSearchPath = path;
     lastSearchContext = context;
+    syncPreviousResults();
     return true;
   }
 
@@ -3108,7 +3132,7 @@
     results.card.hidden = search.prior.hidden;
     results.error.textContent = search.prior.errorText;
     results.error.hidden = search.prior.errorHidden;
-    results.previous.hidden = !lastSearchPath;
+    syncPreviousResults();
     syncCandidateSort();
   }
 
@@ -3140,7 +3164,7 @@
     };
     activeSearch = search;
     clearResultsError();
-    results.previous.hidden = !lastSearchPath;
+    syncPreviousResults();
     setResultsBusy(true);
     function elapsed() {
       if (activeSearch !== search) return;

@@ -281,6 +281,8 @@ struct UnnestStep {
     /// flattened collection. Used for forEach paths ending in `[N]` —
     /// FHIRPath indexes the flattened result, not each array crossing.
     flat_index: Option<i64>,
+    /// See [`PlanNode::LateralUnnest`]'s `array_source`.
+    array_source: bool,
 }
 
 /// One `repeat:` recursive descent — produces a recursive-CTE row source
@@ -369,6 +371,26 @@ fn read_clause_columns_and_iter(
                     });
                 }
             }
+        }
+        // A descent the schema stops after one level is a `forEach`, which
+        // streams row by row; a recursive CTE builds its whole seed level
+        // before yielding the first row.
+        if let ([path], [Value::String(src)]) = (step_paths.as_slice(), repeat.as_slice())
+            && repeat_is_single_level(parent_focus, path, env)
+        {
+            let mut flat = clause.clone();
+            if let Some(obj) = flat.as_object_mut() {
+                obj.remove("repeat");
+                obj.insert("forEach".to_string(), Value::String(src.clone()));
+            }
+            return read_clause_columns_and_iter(
+                &flat,
+                parent_focus,
+                env,
+                alias_seq,
+                dialect,
+                target,
+            );
         }
         let alias = alias_seq.next_recurse();
         let focus = format!("{alias}.node");
@@ -607,6 +629,7 @@ fn read_clause_columns_and_iter(
                     left_join: is_left_join,
                     on_filter: None,
                     flat_index: None,
+                    array_source: false,
                 }],
                 focus,
             )
@@ -636,6 +659,7 @@ fn read_clause_columns_and_iter(
                     left_join: is_left_join,
                     on_filter,
                     flat_index: Some(n),
+                    array_source: false,
                 }],
                 focus,
             )
@@ -693,6 +717,10 @@ fn read_clause_columns_and_iter(
                     }
                     _ => None,
                 };
+                let seg_type = walk_fhir_type(&focus, &super::ir::JsonPath(seg_steps.clone()), env);
+                let array_source = !flatten
+                    && matches!(seg_steps.as_slice(), [PathStep::Field(_)])
+                    && matches!(seg_type, Some((_, true)));
                 unnests.push(UnnestStep {
                     source,
                     out_alias: alias.clone(),
@@ -701,9 +729,9 @@ fn read_clause_columns_and_iter(
                     left_join: is_left_join && i == last_idx,
                     on_filter,
                     flat_index: None,
+                    array_source,
                 });
-                if let Some((ty, _)) = walk_fhir_type(&focus, &super::ir::JsonPath(seg_steps), env)
-                {
+                if let Some((ty, _)) = seg_type {
                     env.focus_types.insert(format!("{alias}.value"), ty);
                 }
                 focus = format!("{alias}.value");
@@ -897,6 +925,30 @@ fn path_likely_multi_valued(path: &str, resource_type: &str, fhir_version: FhirV
     false
 }
 
+/// True when a single-path `repeat:` provably stops after its first level: the
+/// path resolves from the parent focus to a known type, and that type has no
+/// element the path could follow again (`Observation.component` →
+/// `ObservationComponent`, which has no `component`). The field table is
+/// generated from every snapshot element, so a known type's missing field is
+/// absent from the schema. Type filters are not resolved by the walk, so a
+/// path containing one keeps the recursive descent.
+fn repeat_is_single_level(
+    parent_focus: &str,
+    path: &super::ir::JsonPath,
+    env: &CompileEnv,
+) -> bool {
+    if path.0.iter().any(|s| matches!(s, PathStep::TypeFilter(_))) {
+        return false;
+    }
+    let Some((node_type, _)) = walk_fhir_type(parent_focus, path, env) else {
+        return false;
+    };
+    let known = ["id", "extension"]
+        .iter()
+        .any(|f| super::lookup_field_type(env.fhir_version, &node_type, f).is_some());
+    known && walk_fhir_type_from(&node_type, path, env).is_none()
+}
+
 /// FHIR type of the nodes a `repeat:` descent visits, when it is unambiguous.
 ///
 /// Each step path is applied first to the parent focus and then, recursively,
@@ -936,6 +988,7 @@ fn infer_decode(expr: &SqlExpr, env: &CompileEnv) -> ColumnDecode {
     }
     match expr {
         SqlExpr::Lit(LitValue::Str(_))
+        | SqlExpr::ColRef(_)
         | SqlExpr::ReferenceKey { .. }
         | SqlExpr::JoinAggregate { .. } => ColumnDecode::Text,
         SqlExpr::Lit(LitValue::Int(_)) | SqlExpr::RowIndex(_) => ColumnDecode::Integer,
@@ -1119,6 +1172,7 @@ fn apply_steps(parent: PlanNode, steps: Vec<IterStep>) -> PlanNode {
             left_join: u.left_join,
             on_filter: u.on_filter,
             flat_index: u.flat_index,
+            array_source: u.array_source,
         },
         IterStep::Recurse(r) => PlanNode::Recurse {
             parent: Box::new(p),
@@ -1235,5 +1289,65 @@ mod tests {
         let (pg, _) =
             build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &PgDialect);
         assert!(pg.contains("(r.data)::jsonb->'name'"), "{pg}");
+    }
+
+    fn plan_recurses(resource: &str, select: serde_json::Value) -> bool {
+        let view = serde_json::json!({"resourceType":"ViewDefinition","resource":resource,"select":select});
+        let (plan, _) = build_plan(
+            &view,
+            &SqliteDialect,
+            crate::sof::compiler::CompileTarget::Sqlite,
+            FhirVersion::R4,
+        )
+        .expect("plan");
+        format!("{plan:?}").contains("Recurse {")
+    }
+
+    /// A `repeat:` the schema stops after one level is planned as a
+    /// `forEach`; one that can descend again keeps the recursive CTE.
+    #[test]
+    fn single_level_repeat_is_planned_as_foreach() {
+        use serde_json::json;
+        let column = |path: &str| json!([{"path": path, "name": "c"}]);
+        // ObservationComponent has no `component`.
+        assert!(!plan_recurses(
+            "Observation",
+            json!([{"repeat":["component"],"column":column("code.text")}])
+        ));
+        // Inside a forEach the focus type still resolves: HumanName has no `name`.
+        assert!(!plan_recurses(
+            "Patient",
+            json!([{"forEach":"contact","select":[{"repeat":["name"],"column":column("family")}]}])
+        ));
+        for (resource, select) in [
+            // Genuinely recursive: QuestionnaireItem.item, QuestionnaireResponseItem.item,
+            // Extension.extension, and an `answer.item` that only resolves from an item.
+            (
+                "Questionnaire",
+                json!([{"repeat":["item"],"column":column("linkId")}]),
+            ),
+            (
+                "QuestionnaireResponse",
+                json!([{"repeat":["item"],"column":column("linkId")}]),
+            ),
+            (
+                "QuestionnaireResponse",
+                json!([{"repeat":["item","answer.item"],"column":column("linkId")}]),
+            ),
+            (
+                "Patient",
+                json!([{"repeat":["extension"],"column":column("url")}]),
+            ),
+            // Two paths are a union per level, not a single forEach.
+            (
+                "Observation",
+                json!([{"repeat":["component","hasMember"],"column":column("id")}]),
+            ),
+        ] {
+            assert!(
+                plan_recurses(resource, select.clone()),
+                "{resource}: {select}"
+            );
+        }
     }
 }

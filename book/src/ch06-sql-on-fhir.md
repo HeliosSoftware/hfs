@@ -404,7 +404,10 @@ source order. `_limit=50` returns the first 50 rows of that full sequence,
 including any preceding nullable rows, with the same data and filters.
 
 A `forEach` inside `unionAll` or `repeat` follows its parent's legacy
-exception. Total global order for those shapes, and changes to indexed
+exception. A `repeat` with one path that cannot recur on the type it
+reaches, such as `repeat: ["component"]` on Observation (a component has no
+`component`), is planned as a `forEach` over that path and follows the
+`forEach` row order. Total global order for those shapes, and changes to indexed
 paths or `%rowIndex`, remain follow-up work in
 [#1867](https://github.com/HeliosSoftware/hfs/issues/1867).
 

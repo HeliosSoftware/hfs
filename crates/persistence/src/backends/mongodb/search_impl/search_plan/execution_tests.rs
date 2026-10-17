@@ -891,12 +891,18 @@ async fn ordered_probe_timeouts_fall_back_without_losing_matches() {
         fixture.close().await;
         return;
     };
-    let plan = batched_plan(vec![]);
+    // Only the failpoint may time out a window here. Under the 10 ms default the
+    // first window, which skip:1 lets through, can expire on its own under load
+    // and fall back before the continuation find is sent (#1994).
+    let plan = BatchedIndexPlan {
+        probe_timeout: Duration::from_secs(30),
+        ..batched_plan(vec![])
+    };
     for code in [50, 89, 262] {
         for (label, mode, offset) in [
             ("initial", doc! {"times":1}, 0),
-            // The failpoint matches only finds on search_index, so with skip:1 the hit can
-            // only come from the continuation window.
+            // The failpoint matches only finds on search_index, so with skip:1 the first
+            // window completes and the hit can only come from the continuation window.
             ("continuation", doc! {"skip":1}, 257),
         ] {
             let armed = fixture.arm_error(&admin, "find", mode.clone(), code).await;
@@ -909,10 +915,13 @@ async fn ordered_probe_timeouts_fall_back_without_losing_matches() {
                 .try_ordered_page(&fixture.db, &resource_filter(), None, &selection)
                 .await;
             let disabled = disable_failpoint(&admin).await;
+            let probe_path = probed
+                .as_ref()
+                .map(|page| page.as_ref().map(|matches| matches.ids.len()));
             assert_eq!(
                 failpoint_hits(&disabled),
                 failpoint_hits(&armed) + 1,
-                "code={code}, {label}: the ordered probe must reach the injected timeout"
+                "code={code}, {label}: the ordered probe must reach the injected timeout (probe returned {probe_path:?})"
             );
             assert!(
                 matches!(probed, Ok(None)),
@@ -923,10 +932,11 @@ async fn ordered_probe_timeouts_fall_back_without_losing_matches() {
                 .execute(&fixture.db, resource_filter(), None, selection)
                 .await;
             let disabled = disable_failpoint(&admin).await;
+            let execute_path = outcome.as_ref().map(|matches| matches.ids.len());
             assert_eq!(
                 failpoint_hits(&disabled),
                 failpoint_hits(&armed) + 1,
-                "code={code}, {label}: full page execution must reach the injected timeout"
+                "code={code}, {label}: full page execution must reach the injected timeout (execute returned {execute_path:?})"
             );
             let result = outcome.unwrap_or_else(|error| panic!("code={code}, {label}: {error}"));
             assert_eq!(

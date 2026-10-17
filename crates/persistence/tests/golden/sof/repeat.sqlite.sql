@@ -27,7 +27,6 @@ SELECT
 FROM rec_0 JOIN resources r ON r.id = rec_0.rid AND r.tenant_id = ?1
   AND r.resource_type = ?2
   AND r.is_deleted = 0
-ORDER BY 1
 
 /* Runner bindings and output metadata:
 {
