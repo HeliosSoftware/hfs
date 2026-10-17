@@ -276,7 +276,10 @@ fn find_zip_entry(archive: &mut zip::ZipArchive<std::fs::File>, suffix: &str) ->
         archive
             .by_index(i)
             .ok()
-            .map(|e| e.name().to_ascii_lowercase().ends_with(suffix))
+            .map(|e| {
+                e.name()
+                    .is_ok_and(|n| n.to_ascii_lowercase().ends_with(suffix))
+            })
             .unwrap_or(false)
     })
 }
@@ -937,7 +940,7 @@ BAD|LINE|ONLY_THREE_FIELDS\n";
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("rrf/RXNCONSO.RRF", opts).unwrap();
             zip.write_all(CONSO_RRF.as_bytes()).unwrap();
             zip.start_file("rrf/RXNREL.RRF", opts).unwrap();
