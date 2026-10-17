@@ -700,6 +700,15 @@ impl DashboardCounters {
             .unwrap_or(false)
     }
 
+    /// `marker` is the one the tenant's last applied reconcile stored: storage
+    /// has not changed since its totals were counted, as far as the marker can
+    /// tell. `false` for an unknown tenant and one without a reconciled marker
+    /// (never reconciled with markers, or invalidated since).
+    pub fn matches_reconciled_marker(&self, tenant: &str, marker: StorageMarker) -> bool {
+        self.with_tenant(tenant, |t| t.reconciled_marker == Some(marker))
+            .unwrap_or(false)
+    }
+
     /// Begins a totals reconcile. `marker` is the tenant's storage write
     /// marker read right *before* the count (`None` when the backend has
     /// none); it is checked against the reconciled marker like
@@ -1782,6 +1791,35 @@ mod tests {
         assert!(c.totals_view("t").unwrap().exact);
         seed_ring(&c, "t", "Patient", HOUR, t0());
         assert!(series(&c, "t", HOUR, "Patient", t0()).exact);
+    }
+
+    #[test]
+    fn matches_reconciled_marker_compares_with_the_stored_after_marker() {
+        let c = DashboardCounters::new();
+        assert!(
+            !c.matches_reconciled_marker("t", marker(1)),
+            "unknown tenant"
+        );
+        reconcile(&c, "t", &[("Patient", 3)], None, None, t0());
+        assert!(
+            !c.matches_reconciled_marker("t", marker(1)),
+            "reconciled without a marker"
+        );
+        reconcile(
+            &c,
+            "t",
+            &[("Patient", 3)],
+            Some(marker(1)),
+            Some(marker(2)),
+            t0(),
+        );
+        assert!(c.matches_reconciled_marker("t", marker(2)));
+        assert!(!c.matches_reconciled_marker("t", marker(1)));
+        c.invalidate_tenant("t");
+        assert!(
+            !c.matches_reconciled_marker("t", marker(2)),
+            "a purge forgets the marker"
+        );
     }
 
     #[test]

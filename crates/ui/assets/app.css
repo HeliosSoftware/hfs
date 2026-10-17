@@ -3901,8 +3901,8 @@ tr:hover .result-id__copy,
 @layer pages {
 /* SQL Queries / SQL Views title row (#839): the selected Library's type
    icon and its two chips (type, status) sit inline with its name inside
-   `.page-head__title` — no other page nests an icon or a chip in this
-   heading class, so the flex/gap treatment `.card-head h3` already gives
+   `.page-head__title` (View Definitions reuses it for its icon alone) —
+   no other page nests an icon or a chip in this heading class, so the flex/gap treatment `.card-head h3` already gives
    its own inline icon is scoped here as a modifier instead of changing the
    shared rule every other page's title also uses. */
 .page-head__title--kind {
