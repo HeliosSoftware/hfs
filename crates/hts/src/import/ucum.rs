@@ -203,7 +203,10 @@ fn read_xml_from_zip(path: &Path) -> Result<String, HtsError> {
     let best_index = (0..archive.len())
         .find_map(|i| {
             let entry = archive.by_index(i).ok()?;
-            let name = entry.name().to_ascii_lowercase();
+            let name = entry
+                .name()
+                .map(|n| n.to_ascii_lowercase())
+                .unwrap_or_default();
             if name.ends_with(".xml") && (name.contains("ucum") || name.contains("essence")) {
                 Some(i)
             } else {
