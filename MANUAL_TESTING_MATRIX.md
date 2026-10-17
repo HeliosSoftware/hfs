@@ -66,7 +66,11 @@ non-S3 backends. A SQL Query or SQL View subject is different: each of its
 dependencies is first materialized into an embedded per-request SQLite by this
 runner, and the query's joins and `WHERE` then run in that SQLite, on every
 backend. The per-dependency row cap (`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`)
-applies to that materialization.
+applies to that materialization, after the query's simple top-level `WHERE`
+filters on a dependency (for example `obs.code = '8302-2'` and
+`obs.value > :min_height`) have been pushed into the ViewDefinition; a query
+without such a filter still materializes the dependency in full. This is why
+the T7 SQL Query rows pass on the full corpus with the default cap.
 
 ³ Same expectations as the `s3` row, plus: the tenants named in
 `HFS_S3_TENANT_BUCKETS` appear on `/ui/tenants` and `GET /admin/tenants` after
@@ -1005,7 +1009,7 @@ Click **Create New** again and paste:
   "select": [ { "column": [
       { "name": "id",         "path": "getResourceKey()", "type": "id" },
       { "name": "patient_id", "path": "subject.getReferenceKey(Patient)", "type": "id" },
-      { "name": "code",       "path": "code.coding.first().code" },
+      { "name": "code",       "path": "code.coding.first().code", "type": "code" },
       { "name": "value",      "path": "value.ofType(Quantity).value", "type": "decimal" },
       { "name": "effective",  "path": "effective.ofType(dateTime)", "type": "dateTime" } ] } ] }
 ```
@@ -1091,6 +1095,13 @@ full kind × format grid.
    WHERE obs.code = '8302-2' AND obs.value > :min_height
    GROUP BY fp.id, fp.city
    ```
+
+   `obs.code = '8302-2'` and `obs.value > :min_height` are simple top-level
+   filters, so they are applied while `observation_flat` is read: rows 7.b, 7.d,
+   7.o and 7.p stay under the default
+   `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` on the full corpus.
+   This relies on `observation_flat` declaring `type` on the filtered columns
+   (`code`, `value`): a column without a `type` is never filtered at the source.
 
 4. The live **Results** preview cannot supply parameter values, so it reports an error
    naming the unbound `min_height` parameter — record the exact message; this is

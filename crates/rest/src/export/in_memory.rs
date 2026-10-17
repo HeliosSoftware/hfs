@@ -2671,8 +2671,9 @@ mod tests {
                     message,
                     "query 'tall_female_patients': dependency 'obs' (ViewDefinition \
                      observation_flat) exceeds 10-row limit: SQL queries materialize each \
-                     dependency in full before the query's WHERE runs. Narrow the dependency \
-                     with a ViewDefinition 'where', or raise \
+                     dependency before the query runs, and only simple equality or range \
+                     filters in the query's top-level WHERE are applied at the source. Narrow \
+                     the dependency with a ViewDefinition 'where', or raise \
                      HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
                 );
                 assert!(!message.contains("WHERE/LIMIT"), "{message}");

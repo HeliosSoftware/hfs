@@ -1683,4 +1683,64 @@ mod tests {
             vec![ColumnDecode::Json, ColumnDecode::Json, ColumnDecode::Text]
         );
     }
+    /// The shape `apply_pushdowns` (helios-sof, #1473) adds to a dependency
+    /// view: a `where` against a bound `%__sof_pd_N` constant.
+    fn pushed_down_view() -> serde_json::Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "constant": [
+                {"name": "__sof_pd_0", "valueString": "8302-2"},
+                {"name": "__sof_pd_1", "valueDecimal": 150.5}
+            ],
+            "where": [
+                {"path": "(code.coding.first().code) = %__sof_pd_0"},
+                {"path": "(value.ofType(Quantity).value) > %__sof_pd_1"}
+            ],
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "code", "path": "code.coding.first().code", "type": "code"},
+                {"name": "value", "path": "value.ofType(Quantity).value", "type": "decimal"}
+            ]}]
+        })
+    }
+
+    #[test]
+    fn test_pushed_down_where_with_constants_compiles_for_sql_dialects() {
+        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let query = compile_view_definition_dialect(
+                &pushed_down_view(),
+                dialect,
+                FhirVersion::default_enabled(),
+            )
+            .unwrap_or_else(|e| panic!("{dialect:?}: {e}"));
+            assert_eq!(query.columns.len(), 3, "{dialect:?}");
+            assert!(
+                query
+                    .constants
+                    .iter()
+                    .any(|c| matches!(c, super::super::ir::LitValue::Str(v) if v == "8302-2")),
+                "{dialect:?}: {:?}",
+                query.constants
+            );
+            // The value is bound or inlined as a literal, never spliced from FHIRPath text.
+            assert!(
+                !query.sql.contains("%__sof_pd"),
+                "{dialect:?}: {}",
+                query.sql
+            );
+        }
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_pushed_down_where_with_constants_compiles_for_mongo() {
+        let pipeline =
+            compile_view_definition_mongo(&pushed_down_view(), FhirVersion::default_enabled())
+                .expect("mongo compiles the pushed-down where");
+        assert_eq!(pipeline.columns, vec!["id", "code", "value"]);
+        let text = format!("{:?}", pipeline.pipeline);
+        assert!(text.contains("8302-2"), "{text}");
+    }
 }
