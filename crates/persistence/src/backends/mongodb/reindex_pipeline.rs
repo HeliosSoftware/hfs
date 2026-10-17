@@ -574,6 +574,19 @@ type ResourceRowIds = HashMap<ResourceKey, Vec<Bson>>;
 struct PreviousIds {
     own: ResourceRowIds,
     contained: ResourceRowIds,
+    /// Rows the page's initial deletes removed, across both collections.
+    deleted: u64,
+}
+
+impl PreviousIds {
+    /// The page found nothing to replace: its deletes removed no rows and
+    /// none were left behind. A delete cannot miss rows that were never
+    /// there, so post-insert verification has nothing to protect. This is
+    /// the first build into an empty index, including the deferred rebuild
+    /// after `$bulk-submit`.
+    fn nothing_replaced(&self) -> bool {
+        self.deleted == 0 && self.own.is_empty() && self.contained.is_empty()
+    }
 }
 
 impl InsertedIds {
@@ -840,7 +853,11 @@ async fn delete_page(
     let result = async {
         let own = snapshot_row_ids(&own, &filters, "search index").await?;
         let contained = snapshot_row_ids(&contained, &filters, "search_index_contained").await?;
-        Ok(PreviousIds { own, contained })
+        Ok(PreviousIds {
+            own,
+            contained,
+            deleted: stats.deleted_entries,
+        })
     }
     .await;
     stats.verify += started.elapsed();
@@ -1381,6 +1398,12 @@ async fn verify_clean_page(
     previous: &PreviousIds,
     stats: &mut ReindexPageStats,
 ) -> Result<Vec<ResourceVerificationFailure>, PageFailure> {
+    // Skipping trades away detection of a concurrent update or delete
+    // racing this page, which the job's catch-up rounds handle, as before
+    // verification existed.
+    if previous.nothing_replaced() {
+        return Ok(Vec::new());
+    }
     let done = verify_page(own, contained, resources, page, inserted, previous).await;
     absorb_db_task(stats, &done.stats);
     done.result
@@ -1705,6 +1728,28 @@ mod tests {
         .unwrap();
         mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(concern))
             .into()
+    }
+
+    #[test]
+    fn verification_is_skipped_only_when_the_page_replaced_nothing() {
+        let key = || ("Patient".to_string(), "p1".to_string());
+        let id = || vec![Bson::ObjectId(ObjectId::new())];
+        assert!(PreviousIds::default().nothing_replaced());
+        let deleted = PreviousIds {
+            deleted: 1,
+            ..Default::default()
+        };
+        assert!(!deleted.nothing_replaced());
+        let own_left = PreviousIds {
+            own: HashMap::from([(key(), id())]),
+            ..Default::default()
+        };
+        assert!(!own_left.nothing_replaced());
+        let contained_left = PreviousIds {
+            contained: HashMap::from([(key(), id())]),
+            ..Default::default()
+        };
+        assert!(!contained_left.nothing_replaced());
     }
 
     #[test]
