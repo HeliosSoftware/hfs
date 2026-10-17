@@ -1944,6 +1944,39 @@ async fn new_page_shows_parameter_chips_and_open_values_rows_only_for_parameteri
     assert!(!html.contains(r#"name="param:Library/q2:from" required"#));
 }
 
+#[tokio::test]
+async fn numeric_parameter_fields_preserve_steps_defaults_required_and_native_submission() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with("Library", FhirVersion::R4, vec![
+        library_with_parameters("numeric", "numeric", "sql-query", "active", serde_json::json!([
+            {"name": "amount", "use": "in", "type": "decimal"},
+            {"name": "whole", "use": "in", "type": "integer", "defaultInteger": 30},
+            {"name": "big", "use": "in", "type": "integer64", "defaultInteger64": "9007199254740993"}
+        ]))
+    ]);
+    let response = app(&backend, source)
+        .oneshot(get("/ui/sql/export/new?subject=Library/numeric"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = html::Dom::page(&html);
+    for (name, step, value, required) in [
+        ("amount", "any", "", true),
+        ("whole", "1", "30", false),
+        ("big", "1", "9007199254740993", false),
+    ] {
+        let field = dom.one(&format!("input[name='param:Library/numeric:{name}']"));
+        assert!(field.has_class("field__input--number"));
+        assert_eq!(field.attr("type"), Some("number"));
+        assert_eq!(field.attr("step"), Some(step));
+        assert_eq!(field.attr("value"), Some(value));
+        assert_eq!(field.has_attr("required"), required);
+        assert!(!field.has_attr("form"));
+        assert!(!field.has_attr("disabled"));
+    }
+}
+
 /// #2049: `sql-export-form.js` shows "This value is required." by finding the
 /// field's own `.field__hint--error` span inside its `label.field`, because
 /// the control's `aria-describedby` is rendered only alongside a server-side

@@ -11,6 +11,57 @@ import type { ResourcesPage } from "../pages/resources";
 
 const noChartData = process.env.HFS_E2E_NO_CHART_DATA === "1";
 
+test("issue2080 modal History choices follow the rail and a reopened resource", async ({ page, resources, request }) => {
+  const id = await seedTwoVersions(request, "Patient", { name: [{ family: "ModalThemedOne" }] },
+    () => ({ name: [{ family: "ModalThemedTwo" }] }));
+  const single = await createResource(request, "Patient", { name: [{ family: "ModalThemedSingle" }] });
+  const posts: string[] = [];
+  page.on("request", req => {
+    if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/history/diff") posts.push(req.postData() || "");
+  });
+  try {
+    await waitSearchable(request, "Patient", id);
+    await waitSearchable(request, "Patient", single);
+    await resources.goto("Patient");
+    const builderMode = page.locator("[data-mode-btn=builder]");
+    if (await builderMode.count()) await builderMode.click();
+    await resources.builder.run(`Patient?_id=${id}`);
+    await resources.results.waitDone();
+    await page.locator("#query-results-body a.result-id").first().click();
+    await resources.modal.waitOpen();
+    await resources.modal.showHistory();
+    const history = resources.modal.history;
+    await expect(history.diff).toContainText("ModalThemedTwo");
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    expect(posts).toHaveLength(1);
+    await history.chooseTo("1");
+    await expect(history.diff).not.toContainText("ModalThemedTwo");
+    expect(posts).toHaveLength(2);
+    await history.versions.first().click();
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    await expect(history.diff).toContainText("ModalThemedTwo");
+    expect(posts).toHaveLength(3);
+    await history.toTrigger.click();
+    await history.toTrigger.press("Escape");
+    await expect(history.toTrigger).toHaveAttribute("aria-expanded", "false");
+    await expect(resources.modal.root).toBeVisible();
+    await resources.modal.close();
+
+    await resources.builder.run(`Patient?_id=${single}`);
+    await resources.results.waitDone();
+    await page.locator("#query-results-body a.result-id").first().click();
+    await resources.modal.waitOpen();
+    await resources.modal.showHistory();
+    await expect(history.versions).toHaveCount(1);
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v1");
+    await expect(history.toSelect.locator("option")).toHaveCount(1);
+    expect(posts).toHaveLength(4);
+    await resources.modal.close();
+  } finally { await deleteResources(request, "Patient", [id, single]); }
+});
+
 // The Resources workspace beyond the edit flows: the type rail (filter + live
 // counts), the modal's open/close/tab surface, the delete flow, and the promise
 // that every FHIR resource type is reachable — "test all the resources".
