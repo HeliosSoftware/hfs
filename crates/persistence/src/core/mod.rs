@@ -185,7 +185,7 @@ pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
     ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
-    ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
+    ResourceStorage, TenantRecord, WriteMarker, bucket_floor, restore_cas_miss,
 };
 pub use tenant_discovery::{
     CountBasis, DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,
