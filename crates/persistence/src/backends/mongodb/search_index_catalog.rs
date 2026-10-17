@@ -164,8 +164,9 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
             &["value_identifier_type_system", "value_identifier_type_code"],
         ),
         // Unchanged from generation 1. Both lead with `resource_id`;
-        // `idx_search_composite` is hinted by name in the id-materialisation
-        // path and `idx_search_resource` serves reindex deletes.
+        // `idx_search_composite` is hinted for resource-ID-led membership checks;
+        // eligible later predicates may use value indexes instead.
+        // `idx_search_resource` serves reindex deletes.
         SearchIndexSpec {
             name: SEARCH_COMPOSITE_INDEX,
             keys: doc! {

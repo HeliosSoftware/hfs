@@ -2075,6 +2075,68 @@ fn form_pane_body(doc: &Value, extra: &[(&str, &str)]) -> String {
     serializer.finish()
 }
 
+#[tokio::test]
+async fn editor_choice_selects_keep_their_native_contract_in_both_response_shapes() {
+    for (document, name, arm) in [
+        (
+            serde_json::json!({"resourceType": "Patient"}),
+            "deceased",
+            "deceasedBoolean",
+        ),
+        (
+            serde_json::json!({"resourceType": "RiskAssessment", "status": "final", "subject": {"reference": "Patient/p1"}}),
+            "occurrence",
+            "occurrencePeriod",
+        ),
+        (
+            serde_json::json!({"resourceType": "ViewDefinition", "status": "draft", "resource": "Patient"}),
+            "versionAlgorithm",
+            "versionAlgorithmString",
+        ),
+        (
+            serde_json::json!({"resourceType": "Library", "status": "draft"}),
+            "subject",
+            "subjectReference",
+        ),
+    ] {
+        for pane in ["", "form"] {
+            let response = edit(&form_pane_body(&document, &[("pane", pane)])).await;
+            let dom = Dom::fragment(&response);
+            let selector = format!("select[data-choose=''][data-declarer='{name}']");
+            let select = dom.one(&selector);
+            assert!(select.has_attr("data-combobox-select"));
+            assert!(!select.has_attr("hidden"));
+            assert!(!select.has_attr("disabled"));
+            assert!(
+                select
+                    .attr("aria-label")
+                    .unwrap()
+                    .starts_with(&format!("{name}[x]"))
+            );
+            assert_eq!(select.one("option[value='']").text(), "Pick a type…");
+            assert_eq!(select.one(&format!("option[value='{arm}']")).text(), arm);
+
+            let changed = edit(&form_pane_body(
+                &document,
+                &[
+                    ("pane", pane),
+                    ("op", "choose"),
+                    ("path", ""),
+                    ("name", name),
+                    ("arm", arm),
+                ],
+            ))
+            .await;
+            let dom = Dom::fragment(&changed);
+            let returned: Value =
+                serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+            assert!(returned.get(arm).is_some());
+            assert_eq!(dom.one("#editor-form").attr("data-focus"), Some(arm));
+            assert_eq!(dom.count(&selector), 0);
+        }
+    }
+}
+
 /// Slices out one row's own markup — from its `<div class="editor-row...`
 /// opening tag, found by the unique `data-path="{path}"` attribute every row
 /// carries, up to the next row (or the end of the fragment). `data-path` is
@@ -6862,6 +6924,48 @@ async fn sql_query_page_shows_the_parameters_card_with_form_associated_fields() 
     assert!(html.contains(r#"id="lib-params""#));
     assert!(html.contains(r#"name="param:ward" value="" form="lib-editor-form""#));
     assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="ward:string""#));
+}
+
+#[tokio::test]
+async fn sql_query_numeric_fields_keep_native_steps_values_and_form_association() {
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "numeric", "name": "numeric", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+        "parameter": [
+            {"name": "amount", "use": "in", "type": "decimal", "defaultDecimal": -150.5},
+            {"name": "whole", "use": "in", "type": "integer", "defaultInteger": 30},
+            {"name": "big", "use": "in", "type": "integer64", "defaultInteger64": "9007199254740993"}
+        ]
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=numeric")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = Dom::page(&html);
+    for (name, step, value) in [
+        ("amount", "any", "-150.5"),
+        ("whole", "1", "30"),
+        ("big", "1", "9007199254740993"),
+    ] {
+        let field = dom.one(&format!("input[name='param:{name}']"));
+        assert!(field.has_class("field__input--number"));
+        assert_eq!(field.attr("type"), Some("number"));
+        assert_eq!(field.attr("step"), Some(step));
+        assert_eq!(field.attr("value"), Some(value));
+        assert_eq!(field.attr("form"), Some("lib-editor-form"));
+    }
 }
 
 /// #1276: Create New (`?lib=new`) renders `#lib-params` for a SQL Query too,

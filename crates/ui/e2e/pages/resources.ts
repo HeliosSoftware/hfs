@@ -4,6 +4,7 @@
 import type { Page, Locator } from "@playwright/test";
 import { Editor } from "./editor";
 import { SearchBuilder, SearchResults } from "./search-builder";
+import { chooseFixed, fixedTrigger } from "./fixed-select";
 import { acceptConfirm } from "./fixtures";
 
 /** How long closing the modal may take before an unexpected confirmation is assumed. */
@@ -190,6 +191,10 @@ export class ModalHistory {
   get toSelect(): Locator {
     return this.page.locator("#resource-history-to");
   }
+  get fromTrigger(): Locator { return fixedTrigger(this.fromSelect); }
+  get toTrigger(): Locator { return fixedTrigger(this.toSelect); }
+  async chooseFrom(value: string): Promise<void> { await chooseFixed(this.fromSelect, value); }
+  async chooseTo(value: string): Promise<void> { await chooseFixed(this.toSelect, value); }
   get metadataCheckbox(): Locator {
     return this.page.locator("#resource-history-metadata");
   }
