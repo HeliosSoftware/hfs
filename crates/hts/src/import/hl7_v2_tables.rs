@@ -190,7 +190,7 @@ fn read_xmls_from_zip(path: &Path) -> Result<Vec<(String, String)>, HtsError> {
                 .ok()
                 .map(|e| {
                     e.name()
-                        .is_ok_and(|name| name.to_ascii_lowercase().ends_with(".xml"))
+                        .is_ok_and(|n| n.to_ascii_lowercase().ends_with(".xml"))
                 })
                 .unwrap_or(false)
         })
@@ -202,7 +202,7 @@ fn read_xmls_from_zip(path: &Path) -> Result<Vec<(String, String)>, HtsError> {
             .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry: {e}")))?;
         let name = entry
             .name()
-            .map_err(|e| HtsError::InvalidRequest(format!("ZIP entry name error: {e}")))?
+            .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry name: {e}")))?
             .into_owned();
         let mut buf = String::new();
         entry

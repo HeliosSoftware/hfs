@@ -146,10 +146,7 @@ fn read_xml_bytes(path: &Path) -> Result<Vec<u8>, HtsError> {
                     .by_index(i)
                     .ok()
                     .map(|e| {
-                        let Ok(name) = e.name() else {
-                            return false;
-                        };
-                        let n = name.to_ascii_lowercase();
+                        let n = e.name().map(|n| n.to_ascii_lowercase()).unwrap_or_default();
                         n.ends_with(".xml") && n.contains("tabular")
                     })
                     .unwrap_or(false)

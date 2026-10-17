@@ -187,10 +187,7 @@ fn read_product_txt_from_zip(path: &Path) -> Result<String, HtsError> {
                 .by_index(i)
                 .ok()
                 .map(|e| {
-                    let Ok(name) = e.name() else {
-                        return false;
-                    };
-                    let n = name.to_ascii_lowercase();
+                    let n = e.name().map(|n| n.to_ascii_lowercase()).unwrap_or_default();
                     n == "product.txt" || n.ends_with("/product.txt")
                 })
                 .unwrap_or(false)

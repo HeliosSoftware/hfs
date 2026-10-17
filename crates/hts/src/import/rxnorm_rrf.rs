@@ -278,7 +278,7 @@ fn find_zip_entry(archive: &mut zip::ZipArchive<std::fs::File>, suffix: &str) ->
             .ok()
             .map(|e| {
                 e.name()
-                    .is_ok_and(|name| name.to_ascii_lowercase().ends_with(suffix))
+                    .is_ok_and(|n| n.to_ascii_lowercase().ends_with(suffix))
             })
             .unwrap_or(false)
     })

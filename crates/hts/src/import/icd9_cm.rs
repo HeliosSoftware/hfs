@@ -219,10 +219,10 @@ fn read_zip_contents(path: &Path) -> Result<Icd9ZipContents, HtsError> {
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
-        let Ok(name) = entry.name() else {
-            continue;
-        };
-        let name = name.to_ascii_lowercase();
+        let name = entry
+            .name()
+            .map(|n| n.to_ascii_lowercase())
+            .unwrap_or_default();
         if !name.ends_with(".txt") {
             continue;
         }

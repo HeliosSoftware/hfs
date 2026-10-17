@@ -297,10 +297,7 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         let Ok(entry) = zip.by_index(i) else {
             continue; // skip unreadable entries (zip64, encoding issues, etc.)
         };
-        let Ok(entry_name) = entry.name() else {
-            continue;
-        };
-        let entry_name = entry_name.to_lowercase();
+        let entry_name = entry.name().map(|n| n.to_lowercase()).unwrap_or_default();
         if entry_name.contains("concept_full") || entry_name.contains("description_full") {
             return Some(ImportFormat::SnomedRf2);
         }

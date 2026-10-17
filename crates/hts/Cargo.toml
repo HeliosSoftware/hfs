@@ -62,7 +62,7 @@ flate2 = "1"
 roxmltree = "0.20"
 form_urlencoded = "1"
 tar = "0.4"
-zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -85,7 +85,7 @@ deadpool-postgres = { version = "0.14", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
-zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 ctor = "0.2"
 
