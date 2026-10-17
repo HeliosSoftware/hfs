@@ -29,7 +29,7 @@ chrono = { workspace = true }
 
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking"] }
-zip = "0.6"
+zip = "9"
 serde_json = { workspace = true }
 
 [package.metadata.docs.rs]
