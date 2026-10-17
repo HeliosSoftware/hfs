@@ -4366,7 +4366,7 @@ fn apply_compose_filters(
             if prev.is_empty() {
                 continue;
             }
-            if property == "code" || property.is_empty() {
+            if is_concept_prop(property) || property.is_empty() {
                 prev.retain(|c| regex.is_match(&c.code));
             } else {
                 let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
@@ -4966,8 +4966,8 @@ fn compile_vs_regex(pattern: &str) -> Result<Regex, HtsError> {
 }
 
 /// Evaluate a `regex` compose filter — returns concepts in `system_id` whose
-/// `code` (when `property == "code"`) or whose `concept_properties` value for
-/// `property` fully matches `pattern`.
+/// code (when `property` is `code` or `concept`) or whose `concept_properties`
+/// value for `property` fully matches `pattern`.
 ///
 /// The match is performed in Rust after the candidate rows have been loaded.
 /// For property-value regex we narrow at the SQL level to rows that even have
@@ -4981,7 +4981,7 @@ fn query_regex_match(
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let regex = compile_vs_regex(pattern)?;
 
-    if property == "code" || property.is_empty() {
+    if is_concept_prop(property) || property.is_empty() {
         // Match against the concept code itself.  Load all concepts for the
         // system and filter in Rust — there is no cheap SQL primitive for an
         // arbitrary regex, and concept counts in tx-ecosystem fixtures are
@@ -5368,7 +5368,7 @@ fn apply_compose_filters_to_candidates(
             }
             (_, "regex") => {
                 let regex = compile_vs_regex(value)?;
-                if property == "code" || property.is_empty() {
+                if is_concept_prop(property) || property.is_empty() {
                     candidates.retain(|c| regex.is_match(&c.code));
                 } else {
                     let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
@@ -11491,6 +11491,107 @@ mod tests {
             vec!["code1", "code2aI", "code2b", "code3"],
             "regex on property selects all concepts with prop value matching pattern"
         );
+    }
+
+    /// #2115: `property: "concept"` names the concept identifier just like
+    /// `code` (VCL emits it for `concept/"re"`).  A regex on it must match
+    /// codes on every path: with no earlier candidate set (full scan), after
+    /// an `is-a` filter has built a candidate set, and on the FTS-first path
+    /// taken when a text filter accompanies the compose filters.
+    #[tokio::test]
+    async fn expand_inline_regex_filter_on_concept_property() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-concept-regex",
+              "url": "http://example.org/cs-concept-regex",
+              "status": "active", "content": "complete",
+              "concept": [
+                { "code": "body", "display": "Body",
+                  "concept": [
+                    { "code": "head", "display": "Head" },
+                    { "code": "limb", "display": "Limb",
+                      "concept": [
+                        { "code": "arm", "display": "Arm" },
+                        { "code": "leg", "display": "Leg" }
+                      ]
+                    }
+                  ]
+                },
+                { "code": "lung", "display": "Lung" }
+              ]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        async fn expand(
+            b: &SqliteTerminologyBackend,
+            filters: serde_json::Value,
+            text: Option<&str>,
+        ) -> Vec<String> {
+            let inline_vs = serde_json::json!({
+                "resourceType": "ValueSet",
+                "compose": { "include": [{
+                    "system": "http://example.org/cs-concept-regex",
+                    "filter": filters
+                }]}
+            });
+            let resp = b
+                .expand(
+                    &ctx(),
+                    ExpandRequest {
+                        value_set: Some(inline_vs),
+                        filter: text.map(str::to_string),
+                        count: Some(50),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut codes: Vec<String> = resp.contains.into_iter().map(|c| c.code).collect();
+            codes.sort();
+            codes
+        }
+
+        // No prior candidate set: full scan of the system.
+        for property in ["concept", "code"] {
+            let codes = expand(
+                &b,
+                serde_json::json!([{ "property": property, "op": "regex", "value": "l.*" }]),
+                None,
+            )
+            .await;
+            assert_eq!(codes, ["leg", "limb", "lung"], "property={property}");
+        }
+
+        // Prior candidate set from `is-a`: regex narrows it in place.
+        for property in ["concept", "code"] {
+            let codes = expand(
+                &b,
+                serde_json::json!([
+                    { "property": "concept", "op": "is-a", "value": "limb" },
+                    { "property": property, "op": "regex", "value": "l.*" }
+                ]),
+                None,
+            )
+            .await;
+            assert_eq!(codes, ["leg", "limb"], "property={property}");
+        }
+
+        // Text filter → FTS-first candidates → compose filters in Rust.
+        for property in ["concept", "code"] {
+            let codes = expand(
+                &b,
+                serde_json::json!([{ "property": property, "op": "regex", "value": "l.*" }]),
+                Some("lung"),
+            )
+            .await;
+            assert_eq!(codes, ["lung"], "property={property}");
+        }
     }
 
     /// Regex `(a+)+` on the regex-bad code system: only the pure `aaaa…` code
