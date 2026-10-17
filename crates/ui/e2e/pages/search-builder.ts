@@ -115,6 +115,9 @@ export class SearchResults {
   get meta(): Locator {
     return this.page.locator("#query-results-meta");
   }
+  get previous(): Locator {
+    return this.page.locator("#query-results-previous");
+  }
   get rows(): Locator {
     return this.page.locator("#query-results-body tr");
   }
