@@ -4987,7 +4987,7 @@ struct LibParamsCard {
 /// [`sql_libraries::TableTarget`] classification (#842/04) — `None` only
 /// for `TableTarget::NotFound`, since nothing was ever fetched. *Reads
 /// from* only needs the classification; the Columns card's own origin
-/// lookup ([`resolve_view_definition_dependencies`]) is what needs the
+/// lookup ([`resolve_column_sources`]) is what needs a ViewDefinition's
 /// document itself, to read its `select[].column[]` list.
 async fn resolve_table_reference(
     state: &WebState,
@@ -5040,10 +5040,82 @@ async fn resolve_table_reference(
                     let target = sql_libraries::classify_table_artifact("Library", lib);
                     (target, Some(lib.clone()))
                 }
-                None => (TableTarget::NotFound, None),
+                None => match resolve_terminology_reference(state, reference).await {
+                    Some((target, artifact)) => (target, Some(artifact)),
+                    None => (TableTarget::NotFound, None),
+                },
             }
         }
     }
+}
+
+/// Resolves a canonical `reference` that names no stored ViewDefinition or
+/// Library on the terminology server (`HFS_TERMINOLOGY_SERVER`), mirroring
+/// `crates/rest/.../sof/terminology.rs`'s own `fetch_relation` (#1824): first
+/// as a value set to expand (`POST ValueSet/$expand`, `count=0` — only
+/// whether it expands matters here, never its rows), then as a concept map
+/// (`GET ConceptMap?url=[&version=]`). `None` when no terminology server is
+/// configured, it knows neither, or it cannot be reached within the same
+/// 2500ms budget the editor's own `$expand` picker uses — the row then shows
+/// as not found, which is what `$sql-run` would report too.
+async fn resolve_terminology_reference(
+    state: &WebState,
+    reference: &str,
+) -> Option<(sql_libraries::TableTarget, serde_json::Value)> {
+    use helios_sof::sqlquery::TerminologyKind;
+    let base = state.terminology.as_deref()?.trim_end_matches('/');
+    let client = editor::terminology_client();
+    let timeout = std::time::Duration::from_millis(2500);
+
+    let expand = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": reference},
+            {"name": "count", "valueInteger": 0}
+        ]
+    });
+    if let Ok(response) = client
+        .post(format!("{base}/ValueSet/$expand"))
+        .header("Content-Type", "application/fhir+json")
+        .header("Accept", "application/fhir+json")
+        .json(&expand)
+        .timeout(timeout)
+        .send()
+        .await
+        && response.status().is_success()
+        && let Ok(value_set) = response.json::<serde_json::Value>().await
+        && value_set.get("resourceType").and_then(|t| t.as_str()) == Some("ValueSet")
+    {
+        let target = sql_libraries::classify_terminology_artifact(
+            TerminologyKind::ValueSet,
+            &value_set,
+            reference,
+        );
+        return Some((target, value_set));
+    }
+
+    let (canonical, version) = sql_libraries::split_canonical_version(reference);
+    let mut query = vec![("url", canonical)];
+    if let Some(version) = version {
+        query.push(("version", version));
+    }
+    let response = client
+        .get(format!("{base}/ConceptMap"))
+        .query(&query)
+        .header("Accept", "application/fhir+json")
+        .timeout(timeout)
+        .send()
+        .await
+        .ok()
+        .filter(|response| response.status().is_success())?;
+    let bundle = response.json::<serde_json::Value>().await.ok()?;
+    let concept_map = sql_libraries::concept_map_in_bundle(&bundle, reference)?.clone();
+    let target = sql_libraries::classify_terminology_artifact(
+        TerminologyKind::ConceptMap,
+        &concept_map,
+        reference,
+    );
+    Some((target, concept_map))
 }
 
 /// Resolves every dependency in `deps` via [`resolve_table_reference`],
@@ -5052,8 +5124,8 @@ async fn resolve_table_reference(
 /// once per render (#842's own "no redundant requests"). Returns each
 /// dependency's own [`sql_libraries::TableRow`] paired with the resolved
 /// artifact's raw JSON (#842/04) — *Reads from*'s own render only needs the
-/// former; [`resolve_view_definition_dependencies`] filters the latter down
-/// to the ViewDefinitions the Columns card needs.
+/// former; [`resolve_column_sources`] turns the pair into the table schemas
+/// the Columns card needs.
 async fn resolve_table_rows(
     state: &WebState,
     version: helios_fhir::FhirVersion,
@@ -5088,13 +5160,13 @@ async fn resolve_table_rows(
     rows
 }
 
-/// Resolves every dependency in `deps` down to the ViewDefinitions among
-/// them — the Columns card's own origin lookup (#842/04): `(label,
-/// resolved document)` for each dependency [`resolve_table_rows`] resolved
-/// to a `TableTarget::ViewDefinition`, in declaration order. A dependency
-/// that fails to resolve, or resolves to a SQL View or anything else, is
-/// simply absent — SQL Views never contribute a column origin (#842's own
-/// "out of scope" rule).
+/// Resolves every dependency in `deps` down to the table schemas the
+/// Columns card's own origin lookup reads (#842/04): `(label, schema)` for
+/// each dependency [`resolve_table_rows`] resolved to a ViewDefinition, a
+/// ValueSet or a ConceptMap (#1824), in declaration order
+/// ([`sql_libraries::column_sources`]). A dependency that fails to resolve,
+/// or resolves to a SQL View or anything else, is simply absent — SQL Views
+/// never contribute a column origin (#842's own "out of scope" rule).
 ///
 /// Only ever called after a successful `$sql-run` (#842/04's own NF1): this
 /// performs the identical fetch [`resolve_table_rows`] does for the Tables
@@ -5102,23 +5174,14 @@ async fn resolve_table_rows(
 /// ran at all — a good run's own dependency resolution "happens once per
 /// dependency", not once per keystroke that leaves the run unable to
 /// happen.
-async fn resolve_view_definition_dependencies(
+async fn resolve_column_sources(
     state: &WebState,
     version: helios_fhir::FhirVersion,
     tenant: &str,
     deps: &[sql_libraries::TableDependency],
     libraries: &[serde_json::Value],
-) -> Vec<(String, serde_json::Value)> {
-    resolve_table_rows(state, version, tenant, deps, libraries)
-        .await
-        .into_iter()
-        .filter_map(|(row, doc)| match (row.target, doc) {
-            (sql_libraries::TableTarget::ViewDefinition { .. }, Some(doc)) => {
-                Some((row.label, doc))
-            }
-            _ => None,
-        })
-        .collect()
+) -> Vec<(String, helios_sof::sqlquery::TableSchema)> {
+    sql_libraries::column_sources(resolve_table_rows(state, version, tenant, deps, libraries).await)
 }
 
 /// [`analyze_tables`]'s pure result: everything the Tables panel needs from
@@ -5279,6 +5342,19 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> Ta
                 &format!("/ui/sql/views?lib={id}"),
                 Some(origin),
             )),
+            link_label: Some(name),
+            detail: None,
+        },
+        sql_libraries::TableTarget::Terminology { kind, name } => TableRowView {
+            label: row.label,
+            chip: i18n.t(match kind {
+                helios_sof::sqlquery::TerminologyKind::ValueSet => "lib-tables-kind-value-set",
+                helios_sof::sqlquery::TerminologyKind::ConceptMap => "lib-tables-kind-concept-map",
+            }),
+            chip_class: "type",
+            // The artifact lives on the terminology server, which has no
+            // page of its own on this UI to link to.
+            link_href: None,
             link_label: Some(name),
             detail: None,
         },
@@ -6282,7 +6358,7 @@ async fn sql_library_page(
             match run_sql_preview(&state, lib, bindings, rv.0, &rt.id).await {
                 Ok((table, raw_rows, ms)) => {
                     // #842/04's own NF1: the Columns card's origin lookup
-                    // resolves dependencies to ViewDefinitions only after a
+                    // resolves dependencies to table schemas only after a
                     // run has actually succeeded — and only the ones the
                     // SQL actually reads (`dependencies_used_by_sql`), so a
                     // stale, no-longer-queried label never manufactures a
@@ -6292,15 +6368,10 @@ async fn sql_library_page(
                         .map(|s| s.sql.as_str())
                         .unwrap_or_default();
                     let used_deps = sql_libraries::dependencies_used_by_sql(run_sql, &deps);
-                    let view_definitions = resolve_view_definition_dependencies(
-                        &state, rv.0, &rt.id, &used_deps, &libraries,
-                    )
-                    .await;
-                    let columns = sql_libraries::analyze_columns(
-                        &table.columns,
-                        &raw_rows,
-                        &view_definitions,
-                    );
+                    let sources =
+                        resolve_column_sources(&state, rv.0, &rt.id, &used_deps, &libraries).await;
+                    let columns =
+                        sql_libraries::analyze_columns(&table.columns, &raw_rows, &sources);
                     (
                         standard_notice(RunResultsState::Success(table, ms)),
                         columns,
@@ -6963,9 +7034,9 @@ struct LibRunFragment {
 ///
 /// Builds the `/run` fragment's own Columns update for a *successful* run
 /// (#842/04, NF1): fetches the tenant's Library list, resolves whichever of
-/// `deps` the SQL actually reads down to their ViewDefinitions
+/// `deps` the SQL actually reads down to their table schemas
 /// (`sql_libraries::dependencies_used_by_sql`,
-/// [`resolve_view_definition_dependencies`]), and analyzes `table`/
+/// [`resolve_column_sources`]), and analyzes `table`/
 /// `raw_rows` against them ([`sql_libraries::analyze_columns`]). A SQL
 /// Query and a SQL View share this identical "good run" shape, differing
 /// only in whether declared parameters were involved getting here — called
@@ -6985,9 +7056,8 @@ async fn columns_fragment_for_success(
     libraries: &[serde_json::Value],
 ) -> ColumnsFragment {
     let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
-    let view_definitions =
-        resolve_view_definition_dependencies(state, version, tenant, &used_deps, libraries).await;
-    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &view_definitions);
+    let sources = resolve_column_sources(state, version, tenant, &used_deps, libraries).await;
+    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &sources);
     ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
 }
 

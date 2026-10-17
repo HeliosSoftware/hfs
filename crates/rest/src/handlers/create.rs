@@ -67,7 +67,7 @@ pub async fn create_handler<S>(
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
@@ -133,6 +133,16 @@ where
     // #1014: an unknown ViewDefinition.resource is rejected on every write.
     super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
 
+    // #1824: a SQLQuery/SQLView Library's ValueSet/ConceptMap dependencies
+    // are expanded by the terminology server before anything is stored.
+    let terminology = super::sof::terminology::prepare_library_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        &resource,
+    )
+    .await?;
+
     // Check for conditional create
     if let Some(search_params) = conditional.if_none_exist() {
         super::conditional_support::require_create(state.storage())?;
@@ -152,6 +162,13 @@ where
         use helios_persistence::core::ConditionalCreateResult;
         return match result {
             ConditionalCreateResult::Created(stored) => {
+                super::sof::terminology::commit_library_write(
+                    &state,
+                    tenant.context(),
+                    stored.id(),
+                    terminology,
+                )
+                .await;
                 // Counted, but conditional writes announce nothing.
                 super::write_event::report(
                     &state,
@@ -240,6 +257,13 @@ where
         .storage()
         .create(tenant.context(), &resource_type, resource, fhir_version)
         .await?;
+    super::sof::terminology::commit_library_write(
+        &state,
+        tenant.context(),
+        stored.id(),
+        terminology,
+    )
+    .await;
     super::write_event::report(
         &state,
         tenant.context(),
