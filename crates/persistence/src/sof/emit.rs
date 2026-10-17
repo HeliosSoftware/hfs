@@ -370,28 +370,12 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     // Iterate `extra_unnests` in reverse since we collected from outermost
     // (closest to Project) downward.
     for layer in extra_unnests.iter().rev() {
-        if let PlanNode::LateralUnnest {
-            source,
-            out_alias: alias,
-            left_join,
-            on_filter,
-            flat_index,
-            ..
-        } = layer
-        {
+        if let PlanNode::LateralUnnest { .. } = layer {
             // Rendered through the shared unnest renderer so PostgreSQL keeps
             // `WITH ORDINALITY` (needed by `%rowIndex`) over a repeat.
             let mut scratch = Frame::new();
             scratch.next_param = frame.next_param;
-            push_lateral_unnest(
-                source,
-                alias,
-                left_join,
-                on_filter,
-                flat_index,
-                dialect,
-                &mut scratch,
-            )?;
+            push_lateral_unnest(layer, dialect, &mut scratch)?;
             frame.next_param = scratch.next_param;
             for join in scratch.joins {
                 from_clause.push('\n');
@@ -408,7 +392,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         "rid, node".to_string()
     };
     let sql = format!(
-        "WITH RECURSIVE {out_alias}({cte_cols}) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}\nORDER BY 1",
+        "WITH RECURSIVE {out_alias}({cte_cols}) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}",
         select_parts.join(",\n  ")
     );
 
@@ -751,25 +735,10 @@ fn render_step_join(
 ) -> Result<String, SofError> {
     let step = &steps[i];
     match step.node {
-        PlanNode::LateralUnnest {
-            source,
-            out_alias,
-            left_join,
-            on_filter,
-            flat_index,
-            ..
-        } => {
+        PlanNode::LateralUnnest { .. } => {
             let mut scratch = Frame::new();
             scratch.next_param = *next_param;
-            push_lateral_unnest(
-                source,
-                out_alias,
-                left_join,
-                on_filter,
-                flat_index,
-                dialect,
-                &mut scratch,
-            )?;
+            push_lateral_unnest(step.node, dialect, &mut scratch)?;
             *next_param = scratch.next_param;
             scratch
                 .joins
@@ -1009,7 +978,7 @@ fn emit_recurse_general(
     }
 
     let sql = format!(
-        "WITH RECURSIVE {}\nSELECT\n  {}\nFROM {from_clause}\nWHERE {}\nORDER BY 1",
+        "WITH RECURSIVE {}\nSELECT\n  {}\nFROM {from_clause}\nWHERE {}",
         ctes.join(",\n"),
         select_parts.join(",\n  "),
         where_parts.join("\n  AND "),
@@ -1028,6 +997,7 @@ fn emit_recurse_general(
 fn column_refers_to_resource(expr: &SqlExpr) -> bool {
     match expr {
         SqlExpr::JsonPath { root, .. } => root == "r.data" || root.starts_with("r.data"),
+        SqlExpr::ColRef(name) => name == super::compile_path::RESOURCE_ID_COLUMN,
         SqlExpr::Cast { inner, .. }
         | SqlExpr::UnaryOp { inner, .. }
         | SqlExpr::AsJson(inner)
@@ -1061,8 +1031,9 @@ fn column_refers_to_resource(expr: &SqlExpr) -> bool {
 }
 
 /// Emit a `UNION ALL` query — each branch is emitted as a standalone SELECT,
-/// trailing `ORDER BY` is stripped from each, and a single `ORDER BY 1` is
-/// appended at the end of the compound query.
+/// and trailing `ORDER BY` is stripped from each. The compound query is left
+/// unordered: row order is not part of the SoF contract, and a sort would hold
+/// back every row until the whole result is built.
 fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql, SofError> {
     if branches.is_empty() {
         return Err(SofError::InvalidViewDefinition(
@@ -1117,7 +1088,7 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
         }
     }
 
-    let sql = format!("{}\nORDER BY 1", branch_sqls.join("\nUNION ALL\n"));
+    let sql = branch_sqls.join("\nUNION ALL\n");
     Ok(EmittedSql {
         sql,
         columns: columns.unwrap_or_default(),
@@ -1200,14 +1171,12 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
             source,
             out_alias,
             left_join,
-            on_filter,
             flat_index,
+            ..
         } => {
             walk_body(parent, dialect, frame)?;
             let joins_before = frame.joins.len();
-            push_lateral_unnest(
-                source, out_alias, left_join, on_filter, flat_index, dialect, frame,
-            )?;
+            push_lateral_unnest(node, dialect, frame)?;
             // A plain `forEach` below an EMPTY `forEachOrNull` keeps the null
             // row: LEFT-join it and accept "no match" only when the ancestor
             // missed (a present ancestor with no match still drops the row).
@@ -1247,14 +1216,22 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
 /// Renders one `LateralUnnest` as a FROM-clause join and pushes it onto
 /// `frame.joins`. Shared by [`walk_body`] and the recursive-CTE emitter.
 fn push_lateral_unnest(
-    source: &SqlExpr,
-    out_alias: &String,
-    left_join: &bool,
-    on_filter: &Option<SqlExpr>,
-    flat_index: &Option<i64>,
+    unnest: &PlanNode,
     dialect: &dyn Dialect,
     frame: &mut Frame,
 ) -> Result<(), SofError> {
+    let PlanNode::LateralUnnest {
+        source,
+        out_alias,
+        left_join,
+        on_filter,
+        flat_index,
+        array_source,
+        ..
+    } = unnest
+    else {
+        unreachable!("push_lateral_unnest called with a non-LateralUnnest node");
+    };
     let join_kw = if *left_join { "LEFT JOIN" } else { "JOIN" };
     let lateral = dialect.lateral_keyword();
     // Lower the optional ON-clause filter (used by `forEach` paths
@@ -1271,7 +1248,16 @@ fn push_lateral_unnest(
         // SQLite — `json_each(<root>, '$.path')` two-arg form when the
         // source is a simple JSON path off the resource document;
         // falls back to `json_each(<sql_expr>)` for anything richer.
-        let source_sql = emit_sqlite_unnest_source(source)?;
+        let array_sql = match source {
+            SqlExpr::JsonPath { root, path } if *array_source => {
+                sqlite_array_unnest_source(root, path)
+            }
+            _ => None,
+        };
+        let source_sql = match array_sql {
+            Some(sql) => sql,
+            None => emit_sqlite_unnest_source(source)?,
+        };
         let on = match &extra_on {
             Some(f) => format!("1=1 AND {f}"),
             None => "1=1".to_string(),
@@ -2249,6 +2235,20 @@ fn emit_where_exists_unnest(
     Ok(format!("FROM {}", one(focus, iter_alias)?))
 }
 
+/// Two-argument `json_each(<root>, '$.field')` over a field the schema says is
+/// an array: iterates the stored array in place, without extracting it as
+/// text and re-parsing it as the guarded form does. `None` for anything but a
+/// single field step.
+fn sqlite_array_unnest_source(root: &str, path: &JsonPath) -> Option<String> {
+    let [PathStep::Field(name)] = path.0.as_slice() else {
+        return None;
+    };
+    Some(format!(
+        "json_each({root}, {})",
+        sqlite_json_path_literal(&[name.as_str()])
+    ))
+}
+
 /// Emits the SQLite `json_each(...)` source clause for a lateral unnest.
 ///
 /// Paths wrap with a type guard: arrays iterate; non-array singletons (FHIR
@@ -2534,17 +2534,16 @@ fn lower_boundary(
     }
 }
 
-/// Strips a trailing `ORDER BY …` clause (case-insensitive). Used when
+/// Strips a trailing `ORDER BY …` line (case-insensitive). Used when
 /// assembling UNION ALL branches — `ORDER BY` inside an individual compound
-/// SELECT term is not portable.
+/// SELECT term is not portable. Only a final line counts: recursive branches
+/// end without one and carry `ORDER BY` inside window functions and
+/// subqueries, which must stay.
 fn strip_trailing_order_by(sql: &str) -> &str {
     let upper = sql.to_ascii_uppercase();
-    if let Some(pos) = upper.rfind("\nORDER BY") {
-        &sql[..pos]
-    } else if let Some(pos) = upper.rfind(" ORDER BY") {
-        &sql[..pos]
-    } else {
-        sql
+    match upper.rfind("\nORDER BY") {
+        Some(pos) if !sql[pos + 1..].contains('\n') => &sql[..pos],
+        _ => sql,
     }
 }
 
@@ -2672,6 +2671,7 @@ mod tests {
             left_join: false,
             on_filter: None,
             flat_index: None,
+            array_source: false,
         }
     }
 
@@ -2913,6 +2913,7 @@ mod tests {
                 left_join: false,
                 on_filter: None,
                 flat_index: None,
+                array_source: false,
             },
             SqlExpr::RowIndex(RowIndexScope::ForEach("fe".into())),
         );
@@ -2940,6 +2941,7 @@ mod tests {
                 left_join,
                 on_filter: None,
                 flat_index: None,
+                array_source: false,
             };
         }
         let plan = project(parent, json_path("a_inner.value", vec![]));
@@ -2977,6 +2979,7 @@ mod tests {
             left_join: false,
             on_filter: None,
             flat_index: Some(0),
+            array_source: false,
         };
         let plan = project(
             PlanNode::LateralUnnest {
@@ -2986,6 +2989,7 @@ mod tests {
                 left_join: false,
                 on_filter: None,
                 flat_index: None,
+                array_source: false,
             },
             json_path("picked.value", vec![]),
         );
@@ -3288,6 +3292,7 @@ mod tests {
                             lit(value),
                         )),
                         flat_index: None,
+                        array_source: false,
                     },
                     json_path("fe.value", vec![field("family")]),
                 ),

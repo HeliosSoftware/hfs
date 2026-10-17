@@ -185,6 +185,7 @@ fn lower_source(
             left_join,
             on_filter,
             flat_index,
+            ..
         } => {
             lower_source(parent, pipeline, constants)?;
             let ctx = Ctx::root(constants);
@@ -655,6 +656,15 @@ fn lower_expr(expr: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
     match expr {
         SqlExpr::Lit(v) => Ok(literal_expr(v)),
         SqlExpr::JsonPath { root, path } => lower_json_path(root, path, ctx),
+        // `getResourceKey()` on the resource: the SQL `id` column is the
+        // document's `id`.
+        SqlExpr::ColRef(name) if name == super::compile_path::RESOURCE_ID_COLUMN => {
+            lower_json_path(
+                "r.data",
+                &JsonPath(vec![PathStep::Field("id".to_string())]),
+                ctx,
+            )
+        }
         SqlExpr::RowIndex(scope) => match scope {
             // Top level / non-iterating scopes are always 0. Must be wrapped in
             // `$literal` — a bare `0` in `$project` means "exclude this field".
@@ -1492,6 +1502,7 @@ mod tests {
             left_join: false,
             on_filter: None,
             flat_index: None,
+            array_source: false,
         }
     }
 

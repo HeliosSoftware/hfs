@@ -1,8 +1,8 @@
 SELECT
   fe2.value AS "given"
 FROM resources r
-JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name') WHEN json_type(r.data, '$.name') IN ('object', 'array') THEN json_array(json(json_extract(r.data, '$.name'))) WHEN json_type(r.data, '$.name') IS NOT NULL THEN json_array(json_extract(r.data, '$.name')) ELSE '[]' END) fe ON 1=1
-JOIN json_each(CASE WHEN json_type(fe.value, '$.given') = 'array' THEN json_extract(fe.value, '$.given') WHEN json_type(fe.value, '$.given') IN ('object', 'array') THEN json_array(json(json_extract(fe.value, '$.given'))) WHEN json_type(fe.value, '$.given') IS NOT NULL THEN json_array(json_extract(fe.value, '$.given')) ELSE '[]' END) fe2 ON 1=1
+JOIN json_each(r.data, '$.name') fe ON 1=1
+JOIN json_each(fe.value, '$.given') fe2 ON 1=1
 WHERE r.tenant_id = ?1
   AND r.resource_type = ?2
   AND r.is_deleted = 0
