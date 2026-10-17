@@ -3599,7 +3599,9 @@ for (const workspace of ["Resources", "Search"] as const) {
         component: [{ ...systolic, code: { ...systolic.code, text: "Systolic reading" } }],
         effectivePeriod: { start: "2026-10-15T09:00:00Z", end: "2026-10-15T09:01:00Z" },
         expected: "Systolic reading",
-        period: '{"start":"2026-10-15T09:00:00Z","end":"2026-10-15T09:01:00Z"…',
+        // Postgres JSONB returns object keys shortest-first, so the
+        // backend decides whether start or end comes first.
+        period: /^\{("start":"2026-10-15T09:00:00Z","end":"2026-10-15T09:01:00Z"|"end":"2026-10-15T09:01:00Z","start":"2026-10-15T09:00:00Z")…$/,
       },
       {
         component: [{ ...systolic, code: { coding: [{ system: "http://loinc.org", code: "8480-6" }] } }],
