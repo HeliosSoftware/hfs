@@ -1,6 +1,6 @@
 //! SQLite implementation of the [`SofTerminologyStore`] (#1824).
 //!
-//! Two bookkeeping tables, created by the v40 migration:
+//! Two bookkeeping tables, created by the v41 migration:
 //!
 //! - `sof_terminology_tables`: one row per (tenant, canonical) relation, whose
 //!   rowid names the physical table holding its rows (`sof_term_<id>`).
@@ -33,7 +33,7 @@ fn physical_table(id: i64) -> String {
     format!("sof_term_{id}")
 }
 
-/// Creates the bookkeeping tables. The body of the v39 -> v40 migration.
+/// Creates the bookkeeping tables. The body of the v40 -> v41 migration.
 pub(crate) fn create_bookkeeping_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sof_terminology_tables (
