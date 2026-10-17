@@ -759,6 +759,20 @@ pub(crate) struct ReconcileReport {
     pub(crate) rings_seeded: usize,
 }
 
+impl ReconcileReport {
+    /// Whether the pass ran a totals or history query against storage —
+    /// including one that failed — rather than only reading the counters.
+    /// Those are the multi-second aggregates on a large database, and the
+    /// heap they free is what the loop hands back to the OS afterwards
+    /// (#2106).
+    pub(crate) fn read_storage(&self) -> bool {
+        !self.seeded.is_empty()
+            || !self.seed_failed.is_empty()
+            || !self.reconciled.is_empty()
+            || self.rings_seeded > 0
+    }
+}
+
 /// The reconcile loop's own per-tenant bookkeeping: when each tenant's totals
 /// may next be re-read (see [`RECONCILE_DUTY_FACTOR`]), which write-marker
 /// bound its markers were read with, and which tenants the budget left for
@@ -2332,7 +2346,8 @@ async fn run_reconcile_loop<S>(
             return;
         }
         Some(provider) => {
-            provider.seed_default_tenant(&mut schedule).await;
+            let report = provider.seed_default_tenant(&mut schedule).await;
+            release_memory_after(&report);
         }
         None => return,
     }
@@ -2350,12 +2365,26 @@ async fn run_reconcile_loop<S>(
             debug!("dashboard reconcile: provider no longer registered; stopping");
             return;
         };
-        if woken {
-            provider.drain_pending_seeds(&mut schedule).await;
+        let report = if woken {
+            provider.drain_pending_seeds(&mut schedule).await
         } else {
-            provider.reconcile_pass(&mut schedule).await;
+            let report = provider.reconcile_pass(&mut schedule).await;
             next_pass = tokio::time::Instant::now() + interval;
-        }
+            report
+        };
+        release_memory_after(&report);
+    }
+}
+
+/// Returns the heap a pass's storage queries freed to the OS (#2106). On a
+/// large SQLite database the totals and history aggregates run for seconds
+/// on Tokio's blocking pool, and each pooled connection can grow a 64 MiB
+/// page cache. glibc keeps what they free in per-thread arenas, so without a
+/// trim a process that only serves the dashboard climbed to its 12 GB limit.
+/// A pass that read nothing from storage skips the trim.
+fn release_memory_after(report: &ReconcileReport) {
+    if report.read_storage() {
+        crate::memory_trim::release_free_memory();
     }
 }
 
@@ -2574,6 +2603,43 @@ mod tests {
 
     fn schedule() -> ReconcileSchedule {
         ReconcileSchedule::new(StdDuration::from_secs(30))
+    }
+
+    #[test]
+    fn only_a_pass_that_queried_storage_asks_for_a_trim() {
+        let quiet = ReconcileReport {
+            not_due: vec!["default".to_string()],
+            skipped_active_import: vec!["a".to_string()],
+            seed_deferred: vec!["b".to_string()],
+            budget_skipped: vec!["c".to_string()],
+            dropped: vec!["d".to_string()],
+            job_counts_refreshed: vec!["e".to_string()],
+            ..ReconcileReport::default()
+        };
+        assert!(!ReconcileReport::default().read_storage());
+        assert!(!quiet.read_storage());
+
+        let queried = [
+            ReconcileReport {
+                seeded: vec!["default".to_string()],
+                ..ReconcileReport::default()
+            },
+            ReconcileReport {
+                seed_failed: vec!["default".to_string()],
+                ..ReconcileReport::default()
+            },
+            ReconcileReport {
+                reconciled: vec!["default".to_string()],
+                ..ReconcileReport::default()
+            },
+            ReconcileReport {
+                rings_seeded: 1,
+                ..ReconcileReport::default()
+            },
+        ];
+        for report in queried {
+            assert!(report.read_storage(), "{report:?}");
+        }
     }
 
     /// The tenants waiting for a background seed, sorted.
