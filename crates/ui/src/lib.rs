@@ -4987,7 +4987,7 @@ struct LibParamsCard {
 /// [`sql_libraries::TableTarget`] classification (#842/04) — `None` only
 /// for `TableTarget::NotFound`, since nothing was ever fetched. *Reads
 /// from* only needs the classification; the Columns card's own origin
-/// lookup ([`resolve_view_definition_dependencies`]) is what needs the
+/// lookup ([`resolve_column_sources`]) is what needs a ViewDefinition's
 /// document itself, to read its `select[].column[]` list.
 async fn resolve_table_reference(
     state: &WebState,
@@ -5124,8 +5124,8 @@ async fn resolve_terminology_reference(
 /// once per render (#842's own "no redundant requests"). Returns each
 /// dependency's own [`sql_libraries::TableRow`] paired with the resolved
 /// artifact's raw JSON (#842/04) — *Reads from*'s own render only needs the
-/// former; [`resolve_view_definition_dependencies`] filters the latter down
-/// to the ViewDefinitions the Columns card needs.
+/// former; [`resolve_column_sources`] turns the pair into the table schemas
+/// the Columns card needs.
 async fn resolve_table_rows(
     state: &WebState,
     version: helios_fhir::FhirVersion,
@@ -5160,13 +5160,13 @@ async fn resolve_table_rows(
     rows
 }
 
-/// Resolves every dependency in `deps` down to the ViewDefinitions among
-/// them — the Columns card's own origin lookup (#842/04): `(label,
-/// resolved document)` for each dependency [`resolve_table_rows`] resolved
-/// to a `TableTarget::ViewDefinition`, in declaration order. A dependency
-/// that fails to resolve, or resolves to a SQL View or anything else, is
-/// simply absent — SQL Views never contribute a column origin (#842's own
-/// "out of scope" rule).
+/// Resolves every dependency in `deps` down to the table schemas the
+/// Columns card's own origin lookup reads (#842/04): `(label, schema)` for
+/// each dependency [`resolve_table_rows`] resolved to a ViewDefinition, a
+/// ValueSet or a ConceptMap (#1824), in declaration order
+/// ([`sql_libraries::column_sources`]). A dependency that fails to resolve,
+/// or resolves to a SQL View or anything else, is simply absent — SQL Views
+/// never contribute a column origin (#842's own "out of scope" rule).
 ///
 /// Only ever called after a successful `$sql-run` (#842/04's own NF1): this
 /// performs the identical fetch [`resolve_table_rows`] does for the Tables
@@ -5174,23 +5174,14 @@ async fn resolve_table_rows(
 /// ran at all — a good run's own dependency resolution "happens once per
 /// dependency", not once per keystroke that leaves the run unable to
 /// happen.
-async fn resolve_view_definition_dependencies(
+async fn resolve_column_sources(
     state: &WebState,
     version: helios_fhir::FhirVersion,
     tenant: &str,
     deps: &[sql_libraries::TableDependency],
     libraries: &[serde_json::Value],
-) -> Vec<(String, serde_json::Value)> {
-    resolve_table_rows(state, version, tenant, deps, libraries)
-        .await
-        .into_iter()
-        .filter_map(|(row, doc)| match (row.target, doc) {
-            (sql_libraries::TableTarget::ViewDefinition { .. }, Some(doc)) => {
-                Some((row.label, doc))
-            }
-            _ => None,
-        })
-        .collect()
+) -> Vec<(String, helios_sof::sqlquery::TableSchema)> {
+    sql_libraries::column_sources(resolve_table_rows(state, version, tenant, deps, libraries).await)
 }
 
 /// [`analyze_tables`]'s pure result: everything the Tables panel needs from
@@ -6367,7 +6358,7 @@ async fn sql_library_page(
             match run_sql_preview(&state, lib, bindings, rv.0, &rt.id).await {
                 Ok((table, raw_rows, ms)) => {
                     // #842/04's own NF1: the Columns card's origin lookup
-                    // resolves dependencies to ViewDefinitions only after a
+                    // resolves dependencies to table schemas only after a
                     // run has actually succeeded — and only the ones the
                     // SQL actually reads (`dependencies_used_by_sql`), so a
                     // stale, no-longer-queried label never manufactures a
@@ -6377,15 +6368,10 @@ async fn sql_library_page(
                         .map(|s| s.sql.as_str())
                         .unwrap_or_default();
                     let used_deps = sql_libraries::dependencies_used_by_sql(run_sql, &deps);
-                    let view_definitions = resolve_view_definition_dependencies(
-                        &state, rv.0, &rt.id, &used_deps, &libraries,
-                    )
-                    .await;
-                    let columns = sql_libraries::analyze_columns(
-                        &table.columns,
-                        &raw_rows,
-                        &view_definitions,
-                    );
+                    let sources =
+                        resolve_column_sources(&state, rv.0, &rt.id, &used_deps, &libraries).await;
+                    let columns =
+                        sql_libraries::analyze_columns(&table.columns, &raw_rows, &sources);
                     (
                         standard_notice(RunResultsState::Success(table, ms)),
                         columns,
@@ -7048,9 +7034,9 @@ struct LibRunFragment {
 ///
 /// Builds the `/run` fragment's own Columns update for a *successful* run
 /// (#842/04, NF1): fetches the tenant's Library list, resolves whichever of
-/// `deps` the SQL actually reads down to their ViewDefinitions
+/// `deps` the SQL actually reads down to their table schemas
 /// (`sql_libraries::dependencies_used_by_sql`,
-/// [`resolve_view_definition_dependencies`]), and analyzes `table`/
+/// [`resolve_column_sources`]), and analyzes `table`/
 /// `raw_rows` against them ([`sql_libraries::analyze_columns`]). A SQL
 /// Query and a SQL View share this identical "good run" shape, differing
 /// only in whether declared parameters were involved getting here — called
@@ -7070,9 +7056,8 @@ async fn columns_fragment_for_success(
     libraries: &[serde_json::Value],
 ) -> ColumnsFragment {
     let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
-    let view_definitions =
-        resolve_view_definition_dependencies(state, version, tenant, &used_deps, libraries).await;
-    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &view_definitions);
+    let sources = resolve_column_sources(state, version, tenant, &used_deps, libraries).await;
+    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &sources);
     ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
 }
 
