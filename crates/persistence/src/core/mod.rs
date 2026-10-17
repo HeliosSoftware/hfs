@@ -109,6 +109,7 @@ pub mod patient_compartment;
 pub mod preconditions;
 pub mod search;
 pub mod sof_runner;
+pub mod sof_terminology;
 pub mod storage;
 pub mod tenant_discovery;
 pub mod transaction;

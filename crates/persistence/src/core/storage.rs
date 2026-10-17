@@ -708,6 +708,17 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the store that persists SQL-on-FHIR terminology relations
+    /// (#1824), when the backend keeps them.
+    ///
+    /// The default implementation returns `None`: SQL query dependencies on a
+    /// `ValueSet` or `ConceptMap` are then not served.
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        None
+    }
+
     /// Returns a whole-type scan for backends that have no search index.
     ///
     /// A backend without search cannot answer `url=` lookups, yet the
