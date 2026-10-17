@@ -3289,10 +3289,11 @@ async fn pg_filter_child_of(
 }
 
 /// Regex match against the named property using PG's POSIX `~` operator.
-/// `property` may be `code`, `display`, or any concept property name. For
-/// non-code/display properties the SQL pre-narrows by `concept_properties`
-/// rows for that property name (resolving FHIR-canonical aliases via
-/// `cs_property_local_codes`), then anchored regex is applied to the value.
+/// `property` may be `code` / `concept` (the concept code), `display`, or any
+/// concept property name. For non-code/display properties the SQL
+/// pre-narrows by `concept_properties` rows for that property name (resolving
+/// FHIR-canonical aliases via `cs_property_local_codes`), then anchored regex
+/// is applied to the value.
 async fn pg_filter_regex(
     client: &tokio_postgres::Client,
     system_id: &str,
@@ -3306,7 +3307,7 @@ async fn pg_filter_regex(
     let anchored_sql = format!("^(?:{value})$");
 
     match property {
-        "code" | "" => {
+        "code" | "concept" | "" => {
             let rows = client
                 .query(
                     "SELECT c.code, c.display FROM concepts c
