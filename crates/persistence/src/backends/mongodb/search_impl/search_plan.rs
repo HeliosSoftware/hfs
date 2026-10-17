@@ -1642,9 +1642,7 @@ async fn matching_index_ids(
 
 fn membership_hint_rejected(hint: &Option<Hint>, error: &mongodb::error::Error) -> bool {
     matches!(hint, Some(Hint::Name(name)) if name == SEARCH_TOKEN_MEMBERSHIP_INDEX)
-        && matches!(error.kind.as_ref(), mongodb::error::ErrorKind::Command(command)
-            if command.code == 2
-                && command.message.contains("hint provided does not correspond to an existing index"))
+        && hint_rejected(error)
 }
 
 /// A background index can disappear after readiness. Retry only that rejected
@@ -1669,12 +1667,20 @@ async fn aggregate_membership(
         .hint(Hint::Name(SEARCH_TOKEN_MEMBERSHIP_INDEX.to_owned()))
         .await;
     match opened {
-        Err(error) if membership_hint_rejected(&hint, &error) => index
-            .aggregate(pipeline)
-            .search_deadline()?
-            .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
-            .await
-            .or_query_error(context),
+        Err(error) if membership_hint_rejected(&hint, &error) => {
+            search_deadline::check()?;
+            tracing::warn!(
+                error = %error,
+                ?hint,
+                "Hinted index is missing; retrying through the composite index"
+            );
+            index
+                .aggregate(pipeline)
+                .search_deadline()?
+                .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
+                .await
+                .or_query_error(context)
+        }
         result => result.or_query_error(context),
     }
 }
