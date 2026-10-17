@@ -281,7 +281,13 @@ async fn configured_cursor_getmore_timeout_finishes_and_allows_followup_reads() 
 #[tokio::test]
 async fn nested_search_and_inline_include_keep_the_original_deadline() {
     use crate::types::{IncludeDirective, IncludeType};
-    let Some(fixture) = Fixture::with_search_timeout("deadline-include", 32, Some(60_000)).await
+    const OUTER_TIMEOUT_MS: u64 = 30_000;
+    const ELAPSED_BEFORE_SEARCH_MS: u64 = 200;
+    // Allow coverage overhead and contention on shared Docker hosts. Keeping
+    // the backend timeout above the outer timeout makes a reset exceed the
+    // remaining command budget asserted below.
+    let Some(fixture) =
+        Fixture::with_search_timeout("deadline-include", 32, Some(OUTER_TIMEOUT_MS * 2)).await
     else {
         return;
     };
@@ -305,10 +311,8 @@ async fn nested_search_and_inline_include_keep_the_original_deadline() {
     fixture.db.run_command(doc! { "profile": 2 }).await.unwrap();
     let backend = &fixture.backend;
     let tenant = fixture.tenant.clone();
-    // The outer budget is generous so a loaded runner never times the search
-    // out, yet far below the configured 60 s so a reset deadline is obvious.
-    let result = search_deadline::run(20_000, async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    let result = search_deadline::run(OUTER_TIMEOUT_MS, async move {
+        tokio::time::sleep(Duration::from_millis(ELAPSED_BEFORE_SEARCH_MS)).await;
         let mut query = SearchQuery::new("Observation").with_count(2);
         query.total = Some(TotalMode::None);
         query.includes = vec![IncludeDirective {
@@ -336,7 +340,7 @@ async fn nested_search_and_inline_include_keep_the_original_deadline() {
             .or_else(|_| command.get_i32("maxTimeMS").map(i64::from))
             .unwrap();
         assert!(
-            (1..=19_800).contains(&budget),
+            (1..=(OUTER_TIMEOUT_MS - ELAPSED_BEFORE_SEARCH_MS) as i64).contains(&budget),
             "nested search reset its deadline: {command:?}"
         );
     }

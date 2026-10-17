@@ -33,7 +33,6 @@ FROM rec_0 JOIN resources r ON r.id = rec_0.rid AND r.tenant_id = ?1
   AND r.is_deleted = 0
   AND r.last_updated >= ?3
   AND EXISTS (SELECT 1 FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_id = r.id AND si.param_name IN (?4,?5) AND si.value_reference IN (SELECT value FROM json_each(?6)))
-ORDER BY 1
 LIMIT 50
 
 /* Runner bindings and output metadata:
