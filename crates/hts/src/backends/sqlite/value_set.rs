@@ -12776,6 +12776,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dotted_code_generalizes_without_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "generalizes", "value": "E11.65"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
+    }
+
+    #[tokio::test]
     async fn dotted_code_is_a_with_prior_filter() {
         let codes = dotted_compose_codes(serde_json::json!([
             {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
@@ -12803,5 +12812,15 @@ mod tests {
         ]))
         .await;
         assert_eq!(codes, vec!["E10", "E11"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_generalizes_with_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+            {"property": "concept", "op": "generalizes", "value": "E11.65"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
     }
 }
