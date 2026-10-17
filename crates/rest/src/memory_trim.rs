@@ -1,9 +1,11 @@
-//! Returning freed heap to the OS after a large request (#2020).
+//! Returning freed heap to the OS after heavy work.
 //!
-//! glibc keeps memory freed by a large Bundle in its per-thread arenas: after
-//! importing transaction Bundles `hfs` held 4–10 GB at idle, which the host
-//! later swapped out. `malloc_trim(0)` hands the free pages back. It walks
-//! every arena, so it runs on a blocking thread, at most one at a time.
+//! glibc keeps freed memory in its per-thread arenas: after importing
+//! transaction Bundles `hfs` held 4–10 GB at idle, which the host later
+//! swapped out (#2020), and the dashboard's reconcile queries on a large
+//! SQLite database grew it until it was killed (#2106). `malloc_trim(0)`
+//! hands the free pages back. It walks every arena, so it runs on a blocking
+//! thread, at most one at a time.
 
 /// A request body at least this large is followed by a trim.
 pub const TRIM_AFTER_BYTES: usize = 8 * 1024 * 1024;
@@ -33,7 +35,7 @@ mod imp {
             tracing::debug!(
                 released,
                 duration_ms = started.elapsed().as_millis() as u64,
-                "malloc_trim after a large request"
+                "malloc_trim released free heap"
             );
             TRIMMING.store(false, Ordering::Release);
         });

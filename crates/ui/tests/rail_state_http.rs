@@ -137,6 +137,16 @@ fn selection_notice_is_hidden(html: &str) -> bool {
     html[start..tag_end].contains("hidden")
 }
 
+/// The selected ViewDefinition's name as its title row shows it — the text
+/// after the row's leading icon — or `None` when nothing is selected.
+fn vd_title_name(html: &str) -> Option<&str> {
+    let row = html
+        .split(r#"<h2 class="page-head__title page-head__title--kind">"#)
+        .nth(1)?;
+    let row = row.split("</h2>").next()?;
+    Some(row.split("</span>").nth(1)?.trim())
+}
+
 /// GET with the `X-Rail-Filter` header the SQL rails' inputs send while the
 /// user types.
 async fn get_live_filter_html(app: Router, path: &str) -> String {
@@ -544,7 +554,7 @@ async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_f
     )
     .await;
     let html = get_ok_html(vd_app_with(store, vds.clone()), "/ui/sql/view-definitions").await;
-    assert!(html.contains(r#"<h2 class="page-head__title">vd_010</h2>"#));
+    assert_eq!(vd_title_name(&html), Some("vd_010"));
 
     // Off the current page: a direct read by id opens it exactly like an
     // explicit `?vd=` would — still one read, not a search.
@@ -556,7 +566,7 @@ async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_f
     )
     .await;
     let html = get_ok_html(vd_app_with(store, vds.clone()), "/ui/sql/view-definitions").await;
-    assert!(html.contains(r#"<h2 class="page-head__title">vd_051</h2>"#));
+    assert_eq!(vd_title_name(&html), Some("vd_051"));
 
     // Names nothing real anywhere: falls back to the rail's first visible
     // entry (name-sorted); the existence sweep then prunes "ghost" for good,
@@ -569,7 +579,7 @@ async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_f
     )
     .await;
     let html = get_ok_html(vd_app_with(store.clone(), vds), "/ui/sql/view-definitions").await;
-    assert!(html.contains(r#"<h2 class="page-head__title">vd_001</h2>"#));
+    assert_eq!(vd_title_name(&html), Some("vd_001"));
     let doc = store.peek("l2:").expect("settings stored");
     let rail = stored_rail(&doc, "viewDefinitions");
     assert_eq!(
@@ -889,7 +899,7 @@ async fn live_rail_filter_requests_do_not_record_the_echoed_selection() {
         "/ui/sql/view-definitions?vd=vd1&filter=pat",
     )
     .await;
-    assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
+    assert_eq!(vd_title_name(&html), Some("patient_demographics"));
     assert!(store.peek("l2:").is_none(), "nothing written while typing");
     get_ok_html(
         vd_app_with(store.clone(), vds),
@@ -942,14 +952,14 @@ async fn live_rail_filter_keeps_an_empty_selection_empty() {
     // The centre's empty-state card is swappable by id (its "No matches for"
     // heading follows the filter).
     assert!(html.contains(r#"id="sql-empty-state""#));
-    assert!(!html.contains(r#"<h2 class="page-head__title">"#));
+    assert_eq!(vd_title_name(&html), None);
 
     let html = get_ok_html(
         vd_app_with(store, vds),
         "/ui/sql/view-definitions?filter=pat",
     )
     .await;
-    assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
+    assert_eq!(vd_title_name(&html), Some("patient_demographics"));
 }
 
 /// Search Parameters narrows both its list and its "Recently used" group
@@ -1336,7 +1346,7 @@ async fn view_definitions_filter_overrides_a_stored_last_it_excludes() {
         "/ui/sql/view-definitions?filter=observation",
     )
     .await;
-    assert!(html.contains(r#"<h2 class="page-head__title">observation_flat</h2>"#));
+    assert_eq!(vd_title_name(&html), Some("observation_flat"));
     assert!(selection_notice_is_hidden(&html));
 
     let html = get_ok_html(
@@ -1344,7 +1354,7 @@ async fn view_definitions_filter_overrides_a_stored_last_it_excludes() {
         "/ui/sql/view-definitions?filter=zzz",
     )
     .await;
-    assert!(!html.contains(r#"<h2 class="page-head__title">"#));
+    assert_eq!(vd_title_name(&html), None);
     assert!(html.contains(r#"<p class="filter-rail__empty" id="sql-rail-empty">"#));
     assert!(html.contains(r#"<a href="/ui/sql/view-definitions">Clear the filter</a>"#));
     let doc = store.peek("l2:").expect("settings stored");
@@ -1355,7 +1365,7 @@ async fn view_definitions_filter_overrides_a_stored_last_it_excludes() {
         "/ui/sql/view-definitions?vd=vd1&filter=observation",
     )
     .await;
-    assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
+    assert_eq!(vd_title_name(&html), Some("patient_demographics"));
     assert!(!selection_notice_is_hidden(&html));
     assert!(html.contains(r#"<a href="/ui/sql/view-definitions?vd=vd1">Clear the filter</a>"#));
 }

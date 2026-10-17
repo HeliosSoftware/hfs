@@ -7544,11 +7544,7 @@ impl ReindexTarget for MongoBackend {
         let db = match self.get_database().await {
             Ok(db) => db,
             Err(e) => {
-                let msg = e.to_string();
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
+                return super::reindex_pipeline::PageFailure::storage(e).fan_out(resources.len());
             }
         };
         let tenant_id = tenant.tenant_id().as_str();
@@ -7559,13 +7555,14 @@ impl ReindexTarget for MongoBackend {
         if resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST {
             self.log_reindex_mode_once(multi_thread, overlapped);
         }
-        if overlapped {
+        let outcome = if overlapped {
             self.write_page_overlapped(&db, tenant_id, resources, stats)
                 .await
         } else {
             self.write_page_serial(&db, tenant_id, resources, stats, multi_thread)
                 .await
-        }
+        };
+        outcome.unwrap_or_else(|failure| failure.fan_out(resources.len()))
     }
 
     /// Delegates to [`Self::write_search_entries_page_timed`] with a
@@ -7610,7 +7607,7 @@ pub(super) async fn insert_search_entries_chunk(
     docs: &[Document],
     error_context: &str,
     stats: &mut ReindexPageStats,
-) -> Result<HashMap<usize, String>, String> {
+) -> Result<HashMap<usize, String>, super::reindex_pipeline::PageFailure> {
     let mut insert_failures: HashMap<usize, String> = HashMap::new();
     let mut offset = 0usize;
     for chunk in docs.chunks(SEARCH_INDEX_INSERT_CHUNK) {
@@ -7620,17 +7617,27 @@ pub(super) async fn insert_search_entries_chunk(
             Ok(_) => {}
             Err(e) => match e.kind.as_ref() {
                 MongoErrorKind::InsertMany(insert_many) => {
-                    let Some(write_errors) = insert_many.write_errors.as_ref() else {
-                        return Err(format!("{error_context}: {e}"));
-                    };
-                    for write_error in write_errors {
+                    for write_error in insert_many.write_errors.iter().flatten() {
                         let owner = owners[offset + write_error.index];
                         insert_failures
                             .entry(owner)
                             .or_insert_with(|| format!("{error_context}: {}", write_error.message));
                     }
+                    if insert_many.write_concern_error.is_some()
+                        || insert_many.write_errors.as_ref().is_none_or(Vec::is_empty)
+                    {
+                        return Err(
+                            super::reindex_pipeline::PageFailure::driver(error_context, e)
+                                .with_permanent(insert_failures),
+                        );
+                    }
                 }
-                _ => return Err(format!("{error_context}: {e}")),
+                _ => {
+                    return Err(
+                        super::reindex_pipeline::PageFailure::driver(error_context, e)
+                            .with_permanent(insert_failures),
+                    );
+                }
             },
         }
         offset += chunk.len();
