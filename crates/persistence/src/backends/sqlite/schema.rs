@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 39;
+pub const SCHEMA_VERSION: i32 = 40;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -481,6 +481,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             36 => migrate_v36_to_v37(conn)?,
             37 => migrate_v37_to_v38(conn)?,
             38 => migrate_v38_to_v39(conn)?,
+            39 => migrate_v39_to_v40(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2121,6 +2122,45 @@ fn backfill_value_date_start(conn: &Connection) -> StorageResult<()> {
         tx.commit()
             .map_err(|e| migration_err(format!("v39 commit backfill batch: {e}")))?;
     }
+    Ok(())
+}
+
+/// The shape v40 gives `idx_history_updated`: the `(tenant_id, last_updated)`
+/// range every history-window read uses, plus each column the dashboard's
+/// bucketed history counts read (#2107).
+const HISTORY_UPDATED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated, resource_type, is_deleted, version_id)";
+
+/// v39 -> v40 (#2107): `idx_history_updated` carries `resource_type`,
+/// `is_deleted` and `version_id` after its `(tenant_id, last_updated)` key, so
+/// the dashboard's bucketed history counts (`count_deltas_by_bucket`,
+/// `count_deltas_by_type_and_bucket`) are answered from the index alone.
+/// Before, every history row in the charted window cost a read of its table
+/// row (the resource blob's page) just to test the type and the delta rule;
+/// after a bulk import that is nearly the whole history table, and on a 19M
+/// resource database the 30-day window took over ten seconds and churned the
+/// connection's page cache.
+///
+/// The index is widened rather than joined by a second one, so the write path
+/// still maintains one entry per history row, and every existing reader of the
+/// `(tenant_id, last_updated)` prefix (the write marker, the activity
+/// histogram, system history) keeps it. The v1 schema still creates the old
+/// shape on a fresh database, so an index of another shape is dropped and
+/// rebuilt here.
+fn migrate_v39_to_v40(conn: &Connection) -> StorageResult<()> {
+    let is_current: bool = conn
+        .query_row(
+            "SELECT sql LIKE '%is_deleted, version_id)%' FROM sqlite_master
+              WHERE type = 'index' AND name = 'idx_history_updated'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !is_current {
+        conn.execute("DROP INDEX IF EXISTS idx_history_updated", [])
+            .map_err(|e| migration_err(format!("v40 drop idx_history_updated: {e}")))?;
+    }
+    conn.execute(HISTORY_UPDATED_INDEX, [])
+        .map_err(|e| migration_err(format!("v40 create idx_history_updated: {e}")))?;
     Ok(())
 }
 
@@ -4326,6 +4366,39 @@ mod tests {
         .unwrap();
         migrate_v34_to_v35(&conn).unwrap();
         assert_eq!(end("a").as_deref(), Some("kept"));
+    }
+
+    /// #2107: v40 widens a v39 database's `idx_history_updated` so the
+    /// dashboard's history counts are covered, and a replay leaves it as is.
+    #[test]
+    fn migrate_v39_to_v40_widens_the_history_updated_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_history_updated;
+             CREATE INDEX idx_history_updated ON resource_history(tenant_id, last_updated);",
+        )
+        .unwrap();
+        set_schema_version(&conn, 39).unwrap();
+        let shape = || -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_history_updated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(!shape().contains("version_id"));
+
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let widened = shape();
+        assert!(
+            widened.ends_with("(tenant_id, last_updated, resource_type, is_deleted, version_id)"),
+            "{widened}"
+        );
+        migrate_v39_to_v40(&conn).unwrap();
+        assert_eq!(shape(), widened, "a replay keeps the index");
     }
 
     /// A v38 database: the v39 column and both date-end indexes un-applied.
