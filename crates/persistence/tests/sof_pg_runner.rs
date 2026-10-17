@@ -2572,7 +2572,7 @@ mod export_paging {
                 "{name}: paged export must return the same rows as the unlimited run"
             );
             if name == "unionall" {
-                // Union views end in `ORDER BY 1`; global order is not part of
+                // Union views are unordered; global order is not part of
                 // the contract, only the multiset.
                 continue;
             }

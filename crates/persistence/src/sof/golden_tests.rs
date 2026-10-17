@@ -223,6 +223,18 @@ fn cases() -> Vec<Case> {
         json!([{"repeat":["item"],"column":[{"path":"linkId","name":"a"}]},
         {"repeat":["item"],"column":[{"path":"linkId","name":"b"}]}]),
     ));
+    // `ObservationComponent` has no `component`: lowered as a `forEach`.
+    cases.push(Case {
+        name: "repeat-single-level",
+        view: view(
+            "Observation",
+            json!([{"column":[{"path":"getResourceKey()","name":"observation_id","type":"id"}]},
+            {"repeat":["component"],"column":[{"path":"code.text","name":"component_name","type":"string"},
+                {"path":"code.coding.first().code","name":"component_code","type":"string"}]}]),
+        ),
+        filters: ViewFilters::default(),
+        paged: false,
+    });
     cases.push(patient(
         "union-in-foreach",
         json!([{"column":[{"path":"id","name":"id"}]},
@@ -314,7 +326,7 @@ async fn check(dialect: SqlDialect, name: &str) {
         std::fs::create_dir_all(&directory).unwrap();
     }
     let cases = cases();
-    assert_eq!(cases.len(), 33, "all golden cases must execute");
+    assert_eq!(cases.len(), 34, "all golden cases must execute");
     for case in cases {
         let groups = || {
             vec![
