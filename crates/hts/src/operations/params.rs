@@ -93,7 +93,10 @@ pub fn collect_canonical_params(params: &[Value], name: &str) -> Vec<(String, St
 }
 
 /// Rewrite a versioned canonical `url_name=X|V` to `url_name=X` plus
-/// `version_name=V`, the form the CodeSystem lookups resolve. FHIR resolves
+/// `version_name=V`, the form the operation lookups resolve
+/// (`ValueSet/$validate-code`: `url` + `valueSetVersion`;
+/// `CodeSystem/$validate-code` and `$lookup`: `url`/`system` + `version`).
+/// Profile bindings carry versioned canonicals (`...|4.0.1`). FHIR resolves
 /// the `|version` suffix as if the version had been passed separately
 /// (R5 §2.1.3.0.6 Canonical URLs). An explicit `version_name` wins: the pipe
 /// is still stripped, but no second version is added. The value keeps its

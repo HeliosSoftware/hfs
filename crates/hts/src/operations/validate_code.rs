@@ -4193,33 +4193,6 @@ fn unresolved_import_response(params: &[Value], unresolved_vs_url: &str) -> Valu
     )
 }
 
-/// `url=http://x|1.0` becomes `url=http://x` plus `valueSetVersion=1.0`, the
-/// form every lookup below resolves. Profile bindings carry versioned
-/// canonicals (`...|4.0.1`), and validators pass them through unchanged. An
-/// explicit `valueSetVersion` wins over the pipe version, as in `$expand`.
-fn split_versioned_vs_url(mut params: Vec<Value>) -> Vec<Value> {
-    let Some(position) = params
-        .iter()
-        .position(|p| p.get("name").and_then(Value::as_str) == Some("url"))
-    else {
-        return params;
-    };
-    let Some(url) = find_str_param(&params, "url") else {
-        return params;
-    };
-    let Some((bare, version)) = url.split_once('|') else {
-        return params;
-    };
-    if version.is_empty() {
-        return params;
-    }
-    params[position] = serde_json::json!({ "name": "url", "valueUri": bare });
-    if find_str_param(&params, "valueSetVersion").is_none() {
-        params.push(serde_json::json!({ "name": "valueSetVersion", "valueString": version }));
-    }
-    params
-}
-
 async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
@@ -4237,7 +4210,10 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // A VCL implicit-ValueSet `url` is rewritten to that inline form here
     // (after the handler cache key, which uses the original VCL URL).
     let is_vcl = find_str_param(&params, "url").is_some_and(|u| crate::vcl::is_vcl_url(&u));
-    let params = split_versioned_vs_url(crate::vcl::rewrite_vcl_params(params)?);
+    let mut params = crate::vcl::rewrite_vcl_params(params)?;
+    // `url=X|V` resolves as `url=X` + `valueSetVersion=V` (#2119). Done after
+    // the VCL rewrite, whose URLs may themselves contain `|`.
+    split_versioned_canonical(&mut params, "url", "valueSetVersion");
     if find_str_param(&params, "url").is_none() {
         if let Some(vs_resource) = find_resource_param(&params, "valueSet") {
             if is_vcl {
