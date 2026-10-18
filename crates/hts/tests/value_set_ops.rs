@@ -357,6 +357,85 @@ async fn vs_validate_code_excluded_code_returns_false() {
     assert!(!result, "'head' should NOT be in the limbs ValueSet");
 }
 
+/// A `url|version` canonical, as profile bindings carry it, resolves the same
+/// stored ValueSet as `url` plus `valueSetVersion`; an unknown version does not.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn vs_validate_code_accepts_a_versioned_canonical_url() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    let result = |body: &serde_json::Value| {
+        body["parameter"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+            .and_then(|p| p["valueBoolean"].as_bool())
+    };
+
+    for (code, expected) in [("arm", true), ("head", false)] {
+        let url = format!("{}|1.0", bundles::LIMBS_VS_URL);
+        let req = TestApp::params(&[
+            ("url", "valueUri", &url),
+            ("code", "valueCode", code),
+            ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ]);
+        let (status, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(result(&body), Some(expected), "{code}: {body}");
+    }
+
+    let url = format!("{}|9.9", bundles::LIMBS_VS_URL);
+    let req = TestApp::params(&[
+        ("url", "valueUri", &url),
+        ("code", "valueCode", "arm"),
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+    ]);
+    let (_, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+    assert_ne!(
+        result(&body),
+        Some(true),
+        "unknown version must not validate: {body}"
+    );
+}
+
+/// A `url|version` canonical sent alongside `valueSetVersion` still resolves:
+/// the pipe is stripped from `url`, and the explicit parameter wins, as in
+/// `$expand`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn vs_validate_code_versioned_canonical_with_explicit_value_set_version() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    let url = format!("{}|1.0", bundles::LIMBS_VS_URL);
+    let validate = |vs_version: &'static str| {
+        TestApp::params(&[
+            ("url", "valueUri", &url),
+            ("valueSetVersion", "valueString", vs_version),
+            ("code", "valueCode", "arm"),
+            ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ])
+    };
+
+    let (status, body) = app
+        .post_fhir("/ValueSet/$validate-code", validate("1.0"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = body["parameter"]
+        .as_array()
+        .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+        .and_then(|p| p["valueBoolean"].as_bool());
+    assert_eq!(result, Some(true), "{body}");
+
+    // `valueSetVersion=9.9` overrides `|1.0`, so the lookup misses.
+    let (status, body) = app
+        .post_fhir("/ValueSet/$validate-code", validate("9.9"))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.to_string().contains("limbs|9.9"),
+        "explicit valueSetVersion must win: {body}"
+    );
+}
+
 /// Regression: when a request specifies `version=1.0.0` and the CodeSystem
 /// exists at that version (even though a newer version also exists), the
 /// response `version` parameter must echo the *requested* version ("1.0.0"),
