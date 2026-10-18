@@ -730,7 +730,9 @@ async fn import_non_bundle_returns_400() {
 /// empty. `$subsumes` is asserted alongside to document that difference.
 #[tokio::test(flavor = "multi_thread")]
 async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
-    let app = TestAppPg::new().await;
+    // Own database: any other test's `TestAppPg::new` would rebuild the
+    // closure this test drops on purpose, before `finalize=true` gets to it.
+    let app = TestAppPg::new_isolated().await;
     let uid = uuid::Uuid::new_v4().simple().to_string();
     let sys = format!("http://chunked.{uid}/cs");
     const DEFER: &str = "/import?defer_closure=true";
@@ -807,12 +809,7 @@ async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
 
     let (status, body) = app.post_fhir("/import?finalize=true", chunk("")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // At least ours; the database is shared with other tests in this binary,
-    // any of which may have left a system in the same state.
-    assert!(
-        body["closures_rebuilt"].as_u64().unwrap_or(0) >= 1,
-        "{body}"
-    );
+    assert_eq!(body["closures_rebuilt"].as_u64(), Some(1), "{body}");
 
     assert_eq!(isa_members(&app, &sys).await, ["A", "A.0", "A.1"]);
     assert_eq!(subsumes(&app, &sys, "A", "A.1").await, "subsumes");
