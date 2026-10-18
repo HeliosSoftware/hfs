@@ -3531,12 +3531,6 @@ async fn build_hierarchical_expansion(
         return Ok(flat);
     }
 
-    let items_map: HashMap<(String, String), ExpansionContains> = flat
-        .iter()
-        .cloned()
-        .map(|c| ((c.system.clone(), c.code.clone()), c))
-        .collect();
-
     let expansion_set: HashSet<(String, String)> = flat
         .iter()
         .map(|c| (c.system.clone(), c.code.clone()))
@@ -3559,7 +3553,6 @@ async fn build_hierarchical_expansion(
     }
 
     let mut parent_to_children: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
-    let mut has_parent: HashSet<(String, String)> = HashSet::new();
 
     for (sys_url, sys_id) in &system_id_map {
         let edge_rows = client
@@ -3579,44 +3572,15 @@ async fn build_hierarchical_expansion(
                 parent_to_children
                     .entry(parent_key)
                     .or_default()
-                    .push(child_key.clone());
-                has_parent.insert(child_key);
+                    .push(child_key);
             }
         }
     }
 
-    let mut roots: Vec<ExpansionContains> = flat
-        .iter()
-        .filter(|c| !has_parent.contains(&(c.system.clone(), c.code.clone())))
-        .map(|c| {
-            build_subtree(
-                &(c.system.clone(), c.code.clone()),
-                &items_map,
-                &parent_to_children,
-            )
-        })
-        .collect();
-
-    roots.sort_by(|a, b| a.code.cmp(&b.code));
-    Ok(roots)
-}
-
-/// Recursively build an [`ExpansionContains`] node with all its nested children.
-fn build_subtree(
-    key: &(String, String),
-    items_map: &HashMap<(String, String), ExpansionContains>,
-    parent_to_children: &HashMap<(String, String), Vec<(String, String)>>,
-) -> ExpansionContains {
-    let mut item = items_map[key].clone();
-    if let Some(children) = parent_to_children.get(key) {
-        let mut child_items: Vec<ExpansionContains> = children
-            .iter()
-            .map(|ck| build_subtree(ck, items_map, parent_to_children))
-            .collect();
-        child_items.sort_by(|a, b| a.code.cmp(&b.code));
-        item.contains = child_items;
-    }
-    item
+    Ok(crate::backends::hierarchy::nest_expansion(
+        flat,
+        &parent_to_children,
+    ))
 }
 
 /// Write computed expansion entries into the `value_set_expansions` cache.

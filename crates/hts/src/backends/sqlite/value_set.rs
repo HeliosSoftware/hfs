@@ -6290,13 +6290,6 @@ fn build_hierarchical_expansion(
         return Ok(flat);
     }
 
-    // Build lookup: (system_url, code) → ExpansionContains.
-    let items_map: HashMap<(String, String), ExpansionContains> = flat
-        .iter()
-        .cloned()
-        .map(|c| ((c.system.clone(), c.code.clone()), c))
-        .collect();
-
     // Set of all (system_url, code) pairs in the expansion for fast membership checks.
     let expansion_set: HashSet<(String, String)> = flat
         .iter()
@@ -6326,8 +6319,6 @@ fn build_hierarchical_expansion(
     // both endpoints are in the expansion.
     // parent_to_children: (system_url, parent_code) → Vec<(system_url, child_code)>
     let mut parent_to_children: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
-    // has_parent: tracks which codes have a parent within the expansion.
-    let mut has_parent: HashSet<(String, String)> = HashSet::new();
 
     for (sys_url, sys_id) in &system_id_map {
         let mut stmt = conn
@@ -6353,57 +6344,15 @@ fn build_hierarchical_expansion(
                 parent_to_children
                     .entry(parent_key)
                     .or_default()
-                    .push(child_key.clone());
-                has_parent.insert(child_key);
+                    .push(child_key);
             }
         }
     }
 
-    // Roots: concepts that appear in the expansion but have no parent within it.
-    let mut roots: Vec<ExpansionContains> = flat
-        .iter()
-        .filter(|c| !has_parent.contains(&(c.system.clone(), c.code.clone())))
-        .map(|c| {
-            build_subtree(
-                &(c.system.clone(), c.code.clone()),
-                &items_map,
-                &parent_to_children,
-            )
-        })
-        .collect();
-
-    roots.sort_by(|a, b| a.code.cmp(&b.code));
-    Ok(roots)
-}
-
-/// Recursively build an [`ExpansionContains`] node with all its nested children.
-///
-/// Looks up `key` in `items_map` to get the base node, then checks
-/// `parent_to_children` for any children of that node, recursing into each
-/// child.  Children are sorted by code before being attached, producing a
-/// deterministic tree order regardless of the order edges were stored in
-/// `concept_hierarchy`.
-///
-/// ## Parameters
-/// - `key` — `(system_url, code)` of the concept to build.
-/// - `items_map` — flat `(system_url, code)` → [`ExpansionContains`] lookup.
-/// - `parent_to_children` — adjacency map built from `concept_hierarchy` edges
-///   that are fully contained within the expansion set.
-fn build_subtree(
-    key: &(String, String),
-    items_map: &HashMap<(String, String), ExpansionContains>,
-    parent_to_children: &HashMap<(String, String), Vec<(String, String)>>,
-) -> ExpansionContains {
-    let mut item = items_map[key].clone();
-    if let Some(children) = parent_to_children.get(key) {
-        let mut child_items: Vec<ExpansionContains> = children
-            .iter()
-            .map(|ck| build_subtree(ck, items_map, parent_to_children))
-            .collect();
-        child_items.sort_by(|a, b| a.code.cmp(&b.code));
-        item.contains = child_items;
-    }
-    item
+    Ok(crate::backends::hierarchy::nest_expansion(
+        flat,
+        &parent_to_children,
+    ))
 }
 
 /// Write computed expansion entries into the `value_set_expansions` cache.
