@@ -358,7 +358,7 @@ impl PostgresTerminologyBackend {
     /// Called once at the end of a CLI bulk import so the server's first
     /// request doesn't pay the build cost. For SNOMED CT (~20M closure pairs)
     /// this takes ~30–60 s.
-    pub async fn rebuild_missing_closures(&self) -> Result<(), HtsError> {
+    pub async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
         let mut client = self
             .pool
             .get()
@@ -368,8 +368,7 @@ impl PostgresTerminologyBackend {
             .await
             .map_err(|e| {
                 HtsError::StorageError(format!("concept_closure migration: {}", error_chain(&e)))
-            })?;
-        Ok(())
+            })
     }
 }
 
@@ -556,6 +555,17 @@ impl BundleImportBackend for PostgresTerminologyBackend {
     ) -> Result<ImportStats, HtsError> {
         let parsed = bundle_parser::parse_bundle(data)?;
         self.import_parsed(ctx, parsed).await
+    }
+
+    /// Delegates to the inherent [`Self::rebuild_missing_closures`], then drops
+    /// the response caches when anything was rebuilt: a `$subsumes` answered
+    /// from the closure-less state may be sitting in `subsumes_response_cache`.
+    async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
+        let rebuilt = PostgresTerminologyBackend::rebuild_missing_closures(self).await?;
+        if rebuilt > 0 {
+            self.invalidate_caches();
+        }
+        Ok(rebuilt)
     }
 
     /// Write an already-parsed bundle, skipping the JSON parse step.
