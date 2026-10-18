@@ -83,7 +83,7 @@ pub struct CoreTerminology {
 pub const CORE_VALUE_SET_PREFIX: &str = "http://hl7.org/fhir/ValueSet/";
 
 /// The FHIR release (`major.minor`) of a FHIR version string: `4.0.1` →
-/// `4.0`, `6.0.0-ballot4` → `6.0`. `None` when it does not look like one.
+/// `4.0`, `6.0.0-snapshot1` → `6.0`. `None` when it does not look like one.
 pub fn fhir_release(version: &str) -> Option<&str> {
     let mut dots = version.match_indices('.').map(|(i, _)| i);
     let first = dots.next()?;
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn fhir_release_is_major_minor() {
         assert_eq!(fhir_release("4.0.1"), Some("4.0"));
-        assert_eq!(fhir_release("6.0.0-ballot4"), Some("6.0"));
+        assert_eq!(fhir_release("6.0.0-snapshot1"), Some("6.0"));
         assert_eq!(fhir_release("5.0"), Some("5.0"));
         assert_eq!(fhir_release("2014-03-26"), None);
         assert_eq!(fhir_release("current"), None);

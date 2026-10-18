@@ -23,7 +23,7 @@
 //! - `R4` - FHIR R4 (4.0.1) - Default
 //! - `R4B` - FHIR R4B (4.3.0)
 //! - `R5` - FHIR R5 (5.0.0)
-//! - `R6` - FHIR R6 (6.0.0-ballot)
+//! - `R6` - FHIR R6 (6.0.0-snapshot1)
 //!
 //! ## Backend Support
 //!
