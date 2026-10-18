@@ -31,6 +31,13 @@ cargo build -p helios-fhir-gen --features R4,R4B,R5,R6
 cargo fmt --all 
 cargo test --workspace --all-features
 ```
+- Regenerate the validator's embedded R6 schema and terminology packs from the same spec files. These packs ([`crates/fhir-validator/packs/`](crates/fhir-validator/packs/)) drive resource validation and the UI's resource editor and guided form. They are committed and embedded at compile time, so they do not pick up spec updates on their own. Run the schema pack first, because `generate-terminology` reads it:
+```bash
+cargo run -p helios-fhir-validator --features gen-packs --bin generate-schema-packs -- R6
+cargo run -p helios-fhir-validator --features gen-packs --bin generate-terminology -- R6
+cargo test -p helios-fhir-validator
+```
+  Expect a large R6 pack diff whenever the R6 spec version moves (for example, ballot to snapshot).
 - Check in these changes.
 - Refresh the bundled HTS terminology data. These files live in [`crates/hts/terminology-data/`](crates/hts/terminology-data/) and ship inside every HTS release archive and Docker image, so customers get a working server with no extra downloads. The bundled terminologies have their own release cadences (ICD-10-CM annually in October, THO periodically, MeSH annually, etc.), so check each upstream source before tagging:
   1. Review the upstream landing pages referenced alongside each block in [`crates/hts/scripts/download-bundled-terminologies.sh`](crates/hts/scripts/download-bundled-terminologies.sh). If newer versions are available, bump the `*_VERSION` / `*_YEAR` variables at the top of the script (and the matching `$Xxx` variables in the `.ps1` companion).
