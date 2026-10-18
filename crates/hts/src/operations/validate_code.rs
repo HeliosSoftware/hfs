@@ -4192,11 +4192,8 @@ fn unresolved_import_response(params: &[Value], unresolved_vs_url: &str) -> Valu
 /// `url=http://x|1.0` becomes `url=http://x` plus `valueSetVersion=1.0`, the
 /// form every lookup below resolves. Profile bindings carry versioned
 /// canonicals (`...|4.0.1`), and validators pass them through unchanged. An
-/// explicit `valueSetVersion` wins and leaves the parameters untouched.
+/// explicit `valueSetVersion` wins over the pipe version, as in `$expand`.
 fn split_versioned_vs_url(mut params: Vec<Value>) -> Vec<Value> {
-    if find_str_param(&params, "valueSetVersion").is_some() {
-        return params;
-    }
     let Some(position) = params
         .iter()
         .position(|p| p.get("name").and_then(Value::as_str) == Some("url"))
@@ -4213,7 +4210,9 @@ fn split_versioned_vs_url(mut params: Vec<Value>) -> Vec<Value> {
         return params;
     }
     params[position] = serde_json::json!({ "name": "url", "valueUri": bare });
-    params.push(serde_json::json!({ "name": "valueSetVersion", "valueString": version }));
+    if find_str_param(&params, "valueSetVersion").is_none() {
+        params.push(serde_json::json!({ "name": "valueSetVersion", "valueString": version }));
+    }
     params
 }
 
