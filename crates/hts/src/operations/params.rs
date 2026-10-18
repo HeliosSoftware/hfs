@@ -92,6 +92,42 @@ pub fn collect_canonical_params(params: &[Value], name: &str) -> Vec<(String, St
         .collect()
 }
 
+/// Rewrite a versioned canonical `url_name=X|V` to `url_name=X` plus
+/// `version_name=V`, the form the CodeSystem lookups resolve. FHIR resolves
+/// the `|version` suffix as if the version had been passed separately
+/// (R5 §2.1.3.0.6 Canonical URLs). An explicit `version_name` wins: the pipe
+/// is still stripped, but no second version is added. The value keeps its
+/// `valueXxx` key. Empty url or version sides leave the parameters unchanged.
+pub fn split_versioned_canonical(params: &mut Vec<Value>, url_name: &str, version_name: &str) {
+    let Some(param) = params
+        .iter_mut()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(url_name))
+    else {
+        return;
+    };
+    let Some(Value::String(value)) = param
+        .as_object_mut()
+        .and_then(|o| {
+            o.iter_mut()
+                .find(|(k, v)| k.starts_with("value") && v.is_string())
+        })
+        .map(|(_, v)| v)
+    else {
+        return;
+    };
+    let Some((bare, version)) = value.split_once('|') else {
+        return;
+    };
+    if bare.is_empty() || version.is_empty() {
+        return;
+    }
+    let version = version.to_string();
+    value.truncate(bare.len());
+    if find_str_param(params, version_name).is_none() {
+        params.push(json!({ "name": version_name, "valueString": version }));
+    }
+}
+
 /// Extract a string-typed value from a FHIR parameter object, checking the
 /// most common `valueXxx` fields.
 fn extract_any_string_value(param: &Value) -> Option<String> {
@@ -410,6 +446,44 @@ pub(super) fn parse_stored_coding(raw_value: &str) -> Result<Value, HtsError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn split_versioned_canonical_moves_the_version_out() {
+        let mut params = vec![
+            json!({"name": "url", "valueCanonical": "http://x|1.0"}),
+            json!({"name": "code", "valueCode": "a"}),
+        ];
+        split_versioned_canonical(&mut params, "url", "version");
+        assert_eq!(
+            params[0],
+            json!({"name": "url", "valueCanonical": "http://x"})
+        );
+        assert_eq!(find_str_param(&params, "version").as_deref(), Some("1.0"));
+    }
+
+    #[test]
+    fn split_versioned_canonical_explicit_version_wins() {
+        let mut params = vec![
+            json!({"name": "version", "valueString": "2.0"}),
+            json!({"name": "url", "valueUri": "http://x|1.0"}),
+        ];
+        split_versioned_canonical(&mut params, "url", "version");
+        assert_eq!(find_str_param(&params, "url").as_deref(), Some("http://x"));
+        assert_eq!(collect_str_params(&params, "version"), vec!["2.0"]);
+    }
+
+    #[test]
+    fn split_versioned_canonical_leaves_other_shapes_alone() {
+        for url in ["http://x", "http://x|", "|1.0"] {
+            let mut params = vec![json!({"name": "url", "valueUri": url})];
+            let before = params.clone();
+            split_versioned_canonical(&mut params, "url", "version");
+            assert_eq!(params, before, "{url}");
+        }
+        let mut params: Vec<Value> = vec![];
+        split_versioned_canonical(&mut params, "url", "version");
+        assert!(params.is_empty());
+    }
 
     #[test]
     fn extract_parameter_array_ok() {

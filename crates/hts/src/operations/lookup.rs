@@ -42,7 +42,7 @@ use crate::types::{DesignationValue, LookupRequest};
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
     collect_str_params, extract_parameter_array, find_str_param, parse_query_string,
-    property_value_part, query_params_to_fhir_params,
+    property_value_part, query_params_to_fhir_params, split_versioned_canonical,
 };
 
 /// Build a canonical cache key for a `$lookup` request from its normalised
@@ -139,8 +139,11 @@ fn lookup_not_found_put(cache: &NotFoundCache, key: String) {
 /// not found, 501 when `expression` is supplied).
 async fn process_lookup<B: TerminologyBackend>(
     state: &AppState<B>,
-    params: Vec<Value>,
+    mut params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // `system=X|V` is looked up as `system=X` + `version=V` (#2122). Done
+    // before the cache key so both spellings share one entry.
+    split_versioned_canonical(&mut params, "system", "version");
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips supplement resolution, the backend `lookup` call, the
     // `code_system_language` lookup, and FHIR Parameters assembly when the
