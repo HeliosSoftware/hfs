@@ -96,25 +96,43 @@ pub type DynGroupExportProvider = Arc<dyn GroupExportProvider + Send + Sync>;
 /// Type alias for a purgable backend.
 pub type DynPurgableStorage = Arc<dyn PurgableStorage + Send + Sync>;
 
-/// Rebuilds the primary's [`StoredResource`] from a body that already carries
-/// `meta.versionId` and `meta.lastUpdated` (bundle results use
-/// [`StoredResource::content_with_meta`]). Missing either is not invented.
+/// Rebuilds the primary's [`StoredResource`] from a bundle entry body.
+///
+/// Production bundle results use [`StoredResource::content_with_meta`], so
+/// `meta.versionId` and `meta.lastUpdated` are present. Older or partial
+/// entries still have to fan out — dropping them leaves the secondary
+/// missing a write that sits beside a delete in the same bundle. Version
+/// then comes from `Location` (`Type/id/_history/{vid}`), then `"1"`;
+/// `lastUpdated` from the entry header, then now.
 fn stored_from_synced_body(
     resource: &Value,
     tenant_id: crate::tenant::TenantId,
     fhir_version: FhirVersion,
+    location: Option<&str>,
+    last_modified: Option<&str>,
 ) -> Option<StoredResource> {
     let resource_type = resource.get("resourceType")?.as_str()?;
     let id = resource.get("id")?.as_str()?;
     let version = resource
         .pointer("/meta/versionId")
         .and_then(Value::as_str)
-        .filter(|version| !version.is_empty())?;
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+        .or_else(|| version_from_location(location))
+        .unwrap_or_else(|| {
+            warn!(
+                resource_type,
+                resource_id = id,
+                "Bundle entry has no primary versionId; syncing as version 1"
+            );
+            "1".to_string()
+        });
     let last_updated = resource
         .pointer("/meta/lastUpdated")
         .and_then(Value::as_str)
-        .and_then(|instant| DateTime::parse_from_rfc3339(instant).ok())
-        .map(|instant| instant.with_timezone(&Utc))?;
+        .and_then(parse_rfc3339)
+        .or_else(|| last_modified.and_then(parse_rfc3339))
+        .unwrap_or_else(Utc::now);
     Some(StoredResource::from_storage(
         resource_type,
         id,
@@ -126,6 +144,19 @@ fn stored_from_synced_body(
         None,
         fhir_version,
     ))
+}
+
+fn parse_rfc3339(instant: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(instant)
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
+}
+
+fn version_from_location(location: Option<&str>) -> Option<String> {
+    let location = location?;
+    let (_, after) = location.split_once("/_history/")?;
+    let version = after.split(['/', '?']).next()?.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 /// Composite storage that coordinates multiple backends.
@@ -897,13 +928,14 @@ impl CompositeStorage {
                     by_type.last_mut().expect("just pushed")
                 }
             };
-            match stored_from_synced_body(resource_json, tenant.tenant_id().clone(), fhir_version) {
-                Some(stored) => group.1.push(stored),
-                None => warn!(
-                    resource_type,
-                    resource_id,
-                    "Bundle entry has no primary versionId or lastUpdated; secondaries not synced"
-                ),
+            if let Some(stored) = stored_from_synced_body(
+                resource_json,
+                tenant.tenant_id().clone(),
+                fhir_version,
+                entry_result.location.as_deref(),
+                entry_result.last_modified.as_deref(),
+            ) {
+                group.1.push(stored);
             }
         }
         // Deletes go first, in the primary's own processing order: a create
