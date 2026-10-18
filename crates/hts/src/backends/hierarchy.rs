@@ -54,15 +54,19 @@ pub(crate) fn nest_expansion(
         collect_keys(&tree, &mut placed);
         roots.push(tree);
     }
-    // Anything still unplaced sits in a cycle with no parent outside it.
-    // `ordered` is sorted, so each such cycle is rooted at its lowest code.
-    for key in &ordered {
-        if placed.contains(key) {
-            continue;
-        }
-        let tree = build_subtree(key, &items_map, parent_to_children, &mut path);
-        collect_keys(&tree, &mut placed);
-        roots.push(tree);
+    // Anything still unplaced is a rootless cycle or hangs below one. Root
+    // only the cycles nothing outside them points into, each at its lowest
+    // code; everything else unplaced is reachable from one of them. Rooting
+    // at the lowest unplaced code instead would promote a descendant that
+    // sorts before its cycle, and it would then also appear nested.
+    let unplaced: Vec<&ConceptKey> = ordered.iter().filter(|k| !placed.contains(*k)).collect();
+    for key in source_cycle_roots(&unplaced, parent_to_children) {
+        roots.push(build_subtree(
+            key,
+            &items_map,
+            parent_to_children,
+            &mut path,
+        ));
     }
 
     roots.sort_by(|a, b| a.code.cmp(&b.code));
@@ -100,6 +104,107 @@ fn build_subtree(
         item.contains = child_items;
     }
     item
+}
+
+/// Pick one root per source strongly connected component of `unplaced`.
+///
+/// `unplaced` must be sorted by code. Every parent of an unplaced concept is
+/// itself unplaced (a placed parent would have placed it), so the components
+/// with no parent outside themselves are exactly the cycles that nothing else
+/// reaches. Each is rooted at its first member in `unplaced` order, i.e. its
+/// lowest code.
+///
+/// Tarjan's algorithm, iterative so a long chain cannot overflow the stack.
+fn source_cycle_roots<'a>(
+    unplaced: &[&'a ConceptKey],
+    parent_to_children: &HashMap<ConceptKey, Vec<ConceptKey>>,
+) -> Vec<&'a ConceptKey> {
+    let pos: HashMap<&ConceptKey, usize> =
+        unplaced.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    let children: Vec<Vec<usize>> = unplaced
+        .iter()
+        .map(|k| {
+            parent_to_children
+                .get(*k)
+                .into_iter()
+                .flatten()
+                .filter_map(|c| pos.get(c).copied())
+                .collect()
+        })
+        .collect();
+
+    let n = unplaced.len();
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut comp = vec![usize::MAX; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next_index = 0usize;
+    let mut comp_count = 0usize;
+
+    for start in 0..n {
+        if index[start] != usize::MAX {
+            continue;
+        }
+        // (node, next child to visit)
+        let mut work: Vec<(usize, usize)> = vec![(start, 0)];
+        index[start] = next_index;
+        low[start] = next_index;
+        next_index += 1;
+        stack.push(start);
+        on_stack[start] = true;
+
+        while let Some(&mut (v, ref mut ci)) = work.last_mut() {
+            if let Some(&w) = children[v].get(*ci) {
+                *ci += 1;
+                if index[w] == usize::MAX {
+                    index[w] = next_index;
+                    low[w] = next_index;
+                    next_index += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == index[v] {
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    comp[w] = comp_count;
+                    if w == v {
+                        break;
+                    }
+                }
+                comp_count += 1;
+            }
+        }
+    }
+
+    // A component is a source when no edge enters it from another component.
+    let mut has_incoming = vec![false; comp_count];
+    for (v, kids) in children.iter().enumerate() {
+        for &w in kids {
+            if comp[v] != comp[w] {
+                has_incoming[comp[w]] = true;
+            }
+        }
+    }
+    let mut rooted = vec![false; comp_count];
+    let mut roots = Vec::new();
+    for (i, key) in unplaced.iter().enumerate() {
+        let c = comp[i];
+        if !has_incoming[c] && !rooted[c] {
+            rooted[c] = true;
+            roots.push(*key);
+        }
+    }
+    roots
 }
 
 fn collect_keys(node: &ExpansionContains, out: &mut HashSet<ConceptKey>) {
@@ -221,6 +326,28 @@ mod tests {
             &edges(&[("root", "leaf"), ("x", "y"), ("y", "x")]),
         );
         assert_eq!(render(&tree), "root(leaf) x(y)");
+    }
+
+    /// A child of a rootless cycle that sorts before the cycle's members must
+    /// stay nested, not also become a root of its own.
+    #[test]
+    fn roots_a_rootless_cycle_not_its_lower_sorting_child() {
+        let tree = nest_expansion(
+            flat(&["a", "m", "n"]),
+            &edges(&[("m", "n"), ("n", "m"), ("n", "a")]),
+        );
+        assert_eq!(render(&tree), "m(n(a))");
+    }
+
+    /// Only the upstream cycle is a source; the cycle below it is reached
+    /// through it and must not be promoted as well.
+    #[test]
+    fn roots_only_the_upstream_cycle_of_a_chain() {
+        let tree = nest_expansion(
+            flat(&["a", "b", "x", "y"]),
+            &edges(&[("x", "y"), ("y", "x"), ("y", "a"), ("a", "b"), ("b", "a")]),
+        );
+        assert_eq!(render(&tree), "x(y(a(b)))");
     }
 
     #[test]

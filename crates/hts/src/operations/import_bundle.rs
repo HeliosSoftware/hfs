@@ -94,7 +94,16 @@ where
             let mut closures_rebuilt = 0usize;
             if finalize {
                 match state.backend.rebuild_missing_closures().await {
-                    Ok(n) => closures_rebuilt = n,
+                    Ok(n) => {
+                        closures_rebuilt = n;
+                        // The handler caches were cleared above, before the
+                        // rebuild; anything answered while it ran was computed
+                        // without the closure. The backend's own
+                        // `invalidate_caches` does not reach these.
+                        if n > 0 {
+                            state.clear_expand_cache();
+                        }
+                    }
                     // Non-fatal: the concepts are stored either way, and the
                     // startup migration will still rebuild. Surfaced in
                     // `errors` so the caller does not assume it succeeded.
