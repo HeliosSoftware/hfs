@@ -13,13 +13,13 @@
       }
     }
   ],
+  "date": "2021-11-02T14:48:59.890Z",
+  "copyright": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
   "artifactReference": {
     "reference": "Evidence/example-stroke-alteplase-fatalICH",
     "type": "Evidence",
     "display": "Critically appraised summary of all-cause mortality in meta-analysis of RCTs of heparin for moderately ill patients with COVID-19"
   },
-  "date": "2021-11-02T14:48:59.890Z",
-  "copyright": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
   "content": [
     {
       "summary": "serious concerns with risk of bias, inconsistency, and imprecision",

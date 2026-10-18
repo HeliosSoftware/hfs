@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="AdministrableProductDefinition"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -479,7 +479,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"></td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="references.html#Reference">Reference</a>(
-            <a href="http.html">Binary</a>)
+            <a href="binary.html">Binary</a>)
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
         </tr>
@@ -500,7 +500,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The status of characteristic e.g. assigned or pending
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The status of characteristic e.g. draft or active
             <br/>Binding: 
             <a href="valueset-publication-status.html">PublicationStatus</a> (
             <a href="terminologies.html#required" title="To be conformant, the concept in this element SHALL be from the specified value set.">Required</a>)
@@ -828,7 +828,7 @@
   <name value="AdministrableProductDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Biomedical Research and Regulation"/>
   <contact>
     <telecom>
@@ -1781,7 +1781,7 @@
     </element>
     <element id="AdministrableProductDefinition.property.status">
       <path value="AdministrableProductDefinition.property.status"/>
-      <short value="The status of characteristic e.g. assigned or pending"/>
+      <short value="The status of characteristic e.g. draft or active"/>
       <definition value="The status of characteristic e.g. assigned or pending."/>
       <min value="0"/>
       <max value="1"/>
@@ -2877,7 +2877,7 @@
     </element>
     <element id="AdministrableProductDefinition.property.status">
       <path value="AdministrableProductDefinition.property.status"/>
-      <short value="The status of characteristic e.g. assigned or pending"/>
+      <short value="The status of characteristic e.g. draft or active"/>
       <definition value="The status of characteristic e.g. assigned or pending."/>
       <min value="0"/>
       <max value="1"/>

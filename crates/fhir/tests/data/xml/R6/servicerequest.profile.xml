@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ServiceRequest"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -984,7 +984,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Requested location
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v3-ServiceDeliveryLocationRoleType.html">ServiceDeliveryLocationRoleType</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v3-ServiceDeliveryLocationRoleType.html">ServiceDeliveryLocationRoleType</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -1231,7 +1231,7 @@
   <name value="ServiceRequest"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -2059,7 +2059,7 @@
       </mapping>
       <mapping>
         <identity value="v2"/>
-        <map value="TQ1.9, RF1-2"/>
+        <map value="TQ1-9, OBR-5, RF1-2"/>
       </mapping>
       <mapping>
         <identity value="rim"/>
@@ -2190,7 +2190,7 @@
       <isSummary value="true"/>
       <mapping>
         <identity value="v2"/>
-        <map value="NTE"/>
+        <map value="NTE; associated OBX where OBX-11=O (parameter code: OBX-3; parameter value: OBX-5)"/>
       </mapping>
     </element>
     <element id="ServiceRequest.orderDetail.id">
@@ -2598,7 +2598,7 @@
       <isSummary value="true"/>
       <mapping>
         <identity value="v2"/>
-        <map value="NTE"/>
+        <map value="ORC-7/OBR-27 (older versions) or TQ1-2"/>
       </mapping>
       <mapping>
         <identity value="rim"/>
@@ -2777,7 +2777,7 @@
       </mapping>
       <mapping>
         <identity value="v2"/>
-        <map value="TQ1/TQ2, OBR-7/OBR-8"/>
+        <map value="TQ1/TQ2; occurrenceTiming: TQ1-13/TQ1-14; occurrenceDateTime: OBR-6"/>
       </mapping>
       <mapping>
         <identity value="rim"/>
@@ -2945,7 +2945,7 @@
       </mapping>
       <mapping>
         <identity value="v2"/>
-        <map value="ORC-12, PRT"/>
+        <map value="ORC-12/OBR-16, PRT"/>
       </mapping>
       <mapping>
         <identity value="rim"/>
@@ -3912,7 +3912,7 @@
       </mapping>
       <mapping>
         <identity value="v2"/>
-        <map value="TQ1.9, RF1-2"/>
+        <map value="TQ1-9, OBR-5, RF1-2"/>
       </mapping>
       <mapping>
         <identity value="rim"/>
@@ -4007,7 +4007,7 @@
       <isSummary value="true"/>
       <mapping>
         <identity value="v2"/>
-        <map value="NTE"/>
+        <map value="NTE; associated OBX where OBX-11=O (parameter code: OBX-3; parameter value: OBX-5)"/>
       </mapping>
     </element>
     <element id="ServiceRequest.orderDetail.parameterFocus[x]">
@@ -4139,7 +4139,7 @@
       <isSummary value="true"/>
       <mapping>
         <identity value="v2"/>
-        <map value="NTE"/>
+        <map value="ORC-7/OBR-27 (older versions) or TQ1-2"/>
       </mapping>
       <mapping>
         <identity value="rim"/>
@@ -4270,7 +4270,7 @@
       </mapping>
       <mapping>
         <identity value="v2"/>
-        <map value="TQ1/TQ2, OBR-7/OBR-8"/>
+        <map value="TQ1/TQ2; occurrenceTiming: TQ1-13/TQ1-14; occurrenceDateTime: OBR-6"/>
       </mapping>
       <mapping>
         <identity value="rim"/>
@@ -4390,7 +4390,7 @@
       </mapping>
       <mapping>
         <identity value="v2"/>
-        <map value="ORC-12, PRT"/>
+        <map value="ORC-12/OBR-16, PRT"/>
       </mapping>
       <mapping>
         <identity value="rim"/>

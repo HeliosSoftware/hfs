@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ImagingStudy"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -834,7 +834,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#unsignedInt">unsignedInt</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The number of this instance in the series
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The number of frames in the instance
             <br/>
           </td>
         </tr>
@@ -887,7 +887,7 @@
   <name value="ImagingStudy"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Imaging Integration"/>
   <contact>
     <telecom>
@@ -2993,7 +2993,7 @@
     </element>
     <element id="ImagingStudy.series.instance.numberOfFrames">
       <path value="ImagingStudy.series.instance.numberOfFrames"/>
-      <short value="The number of this instance in the series"/>
+      <short value="The number of frames in the instance"/>
       <definition value="The number frames in a multiframe image."/>
       <alias value="NumberOfFrames"/>
       <min value="0"/>
@@ -4083,7 +4083,7 @@
     </element>
     <element id="ImagingStudy.series.instance.numberOfFrames">
       <path value="ImagingStudy.series.instance.numberOfFrames"/>
-      <short value="The number of this instance in the series"/>
+      <short value="The number of frames in the instance"/>
       <definition value="The number frames in a multiframe image."/>
       <alias value="NumberOfFrames"/>
       <min value="0"/>

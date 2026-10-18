@@ -27,210 +27,210 @@ The following resources may be in this compartment:
  
         <tr>
           <td>
-            <a href="account.html">Account</a>
+            <a href="account.html">ACCOUNT</a>
           </td>
           <td>subject</td>
         </tr>
  
         <tr>
           <td>
-            <a href="appointment.html">Appointment</a>
+            <a href="appointment.html">APPOINTMENT</a>
           </td>
           <td>actor</td>
         </tr>
  
         <tr>
           <td>
-            <a href="appointmentresponse.html">AppointmentResponse</a>
+            <a href="appointmentresponse.html">APPOINTMENTRESPONSE</a>
           </td>
           <td>actor</td>
         </tr>
  
         <tr>
           <td>
-            <a href="auditevent.html">AuditEvent</a>
+            <a href="auditevent.html">AUDITEVENT</a>
           </td>
           <td>agent</td>
         </tr>
  
         <tr>
           <td>
-            <a href="claim.html">Claim</a>
+            <a href="claim.html">CLAIM</a>
           </td>
           <td>procedure-udi, item-udi, detail-udi, subdetail-udi</td>
         </tr>
  
         <tr>
           <td>
-            <a href="communication.html">Communication</a>
+            <a href="communication.html">COMMUNICATION</a>
           </td>
           <td>sender, recipient</td>
         </tr>
  
         <tr>
           <td>
-            <a href="communicationrequest.html">CommunicationRequest</a>
+            <a href="communicationrequest.html">COMMUNICATIONREQUEST</a>
           </td>
           <td>information-provider, recipient</td>
         </tr>
  
         <tr>
           <td>
-            <a href="composition.html">Composition</a>
+            <a href="composition.html">COMPOSITION</a>
           </td>
           <td>author</td>
         </tr>
  
         <tr>
           <td>
-            <a href="detectedissue.html">DetectedIssue</a>
+            <a href="detectedissue.html">DETECTEDISSUE</a>
           </td>
           <td>author</td>
         </tr>
  
         <tr>
           <td>
-            <a href="device.html">Device</a>
+            <a href="device.html">DEVICE</a>
           </td>
           <td>{def}</td>
         </tr>
  
         <tr>
           <td>
-            <a href="devicealert.html">DeviceAlert</a>
+            <a href="devicealert.html">DEVICEALERT</a>
           </td>
           <td>subject, device, annunciator-device, acknowledged-by</td>
         </tr>
  
         <tr>
           <td>
-            <a href="deviceassociation.html">DeviceAssociation</a>
+            <a href="deviceassociation.html">DEVICEASSOCIATION</a>
           </td>
           <td>device, focus</td>
         </tr>
  
         <tr>
           <td>
-            <a href="devicemetric.html">DeviceMetric</a>
+            <a href="devicemetric.html">DEVICEMETRIC</a>
           </td>
           <td>device</td>
         </tr>
  
         <tr>
           <td>
-            <a href="devicerequest.html">DeviceRequest</a>
+            <a href="devicerequest.html">DEVICEREQUEST</a>
           </td>
           <td>subject, requester, performer, device</td>
         </tr>
  
         <tr>
           <td>
-            <a href="diagnosticreport.html">DiagnosticReport</a>
+            <a href="diagnosticreport.html">DIAGNOSTICREPORT</a>
           </td>
           <td>subject</td>
         </tr>
  
         <tr>
           <td>
-            <a href="documentreference.html">DocumentReference</a>
+            <a href="documentreference.html">DOCUMENTREFERENCE</a>
           </td>
           <td>subject, author</td>
         </tr>
  
         <tr>
           <td>
-            <a href="explanationofbenefit.html">ExplanationOfBenefit</a>
+            <a href="explanationofbenefit.html">EXPLANATIONOFBENEFIT</a>
           </td>
           <td>procedure-udi, item-udi, detail-udi, subdetail-udi</td>
         </tr>
  
         <tr>
           <td>
-            <a href="flag.html">Flag</a>
+            <a href="flag.html">FLAG</a>
           </td>
           <td>author</td>
         </tr>
  
         <tr>
           <td>
-            <a href="group.html">Group</a>
+            <a href="group.html">GROUP</a>
           </td>
           <td>member</td>
         </tr>
  
         <tr>
           <td>
-            <a href="list.html">List</a>
+            <a href="list.html">LIST</a>
           </td>
           <td>subject, source</td>
         </tr>
  
         <tr>
           <td>
-            <a href="messageheader.html">MessageHeader</a>
+            <a href="messageheader.html">MESSAGEHEADER</a>
           </td>
           <td>receiver</td>
         </tr>
  
         <tr>
           <td>
-            <a href="observation.html">Observation</a>
+            <a href="observation.html">OBSERVATION</a>
           </td>
           <td>subject, device</td>
         </tr>
  
         <tr>
           <td>
-            <a href="provenance.html">Provenance</a>
+            <a href="provenance.html">PROVENANCE</a>
           </td>
           <td>agent</td>
         </tr>
  
         <tr>
           <td>
-            <a href="questionnaireresponse.html">QuestionnaireResponse</a>
+            <a href="questionnaireresponse.html">QUESTIONNAIRERESPONSE</a>
           </td>
           <td>author</td>
         </tr>
  
         <tr>
           <td>
-            <a href="requestorchestration.html">RequestOrchestration</a>
+            <a href="requestorchestration.html">REQUESTORCHESTRATION</a>
           </td>
           <td>author</td>
         </tr>
  
         <tr>
           <td>
-            <a href="researchsubject.html">ResearchSubject</a>
+            <a href="researchsubject.html">RESEARCHSUBJECT</a>
           </td>
           <td>subject</td>
         </tr>
  
         <tr>
           <td>
-            <a href="riskassessment.html">RiskAssessment</a>
+            <a href="riskassessment.html">RISKASSESSMENT</a>
           </td>
           <td>performer</td>
         </tr>
  
         <tr>
           <td>
-            <a href="schedule.html">Schedule</a>
+            <a href="schedule.html">SCHEDULE</a>
           </td>
           <td>actor</td>
         </tr>
  
         <tr>
           <td>
-            <a href="servicerequest.html">ServiceRequest</a>
+            <a href="servicerequest.html">SERVICEREQUEST</a>
           </td>
           <td>performer, requester</td>
         </tr>
  
         <tr>
           <td>
-            <a href="specimen.html">Specimen</a>
+            <a href="specimen.html">SPECIMEN</a>
           </td>
           <td>subject</td>
         </tr>
@@ -252,359 +252,359 @@ The following resources are never in this compartment:
       <ul>
  
         <li>
-          <a href="activitydefinition.html">ActivityDefinition</a>
+          <a href="activitydefinition.html">ACTIVITYDEFINITION</a>
         </li>
  
         <li>
-          <a href="actordefinition.html">ActorDefinition</a>
+          <a href="actordefinition.html">ACTORDEFINITION</a>
         </li>
  
         <li>
-          <a href="administrableproductdefinition.html">AdministrableProductDefinition</a>
+          <a href="administrableproductdefinition.html">ADMINISTRABLEPRODUCTDEFINITION</a>
         </li>
  
         <li>
-          <a href="adverseevent.html">AdverseEvent</a>
+          <a href="adverseevent.html">ADVERSEEVENT</a>
         </li>
  
         <li>
-          <a href="allergyintolerance.html">AllergyIntolerance</a>
+          <a href="allergyintolerance.html">ALLERGYINTOLERANCE</a>
         </li>
  
         <li>
-          <a href="artifactassessment.html">ArtifactAssessment</a>
+          <a href="artifactassessment.html">ARTIFACTASSESSMENT</a>
         </li>
  
         <li>
-          <a href="basic.html">Basic</a>
+          <a href="basic.html">BASIC</a>
         </li>
  
         <li>
-          <a href="binary.html">Binary</a>
+          <a href="binary.html">BINARY</a>
         </li>
  
         <li>
-          <a href="biologicallyderivedproduct.html">BiologicallyDerivedProduct</a>
+          <a href="biologicallyderivedproduct.html">BIOLOGICALLYDERIVEDPRODUCT</a>
         </li>
  
         <li>
-          <a href="bodystructure.html">BodyStructure</a>
+          <a href="bodystructure.html">BODYSTRUCTURE</a>
         </li>
  
         <li>
-          <a href="bundle.html">Bundle</a>
+          <a href="bundle.html">BUNDLE</a>
         </li>
  
         <li>
-          <a href="capabilitystatement.html">CapabilityStatement</a>
+          <a href="capabilitystatement.html">CAPABILITYSTATEMENT</a>
         </li>
  
         <li>
-          <a href="careplan.html">CarePlan</a>
+          <a href="careplan.html">CAREPLAN</a>
         </li>
  
         <li>
-          <a href="careteam.html">CareTeam</a>
+          <a href="careteam.html">CARETEAM</a>
         </li>
  
         <li>
-          <a href="claimresponse.html">ClaimResponse</a>
+          <a href="claimresponse.html">CLAIMRESPONSE</a>
         </li>
  
         <li>
-          <a href="clinicalusedefinition.html">ClinicalUseDefinition</a>
+          <a href="clinicalusedefinition.html">CLINICALUSEDEFINITION</a>
         </li>
  
         <li>
-          <a href="codesystem.html">CodeSystem</a>
+          <a href="codesystem.html">CODESYSTEM</a>
         </li>
  
         <li>
-          <a href="compartmentdefinition.html">CompartmentDefinition</a>
+          <a href="compartmentdefinition.html">COMPARTMENTDEFINITION</a>
         </li>
  
         <li>
-          <a href="conceptmap.html">ConceptMap</a>
+          <a href="conceptmap.html">CONCEPTMAP</a>
         </li>
  
         <li>
-          <a href="condition.html">Condition</a>
+          <a href="condition.html">CONDITION</a>
         </li>
  
         <li>
-          <a href="consent.html">Consent</a>
+          <a href="consent.html">CONSENT</a>
         </li>
  
         <li>
-          <a href="coverage.html">Coverage</a>
+          <a href="coverage.html">COVERAGE</a>
         </li>
  
         <li>
-          <a href="coverageeligibilityrequest.html">CoverageEligibilityRequest</a>
+          <a href="coverageeligibilityrequest.html">COVERAGEELIGIBILITYREQUEST</a>
         </li>
  
         <li>
-          <a href="coverageeligibilityresponse.html">CoverageEligibilityResponse</a>
+          <a href="coverageeligibilityresponse.html">COVERAGEELIGIBILITYRESPONSE</a>
         </li>
  
         <li>
-          <a href="devicedefinition.html">DeviceDefinition</a>
+          <a href="devicedefinition.html">DEVICEDEFINITION</a>
         </li>
  
         <li>
-          <a href="encounter.html">Encounter</a>
+          <a href="encounter.html">ENCOUNTER</a>
         </li>
  
         <li>
-          <a href="endpoint.html">Endpoint</a>
+          <a href="endpoint.html">ENDPOINT</a>
         </li>
  
         <li>
-          <a href="episodeofcare.html">EpisodeOfCare</a>
+          <a href="episodeofcare.html">EPISODEOFCARE</a>
         </li>
  
         <li>
-          <a href="eventdefinition.html">EventDefinition</a>
+          <a href="eventdefinition.html">EVENTDEFINITION</a>
         </li>
  
         <li>
-          <a href="evidence.html">Evidence</a>
+          <a href="evidence.html">EVIDENCE</a>
         </li>
  
         <li>
-          <a href="evidencevariable.html">EvidenceVariable</a>
+          <a href="evidencevariable.html">EVIDENCEVARIABLE</a>
         </li>
  
         <li>
-          <a href="examplescenario.html">ExampleScenario</a>
+          <a href="examplescenario.html">EXAMPLESCENARIO</a>
         </li>
  
         <li>
-          <a href="familymemberhistory.html">FamilyMemberHistory</a>
+          <a href="familymemberhistory.html">FAMILYMEMBERHISTORY</a>
         </li>
  
         <li>
-          <a href="goal.html">Goal</a>
+          <a href="goal.html">GOAL</a>
         </li>
  
         <li>
-          <a href="guidanceresponse.html">GuidanceResponse</a>
+          <a href="guidanceresponse.html">GUIDANCERESPONSE</a>
         </li>
  
         <li>
-          <a href="healthcareservice.html">HealthcareService</a>
+          <a href="healthcareservice.html">HEALTHCARESERVICE</a>
         </li>
  
         <li>
-          <a href="imagingselection.html">ImagingSelection</a>
+          <a href="imagingselection.html">IMAGINGSELECTION</a>
         </li>
  
         <li>
-          <a href="imagingstudy.html">ImagingStudy</a>
+          <a href="imagingstudy.html">IMAGINGSTUDY</a>
         </li>
  
         <li>
-          <a href="immunization.html">Immunization</a>
+          <a href="immunization.html">IMMUNIZATION</a>
         </li>
  
         <li>
-          <a href="implementationguide.html">ImplementationGuide</a>
+          <a href="implementationguide.html">IMPLEMENTATIONGUIDE</a>
         </li>
  
         <li>
-          <a href="ingredient.html">Ingredient</a>
+          <a href="ingredient.html">INGREDIENT</a>
         </li>
  
         <li>
-          <a href="library.html">Library</a>
+          <a href="library.html">LIBRARY</a>
         </li>
  
         <li>
-          <a href="location.html">Location</a>
+          <a href="location.html">LOCATION</a>
         </li>
  
         <li>
-          <a href="manufactureditemdefinition.html">ManufacturedItemDefinition</a>
+          <a href="manufactureditemdefinition.html">MANUFACTUREDITEMDEFINITION</a>
         </li>
  
         <li>
-          <a href="measure.html">Measure</a>
+          <a href="measure.html">MEASURE</a>
         </li>
  
         <li>
-          <a href="measurereport.html">MeasureReport</a>
+          <a href="measurereport.html">MEASUREREPORT</a>
         </li>
  
         <li>
-          <a href="medication.html">Medication</a>
+          <a href="medication.html">MEDICATION</a>
         </li>
  
         <li>
-          <a href="medicationadministration.html">MedicationAdministration</a>
+          <a href="medicationadministration.html">MEDICATIONADMINISTRATION</a>
         </li>
  
         <li>
-          <a href="medicationdispense.html">MedicationDispense</a>
+          <a href="medicationdispense.html">MEDICATIONDISPENSE</a>
         </li>
  
         <li>
-          <a href="medicationrequest.html">MedicationRequest</a>
+          <a href="medicationrequest.html">MEDICATIONREQUEST</a>
         </li>
  
         <li>
-          <a href="medicationstatement.html">MedicationStatement</a>
+          <a href="medicationstatement.html">MEDICATIONSTATEMENT</a>
         </li>
  
         <li>
-          <a href="medicinalproductdefinition.html">MedicinalProductDefinition</a>
+          <a href="medicinalproductdefinition.html">MEDICINALPRODUCTDEFINITION</a>
         </li>
  
         <li>
-          <a href="messagedefinition.html">MessageDefinition</a>
+          <a href="messagedefinition.html">MESSAGEDEFINITION</a>
         </li>
  
         <li>
-          <a href="namingsystem.html">NamingSystem</a>
+          <a href="namingsystem.html">NAMINGSYSTEM</a>
         </li>
  
         <li>
-          <a href="nutritionintake.html">NutritionIntake</a>
+          <a href="nutritionintake.html">NUTRITIONINTAKE</a>
         </li>
  
         <li>
-          <a href="nutritionorder.html">NutritionOrder</a>
+          <a href="nutritionorder.html">NUTRITIONORDER</a>
         </li>
  
         <li>
-          <a href="nutritionproduct.html">NutritionProduct</a>
+          <a href="nutritionproduct.html">NUTRITIONPRODUCT</a>
         </li>
  
         <li>
-          <a href="observationdefinition.html">ObservationDefinition</a>
+          <a href="observationdefinition.html">OBSERVATIONDEFINITION</a>
         </li>
  
         <li>
-          <a href="operationdefinition.html">OperationDefinition</a>
+          <a href="operationdefinition.html">OPERATIONDEFINITION</a>
         </li>
  
         <li>
-          <a href="operationoutcome.html">OperationOutcome</a>
+          <a href="operationoutcome.html">OPERATIONOUTCOME</a>
         </li>
  
         <li>
-          <a href="organization.html">Organization</a>
+          <a href="organization.html">ORGANIZATION</a>
         </li>
  
         <li>
-          <a href="organizationaffiliation.html">OrganizationAffiliation</a>
+          <a href="organizationaffiliation.html">ORGANIZATIONAFFILIATION</a>
         </li>
  
         <li>
-          <a href="packagedproductdefinition.html">PackagedProductDefinition</a>
+          <a href="packagedproductdefinition.html">PACKAGEDPRODUCTDEFINITION</a>
         </li>
  
         <li>
-          <a href="patient.html">Patient</a>
+          <a href="patient.html">PATIENT</a>
         </li>
  
         <li>
-          <a href="paymentnotice.html">PaymentNotice</a>
+          <a href="paymentnotice.html">PAYMENTNOTICE</a>
         </li>
  
         <li>
-          <a href="paymentreconciliation.html">PaymentReconciliation</a>
+          <a href="paymentreconciliation.html">PAYMENTRECONCILIATION</a>
         </li>
  
         <li>
-          <a href="person.html">Person</a>
+          <a href="person.html">PERSON</a>
         </li>
  
         <li>
-          <a href="plandefinition.html">PlanDefinition</a>
+          <a href="plandefinition.html">PLANDEFINITION</a>
         </li>
  
         <li>
-          <a href="practitioner.html">Practitioner</a>
+          <a href="practitioner.html">PRACTITIONER</a>
         </li>
  
         <li>
-          <a href="practitionerrole.html">PractitionerRole</a>
+          <a href="practitionerrole.html">PRACTITIONERROLE</a>
         </li>
  
         <li>
-          <a href="procedure.html">Procedure</a>
+          <a href="procedure.html">PROCEDURE</a>
         </li>
  
         <li>
-          <a href="questionnaire.html">Questionnaire</a>
+          <a href="questionnaire.html">QUESTIONNAIRE</a>
         </li>
  
         <li>
-          <a href="regulatedauthorization.html">RegulatedAuthorization</a>
+          <a href="regulatedauthorization.html">REGULATEDAUTHORIZATION</a>
         </li>
  
         <li>
-          <a href="relatedperson.html">RelatedPerson</a>
+          <a href="relatedperson.html">RELATEDPERSON</a>
         </li>
  
         <li>
-          <a href="requirements.html">Requirements</a>
+          <a href="requirements.html">REQUIREMENTS</a>
         </li>
  
         <li>
-          <a href="researchstudy.html">ResearchStudy</a>
+          <a href="researchstudy.html">RESEARCHSTUDY</a>
         </li>
  
         <li>
-          <a href="searchparameter.html">SearchParameter</a>
+          <a href="searchparameter.html">SEARCHPARAMETER</a>
         </li>
  
         <li>
-          <a href="slot.html">Slot</a>
+          <a href="slot.html">SLOT</a>
         </li>
  
         <li>
-          <a href="specimendefinition.html">SpecimenDefinition</a>
+          <a href="specimendefinition.html">SPECIMENDEFINITION</a>
         </li>
  
         <li>
-          <a href="structuredefinition.html">StructureDefinition</a>
+          <a href="structuredefinition.html">STRUCTUREDEFINITION</a>
         </li>
  
         <li>
-          <a href="subscription.html">Subscription</a>
+          <a href="subscription.html">SUBSCRIPTION</a>
         </li>
  
         <li>
-          <a href="subscriptionstatus.html">SubscriptionStatus</a>
+          <a href="subscriptionstatus.html">SUBSCRIPTIONSTATUS</a>
         </li>
  
         <li>
-          <a href="subscriptiontopic.html">SubscriptionTopic</a>
+          <a href="subscriptiontopic.html">SUBSCRIPTIONTOPIC</a>
         </li>
  
         <li>
-          <a href="substance.html">Substance</a>
+          <a href="substance.html">SUBSTANCE</a>
         </li>
  
         <li>
-          <a href="substancedefinition.html">SubstanceDefinition</a>
+          <a href="substancedefinition.html">SUBSTANCEDEFINITION</a>
         </li>
  
         <li>
-          <a href="task.html">Task</a>
+          <a href="task.html">TASK</a>
         </li>
  
         <li>
-          <a href="terminologycapabilities.html">TerminologyCapabilities</a>
+          <a href="terminologycapabilities.html">TERMINOLOGYCAPABILITIES</a>
         </li>
  
         <li>
-          <a href="valueset.html">ValueSet</a>
+          <a href="valueset.html">VALUESET</a>
         </li>
  
         <li>
-          <a href="visionprescription.html">VisionPrescription</a>
+          <a href="visionprescription.html">VISIONPRESCRIPTION</a>
         </li>
 
       </ul>
@@ -618,7 +618,7 @@ The following resources are never in this compartment:
   <name value="Base FHIR compartment definition for Device"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>

@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "resource-status",
   "meta": {
-    "lastUpdated": "2026-09-14T16:43:45.341+00:00"
+    "lastUpdated": "2026-10-17T20:58:40.703+00:00"
   },
   "text": {
     "status": "generated",
@@ -30,7 +30,7 @@
   "title": "Canonical Status Codes for FHIR Resources",
   "status": "active",
   "experimental": true,
-  "date": "2026-09-14T16:43:45+00:00",
+  "date": "2026-10-17T20:58:40+00:00",
   "publisher": "FHIR Project",
   "contact": [
     {

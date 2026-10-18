@@ -2,11 +2,11 @@
   "resourceType": "ValueSet",
   "id": "report-codes",
   "meta": {
-    "lastUpdated": "2026-09-14T16:43:45.341+00:00"
+    "lastUpdated": "2026-10-17T20:58:40.703+00:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet report-codes\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"report-codes\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcreport-codes\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where STATUS  \u003d ACTIVE, ORDER_OBS  in Order,Both and CLASSTYPE  in 1,2\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet report-codes\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"report-codes\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcreport-codes\"\u003e \u003c/a\u003e\u003cp\u003eThis value set includes codes based on the following rules:\u003c/p\u003e\u003cul\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where STATUS  \u003d ACTIVE, ORDER_OBS  \u003d Order and CLASSTYPE  \u003d 1\u003c/li\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where STATUS  \u003d ACTIVE, ORDER_OBS  \u003d Order and CLASSTYPE  \u003d 2\u003c/li\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where STATUS  \u003d ACTIVE, ORDER_OBS  \u003d Both and CLASSTYPE  \u003d 1\u003c/li\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where STATUS  \u003d ACTIVE, ORDER_OBS  \u003d Both and CLASSTYPE  \u003d 2\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -76,13 +76,73 @@
           },
           {
             "property": "ORDER_OBS",
-            "op": "in",
-            "value": "Order,Both"
+            "op": "\u003d",
+            "value": "Order"
           },
           {
             "property": "CLASSTYPE",
-            "op": "in",
-            "value": "1,2"
+            "op": "\u003d",
+            "value": "1"
+          }
+        ]
+      },
+      {
+        "system": "http://loinc.org",
+        "filter": [
+          {
+            "property": "STATUS",
+            "op": "\u003d",
+            "value": "ACTIVE"
+          },
+          {
+            "property": "ORDER_OBS",
+            "op": "\u003d",
+            "value": "Order"
+          },
+          {
+            "property": "CLASSTYPE",
+            "op": "\u003d",
+            "value": "2"
+          }
+        ]
+      },
+      {
+        "system": "http://loinc.org",
+        "filter": [
+          {
+            "property": "STATUS",
+            "op": "\u003d",
+            "value": "ACTIVE"
+          },
+          {
+            "property": "ORDER_OBS",
+            "op": "\u003d",
+            "value": "Both"
+          },
+          {
+            "property": "CLASSTYPE",
+            "op": "\u003d",
+            "value": "1"
+          }
+        ]
+      },
+      {
+        "system": "http://loinc.org",
+        "filter": [
+          {
+            "property": "STATUS",
+            "op": "\u003d",
+            "value": "ACTIVE"
+          },
+          {
+            "property": "ORDER_OBS",
+            "op": "\u003d",
+            "value": "Both"
+          },
+          {
+            "property": "CLASSTYPE",
+            "op": "\u003d",
+            "value": "2"
           }
         ]
       }

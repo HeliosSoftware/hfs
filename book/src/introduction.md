@@ -38,7 +38,7 @@ The project ships several standalone tools:
 | FHIR R4 (4.0.1) | ✅ Default |
 | FHIR R4B (4.3.0) | ✅ Supported |
 | FHIR R5 (5.0.0) | ✅ Supported |
-| FHIR R6 (6.0.0-ballot2) | ✅ Supported |
+| FHIR R6 (6.0.0-snapshot1) | ✅ Supported |
 
 ---
 

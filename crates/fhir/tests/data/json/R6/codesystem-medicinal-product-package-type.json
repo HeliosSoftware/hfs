@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "medicinal-product-package-type",
   "meta": {
-    "lastUpdated": "2026-09-15T03:43:45.341+11:00"
+    "lastUpdated": "2026-10-18T07:58:40.703+11:00"
   },
   "text": {
     "status": "generated",

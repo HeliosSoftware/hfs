@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="MeasureReport"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -506,7 +506,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">process | outcome | structure | patient-reported-outcome
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-type.html">MeasureType</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-measure-type.html">MeasureType</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -561,7 +561,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">What scoring method (e.g. proportion, ratio, continuous-variable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-scoring.html">Measure Scoring</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-measure-scoring.html">Measure Scoring</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -585,7 +585,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">opportunity | all-or-nothing | linear | weighted
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-composite-measure-scoring.html">CompositeMeasureScoring</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-composite-measure-scoring.html">CompositeMeasureScoring</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -609,7 +609,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">increase | decrease
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-improvement-notation.html" title="Observation values that indicate what change in a measurement value or score is indicative of an improvement in the measured item or scored issue.">MeasureImprovementNotation</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-measure-improvement-notation.html" title="Observation values that indicate what change in a measurement value or score is indicative of an improvement in the measured item or scored issue.">MeasureImprovementNotation</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -719,7 +719,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">initial-population | numerator | numerator-exclusion | denominator | denominator-exclusion | denominator-exception | measure-population | measure-population-exclusion | measure-observation
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-population.html">MeasurePopulationType</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-measure-population.html">MeasurePopulationType</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1152,7 +1152,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"></td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The stratum value, e.g. male
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The stratum value, e.g. northwest
             <br/>Binding: 
             <a href="valueset-measurereport-stratifier-value-example.html">Measure Report Stratifier Value Example</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
@@ -1400,7 +1400,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">1..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"></td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The stratum component value, e.g. male
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The stratum component value, e.g. northwest
             <br/>Binding: 
             <a href="valueset-measurereport-stratifier-value-example.html">Measure Report Stratifier Value Example</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
@@ -1614,7 +1614,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">initial-population | numerator | numerator-exclusion | denominator | denominator-exclusion | denominator-exception | measure-population | measure-population-exclusion | measure-observation
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-measure-population.html">MeasurePopulationType</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-measure-population.html">MeasurePopulationType</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -1977,7 +1977,7 @@
   <name value="MeasureReport"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Clinical Quality Information"/>
   <contact>
     <telecom>
@@ -4236,7 +4236,7 @@
     </element>
     <element id="MeasureReport.group.stratifier.stratum.value[x]">
       <path value="MeasureReport.group.stratifier.stratum.value[x]"/>
-      <short value="The stratum value, e.g. male"/>
+      <short value="The stratum value, e.g. northwest"/>
       <definition value="The value for this stratum, expressed as a CodeableConcept. When defining stratifiers on complex values, the value must be rendered such that the value for each stratum within the stratifier is unique."/>
       <comment value="Note that the string choice for stratum values should only be used when the data would not typically be coded; use CodeableConcept for data that would typically be coded, but a code is not known."/>
       <min value="0"/>
@@ -4525,7 +4525,7 @@
     </element>
     <element id="MeasureReport.group.stratifier.stratum.component.value[x]">
       <path value="MeasureReport.group.stratifier.stratum.component.value[x]"/>
-      <short value="The stratum component value, e.g. male"/>
+      <short value="The stratum component value, e.g. northwest"/>
       <definition value="The stratum component value."/>
       <comment value="Note that the string choice for stratum values should only be used when the data would not typically be coded; use CodeableConcept for data that would typically be coded, but a code is not known."/>
       <min value="1"/>
@@ -6023,7 +6023,7 @@
     </element>
     <element id="MeasureReport.group.stratifier.stratum.value[x]">
       <path value="MeasureReport.group.stratifier.stratum.value[x]"/>
-      <short value="The stratum value, e.g. male"/>
+      <short value="The stratum value, e.g. northwest"/>
       <definition value="The value for this stratum, expressed as a CodeableConcept. When defining stratifiers on complex values, the value must be rendered such that the value for each stratum within the stratifier is unique."/>
       <comment value="Note that the string choice for stratum values should only be used when the data would not typically be coded; use CodeableConcept for data that would typically be coded, but a code is not known."/>
       <min value="0"/>
@@ -6144,7 +6144,7 @@
     </element>
     <element id="MeasureReport.group.stratifier.stratum.component.value[x]">
       <path value="MeasureReport.group.stratifier.stratum.component.value[x]"/>
-      <short value="The stratum component value, e.g. male"/>
+      <short value="The stratum component value, e.g. northwest"/>
       <definition value="The stratum component value."/>
       <comment value="Note that the string choice for stratum values should only be used when the data would not typically be coded; use CodeableConcept for data that would typically be coded, but a code is not known."/>
       <min value="1"/>

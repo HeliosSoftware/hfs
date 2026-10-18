@@ -22,7 +22,7 @@
     }
   ],
   "status": "on-hold",
-  "notPerformedReason": {
+  "statusReason": {
     "reference": {
       "reference": "DetectedIssue/allergy"
     }

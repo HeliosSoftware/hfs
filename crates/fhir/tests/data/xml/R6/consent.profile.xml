@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Consent"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -199,7 +199,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="Consent.grantor : The entity responsible for granting the rights listed in a Consent Directive.">grantor</span>
+            <span title="Consent.grantor : The agent responsible for granting the rights listed in a Consent Directive.">grantor</span>
             <a name="Consent.grantor"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -228,7 +228,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: white; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="Consent.grantee : The entity responsible for complying with the Consent Directive, including any obligations or limitations on authorizations and enforcement of prohibitions.">grantee</span>
+            <span title="Consent.grantee : The agent responsible for complying with the Consent Directive, including any obligations or limitations on authorizations and enforcement of prohibitions.">grantee</span>
             <a name="Consent.grantee"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -443,7 +443,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPQfAOvGUf7ztuvPMf/78/fkl/Pbg+u8Rvjqteu2Pf3zxPz36Pz0z+vTmPzurPvuw/npofbjquvNefHVduuyN+uuMu3Oafbgjfnqvf/3zv/3xevPi+vRjP/20/bmsP///wD/ACH5BAEKAB8ALAAAAAAQABAAAAVl4CeOZGme5qCqqDg8jyVJaz1876DsmAQAgqDgltspMEhMJoMZ4iy6I1AooFCIv+wKybziALVAoAEjYLwDgGIpJhMslgxaLR4/3rMAWoBp32V5exg8Shl1ckRUQVaMVkQ2kCstKCEAOw==" alt="." style="background-color: white; background-color: inherit" title="Element" class="hierarchy"/> 
-            <span title="Consent.verification : Whether the consent instructions/rules (e.g. artificial respiration: yes or no) have been verified with the patient, his/her family, or another authorized person.">verification</span>
+            <span title="Consent.verification : Whether the consent instructions/rules (e.g. artificial respiration: yes or no) have been verified with the patient, his/her family, or another authorized agent.">verification</span>
             <a name="Consent.verification"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -453,7 +453,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="types.html#BackBoneElement">BackboneElement</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Consent verified by patient (or another authorized person)
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Consent verified by patient or another authorized agent
             <br/>
             <br/>
           </td>
@@ -465,7 +465,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="Consent.verification.verified : Has the instruction been verified.">verified</span>
+            <span title="Consent.verification.verified : Have the consent provisions been verified as correct and authentic.">verified</span>
             <a name="Consent.verification.verified"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -508,7 +508,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="Consent.verification.verifiedBy : The person who conducted the verification/validation of the Grantor decision.">verifiedBy</span>
+            <span title="Consent.verification.verifiedBy : The person or agent who conducted the verification/validation of the Grantor decision as listed in .verifiedWith. This agent will have interviewed or in some other way captured the verification information.">verifiedBy</span>
             <a name="Consent.verification.verifiedBy"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -517,9 +517,10 @@
             <a href="references.html#Reference">Reference</a>(
             <a href="organization.html">Organization</a> | 
             <a href="practitioner.html">Practitioner</a> | 
-            <a href="practitionerrole.html">PractitionerRole</a>)
+            <a href="practitionerrole.html">PractitionerRole</a> | 
+            <a href="device.html">Device</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Person conducting verification
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Person or agent conducting verification
             <br/>
           </td>
         </tr>
@@ -530,7 +531,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: white; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="Consent.verification.verifiedWith : Who verified the instruction (Patient, Relative or other Authorized Person).">verifiedWith</span>
+            <span title="Consent.verification.verifiedWith : Who verified the patient's provisions as correct and authentic. This may be a Patient, Relative, or other Authorized agent.">verifiedWith</span>
             <a name="Consent.verification.verifiedWith"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -773,7 +774,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Context of activities covered by this provision
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v3-PurposeOfUse.html">PurposeOfUse</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v3-PurposeOfUse.html">PurposeOfUse</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -994,7 +995,7 @@
   <name value="Consent"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Security"/>
   <contact>
     <telecom>
@@ -1619,7 +1620,7 @@
     <element id="Consent.grantor">
       <path value="Consent.grantor"/>
       <short value="Who is granting rights according to the policy and rules"/>
-      <definition value="The entity responsible for granting the rights listed in a Consent Directive."/>
+      <definition value="The agent responsible for granting the rights listed in a Consent Directive."/>
       <alias value="grantor"/>
       <min value="0"/>
       <max value="*"/>
@@ -1653,7 +1654,7 @@
     <element id="Consent.grantee">
       <path value="Consent.grantee"/>
       <short value="Who is agreeing to the policy and rules"/>
-      <definition value="The entity responsible for complying with the Consent Directive, including any obligations or limitations on authorizations and enforcement of prohibitions."/>
+      <definition value="The agent responsible for complying with the Consent Directive, including any obligations or limitations on authorizations and enforcement of prohibitions."/>
       <comment value="In a fully computable consent, both grantee and grantor  will be listed as actors within the consent. The Grantee and Grantor elements are for ease of search only."/>
       <alias value="grantee"/>
       <min value="0"/>
@@ -2062,8 +2063,8 @@
     </element>
     <element id="Consent.verification">
       <path value="Consent.verification"/>
-      <short value="Consent verified by patient (or another authorized person)"/>
-      <definition value="Whether the consent instructions/rules (e.g. artificial respiration: yes or no) have been verified with the patient, his/her family, or another authorized person."/>
+      <short value="Consent verified by patient or another authorized agent"/>
+      <definition value="Whether the consent instructions/rules (e.g. artificial respiration: yes or no) have been verified with the patient, his/her family, or another authorized agent."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2196,7 +2197,7 @@
     <element id="Consent.verification.verified">
       <path value="Consent.verification.verified"/>
       <short value="Has been verified"/>
-      <definition value="Has the instruction been verified."/>
+      <definition value="Have the consent provisions been verified as correct and authentic."/>
       <min value="1"/>
       <max value="1"/>
       <base>
@@ -2254,8 +2255,8 @@
     </element>
     <element id="Consent.verification.verifiedBy">
       <path value="Consent.verification.verifiedBy"/>
-      <short value="Person conducting verification"/>
-      <definition value="The person who conducted the verification/validation of the Grantor decision."/>
+      <short value="Person or agent conducting verification"/>
+      <definition value="The person or agent who conducted the verification/validation of the Grantor decision as listed in .verifiedWith. This agent will have interviewed or in some other way captured the verification information."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2268,6 +2269,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Organization"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Practitioner"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/PractitionerRole"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -2283,7 +2285,7 @@
     <element id="Consent.verification.verifiedWith">
       <path value="Consent.verification.verifiedWith"/>
       <short value="Person who verified"/>
-      <definition value="Who verified the instruction (Patient, Relative or other Authorized Person)."/>
+      <definition value="Who verified the patient's provisions as correct and authentic. This may be a Patient, Relative, or other Authorized agent."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -3389,7 +3391,7 @@
     <element id="Consent.grantor">
       <path value="Consent.grantor"/>
       <short value="Who is granting rights according to the policy and rules"/>
-      <definition value="The entity responsible for granting the rights listed in a Consent Directive."/>
+      <definition value="The agent responsible for granting the rights listed in a Consent Directive."/>
       <alias value="grantor"/>
       <min value="0"/>
       <max value="*"/>
@@ -3411,7 +3413,7 @@
     <element id="Consent.grantee">
       <path value="Consent.grantee"/>
       <short value="Who is agreeing to the policy and rules"/>
-      <definition value="The entity responsible for complying with the Consent Directive, including any obligations or limitations on authorizations and enforcement of prohibitions."/>
+      <definition value="The agent responsible for complying with the Consent Directive, including any obligations or limitations on authorizations and enforcement of prohibitions."/>
       <comment value="In a fully computable consent, both grantee and grantor  will be listed as actors within the consent. The Grantee and Grantor elements are for ease of search only."/>
       <alias value="grantee"/>
       <min value="0"/>
@@ -3592,8 +3594,8 @@
     </element>
     <element id="Consent.verification">
       <path value="Consent.verification"/>
-      <short value="Consent verified by patient (or another authorized person)"/>
-      <definition value="Whether the consent instructions/rules (e.g. artificial respiration: yes or no) have been verified with the patient, his/her family, or another authorized person."/>
+      <short value="Consent verified by patient or another authorized agent"/>
+      <definition value="Whether the consent instructions/rules (e.g. artificial respiration: yes or no) have been verified with the patient, his/her family, or another authorized agent."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -3606,7 +3608,7 @@
     <element id="Consent.verification.verified">
       <path value="Consent.verification.verified"/>
       <short value="Has been verified"/>
-      <definition value="Has the instruction been verified."/>
+      <definition value="Have the consent provisions been verified as correct and authentic."/>
       <min value="1"/>
       <max value="1"/>
       <type>
@@ -3640,8 +3642,8 @@
     </element>
     <element id="Consent.verification.verifiedBy">
       <path value="Consent.verification.verifiedBy"/>
-      <short value="Person conducting verification"/>
-      <definition value="The person who conducted the verification/validation of the Grantor decision."/>
+      <short value="Person or agent conducting verification"/>
+      <definition value="The person or agent who conducted the verification/validation of the Grantor decision as listed in .verifiedWith. This agent will have interviewed or in some other way captured the verification information."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -3649,6 +3651,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Organization"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Practitioner"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/PractitionerRole"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
@@ -3657,7 +3660,7 @@
     <element id="Consent.verification.verifiedWith">
       <path value="Consent.verification.verifiedWith"/>
       <short value="Person who verified"/>
-      <definition value="Who verified the instruction (Patient, Relative or other Authorized Person)."/>
+      <definition value="Who verified the patient's provisions as correct and authentic. This may be a Patient, Relative, or other Authorized agent."/>
       <min value="0"/>
       <max value="1"/>
       <type>

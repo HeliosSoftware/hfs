@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="MedicationDispense"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -47,7 +47,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Dispensing a medication to a named patient
             <br/>
-            <span style="font-style: italic" title="mdd-1">+ Rule: whenHandedOver cannot be before whenPrepared</span>
+            <span style="font-style: italic" title="mdd-1">+ Warning: whenHandedOver cannot be before whenPrepared</span>
             <br/>
             <br/>Elements defined in Ancestors: 
             <a href="resource.html#Resource" title="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes.">id</a>, 
@@ -150,8 +150,8 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="MedicationDispense.notPerformedReason : Indicates the reason why a dispense was not performed.">notPerformedReason</span>
-            <a name="MedicationDispense.notPerformedReason"> </a>
+            <span title="MedicationDispense.statusReason : Captures the reason for the current status of the dispense, for example why it was not performed, put on hold, or resumed.">statusReason</span>
+            <a name="MedicationDispense.statusReason"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
@@ -159,7 +159,7 @@
             <a href="references.html#CodeableReference">CodeableReference</a>(
             <a href="detectedissue.html">DetectedIssue</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Why a dispense was not performed
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Reason for current status
             <br/>Binding: 
             <a href="valueset-medicationdispense-status-reason.html">MedicationDispense Status Reason Codes</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
@@ -414,7 +414,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Trial fill, partial fill, emergency fill, etc
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v3-ActPharmacySupplyType.html" title="Indicates the type of dispensing event that is performed. For example, Trial Fill, Completion of Trial, Partial Fill, Emergency Fill, Samples, etc.">ActPharmacySupplyType</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v3-ActPharmacySupplyType.html" title="Indicates the type of dispensing event that is performed. For example, Trial Fill, Completion of Trial, Partial Fill, Emergency Fill, Samples, etc.">ActPharmacySupplyType</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -689,7 +689,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Code signifying whether a different drug was dispensed from what was prescribed
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v3-ActSubstanceAdminSubstitutionCode.html" title="A coded concept describing whether a different medicinal product may be dispensed other than the product as specified exactly in the prescription.">ActSubstanceAdminSubstitutionCode</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v3-ActSubstanceAdminSubstitutionCode.html" title="A coded concept describing whether a different medicinal product may be dispensed other than the product as specified exactly in the prescription.">ActSubstanceAdminSubstitutionCode</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -711,7 +711,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Why was substitution made
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v3-SubstanceAdminSubstitutionReason.html" title="A coded concept describing the reason that a different medication should (or should not) be substituted from what was prescribed.">SubstanceAdminSubstitutionReason</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v3-SubstanceAdminSubstitutionReason.html" title="A coded concept describing the reason that a different medication should (or should not) be substituted from what was prescribed.">SubstanceAdminSubstitutionReason</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -788,7 +788,7 @@
   <name value="MedicationDispense"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Pharmacy"/>
   <contact>
     <telecom>
@@ -896,9 +896,9 @@
       </constraint>
       <constraint>
         <key value="mdd-1"/>
-        <severity value="error"/>
+        <severity value="warning"/>
         <human value="whenHandedOver cannot be before whenPrepared"/>
-        <expression value="(whenHandedOver.hasValue() and whenPrepared.hasValue()) implies whenHandedOver &gt;= whenPrepared"/>
+        <expression value="(whenHandedOver.hasValue() and whenPrepared.hasValue()) implies whenHandedOver.highBoundary() &gt;= whenPrepared.lowBoundary()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/MedicationDispense"/>
       </constraint>
       <mustSupport value="false"/>
@@ -1256,7 +1256,7 @@
       <path value="MedicationDispense.partOf"/>
       <short value="Event that dispense is part of"/>
       <definition value="The procedure or medication administration that triggered the dispense."/>
-      <comment value="While both a procedure and a medication administration may have triggered the dispense, but it is not expected that multiple procedures and/or multiple medication administrations would be triggers."/>
+      <comment value="While both a procedure and a medication administration may have triggered the dispense, but it is not expected that multiple procedures and/or multiple medication administrations would be triggers. A dispense can be part of a medication administration when there is no separate, formal dispense, for example when the medication is taken from ward stock or an emergency cart in order to administer it. The MedicationDispense then records the supply, for example for logistics and inventory, without adding that information to the MedicationAdministration, and references the administration in `partOf`. This does not create a circular reference: a given MedicationDispense and MedicationAdministration are not each recorded as part of the other."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -1342,14 +1342,14 @@
         <map value="CombinedMedicationDispense.SupplyEvent.statusCode"/>
       </mapping>
     </element>
-    <element id="MedicationDispense.notPerformedReason">
-      <path value="MedicationDispense.notPerformedReason"/>
-      <short value="Why a dispense was not performed"/>
-      <definition value="Indicates the reason why a dispense was not performed."/>
+    <element id="MedicationDispense.statusReason">
+      <path value="MedicationDispense.statusReason"/>
+      <short value="Reason for current status"/>
+      <definition value="Captures the reason for the current status of the dispense, for example why it was not performed, put on hold, or resumed."/>
       <min value="0"/>
       <max value="1"/>
       <base>
-        <path value="MedicationDispense.notPerformedReason"/>
+        <path value="MedicationDispense.statusReason"/>
         <min value="0"/>
         <max value="1"/>
       </base>
@@ -1374,6 +1374,10 @@
         <strength value="example"/>
         <valueSet value="http://hl7.org/fhir/ValueSet/medicationdispense-status-reason"/>
       </binding>
+      <mapping>
+        <identity value="workflow"/>
+        <map value="Event.statusReason"/>
+      </mapping>
     </element>
     <element id="MedicationDispense.statusChanged">
       <path value="MedicationDispense.statusChanged"/>
@@ -2679,9 +2683,9 @@
       <max value="*"/>
       <constraint>
         <key value="mdd-1"/>
-        <severity value="error"/>
+        <severity value="warning"/>
         <human value="whenHandedOver cannot be before whenPrepared"/>
-        <expression value="(whenHandedOver.hasValue() and whenPrepared.hasValue()) implies whenHandedOver &gt;= whenPrepared"/>
+        <expression value="(whenHandedOver.hasValue() and whenPrepared.hasValue()) implies whenHandedOver.highBoundary() &gt;= whenPrepared.lowBoundary()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/MedicationDispense"/>
       </constraint>
       <mustSupport value="false"/>
@@ -2751,7 +2755,7 @@
       <path value="MedicationDispense.partOf"/>
       <short value="Event that dispense is part of"/>
       <definition value="The procedure or medication administration that triggered the dispense."/>
-      <comment value="While both a procedure and a medication administration may have triggered the dispense, but it is not expected that multiple procedures and/or multiple medication administrations would be triggers."/>
+      <comment value="While both a procedure and a medication administration may have triggered the dispense, but it is not expected that multiple procedures and/or multiple medication administrations would be triggers. A dispense can be part of a medication administration when there is no separate, formal dispense, for example when the medication is taken from ward stock or an emergency cart in order to administer it. The MedicationDispense then records the supply, for example for logistics and inventory, without adding that information to the MedicationAdministration, and references the administration in `partOf`. This does not create a circular reference: a given MedicationDispense and MedicationAdministration are not each recorded as part of the other."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -2813,10 +2817,10 @@
         <map value="CombinedMedicationDispense.SupplyEvent.statusCode"/>
       </mapping>
     </element>
-    <element id="MedicationDispense.notPerformedReason">
-      <path value="MedicationDispense.notPerformedReason"/>
-      <short value="Why a dispense was not performed"/>
-      <definition value="Indicates the reason why a dispense was not performed."/>
+    <element id="MedicationDispense.statusReason">
+      <path value="MedicationDispense.statusReason"/>
+      <short value="Reason for current status"/>
+      <definition value="Captures the reason for the current status of the dispense, for example why it was not performed, put on hold, or resumed."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -2833,6 +2837,10 @@
         <strength value="example"/>
         <valueSet value="http://hl7.org/fhir/ValueSet/medicationdispense-status-reason"/>
       </binding>
+      <mapping>
+        <identity value="workflow"/>
+        <map value="Event.statusReason"/>
+      </mapping>
     </element>
     <element id="MedicationDispense.statusChanged">
       <path value="MedicationDispense.statusChanged"/>

@@ -79,7 +79,7 @@
     <element id="Observation">
       <path value="Observation"/>
       <short value="FHIR Blood Pressure Profile"/>
-      <definition value="This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity but contains at least one component (systolic and/or diastolic)."/>
+      <definition value="This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity and contains two components (systolic and diastolic). If one or both are not performed, that is reflected in the dataAbsentReason of the corresponding component."/>
       <comment value="Used for simple observations such as device measurements, laboratory atomic results, vital signs, height, weight, smoking status, comments, etc.  Other resources are used to provide context for observations such as laboratory reports, etc."/>
       <alias value="Vital Sign"/>
       <alias value="Measurement"/>
@@ -2651,6 +2651,10 @@
       <type>
         <code value="Attachment"/>
       </type>
+      <type>
+        <code value="Reference"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
+      </type>
       <condition value="obs-10"/>
       <constraint>
         <key value="ele-1"/>
@@ -3767,7 +3771,7 @@
     <element id="Observation">
       <path value="Observation"/>
       <short value="FHIR Blood Pressure Profile"/>
-      <definition value="This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity but contains at least one component (systolic and/or diastolic)."/>
+      <definition value="This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity and contains two components (systolic and diastolic). If one or both are not performed, that is reflected in the dataAbsentReason of the corresponding component."/>
     </element>
     <element id="Observation.code">
       <path value="Observation.code"/>
