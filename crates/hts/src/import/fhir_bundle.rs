@@ -20,6 +20,8 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 #[cfg(feature = "sqlite")]
 use rusqlite::{Connection, OptionalExtension};
+#[cfg(feature = "sqlite")]
+use std::collections::HashSet;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -339,6 +341,11 @@ fn write_code_system(
          (concept_id, language, use_system, use_code, value)
          VALUES (?1, ?2, ?3, ?4, ?5)";
 
+    // Codes whose old parent edges this write has already cleared. A bundle
+    // can list the same code more than once, and the second occurrence must
+    // not wipe the edges the first one just inserted.
+    let mut edges_cleared: HashSet<&str> = HashSet::new();
+
     for concept in &cs.concepts {
         let concept_id: i64 = conn
             .prepare_cached(UPSERT_CONCEPT_SQL)
@@ -349,6 +356,20 @@ fn write_code_system(
                 )
             })
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        // Replace this concept's parent edges rather than adding to them, so
+        // a re-import that moves a concept to a new parent (or reverses an
+        // edge) does not leave the old edge behind, which can form a cycle
+        // (#2129). Safe across chunked loads for the same reason as the
+        // property delete below: a concept and all its parents arrive in one
+        // batch. Skipped on a fresh load (nothing to delete).
+        if !skip_child_delete && edges_cleared.insert(concept.code.as_str()) {
+            conn.prepare_cached(
+                "DELETE FROM concept_hierarchy WHERE system_id = ?1 AND child_code = ?2",
+            )
+            .and_then(|mut s| s.execute(rusqlite::params![system_id, concept.code]))
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        }
 
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {
@@ -1287,5 +1308,126 @@ mod tests {
             0,
             "stale property must be removed on re-import"
         );
+    }
+
+    /// A bundle for `http://example.org/cs/moves` whose concepts are given as
+    /// `(code, parents)` pairs, with parents expressed as `parent` properties.
+    fn cs_with_parents(concepts: &[(&str, &[&str])]) -> String {
+        let concepts: Vec<serde_json::Value> = concepts
+            .iter()
+            .map(|(code, parents)| {
+                let props: Vec<serde_json::Value> = parents
+                    .iter()
+                    .map(|p| serde_json::json!({"code": "parent", "valueCode": p}))
+                    .collect();
+                serde_json::json!({"code": code, "display": code, "property": props})
+            })
+            .collect();
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [{"resource": {
+                "resourceType": "CodeSystem",
+                "url": "http://example.org/cs/moves",
+                "version": "1.0",
+                "status": "active",
+                "content": "complete",
+                "property": [{"code": "parent", "type": "code"}],
+                "concept": concepts
+            }}]
+        })
+        .to_string()
+    }
+
+    fn hierarchy_edges(b: &SqliteTerminologyBackend) -> Vec<(String, String)> {
+        let conn = b.pool().get().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT h.parent_code, h.child_code FROM concept_hierarchy h \
+                 JOIN code_systems s ON s.id = h.system_id \
+                 WHERE s.url = 'http://example.org/cs/moves' \
+                 ORDER BY h.parent_code, h.child_code",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn edges(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(p, c)| (p.to_string(), c.to_string()))
+            .collect()
+    }
+
+    /// Re-importing a CodeSystem with a reversed edge must replace the old
+    /// edge, not add the new one beside it and form a cycle (#2129).
+    #[tokio::test]
+    async fn reimport_replaces_reversed_hierarchy_edge() {
+        let b = backend();
+        let ctx = ctx();
+
+        b.import_bundle(
+            &ctx,
+            cs_with_parents(&[("P", &[]), ("C", &["P"])]).as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hierarchy_edges(&b), edges(&[("P", "C")]));
+
+        b.import_bundle(
+            &ctx,
+            cs_with_parents(&[("P", &["C"]), ("C", &[])]).as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hierarchy_edges(&b),
+            edges(&[("C", "P")]),
+            "the stale P>C edge must be gone, or P and C are each other's parent"
+        );
+    }
+
+    /// A concept that moves to a different parent loses the old edge, and a
+    /// concept with several parents keeps all of them.
+    #[tokio::test]
+    async fn reimport_replaces_moved_parent_and_keeps_polyhierarchy() {
+        let b = backend();
+        let ctx = ctx();
+
+        let first = cs_with_parents(&[("A", &[]), ("B", &[]), ("X", &["A"]), ("Y", &["A", "B"])]);
+        b.import_bundle(&ctx, first.as_bytes()).await.unwrap();
+        assert_eq!(
+            hierarchy_edges(&b),
+            edges(&[("A", "X"), ("A", "Y"), ("B", "Y")])
+        );
+
+        let second = cs_with_parents(&[("A", &[]), ("B", &[]), ("X", &["B"]), ("Y", &["A", "B"])]);
+        b.import_bundle(&ctx, second.as_bytes()).await.unwrap();
+        assert_eq!(
+            hierarchy_edges(&b),
+            edges(&[("A", "Y"), ("B", "X"), ("B", "Y")])
+        );
+    }
+
+    /// Chunked loads send each concept in exactly one batch, so a later batch
+    /// must not remove edges written by an earlier one.
+    #[tokio::test]
+    async fn later_batch_keeps_earlier_batch_edges() {
+        let b = backend();
+        let ctx = ctx();
+
+        b.import_bundle(
+            &ctx,
+            cs_with_parents(&[("A", &[]), ("B", &["A"])]).as_bytes(),
+        )
+        .await
+        .unwrap();
+        b.import_bundle(&ctx, cs_with_parents(&[("C", &["B"])]).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(hierarchy_edges(&b), edges(&[("A", "B"), ("B", "C")]));
     }
 }
