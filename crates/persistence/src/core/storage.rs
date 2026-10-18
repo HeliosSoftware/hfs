@@ -34,6 +34,7 @@ pub struct WriteMarker {
     /// leave `latest` unchanged. `None` when no bound was asked for.
     pub recent_writes: Option<u64>,
 }
+use crate::search::ReindexTarget;
 use crate::types::StoredResource;
 
 /// A registered tenant, as returned by the tenant registry.
@@ -476,51 +477,17 @@ pub trait ResourceStorage: Send + Sync {
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)>;
 
-    /// [`create_many`](Self::create_many) for resources a composite primary
-    /// has already stored, written to this backend as a secondary. Each
-    /// resource's `meta.versionId` is the version the primary assigned.
+    /// When this backend's stored document *is* the search index, composite
+    /// secondary sync writes through [`ReindexTarget::write_search_entries`]
+    /// so `version_id` and `last_modified` come from the primary's
+    /// [`StoredResource`].
     ///
-    /// The default is `create_many`. A secondary that answers searches from
-    /// its own copy (Elasticsearch) overrides it to keep the primary's
-    /// version, so a search result's `meta.versionId` can be sent back as
-    /// `If-Match`.
-    async fn mirror_many(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        resources: Vec<Value>,
-        fhir_version: FhirVersion,
-    ) -> Vec<StorageResult<StoredResource>> {
-        self.create_many(tenant, resource_type, resources, fhir_version)
-            .await
-    }
-
-    /// [`create`](Self::create) for a resource a composite primary has
-    /// already stored; see [`mirror_many`](Self::mirror_many).
-    async fn mirror_create(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        resource: Value,
-        fhir_version: FhirVersion,
-    ) -> StorageResult<StoredResource> {
-        self.create(tenant, resource_type, resource, fhir_version)
-            .await
-    }
-
-    /// [`create_or_update`](Self::create_or_update) for a resource a
-    /// composite primary has already stored; see
-    /// [`mirror_many`](Self::mirror_many).
-    async fn mirror_update(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        id: &str,
-        resource: Value,
-        fhir_version: FhirVersion,
-    ) -> StorageResult<(StoredResource, bool)> {
-        self.create_or_update(tenant, resource_type, id, resource, fhir_version)
-            .await
+    /// Elasticsearch returns `Some(self)`. SQL, S3 and Mongo return `None`
+    /// even though they implement [`ReindexTarget`]: their search writer
+    /// rebuilds derived rows from a resource they already store, and a
+    /// secondary replica still has to `create` / `create_or_update`.
+    fn as_search_index(&self) -> Option<&dyn ReindexTarget> {
+        None
     }
 
     /// Reads a resource by type and ID.
