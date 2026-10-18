@@ -69,7 +69,7 @@ pub async fn update_handler<S>(
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
@@ -153,6 +153,16 @@ where
 
     // #1014: an unknown ViewDefinition.resource is rejected on every write.
     super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
+    // #1824: a SQLQuery/SQLView Library's ValueSet/ConceptMap dependencies
+    // are expanded by the terminology server before anything is stored.
+    let terminology = super::sof::terminology::prepare_library_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        &resource,
+    )
+    .await?;
 
     // Handle the If-Match precondition (RFC 9110 §13.1.1).
     //
@@ -288,6 +298,13 @@ where
             )
             .await?
     };
+    super::sof::terminology::commit_library_write(
+        &state,
+        tenant.context(),
+        stored.id(),
+        terminology,
+    )
+    .await;
     // A create — including the restore of a deleted resource, which storage
     // reports as created — adds a live resource; a plain update does not.
     super::write_event::report(
@@ -380,7 +397,7 @@ pub async fn conditional_update_handler<S>(
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
     super::conditional_support::require_update(state.storage())?;
 
@@ -424,6 +441,16 @@ where
     // #1014: an unknown ViewDefinition.resource is rejected on every write.
     super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
 
+    // #1824: a SQLQuery/SQLView Library's ValueSet/ConceptMap dependencies
+    // are expanded by the terminology server before anything is stored.
+    let terminology = super::sof::terminology::prepare_library_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        &resource,
+    )
+    .await?;
+
     // `If-Match` is honoured, not ignored (#1381). It is evaluated by the
     // backend, against the one resource the criteria resolve to and ahead of
     // the compare-and-swap that writes it — this handler never holds that row.
@@ -444,6 +471,17 @@ where
         .map_err(|e| conditional_write_error(e, &resource_type))?;
 
     use helios_persistence::core::ConditionalUpdateResult;
+    if let ConditionalUpdateResult::Updated(stored) | ConditionalUpdateResult::Created(stored) =
+        &result
+    {
+        super::sof::terminology::commit_library_write(
+            &state,
+            tenant.context(),
+            stored.id(),
+            terminology,
+        )
+        .await;
+    }
     match result {
         ConditionalUpdateResult::Updated(stored) => {
             // Conditional writes announce nothing.

@@ -1,5 +1,6 @@
-import { createResource, deleteResources, waitSearchable } from "../pages/api";
+import { createResource, deleteResources, seedTwoVersions, waitSearchable } from "../pages/api";
 import { SearchBuilder } from "../pages/search-builder";
+import { fixedTrigger } from "../pages/fixed-select";
 import { holdSearches } from "../pages/search-lifecycle";
 import { test, expect, confirmDialog, dismissConfirm } from "../pages/fixtures";
 import type { Page } from "@playwright/test";
@@ -36,8 +37,10 @@ const SCAN_BUDGET_MS = 40_000;
  * the same page: without it a red run says only which test failed, not which
  * dialog was on screen when axe objected.
  */
-async function expectNoViolations(page: Page, state: string): Promise<void> {
-  const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+async function expectNoViolations(page: Page, state: string, scope?: string): Promise<void> {
+  const scan = new AxeBuilder({ page }).withTags(WCAG);
+  if (scope) scan.include(scope);
+  const { violations } = await scan.analyze();
   expect(
     violations,
     `axe found ${violations.length} violation(s) with ${state}:\n${axeSummary(violations)}`,
@@ -246,7 +249,7 @@ for (const theme of THEMES) {
   });
 
   // #1677: a query with a chained condition, result controls and an include,
-  // so the builder shows every row kind that renders a <select> (the chain's
+  // so the builder shows every row kind that projects a <select> (the chain's
   // target type, a control or include key, an include's target type). The
   // ROUTES sweep above analyzes the bare pages, where none of them exist.
   test(`the search builder's chain, control and include rows are accessible — ${theme}`, async ({ page, chrome }) => {
@@ -255,11 +258,42 @@ for (const theme of THEMES) {
     await page.locator("[data-mode-btn=builder]").click();
     const builder = new SearchBuilder(page);
     await builder.run("Observation?subject:Patient.name=a&_count=5&_include=Observation:subject");
-    const selects = page.locator("#builder-sections select:visible");
-    await expect(page.locator("select.builder-row__key").first()).toBeVisible();
-    await expect(page.locator("select.builder-row__itarget").first()).toBeVisible();
-    for (const select of await selects.all()) await expect(select).toHaveAccessibleName(/.+/);
+    const triggers = page.locator("#builder-sections [data-combobox-trigger]:visible");
+    await expect(fixedTrigger(page.locator("select.builder-row__key").first())).toBeVisible();
+    await expect(fixedTrigger(page.locator("select.builder-row__itarget").first())).toBeVisible();
+    await expect(page.locator("#builder-sections select:visible")).toHaveCount(0);
+    for (const trigger of await triggers.all()) await expect(trigger).toHaveAccessibleName(/.+/);
     await expectNoViolations(page, "the search builder showing chain, control and include rows");
+    await triggers.first().click();
+    await expect(page.locator('#builder-sections [role="listbox"]:visible')).toHaveCount(1);
+    await expectNoViolations(page, "the search builder with a themed choice popup open");
+  });
+
+  test(`issue2080 History choice popups are accessible on the page and in Resources — ${theme}`, async ({ page, chrome, history, resources, request }) => {
+    test.setTimeout(2 * SCAN_BUDGET_MS);
+    const id = await seedTwoVersions(request, "Patient", { name: [{ family: "ChoiceAxeOne" }] },
+      () => ({ name: [{ family: "ChoiceAxeTwo" }] }));
+    try {
+      await chrome.seedTheme(theme);
+      await history.goto({ type: "Patient", id });
+      await expect(history.toTrigger).toHaveAccessibleName("To v2");
+      await history.toTrigger.click();
+      await expectNoViolations(page, "History controls with their themed version popup open", "#history-controls");
+      await history.toTrigger.press("Escape");
+
+      await waitSearchable(request, "Patient", id);
+      await page.goto(`/ui/resources?type=Patient&url=${encodeURIComponent(`/Patient?_id=${id}`)}`, { waitUntil: "networkidle" });
+      await resources.results.waitDone();
+      await page.locator("#query-results-body a.result-id").first().click();
+      await resources.modal.waitOpen();
+      await resources.modal.showHistory();
+      await expect(resources.modal.history.toTrigger).toHaveAccessibleName("To v2");
+      await resources.modal.history.toTrigger.click();
+      await expectNoViolations(page, "the Resources History controls with their themed version popup open", "#resource-history-controls");
+      await resources.modal.history.toTrigger.press("Escape");
+      await expect(resources.modal.root).toBeVisible();
+      await resources.modal.close();
+    } finally { await deleteResources(request, "Patient", [id]); }
   });
 
   // Open disclosures remain accessible after #1721 closes the picker on Add.
@@ -360,7 +394,7 @@ for (const theme of THEMES) {
     const builder = new SearchBuilder(page);
     await builder.run("Patient?_id=issue1577-axe");
     await expect(builder.status).toBeVisible();
-    await expect(page.locator(".builder-row__modifier")).toHaveAccessibleName("Modifiers");
+    await expect(fixedTrigger(page.locator(".builder-row__modifier"))).toHaveAccessibleName("Modifiers is");
     await expect(builder.status).toBeInViewport();
     await page.clock.resume();
     await expectNoViolations(page, "pending search");

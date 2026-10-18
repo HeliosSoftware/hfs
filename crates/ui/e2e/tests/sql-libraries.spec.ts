@@ -1602,7 +1602,7 @@ test.describe("Tables panel", () => {
     await expect(row.locator("code")).toHaveText("v");
     await expect(row.locator(".tag--failed")).toHaveText("Not found");
     await expect(row).toContainText(
-      "No ViewDefinition or SQL View answers to http://example.org/ViewDefinition/change-me. Fix the canonical in Details or remove the row.",
+      "No ViewDefinition, SQL View, ValueSet or ConceptMap answers to http://example.org/ViewDefinition/change-me. Fix the canonical in Details or remove the row.",
     );
 
     // #842/04: the starter's own SQL ("SELECT * FROM v") still reads `v` —

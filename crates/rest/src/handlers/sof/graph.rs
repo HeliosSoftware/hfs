@@ -50,7 +50,7 @@ use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
     BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
-    TableSchema,
+    TableSchema, TerminologyKind, TerminologyRelation,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -124,6 +124,18 @@ pub(crate) enum PlanNode {
         /// names this node. Not used for resolution.
         name: String,
     },
+    /// A `ValueSet` or `ConceptMap` dependency (#1824): a leaf whose rows were
+    /// read in Phase 1 (from the persisted table, or from the terminology
+    /// server), so Phase 2 — including the `$sql-export` worker, which has no
+    /// storage access — only copies them into the engine.
+    Terminology {
+        /// Canonical internal table name this node's rows are stored under.
+        internal_name: String,
+        /// The flattened relation.
+        relation: TerminologyRelation,
+        /// The dependency's canonical URL, for error messages.
+        name: String,
+    },
 }
 
 /// The output of Phase 1: a topologically-ordered (leaves first) dependency
@@ -191,6 +203,17 @@ pub(crate) trait ArtifactFetcher: Send + Sync {
     /// aborts resolution immediately rather than being aggregated with
     /// structural errors.
     async fn fetch(&self, url: &str) -> Result<Value, RestError>;
+
+    /// Resolves `url` as a terminology dependency (a `ValueSet` or
+    /// `ConceptMap`, #1824) once [`Self::fetch`] and the inline `context`
+    /// found no ViewDefinition or Library there. `Ok(None)` means it is not
+    /// terminology either.
+    async fn fetch_terminology(
+        &self,
+        _url: &str,
+    ) -> Result<Option<TerminologyRelation>, RestError> {
+        Ok(None)
+    }
 }
 
 /// Storage-backed [`ArtifactFetcher`] used by the real HTTP handlers.
@@ -228,6 +251,10 @@ where
             }
             Err(other) => Err(other),
         }
+    }
+
+    async fn fetch_terminology(&self, url: &str) -> Result<Option<TerminologyRelation>, RestError> {
+        super::terminology::resolve_relation(self.state, self.tenant, url).await
     }
 }
 
@@ -485,11 +512,45 @@ pub(crate) async fn build_plan(
         let artifact = match fetch_dependency(fetcher, inline, &dep.url).await {
             Ok(v) => v,
             Err(RestError::NotFound { .. }) => {
-                errors.push(RestError::NotFound {
-                    resource_type: "ViewDefinition or Library".to_string(),
-                    id: dep.url.clone(),
-                });
-                failed.insert(dep.url.clone());
+                // Not a ViewDefinition or Library: a ValueSet or ConceptMap
+                // is a terminology leaf (#1824).
+                match fetcher.fetch_terminology(&dep.url).await {
+                    Ok(Some(relation)) => {
+                        if let Some(err) = count_node(&mut resolved_nodes, max_nodes) {
+                            errors.push(err);
+                            return Err(errors);
+                        }
+                        let internal_name = next_internal_name(&mut next_internal_id);
+                        finished.insert(dep.url.clone(), internal_name.clone());
+                        nodes.push(PlanNode::Terminology {
+                            internal_name: internal_name.clone(),
+                            relation,
+                            name: dep.url.clone(),
+                        });
+                        if let Some(err) =
+                            register_label(&mut label_registry, &dep.label, &internal_name)
+                        {
+                            errors.push(err);
+                        } else {
+                            let top = stack.last_mut().expect("checked above");
+                            top.resolved_edges.push(Edge {
+                                label: dep.label.clone(),
+                                target_internal_name: internal_name,
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        errors.push(RestError::NotFound {
+                            resource_type: "ViewDefinition or Library".to_string(),
+                            id: dep.url.clone(),
+                        });
+                        failed.insert(dep.url.clone());
+                    }
+                    Err(e) => {
+                        errors.push(e);
+                        failed.insert(dep.url.clone());
+                    }
+                }
                 continue;
             }
             Err(other) => return Err(vec![other]),
@@ -855,6 +916,48 @@ pub(crate) async fn execute_plan(
                     elapsed_ms,
                     "materialized SQL view node"
                 );
+                engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
+            }
+            PlanNode::Terminology {
+                internal_name,
+                relation,
+                name,
+            } => {
+                let schema = relation.kind.table_schema();
+                engine.create_table(internal_name, &schema)?;
+                let rows: Vec<Result<Value, String>> =
+                    relation.rows.iter().cloned().map(Ok).collect();
+                let (returned_engine, inserted) = engine
+                    .insert_rows(
+                        internal_name,
+                        &schema,
+                        Box::pin(futures::stream::iter(rows)),
+                        limits.max_source_rows_per_vd,
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        SqlQueryError::RowCapExceeded { max } => {
+                            SqlQueryError::DependencyRowCapExceeded {
+                                label: dependency_label(&labels_by_target, internal_name, name)
+                                    .to_string(),
+                                kind: match relation.kind {
+                                    TerminologyKind::ValueSet => DependencyKind::ValueSet,
+                                    TerminologyKind::ConceptMap => DependencyKind::ConceptMap,
+                                },
+                                view: name.clone(),
+                                max,
+                            }
+                        }
+                        other => other,
+                    })?;
+                engine = returned_engine;
+                debug!(
+                    table = %internal_name,
+                    dependency = %name,
+                    rows = inserted,
+                    "materialized SQL query terminology dependency"
+                );
+                leaf_schemas.push(schema);
                 engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
             }
         }
@@ -1750,7 +1853,7 @@ mod tests {
             .iter()
             .filter_map(|n| match n {
                 PlanNode::SqlView { name, .. } => Some(name.as_str()),
-                PlanNode::Leaf { .. } => None,
+                _ => None,
             })
             .collect();
         assert_eq!(names, vec!["female_patients", unnamed_url]);
@@ -1875,6 +1978,114 @@ mod tests {
             .await
             .expect("a dependency of exactly the cap must run");
         assert_eq!(result.rows.len(), 3);
+    }
+
+    /// A [`MapFetcher`] that also answers terminology dependencies (#1824).
+    struct TerminologyFetcher {
+        artifacts: MapFetcher,
+        terminology: HashMap<String, TerminologyRelation>,
+    }
+
+    #[async_trait]
+    impl ArtifactFetcher for TerminologyFetcher {
+        async fn fetch(&self, url: &str) -> Result<Value, RestError> {
+            self.artifacts.fetch(url).await
+        }
+
+        async fn fetch_terminology(
+            &self,
+            url: &str,
+        ) -> Result<Option<TerminologyRelation>, RestError> {
+            Ok(self.terminology.get(url).cloned())
+        }
+    }
+
+    fn value_set_relation(codes: &[&str]) -> TerminologyRelation {
+        TerminologyRelation {
+            kind: TerminologyKind::ValueSet,
+            rows: codes
+                .iter()
+                .map(|c| {
+                    json!({"system": "http://s", "version": null, "code": c,
+                           "display": null, "inactive": null})
+                })
+                .collect(),
+        }
+    }
+
+    /// A ValueSet dependency is a leaf whose label joins like any table: the
+    /// spec's semi-join example shape.
+    #[tokio::test]
+    async fn value_set_dependency_is_joinable_by_label() {
+        let vd_url = "http://example.org/patients";
+        let vs_url = "http://example.org/vs";
+        let fetcher = TerminologyFetcher {
+            artifacts: MapFetcher(HashMap::from([(
+                vd_url.to_string(),
+                view_definition(vd_url),
+            )])),
+            terminology: HashMap::from([(vs_url.to_string(), value_set_relation(&["p1", "p3"]))]),
+        };
+        let deps = vec![depends_on("pts", vd_url), depends_on("cardio", vs_url)];
+        let plan = build_plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect("plan should resolve");
+        assert!(
+            plan.nodes
+                .iter()
+                .any(|n| matches!(n, PlanNode::Terminology { name, .. } if name == vs_url))
+        );
+
+        let (result, _) = run_plan(
+            5,
+            limits(100, 100),
+            &plan,
+            "SELECT p.id FROM pts p WHERE EXISTS \
+             (SELECT 1 FROM cardio c WHERE c.code = p.id) ORDER BY p.id",
+        )
+        .await
+        .expect("query should run");
+        assert_eq!(
+            result.rows,
+            vec![vec![Some(json!("p1"))], vec![Some(json!("p3"))]]
+        );
+    }
+
+    /// A dependency that is neither a view nor terminology is still a 404.
+    #[tokio::test]
+    async fn unknown_dependency_is_still_not_found() {
+        let fetcher = TerminologyFetcher {
+            artifacts: MapFetcher(HashMap::new()),
+            terminology: HashMap::new(),
+        };
+        let deps = vec![depends_on("x", "http://example.org/nothing")];
+        let errors = build_plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect_err("unresolvable");
+        assert!(matches!(errors.as_slice(), [RestError::NotFound { .. }]));
+    }
+
+    #[tokio::test]
+    async fn terminology_dependency_over_the_cap_names_its_kind() {
+        let plan = GraphPlan {
+            nodes: vec![PlanNode::Terminology {
+                internal_name: "__sof_node_0".to_string(),
+                relation: value_set_relation(&["a", "b", "c"]),
+                name: "http://example.org/vs".to_string(),
+            }],
+            subject_edges: vec![edge("vs", "__sof_node_0")],
+        };
+        let err = run_plan(0, limits(2, 100), &plan, "SELECT * FROM vs")
+            .await
+            .err()
+            .expect("3 rows exceed a cap of 2");
+        assert!(matches!(
+            err,
+            SqlQueryError::DependencyRowCapExceeded {
+                kind: DependencyKind::ValueSet,
+                ..
+            }
+        ));
     }
 
     /// How a [`FailingStoreRunner`]'s store fails.

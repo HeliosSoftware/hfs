@@ -87,15 +87,15 @@
       <!-- Comparison controls: which two versions, and whether to show the
            metadata churn (versionId/lastUpdated move on every version). -->
       <div class="history__controls" id="history-controls" hidden>
-        <label class="history__select">
-          <span>{{ i18n.t("history-from") }}</span>
-          <select id="history-from"></select>
-        </label>
+        <div class="history__select">
+          <span id="history-from-label">{{ i18n.t("history-from") }}</span>
+          <select id="history-from" aria-labelledby="history-from-label" data-combobox-select></select>
+        </div>
         <span class="history__arrow">→</span>
-        <label class="history__select">
-          <span>{{ i18n.t("history-to") }}</span>
-          <select id="history-to"></select>
-        </label>
+        <div class="history__select">
+          <span id="history-to-label">{{ i18n.t("history-to") }}</span>
+          <select id="history-to" aria-labelledby="history-to-label" data-combobox-select></select>
+        </div>
         <label class="history__meta-toggle">
           <input type="checkbox" id="history-show-metadata">
           {{ i18n.t("history-show-metadata") }}
@@ -110,5 +110,6 @@
   </div>
 </div>
 
+<script src="/ui/assets/combobox.js" defer></script>
 <script src="/ui/assets/history.js" defer></script>
 {% endblock %}

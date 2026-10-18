@@ -2597,25 +2597,33 @@ async fn sparse_first_batches_page_from_the_id_set() {
     data.fixture.close().await;
 }
 
-/// The scan's per-batch membership checks: hinted aggregates on the index.
-async fn membership_checks(db: &mongodb::Database) -> Vec<Document> {
-    profiled_operations(
-        db,
-        doc! { "command.aggregate": "search_index", "command.hint": { "$exists": true } },
-    )
-    .await
+/// Membership aggregates check an explicit candidate set, with or without a hint.
+fn membership_check_filter() -> Document {
+    doc! {
+        "command.aggregate": "search_index",
+        "command.pipeline.0.$match.$and": {
+            "$elemMatch": { "resource_id.$in": { "$type": "array" } },
+        },
+    }
 }
 
-/// The id-set pass reads the driver predicate's rows with a `find` on the
-/// index, or groups the index by resource id without a hint for a complement;
-/// the scan's membership checks are hinted aggregates and do neither.
+async fn membership_checks(db: &mongodb::Database) -> Vec<Document> {
+    profiled_operations(db, membership_check_filter()).await
+}
+
+/// The id-set pass reads the driver with a `find`, or groups the index for a
+/// complement. Bounded membership checks belong to neither, regardless of hint.
 async fn id_set_operations(db: &mongodb::Database) -> Vec<Document> {
     // Not `profiled_operations`: an empty result is a valid outcome here.
     collect_documents(
         db.collection::<Document>("system.profile")
             .find(doc! { "$or": [
                 { "command.find": "search_index" },
-                { "command.aggregate": "search_index", "command.hint": { "$exists": false } },
+                {
+                    "command.aggregate": "search_index",
+                    "command.hint": { "$exists": false },
+                    "$nor": [membership_check_filter()],
+                },
             ] })
             .await
             .unwrap(),

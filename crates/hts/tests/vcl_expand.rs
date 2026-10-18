@@ -171,6 +171,31 @@ async fn vcl_expand_regex() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+async fn vcl_expand_regex_on_concept() {
+    // #2115: `concept/"re"` names the concept code, same as `code/"re"`.
+    let app = app().await;
+    for prop in ["concept", "code"] {
+        assert_eq!(
+            expand_codes(&app, &format!("({SYS}){prop}/\"l.*\"")).await,
+            ["leg", "limb"],
+            "{prop}"
+        );
+        // After an earlier filter has built a candidate set.
+        assert_eq!(
+            expand_codes(&app, &format!("({SYS})(concept<<limb,{prop}/\"a.*\")")).await,
+            ["arm"],
+            "{prop}"
+        );
+        // With a text filter (FTS-first path on SQLite).
+        let expr = format!("({SYS}){prop}/\"l.*\"");
+        let (status, body) = expand_with(&app, &expr, &[("filter", "valueString", "leg")]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(codes_of(&body), ["leg"], "{prop}");
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
 async fn vcl_expand_in_list() {
     let app = app().await;
     let codes = expand_codes(&app, &format!("({SYS})concept^{{arm,leg}}")).await;

@@ -149,6 +149,44 @@ const LATEST_WRITE_SQL: &str = "SELECT last_updated FROM resource_history \
 const RECENT_WRITES_SQL: &str = "SELECT COUNT(*) FROM (SELECT 1 FROM resource_history \
      WHERE tenant_id = ?1 AND last_updated >= ?2 LIMIT ?3)";
 
+/// One type's bucketed history deltas (`count_deltas_by_bucket`): `?1`
+/// tenant, `?2` type, `?3` window bound, `?4` bucket width. The unary `+` keeps
+/// the planner off `idx_history_resource`, whose `(tenant_id, resource_type)`
+/// equality looks better unanalysed but visits every version of the type with
+/// a table read each; `idx_history_updated` covers the query (schema v40,
+/// #2107), so it reads only the window, from the index alone.
+const COUNT_DELTAS_BY_BUCKET_SQL: &str = "SELECT (CAST(strftime('%s', last_updated) AS INTEGER) / ?4) * ?4 AS bucket, \
+            SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                     WHEN version_id = '1' THEN 1 \
+                     ELSE 0 END) AS delta \
+     FROM resource_history \
+     WHERE tenant_id = ?1 AND +resource_type = ?2 AND last_updated >= ?3 \
+     GROUP BY bucket HAVING delta != 0 ORDER BY bucket";
+
+/// Several types' bucketed history deltas in one range read
+/// (`count_deltas_by_type_and_bucket`): `?1` tenant, `?2` window bound, `?3`
+/// bucket width, then one placeholder per type from `?4`. Answered from
+/// `idx_history_updated` alone (schema v40, #2107); the `+` as in
+/// [`COUNT_DELTAS_BY_BUCKET_SQL`].
+fn count_deltas_by_type_and_bucket_sql(types: usize) -> String {
+    let placeholders = (0..types)
+        .map(|i| format!("?{}", i + 4))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT resource_type, \
+                (CAST(strftime('%s', last_updated) AS INTEGER) / ?3) * ?3 AS bucket, \
+                SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                         WHEN version_id = '1' THEN 1 \
+                         ELSE 0 END) AS delta \
+         FROM resource_history \
+         WHERE tenant_id = ?1 AND last_updated >= ?2 \
+           AND +resource_type IN ({placeholders}) \
+         GROUP BY resource_type, bucket HAVING delta != 0 \
+         ORDER BY resource_type, bucket"
+    )
+}
+
 impl SqliteBackend {
     /// [`ResourceStorage::latest_write_marker`] with the `recent_writes` cap as
     /// a parameter, so tests can exercise the cap without 10,000 writes.
@@ -240,6 +278,12 @@ impl ResourceStorage for SqliteBackend {
 
     fn is_cluster_shared(&self) -> bool {
         false
+    }
+
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        Some(std::sync::Arc::new(self.clone()))
     }
 
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
@@ -754,15 +798,7 @@ impl ResourceStorage for SqliteBackend {
         // trait doc: creation `+1`, delete `-1`, plain update `0`.
         self.run_blocking(move |conn| {
             let mut stmt = conn
-                .prepare(
-                    "SELECT (CAST(strftime('%s', last_updated) AS INTEGER) / ?4) * ?4 AS bucket, \
-                            SUM(CASE WHEN is_deleted = 1 THEN -1 \
-                                     WHEN version_id = '1' THEN 1 \
-                                     ELSE 0 END) AS delta \
-                     FROM resource_history \
-                     WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated >= ?3 \
-                     GROUP BY bucket HAVING delta != 0 ORDER BY bucket",
-                )
+                .prepare(COUNT_DELTAS_BY_BUCKET_SQL)
                 .or_query_error("Failed to prepare count_deltas_by_bucket")?;
 
             let rows = stmt
@@ -824,22 +860,7 @@ impl ResourceStorage for SqliteBackend {
         let since_bound = crate::core::bucket_floor(since, bucket_seconds).to_rfc3339();
 
         self.run_blocking(move |conn| {
-            let placeholders = (0..resource_types.len())
-                .map(|i| format!("?{}", i + 4))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT resource_type, \
-                        (CAST(strftime('%s', last_updated) AS INTEGER) / ?3) * ?3 AS bucket, \
-                        SUM(CASE WHEN is_deleted = 1 THEN -1 \
-                                 WHEN version_id = '1' THEN 1 \
-                                 ELSE 0 END) AS delta \
-                 FROM resource_history \
-                 WHERE tenant_id = ?1 AND last_updated >= ?2 \
-                   AND resource_type IN ({placeholders}) \
-                 GROUP BY resource_type, bucket HAVING delta != 0 \
-                 ORDER BY resource_type, bucket"
-            );
+            let sql = count_deltas_by_type_and_bucket_sql(resource_types.len());
             let mut stmt = conn
                 .prepare(&sql)
                 .or_query_error("Failed to prepare count_deltas_by_type_and_bucket")?;
@@ -1298,6 +1319,10 @@ impl ResourceStorage for SqliteBackend {
                         params![id],
                     )
                     .or_query_error("purge FTS mapping")?;
+                    // SQL-on-FHIR terminology relations (#1824): plain tables named
+                    // by registry id, so neither the cascade nor a tenant_id
+                    // filter on resources reaches them.
+                    super::sof_terminology::purge_tenant_in_txn(&tx, id)?;
                     // Per-user settings are keyed by user, not tenant, so they are not swept
                     // by the deletes above — but a client stores PHI-derived query strings in
                     // them, which belong to this tenant (issue #313). Same transaction: this
@@ -5188,6 +5213,56 @@ mod tests {
             assert!(
                 !details.iter().any(|d| d.contains("TEMP B-TREE")),
                 "{name}: must not sort, got {details:?}"
+            );
+        }
+    }
+
+    /// #2107: the dashboard's bucketed history counts read only the window,
+    /// from `idx_history_updated` alone — never a table row per version, and
+    /// never every version of a type through `idx_history_resource`.
+    #[test]
+    fn test_count_deltas_query_plans_are_covered_by_the_history_index() {
+        let backend = create_test_backend();
+        let conn = backend.get_connection().unwrap();
+        let plan = |sql: &str, binds: &[&dyn ToSql]| -> Vec<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map(binds, |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let bound = Utc::now().to_rfc3339();
+        let grouped = count_deltas_by_type_and_bucket_sql(3);
+
+        for (name, details) in [
+            (
+                "per type",
+                plan(
+                    COUNT_DELTAS_BY_BUCKET_SQL,
+                    &[&"t", &"Patient", &bound, &3600_i64],
+                ),
+            ),
+            (
+                "grouped",
+                plan(
+                    &grouped,
+                    &[
+                        &"t",
+                        &bound,
+                        &3600_i64,
+                        &"Patient",
+                        &"Observation",
+                        &"Encounter",
+                    ],
+                ),
+            ),
+        ] {
+            assert!(
+                details.iter().any(|d| d.starts_with(
+                    "SEARCH resource_history USING COVERING INDEX idx_history_updated \
+                     (tenant_id=? AND last_updated>?)"
+                )),
+                "{name}: expected a covering idx_history_updated range, got {details:?}"
             );
         }
     }

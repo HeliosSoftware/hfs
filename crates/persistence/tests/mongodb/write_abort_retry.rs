@@ -267,6 +267,10 @@ async fn an_update_that_keeps_being_aborted_gives_up_as_unavailable() {
 
 /// A real lost race keeps its contract: the labelled `WriteConflict` on the
 /// resource update is a `VersionConflict` at once, with no second attempt.
+///
+/// Called through `update`, not `create_or_update`: an unconditional PUT
+/// re-reads and retries a lost race by design (its `# Concurrency` contract),
+/// so it would hide what this pins — that the write-abort replay does not.
 #[tokio::test]
 async fn a_lost_race_is_still_a_version_conflict_without_a_second_attempt() {
     let app = "fp-write-abort-lost-race";
@@ -274,6 +278,11 @@ async fn a_lost_race_is_still_a_version_conflict_without_a_second_attempt() {
     else {
         return;
     };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
     let Some(fail_point) =
         FailPoint::enable(app, write_conflict_on("update"), doc! { "times": 1 }).await
     else {
@@ -281,13 +290,7 @@ async fn a_lost_race_is_still_a_version_conflict_without_a_second_attempt() {
     };
 
     let result = backend
-        .create_or_update(
-            &tenant,
-            "Observation",
-            "obs-1",
-            observation("obs-1", "amended"),
-            FhirVersion::default(),
-        )
+        .update(&tenant, &current, observation("obs-1", "amended"))
         .await;
     let entered = fail_point.off_and_count().await;
 

@@ -919,7 +919,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         system_url: &str,
         codes: &[String],
         properties: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+    ) -> Result<std::collections::HashMap<String, Vec<PropertyValue>>, HtsError> {
         if codes.is_empty() || properties.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -941,7 +941,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT c.code, cp.property, cp.value
+                "SELECT c.code, cp.property, cp.value, cp.value_type
                  FROM concept_properties cp
                  JOIN concepts c ON c.id = cp.concept_id
                  JOIN code_systems s ON s.id = c.system_id
@@ -961,20 +961,24 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             for p in &properties {
                 params.push(p as &dyn rusqlite::ToSql);
             }
-            let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+            let mut out: std::collections::HashMap<String, Vec<PropertyValue>> =
                 std::collections::HashMap::new();
             let rows = stmt
                 .query_map(params.as_slice(), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        PropertyValue {
+                            code: row.get(1)?,
+                            value: row.get(2)?,
+                            value_type: row.get(3)?,
+                            description: None,
+                        },
                     ))
                 })
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             for r in rows {
-                let (code, prop, value) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
-                out.entry(code).or_default().push((prop, value));
+                let (code, property) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                out.entry(code).or_default().push(property);
             }
 
             // FHIR `definition` is stored as a column on `concepts` rather
@@ -1016,8 +1020,13 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     // Don't double-emit if a `definition` already came from
                     // concept_properties (unusual but possible for hand-rolled
                     // CSes that mirror the field as a property).
-                    if !entry.iter().any(|(p, _)| p == "definition") {
-                        entry.push(("definition".to_string(), definition));
+                    if !entry.iter().any(|property| property.code == "definition") {
+                        entry.push(PropertyValue {
+                            code: "definition".into(),
+                            value_type: "string".into(),
+                            value: definition,
+                            description: None,
+                        });
                     }
                 }
             }
@@ -1455,7 +1464,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         supplement_urls: &[String],
         codes: &[String],
         properties: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+    ) -> Result<std::collections::HashMap<String, Vec<PropertyValue>>, HtsError> {
         if supplement_urls.is_empty() || codes.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -1492,7 +1501,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 format!(" AND cp.property IN ({prop_ph})")
             };
             let sql = format!(
-                "SELECT c.code, cp.property, cp.value
+                "SELECT c.code, cp.property, cp.value, cp.value_type
                  FROM concept_properties cp
                  JOIN concepts c ON c.id = cp.concept_id
                  JOIN code_systems s ON s.id = c.system_id
@@ -1517,20 +1526,24 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     params.push(p as &dyn rusqlite::ToSql);
                 }
             }
-            let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+            let mut out: std::collections::HashMap<String, Vec<PropertyValue>> =
                 std::collections::HashMap::new();
             let rows = stmt
                 .query_map(params.as_slice(), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        PropertyValue {
+                            code: row.get(1)?,
+                            value: row.get(2)?,
+                            value_type: row.get(3)?,
+                            description: None,
+                        },
                     ))
                 })
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             for r in rows {
-                let (code, prop, value) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
-                out.entry(code).or_default().push((prop, value));
+                let (code, property) = r.map_err(|e| HtsError::StorageError(e.to_string()))?;
+                out.entry(code).or_default().push(property);
             }
             Ok(out)
         })

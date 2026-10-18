@@ -50,6 +50,7 @@
     // without the picker's own state surviving a re-render.
     var picker = window.HfsEditorAdd;
     if (picker) picker.attach(root);
+    if (window.HfsCombobox) window.HfsCombobox.install(root);
 
     /* ---- the round trip -------------------------------------------------- */
 
@@ -130,6 +131,7 @@
       else if (freshState) root.appendChild(freshState);
 
       var oldCard = root.querySelector("section.editor-form");
+      if (oldCard && window.HfsCombobox) window.HfsCombobox.destroy(oldCard);
       if (freshCard && oldCard) oldCard.replaceWith(freshCard);
       else if (freshCard) root.appendChild(freshCard);
 
@@ -139,6 +141,8 @@
       fresh.querySelectorAll("body > datalist").forEach(function (list) {
         root.appendChild(list);
       });
+      // This fetch-driven replacement does not emit htmx:afterSwap.
+      if (window.HfsCombobox) window.HfsCombobox.install(root);
       return true;
     }
 

@@ -332,6 +332,12 @@ impl ResourceStorage for IndexingSubmitJobs {
         self.inner.sof_runner()
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        self.inner.sof_terminology_store()
+    }
+
     async fn count_by_types(
         &self,
         tenant: &TenantContext,
