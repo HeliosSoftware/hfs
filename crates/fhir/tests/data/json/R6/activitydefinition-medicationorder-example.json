@@ -27,8 +27,14 @@
       "ingredient": [
         {
           "item": {
-            "reference": {
-              "reference": "#citalopramSubstance"
+            "concept": {
+              "coding": [
+                {
+                  "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                  "code": "2556"
+                }
+              ],
+              "text": "citalopram"
             }
           },
           "strengthRatio": {
@@ -43,21 +49,6 @@
           }
         }
       ]
-    },
-    {
-      "resourceType": "Substance",
-      "id": "citalopramSubstance",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-              "code": "2556"
-            }
-          ],
-          "text": "citalopram"
-        }
-      }
     }
   ],
   "extension": [

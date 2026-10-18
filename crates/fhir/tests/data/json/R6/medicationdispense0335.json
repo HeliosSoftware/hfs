@@ -2,7 +2,7 @@
   "resourceType": "MedicationDispense",
   "id": "meddisp0335",
   "status": "cancelled",
-  "notPerformedReason": {
+  "statusReason": {
     "concept": {
       "coding": [
         {

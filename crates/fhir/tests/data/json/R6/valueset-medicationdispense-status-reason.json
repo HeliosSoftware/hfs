@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "medicationdispense-status-reason",
   "meta": {
-    "lastUpdated": "2026-09-14T16:43:45.341+00:00"
+    "lastUpdated": "2026-10-17T20:58:40.703+00:00"
   },
   "text": {
     "status": "generated",
@@ -45,7 +45,7 @@
       ]
     }
   ],
-  "description": "MedicationDispense Status Reason Codes",
+  "description": "MedicationDispense Status Reason Codes: reasons for the current status of a dispense, for example why it was not performed, put on hold, or resumed.",
   "jurisdiction": [
     {
       "coding": [

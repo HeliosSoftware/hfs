@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Task"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -175,7 +175,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: white; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="Task.statusReason : An explanation as to why this task is held, failed, was refused, etc.">statusReason</span>
+            <span title="Task.statusReason : An explanation of the current status of the Task (depending on a combination of Task.status, Task.businessStatus, Task.input, and Task.output).">statusReason</span>
             <a name="Task.statusReason"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -600,9 +600,10 @@
             <a href="careteam.html">CareTeam</a> | 
             <a href="patient.html">Patient</a> | 
             <a href="relatedperson.html">RelatedPerson</a> | 
-            <a href="group.html">Group</a>)
+            <a href="group.html">Group</a> | 
+            <a href="device.html">Device</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Responsible individual
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Responsible party
             <br/>
           </td>
         </tr>
@@ -1018,7 +1019,7 @@
   <name value="Task"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -1607,8 +1608,8 @@
     <element id="Task.statusReason">
       <path value="Task.statusReason"/>
       <short value="Reason for current status"/>
-      <definition value="An explanation as to why this task is held, failed, was refused, etc."/>
-      <comment value="This applies to the current status.  Look at the history of the task to see reasons for past statuses."/>
+      <definition value="An explanation of the current status of the Task (depending on a combination of Task.status, Task.businessStatus, Task.input, and Task.output)."/>
+      <comment value="This applies to the current state, which is dependent on a combination of Task.status, Task.businessStatus, Task.input, and Task.output (when there are values for the optional fields)."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2397,7 +2398,7 @@
     </element>
     <element id="Task.owner">
       <path value="Task.owner"/>
-      <short value="Responsible individual"/>
+      <short value="Responsible party"/>
       <definition value="Party responsible for managing task execution."/>
       <comment value="Tasks may be created with an owner not yet identified. Group is only allowed in the circumstance where the group represents a family or a household, and should not represent groups of Practitioners where other more specific resources can be used instead."/>
       <requirements value="Identifies who is expected to perform this task."/>
@@ -2419,6 +2420,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Patient"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -3995,8 +3997,8 @@
     <element id="Task.statusReason">
       <path value="Task.statusReason"/>
       <short value="Reason for current status"/>
-      <definition value="An explanation as to why this task is held, failed, was refused, etc."/>
-      <comment value="This applies to the current status.  Look at the history of the task to see reasons for past statuses."/>
+      <definition value="An explanation of the current status of the Task (depending on a combination of Task.status, Task.businessStatus, Task.input, and Task.output)."/>
+      <comment value="This applies to the current state, which is dependent on a combination of Task.status, Task.businessStatus, Task.input, and Task.output (when there are values for the optional fields)."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -4473,7 +4475,7 @@
     </element>
     <element id="Task.owner">
       <path value="Task.owner"/>
-      <short value="Responsible individual"/>
+      <short value="Responsible party"/>
       <definition value="Party responsible for managing task execution."/>
       <comment value="Tasks may be created with an owner not yet identified. Group is only allowed in the circumstance where the group represents a family or a household, and should not represent groups of Practitioners where other more specific resources can be used instead."/>
       <requirements value="Identifies who is expected to perform this task."/>
@@ -4490,6 +4492,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Patient"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>

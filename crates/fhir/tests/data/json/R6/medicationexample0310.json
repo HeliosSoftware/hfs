@@ -1,23 +1,6 @@
 {
   "resourceType": "Medication",
   "id": "med0310",
-  "contained": [
-    {
-      "resourceType": "Substance",
-      "id": "sub03",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "55452001",
-              "display": "Oxycodone (substance)"
-            }
-          ]
-        }
-      }
-    }
-  ],
   "code": {
     "coding": [
       {
@@ -39,8 +22,14 @@
   "ingredient": [
     {
       "item": {
-        "reference": {
-          "reference": "#sub03"
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "55452001",
+              "display": "Oxycodone (substance)"
+            }
+          ]
         }
       },
       "strengthRatio": {
