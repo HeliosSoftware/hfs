@@ -1800,6 +1800,22 @@ async fn create_backend_with_full_registry(test_name: &str) -> Option<MongoBacke
     create_backend(test_name).await
 }
 
+/// A [`create_backend`] whose plan probes do not time out. The default probe
+/// timeout is short enough that a loaded host times a probe out, and the
+/// search then takes a different (still correct) plan than the one a
+/// winning-plan assertion expects; a generous timeout keeps the plan fixed.
+async fn create_backend_with_stable_probes(test_name: &str) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        data_dir: Some(repo_data_dir()),
+        probe_timeout_ms: 10_000,
+        ..Default::default()
+    })
+    .await
+}
+
 async fn search_index_entry_count(
     backend: &MongoBackend,
     tenant: &TenantContext,
@@ -7646,7 +7662,7 @@ async fn mongodb_integration_uri_below_and_above_are_segment_aware() {
 /// stays bounded rather than falling back to a full collection scan.
 #[tokio::test]
 async fn mongodb_integration_uri_below_search_is_a_covered_v2_scan() {
-    let Some(backend) = create_backend_with_full_registry("covered_uri_below").await else {
+    let Some(backend) = create_backend_with_stable_probes("covered_uri_below").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -18921,7 +18937,7 @@ async fn assert_search_index_ops_are_covered(
 /// scan on `idx_search_date_v3`, which carries both.
 #[tokio::test]
 async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
-    let Some(backend) = create_backend_with_full_registry("covered_date").await else {
+    let Some(backend) = create_backend_with_stable_probes("covered_date").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -19173,7 +19189,7 @@ async fn mongodb_integration_period_with_unreadable_end_is_dropped_not_open() {
 
 #[tokio::test]
 async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
-    let Some(backend) = create_backend_with_full_registry("covered_token").await else {
+    let Some(backend) = create_backend_with_stable_probes("covered_token").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -19228,7 +19244,7 @@ async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
 /// key — the scan is fully covered.
 #[tokio::test]
 async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
-    let Some(backend) = create_backend_with_full_registry("missing_false").await else {
+    let Some(backend) = create_backend_with_stable_probes("missing_false").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -22259,7 +22275,7 @@ async fn mongodb_date_sort_honors_all_explicit_date_and_id_directions() {
 
 #[tokio::test]
 async fn mongodb_selective_reference_search_uses_existing_ordered_index() {
-    let Some(backend) = create_backend("reference_plan").await else {
+    let Some(backend) = create_backend_with_stable_probes("reference_plan").await else {
         return;
     };
     let tenant = create_tenant("reference-plan");

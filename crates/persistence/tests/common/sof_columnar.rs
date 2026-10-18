@@ -71,7 +71,10 @@ pub async fn columnar_batches(
 }
 
 /// Asserts the columnar path yields the same column names, row count, row
-/// order and cell values as the row path.
+/// order and cell values as the row path. A view with a `unionAll` is
+/// compared as a multiset: its compound query is left unordered (row order is
+/// not part of the SoF contract), so two executions can return the branches
+/// in a different order.
 ///
 /// Returns the batches so callers can add type assertions.
 pub async fn assert_columnar_parity(
@@ -111,10 +114,26 @@ pub async fn assert_columnar_parity(
         );
     }
     assert_eq!(actual.len(), expected.len(), "{ctx}: row count differs");
+    let mut expected = expected;
+    if has_union_all(view) {
+        actual.sort();
+        expected.sort();
+    }
     for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
         assert_eq!(a, e, "{ctx}: row {i} differs");
     }
     batches
+}
+
+/// Whether `view` has a `unionAll` at any depth.
+fn has_union_all(view: &Value) -> bool {
+    match view {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key == "unionAll" || has_union_all(value)),
+        Value::Array(items) => items.iter().any(has_union_all),
+        _ => false,
+    }
 }
 
 /// The Arrow type of each column of the first batch, by name.

@@ -266,7 +266,7 @@ async fn write_primary_resources(
     let fhir_version = resources
         .first()
         .map(StoredResource::fhir_version)
-        .unwrap_or_default();
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
     let contents = resources
         .iter()
         .map(StoredResource::content_with_meta)
