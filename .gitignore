@@ -41,3 +41,6 @@ __pycache__/
 
 # Local $bulk-submit output receipts
 data/submit/
+
+# Local $export output (filesystem export storage)
+data/exports/
