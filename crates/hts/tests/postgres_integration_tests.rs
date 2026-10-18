@@ -1045,6 +1045,74 @@ async fn expand_hierarchical_returns_nested_tree() {
     assert_eq!(b.contains[0].code, "C");
 }
 
+/// `concept_hierarchy` is not acyclic (SNOMED RF2 leaves mutual parent/child
+/// pairs behind). Tree-mode `$expand` used to recurse across such a pair until
+/// the stack overflowed, aborting the process. Mirrors the SQLite unit tests in
+/// `backends::hierarchy`; this one proves the shared builder is actually wired
+/// into the PostgreSQL path.
+#[tokio::test]
+async fn expand_hierarchical_terminates_on_cyclic_hierarchy() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("exp-cycle");
+
+    // root → a, plus the mutual pair a ⇄ b, expressed with `parent` properties
+    // because nested `concept` cannot describe a cycle.
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
+                "url": format!("{base}cs"), "name": "CycleCS",
+                "status": "active", "content": "complete",
+                "hierarchyMeaning": "is-a",
+                "property": [{"code": "parent",
+                    "uri": "http://hl7.org/fhir/concept-properties#parent",
+                    "type": "code"}],
+                "concept": [
+                    {"code": "root", "display": "root"},
+                    {"code": "a", "display": "a", "property": [
+                        {"code": "parent", "valueCode": "root"},
+                        {"code": "parent", "valueCode": "b"}]},
+                    {"code": "b", "display": "b", "property": [
+                        {"code": "parent", "valueCode": "a"}]}
+                ]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
+                "url": format!("{base}vs"), "name": "CycleVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                hierarchical: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // root → a → b; b's edge back to a closes the cycle and is dropped.
+    assert_eq!(resp.contains.len(), 1, "{:?}", resp.contains);
+    let root = &resp.contains[0];
+    assert_eq!(root.code, "root");
+    assert_eq!(root.contains.len(), 1);
+    assert_eq!(root.contains[0].code, "a");
+    assert_eq!(root.contains[0].contains.len(), 1);
+    assert_eq!(root.contains[0].contains[0].code, "b");
+    assert!(root.contains[0].contains[0].contains.is_empty());
+}
+
 #[tokio::test]
 async fn expand_cache_hit_on_second_call() {
     let backend = fresh_backend().await;

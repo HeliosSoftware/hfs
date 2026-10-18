@@ -1045,6 +1045,28 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         result
     }
 
+    /// Rebuild closures for systems left with hierarchy but none, on a blocking
+    /// thread — the build is a recursive SQL walk that can take tens of seconds
+    /// for a large system.
+    async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
+        let pool = self.pool.clone();
+        let rebuilt = tokio::task::spawn_blocking(move || -> Result<usize, HtsError> {
+            let conn = pool.get().map_err(|e| {
+                HtsError::StorageError(format!("Failed to acquire connection: {e}"))
+            })?;
+            schema::migrate_concept_closure(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to rebuild concept closure: {e}"))
+            })
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))??;
+
+        if rebuilt > 0 {
+            self.invalidate_caches();
+        }
+        Ok(rebuilt)
+    }
+
     async fn code_system_has_concepts(
         &self,
         _ctx: &TenantContext,

@@ -146,10 +146,16 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     // bootstrapped server can come up with chunked SNOMED/LOINC closure data
     // wiped during import and never rebuilt. Idempotent — only systems missing
     // closure rows are recomputed.
-    backend
+    let rebuilt = backend
         .rebuild_missing_closures()
         .await
         .map_err(|e| anyhow::anyhow!("post-bootstrap closure rebuild failed: {e}"))?;
+    if rebuilt > 0 {
+        info!(
+            systems = rebuilt,
+            "Rebuilt concept closures after bootstrap"
+        );
+    }
 
     let resource_store = PostgresBackend::from_connection_string(&config.database_url)
         .await
@@ -564,11 +570,11 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
             // closure build, blowing past the 60 s health-check timeout.
             if !args.dry_run {
                 info!("Building concept closures (this may take ~30–60 s for SNOMED CT)…");
-                backend
+                let rebuilt = backend
                     .rebuild_missing_closures()
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to build concept closures: {e}"))?;
-                info!("Concept closures ready");
+                info!(systems = rebuilt, "Concept closures ready");
             }
 
             result

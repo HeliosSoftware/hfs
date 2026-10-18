@@ -501,9 +501,11 @@ pub async fn build_concept_closure_pg(
 /// a parallel sequential scan of the 1.2M-row SNOMED hierarchy and exhausted
 /// the dynamic-shared-memory segment on CI containers with a 64 MB `/dev/shm`
 /// — even when no closure work was actually needed.
+/// Returns the number of systems rebuilt, so callers can log whether any work
+/// happened rather than guessing.
 pub async fn migrate_concept_closure_pg(
     client: &mut tokio_postgres::Client,
-) -> Result<(), tokio_postgres::Error> {
+) -> Result<usize, tokio_postgres::Error> {
     let systems_needing_closure: Vec<String> = client
         .query(
             "SELECT cs.id FROM code_systems cs
@@ -527,5 +529,5 @@ pub async fn migrate_concept_closure_pg(
     for sid in &systems_needing_closure {
         build_concept_closure_pg(client, sid).await?;
     }
-    Ok(())
+    Ok(systems_needing_closure.len())
 }

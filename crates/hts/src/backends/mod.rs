@@ -13,6 +13,9 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod hierarchy;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 

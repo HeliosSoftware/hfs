@@ -268,6 +268,32 @@ pub trait BundleImportBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Build `concept_closure` for every system that has hierarchy edges but no
+    /// closure rows, and return the number of systems rebuilt.
+    ///
+    /// [`Self::import_bundle`] deliberately skips the closure build for a system
+    /// that already had concepts, because rebuilding after every chunk of a
+    /// bulk load is O(n²) — for SNOMED CT that is hours. The build is instead
+    /// deferred to the startup migration. That leaves a gap for a *chunked
+    /// import into an already-running server*: the first chunk creates the
+    /// system with no concepts and therefore no hierarchy edges yet, every
+    /// later chunk sees a non-empty system and defers, and the startup
+    /// migration never runs because the server never restarted. The system ends
+    /// up with hierarchy but no closure, which silently answers `not-subsumed`
+    /// from `$subsumes` (unbounded `is-a` / `descendent-of` expansion is
+    /// unaffected — it walks `concept_hierarchy`).
+    ///
+    /// Chunked importers close that gap by calling this once after the final
+    /// chunk, which is what `POST /import?finalize=true` does. It is idempotent
+    /// and only touches systems that are actually missing closure rows, so a
+    /// call on an up-to-date database costs one query.
+    ///
+    /// The default returns `Ok(0)`: a backend with no closure table has nothing
+    /// to rebuild.
+    async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
+        Ok(0)
+    }
+
     /// Remove all HTS normalized rows for the resource identified by `resource_url`.
     ///
     /// Called by the CRUD DELETE handler after the persistence soft-delete so

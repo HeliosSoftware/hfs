@@ -572,6 +572,18 @@ curl -X POST http://localhost:8090/import \
   -d @bundle.json
 ```
 
+When a large CodeSystem is loaded as a series of chunked bundles, pass
+`?finalize=true` on the **last** chunk. Each chunk after the first skips the
+`concept_closure` build (rebuilding it per chunk is O(n²)), so without this the
+system has hierarchy edges but no closure until the next restart and `$subsumes`
+answers `not-subsumed`. The response then includes `closures_rebuilt`.
+
+```bash
+curl -X POST "http://localhost:8090/import?finalize=true" \
+  -H "Content-Type: application/fhir+json" \
+  -d @bundle-last-chunk.json
+```
+
 ### Lookup a Concept
 
 ```bash
