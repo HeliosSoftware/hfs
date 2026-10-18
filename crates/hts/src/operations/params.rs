@@ -367,9 +367,14 @@ pub fn query_params_to_fhir_params(pairs: Vec<(String, String)>) -> Vec<Value> {
 
 /// Map a FHIR property `value_type` string to the correct `valueXxx` key
 /// used in a FHIR Parameters `part` entry.
-pub fn property_value_part(value_type: &str, raw_value: &str) -> Value {
-    match value_type {
+/// Malformed stored Coding JSON is a storage error, never a string property.
+pub fn property_value_part(value_type: &str, raw_value: &str) -> Result<Value, HtsError> {
+    Ok(match value_type {
         "code" => serde_json::json!({"name": "value", "valueCode": raw_value}),
+        "Coding" => {
+            let coding = parse_stored_coding(raw_value)?;
+            serde_json::json!({"name": "value", "valueCoding": coding})
+        }
         "boolean" => {
             let b = raw_value.parse::<bool>().unwrap_or(false);
             serde_json::json!({"name": "value", "valueBoolean": b})
@@ -384,7 +389,19 @@ pub fn property_value_part(value_type: &str, raw_value: &str) -> Value {
         }
         "dateTime" => serde_json::json!({"name": "value", "valueDateTime": raw_value}),
         _ => serde_json::json!({"name": "value", "valueString": raw_value}),
+    })
+}
+
+pub(super) fn parse_stored_coding(raw_value: &str) -> Result<Value, HtsError> {
+    let coding: Value = serde_json::from_str(raw_value).map_err(|error| {
+        HtsError::StorageError(format!("Invalid stored Coding property: {error}"))
+    })?;
+    if !coding.is_object() {
+        return Err(HtsError::StorageError(
+            "Stored Coding property must be a JSON object".into(),
+        ));
     }
+    Ok(coding)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -451,33 +468,56 @@ mod tests {
 
     #[test]
     fn property_value_part_code() {
-        let part = property_value_part("code", "ROOT");
+        let part = property_value_part("code", "ROOT").unwrap();
         assert_eq!(part["valueCode"], "ROOT");
     }
 
     #[test]
     fn property_value_part_boolean() {
-        let part = property_value_part("boolean", "true");
+        let part = property_value_part("boolean", "true").unwrap();
         assert_eq!(part["valueBoolean"], true);
     }
 
     #[test]
     fn property_value_part_integer() {
-        let part = property_value_part("integer", "42");
+        let part = property_value_part("integer", "42").unwrap();
         assert_eq!(part["valueInteger"], 42);
     }
 
     #[test]
     fn property_value_part_decimal() {
-        let part = property_value_part("decimal", "2.5");
+        let part = property_value_part("decimal", "2.5").unwrap();
         let v = part["valueDecimal"].as_f64().unwrap();
         assert!((v - 2.5_f64).abs() < 1e-9);
     }
 
     #[test]
     fn property_value_part_unknown_type_falls_back_to_string() {
-        let part = property_value_part("custom", "hello");
+        let part = property_value_part("custom", "hello").unwrap();
         assert_eq!(part["valueString"], "hello");
+    }
+
+    #[test]
+    fn property_value_part_coding_preserves_the_complete_object() {
+        let coding = json!({
+            "system": "http://example.org/target", "version": "2026",
+            "code": "A", "display": "Alpha", "userSelected": true,
+            "extension": [{"url": "http://example.org/note", "valueString": "detail"}]
+        });
+        assert_eq!(
+            property_value_part("Coding", &coding.to_string()).unwrap(),
+            json!({"name": "value", "valueCoding": coding})
+        );
+    }
+
+    #[test]
+    fn property_value_part_rejects_invalid_stored_coding() {
+        for value in ["not json", "null", "[]", "42", "true", "\"A\""] {
+            assert!(matches!(
+                property_value_part("Coding", value),
+                Err(HtsError::StorageError(_))
+            ));
+        }
     }
 
     // ── extract_coding ─────────────────────────────────────────────────────────

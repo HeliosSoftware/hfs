@@ -1086,6 +1086,14 @@ impl ResourceStorage for CompositeStorage {
         self.primary.sof_runner()
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        // Terminology relations live beside the SQL-on-FHIR runner, in the
+        // primary store.
+        self.primary.sof_terminology_store()
+    }
+
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type))]
     async fn create(
         &self,

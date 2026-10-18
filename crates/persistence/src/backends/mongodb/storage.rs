@@ -1577,34 +1577,60 @@ impl ResourceStorage for MongoBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
-                let mut resource = resource;
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+        // Every branch is a check-then-act on the `read`, and every write is
+        // a compare-and-swap, so a race with another writer (on this or
+        // another instance) surfaces as a typed error that is never a
+        // legitimate answer from *this* method — it decides existence itself.
+        // Re-read and retry a bounded number of times; see the Postgres
+        // backend's `create_or_update` for the full reasoning.
+        const MAX_CAS_RETRIES: usize = 3;
+        let mut attempts = 0;
+        let mut resource = resource;
+        loop {
+            let body = if attempts < MAX_CAS_RETRIES {
+                resource.clone()
+            } else {
+                std::mem::take(&mut resource)
+            };
+
+            let result = match self.read(tenant, resource_type, id).await {
+                // Update existing (preserves original FHIR version)
+                Ok(Some(current)) => self
+                    .update(tenant, &current, body)
+                    .await
+                    .map(|updated| (updated, false)),
+                // Create new with specific ID
+                Ok(None) => {
+                    let mut body = body;
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(id.to_string()));
+                    }
+                    self.create(tenant, resource_type, body, fhir_version)
+                        .await
+                        .map(|created| (created, true))
                 }
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok((created, true))
+                // A deleted resource is brought back to life by a subsequent
+                // update (FHIR http.html#delete), continuing the existing
+                // version chain rather than being rejected with `Gone`.
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => self
+                    .restore_deleted(tenant, resource_type, id, body)
+                    .await
+                    .map(|restored| (restored, true)),
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+                    | StorageError::Resource(
+                        ResourceError::NotFound { .. } | ResourceError::AlreadyExists { .. },
+                    ),
+                ) if attempts < MAX_CAS_RETRIES => {
+                    attempts += 1;
+                    continue;
+                }
+                other => return other,
             }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
-                let restored = self
-                    .restore_deleted(tenant, resource_type, id, resource)
-                    .await?;
-                Ok((restored, true))
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -3193,6 +3219,12 @@ impl MongoBackend {
     /// record keeps its version, the restore gets the next one) and keeps the
     /// FHIR version the resource was originally stored under.
     ///
+    /// The write is a compare-and-swap on the tombstone's version, so a lost
+    /// race reports `VersionConflict` (with the version actually stored) and
+    /// `create_or_update` retries from a fresh read. Returns `NotFound` only
+    /// if no document is present at all — the caller has already established
+    /// a tombstone exists, so either only happens under a concurrent write.
+    ///
     /// The attempt is run again when the server aborts it without a
     /// conflicting writer ([`replay_aborted_writes`]).
     async fn restore_deleted(
@@ -3298,11 +3330,51 @@ impl MongoBackend {
         });
 
         let update_result = if let Some(active_session) = session.as_mut() {
-            resources
+            match resources
                 .update_one(restore_filter.clone(), restore_doc.clone())
                 .session(active_session)
                 .await
-                .map_err(|e| internal_driver_error("Failed to restore resource (session)", e))?
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    match WriteAttemptError::driver("Failed to restore resource (session)", e) {
+                        // Inside a transaction a racing restore does not queue
+                        // behind the winner: it fails at once with `WriteConflict`.
+                        // That is the same lost CAS as a zero-match below, so give
+                        // the winner a moment to commit and report it the same way
+                        // — `create_or_update` retries it from a fresh read —
+                        // instead of as a 500.
+                        WriteAttemptError::Conflict(conflict) => {
+                            tracing::debug!(
+                                resource_type,
+                                id,
+                                error = %conflict,
+                                "MongoDB write conflict on restore: a concurrent writer won"
+                            );
+                            drop(session);
+                            tokio::time::sleep(WRITE_CONFLICT_RETRY_DELAY).await;
+                            let actual = resources
+                                .find_one(doc! {
+                                    "tenant_id": tenant_id,
+                                    "resource_type": resource_type,
+                                    "id": id,
+                                })
+                                .await
+                                .map_err(|e| {
+                                    internal_error(format!("Failed to get current version: {}", e))
+                                })?;
+                            return Err(crate::core::restore_cas_miss(
+                                resource_type,
+                                id,
+                                deleted_version,
+                                actual
+                                    .map(|doc| doc.get_str("version_id").unwrap_or("").to_string()),
+                            ));
+                        }
+                        WriteAttemptError::Storage(e) => return Err(e),
+                    }
+                }
+            }
         } else {
             resources
                 .update_one(restore_filter, restore_doc)
@@ -3311,10 +3383,33 @@ impl MongoBackend {
         };
 
         if update_result.matched_count == 0 {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
+            // The tombstone the read observed is gone. A concurrent PUT
+            // restored it (a live document now) or restored and re-deleted it
+            // (a newer tombstone) — the same fact for the caller, so the
+            // re-read does not filter on `is_deleted`: any document is a
+            // conflict `create_or_update` retries from a fresh read; none at
+            // all is a hard delete.
+            let current_filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "id": id,
+            };
+            let actual = if let Some(active_session) = session.as_mut() {
+                resources
+                    .find_one(current_filter)
+                    .session(active_session)
+                    .await
+            } else {
+                resources.find_one(current_filter).await
+            }
+            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+
+            return Err(crate::core::restore_cas_miss(
+                resource_type,
+                id,
+                deleted_version,
+                actual.map(|doc| doc.get_str("version_id").unwrap_or("").to_string()),
+            ));
         }
 
         let history_doc = doc! {
@@ -7449,11 +7544,7 @@ impl ReindexTarget for MongoBackend {
         let db = match self.get_database().await {
             Ok(db) => db,
             Err(e) => {
-                let msg = e.to_string();
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
+                return super::reindex_pipeline::PageFailure::storage(e).fan_out(resources.len());
             }
         };
         let tenant_id = tenant.tenant_id().as_str();
@@ -7464,13 +7555,14 @@ impl ReindexTarget for MongoBackend {
         if resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST {
             self.log_reindex_mode_once(multi_thread, overlapped);
         }
-        if overlapped {
+        let outcome = if overlapped {
             self.write_page_overlapped(&db, tenant_id, resources, stats)
                 .await
         } else {
             self.write_page_serial(&db, tenant_id, resources, stats, multi_thread)
                 .await
-        }
+        };
+        outcome.unwrap_or_else(|failure| failure.fan_out(resources.len()))
     }
 
     /// Delegates to [`Self::write_search_entries_page_timed`] with a
@@ -7515,7 +7607,7 @@ pub(super) async fn insert_search_entries_chunk(
     docs: &[Document],
     error_context: &str,
     stats: &mut ReindexPageStats,
-) -> Result<HashMap<usize, String>, String> {
+) -> Result<HashMap<usize, String>, super::reindex_pipeline::PageFailure> {
     let mut insert_failures: HashMap<usize, String> = HashMap::new();
     let mut offset = 0usize;
     for chunk in docs.chunks(SEARCH_INDEX_INSERT_CHUNK) {
@@ -7525,17 +7617,27 @@ pub(super) async fn insert_search_entries_chunk(
             Ok(_) => {}
             Err(e) => match e.kind.as_ref() {
                 MongoErrorKind::InsertMany(insert_many) => {
-                    let Some(write_errors) = insert_many.write_errors.as_ref() else {
-                        return Err(format!("{error_context}: {e}"));
-                    };
-                    for write_error in write_errors {
+                    for write_error in insert_many.write_errors.iter().flatten() {
                         let owner = owners[offset + write_error.index];
                         insert_failures
                             .entry(owner)
                             .or_insert_with(|| format!("{error_context}: {}", write_error.message));
                     }
+                    if insert_many.write_concern_error.is_some()
+                        || insert_many.write_errors.as_ref().is_none_or(Vec::is_empty)
+                    {
+                        return Err(
+                            super::reindex_pipeline::PageFailure::driver(error_context, e)
+                                .with_permanent(insert_failures),
+                        );
+                    }
                 }
-                _ => return Err(format!("{error_context}: {e}")),
+                _ => {
+                    return Err(
+                        super::reindex_pipeline::PageFailure::driver(error_context, e)
+                            .with_permanent(insert_failures),
+                    );
+                }
             },
         }
         offset += chunk.len();

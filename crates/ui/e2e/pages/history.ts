@@ -1,6 +1,7 @@
 // History & Versions page (/ui/history): locate an instance, pick two versions,
 // see the two-layer diff, toggle metadata churn on/off.
 import type { Page, Locator } from "@playwright/test";
+import { chooseFixed, fixedTrigger } from "./fixed-select";
 
 export class HistoryPage {
   constructor(readonly page: Page) {}
@@ -31,6 +32,10 @@ export class HistoryPage {
   get toSelect(): Locator {
     return this.page.locator("#history-to");
   }
+  get fromTrigger(): Locator { return fixedTrigger(this.fromSelect); }
+  get toTrigger(): Locator { return fixedTrigger(this.toSelect); }
+  async chooseFrom(value: string): Promise<void> { await chooseFixed(this.fromSelect, value); }
+  async chooseTo(value: string): Promise<void> { await chooseFixed(this.toSelect, value); }
   get metadataCheckbox(): Locator {
     return this.page.locator("#history-show-metadata");
   }

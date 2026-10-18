@@ -546,6 +546,12 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.sof_runner()
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        self.composite.sof_terminology_store()
+    }
+
     async fn count_by_types(
         &self,
         tenant: &TenantContext,

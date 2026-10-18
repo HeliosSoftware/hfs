@@ -226,6 +226,8 @@ where
         id = %id,
         "Resource deleted"
     );
+    // #1824: a deleted SQL Library releases its terminology tables.
+    super::sof::terminology::release_library(&state, tenant.context(), &resource_type, &id).await;
 
     // Compartment reference for the audit record, taken from the pre-delete
     // content while it is still in hand. `update_handler` and `patch_handler`
@@ -366,6 +368,13 @@ where
     use helios_persistence::core::ConditionalDeleteResult;
     match result {
         ConditionalDeleteResult::Deleted(deleted) => {
+            super::sof::terminology::release_library(
+                &state,
+                tenant.context(),
+                &resource_type,
+                deleted.id(),
+            )
+            .await;
             // Counted, but conditional writes announce nothing.
             super::write_event::report(
                 &state,

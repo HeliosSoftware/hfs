@@ -4226,11 +4226,17 @@ fn apply_compose_filters(
                 ));
             }
             any_filter_seen = true;
-            let closure: HashSet<String> =
-                ecl::parse_and_evaluate(conn, system_id, &format!("<< {value}"))?
-                    .into_iter()
-                    .map(|c| c.code)
-                    .collect();
+            // Evaluate the closure on the AST rather than an `<< {value}` ECL
+            // string so non-SNOMED codes (e.g. `E11.6`) survive (#2114).
+            let closure: HashSet<String> = ecl::evaluate_hierarchy(
+                conn,
+                system_id,
+                ecl::ConceptOperator::DescendantOrSelf,
+                value,
+            )?
+            .into_iter()
+            .map(|c| c.code)
+            .collect();
             match result.as_mut() {
                 Some(prev) => prev.retain(|c| !closure.contains(&c.code)),
                 None => {
@@ -4253,12 +4259,16 @@ fn apply_compose_filters(
         } else {
             property
         };
-        let ecl_expr: String = match (property_norm, op) {
-            ("constraint", "=") => value.to_owned(),
-            ("concept", "is-a") => format!("<< {value}"),
-            ("concept", "descendent-of") => format!("< {value}"),
+        // `constraint =` carries a real ECL expression and goes through the
+        // parser (`None`). The concept hierarchy ops carry a bare code from an
+        // arbitrary code system — ICD-10-CM `E11.6` is not a valid ECL concept
+        // id — so they map to an operator applied to the code directly (#2114).
+        let hierarchy_op: Option<ecl::ConceptOperator> = match (property_norm, op) {
+            ("constraint", "=") => None,
+            ("concept", "is-a") => Some(ecl::ConceptOperator::DescendantOrSelf),
+            ("concept", "descendent-of") => Some(ecl::ConceptOperator::DescendantOf),
             // generalizes: all X such that value is-a X (ancestors of value + self).
-            ("concept", "generalizes") => format!(">> {value}"),
+            ("concept", "generalizes") => Some(ecl::ConceptOperator::AncestorOrSelf),
             _ => {
                 tracing::warn!(
                     property,
@@ -4320,8 +4330,11 @@ fn apply_compose_filters(
             continue;
         }
 
-        // Slow path: no prior bounded set — compute the full ECL expansion.
-        let resolved = ecl::parse_and_evaluate(conn, system_id, &ecl_expr)?;
+        // Slow path: no prior bounded set — compute the full expansion.
+        let resolved = match hierarchy_op {
+            Some(hierarchy_op) => ecl::evaluate_hierarchy(conn, system_id, hierarchy_op, value)?,
+            None => ecl::parse_and_evaluate(conn, system_id, value)?,
+        };
         let concepts: Vec<ExpansionContains> = resolved
             .into_iter()
             .map(|c| ExpansionContains {
@@ -4366,7 +4379,7 @@ fn apply_compose_filters(
             if prev.is_empty() {
                 continue;
             }
-            if property == "code" || property.is_empty() {
+            if is_concept_prop(property) || property.is_empty() {
                 prev.retain(|c| regex.is_match(&c.code));
             } else {
                 let codes: Vec<String> = prev.iter().map(|c| c.code.clone()).collect();
@@ -4966,8 +4979,8 @@ fn compile_vs_regex(pattern: &str) -> Result<Regex, HtsError> {
 }
 
 /// Evaluate a `regex` compose filter — returns concepts in `system_id` whose
-/// `code` (when `property == "code"`) or whose `concept_properties` value for
-/// `property` fully matches `pattern`.
+/// code (when `property` is `code` or `concept`) or whose `concept_properties`
+/// value for `property` fully matches `pattern`.
 ///
 /// The match is performed in Rust after the candidate rows have been loaded.
 /// For property-value regex we narrow at the SQL level to rows that even have
@@ -4981,7 +4994,7 @@ fn query_regex_match(
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let regex = compile_vs_regex(pattern)?;
 
-    if property == "code" || property.is_empty() {
+    if is_concept_prop(property) || property.is_empty() {
         // Match against the concept code itself.  Load all concepts for the
         // system and filter in Rust — there is no cheap SQL primitive for an
         // arbitrary regex, and concept counts in tx-ecosystem fixtures are
@@ -5368,7 +5381,7 @@ fn apply_compose_filters_to_candidates(
             }
             (_, "regex") => {
                 let regex = compile_vs_regex(value)?;
-                if property == "code" || property.is_empty() {
+                if is_concept_prop(property) || property.is_empty() {
                     candidates.retain(|c| regex.is_match(&c.code));
                 } else {
                     let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
@@ -11493,6 +11506,107 @@ mod tests {
         );
     }
 
+    /// #2115: `property: "concept"` names the concept identifier just like
+    /// `code` (VCL emits it for `concept/"re"`).  A regex on it must match
+    /// codes on every path: with no earlier candidate set (full scan), after
+    /// an `is-a` filter has built a candidate set, and on the FTS-first path
+    /// taken when a text filter accompanies the compose filters.
+    #[tokio::test]
+    async fn expand_inline_regex_filter_on_concept_property() {
+        let b = backend();
+        let bundle = r#"{
+          "resourceType": "Bundle", "type": "collection",
+          "entry": [{
+            "resource": {
+              "resourceType": "CodeSystem",
+              "id": "cs-concept-regex",
+              "url": "http://example.org/cs-concept-regex",
+              "status": "active", "content": "complete",
+              "concept": [
+                { "code": "body", "display": "Body",
+                  "concept": [
+                    { "code": "head", "display": "Head" },
+                    { "code": "limb", "display": "Limb",
+                      "concept": [
+                        { "code": "arm", "display": "Arm" },
+                        { "code": "leg", "display": "Leg" }
+                      ]
+                    }
+                  ]
+                },
+                { "code": "lung", "display": "Lung" }
+              ]
+            }
+          }]
+        }"#;
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+
+        async fn expand(
+            b: &SqliteTerminologyBackend,
+            filters: serde_json::Value,
+            text: Option<&str>,
+        ) -> Vec<String> {
+            let inline_vs = serde_json::json!({
+                "resourceType": "ValueSet",
+                "compose": { "include": [{
+                    "system": "http://example.org/cs-concept-regex",
+                    "filter": filters
+                }]}
+            });
+            let resp = b
+                .expand(
+                    &ctx(),
+                    ExpandRequest {
+                        value_set: Some(inline_vs),
+                        filter: text.map(str::to_string),
+                        count: Some(50),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut codes: Vec<String> = resp.contains.into_iter().map(|c| c.code).collect();
+            codes.sort();
+            codes
+        }
+
+        // No prior candidate set: full scan of the system.
+        for property in ["concept", "code"] {
+            let codes = expand(
+                &b,
+                serde_json::json!([{ "property": property, "op": "regex", "value": "l.*" }]),
+                None,
+            )
+            .await;
+            assert_eq!(codes, ["leg", "limb", "lung"], "property={property}");
+        }
+
+        // Prior candidate set from `is-a`: regex narrows it in place.
+        for property in ["concept", "code"] {
+            let codes = expand(
+                &b,
+                serde_json::json!([
+                    { "property": "concept", "op": "is-a", "value": "limb" },
+                    { "property": property, "op": "regex", "value": "l.*" }
+                ]),
+                None,
+            )
+            .await;
+            assert_eq!(codes, ["leg", "limb"], "property={property}");
+        }
+
+        // Text filter → FTS-first candidates → compose filters in Rust.
+        for property in ["concept", "code"] {
+            let codes = expand(
+                &b,
+                serde_json::json!([{ "property": property, "op": "regex", "value": "l.*" }]),
+                Some("lung"),
+            )
+            .await;
+            assert_eq!(codes, ["lung"], "property={property}");
+        }
+    }
+
     /// Regex `(a+)+` on the regex-bad code system: only the pure `aaaa…` code
     /// (no trailing chars) matches a full-string anchored pattern.  The codes
     /// with trailing `Y` / `Z` must NOT match.  Rust's RE2-style engine handles
@@ -12668,5 +12782,146 @@ mod tests {
         )
         .await;
         assert_eq!(codes, vec!["child2", "orphan"]);
+    }
+
+    // ── is-a / descendent-of / is-not-a on dotted codes (#2114) ─────────────
+    // ICD-10-CM style codes such as `E11.6` are not valid ECL concept ids, so
+    // the hierarchy filters must not route the raw code through the ECL parser.
+
+    const DOTTED_SYS: &str = "http://example.org/cs-dotted";
+
+    fn bundle_with_dotted_hierarchy() -> &'static str {
+        r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "cs-dotted",
+                "url": "http://example.org/cs-dotted",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  {
+                    "code": "E11",
+                    "display": "Type 2 diabetes mellitus",
+                    "concept": [
+                      {
+                        "code": "E11.6",
+                        "display": "Type 2 diabetes mellitus with other specified complications",
+                        "concept": [
+                          { "code": "E11.65", "display": "With hyperglycemia" },
+                          { "code": "E11.69", "display": "With other specified complication" }
+                        ]
+                      },
+                      { "code": "E11.9", "display": "Without complications" }
+                    ]
+                  },
+                  { "code": "E10", "display": "Type 1 diabetes mellitus" }
+                ]
+              }
+            }
+          ]
+        }"#
+    }
+
+    async fn dotted_compose_codes(filters: serde_json::Value) -> Vec<String> {
+        let b = backend();
+        b.import_bundle(&ctx(), bundle_with_dotted_hierarchy().as_bytes())
+            .await
+            .unwrap();
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(serde_json::json!({
+                        "resourceType": "ValueSet",
+                        "compose": {"include": [{"system": DOTTED_SYS, "filter": filters}]}
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut codes: Vec<String> = resp.contains.iter().map(|c| c.code.clone()).collect();
+        codes.sort();
+        codes
+    }
+
+    #[tokio::test]
+    async fn dotted_code_is_a_without_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "is-a", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11.6", "E11.65", "E11.69"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_descendent_of_without_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "descendent-of", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11.65", "E11.69"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_is_not_a_without_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "is-not-a", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E10", "E11", "E11.9"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_generalizes_without_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "generalizes", "value": "E11.65"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_is_a_with_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+            {"property": "concept", "op": "is-a", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11.6", "E11.65"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_descendent_of_with_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+            {"property": "concept", "op": "descendent-of", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11.65"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_is_not_a_with_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+            {"property": "concept", "op": "is-not-a", "value": "E11.6"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E10", "E11"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_code_generalizes_with_prior_filter() {
+        let codes = dotted_compose_codes(serde_json::json!([
+            {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+            {"property": "concept", "op": "generalizes", "value": "E11.65"}
+        ]))
+        .await;
+        assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
     }
 }

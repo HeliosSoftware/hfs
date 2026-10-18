@@ -14,6 +14,7 @@ pub mod library;
 pub mod output;
 pub mod params;
 pub mod scan;
+pub mod terminology;
 
 pub use bind::{BINDABLE_PARAMETER_TYPES, BoundParam, bind_supplied_params};
 pub use engine::{ColumnFhirType, InMemorySqlEngine, QueryResult, TableSchema};
@@ -23,6 +24,7 @@ pub use params::{SqlQueryRunParams, extract_sqlquery_params_from_json};
 pub use scan::{
     Placeholder, ScanError, ScanResult, SourcePosition, TableRef, scan_sql, undeclared_tables,
 };
+pub use terminology::{TerminologyFlattenError, TerminologyKind, TerminologyRelation};
 
 use std::fmt;
 
@@ -36,6 +38,10 @@ pub enum DependencyKind {
     ViewDefinition,
     /// An interior SQL View Library, materialized by running its SQL.
     SqlView,
+    /// A ValueSet, materialized from its expansion.
+    ValueSet,
+    /// A ConceptMap, materialized from its mappings.
+    ConceptMap,
 }
 
 impl fmt::Display for DependencyKind {
@@ -43,6 +49,8 @@ impl fmt::Display for DependencyKind {
         match self {
             Self::ViewDefinition => f.write_str("ViewDefinition"),
             Self::SqlView => f.write_str("SQL View"),
+            Self::ValueSet => f.write_str("ValueSet"),
+            Self::ConceptMap => f.write_str("ConceptMap"),
         }
     }
 }

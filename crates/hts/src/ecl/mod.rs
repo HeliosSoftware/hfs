@@ -83,6 +83,34 @@ pub fn parse_and_evaluate(
     evaluator::evaluate(conn, system_id, &expr)
 }
 
+/// Evaluate a single hierarchy operator (`<`, `<<`, `>`, `>>`) applied to one
+/// concept code, without going through the ECL parser.
+///
+/// The `concept is-a` / `descendent-of` / `generalizes` / `is-not-a` compose
+/// filters carry a bare code that may come from any code system. Codes such
+/// as ICD-10-CM `E11.6` are not valid ECL concept ids, so building an ECL
+/// string from them fails to tokenize; building the AST directly evaluates the
+/// same closure query for any code (#2114).
+///
+/// Returns a sorted `Vec<ResolvedConcept>` (sorted by code).
+///
+/// # Errors
+///
+/// Returns `HtsError::StorageError` if a database query fails.
+#[cfg(feature = "sqlite")]
+pub fn evaluate_hierarchy(
+    conn: &Connection,
+    system_id: &str,
+    op: ConceptOperator,
+    code: &str,
+) -> Result<Vec<ResolvedConcept>, HtsError> {
+    let expr = EclExpr::Focus {
+        op: Some(op),
+        concept: FocusConcept::Id(code.to_owned()),
+    };
+    evaluator::evaluate(conn, system_id, &expr)
+}
+
 /// Return the subset of `candidates` that are members of the ECL constraint.
 ///
 /// Evaluates `ecl` against `system_id` and intersects the resulting concept

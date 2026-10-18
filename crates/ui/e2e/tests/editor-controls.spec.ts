@@ -1,6 +1,7 @@
 import { test, expect, acceptConfirm, dismissConfirm, dialogsSeen } from "../pages/fixtures";
 import { Editor } from "../pages/editor";
 import { createResource } from "../pages/api";
+import { chooseFixed } from "../pages/fixed-select";
 
 // The schema-driven editor's structural controls, exercised through the
 // Resources modal (they are delegated in resources.js): fold/expand, add-node
@@ -99,7 +100,7 @@ test("the value[x] choice select adds the chosen variant", async ({ resources, p
   const choose = panel.locator("select[data-declarer='value']");
   const arms = await choose.locator("option").allInnerTexts();
   const arm = arms.find((a) => /string/i.test(a)) ?? arms[1];
-  await choose.selectOption({ label: arm });
+  await chooseFixed(choose, arm);
 
   await expect
     .poll(async () => Object.keys(await ed.currentDoc()).join(","))

@@ -418,6 +418,34 @@
     select.appendChild(el);
   }
 
+  /* The native select keeps the builder's value and events. Its themed
+   * projection is refreshed silently when the builder changes that state. */
+  function refreshSelect(select, available) {
+    if (!select) return;
+    // Mount after insertion, when form association is available. Late catalog
+    // completions on removed rows must not recreate document listeners.
+    if (!select.isConnected) {
+      if (typeof available === "boolean") select.hidden = !available;
+      return;
+    }
+    if (window.HfsCombobox) {
+      window.HfsCombobox.refresh(select,
+        typeof available === "boolean" ? { available: available } : undefined);
+    } else if (typeof available === "boolean") select.hidden = !available;
+  }
+
+  function enhanceRowSelects(row) {
+    if (!window.HfsCombobox || !row.isConnected) return;
+    row.querySelectorAll("select").forEach(function (select) {
+      window.HfsCombobox.adopt(select);
+    });
+  }
+
+  function releaseRowControls(row) {
+    releaseRowTypeaheads(row);
+    if (window.HfsCombobox) window.HfsCombobox.destroy(row);
+  }
+
   /* ---- chaining rows (#394) -------------------------------------------- */
 
   var chainListSeq = 0;
@@ -508,6 +536,7 @@
     rm.textContent = "×";
     wrap.appendChild(rm);
     host.appendChild(wrap);
+    refreshSelect(comparator, !comparator.hidden);
     return input;
   }
 
@@ -738,6 +767,7 @@
     }
     var panel = row.querySelector(".builder-row__modpanel");
     if (panel) fillModPanel(panel, row, mods);
+    refreshSelect(modifier);
     return original !== selected;
   }
 
@@ -754,6 +784,7 @@
       input.dataset.fhirWire = comparator.value + input.dataset.fhirWire;
     }
     comparator.value = "";
+    refreshSelect(comparator);
   }
 
   function classifyHydratedComparators(row, sourceType, classifySelected) {
@@ -806,6 +837,7 @@
   function clearComparatorsForModifier(row) {
     row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
       comparator.value = "";
+      refreshSelect(comparator);
     });
   }
 
@@ -900,7 +932,7 @@
       if (!paramType && selected && prefixes.indexOf(selected) < 0) {
         option(comparator, selected, selected, true);
       }
-      comparator.hidden = prefixes.length === 0 && !selected;
+      refreshSelect(comparator, prefixes.length > 0 || !!selected);
     });
     return wireChanged;
   }
@@ -1144,6 +1176,7 @@
               if (chosen && targets.indexOf(chosen) < 0) {
                 option(typeSel, chosen, chosen, true);
               }
+              refreshSelect(typeSel);
             }
           });
         });
@@ -1221,6 +1254,7 @@
       });
 
       hopsHost.appendChild(seg);
+      enhanceRowSelects(seg);
       segRefill(k);
     }
 
@@ -1402,6 +1436,7 @@
           if (chosen && targets.indexOf(chosen) < 0) {
             option(target, chosen, chosen, true);
           }
+          refreshSelect(target);
         }
       });
     }
@@ -1819,12 +1854,14 @@
 
     var hosts = builderHosts();
     Object.keys(hosts).forEach(function (kind) {
-      releaseRowTypeaheads(hosts[kind]);
+      releaseRowControls(hosts[kind]);
       hosts[kind].textContent = "";
     });
     splitQuery(parsed.query).forEach(function (part) {
       var kind = bucketFor(part);
-      hosts[kind].appendChild(builderRow(kind, part));
+      var row = builderRow(kind, part);
+      hosts[kind].appendChild(row);
+      enhanceRowSelects(row);
     });
     refreshRunAvailability();
     refreshChainAffordances();
@@ -1958,6 +1995,7 @@
           var rowModifier = row.querySelector(".builder-row__modifier");
           if (rowModifier) {
             rowModifier.value = "";
+            refreshSelect(rowModifier);
             var rowPanel = row.querySelector(".builder-row__modpanel");
             if (rowPanel) {
               fillModPanel(rowPanel, row, applicableMods(row.dataset.modType || ""));
@@ -2023,6 +2061,7 @@
         var chipRow = modChip.closest(".builder-row");
         var sel = chipRow.querySelector(".builder-row__modifier");
         sel.value = sel.value === modChip.dataset.modChip ? "" : modChip.dataset.modChip;
+        refreshSelect(sel);
         var modifierDeferred = false;
         if (sel.value) {
           modifierDeferred = !enforceModifierComparatorExclusion(chipRow);
@@ -2053,6 +2092,7 @@
         var orWrap = removeOr.closest(".builder-row__orvalue");
         if (orWrap.parentElement.children.length > 1) {
           var removeOrRow = orWrap.closest(".builder-row");
+          releaseRowControls(orWrap);
           orWrap.remove();
           cancelComparatorClassification(removeOrRow);
           updateUrl();
@@ -2062,7 +2102,7 @@
       if (remove) {
         noteBuilderUserEdit();
         var removedRow = remove.closest(".builder-row");
-        releaseRowTypeaheads(removedRow);
+        releaseRowControls(removedRow);
         removedRow.remove();
         refreshRunAvailability();
         updateUrl();
@@ -2091,8 +2131,9 @@
           modifier: keptMod,
           value: keptValues.join(","),
         });
-        releaseRowTypeaheads(from);
+        releaseRowControls(from);
         from.replaceWith(chain);
+        enhanceRowSelects(chain);
         noteBuilderUserEdit();
         focusQuietly(chain.querySelector(".builder-row__cparam"));
         updateUrl();
@@ -2105,6 +2146,7 @@
             value: "",
           });
           builderHosts().include.appendChild(inc);
+          enhanceRowSelects(inc);
           noteBuilderUserEdit();
           inc.querySelector(kind === "include-rev" ? ".builder-row__itype" : ".builder-row__iparam").focus();
           return;
@@ -2119,6 +2161,7 @@
             value: "",
           });
           builderHosts().condition.appendChild(has);
+          enhanceRowSelects(has);
           noteBuilderUserEdit();
           has.querySelector(".builder-row__htype").focus();
           return;
@@ -2130,6 +2173,7 @@
         };
         var row = builderRow(kind, part);
         builderHosts()[kind].appendChild(row);
+        enhanceRowSelects(row);
         noteBuilderUserEdit();
         if (kind === "condition") refreshChainAffordances();
         focusQuietly(row.querySelector(kind === "condition" ? ".builder-row__key" : ".builder-row__value"));
@@ -3094,6 +3138,7 @@
     });
     results.sort.value = value;
     if (results.sort.value !== value) results.sort.value = "";
+    refreshSelect(results.sort);
   }
 
   function setResultsBusy(busy) {
@@ -3102,7 +3147,10 @@
     var run = form.querySelector('[data-intent="run"]');
     if (run) run.setAttribute("aria-busy", busy ? "true" : "false");
     results.meta.hidden = busy;
-    if (results.sort) results.sort.disabled = busy;
+    if (results.sort) {
+      results.sort.disabled = busy;
+      refreshSelect(results.sort);
+    }
     searchCancel.hidden = !busy;
   }
 

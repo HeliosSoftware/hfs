@@ -34,5 +34,10 @@ __pycache__/
 # they should never reach a PR. `tmp/` is the intended home for them.
 /tmp/
 
+# Cluster-capable-state planning docs and draft-issue scratch files under
+# docs/ are local working notes too (discussion #223); they never ship.
+/docs/cluster-*.md
+/docs/draft-issues-*.md
+
 # Local $bulk-submit output receipts
 data/submit/

@@ -109,6 +109,7 @@ pub mod patient_compartment;
 pub mod preconditions;
 pub mod search;
 pub mod sof_runner;
+pub mod sof_terminology;
 pub mod storage;
 pub mod tenant_discovery;
 pub mod transaction;
@@ -185,7 +186,7 @@ pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
     ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
-    ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
+    ResourceStorage, TenantRecord, WriteMarker, bucket_floor, restore_cas_miss,
 };
 pub use tenant_discovery::{
     CountBasis, DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,

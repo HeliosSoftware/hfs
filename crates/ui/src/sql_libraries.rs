@@ -515,7 +515,7 @@ pub(crate) fn tables_signature_with_unknown(
 /// written by this UI's own [`add_table`] and is out of scope for #842's own
 /// "imitates, does not replace" resolution — a document that used it would
 /// simply not resolve here, exactly as an unversioned typo would not.
-fn split_canonical_version(reference: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_canonical_version(reference: &str) -> (&str, Option<&str>) {
     match reference.split_once('|') {
         Some((canonical, version)) => (canonical, Some(version)),
         None => (reference, None),
@@ -620,10 +620,66 @@ pub(crate) enum TableTarget {
     /// answering to the dependency's own `resource` (the starter
     /// document's own `change-me` canonical, for instance).
     NotFound,
+    /// Resolved on the terminology server (`HFS_TERMINOLOGY_SERVER`) to a
+    /// ValueSet it can expand or a ConceptMap it holds (#1824) — the same
+    /// fallback `$sql-run`'s own graph walk takes once storage has no
+    /// ViewDefinition or Library at the canonical. `name` is the artifact's
+    /// own `title`, else `name`, else the canonical itself.
+    Terminology {
+        kind: helios_sof::sqlquery::TerminologyKind,
+        name: String,
+    },
     /// Resolved to something storage holds, but not a ViewDefinition or a
     /// `sql-view` Library — a `sql-query` Library, most commonly, which
     /// `$sql-run`'s own graph walk would reject the same way.
     NotATable,
+}
+
+/// Classifies a terminology `artifact` of `kind` — the expanded ValueSet or
+/// the ConceptMap the terminology server returned for `reference` — into a
+/// [`TableTarget::Terminology`] (#1824). With no `title` or `name`, a VCL
+/// implicit value set reads as its decoded expression ([`vcl_expression`])
+/// rather than its percent-encoded URL; any other reference reads verbatim.
+pub(crate) fn classify_terminology_artifact(
+    kind: helios_sof::sqlquery::TerminologyKind,
+    artifact: &Value,
+    reference: &str,
+) -> TableTarget {
+    let name = ["title", "name"]
+        .iter()
+        .find_map(|key| artifact.get(key).and_then(Value::as_str))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| vcl_expression(reference).map(|expr| format!("VCL: {expr}")))
+        .unwrap_or_else(|| reference.to_string());
+    TableTarget::Terminology { kind, name }
+}
+
+/// The decoded VCL expression of a VCL implicit value set URL
+/// (`http://fhir.org/VCL?v1=<percent-encoded expression>`, either scheme),
+/// or `None` for any other reference, or one with no non-empty `v1`.
+pub(crate) fn vcl_expression(reference: &str) -> Option<String> {
+    let query = reference
+        .strip_prefix("http://fhir.org/VCL?")
+        .or_else(|| reference.strip_prefix("https://fhir.org/VCL?"))?;
+    form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "v1")
+        .map(|(_, expr)| expr.into_owned())
+        .filter(|expr| !expr.is_empty())
+}
+
+/// The first ConceptMap in a terminology server's `ConceptMap?url=` search
+/// `bundle` that `reference` identifies ([`matches_reference`]), or `None`.
+pub(crate) fn concept_map_in_bundle<'a>(bundle: &'a Value, reference: &str) -> Option<&'a Value> {
+    bundle
+        .get("entry")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|entry| entry.get("resource"))
+        .find(|resource| {
+            resource.get("resourceType").and_then(Value::as_str) == Some("ConceptMap")
+                && matches_reference(reference, "ConceptMap", resource)
+        })
 }
 
 /// Classifies an already-fetched `artifact` of `resource_type` into a
@@ -809,8 +865,9 @@ pub(crate) fn remove_table(document: &mut Value, label: &str) {
 // ---------------------------------------------------------------------
 // Columns card (#842/04): the last good run's own column list — name,
 // type, and origin — the *Reads from* resolution's own byproduct once a
-// dependency resolves to a `ViewDefinition`. Building this needs no I/O of
-// its own: the caller (`crate::resolve_view_definition_dependencies`)
+// dependency resolves to a `ViewDefinition`, `ValueSet` or `ConceptMap`.
+// Building this needs no I/O of its own: the caller
+// (`crate::resolve_column_sources`)
 // already resolved every dependency for the Tables panel; this module only
 // reasons over the result.
 // ---------------------------------------------------------------------
@@ -828,8 +885,8 @@ pub(crate) struct ColumnInfo {
     /// an answer (the card's own "—" placeholder).
     pub type_code: Option<String>,
     /// `Some((label, column_name))` only when this column's own name
-    /// exists in exactly one resolved ViewDefinition dependency's own
-    /// schema — `column_name` always equals [`Self::name`], carried
+    /// exists in exactly one resolved ViewDefinition/ValueSet/ConceptMap
+    /// dependency's own schema — `column_name` always equals [`Self::name`], carried
     /// alongside it only so the view layer never has to re-borrow `name`
     /// to render `"{label}.{column}"`. Ambiguous (present in two or more
     /// dependencies) or absent from all of them alike renders `None` — the
@@ -838,13 +895,38 @@ pub(crate) struct ColumnInfo {
     pub origin: Option<(String, String)>,
 }
 
+/// The table schema each resolved dependency contributes to the Columns
+/// card's origin lookup, as `(label, schema)` in declaration order: a
+/// ViewDefinition's own declared columns, or a ValueSet's/ConceptMap's
+/// fixed columns (#1824, [`helios_sof::sqlquery::TerminologyKind::columns`]).
+/// SQL View dependencies contribute nothing (#842's own "no origin from a
+/// SQL View" rule), and neither does a dependency that failed to resolve.
+/// A ViewDefinition with an invalid `ansi/type` tag cannot be resolved to a
+/// schema (the server rejects it the same way), so it is treated like any
+/// other dependency that fails to resolve: absent, with no origin and the
+/// type inferred from the row values — never silently ignoring the bad tag.
+pub(crate) fn column_sources(
+    resolved: Vec<(TableRow, Option<Value>)>,
+) -> Vec<(String, helios_sof::sqlquery::TableSchema)> {
+    resolved
+        .into_iter()
+        .filter_map(|(row, doc)| {
+            let schema = match (&row.target, doc) {
+                (TableTarget::ViewDefinition { .. }, Some(vd)) => {
+                    helios_sof::sqlquery::TableSchema::try_from_view_definition(&vd).ok()?
+                }
+                (TableTarget::Terminology { kind, .. }, _) => kind.table_schema(),
+                _ => return None,
+            };
+            Some((row.label, schema))
+        })
+        .collect()
+}
+
 /// Builds one [`ColumnInfo`] per entry of `columns` (the last good run's
 /// own result columns, in order) — the Columns card's own analysis
-/// (#842/04). `view_definitions` is every dependency already resolved to a
-/// `ViewDefinition` (label, resolved document), from `crate::
-/// resolve_view_definition_dependencies` — SQL View dependencies never
-/// reach here at all (#842's own "no origin from a SQL View" rule is
-/// simply that this list never contains one). `rows` are the raw JSON
+/// (#842/04). `sources` is every dependency's own table schema, from
+/// [`column_sources`]. `rows` are the raw JSON
 /// objects `$sql-run` returned, before [`crate::sql_views::build_table`]
 /// stringifies them — needed so a column with no origin can still infer a
 /// type from the values' own JSON shape rather than their rendered text.
@@ -882,31 +964,17 @@ pub(crate) fn dependencies_used_by_sql(
 pub(crate) fn analyze_columns(
     columns: &[String],
     rows: &[Value],
-    view_definitions: &[(String, Value)],
+    sources: &[(String, helios_sof::sqlquery::TableSchema)],
 ) -> Vec<ColumnInfo> {
-    let schemas: Vec<(&str, helios_sof::sqlquery::TableSchema)> = view_definitions
-        .iter()
-        .filter_map(|(label, vd)| {
-            // A ViewDefinition with an invalid `ansi/type` tag cannot be
-            // resolved to a schema (the server rejects it the same way), so
-            // it is treated like any other dependency that fails to
-            // resolve: absent, with no origin and the type inferred from
-            // the row values — never silently ignoring the bad tag.
-            helios_sof::sqlquery::TableSchema::try_from_view_definition(vd)
-                .ok()
-                .map(|schema| (label.as_str(), schema))
-        })
-        .collect();
-
     columns
         .iter()
         .map(|name| {
-            let mut matches = schemas.iter().filter_map(|(label, schema)| {
+            let mut matches = sources.iter().filter_map(|(label, schema)| {
                 schema
                     .columns
                     .iter()
                     .find(|c| c.name == *name)
-                    .map(|c| (*label, c.fhir_type.code()))
+                    .map(|c| (label.as_str(), c.fhir_type.code()))
             });
             let first = matches.next();
             let single = first.filter(|_| matches.next().is_none());
@@ -1566,6 +1634,106 @@ mod tests {
     }
 
     #[test]
+    fn classify_terminology_artifact_prefers_title_then_name_then_reference() {
+        use helios_sof::sqlquery::TerminologyKind;
+        let reference = "http://hl7.org/fhir/ValueSet/administrative-gender";
+        assert_eq!(
+            classify_terminology_artifact(
+                TerminologyKind::ValueSet,
+                &json!({"name": "AdministrativeGender", "title": "Administrative Gender"}),
+                reference
+            ),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ValueSet,
+                name: "Administrative Gender".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_terminology_artifact(
+                TerminologyKind::ConceptMap,
+                &json!({"name": "ids_to_icd"}),
+                reference
+            ),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ConceptMap,
+                name: "ids_to_icd".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_terminology_artifact(TerminologyKind::ValueSet, &json!({}), reference),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ValueSet,
+                name: reference.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn vcl_value_sets_without_a_title_read_as_their_decoded_expression() {
+        use helios_sof::sqlquery::TerminologyKind;
+        let vcl = "http://fhir.org/VCL?v1=%28http%3A%2F%2Fhl7.org%2Ffhir%2Fsid%2Ficd-10-cm%29concept%3C%3CE11";
+        assert_eq!(
+            vcl_expression(vcl).as_deref(),
+            Some("(http://hl7.org/fhir/sid/icd-10-cm)concept<<E11")
+        );
+        assert_eq!(
+            vcl_expression("https://fhir.org/VCL?v1=%28http%3A%2F%2Fs%29%22E11.9%22").as_deref(),
+            Some(r#"(http://s)"E11.9""#)
+        );
+        assert_eq!(vcl_expression("http://fhir.org/VCL?v1="), None);
+        assert_eq!(vcl_expression("http://fhir.org/VCL?v2=A"), None);
+        assert_eq!(vcl_expression("http://hl7.org/fhir/ValueSet/x"), None);
+
+        assert_eq!(
+            classify_terminology_artifact(TerminologyKind::ValueSet, &json!({}), vcl),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ValueSet,
+                name: "VCL: (http://hl7.org/fhir/sid/icd-10-cm)concept<<E11".to_string(),
+            }
+        );
+        // A title the terminology server does send still wins.
+        assert_eq!(
+            classify_terminology_artifact(
+                TerminologyKind::ValueSet,
+                &json!({"title": "T2DM"}),
+                vcl
+            ),
+            TableTarget::Terminology {
+                kind: TerminologyKind::ValueSet,
+                name: "T2DM".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn concept_map_in_bundle_matches_canonical_and_pinned_version() {
+        let bundle = json!({"resourceType": "Bundle", "entry": [
+            {"resource": {"resourceType": "OperationOutcome"}},
+            {"resource": {"resourceType": "ConceptMap", "id": "a",
+                          "url": "http://example.org/cm", "version": "1"}},
+            {"resource": {"resourceType": "ConceptMap", "id": "b",
+                          "url": "http://example.org/cm", "version": "2"}},
+        ]});
+        let id = |r: Option<&Value>| r.and_then(|r| r["id"].as_str()).map(str::to_string);
+        assert_eq!(
+            id(concept_map_in_bundle(&bundle, "http://example.org/cm")),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            id(concept_map_in_bundle(&bundle, "http://example.org/cm|2")),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            concept_map_in_bundle(&bundle, "http://example.org/cm|3"),
+            None
+        );
+        assert_eq!(
+            concept_map_in_bundle(&json!({"resourceType": "Bundle"}), "http://example.org/cm"),
+            None
+        );
+    }
+
+    #[test]
     fn used_by_artifacts_matches_by_identity_excludes_self_and_sorts_by_name() {
         let target = json!({
             "resourceType": "Library", "id": "v1", "name": "patients_flat",
@@ -1780,6 +1948,94 @@ mod tests {
         })
     }
 
+    /// Each `(label, vd)` as a resolved ViewDefinition *Reads from* row,
+    /// through [`column_sources`].
+    fn vd_sources(vds: Vec<(&str, Value)>) -> Vec<(String, helios_sof::sqlquery::TableSchema)> {
+        column_sources(
+            vds.into_iter()
+                .map(|(label, vd)| {
+                    let row = TableRow {
+                        label: label.to_string(),
+                        resource: String::new(),
+                        target: TableTarget::ViewDefinition {
+                            id: "vd".to_string(),
+                            name: label.to_string(),
+                        },
+                    };
+                    (row, Some(vd))
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn analyze_columns_traces_terminology_columns_to_their_dependency() {
+        use helios_sof::sqlquery::TerminologyKind;
+        let row = |label: &str, target: TableTarget| TableRow {
+            label: label.to_string(),
+            resource: String::new(),
+            target,
+        };
+        let sources = column_sources(vec![
+            (
+                row(
+                    "v",
+                    TableTarget::ViewDefinition {
+                        id: "vd".to_string(),
+                        name: "v".to_string(),
+                    },
+                ),
+                Some(view_definition_with_columns(&[("patient_id", "string")])),
+            ),
+            (
+                row(
+                    "gender",
+                    TableTarget::Terminology {
+                        kind: TerminologyKind::ValueSet,
+                        name: "AdministrativeGender".to_string(),
+                    },
+                ),
+                None,
+            ),
+            (
+                row(
+                    "icd",
+                    TableTarget::Terminology {
+                        kind: TerminologyKind::ConceptMap,
+                        name: "IdsToIcd".to_string(),
+                    },
+                ),
+                None,
+            ),
+            (row("missing", TableTarget::NotFound), None),
+        ]);
+        let labels: Vec<&str> = sources.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["v", "gender", "icd"]);
+
+        let columns = vec![
+            "patient_id".to_string(),
+            "display".to_string(),
+            "relationship".to_string(),
+        ];
+        let info = analyze_columns(&columns, &[], &sources);
+        assert_eq!(
+            info[1],
+            ColumnInfo {
+                name: "display".to_string(),
+                type_code: Some("string".to_string()),
+                origin: Some(("gender".to_string(), "display".to_string())),
+            }
+        );
+        assert_eq!(
+            info[2],
+            ColumnInfo {
+                name: "relationship".to_string(),
+                type_code: Some("code".to_string()),
+                origin: Some(("icd".to_string(), "relationship".to_string())),
+            }
+        );
+    }
+
     #[test]
     fn analyze_columns_prefers_the_single_resolved_origin_and_its_type() {
         let vd = view_definition_with_columns(&[("id", "string"), ("family", "string")]);
@@ -1790,7 +2046,7 @@ mod tests {
             "n".to_string(),
             "ok".to_string(),
         ];
-        let info = analyze_columns(&columns, &rows, &[("v".to_string(), vd)]);
+        let info = analyze_columns(&columns, &rows, &vd_sources(vec![("v", vd)]));
         assert_eq!(
             info[0],
             ColumnInfo {
@@ -1831,7 +2087,7 @@ mod tests {
         ]);
         assert!(helios_sof::sqlquery::TableSchema::try_from_view_definition(&vd).is_err());
         let rows = vec![json!({"id": "p1"})];
-        let info = analyze_columns(&["id".to_string()], &rows, &[("v".to_string(), vd)]);
+        let info = analyze_columns(&["id".to_string()], &rows, &vd_sources(vec![("v", vd)]));
         // Unresolvable dependency: no origin, type inferred from the rows.
         assert_eq!(info[0].origin, None);
         assert_eq!(info[0].type_code.as_deref(), Some("string"));
@@ -1845,7 +2101,7 @@ mod tests {
         let info = analyze_columns(
             &["id".to_string()],
             &rows,
-            &[("a".to_string(), a), ("b".to_string(), b)],
+            &vd_sources(vec![("a", a), ("b", b)]),
         );
         assert_eq!(info[0].origin, None);
         // Falls back to the row values: a single string value.

@@ -19,7 +19,8 @@
 //!
 //! | Operation | Endpoint | Used by |
 //! |-----------|----------|---------|
-//! | ValueSet $expand | `POST /ValueSet/$expand` | `:in` / `:not-in` search modifiers |
+//! | ValueSet $expand | `POST /ValueSet/$expand` | `:in` / `:not-in` search modifiers, SQL query ValueSet dependencies |
+//! | ConceptMap search | `GET /ConceptMap?url=` | SQL query ConceptMap dependencies |
 
 use std::time::Duration;
 
@@ -240,6 +241,100 @@ impl TerminologyServiceClient {
             .map_err(|e| TerminologyError::Parse(e.to_string()))?;
 
         extract_expansion_codes(&value)
+    }
+
+    /// Fetches one page of a ValueSet expansion as the raw expanded ValueSet:
+    /// `POST {base_url}/ValueSet/$expand` with `url`, `offset` and `count`.
+    ///
+    /// Returns `Ok(None)` when the server answers `404` (it knows no value set
+    /// at `value_set_url`). Used by SQL-on-FHIR terminology relations (#1824),
+    /// which need nesting, `abstract`, `version` and `inactive` intact.
+    pub async fn expand_value_set_page(
+        &self,
+        value_set_url: &str,
+        offset: usize,
+        count: usize,
+    ) -> Result<Option<Value>, TerminologyError> {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": value_set_url},
+                {"name": "offset", "valueInteger": offset},
+                {"name": "count", "valueInteger": count}
+            ]
+        });
+        let request = self
+            .client
+            .post(format!("{}/ValueSet/$expand", self.base_url))
+            .json(&body)
+            .header("Content-Type", "application/fhir+json");
+        self.send_optional(request).await
+    }
+
+    /// Looks up a ConceptMap by canonical (`url`, or `url|version`) with
+    /// `GET {base_url}/ConceptMap?url=…[&version=…]`.
+    ///
+    /// Returns `Ok(None)` when no map matches, and the first match otherwise
+    /// (a server holding several versions of an unversioned canonical decides
+    /// the order).
+    pub async fn find_concept_map(
+        &self,
+        canonical: &str,
+    ) -> Result<Option<Value>, TerminologyError> {
+        let (url, version) = match canonical.split_once('|') {
+            Some((url, version)) => (url, Some(version)),
+            None => (canonical, None),
+        };
+        let mut query = vec![("url", url)];
+        if let Some(version) = version {
+            query.push(("version", version));
+        }
+        let request = self
+            .client
+            .get(format!("{}/ConceptMap", self.base_url))
+            .query(&query);
+        let Some(bundle) = self.send_optional(request).await? else {
+            return Ok(None);
+        };
+        Ok(bundle
+            .get("entry")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("resource"))
+            .find(|r| r.get("resourceType").and_then(Value::as_str) == Some("ConceptMap"))
+            .cloned())
+    }
+
+    /// Sends `request` expecting a FHIR JSON body; `404` becomes `Ok(None)`.
+    async fn send_optional(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<Option<Value>, TerminologyError> {
+        let response = request
+            .header("Accept", "application/fhir+json")
+            .send()
+            .await
+            .map_err(|e| TerminologyError::Network(e.to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect::<String>();
+            return Err(TerminologyError::ServerError { status, body });
+        }
+        response
+            .json()
+            .await
+            .map(Some)
+            .map_err(|e| TerminologyError::Parse(e.to_string()))
     }
 }
 

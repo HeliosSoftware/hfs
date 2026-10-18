@@ -55,9 +55,9 @@
     <span class="field__label"><code>:{{ p.name }}</code> · {{ p.type_code }}{% if let Some(default) = p.default %} · {{ i18n.t("sql-param-default") }} {{ default }}{% endif %}</span>
     {% match p.type_code.as_str() %}
     {% when "integer" | "positiveInt" | "unsignedInt" | "integer64" %}
-    <input class="field__input" type="number" step="1" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input field__input--number" type="number" step="1" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "decimal" %}
-    <input class="field__input" type="number" step="any" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input field__input--number" type="number" step="any" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "date" %}
     <input class="field__input" type="date" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "boolean" %}
