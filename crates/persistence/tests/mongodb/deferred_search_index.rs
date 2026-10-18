@@ -1993,6 +1993,11 @@ async fn a_repair_finishes_every_healthy_batch_and_keeps_a_chunk_with_a_poisoned
 /// Two repairs (two instances, or a call that overlaps another) that read the
 /// same ledger document do not both work on it: the claim lets one through and
 /// the other skips it. Either way the Bundle ends with one row set per resource.
+///
+/// The claim moves `not_before` to now, so it only keeps the other repair out
+/// for `min_age`: with a zero minimum age a repair that lists the ledger after
+/// the claim finds the document due again and runs it a second time. The
+/// ledger document is backdated and both repairs run with a real lease.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_repairs_write_one_row_set() {
     const NAME: &str = "two_concurrent_repairs_write_one_row_set";
@@ -2027,9 +2032,19 @@ async fn two_concurrent_repairs_write_one_row_set() {
     assert!(snapshot.iter().all(|rows| !rows.is_empty()));
 
     replant_ledger(&backend, tenant_id, &resources, true).await;
+    const LEASE: Duration = Duration::from_secs(600);
+    let due = mongodb::bson::DateTime::from_millis(
+        mongodb::bson::DateTime::now().timestamp_millis() - 2 * LEASE.as_millis() as i64,
+    );
+    raw_db(&backend)
+        .await
+        .collection::<Document>("search_index_pending")
+        .update_many(doc! {}, doc! { "$set": { "not_before": due } })
+        .await
+        .unwrap();
     let (first, second) = tokio::join!(
-        backend.repair_deferred_search_index(Duration::ZERO, 10),
-        other.repair_deferred_search_index(Duration::ZERO, 10),
+        backend.repair_deferred_search_index(LEASE, 10),
+        other.repair_deferred_search_index(LEASE, 10),
     );
     let (first, second) = (first.unwrap(), second.unwrap());
     assert_eq!(
