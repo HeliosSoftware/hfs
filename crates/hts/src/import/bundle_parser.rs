@@ -44,6 +44,17 @@ pub struct ParsedBundle {
     /// is purely a fast-path for first-time bulk loads. Importers MUST leave it
     /// `false` whenever the target may already contain concepts (re-import).
     pub fresh_load: bool,
+    /// When `true`, the write layer does not rebuild `concept_closure` for code
+    /// systems that already held concepts before this bundle. Rebuilding after
+    /// every batch of a chunked bulk load (SNOMED RF2, LOINC, RxNorm, …) is
+    /// O(n²), so those importers set this on each batch and leave the single
+    /// rebuild to `finalize_after_bootstrap` / `migrate_concept_closure*`.
+    /// Systems that were empty before the bundle are still rebuilt (cheap).
+    ///
+    /// Defaults to `false`: every code system the bundle writes gets its
+    /// closure rebuilt before the import returns, so a plain re-import never
+    /// leaves `$subsumes` / `is-a` answering from a wiped closure (#2128).
+    pub defer_closure: bool,
 }
 
 /// Authority rank for a resource we have POSITIVE evidence is authoritative:

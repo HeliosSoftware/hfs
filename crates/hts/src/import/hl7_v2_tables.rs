@@ -115,7 +115,7 @@ pub async fn import_hl7_v2_tables(
             ..Default::default()
         };
         let seed_bytes = build_code_system_bundle(&meta, std::slice::from_ref(&root));
-        let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+        let seed_stats = backend.import_bundle_deferred(ctx, &seed_bytes).await?;
         stats.code_systems += seed_stats.code_systems;
         stats.errors.extend(seed_stats.errors);
 
@@ -133,7 +133,7 @@ pub async fn import_hl7_v2_tables(
                 })
                 .collect();
             let bytes = build_code_system_bundle(&meta, &builder);
-            let chunk = backend.import_bundle(ctx, &bytes).await?;
+            let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
             stats.errors.extend(chunk.errors);
 
             eprintln!(

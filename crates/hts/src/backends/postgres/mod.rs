@@ -580,34 +580,42 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
-        // Before the transaction: record which CodeSystems currently have zero
-        // concepts in the DB so the post-commit closure build only touches
-        // newly-imported (or empty-stub) systems. Systems being updated in a
-        // batch import (e.g. SNOMED RF2 chunks) skip the per-batch rebuild
-        // because rebuilding per chunk is O(n²) — the SNOMED full closure
-        // is built once via the end-of-CLI `migrate_concept_closure_pg` call.
-        // Mirrors the SQLite import_bundle pattern.
+        // Before the transaction: decide which CodeSystems get their closure
+        // rebuilt once the bundle commits. `write_code_system` deletes a
+        // system's closure on every write, so a system left out of this list
+        // answers `$subsumes` / `is-a` from an empty closure until the next
+        // `migrate_concept_closure_pg` (issue #2128).
+        //
+        // A plain import rebuilds every system it writes. A batch of a chunked
+        // bulk load (`defer_closure`, e.g. SNOMED RF2 chunks) only rebuilds
+        // systems that had no concepts before it: rebuilding per chunk is
+        // O(n²), so the full closure is built once via the end-of-CLI /
+        // post-bootstrap `rebuild_missing_closures` call. Mirrors the SQLite
+        // import_parsed_sync pattern.
         // Probed with EXISTS rather than COUNT(*): the answer only
         // distinguishes empty from non-empty, and a COUNT over an
         // ever-growing concept set would make each batch of a chunked bulk
         // load scan all previously imported rows.
-        let mut systems_needing_closure: Vec<String> = Vec::new();
+        let mut systems_needing_closure: Vec<(String, Option<String>)> = Vec::new();
         for cs in &parsed.code_systems {
-            let row = client
-                .query_opt(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM concepts c
-                         JOIN code_systems s ON c.system_id = s.id
-                         WHERE s.url = $1
-                     )",
-                    &[&cs.url],
-                )
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-            let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
-            if !has_concepts {
-                systems_needing_closure.push(cs.url.clone());
+            if parsed.defer_closure {
+                let row = client
+                    .query_opt(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM concepts c
+                             JOIN code_systems s ON c.system_id = s.id
+                             WHERE s.url = $1
+                         )",
+                        &[&cs.url],
+                    )
+                    .await
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+                let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
+                if has_concepts {
+                    continue;
+                }
             }
+            systems_needing_closure.push((cs.url.clone(), cs.version.clone()));
         }
 
         let tx = client.transaction().await.map_err(|e| {
@@ -643,41 +651,37 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             HtsError::StorageError(format!("Commit transaction: {}", error_chain(&e)))
         })?;
 
-        // Rebuild concept_closure for newly-imported (previously empty) code
-        // systems. Skipped for batch imports of existing systems so SNOMED
-        // RF2's ~1300 batches don't each pay the closure-rebuild cost — the
-        // full closure is built once at end-of-CLI via
-        // `migrate_concept_closure_pg` (called from main.rs). Mirrors the
-        // SQLite post-commit closure rebuild.
-        //
-        // A URL may map to multiple `code_systems` rows when several versions
-        // share a canonical URL (e.g. the hl7.terminology@7.0.1 SNOMED stub
-        // sharing `http://snomed.info/sct` with the RF2 import that follows).
-        // Iterate every matching row and build the closure for each system_id
-        // that has hierarchy edges.
-        for url in &systems_needing_closure {
-            let rows = client
-                .query("SELECT id FROM code_systems WHERE url = $1", &[url])
+        // Rebuild the closure of exactly the (url, version) rows this bundle
+        // wrote. A URL may map to several `code_systems` rows when versions
+        // share a canonical (e.g. the hl7.terminology@7.0.1 SNOMED stub sharing
+        // `http://snomed.info/sct` with an RF2 import), and re-importing the
+        // small one must not rebuild the large one.
+        for (url, version) in &systems_needing_closure {
+            let row = client
+                .query_opt(
+                    "SELECT id FROM code_systems
+                     WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
+                    &[url, version],
+                )
                 .await
                 .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-            for row in rows {
-                let sid: String = row.get(0);
-                let has_hier: bool = client
-                    .query_one(
-                        "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = $1 LIMIT 1)",
-                        &[&sid],
-                    )
-                    .await
-                    .map(|r| r.get(0))
-                    .unwrap_or(false);
-                if has_hier {
-                    if let Err(e) = schema::build_concept_closure_pg(&mut client, &sid).await {
-                        tracing::warn!(
-                            system_id = %sid,
-                            error = %error_chain(&e),
-                            "Failed to build concept_closure after import"
-                        );
-                    }
+            let Some(row) = row else { continue };
+            let sid: String = row.get(0);
+            let has_hier: bool = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = $1 LIMIT 1)",
+                    &[&sid],
+                )
+                .await
+                .map(|r| r.get(0))
+                .unwrap_or(false);
+            if has_hier {
+                if let Err(e) = schema::build_concept_closure_pg(&mut client, &sid).await {
+                    tracing::warn!(
+                        system_id = %sid,
+                        error = %error_chain(&e),
+                        "Failed to build concept_closure after import"
+                    );
                 }
             }
         }

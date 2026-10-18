@@ -96,7 +96,7 @@ pub async fn import_dicom(
         ..Default::default()
     };
     let seed = build_code_system_bundle(&meta, std::slice::from_ref(&root));
-    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -114,7 +114,7 @@ pub async fn import_dicom(
             })
             .collect();
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
         stats.errors.extend(chunk.errors);
 
         eprintln!(

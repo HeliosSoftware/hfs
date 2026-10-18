@@ -251,6 +251,21 @@ pub trait BundleImportBackend: Send + Sync {
         parsed: bundle_parser::ParsedBundle,
     ) -> Result<ImportStats, HtsError>;
 
+    /// [`Self::import_bundle`] for one batch of a chunked bulk load: sets
+    /// [`bundle_parser::ParsedBundle::defer_closure`] so a code system that
+    /// already holds concepts does not get its closure rebuilt after every
+    /// batch. The caller must arrange a closure rebuild once the load is done
+    /// (the CLI and bootstrap paths run `finalize_after_bootstrap`).
+    async fn import_bundle_deferred(
+        &self,
+        ctx: &TenantContext,
+        data: &[u8],
+    ) -> Result<ImportStats, HtsError> {
+        let mut parsed = bundle_parser::parse_bundle(data)?;
+        parsed.defer_closure = true;
+        self.import_parsed(ctx, parsed).await
+    }
+
     /// `true` when the code system at `url` already has at least one concept
     /// stored. Chunked importers call this **once** before a bulk load to decide
     /// whether it is a fresh first-time import (no prior concepts) — in which

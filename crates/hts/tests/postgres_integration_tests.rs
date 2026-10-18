@@ -579,6 +579,61 @@ async fn subsumes_subsumed_by_returns_correct_outcome() {
     assert_eq!(resp.outcome, SubsumptionOutcome::SubsumedBy);
 }
 
+/// Re-importing an existing CodeSystem must leave its closure populated: the
+/// write deletes the closure, and it used to be rebuilt only at the next
+/// startup, so closure-backed `is-a` expansion found nothing in between
+/// (#2128). (PostgreSQL `$subsumes` walks `concept_hierarchy` directly, so it
+/// cannot observe this; count the rows instead.)
+#[tokio::test]
+async fn closure_survives_reimport() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("closure-reimport");
+    let system = format!("{base}cs");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem",
+            "id": format!("cs-{uid}"),
+            "url": system,
+            "name": "HierCS",
+            "status": "active",
+            "content": "complete",
+            "hierarchyMeaning": "is-a",
+            "concept": [{
+                "code": "A", "display": "A",
+                "concept": [{"code": "A.0", "display": "A.0"}]
+            }]
+        }}]
+    });
+    let bytes = serde_json::to_vec(&bundle).unwrap();
+    let closure_rows = || async {
+        let client = backend.pool().get().await.unwrap();
+        client
+            .query_one(
+                "SELECT COUNT(*) FROM concept_closure cc
+                 JOIN code_systems s ON s.id = cc.system_id
+                 WHERE s.url = $1",
+                &[&system],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+    };
+
+    // (A, A), (A.0, A.0), (A, A.0)
+    backend.import_bundle(&ctx(), &bytes).await.unwrap();
+    assert_eq!(closure_rows().await, 3);
+
+    backend.import_bundle(&ctx(), &bytes).await.unwrap();
+    assert_eq!(
+        closure_rows().await,
+        3,
+        "re-import must rebuild the closure it deletes"
+    );
+}
+
 #[tokio::test]
 async fn subsumes_not_subsumed_returns_correct_outcome() {
     let backend = fresh_backend().await;
