@@ -721,8 +721,8 @@ async fn import_non_bundle_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// A chunked import into a running server leaves `concept_closure` empty, and
-/// `?finalize=true` rebuilds it. Same scenario as the SQLite test in
+/// A chunked import into a running server with `?defer_closure=true` leaves
+/// `concept_closure` empty, and `?finalize=true` rebuilds it. Same scenario as the SQLite test in
 /// `operations::import_bundle`, but the symptom differs per backend: PostgreSQL
 /// answers `$subsumes` from a recursive CTE over `concept_hierarchy`, so it is
 /// unaffected there; what reads the closure on PostgreSQL is the `is-a`
@@ -733,6 +733,7 @@ async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
     let app = TestAppPg::new().await;
     let uid = uuid::Uuid::new_v4().simple().to_string();
     let sys = format!("http://chunked.{uid}/cs");
+    const DEFER: &str = "/import?defer_closure=true";
 
     let chunk = |concepts: &str| {
         format!(
@@ -776,17 +777,22 @@ async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
     // Chunk 1: metadata only. Chunk 2: parent + child, builds the closure.
     // Chunk 3: another child; the system is no longer empty, so the closure is
     // deleted and not rebuilt.
-    let (status, body) = app.import_bundle(&chunk("")).await;
+    let (status, body) = app.post_fhir(DEFER, chunk("")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = app
-        .import_bundle(&chunk(
-            r#"{"code":"A","display":"A"},
+        .post_fhir(
+            DEFER,
+            chunk(
+                r#"{"code":"A","display":"A"},
                {"code":"A.0","display":"A zero","property":[{"code":"parent","valueCode":"A"}]}"#,
-        ))
+            ),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = app
-        .import_bundle(&chunk(
+        .post_fhir(
+            DEFER,
+            chunk(
             r#"{"code":"A.1","display":"A one","property":[{"code":"parent","valueCode":"A"}]}"#,
         ))
         .await;

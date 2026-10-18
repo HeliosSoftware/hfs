@@ -251,6 +251,21 @@ pub trait BundleImportBackend: Send + Sync {
         parsed: bundle_parser::ParsedBundle,
     ) -> Result<ImportStats, HtsError>;
 
+    /// [`Self::import_bundle`] for one batch of a chunked bulk load: sets
+    /// [`bundle_parser::ParsedBundle::defer_closure`] so a code system that
+    /// already holds concepts does not get its closure rebuilt after every
+    /// batch. The caller must arrange a closure rebuild once the load is done
+    /// (the CLI and bootstrap paths run `finalize_after_bootstrap`).
+    async fn import_bundle_deferred(
+        &self,
+        ctx: &TenantContext,
+        data: &[u8],
+    ) -> Result<ImportStats, HtsError> {
+        let mut parsed = bundle_parser::parse_bundle(data)?;
+        parsed.defer_closure = true;
+        self.import_parsed(ctx, parsed).await
+    }
+
     /// `true` when the code system at `url` already has at least one concept
     /// stored. Chunked importers call this **once** before a bulk load to decide
     /// whether it is a fresh first-time import (no prior concepts) — in which
@@ -271,17 +286,16 @@ pub trait BundleImportBackend: Send + Sync {
     /// Build `concept_closure` for every system that has hierarchy edges but no
     /// closure rows, and return the number of systems rebuilt.
     ///
-    /// [`Self::import_bundle`] deliberately skips the closure build for a system
-    /// that already had concepts, because rebuilding after every chunk of a
-    /// bulk load is O(n²) — for SNOMED CT that is hours. The build is instead
-    /// deferred to the startup migration. That leaves a gap for a *chunked
-    /// import into an already-running server*: the first chunk creates the
-    /// system with no concepts and therefore no hierarchy edges yet, every
-    /// later chunk sees a non-empty system and defers, and the startup
-    /// migration never runs because the server never restarted. The system ends
-    /// up with hierarchy but no closure, which silently answers `not-subsumed`
-    /// from `$subsumes` (unbounded `is-a` / `descendent-of` expansion is
-    /// unaffected — it walks `concept_hierarchy`).
+    /// A deferred batch ([`Self::import_bundle_deferred`], or a parsed bundle
+    /// with [`bundle_parser::ParsedBundle::defer_closure`]) deletes the closure
+    /// of a system that already had concepts and does not rebuild it, because
+    /// rebuilding after every chunk of a bulk load is O(n²) — for SNOMED CT
+    /// that is hours. The CLI and bootstrap loads run this once at the end. A
+    /// *chunked import into an already-running server* (`POST
+    /// /import?defer_closure=true`) has no such end step of its own, so the
+    /// system is left with hierarchy but no closure, which silently answers
+    /// `not-subsumed` from `$subsumes` on SQLite and empties closure-backed
+    /// `is-a` expansion on PostgreSQL.
     ///
     /// Chunked importers close that gap by calling this once after the final
     /// chunk, which is what `POST /import?finalize=true` does. It is idempotent

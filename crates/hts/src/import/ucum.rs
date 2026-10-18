@@ -134,7 +134,7 @@ pub async fn import_ucum(
         },
         std::slice::from_ref(&root),
     );
-    let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+    let seed_stats = backend.import_bundle_deferred(ctx, &seed_bytes).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -162,7 +162,7 @@ pub async fn import_ucum(
             &builder_concepts,
         );
 
-        let chunk_stats = backend.import_bundle(ctx, &bytes).await?;
+        let chunk_stats = backend.import_bundle_deferred(ctx, &bytes).await?;
         stats.errors.extend(chunk_stats.errors);
 
         eprintln!(

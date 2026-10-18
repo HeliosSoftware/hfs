@@ -572,11 +572,14 @@ curl -X POST http://localhost:8090/import \
   -d @bundle.json
 ```
 
-When a large CodeSystem is loaded as a series of chunked bundles, pass
-`?finalize=true` on the **last** chunk. Each chunk after the first skips the
-`concept_closure` build (rebuilding it per chunk is O(n²)), so without this the
-system has hierarchy edges but no closure until the next restart and `$subsumes`
-answers `not-subsumed`. The response then includes `closures_rebuilt`.
+A plain import rebuilds the `concept_closure` of every CodeSystem it writes
+before responding, so `$subsumes` and `is-a` filters see the new hierarchy
+immediately. For a large CodeSystem loaded as a series of chunked bundles that
+rebuild is O(n²) across the load, so pass `?defer_closure=true` on every chunk
+except the last, and `?finalize=true` on the **last** chunk. Deferred chunks
+leave the system with hierarchy edges but no closure until it is finalized (or
+the server restarts), during which `$subsumes` answers `not-subsumed`. The
+finalizing response includes `closures_rebuilt`.
 
 ```bash
 curl -X POST "http://localhost:8090/import?finalize=true" \
