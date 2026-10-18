@@ -717,7 +717,7 @@ helios-rest = { version = "0.1", features = ["R4", "sqlite"] }
 - `R4` (default) - FHIR R4 (4.0.1)
 - `R4B` - FHIR R4B (4.3.0)
 - `R5` - FHIR R5 (5.0.0)
-- `R6` - FHIR R6 (6.0.0-ballot)
+- `R6` - FHIR R6 (6.0.0-snapshot1)
 
 ### Backends
 - `sqlite` (default) - SQLite (great for development)

@@ -1,0 +1,33 @@
+{
+  "resourceType": "Medication",
+  "id": "med0324",
+  "url": "http://example.org/fhir/Medication/amoxicillin-500mg-capsule",
+  "identifier": [
+    {
+      "system": "http://example.org/medication-catalogue",
+      "value": "CAT-AMX-500-CAP"
+    }
+  ],
+  "version": "1.0.0",
+  "name": "Amoxicillin500mgCapsule",
+  "title": "Amoxicillin 500 mg capsule",
+  "code": {
+    "coding": [
+      {
+        "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+        "code": "308191",
+        "display": "amoxicillin 500 MG Oral Capsule"
+      }
+    ]
+  },
+  "status": "active",
+  "doseForm": {
+    "coding": [
+      {
+        "system": "http://snomed.info/sct",
+        "code": "385049006",
+        "display": "Capsule"
+      }
+    ]
+  }
+}

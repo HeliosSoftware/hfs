@@ -587,6 +587,19 @@ curl -X POST "http://localhost:8090/import?finalize=true" \
   -d @bundle-last-chunk.json
 ```
 
+The rebuild for a very large system (SNOMED CT takes 30–60 s on PostgreSQL)
+can take longer than the 30 s request timeout. If it is still running after
+20 s, the server answers `202 Accepted` with `"closures_rebuild": "pending"`
+and lets the rebuild finish in the background. A client disconnect does not
+cancel it either. To wait for it, re-send `finalize=true` with an empty Bundle
+until the status is `200`:
+
+```bash
+curl -X POST "http://localhost:8090/import?finalize=true" \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Bundle","type":"collection"}'
+```
+
 ### Lookup a Concept
 
 ```bash

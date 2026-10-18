@@ -83,7 +83,7 @@ Implement the CDS Hooks standard using `helios-cds-hooks` types and traits, comp
 | FHIR R4 (4.0.1) | Normative | ✅ Default |
 | FHIR R4B (4.3.0) | Normative | ✅ Supported |
 | FHIR R5 (5.0.0) | Current standard | ✅ Supported |
-| FHIR R6 (6.0.0-ballot2) | Latest ballot | ✅ Supported |
+| FHIR R6 (6.0.0-snapshot1) | Pre-release snapshot | ✅ Supported |
 
 All four versions are available via Cargo feature flags. The default build compiles R4 only; use `--features R4,R4B,R5,R6` to enable all versions.
 

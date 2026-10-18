@@ -18,7 +18,7 @@
           <code>xml</code>, 
           <code>json</code>
         </li>
-        <li>Published on: 2026-09-14T16:43:45Z </li>
+        <li>Published on: 2026-10-17T20:58:40Z </li>
         <li>Published by: HL7 International / FHIR Infrastructure </li>
       </ul>
       <blockquote class="impl-note">
@@ -922,6 +922,7 @@
                 <code>ResearchSubject.subject</code>, 
                 <code>ResearchSubject.patient</code>, 
                 <code>Specimen.subject</code>, 
+                <code>Specimen.focus</code>, 
                 <code>Specimen.patient</code>
               </td>
               <td/>
@@ -1577,6 +1578,7 @@
               <td>
                 <code>Account.patient</code>, 
                 <code>Account.subject</code>, 
+                <code>AllergyIntolerance.asserter</code>, 
                 <code>Appointment.patient</code>, 
                 <code>Appointment.group</code>, 
                 <code>Appointment.practitioner</code>, 
@@ -1590,6 +1592,7 @@
                 <code>AuditEvent.agent</code>, 
                 <code>AuditEvent.source</code>, 
                 <code>Basic.author</code>, 
+                <code>BiologicallyDerivedProduct.collector</code>, 
                 <code>CarePlan.custodian</code>, 
                 <code>Claim.detail-udi</code>, 
                 <code>Claim.procedure-udi</code>, 
@@ -1623,6 +1626,7 @@
                 <code>DiagnosticReport.performer</code>, 
                 <code>DiagnosticReport.subject</code>, 
                 <code>DiagnosticReport.patient</code>, 
+                <code>DiagnosticReport.results-interpreter</code>, 
                 <code>DocumentReference.author</code>, 
                 <code>Encounter.participant</code>, 
                 <code>Encounter.practitioner</code>, 
@@ -1647,8 +1651,8 @@
                 <code>MessageHeader.receiver</code>, 
                 <code>MessageHeader.sender</code>, 
                 <code>Observation.subject</code>, 
-                <code>Observation.patient</code>, 
                 <code>Observation.device</code>, 
+                <code>Observation.patient</code>, 
                 <code>Procedure.performer</code>, 
                 <code>Procedure.subject</code>, 
                 <code>Procedure.patient</code>, 
@@ -1668,10 +1672,14 @@
                 <code>ServiceRequest.subject</code>, 
                 <code>ServiceRequest.patient</code>, 
                 <code>Specimen.subject</code>, 
+                <code>Specimen.focus</code>, 
+                <code>Specimen.collector</code>, 
                 <code>Specimen.patient</code>, 
                 <code>Subscription.owner</code>, 
+                <code>Task.owner</code>, 
                 <code>Task.requester</code>, 
-                <code>Task.actor</code>
+                <code>Task.actor</code>, 
+                <code>VisionPrescription.prescriber</code>
               </td>
               <td/>
             </tr>
@@ -2264,6 +2272,7 @@
                 <code>ActivityDefinition.subject-reference</code>, 
                 <code>AdverseEvent.subject</code>, 
                 <code>AdverseEvent.patient</code>, 
+                <code>AllergyIntolerance.asserter</code>, 
                 <code>Appointment.subject</code>, 
                 <code>Appointment.patient</code>, 
                 <code>Appointment.group</code>, 
@@ -2385,6 +2394,7 @@
                 <code>ServiceRequest.subject</code>, 
                 <code>ServiceRequest.patient</code>, 
                 <code>Specimen.subject</code>, 
+                <code>Specimen.focus</code>, 
                 <code>Specimen.patient</code>, 
                 <code>Subscription.owner</code>, 
                 <code>Task.owner</code>, 
@@ -2509,6 +2519,7 @@
                 <code>ImagingSelection.patient</code>
               </td>
               <td>
+                <code>DiagnosticReport.media</code>, 
                 <code>Observation.derived-from</code>
               </td>
               <td/>
@@ -2760,7 +2771,10 @@
                 <code>MedicationDispense.destination</code>, 
                 <code>MedicationDispense.location</code>, 
                 <code>Observation.subject</code>, 
+                <code>Observation.combo-value-reference</code>, 
+                <code>Observation.value-reference</code>, 
                 <code>Observation.patient</code>, 
+                <code>Observation.component-value-reference</code>, 
                 <code>OrganizationAffiliation.location</code>, 
                 <code>PractitionerRole.location</code>, 
                 <code>Procedure.subject</code>, 
@@ -2776,6 +2790,7 @@
                 <code>ServiceRequest.subject</code>, 
                 <code>ServiceRequest.patient</code>, 
                 <code>Specimen.subject</code>, 
+                <code>Specimen.focus</code>, 
                 <code>Specimen.patient</code>
               </td>
               <td/>
@@ -3244,6 +3259,7 @@
                 <code>Observation.patient</code>, 
                 <code>RegulatedAuthorization.subject</code>, 
                 <code>Specimen.subject</code>, 
+                <code>Specimen.focus</code>, 
                 <code>Specimen.patient</code>
               </td>
               <td/>
@@ -3263,21 +3279,24 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>date, combo-data-absent-reason, code, combo-code-value-quantity, component-data-absent-reason, subject, body-structure-code, value-concept, value-date, derived-from, focus, part-of, has-member, combo-interpretation, reference, code-value-string, component-code-value-quantity, based-on, component-interpretation, code-value-date, patient, specimen, code-value-quantity, component-code, combo-code-value-concept, value-string, identifier, performer, combo-code, method, value-quantity, component-value-quantity, data-absent-reason, combo-value-quantity, encounter, code-value-concept, interpretation, component-code-value-concept, component-value-concept, category, body-site, device, combo-value-concept, supporting-device, status</td>
+              <td>date, subject, value-concept, value-date, derived-from, focus, has-member, combo-interpretation, component-code-value-quantity, combo-value-reference, component-interpretation, code-value-date, code-value-quantity, body-structure-reference, combo-code-value-concept, value-string, identifier, method, value-quantity, combo-value-quantity, code-value-concept, code-value-reference, interpretation, device, supporting-device, status, combo-data-absent-reason, code, combo-code-value-quantity, component-data-absent-reason, body-structure-code, part-of, value-reference, code-value-string, based-on, patient, specimen, component-code, component-code-value-reference, component-value-reference, performer, combo-code, component-value-quantity, data-absent-reason, encounter, organizer, component-code-value-concept, component-value-concept, category, body-site, combo-value-concept</td>
               <td>
                 <code>Observation.subject</code>, 
                 <code>Observation.derived-from</code>, 
                 <code>Observation.focus</code>, 
-                <code>Observation.part-of</code>, 
                 <code>Observation.has-member</code>, 
-                <code>Observation.reference</code>, 
+                <code>Observation.combo-value-reference</code>, 
+                <code>Observation.body-structure-reference</code>, 
+                <code>Observation.device</code>, 
+                <code>Observation.supporting-device</code>, 
+                <code>Observation.part-of</code>, 
+                <code>Observation.value-reference</code>, 
                 <code>Observation.based-on</code>, 
                 <code>Observation.patient</code>, 
                 <code>Observation.specimen</code>, 
+                <code>Observation.component-value-reference</code>, 
                 <code>Observation.performer</code>, 
-                <code>Observation.encounter</code>, 
-                <code>Observation.device</code>, 
-                <code>Observation.supporting-device</code>
+                <code>Observation.encounter</code>
               </td>
               <td>
                 <code>DeviceAlert.derived-from</code>, 
@@ -3388,6 +3407,7 @@
                 <code>Account.patient</code>, 
                 <code>Account.subject</code>, 
                 <code>Account.guarantor</code>, 
+                <code>AllergyIntolerance.asserter</code>, 
                 <code>AuditEvent.agent</code>, 
                 <code>AuditEvent.source</code>, 
                 <code>Basic.author</code>, 
@@ -3408,6 +3428,7 @@
                 <code>CommunicationRequest.information-provider</code>, 
                 <code>Composition.author</code>, 
                 <code>Composition.attester</code>, 
+                <code>Condition.asserter</code>, 
                 <code>Consent.controller</code>, 
                 <code>Consent.manager</code>, 
                 <code>Consent.grantee</code>, 
@@ -3757,6 +3778,7 @@
                 <code>ServiceRequest.subject</code>, 
                 <code>ServiceRequest.patient</code>, 
                 <code>Specimen.subject</code>, 
+                <code>Specimen.focus</code>, 
                 <code>Specimen.collector</code>, 
                 <code>Specimen.patient</code>, 
                 <code>Subscription.owner</code>, 
@@ -4421,6 +4443,7 @@
                 <code>Schedule.actor</code>, 
                 <code>ServiceRequest.requester</code>, 
                 <code>ServiceRequest.performer</code>, 
+                <code>Specimen.focus</code>, 
                 <code>Specimen.collector</code>, 
                 <code>Subscription.owner</code>, 
                 <code>Task.owner</code>, 
@@ -4644,18 +4667,18 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>authored, requester, identifier, performer, location-code, requisition, replaces, subject, body-structure-code, encounter, occurrence, priority, intent, performer-type, reference, based-on, code-reference, patient, code-concept, location-reference, category, group-or-identifier, status</td>
+              <td>authored, requester, identifier, performer, location-code, requisition, replaces, subject, body-structure-code, encounter, occurrence, priority, intent, performer-type, based-on, code-reference, patient, code-concept, location-reference, body-structure-reference, category, group-or-identifier, status</td>
               <td>
                 <code>ServiceRequest.requester</code>, 
                 <code>ServiceRequest.performer</code>, 
                 <code>ServiceRequest.replaces</code>, 
                 <code>ServiceRequest.subject</code>, 
                 <code>ServiceRequest.encounter</code>, 
-                <code>ServiceRequest.reference</code>, 
                 <code>ServiceRequest.based-on</code>, 
                 <code>ServiceRequest.code-reference</code>, 
                 <code>ServiceRequest.patient</code>, 
-                <code>ServiceRequest.location-reference</code>
+                <code>ServiceRequest.location-reference</code>, 
+                <code>ServiceRequest.body-structure-reference</code>
               </td>
               <td>
                 <code>Appointment.based-on</code>, 
@@ -4719,15 +4742,16 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>identifier, parent, request, subject, container-device-code, bodystructure, collected, procedure, type, collection-device-code, collector, patient, processing-device-code, status</td>
+              <td>identifier, parent, request, subject, container-device-code, focus, collected, procedure, type, collection-device-code, collector, patient, body-structure-reference, processing-device-code, status</td>
               <td>
                 <code>Specimen.parent</code>, 
                 <code>Specimen.request</code>, 
                 <code>Specimen.subject</code>, 
-                <code>Specimen.bodystructure</code>, 
+                <code>Specimen.focus</code>, 
                 <code>Specimen.procedure</code>, 
                 <code>Specimen.collector</code>, 
-                <code>Specimen.patient</code>
+                <code>Specimen.patient</code>, 
+                <code>Specimen.body-structure-reference</code>
               </td>
               <td>
                 <code>DeviceAlert.subject</code>, 
@@ -4899,6 +4923,7 @@
                 <code>ResearchSubject.subject</code>, 
                 <code>ResearchSubject.patient</code>, 
                 <code>Specimen.subject</code>, 
+                <code>Specimen.focus</code>, 
                 <code>Specimen.patient</code>
               </td>
               <td/>
@@ -8112,7 +8137,7 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="artifactassessment-search.html#ArtifactAssessment-date">date</a>
+                        <a href="activitydefinition-search.html#CanonicalResource-date">date</a>
                       </td>
                       <td>
                         <code>date</code>
@@ -8129,7 +8154,7 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="artifactassessment-search.html#ArtifactAssessment-identifier">identifier</a>
+                        <a href="activitydefinition-search.html#CanonicalResource-identifier">identifier</a>
                       </td>
                       <td>
                         <code>token</code>
@@ -9247,7 +9272,7 @@
                       </td>
                       <td>
                         <div>
-                          <p>The kind of structure</p>
+                          <p>The morphology of the overall body structure or an included structure</p>
 
                         </div>
                       </td>
@@ -29124,7 +29149,7 @@
                       </td>
                       <td>
                         <div>
-                          <p>Returns medications in a instance with this lot number</p>
+                          <p>Returns instance(s) of Medication resource that have this serial number</p>
 
                         </div>
                       </td>
@@ -29168,7 +29193,7 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="medication-search.html#Medication-status">status</a>
+                        <a href="activitydefinition-search.html#CanonicalResource-status">status</a>
                       </td>
                       <td>
                         <code>token</code>
@@ -33173,74 +33198,6 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-combo-data-absent-reason">combo-data-absent-reason</a>
-                      </td>
-                      <td>
-                        <code>token</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>The reason why the expected value in the element Observation.value[x] or Observation.component.value[x] is missing.</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="adverseevent-search.html#clinical-code">code</a>
-                      </td>
-                      <td>
-                        <code>token</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>The code of the observation type</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-combo-code-value-quantity">combo-code-value-quantity</a>
-                      </td>
-                      <td>
-                        <code>composite</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Code and quantity value parameter pair, including in components</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-component-data-absent-reason">component-data-absent-reason</a>
-                      </td>
-                      <td>
-                        <code>token</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>The reason why the expected value in the element Observation.component.value[x] is missing.</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
                         <a href="observation-search.html#Observation-subject">subject</a>
                       </td>
                       <td>
@@ -33249,23 +33206,6 @@
                       <td>
                         <div>
                           <p>The subject that the observation is about</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-body-structure-code">body-structure-code</a>
-                      </td>
-                      <td>
-                        <code>token</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Code for observed body structure</p>
 
                         </div>
                       </td>
@@ -33343,23 +33283,6 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-part-of">part-of</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Part of referenced event</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
                         <a href="observation-search.html#Observation-has-member">has-member</a>
                       </td>
                       <td>
@@ -33394,40 +33317,6 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-reference">reference</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Observed body structure (reference)</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-code-value-string">code-value-string</a>
-                      </td>
-                      <td>
-                        <code>composite</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Code and string value parameter pair</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
                         <a href="observation-search.html#Observation-component-code-value-quantity">component-code-value-quantity</a>
                       </td>
                       <td>
@@ -33445,14 +33334,14 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-based-on">based-on</a>
+                        <a href="observation-search.html#Observation-combo-value-reference">combo-value-reference</a>
                       </td>
                       <td>
                         <code>reference</code>
                       </td>
                       <td>
                         <div>
-                          <p>Reference to the service request.</p>
+                          <p>The Location referenced by the observation value or a component value</p>
 
                         </div>
                       </td>
@@ -33496,40 +33385,6 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="account-search.html#clinical-patient">patient</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>The subject that the observation is about (if patient)</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-specimen">specimen</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Specimen used for this observation</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
                         <a href="observation-search.html#Observation-code-value-quantity">code-value-quantity</a>
                       </td>
                       <td>
@@ -33547,14 +33402,14 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-component-code">component-code</a>
+                        <a href="observation-search.html#Observation-body-structure-reference">body-structure-reference</a>
                       </td>
                       <td>
-                        <code>token</code>
+                        <code>reference</code>
                       </td>
                       <td>
                         <div>
-                          <p>The component code of the observation type</p>
+                          <p>Observed body structure (reference)</p>
 
                         </div>
                       </td>
@@ -33615,40 +33470,6 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-performer">performer</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Who performed the observation</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-combo-code">combo-code</a>
-                      </td>
-                      <td>
-                        <code>token</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>The code of the observation type or component type</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
                         <a href="observation-search.html#Observation-method">method</a>
                       </td>
                       <td>
@@ -33674,6 +33495,397 @@
                       <td>
                         <div>
                           <p>The value of the observation, if the value is a Quantity.</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-combo-value-quantity">combo-value-quantity</a>
+                      </td>
+                      <td>
+                        <code>quantity</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The value or component value of the observation, if the value is a Quantity.</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-code-value-concept">code-value-concept</a>
+                      </td>
+                      <td>
+                        <code>composite</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Code and coded value parameter pair</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-code-value-reference">code-value-reference</a>
+                      </td>
+                      <td>
+                        <code>composite</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Code and Location reference value parameter pair</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-interpretation">interpretation</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The interpretation of the observation type</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-device">device</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The Device that generated the observation data.</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-supporting-device">supporting-device</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Device supporting generation of the measurement</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-status">status</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The status of the observation</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-combo-data-absent-reason">combo-data-absent-reason</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The reason why the expected value in the element Observation.value[x] or Observation.component.value[x] is missing.</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="adverseevent-search.html#clinical-code">code</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The code of the observation type</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-combo-code-value-quantity">combo-code-value-quantity</a>
+                      </td>
+                      <td>
+                        <code>composite</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Code and quantity value parameter pair, including in components</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-component-data-absent-reason">component-data-absent-reason</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The reason why the expected value in the element Observation.component.value[x] is missing.</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-body-structure-code">body-structure-code</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Code for observed body structure</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-part-of">part-of</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Part of referenced event</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-value-reference">value-reference</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The Location referenced by the observation value</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-code-value-string">code-value-string</a>
+                      </td>
+                      <td>
+                        <code>composite</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Code and string value parameter pair</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-based-on">based-on</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Reference to the service request.</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="account-search.html#clinical-patient">patient</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The subject that the observation is about (if patient)</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-specimen">specimen</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Specimen used for this observation</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-component-code">component-code</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The component code of the observation type</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-component-code-value-reference">component-code-value-reference</a>
+                      </td>
+                      <td>
+                        <code>composite</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Component code and Location reference value parameter pair</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-component-value-reference">component-value-reference</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The Location referenced by a component value</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-performer">performer</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Who performed the observation</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="observation-search.html#Observation-combo-code">combo-code</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The code of the observation type or component type</p>
 
                         </div>
                       </td>
@@ -33717,23 +33929,6 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-combo-value-quantity">combo-value-quantity</a>
-                      </td>
-                      <td>
-                        <code>quantity</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>The value or component value of the observation, if the value is a Quantity.</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
                         <a href="auditevent-search.html#clinical-encounter">encounter</a>
                       </td>
                       <td>
@@ -33751,31 +33946,14 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-code-value-concept">code-value-concept</a>
-                      </td>
-                      <td>
-                        <code>composite</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Code and coded value parameter pair</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-interpretation">interpretation</a>
+                        <a href="observation-search.html#Observation-organizer">organizer</a>
                       </td>
                       <td>
                         <code>token</code>
                       </td>
                       <td>
                         <div>
-                          <p>The interpretation of the observation type</p>
+                          <p>Whether the observation organizes a set of sub-observations</p>
 
                         </div>
                       </td>
@@ -33853,23 +34031,6 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="observation-search.html#Observation-device">device</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>The Device that generated the observation data.</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
                         <a href="observation-search.html#Observation-combo-value-concept">combo-value-concept</a>
                       </td>
                       <td>
@@ -33878,40 +34039,6 @@
                       <td>
                         <div>
                           <p>The value or component value of the observation, if the value is a CodeableConcept</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-supporting-device">supporting-device</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Device supporting generation of the measurement</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
-                        <a href="observation-search.html#Observation-status">status</a>
-                      </td>
-                      <td>
-                        <code>token</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>The status of the observation</p>
 
                         </div>
                       </td>
@@ -44032,23 +44159,6 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="servicerequest-search.html#ServiceRequest-reference">reference</a>
-                      </td>
-                      <td>
-                        <code>reference</code>
-                      </td>
-                      <td>
-                        <div>
-                          <p>Body structure where procedure is going to be done (reference)</p>
-
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        <b>SHALL</b>
-                      </td>
-                      <td>
                         <a href="servicerequest-search.html#ServiceRequest-based-on">based-on</a>
                       </td>
                       <td>
@@ -44125,6 +44235,23 @@
                       <td>
                         <div>
                           <p>The preferred location specified in the ServiceRequest (resource reference)</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="servicerequest-search.html#ServiceRequest-body-structure-reference">body-structure-reference</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Body structure where procedure is going to be done (reference)</p>
 
                         </div>
                       </td>
@@ -44640,14 +44767,14 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="specimen-search.html#Specimen-bodystructure">bodystructure</a>
+                        <a href="specimen-search.html#Specimen-focus">focus</a>
                       </td>
                       <td>
                         <code>reference</code>
                       </td>
                       <td>
                         <div>
-                          <p>Reference to a resource (by instance)</p>
+                          <p>The entity from which the specimen was collected when it is not the subject of record</p>
 
                         </div>
                       </td>
@@ -44750,6 +44877,23 @@
                       <td>
                         <div>
                           <p>The patient the specimen comes from</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="specimen-search.html#Specimen-body-structure-reference">body-structure-reference</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>Reference to a resource (by instance)</p>
 
                         </div>
                       </td>
@@ -46631,7 +46775,7 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="substancedefinition-search.html#SubstanceDefinition-identifier">identifier</a>
+                        <a href="activitydefinition-search.html#CanonicalResource-identifier">identifier</a>
                       </td>
                       <td>
                         <code>token</code>
@@ -46682,7 +46826,7 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="substancedefinition-search.html#SubstanceDefinition-name">name</a>
+                        <a href="activitydefinition-search.html#CanonicalResource-name">name</a>
                       </td>
                       <td>
                         <code>string</code>
@@ -46716,7 +46860,7 @@
                         <b>SHALL</b>
                       </td>
                       <td>
-                        <a href="substancedefinition-search.html#SubstanceDefinition-status">status</a>
+                        <a href="activitydefinition-search.html#CanonicalResource-status">status</a>
                       </td>
                       <td>
                         <code>token</code>
@@ -48370,7 +48514,7 @@
   <name value="Base FHIR Capability Statement (Full)"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -49598,13 +49742,13 @@
       <referencePolicy value="logical"/>
       <searchParam>
         <name value="date"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/ArtifactAssessment-date"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/CanonicalResource-date"/>
         <type value="date"/>
         <documentation value="The artifact assessment publication date"/>
       </searchParam>
       <searchParam>
         <name value="identifier"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/ArtifactAssessment-identifier"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/CanonicalResource-identifier"/>
         <type value="token"/>
         <documentation value="The artifact assessment identifier"/>
       </searchParam>
@@ -49942,6 +50086,7 @@
       <searchRevInclude value="ResearchSubject.subject"/>
       <searchRevInclude value="ResearchSubject.patient"/>
       <searchRevInclude value="Specimen.subject"/>
+      <searchRevInclude value="Specimen.focus"/>
       <searchRevInclude value="Specimen.patient"/>
       <searchParam>
         <name value="identifier"/>
@@ -50067,7 +50212,7 @@
         <name value="morphology"/>
         <definition value="http://hl7.org/fhir/SearchParameter/BodyStructure-morphology"/>
         <type value="token"/>
-        <documentation value="The kind of structure"/>
+        <documentation value="The morphology of the overall body structure or an included structure"/>
       </searchParam>
       <searchParam>
         <name value="excluded-structure"/>
@@ -52929,6 +53074,7 @@
       <searchInclude value="Device.location"/>
       <searchRevInclude value="Account.patient"/>
       <searchRevInclude value="Account.subject"/>
+      <searchRevInclude value="AllergyIntolerance.asserter"/>
       <searchRevInclude value="Appointment.patient"/>
       <searchRevInclude value="Appointment.group"/>
       <searchRevInclude value="Appointment.practitioner"/>
@@ -52942,6 +53088,7 @@
       <searchRevInclude value="AuditEvent.agent"/>
       <searchRevInclude value="AuditEvent.source"/>
       <searchRevInclude value="Basic.author"/>
+      <searchRevInclude value="BiologicallyDerivedProduct.collector"/>
       <searchRevInclude value="CarePlan.custodian"/>
       <searchRevInclude value="Claim.detail-udi"/>
       <searchRevInclude value="Claim.procedure-udi"/>
@@ -52975,6 +53122,7 @@
       <searchRevInclude value="DiagnosticReport.performer"/>
       <searchRevInclude value="DiagnosticReport.subject"/>
       <searchRevInclude value="DiagnosticReport.patient"/>
+      <searchRevInclude value="DiagnosticReport.results-interpreter"/>
       <searchRevInclude value="DocumentReference.author"/>
       <searchRevInclude value="Encounter.participant"/>
       <searchRevInclude value="Encounter.practitioner"/>
@@ -52999,8 +53147,8 @@
       <searchRevInclude value="MessageHeader.receiver"/>
       <searchRevInclude value="MessageHeader.sender"/>
       <searchRevInclude value="Observation.subject"/>
-      <searchRevInclude value="Observation.patient"/>
       <searchRevInclude value="Observation.device"/>
+      <searchRevInclude value="Observation.patient"/>
       <searchRevInclude value="Procedure.performer"/>
       <searchRevInclude value="Procedure.subject"/>
       <searchRevInclude value="Procedure.patient"/>
@@ -53020,10 +53168,14 @@
       <searchRevInclude value="ServiceRequest.subject"/>
       <searchRevInclude value="ServiceRequest.patient"/>
       <searchRevInclude value="Specimen.subject"/>
+      <searchRevInclude value="Specimen.focus"/>
+      <searchRevInclude value="Specimen.collector"/>
       <searchRevInclude value="Specimen.patient"/>
       <searchRevInclude value="Subscription.owner"/>
+      <searchRevInclude value="Task.owner"/>
       <searchRevInclude value="Task.requester"/>
       <searchRevInclude value="Task.actor"/>
+      <searchRevInclude value="VisionPrescription.prescriber"/>
       <searchParam>
         <name value="udi-di"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Device-udi-di"/>
@@ -55836,6 +55988,7 @@
       <searchRevInclude value="ActivityDefinition.subject-reference"/>
       <searchRevInclude value="AdverseEvent.subject"/>
       <searchRevInclude value="AdverseEvent.patient"/>
+      <searchRevInclude value="AllergyIntolerance.asserter"/>
       <searchRevInclude value="Appointment.subject"/>
       <searchRevInclude value="Appointment.patient"/>
       <searchRevInclude value="Appointment.group"/>
@@ -55957,6 +56110,7 @@
       <searchRevInclude value="ServiceRequest.subject"/>
       <searchRevInclude value="ServiceRequest.patient"/>
       <searchRevInclude value="Specimen.subject"/>
+      <searchRevInclude value="Specimen.focus"/>
       <searchRevInclude value="Specimen.patient"/>
       <searchRevInclude value="Subscription.owner"/>
       <searchRevInclude value="Task.owner"/>
@@ -56391,6 +56545,7 @@
       <searchInclude value="ImagingSelection.body-structure"/>
       <searchInclude value="ImagingSelection.based-on"/>
       <searchInclude value="ImagingSelection.patient"/>
+      <searchRevInclude value="DiagnosticReport.media"/>
       <searchRevInclude value="Observation.derived-from"/>
       <searchParam>
         <name value="identifier"/>
@@ -57562,7 +57717,10 @@
       <searchRevInclude value="MedicationDispense.destination"/>
       <searchRevInclude value="MedicationDispense.location"/>
       <searchRevInclude value="Observation.subject"/>
+      <searchRevInclude value="Observation.combo-value-reference"/>
+      <searchRevInclude value="Observation.value-reference"/>
       <searchRevInclude value="Observation.patient"/>
+      <searchRevInclude value="Observation.component-value-reference"/>
       <searchRevInclude value="OrganizationAffiliation.location"/>
       <searchRevInclude value="PractitionerRole.location"/>
       <searchRevInclude value="Procedure.subject"/>
@@ -57578,6 +57736,7 @@
       <searchRevInclude value="ServiceRequest.subject"/>
       <searchRevInclude value="ServiceRequest.patient"/>
       <searchRevInclude value="Specimen.subject"/>
+      <searchRevInclude value="Specimen.focus"/>
       <searchRevInclude value="Specimen.patient"/>
       <searchParam>
         <name value="identifier"/>
@@ -58198,7 +58357,7 @@
         <name value="serial-number"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Medication-serial-number"/>
         <type value="token"/>
-        <documentation value="Returns medications in a instance with this lot number"/>
+        <documentation value="Returns instance(s) of Medication resource that have this serial number"/>
       </searchParam>
       <searchParam>
         <name value="expiration-date"/>
@@ -58214,7 +58373,7 @@
       </searchParam>
       <searchParam>
         <name value="status"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Medication-status"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/CanonicalResource-status"/>
         <type value="token"/>
         <documentation value="Returns medications for this status"/>
       </searchParam>
@@ -59705,6 +59864,7 @@
       <searchRevInclude value="Observation.patient"/>
       <searchRevInclude value="RegulatedAuthorization.subject"/>
       <searchRevInclude value="Specimen.subject"/>
+      <searchRevInclude value="Specimen.focus"/>
       <searchRevInclude value="Specimen.patient"/>
       <searchParam>
         <name value="identifier"/>
@@ -59792,16 +59952,19 @@
       <searchInclude value="Observation.subject"/>
       <searchInclude value="Observation.derived-from"/>
       <searchInclude value="Observation.focus"/>
-      <searchInclude value="Observation.part-of"/>
       <searchInclude value="Observation.has-member"/>
-      <searchInclude value="Observation.reference"/>
+      <searchInclude value="Observation.combo-value-reference"/>
+      <searchInclude value="Observation.body-structure-reference"/>
+      <searchInclude value="Observation.device"/>
+      <searchInclude value="Observation.supporting-device"/>
+      <searchInclude value="Observation.part-of"/>
+      <searchInclude value="Observation.value-reference"/>
       <searchInclude value="Observation.based-on"/>
       <searchInclude value="Observation.patient"/>
       <searchInclude value="Observation.specimen"/>
+      <searchInclude value="Observation.component-value-reference"/>
       <searchInclude value="Observation.performer"/>
       <searchInclude value="Observation.encounter"/>
-      <searchInclude value="Observation.device"/>
-      <searchInclude value="Observation.supporting-device"/>
       <searchRevInclude value="DeviceAlert.derived-from"/>
       <searchRevInclude value="DiagnosticReport.result"/>
       <searchRevInclude value="Goal.addresses"/>
@@ -59816,40 +59979,10 @@
         <documentation value="Clinically relevant time/time-period for observation"/>
       </searchParam>
       <searchParam>
-        <name value="combo-data-absent-reason"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-data-absent-reason"/>
-        <type value="token"/>
-        <documentation value="The reason why the expected value in the element Observation.value[x] or Observation.component.value[x] is missing."/>
-      </searchParam>
-      <searchParam>
-        <name value="code"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/clinical-code"/>
-        <type value="token"/>
-        <documentation value="The code of the observation type"/>
-      </searchParam>
-      <searchParam>
-        <name value="combo-code-value-quantity"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-code-value-quantity"/>
-        <type value="composite"/>
-        <documentation value="Code and quantity value parameter pair, including in components"/>
-      </searchParam>
-      <searchParam>
-        <name value="component-data-absent-reason"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-component-data-absent-reason"/>
-        <type value="token"/>
-        <documentation value="The reason why the expected value in the element Observation.component.value[x] is missing."/>
-      </searchParam>
-      <searchParam>
         <name value="subject"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Observation-subject"/>
         <type value="reference"/>
         <documentation value="The subject that the observation is about"/>
-      </searchParam>
-      <searchParam>
-        <name value="body-structure-code"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-body-structure-code"/>
-        <type value="token"/>
-        <documentation value="Code for observed body structure"/>
       </searchParam>
       <searchParam>
         <name value="value-concept"/>
@@ -59876,12 +60009,6 @@
         <documentation value="The focus of an observation when the focus is not the patient of record."/>
       </searchParam>
       <searchParam>
-        <name value="part-of"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-part-of"/>
-        <type value="reference"/>
-        <documentation value="Part of referenced event"/>
-      </searchParam>
-      <searchParam>
         <name value="has-member"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Observation-has-member"/>
         <type value="reference"/>
@@ -59894,28 +60021,16 @@
         <documentation value="The interpretation of the observation type or component type"/>
       </searchParam>
       <searchParam>
-        <name value="reference"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-reference"/>
-        <type value="reference"/>
-        <documentation value="Observed body structure (reference)"/>
-      </searchParam>
-      <searchParam>
-        <name value="code-value-string"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-code-value-string"/>
-        <type value="composite"/>
-        <documentation value="Code and string value parameter pair"/>
-      </searchParam>
-      <searchParam>
         <name value="component-code-value-quantity"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Observation-component-code-value-quantity"/>
         <type value="composite"/>
         <documentation value="Component code and component quantity value parameter pair"/>
       </searchParam>
       <searchParam>
-        <name value="based-on"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-based-on"/>
+        <name value="combo-value-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-value-reference"/>
         <type value="reference"/>
-        <documentation value="Reference to the service request."/>
+        <documentation value="The Location referenced by the observation value or a component value"/>
       </searchParam>
       <searchParam>
         <name value="component-interpretation"/>
@@ -59930,28 +60045,16 @@
         <documentation value="Code and date/time value parameter pair"/>
       </searchParam>
       <searchParam>
-        <name value="patient"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/clinical-patient"/>
-        <type value="reference"/>
-        <documentation value="The subject that the observation is about (if patient)"/>
-      </searchParam>
-      <searchParam>
-        <name value="specimen"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-specimen"/>
-        <type value="reference"/>
-        <documentation value="Specimen used for this observation"/>
-      </searchParam>
-      <searchParam>
         <name value="code-value-quantity"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Observation-code-value-quantity"/>
         <type value="composite"/>
         <documentation value="Code and quantity value parameter pair"/>
       </searchParam>
       <searchParam>
-        <name value="component-code"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-component-code"/>
-        <type value="token"/>
-        <documentation value="The component code of the observation type"/>
+        <name value="body-structure-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-body-structure-reference"/>
+        <type value="reference"/>
+        <documentation value="Observed body structure (reference)"/>
       </searchParam>
       <searchParam>
         <name value="combo-code-value-concept"/>
@@ -59972,18 +60075,6 @@
         <documentation value="The unique id for a particular observation"/>
       </searchParam>
       <searchParam>
-        <name value="performer"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-performer"/>
-        <type value="reference"/>
-        <documentation value="Who performed the observation"/>
-      </searchParam>
-      <searchParam>
-        <name value="combo-code"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-code"/>
-        <type value="token"/>
-        <documentation value="The code of the observation type or component type"/>
-      </searchParam>
-      <searchParam>
         <name value="method"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Observation-method"/>
         <type value="token"/>
@@ -59994,6 +60085,144 @@
         <definition value="http://hl7.org/fhir/SearchParameter/Observation-value-quantity"/>
         <type value="quantity"/>
         <documentation value="The value of the observation, if the value is a Quantity."/>
+      </searchParam>
+      <searchParam>
+        <name value="combo-value-quantity"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-value-quantity"/>
+        <type value="quantity"/>
+        <documentation value="The value or component value of the observation, if the value is a Quantity."/>
+      </searchParam>
+      <searchParam>
+        <name value="code-value-concept"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-code-value-concept"/>
+        <type value="composite"/>
+        <documentation value="Code and coded value parameter pair"/>
+      </searchParam>
+      <searchParam>
+        <name value="code-value-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-code-value-reference"/>
+        <type value="composite"/>
+        <documentation value="Code and Location reference value parameter pair"/>
+      </searchParam>
+      <searchParam>
+        <name value="interpretation"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-interpretation"/>
+        <type value="token"/>
+        <documentation value="The interpretation of the observation type"/>
+      </searchParam>
+      <searchParam>
+        <name value="device"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-device"/>
+        <type value="reference"/>
+        <documentation value="The Device that generated the observation data."/>
+      </searchParam>
+      <searchParam>
+        <name value="supporting-device"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-supporting-device"/>
+        <type value="reference"/>
+        <documentation value="Device supporting generation of the measurement"/>
+      </searchParam>
+      <searchParam>
+        <name value="status"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-status"/>
+        <type value="token"/>
+        <documentation value="The status of the observation"/>
+      </searchParam>
+      <searchParam>
+        <name value="combo-data-absent-reason"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-data-absent-reason"/>
+        <type value="token"/>
+        <documentation value="The reason why the expected value in the element Observation.value[x] or Observation.component.value[x] is missing."/>
+      </searchParam>
+      <searchParam>
+        <name value="code"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/clinical-code"/>
+        <type value="token"/>
+        <documentation value="The code of the observation type"/>
+      </searchParam>
+      <searchParam>
+        <name value="combo-code-value-quantity"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-code-value-quantity"/>
+        <type value="composite"/>
+        <documentation value="Code and quantity value parameter pair, including in components"/>
+      </searchParam>
+      <searchParam>
+        <name value="component-data-absent-reason"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-component-data-absent-reason"/>
+        <type value="token"/>
+        <documentation value="The reason why the expected value in the element Observation.component.value[x] is missing."/>
+      </searchParam>
+      <searchParam>
+        <name value="body-structure-code"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-body-structure-code"/>
+        <type value="token"/>
+        <documentation value="Code for observed body structure"/>
+      </searchParam>
+      <searchParam>
+        <name value="part-of"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-part-of"/>
+        <type value="reference"/>
+        <documentation value="Part of referenced event"/>
+      </searchParam>
+      <searchParam>
+        <name value="value-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-value-reference"/>
+        <type value="reference"/>
+        <documentation value="The Location referenced by the observation value"/>
+      </searchParam>
+      <searchParam>
+        <name value="code-value-string"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-code-value-string"/>
+        <type value="composite"/>
+        <documentation value="Code and string value parameter pair"/>
+      </searchParam>
+      <searchParam>
+        <name value="based-on"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-based-on"/>
+        <type value="reference"/>
+        <documentation value="Reference to the service request."/>
+      </searchParam>
+      <searchParam>
+        <name value="patient"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/clinical-patient"/>
+        <type value="reference"/>
+        <documentation value="The subject that the observation is about (if patient)"/>
+      </searchParam>
+      <searchParam>
+        <name value="specimen"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-specimen"/>
+        <type value="reference"/>
+        <documentation value="Specimen used for this observation"/>
+      </searchParam>
+      <searchParam>
+        <name value="component-code"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-component-code"/>
+        <type value="token"/>
+        <documentation value="The component code of the observation type"/>
+      </searchParam>
+      <searchParam>
+        <name value="component-code-value-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-component-code-value-reference"/>
+        <type value="composite"/>
+        <documentation value="Component code and Location reference value parameter pair"/>
+      </searchParam>
+      <searchParam>
+        <name value="component-value-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-component-value-reference"/>
+        <type value="reference"/>
+        <documentation value="The Location referenced by a component value"/>
+      </searchParam>
+      <searchParam>
+        <name value="performer"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-performer"/>
+        <type value="reference"/>
+        <documentation value="Who performed the observation"/>
+      </searchParam>
+      <searchParam>
+        <name value="combo-code"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-code"/>
+        <type value="token"/>
+        <documentation value="The code of the observation type or component type"/>
       </searchParam>
       <searchParam>
         <name value="component-value-quantity"/>
@@ -60008,28 +60237,16 @@
         <documentation value="The reason why the expected value in the element Observation.value[x] is missing."/>
       </searchParam>
       <searchParam>
-        <name value="combo-value-quantity"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-value-quantity"/>
-        <type value="quantity"/>
-        <documentation value="The value or component value of the observation, if the value is a Quantity."/>
-      </searchParam>
-      <searchParam>
         <name value="encounter"/>
         <definition value="http://hl7.org/fhir/SearchParameter/clinical-encounter"/>
         <type value="reference"/>
         <documentation value="Encounter related to the observation"/>
       </searchParam>
       <searchParam>
-        <name value="code-value-concept"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-code-value-concept"/>
-        <type value="composite"/>
-        <documentation value="Code and coded value parameter pair"/>
-      </searchParam>
-      <searchParam>
-        <name value="interpretation"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-interpretation"/>
+        <name value="organizer"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Observation-organizer"/>
         <type value="token"/>
-        <documentation value="The interpretation of the observation type"/>
+        <documentation value="Whether the observation organizes a set of sub-observations"/>
       </searchParam>
       <searchParam>
         <name value="component-code-value-concept"/>
@@ -60056,28 +60273,10 @@
         <documentation value="DEPRECATED: Observed body part"/>
       </searchParam>
       <searchParam>
-        <name value="device"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-device"/>
-        <type value="reference"/>
-        <documentation value="The Device that generated the observation data."/>
-      </searchParam>
-      <searchParam>
         <name value="combo-value-concept"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Observation-combo-value-concept"/>
         <type value="token"/>
         <documentation value="The value or component value of the observation, if the value is a CodeableConcept"/>
-      </searchParam>
-      <searchParam>
-        <name value="supporting-device"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-supporting-device"/>
-        <type value="reference"/>
-        <documentation value="Device supporting generation of the measurement"/>
-      </searchParam>
-      <searchParam>
-        <name value="status"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Observation-status"/>
-        <type value="token"/>
-        <documentation value="The status of the observation"/>
       </searchParam>
     </resource>
     <resource>
@@ -60480,6 +60679,7 @@
       <searchRevInclude value="Account.patient"/>
       <searchRevInclude value="Account.subject"/>
       <searchRevInclude value="Account.guarantor"/>
+      <searchRevInclude value="AllergyIntolerance.asserter"/>
       <searchRevInclude value="AuditEvent.agent"/>
       <searchRevInclude value="AuditEvent.source"/>
       <searchRevInclude value="Basic.author"/>
@@ -60500,6 +60700,7 @@
       <searchRevInclude value="CommunicationRequest.information-provider"/>
       <searchRevInclude value="Composition.author"/>
       <searchRevInclude value="Composition.attester"/>
+      <searchRevInclude value="Condition.asserter"/>
       <searchRevInclude value="Consent.controller"/>
       <searchRevInclude value="Consent.manager"/>
       <searchRevInclude value="Consent.grantee"/>
@@ -61129,6 +61330,7 @@
       <searchRevInclude value="ServiceRequest.subject"/>
       <searchRevInclude value="ServiceRequest.patient"/>
       <searchRevInclude value="Specimen.subject"/>
+      <searchRevInclude value="Specimen.focus"/>
       <searchRevInclude value="Specimen.collector"/>
       <searchRevInclude value="Specimen.patient"/>
       <searchRevInclude value="Subscription.owner"/>
@@ -63341,6 +63543,7 @@
       <searchRevInclude value="Schedule.actor"/>
       <searchRevInclude value="ServiceRequest.requester"/>
       <searchRevInclude value="ServiceRequest.performer"/>
+      <searchRevInclude value="Specimen.focus"/>
       <searchRevInclude value="Specimen.collector"/>
       <searchRevInclude value="Subscription.owner"/>
       <searchRevInclude value="Task.owner"/>
@@ -64505,11 +64708,11 @@
       <searchInclude value="ServiceRequest.replaces"/>
       <searchInclude value="ServiceRequest.subject"/>
       <searchInclude value="ServiceRequest.encounter"/>
-      <searchInclude value="ServiceRequest.reference"/>
       <searchInclude value="ServiceRequest.based-on"/>
       <searchInclude value="ServiceRequest.code-reference"/>
       <searchInclude value="ServiceRequest.patient"/>
       <searchInclude value="ServiceRequest.location-reference"/>
+      <searchInclude value="ServiceRequest.body-structure-reference"/>
       <searchRevInclude value="Appointment.based-on"/>
       <searchRevInclude value="BiologicallyDerivedProduct.request"/>
       <searchRevInclude value="CarePlan.activity-reference"/>
@@ -64613,12 +64816,6 @@
         <documentation value="Performer role"/>
       </searchParam>
       <searchParam>
-        <name value="reference"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/ServiceRequest-reference"/>
-        <type value="reference"/>
-        <documentation value="Body structure where procedure is going to be done (reference)"/>
-      </searchParam>
-      <searchParam>
         <name value="based-on"/>
         <definition value="http://hl7.org/fhir/SearchParameter/ServiceRequest-based-on"/>
         <type value="reference"/>
@@ -64647,6 +64844,12 @@
         <definition value="http://hl7.org/fhir/SearchParameter/ServiceRequest-location-reference"/>
         <type value="reference"/>
         <documentation value="The preferred location specified in the ServiceRequest (resource reference)"/>
+      </searchParam>
+      <searchParam>
+        <name value="body-structure-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/ServiceRequest-body-structure-reference"/>
+        <type value="reference"/>
+        <documentation value="Body structure where procedure is going to be done (reference)"/>
       </searchParam>
       <searchParam>
         <name value="category"/>
@@ -64814,10 +65017,11 @@
       <searchInclude value="Specimen.parent"/>
       <searchInclude value="Specimen.request"/>
       <searchInclude value="Specimen.subject"/>
-      <searchInclude value="Specimen.bodystructure"/>
+      <searchInclude value="Specimen.focus"/>
       <searchInclude value="Specimen.procedure"/>
       <searchInclude value="Specimen.collector"/>
       <searchInclude value="Specimen.patient"/>
+      <searchInclude value="Specimen.body-structure-reference"/>
       <searchRevInclude value="DeviceAlert.subject"/>
       <searchRevInclude value="DeviceAlert.patient"/>
       <searchRevInclude value="DeviceAssociation.subject"/>
@@ -64863,10 +65067,10 @@
         <documentation value="The code associated with the specimen container"/>
       </searchParam>
       <searchParam>
-        <name value="bodystructure"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/Specimen-bodystructure"/>
+        <name value="focus"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Specimen-focus"/>
         <type value="reference"/>
-        <documentation value="Reference to a resource (by instance)"/>
+        <documentation value="The entity from which the specimen was collected when it is not the subject of record"/>
       </searchParam>
       <searchParam>
         <name value="collected"/>
@@ -64903,6 +65107,12 @@
         <definition value="http://hl7.org/fhir/SearchParameter/clinical-patient"/>
         <type value="reference"/>
         <documentation value="The patient the specimen comes from"/>
+      </searchParam>
+      <searchParam>
+        <name value="body-structure-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Specimen-body-structure-reference"/>
+        <type value="reference"/>
+        <documentation value="Reference to a resource (by instance)"/>
       </searchParam>
       <searchParam>
         <name value="processing-device-code"/>
@@ -65557,6 +65767,7 @@
       <searchRevInclude value="ResearchSubject.subject"/>
       <searchRevInclude value="ResearchSubject.patient"/>
       <searchRevInclude value="Specimen.subject"/>
+      <searchRevInclude value="Specimen.focus"/>
       <searchRevInclude value="Specimen.patient"/>
       <searchParam>
         <name value="identifier"/>
@@ -65652,7 +65863,7 @@
       <searchRevInclude value="ResearchSubject.patient"/>
       <searchParam>
         <name value="identifier"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/SubstanceDefinition-identifier"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/CanonicalResource-identifier"/>
         <type value="token"/>
         <documentation value="Identifier by which this substance is known"/>
       </searchParam>
@@ -65670,7 +65881,7 @@
       </searchParam>
       <searchParam>
         <name value="name"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/SubstanceDefinition-name"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/CanonicalResource-name"/>
         <type value="string"/>
         <documentation value="The actual name"/>
       </searchParam>
@@ -65682,7 +65893,7 @@
       </searchParam>
       <searchParam>
         <name value="status"/>
-        <definition value="http://hl7.org/fhir/SearchParameter/SubstanceDefinition-status"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/CanonicalResource-status"/>
         <type value="token"/>
         <documentation value="Status of substance within the catalogue e.g. active, retired"/>
       </searchParam>

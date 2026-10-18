@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ObservationDefinition"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -386,7 +386,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Jurisdiction of the authority that maintains the this ObservationDefinition (if applicable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -640,7 +640,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Type of observation
             <br/>Binding: 
-            <a href="valueset-observation-codes-observationorboth.html">LOINC codes with Observation or Both</a> (
+            <a href="valueset-observation-codes.html">LOINC Codes</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -661,7 +661,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#code">code</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period | Reference
             <br/>Binding: 
             <a href="valueset-permitted-data-type.html">Observation Data Type</a> (
             <a href="terminologies.html#required" title="To be conformant, the concept in this element SHALL be from the specified value set.">Required</a>)
@@ -1231,7 +1231,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#code">code</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period | Reference
             <br/>Binding: 
             <a href="valueset-permitted-data-type.html">Observation Data Type</a> (
             <a href="terminologies.html#required" title="To be conformant, the concept in this element SHALL be from the specified value set.">Required</a>)
@@ -1316,7 +1316,7 @@
   <name value="ObservationDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -2540,8 +2540,8 @@
           <valueString value="ObservationCode"/>
         </extension>
         <strength value="example"/>
-        <description value="Codes identifying names of simple observations."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/observation-codes-observationorboth"/>
+        <description value="LOINC codes identifying types of observations, including panels."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/observation-codes"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -2562,7 +2562,7 @@
     </element>
     <element id="ObservationDefinition.permittedDataType">
       <path value="ObservationDefinition.permittedDataType"/>
-      <short value="Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period"/>
+      <short value="Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period | Reference"/>
       <definition value="The data types allowed for the value element of the instance observations conforming to this ObservationDefinition."/>
       <min value="0"/>
       <max value="*"/>
@@ -3595,7 +3595,7 @@
     </element>
     <element id="ObservationDefinition.component.permittedDataType">
       <path value="ObservationDefinition.component.permittedDataType"/>
-      <short value="Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period"/>
+      <short value="Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period | Reference"/>
       <definition value="The data types allowed for the value element of the instance of these component observations."/>
       <min value="0"/>
       <max value="*"/>
@@ -4287,8 +4287,8 @@
           <valueString value="ObservationCode"/>
         </extension>
         <strength value="example"/>
-        <description value="Codes identifying names of simple observations."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/observation-codes-observationorboth"/>
+        <description value="LOINC codes identifying types of observations, including panels."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/observation-codes"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -4309,7 +4309,7 @@
     </element>
     <element id="ObservationDefinition.permittedDataType">
       <path value="ObservationDefinition.permittedDataType"/>
-      <short value="Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period"/>
+      <short value="Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period | Reference"/>
       <definition value="The data types allowed for the value element of the instance observations conforming to this ObservationDefinition."/>
       <min value="0"/>
       <max value="*"/>
@@ -4814,7 +4814,7 @@
     </element>
     <element id="ObservationDefinition.component.permittedDataType">
       <path value="ObservationDefinition.component.permittedDataType"/>
-      <short value="Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period"/>
+      <short value="Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period | Reference"/>
       <definition value="The data types allowed for the value element of the instance of these component observations."/>
       <min value="0"/>
       <max value="*"/>

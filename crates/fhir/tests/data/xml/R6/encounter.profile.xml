@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Encounter"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -234,7 +234,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Classification of patient encounter context - e.g. Inpatient, outpatient
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-encounter-class.html">Encounter class</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-encounter-class.html">Encounter class</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -256,7 +256,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Indicates the urgency of the encounter
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v3-ActPriority.html">ActPriority</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v3-ActPriority.html">ActPriority</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -277,7 +277,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Specific type of encounter (e.g. e-mail consultation, surgical day-care, ...)
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Specific type of encounter (e.g. annual diabetes screening, outpatient injection, ...)
             <br/>Binding: 
             <a href="valueset-encounter-type.html" title="The type of encounter.">Encounter Type</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
@@ -809,7 +809,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Role that this diagnosis has within the encounter (e.g. admission, billing, discharge …)
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Role that this diagnosis has within the encounter (e.g. working, final …)
             <br/>Binding: 
             <a href="valueset-encounter-diagnosis-use.html">Encounter Diagnosis Use</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
@@ -873,7 +873,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Wheelchair, translator, stretcher, etc
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Wheelchair, interpreter, attendant, etc
             <br/>Binding: 
             <a href="valueset-encounter-special-arrangements.html">Special Arrangements</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
@@ -1000,7 +1000,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Indicates that the patient is being re-admitted
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v2-0092.html">hl7VS-re-admissionIndicator</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v2-0092.html">hl7VS-re-admissionIndicator</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1179,7 +1179,7 @@
   <name value="Encounter"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Patient Administration"/>
   <contact>
     <telecom>
@@ -1984,7 +1984,7 @@
     </element>
     <element id="Encounter.type">
       <path value="Encounter.type"/>
-      <short value="Specific type of encounter (e.g. e-mail consultation, surgical day-care, ...)"/>
+      <short value="Specific type of encounter (e.g. annual diabetes screening, outpatient injection, ...)"/>
       <definition value="Specific type of encounter (e.g. e-mail consultation, surgical day-care, skilled nursing, rehabilitation)."/>
       <comment value="Since there are many ways to further classify encounters, this element is 0..*."/>
       <min value="0"/>
@@ -3263,7 +3263,7 @@
     </element>
     <element id="Encounter.diagnosis.use">
       <path value="Encounter.diagnosis.use"/>
-      <short value="Role that this diagnosis has within the encounter (e.g. admission, billing, discharge …)"/>
+      <short value="Role that this diagnosis has within the encounter (e.g. working, final …)"/>
       <definition value="Role that this diagnosis has within the encounter (e.g. admission, billing, discharge …)."/>
       <min value="0"/>
       <max value="*"/>
@@ -3381,7 +3381,7 @@
     </element>
     <element id="Encounter.specialArrangement">
       <path value="Encounter.specialArrangement"/>
-      <short value="Wheelchair, translator, stretcher, etc"/>
+      <short value="Wheelchair, interpreter, attendant, etc"/>
       <definition value="Any special requests that have been made for this encounter, such as the provision of specific equipment or other things."/>
       <min value="0"/>
       <max value="*"/>
@@ -4348,7 +4348,7 @@
     </element>
     <element id="Encounter.type">
       <path value="Encounter.type"/>
-      <short value="Specific type of encounter (e.g. e-mail consultation, surgical day-care, ...)"/>
+      <short value="Specific type of encounter (e.g. annual diabetes screening, outpatient injection, ...)"/>
       <definition value="Specific type of encounter (e.g. e-mail consultation, surgical day-care, skilled nursing, rehabilitation)."/>
       <comment value="Since there are many ways to further classify encounters, this element is 0..*."/>
       <min value="0"/>
@@ -5015,7 +5015,7 @@
     </element>
     <element id="Encounter.diagnosis.use">
       <path value="Encounter.diagnosis.use"/>
-      <short value="Role that this diagnosis has within the encounter (e.g. admission, billing, discharge …)"/>
+      <short value="Role that this diagnosis has within the encounter (e.g. working, final …)"/>
       <definition value="Role that this diagnosis has within the encounter (e.g. admission, billing, discharge …)."/>
       <min value="0"/>
       <max value="*"/>
@@ -5097,7 +5097,7 @@
     </element>
     <element id="Encounter.specialArrangement">
       <path value="Encounter.specialArrangement"/>
-      <short value="Wheelchair, translator, stretcher, etc"/>
+      <short value="Wheelchair, interpreter, attendant, etc"/>
       <definition value="Any special requests that have been made for this encounter, such as the provision of specific equipment or other things."/>
       <min value="0"/>
       <max value="*"/>

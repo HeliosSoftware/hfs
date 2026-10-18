@@ -291,6 +291,9 @@ where
             helios_observability::middleware::track,
         ))
         .layer(cors)
+        // `POST /import?finalize=true` stops waiting on its closure rebuild
+        // after `AppState::import_finalize_wait` (20 s) and answers 202, so
+        // keep that below this limit if either changes.
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),

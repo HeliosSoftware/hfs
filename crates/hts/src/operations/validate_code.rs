@@ -37,7 +37,7 @@ use super::params::{
     coding_entries_from_codeable_concept, collect_canonical_params, collect_resource_params,
     extract_codeable_concept, extract_coding_full, extract_parameter_array,
     find_codeable_concept_param, find_resource_param, find_str_param, parse_query_string,
-    query_params_to_fhir_params,
+    query_params_to_fhir_params, split_versioned_canonical,
 };
 
 /// Identifies which FHIR `$validate-code` input form the operations layer is
@@ -2196,8 +2196,12 @@ fn validate_code_cache_put(cache: &ValidateCodeHandlerCache, key: String, value:
 /// present, or when `url` is absent for the bare-code form.
 pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     state: &AppState<B>,
-    params: Vec<Value>,
+    mut params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // `url=X|V` (or the `system` alias) is validated as `X` + `version=V`
+    // (#2122). Done before the cache key so both spellings share one entry.
+    split_versioned_canonical(&mut params, "url", "version");
+    split_versioned_canonical(&mut params, "system", "version");
     // ── Handler-level response cache (CS path) ───────────────────────────────
     // Skips ALL pre-call helpers (resolve_supplements, supplement_url_in_coding_error,
     // CodeSystemOperations::validate_code) when the same canonical params have
@@ -4189,33 +4193,6 @@ fn unresolved_import_response(params: &[Value], unresolved_vs_url: &str) -> Valu
     )
 }
 
-/// `url=http://x|1.0` becomes `url=http://x` plus `valueSetVersion=1.0`, the
-/// form every lookup below resolves. Profile bindings carry versioned
-/// canonicals (`...|4.0.1`), and validators pass them through unchanged. An
-/// explicit `valueSetVersion` wins over the pipe version, as in `$expand`.
-fn split_versioned_vs_url(mut params: Vec<Value>) -> Vec<Value> {
-    let Some(position) = params
-        .iter()
-        .position(|p| p.get("name").and_then(Value::as_str) == Some("url"))
-    else {
-        return params;
-    };
-    let Some(url) = find_str_param(&params, "url") else {
-        return params;
-    };
-    let Some((bare, version)) = url.split_once('|') else {
-        return params;
-    };
-    if version.is_empty() {
-        return params;
-    }
-    params[position] = serde_json::json!({ "name": "url", "valueUri": bare });
-    if find_str_param(&params, "valueSetVersion").is_none() {
-        params.push(serde_json::json!({ "name": "valueSetVersion", "valueString": version }));
-    }
-    params
-}
-
 async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
@@ -4233,7 +4210,10 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // A VCL implicit-ValueSet `url` is rewritten to that inline form here
     // (after the handler cache key, which uses the original VCL URL).
     let is_vcl = find_str_param(&params, "url").is_some_and(|u| crate::vcl::is_vcl_url(&u));
-    let params = split_versioned_vs_url(crate::vcl::rewrite_vcl_params(params)?);
+    let mut params = crate::vcl::rewrite_vcl_params(params)?;
+    // `url=X|V` resolves as `url=X` + `valueSetVersion=V` (#2119). Done after
+    // the VCL rewrite, whose URLs may themselves contain `|`.
+    split_versioned_canonical(&mut params, "url", "valueSetVersion");
     if find_str_param(&params, "url").is_none() {
         if let Some(vs_resource) = find_resource_param(&params, "valueSet") {
             if is_vcl {

@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="DeviceMetric"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -144,7 +144,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The kind of metric represented
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-metric-category.html">Device Metric Category</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-metric-category.html">Device Metric Category</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -167,7 +167,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Identity of metric, for example Heart Rate or PEEP Setting
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-devicemetric-type.html" title="Describes the metric type.">Device Metric and Component Types</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-devicemetric-type.html" title="Describes the metric type.">Device Metric and Component Types</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -232,7 +232,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Preferred color for displaying the metric
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-color-codes.html">Color Codes (Names or RGB Values)</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-color-codes.html">Color Codes (Names or RGB Values)</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -273,7 +273,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The continuity of the metric (e.g., measurement)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-metric-availability.html">Device Metric Availability</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-metric-availability.html">Device Metric Availability</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -314,7 +314,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The method of calibration
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-metric-calibration-type.html">Device Metric Calibration Type</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-metric-calibration-type.html">Device Metric Calibration Type</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -336,7 +336,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Calibration state of the metric (e.g., calibration needed)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-metric-calibration-state.html">Device Metric Calibration State</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-metric-calibration-state.html">Device Metric Calibration State</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -389,7 +389,7 @@
   <name value="DeviceMetric"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Devices"/>
   <contact>
     <telecom>

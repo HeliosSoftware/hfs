@@ -1168,6 +1168,81 @@ async fn expand_hierarchical_terminates_on_cyclic_hierarchy() {
     assert!(root.contains[0].contains[0].contains.is_empty());
 }
 
+/// Re-importing a CodeSystem that reverses an edge must replace the old edge
+/// instead of keeping both, which would make the pair each other's parent
+/// (#2129).
+#[tokio::test]
+async fn reimport_replaces_reversed_hierarchy_edge() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("reimport-edge");
+
+    // `(code, parent)` pairs → bundle with the CodeSystem and an all-codes VS.
+    let bundle = |concepts: &[(&str, Option<&str>)]| {
+        let concepts: Vec<serde_json::Value> = concepts
+            .iter()
+            .map(|(code, parent)| match parent {
+                Some(p) => serde_json::json!({"code": code, "display": code,
+                    "property": [{"code": "parent", "valueCode": p}]}),
+                None => serde_json::json!({"code": code, "display": code}),
+            })
+            .collect();
+        serde_json::json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
+                    "url": format!("{base}cs"), "name": "ReimportCS",
+                    "status": "active", "content": "complete",
+                    "hierarchyMeaning": "is-a",
+                    "property": [{"code": "parent",
+                        "uri": "http://hl7.org/fhir/concept-properties#parent",
+                        "type": "code"}],
+                    "concept": concepts
+                }},
+                {"resource": {
+                    "resourceType": "ValueSet", "id": format!("vs-{uid}"),
+                    "url": format!("{base}vs"), "name": "ReimportVS",
+                    "status": "active",
+                    "compose": {"include": [{"system": format!("{base}cs")}]}
+                }}
+            ]
+        })
+    };
+
+    // root → P → C, then re-imported as root → C → P.
+    for concepts in [
+        [("root", None), ("P", Some("root")), ("C", Some("P"))],
+        [("root", None), ("C", Some("root")), ("P", Some("C"))],
+    ] {
+        backend
+            .import_bundle(&ctx(), &serde_json::to_vec(&bundle(&concepts)).unwrap())
+            .await
+            .unwrap();
+    }
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                hierarchical: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // With the stale root>P and P>C edges left behind, root would have both
+    // C and P as children.
+    assert_eq!(resp.contains.len(), 1, "{:?}", resp.contains);
+    let root = &resp.contains[0];
+    assert_eq!(root.code, "root");
+    assert_eq!(root.contains.len(), 1, "{:?}", root.contains);
+    assert_eq!(root.contains[0].code, "C");
+    assert_eq!(root.contains[0].contains.len(), 1);
+    assert_eq!(root.contains[0].contains[0].code, "P");
+}
+
 #[tokio::test]
 async fn expand_cache_hit_on_second_call() {
     let backend = fresh_backend().await;

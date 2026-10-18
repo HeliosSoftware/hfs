@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ResearchStudy"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -187,9 +187,9 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">primary | official | scientific | plain-language | subtitle | short-title | acronym | earlier-title | language | auto-translated | human-use | machine-use | duplicate-uid
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">primary | official | scientific | plain-language | subtitle | short-title | acronym | earlier-title | language | autotranslated | human-use | machine-use | duplicate-uid
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-title-type.html">Title Type</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-title-type.html">Title Type</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -349,7 +349,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">documentation | justification | citation | predecessor | successor | derived-from | depends-on | composed-of | part-of | amends | amended-with | appends | appended-with | cites | cited-by | comments-on | comment-in | contains | contained-in | corrects | correction-in | replaces | replaced-with | retracts | retracted-by | signs | similar-to | supports | supported-with | transforms | transformed-into | transformed-with | documents | specification-of | created-with | cite-as | reprint | reprint-of | summarizes
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-artifact-relationship-type.html">Artifact Relationship Type</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-artifact-relationship-type.html">Artifact Relationship Type</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -516,7 +516,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">treatment | prevention | diagnostic | supportive-care | screening | health-services-research | basic-science | device-feasibility
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-research-study-purpose-type.html">ResearchStudyPurposeType</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-research-study-purpose-type.html">ResearchStudyPurposeType</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -540,7 +540,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Classifier used for clinical trials
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-research-study-phase.html">ResearchStudyPhase</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-research-study-phase.html">ResearchStudyPhase</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -563,7 +563,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Classifications of the study design characteristics
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-study-design.html">Study Design</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-study-design.html">Study Design</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -662,7 +662,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Geographic area for the study
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -844,7 +844,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">sponsor | lead-sponsor | sponsor-investigator | primary-investigator | collaborator | funding-source | general-contact | recruitment-contact | sub-investigator | study-chair | irb | data-monitoring
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-research-study-party-role.html">Research Study Party Role</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-research-study-party-role.html">Research Study Party Role</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -950,7 +950,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Label for status or state (e.g. recruitment status)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-research-study-status.html">Research Study Status</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-research-study-status.html">Research Study Status</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -1011,7 +1011,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">accrual-goal-met | closed-due-to-toxicity | closed-due-to-lack-of-study-progress | temporarily-closed-per-study-design
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-research-study-reason-stopped.html">ResearchStudyReasonStopped</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-research-study-reason-stopped.html">ResearchStudyReasonStopped</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1141,7 +1141,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPQfAOvGUf7ztuvPMf/78/fkl/Pbg+u8Rvjqteu2Pf3zxPz36Pz0z+vTmPzurPvuw/npofbjquvNefHVduuyN+uuMu3Oafbgjfnqvf/3zv/3xevPi+vRjP/20/bmsP///wD/ACH5BAEKAB8ALAAAAAAQABAAAAVl4CeOZGme5qCqqDg8jyVJaz1876DsmAQAgqDgltspMEhMJoMZ4iy6I1AooFCIv+wKybziALVAoAEjYLwDgGIpJhMslgxaLR4/3rMAWoBp32V5exg8Shl1ckRUQVaMVkQ2kCstKCEAOw==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Element" class="hierarchy"/> 
-            <span title="ResearchStudy.comparisonGroup : Describes an expected event or sequence of events for one of the subjects of a study. E.g. for a living subject: exposure to drug A, wash-out, exposure to drug B, wash-out, follow-up. E.g. for a stability study: {store sample from lot A at 25 degrees for 1 month}, {store sample from lot A at 40 degrees for 1 month}.">comparisonGroup</span>
+            <span title="ResearchStudy.comparisonGroup : Describes a group of subjects (participants) in a study that is compared to another group. This group may be an arm of the study, such as controlled trials that define groups for assignment into specific paths or protocols involving different exposures. This group may also be defined for other types of comparisons, such as descriptive or predictive studies characterizing populations by their characteristics.">comparisonGroup</span>
             <a name="ResearchStudy.comparisonGroup"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -1149,7 +1149,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="types.html#BackBoneElement">BackboneElement</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Defined path through the study for a subject
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">A cohort of study participants that is compared to another group
             <br/>
             <br/>
           </td>
@@ -1325,7 +1325,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">primary | secondary | exploratory
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-research-study-objective-type.html">ResearchStudyObjectiveType</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-research-study-objective-type.html">ResearchStudyObjectiveType</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -1407,7 +1407,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">primary | secondary | exploratory
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-research-study-objective-type.html">ResearchStudyObjectiveType</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-research-study-objective-type.html">ResearchStudyObjectiveType</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -1534,7 +1534,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Statistical measure for treatment effect estimate
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-statistic-type.html">Statistic Type</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-statistic-type.html">Statistic Type</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1719,7 +1719,7 @@
   <name value="ResearchStudy"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Biomedical Research and Regulation"/>
   <contact>
     <telecom>
@@ -2395,7 +2395,7 @@
     </element>
     <element id="ResearchStudy.label.type">
       <path value="ResearchStudy.label.type"/>
-      <short value="primary | official | scientific | plain-language | subtitle | short-title | acronym | earlier-title | language | auto-translated | human-use | machine-use | duplicate-uid"/>
+      <short value="primary | official | scientific | plain-language | subtitle | short-title | acronym | earlier-title | language | autotranslated | human-use | machine-use | duplicate-uid"/>
       <definition value="Kind of name."/>
       <min value="0"/>
       <max value="1"/>
@@ -4199,10 +4199,10 @@
     </element>
     <element id="ResearchStudy.comparisonGroup">
       <path value="ResearchStudy.comparisonGroup"/>
-      <short value="Defined path through the study for a subject"/>
-      <definition value="Describes an expected event or sequence of events for one of the subjects of a study. E.g. for a living subject: exposure to drug A, wash-out, exposure to drug B, wash-out, follow-up. E.g. for a stability study: {store sample from lot A at 25 degrees for 1 month}, {store sample from lot A at 40 degrees for 1 month}."/>
-      <comment value="In many clinical trials this is refered to as the ARM of the study, but such a term is not used in other sorts of trials even when there is a comparison between two or more groups."/>
+      <short value="A cohort of study participants that is compared to another group"/>
+      <definition value="Describes a group of subjects (participants) in a study that is compared to another group. This group may be an arm of the study, such as controlled trials that define groups for assignment into specific paths or protocols involving different exposures. This group may also be defined for other types of comparisons, such as descriptive or predictive studies characterizing populations by their characteristics."/>
       <alias value="arm"/>
+      <alias value="cohort"/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -4993,7 +4993,7 @@
       <path value="ResearchStudy.objective.outcomeMeasure.intervention"/>
       <short value="Comparison group of interest"/>
       <definition value="Comparison group of interest."/>
-      <comment value="To re-use and reference a Group represented in ResearchStudy.comparisonGroup.eligibility, one may include the Group Resource in ResearchStudy.contained and then reference the same (internal) Group by its id"/>
+      <comment value="The referenced Group Resource may be the same as a reference noted in ResearchStudy.comparisonGroup.eligibility"/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -5020,7 +5020,7 @@
       <path value="ResearchStudy.objective.outcomeMeasure.comparator"/>
       <short value="Comparison group for comparison"/>
       <definition value="Comparison group for comparison."/>
-      <comment value="To re-use and reference a Group represented in ResearchStudy.comparisonGroup.eligibility, one may include the Group Resource in ResearchStudy.contained and then reference the same (internal) Group by its id"/>
+      <comment value="The referenced Group Resource may be the same as a reference noted in ResearchStudy.comparisonGroup.eligibility"/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -5499,7 +5499,7 @@
     </element>
     <element id="ResearchStudy.label.type">
       <path value="ResearchStudy.label.type"/>
-      <short value="primary | official | scientific | plain-language | subtitle | short-title | acronym | earlier-title | language | auto-translated | human-use | machine-use | duplicate-uid"/>
+      <short value="primary | official | scientific | plain-language | subtitle | short-title | acronym | earlier-title | language | autotranslated | human-use | machine-use | duplicate-uid"/>
       <definition value="Kind of name."/>
       <min value="0"/>
       <max value="1"/>
@@ -6379,10 +6379,10 @@
     </element>
     <element id="ResearchStudy.comparisonGroup">
       <path value="ResearchStudy.comparisonGroup"/>
-      <short value="Defined path through the study for a subject"/>
-      <definition value="Describes an expected event or sequence of events for one of the subjects of a study. E.g. for a living subject: exposure to drug A, wash-out, exposure to drug B, wash-out, follow-up. E.g. for a stability study: {store sample from lot A at 25 degrees for 1 month}, {store sample from lot A at 40 degrees for 1 month}."/>
-      <comment value="In many clinical trials this is refered to as the ARM of the study, but such a term is not used in other sorts of trials even when there is a comparison between two or more groups."/>
+      <short value="A cohort of study participants that is compared to another group"/>
+      <definition value="Describes a group of subjects (participants) in a study that is compared to another group. This group may be an arm of the study, such as controlled trials that define groups for assignment into specific paths or protocols involving different exposures. This group may also be defined for other types of comparisons, such as descriptive or predictive studies characterizing populations by their characteristics."/>
       <alias value="arm"/>
+      <alias value="cohort"/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -6645,7 +6645,7 @@
       <path value="ResearchStudy.objective.outcomeMeasure.intervention"/>
       <short value="Comparison group of interest"/>
       <definition value="Comparison group of interest."/>
-      <comment value="To re-use and reference a Group represented in ResearchStudy.comparisonGroup.eligibility, one may include the Group Resource in ResearchStudy.contained and then reference the same (internal) Group by its id"/>
+      <comment value="The referenced Group Resource may be the same as a reference noted in ResearchStudy.comparisonGroup.eligibility"/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -6660,7 +6660,7 @@
       <path value="ResearchStudy.objective.outcomeMeasure.comparator"/>
       <short value="Comparison group for comparison"/>
       <definition value="Comparison group for comparison."/>
-      <comment value="To re-use and reference a Group represented in ResearchStudy.comparisonGroup.eligibility, one may include the Group Resource in ResearchStudy.contained and then reference the same (internal) Group by its id"/>
+      <comment value="The referenced Group Resource may be the same as a reference noted in ResearchStudy.comparisonGroup.eligibility"/>
       <min value="0"/>
       <max value="1"/>
       <type>

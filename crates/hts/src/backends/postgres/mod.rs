@@ -11,7 +11,7 @@ mod value_set;
 
 use async_trait::async_trait;
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio_postgres::NoTls;
 use tracing::info;
@@ -907,6 +907,11 @@ async fn write_code_system(
         })?
         .get(0);
 
+    // Codes whose old parent edges this write has already cleared. A bundle
+    // can list the same code more than once, and the second occurrence must
+    // not wipe the edges the first one just inserted.
+    let mut edges_cleared: HashSet<&str> = HashSet::new();
+
     for concept in &cs.concepts {
         let rows = client
             .query(
@@ -935,6 +940,22 @@ async fn write_code_system(
             .get(0);
 
         stats.concepts += 1;
+
+        // Replace this concept's parent edges rather than adding to them, so a
+        // re-import that moves a concept to a new parent (or reverses an edge)
+        // does not leave the old edge behind, which can form a cycle (#2129).
+        // A concept and all its parents arrive in one batch, so this is safe
+        // across chunked loads. Skipped on a fresh load (nothing to delete).
+        // Mirrors import/fhir_bundle.rs (SQLite).
+        if !skip_child_delete && edges_cleared.insert(concept.code.as_str()) {
+            client
+                .execute(
+                    "DELETE FROM concept_hierarchy WHERE system_id = $1 AND child_code = $2",
+                    &[&system_id, &concept.code],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+        }
 
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {

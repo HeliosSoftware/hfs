@@ -535,7 +535,7 @@ Storage backend abstraction supporting multiple database technologies optimized 
 - ✅ **FHIR R4** (4.0.1) - Default
 - ✅ **FHIR R4B** (4.3.0)
 - ✅ **FHIR R5** (5.0.0)
-- ✅ **FHIR R6** (6.0.0-ballot2)
+- ✅ **FHIR R6** (6.0.0-snapshot1)
 
 ## FHIRPath Expression Language
 - Complete implementation of [FHIRPath 3.0.0-ballot specification](https://hl7.org/fhirpath/2025Jan/)
