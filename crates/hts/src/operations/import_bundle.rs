@@ -20,19 +20,14 @@ use crate::operations::params::parse_query_string;
 use crate::state::AppState;
 use crate::traits::TerminologyBackend;
 
-/// Whether the request asked for a closure rebuild via `?finalize=true`.
-///
-/// Chunked importers set this on their **final** chunk only. Without it, a
-/// bulk load into a running server leaves the system with hierarchy edges but
-/// no closure rows until the next restart, which silently disables `$subsumes`
-/// for that system — see [`BundleImportBackend::rebuild_missing_closures`].
+/// Whether boolean query flag `name` is set to `true` on the request.
 ///
 /// Parsed from the raw query string like every other HTS handler, so an
 /// unrecognised value is ignored rather than turned into a framework 400.
-fn wants_finalize(raw_query: Option<&str>) -> bool {
+fn query_flag(raw_query: Option<&str>, name: &str) -> bool {
     parse_query_string(raw_query.unwrap_or(""))
         .iter()
-        .any(|(k, v)| k == "finalize" && v.eq_ignore_ascii_case("true"))
+        .any(|(k, v)| k == name && v.eq_ignore_ascii_case("true"))
 }
 
 /// Response body returned by `POST /import`.
@@ -82,9 +77,25 @@ where
     B: TerminologyBackend + BundleImportBackend,
 {
     let ctx = TenantContext::system();
-    let finalize = wants_finalize(raw.as_deref());
+    // `defer_closure=true` marks a non-final chunk of a chunked load: a system
+    // that already holds concepts keeps an empty closure instead of paying an
+    // O(n) rebuild per chunk. `finalize=true` on the last chunk then rebuilds
+    // every closure left missing — see
+    // [`BundleImportBackend::rebuild_missing_closures`]. Without either flag
+    // the import rebuilds the closure of every code system it writes, so a
+    // plain (re-)import never leaves `$subsumes` / `is-a` stale (#2128).
+    // `finalize` implies deferral for its own write: the finalize step below
+    // rebuilds that system anyway, and does so once, counted in
+    // `closures_rebuilt`.
+    let finalize = query_flag(raw.as_deref(), "finalize");
+    let defer_closure = finalize || query_flag(raw.as_deref(), "defer_closure");
 
-    match state.backend.import_bundle(&ctx, &body).await {
+    let imported = if defer_closure {
+        state.backend.import_bundle_deferred(&ctx, &body).await
+    } else {
+        state.backend.import_bundle(&ctx, &body).await
+    };
+    match imported {
         Ok(stats) => {
             // Invalidate cached expansions — newly imported terminology may
             // change which codes belong to a ValueSet.
@@ -215,72 +226,76 @@ mod tests {
         assert_eq!(resp.status(), 400);
     }
 
-    /// A chunked import leaves `concept_closure` empty, and `finalize=true`
-    /// rebuilds it.
+    const CHUNKED_SYS: &str = "http://example.org/chunked-cs";
+
+    async fn post_status(app: &axum::Router, uri: &str, body: String) -> StatusCode {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/fhir+json")
+            .body(Body::from(body))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    /// `$subsumes` outcome for `a` vs `b` in `CHUNKED_SYS`.
+    async fn subsumes(app: &axum::Router, a: &str, b: &str) -> String {
+        let uri = format!("/CodeSystem/$subsumes?system={CHUNKED_SYS}&codeA={a}&codeB={b}",);
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["parameter"]
+            .as_array()
+            .and_then(|ps| {
+                ps.iter()
+                    .find(|p| p["name"] == "outcome")
+                    .and_then(|p| p["valueCode"].as_str())
+            })
+            .unwrap_or("<none>")
+            .to_string()
+    }
+
+    /// One chunk of `CHUNKED_SYS` carrying `concepts` (JSON array items).
+    fn chunk(concepts: &str) -> String {
+        format!(
+            r#"{{"resourceType":"Bundle","type":"collection","entry":[{{"resource":{{
+                 "resourceType":"CodeSystem","id":"chunked-cs","url":"{CHUNKED_SYS}",
+                 "version":"1.0","name":"ChunkedCS","status":"active",
+                 "content":"complete","hierarchyMeaning":"is-a",
+                 "property":[{{"code":"parent","uri":"http://hl7.org/fhir/concept-properties#parent","type":"code"}}],
+                 "concept":[{concepts}]
+               }}}}]}}"#
+        )
+    }
+
+    /// A chunked import with `defer_closure=true` leaves `concept_closure`
+    /// empty, and `finalize=true` rebuilds it.
     ///
-    /// Every batch deletes the system's closure rows, and only a batch that
-    /// found the system with *zero* concepts rebuilds them. So chunk 2 builds
+    /// Every batch deletes the system's closure rows, and a deferred batch
+    /// only rebuilds them when it found the system with *zero* concepts. So chunk 2 builds
     /// the closure and chunk 3 deletes it again without rebuilding, leaving a
     /// system with hierarchy edges but no closure — which silently answers
     /// `not-subsumed` for a genuine parent/child pair. Reproduced against
     /// `$subsumes` rather than the table so the assertion is about behaviour.
     #[tokio::test]
     async fn finalize_rebuilds_closure_dropped_by_a_chunked_import() {
-        const SYS: &str = "http://example.org/chunked-cs";
-
-        async fn post(app: &axum::Router, uri: &str, body: String) -> StatusCode {
-            let req = Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header("content-type", "application/fhir+json")
-                .body(Body::from(body))
-                .unwrap();
-            app.clone().oneshot(req).await.unwrap().status()
-        }
-
-        async fn subsumes(app: &axum::Router, a: &str, b: &str) -> String {
-            let uri = format!("/CodeSystem/$subsumes?system={SYS}&codeA={a}&codeB={b}",);
-            let resp = app
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            json["parameter"]
-                .as_array()
-                .and_then(|ps| {
-                    ps.iter()
-                        .find(|p| p["name"] == "outcome")
-                        .and_then(|p| p["valueCode"].as_str())
-                })
-                .unwrap_or("<none>")
-                .to_string()
-        }
-
-        fn chunk(concepts: &str) -> String {
-            format!(
-                r#"{{"resourceType":"Bundle","type":"collection","entry":[{{"resource":{{
-                     "resourceType":"CodeSystem","id":"chunked-cs","url":"{SYS}",
-                     "version":"1.0","name":"ChunkedCS","status":"active",
-                     "content":"complete","hierarchyMeaning":"is-a",
-                     "property":[{{"code":"parent","uri":"http://hl7.org/fhir/concept-properties#parent","type":"code"}}],
-                     "concept":[{concepts}]
-                   }}}}]}}"#
-            )
-        }
+        const DEFER: &str = "/import?defer_closure=true";
 
         let app = app();
 
         // Chunk 1: metadata only, no concepts and so no hierarchy to close over.
-        assert_eq!(post(&app, "/import", chunk("")).await, StatusCode::OK);
+        assert_eq!(post_status(&app, DEFER, chunk("")).await, StatusCode::OK);
         // Chunk 2: the parent plus one child. This batch does build the closure.
         assert_eq!(
-            post(
+            post_status(
                 &app,
-                "/import",
+                DEFER,
                 chunk(
                     r#"{"code":"A","display":"A"},
                        {"code":"A.0","display":"A zero","property":[{"code":"parent","valueCode":"A"}]}"#
@@ -292,9 +307,9 @@ mod tests {
         // Chunk 3: another child. The system is no longer empty, so this batch
         // deletes the closure and skips the rebuild.
         assert_eq!(
-            post(
+            post_status(
                 &app,
-                "/import",
+                DEFER,
                 chunk(
                     r#"{"code":"A.1","display":"A one","property":[{"code":"parent","valueCode":"A"}]}"#
                 )
@@ -326,6 +341,45 @@ mod tests {
 
         assert_eq!(subsumes(&app, "A", "A.0").await, "subsumes");
         assert_eq!(subsumes(&app, "A", "A.1").await, "subsumes");
+    }
+
+    /// Without `defer_closure`, every chunk — and every re-import of the same
+    /// bundle — leaves the closure current, with no `finalize` needed (#2128).
+    #[tokio::test]
+    async fn plain_chunked_import_and_reimport_keep_closure_current() {
+        let app = app();
+        let parent_and_child = chunk(
+            r#"{"code":"A","display":"A"},
+               {"code":"A.0","display":"A zero","property":[{"code":"parent","valueCode":"A"}]}"#,
+        );
+
+        assert_eq!(
+            post_status(&app, "/import", chunk("")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_status(&app, "/import", parent_and_child.clone()).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_status(
+                &app,
+                "/import",
+                chunk(
+                    r#"{"code":"A.1","display":"A one","property":[{"code":"parent","valueCode":"A"}]}"#
+                )
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(subsumes(&app, "A", "A.0").await, "subsumes");
+        assert_eq!(subsumes(&app, "A", "A.1").await, "subsumes");
+
+        assert_eq!(
+            post_status(&app, "/import", parent_and_child).await,
+            StatusCode::OK
+        );
+        assert_eq!(subsumes(&app, "A", "A.0").await, "subsumes");
     }
 
     #[tokio::test]
