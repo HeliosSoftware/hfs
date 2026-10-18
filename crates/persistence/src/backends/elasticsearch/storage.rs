@@ -19,7 +19,7 @@ use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
 use crate::core::{DailyResourceCount, PurgableStorage, ResourceStorage, WriteMarker};
-use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
+use crate::error::{BackendError, ResourceError, StorageError, StorageResult, ValidationError};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage};
@@ -439,6 +439,31 @@ fn merge_composite_component(entry: &mut Value, origin: ValueOrigin<'_>, value: 
         }
         IndexValue::Uri(u) => push_array_field(entry, "uri", json!(u)),
     }
+}
+
+/// Version and last-updated the primary stamped on a resource sent here.
+fn primary_write_meta(resource: &Value) -> Option<(String, Option<DateTime<Utc>>)> {
+    let version = resource
+        .pointer("/meta/versionId")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)?;
+    let last_updated = resource
+        .pointer("/meta/lastUpdated")
+        .and_then(Value::as_str)
+        .and_then(|instant| DateTime::parse_from_rfc3339(instant).ok())
+        .map(|instant| instant.with_timezone(&Utc));
+    Some((version, last_updated))
+}
+
+fn missing_primary_version(resource_type: &str, id: &str) -> StorageError {
+    StorageError::Validation(ValidationError::InvalidResource {
+        message: format!(
+            "Elasticsearch is a search secondary and cannot assign versions; \
+             {resource_type}/{id} has no versionId from the primary"
+        ),
+        details: Vec::new(),
+    })
 }
 
 /// The search document for one stored resource. `last_updated` is the
@@ -1064,24 +1089,12 @@ impl ElasticsearchBackend {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl ResourceStorage for ElasticsearchBackend {
-    fn backend_name(&self) -> &'static str {
-        "elasticsearch"
-    }
-
-    async fn readiness_check(&self) -> Result<(), BackendError> {
-        <Self as crate::core::Backend>::health_check(self).await
-    }
-
-    fn bulk_write_concurrency(&self) -> usize {
-        // One index request per resource; ES absorbs parallel writers.
-        8
-    }
-
-    async fn create(
+    /// A single-document create. Elasticsearch is always a search secondary,
+    /// so `meta.versionId` and `meta.lastUpdated` come from the primary when
+    /// present. A body with neither still starts at version 1 and now — the
+    /// path integration tests use to seed an index — and logs a warning.
+    async fn index_new(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
@@ -1098,7 +1111,18 @@ impl ResourceStorage for ElasticsearchBackend {
             .map(String::from)
             .unwrap_or_else(crate::types::new_resource_id);
 
-        let version_id = "1";
+        let (version_id, now) = match primary_write_meta(&resource) {
+            Some((version, last_updated)) => (version, last_updated.unwrap_or_else(Utc::now)),
+            None => {
+                tracing::warn!(
+                    resource_type,
+                    id,
+                    "Elasticsearch create has no primary meta.versionId; indexing as version 1"
+                );
+                ("1".to_string(), Utc::now())
+            }
+        };
+        let version_id = version_id.as_str();
 
         // Ensure the resource has correct type and id
         let mut resource = resource;
@@ -1118,7 +1142,6 @@ impl ResourceStorage for ElasticsearchBackend {
 
         // The resource's instant: indexed as `last_updated` and returned as
         // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
-        let now = Utc::now();
         let doc = build_es_document(
             tenant_id,
             resource_type,
@@ -1190,7 +1213,11 @@ impl ResourceStorage for ElasticsearchBackend {
     /// cost N refresh waits — the ~1.4k-resource conformance seed took over
     /// twenty minutes and the server never came up — while one bulk request
     /// costs one.
-    async fn create_many(
+    ///
+    /// Each document takes the resource's own `meta.versionId` and
+    /// `meta.lastUpdated` when the primary stamped them; otherwise version 1
+    /// and the batch instant, with a warning.
+    async fn index_many(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
@@ -1216,7 +1243,6 @@ impl ResourceStorage for ElasticsearchBackend {
         }
 
         let tenant_id = tenant.tenant_id().as_str();
-        let version_id = "1";
         let extractor = self.tenant_extractor(tenant_id);
         // One instant for the batch: indexed as every document's
         // `last_updated` and returned as each stored resource's
@@ -1229,6 +1255,8 @@ impl ResourceStorage for ElasticsearchBackend {
         // out in a few requests.
         struct Prepared {
             id: String,
+            version_id: String,
+            last_updated: DateTime<Utc>,
             resource: Value,
             docs: Vec<(String, String, Value)>,
         }
@@ -1248,6 +1276,19 @@ impl ResourceStorage for ElasticsearchBackend {
                     );
                     obj.insert("id".to_string(), Value::String(id.clone()));
                 }
+                let (version_id, last_updated) = match primary_write_meta(&resource) {
+                    Some((version, last_updated)) => {
+                        (version, last_updated.unwrap_or(now))
+                    }
+                    None => {
+                        tracing::warn!(
+                            resource_type,
+                            id,
+                            "Elasticsearch create_many has no primary meta.versionId; indexing as version 1"
+                        );
+                        ("1".to_string(), now)
+                    }
+                };
                 let extracted_values = extractor
                     .extract(&resource, resource_type)
                     .unwrap_or_default();
@@ -1258,8 +1299,8 @@ impl ResourceStorage for ElasticsearchBackend {
                         tenant_id,
                         resource_type,
                         &id,
-                        version_id,
-                        now,
+                        &version_id,
+                        last_updated,
                         &resource,
                         fhir_version,
                         &extracted_values,
@@ -1280,14 +1321,20 @@ impl ResourceStorage for ElasticsearchBackend {
                             &contained.contained_type,
                             &contained.local_id,
                             &contained.content,
-                            version_id,
-                            now,
+                            &version_id,
+                            last_updated,
                             fhir_version,
                             &contained.values,
                         ),
                     ));
                 }
-                Prepared { id, resource, docs }
+                Prepared {
+                    id,
+                    version_id,
+                    last_updated,
+                    resource,
+                    docs,
+                }
             })
             .collect();
 
@@ -1329,11 +1376,11 @@ impl ResourceStorage for ElasticsearchBackend {
                 None => Ok(StoredResource::from_storage(
                     resource_type,
                     &p.id,
-                    version_id,
+                    &p.version_id,
                     tenant.tenant_id().clone(),
                     p.resource,
-                    now,
-                    now,
+                    p.last_updated,
+                    p.last_updated,
                     None,
                     fhir_version,
                 )),
@@ -1341,7 +1388,12 @@ impl ResourceStorage for ElasticsearchBackend {
             .collect()
     }
 
-    async fn create_or_update(
+    /// PUT semantics. When the primary stamped `meta.versionId`, that version
+    /// and `meta.lastUpdated` are indexed and the existence GET is skipped;
+    /// the write is new exactly when the primary's version is 1.
+    /// Without them this backend still counts its own versions — the seed
+    /// path used by tests — and logs a warning.
+    async fn upsert(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
@@ -1351,68 +1403,81 @@ impl ResourceStorage for ElasticsearchBackend {
     ) -> StorageResult<(StoredResource, bool)> {
         let tenant_id = tenant.tenant_id().as_str();
 
-        // Check if document exists
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
 
-        // Deciding "this resource is new, start at version 1" requires knowing that
-        // it does not already exist. Only Elasticsearch saying so establishes that
-        // (`"found": false`, or the index does not exist) — the same two answers
-        // `read` accepts, through the same retried request (#1364). If the
-        // existence check failed, or was answered by something else with a bare
-        // 404, we must not guess "new" — doing so would reset the version of a
-        // resource that does exist, silently clobbering its history.
-        let op = ReadOp::Get { doc_id: &doc_id };
-        let existing = send_read_with_retry(self, op, &index, Value::Null).await?;
+        let (version_id, now, is_new) =
+            if let Some((version, last_updated)) = primary_write_meta(&resource) {
+                // The primary assigns versions, so its version 1 is a create.
+                let is_new = version == "1";
+                (version, last_updated.unwrap_or_else(Utc::now), is_new)
+            } else {
+                tracing::warn!(
+                    resource_type,
+                    id,
+                    "Elasticsearch create_or_update has no primary meta.versionId; \
+                 fetching the existing document to increment its version"
+                );
+                // Deciding "this resource is new, start at version 1" requires knowing that
+                // it does not already exist. Only Elasticsearch saying so establishes that
+                // (`"found": false`, or the index does not exist) — the same two answers
+                // `read` accepts, through the same retried request (#1364). If the
+                // existence check failed, or was answered by something else with a bare
+                // 404, we must not guess "new" — doing so would reset the version of a
+                // resource that does exist, silently clobbering its history.
+                let op = ReadOp::Get { doc_id: &doc_id };
+                let existing = send_read_with_retry(self, op, &index, Value::Null).await?;
 
-        let (version_id, is_new) = match existing {
-            Some(body) => {
-                let source = body.get("_source");
-                // Belt-and-braces tenant guard, mirroring `read` (see below).
-                //
-                // After the #384 fix an injective `index_name` already guarantees
-                // this index belongs to exactly one tenant, so this check should
-                // never fire. It is kept because this is the one place the backend
-                // reads *foreign state* to make a *write* decision, and a future
-                // regression in the naming derivation would otherwise silently
-                // resume deriving one tenant's version from another's document.
-                //
-                // A mismatch is treated as **absent**, not as an error. An index
-                // upgraded from the pre-fix layout can still hold documents left
-                // behind by a colliding tenant; erroring would brick the rightful
-                // owner on exactly those ids, permanently, with no operator
-                // remedy. Treating them as absent is self-healing — the foreign
-                // document is overwritten and leaves an index it never belonged
-                // in — and is correct on the merits: from this tenant's
-                // perspective the resource genuinely does not exist. Resetting the
-                // version is harmless because Elasticsearch keeps no history and,
-                // in every supported composite mode, the primary is authoritative
-                // for version assignment (writes always land there first).
-                let doc_tenant = source
-                    .and_then(|s| s.get("tenant_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if doc_tenant != tenant_id {
-                    tracing::warn!(
-                        tenant = %tenant_id,
-                        found_tenant = %doc_tenant,
-                        resource_type,
-                        id,
-                        "Elasticsearch document at this address belongs to another tenant; \
-                         treating as absent and overwriting (see issue #384)"
-                    );
-                    ("1".to_string(), true)
-                } else {
-                    let current_version: u64 = source
-                        .and_then(|s| s.get("version_id"))
-                        .and_then(|v| v.as_str())
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    ((current_version + 1).to_string(), false)
-                }
-            }
-            None => ("1".to_string(), true),
-        };
+                let (version_id, is_new) = match existing {
+                    Some(body) => {
+                        let source = body.get("_source");
+                        // Belt-and-braces tenant guard, mirroring `read` (see below).
+                        //
+                        // After the #384 fix an injective `index_name` already guarantees
+                        // this index belongs to exactly one tenant, so this check should
+                        // never fire. It is kept because this is the one place the backend
+                        // reads *foreign state* to make a *write* decision, and a future
+                        // regression in the naming derivation would otherwise silently
+                        // resume deriving one tenant's version from another's document.
+                        //
+                        // A mismatch is treated as **absent**, not as an error. An index
+                        // upgraded from the pre-fix layout can still hold documents left
+                        // behind by a colliding tenant; erroring would brick the rightful
+                        // owner on exactly those ids, permanently, with no operator
+                        // remedy. Treating them as absent is self-healing — the foreign
+                        // document is overwritten and leaves an index it never belonged
+                        // in — and is correct on the merits: from this tenant's
+                        // perspective the resource genuinely does not exist. Resetting the
+                        // version is harmless because Elasticsearch keeps no history and,
+                        // in every supported composite mode, the primary is authoritative
+                        // for version assignment (writes always land there first).
+                        let doc_tenant = source
+                            .and_then(|s| s.get("tenant_id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if doc_tenant != tenant_id {
+                            tracing::warn!(
+                                tenant = %tenant_id,
+                                found_tenant = %doc_tenant,
+                                resource_type,
+                                id,
+                                "Elasticsearch document at this address belongs to another tenant; \
+                                 treating as absent and overwriting (see issue #384)"
+                            );
+                            ("1".to_string(), true)
+                        } else {
+                            let current_version: u64 = source
+                                .and_then(|s| s.get("version_id"))
+                                .and_then(|v| v.as_str())
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(0);
+                            ((current_version + 1).to_string(), false)
+                        }
+                    }
+                    None => ("1".to_string(), true),
+                };
+                (version_id, Utc::now(), is_new)
+            };
 
         // Ensure resource has correct type and id
         let mut resource = resource;
@@ -1432,7 +1497,6 @@ impl ResourceStorage for ElasticsearchBackend {
 
         // The resource's instant: indexed as `last_updated` and returned as
         // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
-        let now = Utc::now();
         let doc = build_es_document(
             tenant_id,
             resource_type,
@@ -1485,6 +1549,62 @@ impl ResourceStorage for ElasticsearchBackend {
             ),
             is_new,
         ))
+    }
+}
+
+#[async_trait]
+impl ResourceStorage for ElasticsearchBackend {
+    fn backend_name(&self) -> &'static str {
+        "elasticsearch"
+    }
+
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
+    fn bulk_write_concurrency(&self) -> usize {
+        // One index request per resource; ES absorbs parallel writers.
+        8
+    }
+
+    async fn create(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<StoredResource> {
+        self.index_new(tenant, resource_type, resource, fhir_version)
+            .await
+    }
+
+    fn as_search_index(&self) -> Option<&dyn ReindexTarget> {
+        Some(self)
+    }
+
+    /// `_bulk` requests of at most [`BULK_OPS_PER_REQUEST`] operations; see
+    /// [`ElasticsearchBackend::index_many`].
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        self.index_many(tenant, resource_type, resources, fhir_version)
+            .await
+    }
+
+    async fn create_or_update(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<(StoredResource, bool)> {
+        self.upsert(tenant, resource_type, id, resource, fhir_version)
+            .await
     }
 
     async fn read(
@@ -2368,127 +2488,20 @@ impl ElasticsearchBackend {
     }
 }
 
-#[async_trait]
-impl ReindexTarget for ElasticsearchBackend {
-    /// Deletes the resource's document and every contained document derived
-    /// from it; see [`Self::delete_search_entries_for_resources`].
-    ///
-    /// The page rebuild ([`Self::write_search_entries_page`]) does not call
-    /// this: there the entries are *fields of the resource document*, which the
-    /// rebuild re-indexes under the same `_id`, and deleting first would drop
-    /// the resource from search between the delete and the write. It is the
-    /// clear of a run named by resource IDs with `clearExisting`, where a named
-    /// resource may be gone from the source or may have dropped a `contained[]`
-    /// entry — neither of which the rebuild overwrites (#1629).
-    async fn delete_search_entries(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-    ) -> StorageResult<u64> {
-        self.delete_search_entries_for_resources(
-            tenant,
-            resource_type,
-            std::slice::from_ref(&resource_id.to_string()),
-        )
-        .await
-    }
-
-    /// Deletes the named resources' documents and their contained documents
-    /// in one delete-by-query per [`DELETE_IDS_PER_REQUEST`] IDs, rather than
-    /// a round trip per resource.
-    ///
-    /// Scoped like `clear_search_index_for_types`: a `tenant_id` term over the
-    /// tenant's index pattern (contained documents live in their own type's
-    /// index), a top-level document by its `resource_type`/`resource_id`, and
-    /// a contained one by its `container_type`/`container_id` — never by its
-    /// own `resource_type`, so a Patient contained in a named Observation goes
-    /// and a top-level Patient with the same ID stays. Missing documents and
-    /// missing indices are nothing to delete, not an error.
-    async fn delete_search_entries_for_resources(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        resource_ids: &[String],
-    ) -> StorageResult<u64> {
-        let tenant_id = tenant.tenant_id().as_str();
-        let pattern = tenant_index_pattern(self, tenant_id);
-        let mut deleted = 0;
-        for ids in resource_ids.chunks(DELETE_IDS_PER_REQUEST) {
-            let body = json!({ "query": { "bool": { "filter": [
-                { "term": { "tenant_id": tenant_id } },
-                { "bool": {
-                    "minimum_should_match": 1,
-                    "should": [
-                        { "bool": {
-                            "filter": [
-                                { "term": { "resource_type": resource_type } },
-                                { "terms": { "resource_id": ids } }
-                            ],
-                            "must_not": [{ "term": { "is_contained": true } }]
-                        } },
-                        { "bool": { "filter": [
-                            { "term": { "is_contained": true } },
-                            { "term": { "container_type": resource_type } },
-                            { "terms": { "container_id": ids } }
-                        ] } }
-                    ]
-                } }
-            ]}}});
-            deleted += delete_by_query_scoped(
-                self,
-                &pattern,
-                body,
-                &format!(
-                    "clear the search entries of {} {resource_type} resource(s)",
-                    ids.len()
-                ),
-            )
-            .await?;
-        }
-        Ok(deleted)
-    }
-
-    /// Rebuilds a page of resources in `_bulk` requests bounded by
-    /// [`BULK_OPS_PER_REQUEST`] documents and the configured byte budget, under
-    /// the rebuild's own refresh policy
-    /// ([`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh)).
-    ///
-    /// The default trait implementation walks the page one resource at a time,
-    /// which against Elasticsearch is one HTTP round trip each and held
-    /// `$reindex` to ~160 resources/s however fast the source read was — at
-    /// which a corpus-sized rebuild cannot finish, so the deferred-indexing
-    /// fast-load path had no usable recovery (#1021). SQLite already overrode
-    /// this for the same reason, batching a page into one transaction; this is
-    /// its Elasticsearch counterpart.
-    ///
-    /// Under `refresh=wait_for` the saving is larger still: that policy blocks
-    /// each write until the next scheduled refresh, so per-document writes cost
-    /// one refresh wait each while a bulk request costs one for the page.
-    /// Delegates to [`Self::write_search_entries_page_timed`] with a
-    /// throwaway `ReindexPageStats`, as the trait requires, so the driver's
-    /// path and the composite ingest sink's never diverge.
-    async fn write_search_entries_page(
-        &self,
-        tenant: &TenantContext,
-        resources: &[StoredResource],
-    ) -> Vec<StorageResult<usize>> {
-        let mut stats = ReindexPageStats::default();
-        self.write_search_entries_page_timed(tenant, resources, &mut stats)
-            .await
-    }
-
+impl ElasticsearchBackend {
     /// One page: extract every resource's documents (on the prepare pool
     /// when the page is large enough and the runtime allows, #1250), make
     /// sure each index touched exists, then send the documents in `_bulk`
     /// requests. `stats.extract` is the extraction, `stats.insert` the
     /// `_bulk` round trips, `inserted_entries` the documents sent;
-    /// `pool_sub_batches` says whether the page ran on the pool.
-    async fn write_search_entries_page_timed(
+    /// `pool_sub_batches` says whether the page ran on the pool. `refresh`
+    /// is the rebuild's policy or, for composite sync, the ordinary write one.
+    async fn write_search_page(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
+        refresh: Option<Refresh>,
     ) -> Vec<StorageResult<usize>> {
         if resources.is_empty() {
             return Vec::new();
@@ -2508,6 +2521,17 @@ impl ReindexTarget for ElasticsearchBackend {
             let resource = &resources[i];
             let resource_type = resource.resource_type();
             let id = resource.id();
+            if resource.version_id().is_empty() {
+                return Prepared {
+                    values: 0,
+                    docs: Vec::new(),
+                    failure: Some(format!(
+                        "Elasticsearch is a search secondary and cannot assign versions; \
+                         {resource_type}/{id} has no versionId from the primary"
+                    )),
+                    types: Vec::new(),
+                };
+            }
             let content = resource.content();
             let fhir_version = resource.fhir_version();
             let extracted_values = match extractor.extract(content, resource_type) {
@@ -2623,9 +2647,7 @@ impl ReindexTarget for ElasticsearchBackend {
             .collect();
         let documents = ops.len() as u64;
         let send_started = Instant::now();
-        let failures = self
-            .send_bulk_index(&ops, prepared.len(), self.reindex_refresh_param())
-            .await;
+        let failures = self.send_bulk_index(&ops, prepared.len(), refresh).await;
         stats.insert += send_started.elapsed();
         stats.inserted_entries += documents;
         stats.db_wait = Some(stats.insert);
@@ -2645,12 +2667,156 @@ impl ReindexTarget for ElasticsearchBackend {
             })
             .collect()
     }
+}
+
+#[async_trait]
+impl ReindexTarget for ElasticsearchBackend {
+    /// Deletes the resource's document and every contained document derived
+    /// from it; see [`Self::delete_search_entries_for_resources`].
+    ///
+    /// The page rebuild ([`Self::write_search_entries_page`]) does not call
+    /// this: there the entries are *fields of the resource document*, which the
+    /// rebuild re-indexes under the same `_id`, and deleting first would drop
+    /// the resource from search between the delete and the write. It is the
+    /// clear of a run named by resource IDs with `clearExisting`, where a named
+    /// resource may be gone from the source or may have dropped a `contained[]`
+    /// entry — neither of which the rebuild overwrites (#1629).
+    async fn delete_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> StorageResult<u64> {
+        self.delete_search_entries_for_resources(
+            tenant,
+            resource_type,
+            std::slice::from_ref(&resource_id.to_string()),
+        )
+        .await
+    }
+
+    /// Deletes the named resources' documents and their contained documents
+    /// in one delete-by-query per [`DELETE_IDS_PER_REQUEST`] IDs, rather than
+    /// a round trip per resource.
+    ///
+    /// Scoped like `clear_search_index_for_types`: a `tenant_id` term over the
+    /// tenant's index pattern (contained documents live in their own type's
+    /// index), a top-level document by its `resource_type`/`resource_id`, and
+    /// a contained one by its `container_type`/`container_id` — never by its
+    /// own `resource_type`, so a Patient contained in a named Observation goes
+    /// and a top-level Patient with the same ID stays. Missing documents and
+    /// missing indices are nothing to delete, not an error.
+    async fn delete_search_entries_for_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_ids: &[String],
+    ) -> StorageResult<u64> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let mut deleted = 0;
+        for ids in resource_ids.chunks(DELETE_IDS_PER_REQUEST) {
+            let body = json!({ "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "bool": {
+                    "minimum_should_match": 1,
+                    "should": [
+                        { "bool": {
+                            "filter": [
+                                { "term": { "resource_type": resource_type } },
+                                { "terms": { "resource_id": ids } }
+                            ],
+                            "must_not": [{ "term": { "is_contained": true } }]
+                        } },
+                        { "bool": { "filter": [
+                            { "term": { "is_contained": true } },
+                            { "term": { "container_type": resource_type } },
+                            { "terms": { "container_id": ids } }
+                        ] } }
+                    ]
+                } }
+            ]}}});
+            deleted += delete_by_query_scoped(
+                self,
+                &pattern,
+                body,
+                &format!(
+                    "clear the search entries of {} {resource_type} resource(s)",
+                    ids.len()
+                ),
+            )
+            .await?;
+        }
+        Ok(deleted)
+    }
+
+    /// Rebuilds a page of resources in `_bulk` requests bounded by
+    /// [`BULK_OPS_PER_REQUEST`] documents and the configured byte budget, under
+    /// the rebuild's own refresh policy
+    /// ([`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh)).
+    ///
+    /// The default trait implementation walks the page one resource at a time,
+    /// which against Elasticsearch is one HTTP round trip each and held
+    /// `$reindex` to ~160 resources/s however fast the source read was — at
+    /// which a corpus-sized rebuild cannot finish, so the deferred-indexing
+    /// fast-load path had no usable recovery (#1021). SQLite already overrode
+    /// this for the same reason, batching a page into one transaction; this is
+    /// its Elasticsearch counterpart.
+    ///
+    /// Under `refresh=wait_for` the saving is larger still: that policy blocks
+    /// each write until the next scheduled refresh, so per-document writes cost
+    /// one refresh wait each while a bulk request costs one for the page.
+    /// Delegates to [`Self::write_search_entries_page_timed`] with a
+    /// throwaway `ReindexPageStats`, as the trait requires, so the driver's
+    /// path and the composite ingest sink's never diverge.
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
+            .await
+    }
+
+    /// The rebuild's page, under
+    /// [`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh);
+    /// see `ElasticsearchBackend::write_search_page`.
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+    ) -> Vec<StorageResult<usize>> {
+        self.write_search_page(tenant, resources, stats, self.reindex_refresh_param())
+            .await
+    }
+
+    /// Composite sync of writes the primary just made: the same `_bulk`
+    /// page, under the ordinary write refresh policy, so a search right
+    /// after a transaction bundle sees it even when rebuilds skip the
+    /// refresh wait.
+    async fn write_synced_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_page(tenant, resources, &mut stats, self.write_refresh_param())
+            .await
+    }
 
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
         resource: &StoredResource,
     ) -> StorageResult<usize> {
+        if resource.version_id().is_empty() {
+            return Err(missing_primary_version(
+                resource.resource_type(),
+                resource.id(),
+            ));
+        }
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = resource.resource_type();
         let resource_id = resource.id();

@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -94,6 +95,69 @@ pub type DynGroupExportProvider = Arc<dyn GroupExportProvider + Send + Sync>;
 
 /// Type alias for a purgable backend.
 pub type DynPurgableStorage = Arc<dyn PurgableStorage + Send + Sync>;
+
+/// Rebuilds the primary's [`StoredResource`] from a bundle entry body.
+///
+/// Production bundle results use [`StoredResource::content_with_meta`], so
+/// `meta.versionId` and `meta.lastUpdated` are present. Older or partial
+/// entries still have to fan out — dropping them leaves the secondary
+/// missing a write that sits beside a delete in the same bundle. Version
+/// then comes from `Location` (`Type/id/_history/{vid}`), then `"1"`;
+/// `lastUpdated` from the entry header, then now.
+fn stored_from_synced_body(
+    resource: &Value,
+    tenant_id: crate::tenant::TenantId,
+    fhir_version: FhirVersion,
+    location: Option<&str>,
+    last_modified: Option<&str>,
+) -> Option<StoredResource> {
+    let resource_type = resource.get("resourceType")?.as_str()?;
+    let id = resource.get("id")?.as_str()?;
+    let version = resource
+        .pointer("/meta/versionId")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+        .or_else(|| version_from_location(location))
+        .unwrap_or_else(|| {
+            warn!(
+                resource_type,
+                resource_id = id,
+                "Bundle entry has no primary versionId; syncing as version 1"
+            );
+            "1".to_string()
+        });
+    let last_updated = resource
+        .pointer("/meta/lastUpdated")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .or_else(|| last_modified.and_then(parse_rfc3339))
+        .unwrap_or_else(Utc::now);
+    Some(StoredResource::from_storage(
+        resource_type,
+        id,
+        version,
+        tenant_id,
+        resource.clone(),
+        last_updated,
+        last_updated,
+        None,
+        fhir_version,
+    ))
+}
+
+fn parse_rfc3339(instant: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(instant)
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
+}
+
+fn version_from_location(location: Option<&str>) -> Option<String> {
+    let location = location?;
+    let (_, after) = location.split_once("/_history/")?;
+    let version = after.split(['/', '?']).next()?.trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
 
 /// Composite storage that coordinates multiple backends.
 ///
@@ -823,7 +887,7 @@ impl CompositeStorage {
         result: &BundleResult,
         fhir_version: FhirVersion,
     ) {
-        let mut by_type: Vec<(String, Vec<(String, Value)>)> = Vec::new();
+        let mut by_type: Vec<(String, Vec<StoredResource>)> = Vec::new();
         let mut deletes: Vec<(String, String)> = Vec::new();
         for (entry_url, entry_result) in entry_urls.iter().zip(&result.entries) {
             if entry_result.effect == BundleEntryEffect::Deleted {
@@ -837,7 +901,7 @@ impl CompositeStorage {
                     continue;
                 };
                 if let Some((_, group)) = by_type.iter_mut().find(|(t, _)| *t == resource_type) {
-                    group.retain(|(id, _)| *id != resource_id);
+                    group.retain(|resource| resource.id() != resource_id);
                 }
                 deletes.push((resource_type, resource_id));
                 continue;
@@ -864,9 +928,15 @@ impl CompositeStorage {
                     by_type.last_mut().expect("just pushed")
                 }
             };
-            group
-                .1
-                .push((resource_id.to_string(), resource_json.clone()));
+            if let Some(stored) = stored_from_synced_body(
+                resource_json,
+                tenant.tenant_id().clone(),
+                fhir_version,
+                entry_result.location.as_deref(),
+                entry_result.last_modified.as_deref(),
+            ) {
+                group.1.push(stored);
+            }
         }
         // Deletes go first, in the primary's own processing order: a create
         // that preceded a delete of the same resource was dropped from
@@ -893,7 +963,7 @@ impl CompositeStorage {
             // rejection; the per-backend statuses are for callers that do
             // (bulk-submit), so this one discards them.
             let _ = self
-                .sync_creates_to_secondaries(tenant, &resource_type, fhir_version, resources)
+                .sync_creates_to_secondaries(tenant, &resource_type, resources)
                 .await;
         }
     }
@@ -912,8 +982,7 @@ impl CompositeStorage {
         &self,
         tenant: &TenantContext,
         resource_type: &str,
-        fhir_version: FhirVersion,
-        resources: Vec<(String, Value)>,
+        resources: Vec<StoredResource>,
     ) -> Vec<SyncStatus> {
         if resources.is_empty() {
             return Vec::new();
@@ -925,7 +994,6 @@ impl CompositeStorage {
             .sync_creates(
                 tenant.tenant_id(),
                 resource_type,
-                fhir_version,
                 resources,
                 &self.secondaries,
             )
@@ -1051,13 +1119,7 @@ impl ResourceStorage for CompositeStorage {
 
         // Sync to secondaries
         if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::Create {
-                resource_type: resource_type.to_string(),
-                resource_id: stored.id().to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                fhir_version,
-            })
+            .sync_to_secondaries(SyncEvent::created(stored.clone()))
             .await
         {
             warn!(error = %e, "Failed to sync create to secondaries");
@@ -1096,16 +1158,16 @@ impl ResourceStorage for CompositeStorage {
         });
         self.update_health(primary_id, backend_failure.is_none(), backend_failure);
 
-        let created: Vec<(String, Value)> = results
+        let created: Vec<StoredResource> = results
             .iter()
             .filter_map(|result| result.as_ref().ok())
-            .map(|stored| (stored.id().to_string(), stored.content().clone()))
+            .cloned()
             .collect();
         // `create_many` has no per-entry receipt to correct either — that is
         // `CompositeSubmitJobs::sync_ingested`'s job, which calls
         // `sync_creates_to_secondaries` itself and inspects the statuses.
         let _ = self
-            .sync_creates_to_secondaries(tenant, resource_type, fhir_version, created)
+            .sync_creates_to_secondaries(tenant, resource_type, created)
             .await;
 
         results
@@ -1143,22 +1205,9 @@ impl ResourceStorage for CompositeStorage {
         // backends whose `create` rejects an existing id would otherwise drop
         // the write and go stale.
         let event = if created && stored.version_id() == "1" {
-            SyncEvent::Create {
-                resource_type: resource_type.to_string(),
-                resource_id: id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                fhir_version,
-            }
+            SyncEvent::created(stored.clone())
         } else {
-            SyncEvent::Update {
-                resource_type: resource_type.to_string(),
-                resource_id: id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                version: stored.version_id().to_string(),
-                fhir_version,
-            }
+            SyncEvent::updated(stored.clone())
         };
 
         if let Err(e) = self.sync_to_secondaries(event).await {
@@ -1208,14 +1257,7 @@ impl ResourceStorage for CompositeStorage {
 
         // Sync to secondaries
         if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::Update {
-                resource_type: current.resource_type().to_string(),
-                resource_id: current.id().to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                version: stored.version_id().to_string(),
-                fhir_version: stored.fhir_version(),
-            })
+            .sync_to_secondaries(SyncEvent::updated(stored.clone()))
             .await
         {
             warn!(error = %e, "Failed to sync update to secondaries");
@@ -1807,13 +1849,7 @@ impl ConditionalStorage for CompositeStorage {
                         .await?;
 
                     if let Err(e) = self
-                        .sync_to_secondaries(SyncEvent::Create {
-                            resource_type: resource_type.to_string(),
-                            resource_id: created.id().to_string(),
-                            content: created.content().clone(),
-                            tenant_id: tenant.tenant_id().clone(),
-                            fhir_version,
-                        })
+                        .sync_to_secondaries(SyncEvent::created(created.clone()))
                         .await
                     {
                         warn!(error = %e, "Failed to sync conditional_create to secondaries");
@@ -1842,13 +1878,7 @@ impl ConditionalStorage for CompositeStorage {
         // Sync created resource to secondaries
         if let ConditionalCreateResult::Created(ref stored) = result {
             if let Err(e) = self
-                .sync_to_secondaries(SyncEvent::Create {
-                    resource_type: resource_type.to_string(),
-                    resource_id: stored.id().to_string(),
-                    content: stored.content().clone(),
-                    tenant_id: tenant.tenant_id().clone(),
-                    fhir_version,
-                })
+                .sync_to_secondaries(SyncEvent::created(stored.clone()))
                 .await
             {
                 warn!(error = %e, "Failed to sync conditional_create to secondaries");
@@ -1886,13 +1916,7 @@ impl ConditionalStorage for CompositeStorage {
                             .await?;
 
                         if let Err(e) = self
-                            .sync_to_secondaries(SyncEvent::Create {
-                                resource_type: resource_type.to_string(),
-                                resource_id: created.id().to_string(),
-                                content: created.content().clone(),
-                                tenant_id: tenant.tenant_id().clone(),
-                                fhir_version,
-                            })
+                            .sync_to_secondaries(SyncEvent::created(created.clone()))
                             .await
                         {
                             warn!(
@@ -1920,14 +1944,7 @@ impl ConditionalStorage for CompositeStorage {
                     let updated = self.primary.update(tenant, &current, resource).await?;
 
                     if let Err(e) = self
-                        .sync_to_secondaries(SyncEvent::Update {
-                            resource_type: resource_type.to_string(),
-                            resource_id: updated.id().to_string(),
-                            content: updated.content().clone(),
-                            tenant_id: tenant.tenant_id().clone(),
-                            version: updated.version_id().to_string(),
-                            fhir_version: updated.fhir_version(),
-                        })
+                        .sync_to_secondaries(SyncEvent::updated(updated.clone()))
                         .await
                     {
                         warn!(error = %e, "Failed to sync conditional_update to secondaries");
@@ -1962,13 +1979,7 @@ impl ConditionalStorage for CompositeStorage {
         match &result {
             ConditionalUpdateResult::Created(stored) => {
                 if let Err(e) = self
-                    .sync_to_secondaries(SyncEvent::Create {
-                        resource_type: resource_type.to_string(),
-                        resource_id: stored.id().to_string(),
-                        content: stored.content().clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                        fhir_version,
-                    })
+                    .sync_to_secondaries(SyncEvent::created(stored.clone()))
                     .await
                 {
                     warn!(error = %e, "Failed to sync conditional_update create to secondaries");
@@ -1976,14 +1987,7 @@ impl ConditionalStorage for CompositeStorage {
             }
             ConditionalUpdateResult::Updated(stored) => {
                 if let Err(e) = self
-                    .sync_to_secondaries(SyncEvent::Update {
-                        resource_type: resource_type.to_string(),
-                        resource_id: stored.id().to_string(),
-                        content: stored.content().clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                        version: stored.version_id().to_string(),
-                        fhir_version: stored.fhir_version(),
-                    })
+                    .sync_to_secondaries(SyncEvent::updated(stored.clone()))
                     .await
                 {
                     warn!(error = %e, "Failed to sync conditional_update to secondaries");
@@ -2116,14 +2120,7 @@ impl VersionedStorage for CompositeStorage {
 
         // Sync to secondaries
         if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::Update {
-                resource_type: resource_type.to_string(),
-                resource_id: id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                version: stored.version_id().to_string(),
-                fhir_version: stored.fhir_version(),
-            })
+            .sync_to_secondaries(SyncEvent::updated(stored.clone()))
             .await
         {
             warn!(error = %e, "Failed to sync update_with_match to secondaries");

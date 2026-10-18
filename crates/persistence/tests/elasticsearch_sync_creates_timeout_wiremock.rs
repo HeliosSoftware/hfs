@@ -1,8 +1,8 @@
 //! A whole-request `_bulk` timeout in `SyncManager::sync_creates` (#1749).
 //!
-//! `create_many` on Elasticsearch reports a timed-out `_bulk` as one error per
-//! resource, and `sync_creates` retries them individually through
-//! `sync_event_to_backend` (`max_retries + 1` attempts each, with backoff).
+//! `write_search_entries_page` on Elasticsearch reports a timed-out `_bulk`
+//! as one error per resource, and `sync_creates` retries them individually
+//! through `sync_event_to_backend` (`max_retries + 1` attempts each, with backoff).
 //! Retrying every one serially against a cluster that does not answer made a
 //! batch of N block for N x (max_retries + 1) request timeouts; it now stops
 //! after the first resource whose own retry fails because the backend is
@@ -23,7 +23,8 @@ use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, Elastics
 use helios_persistence::composite::{SyncManager, config::SyncConfig, config::SyncMode};
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::tenant::TenantId;
-use serde_json::{Value, json};
+use helios_persistence::types::StoredResource;
+use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -46,6 +47,16 @@ async fn run(n: usize, singles_hang: bool) -> Measured {
     Mock::given(method("POST"))
         .and(path("/_bulk"))
         .respond_with(|_: &Request| ResponseTemplate::new(200).set_delay(DELAY))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/hfs_t_*/_delete_by_query"))
+        .respond_with(|_: &Request| {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "took": 1, "timed_out": false, "total": 0, "deleted": 0,
+                "version_conflicts": 0, "failures": []
+            }))
+        })
         .mount(&server)
         .await;
     // Single-document index: POST /{index}/_doc/{id} (after the `_bulk` mock).
@@ -74,25 +85,23 @@ async fn run(n: usize, singles_hang: bool) -> Measured {
         mode: SyncMode::Synchronous,
         ..Default::default()
     });
-    let resources: Vec<(String, Value)> = (0..n)
+    let tenant = TenantId::new("t");
+    let resources: Vec<StoredResource> = (0..n)
         .map(|i| {
             let id = format!("p{i}");
-            (
+            StoredResource::new(
+                "Patient",
                 id.clone(),
+                tenant.clone(),
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "X"}]}),
+                FhirVersion::default(),
             )
         })
         .collect();
 
     let start = Instant::now();
     let statuses = manager
-        .sync_creates(
-            &TenantId::new("t"),
-            "Patient",
-            FhirVersion::default(),
-            resources,
-            &backends,
-        )
+        .sync_creates(&tenant, "Patient", resources, &backends)
         .await
         .expect("sync_creates");
     let elapsed = start.elapsed();
@@ -101,7 +110,7 @@ async fn run(n: usize, singles_hang: bool) -> Measured {
     let bulk = requests.iter().filter(|r| r.url.path() == "/_bulk").count();
     let single = requests
         .iter()
-        .filter(|r| r.method.as_str() == "POST" && r.url.path() != "/_bulk")
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().contains("/_doc/"))
         .count();
     Measured {
         elapsed,

@@ -101,8 +101,8 @@ use super::storage::CompositeStorage;
 use super::sync::SyncEvent;
 
 /// One batch of ingested resources bound for the secondaries: the resource
-/// type and FHIR version they share, and their `(id, content)` pairs.
-type SyncGroup = ((String, FhirVersion), Vec<(String, Value)>);
+/// type and FHIR version they share, and the primary's stored snapshots.
+type SyncGroup = ((String, FhirVersion), Vec<StoredResource>);
 
 /// The composite's `$bulk-submit` job store: the primary's engine for all
 /// state and ingestion, plus secondary-index sync at manifest boundaries.
@@ -218,17 +218,16 @@ impl CompositeSubmitJobs {
                         by_type.last_mut().expect("just pushed")
                     }
                 };
-                group.1.push((resource_id, stored.content().clone()));
+                group.1.push(stored);
             }
-            for ((resource_type, fhir_version), resources) in by_type {
+            for ((resource_type, _fhir_version), resources) in by_type {
                 attempted += resources.len() as u64;
-                let ids: Vec<String> = resources.iter().map(|(id, _)| id.clone()).collect();
+                let ids: Vec<String> = resources.iter().map(|r| r.id().to_string()).collect();
                 let Ok(statuses) = tokio::time::timeout(
                     self.sync_page_timeout,
                     self.composite.sync_creates_to_secondaries(
                         &lease.tenant,
                         &resource_type,
-                        fhir_version,
                         resources,
                     ),
                 )
@@ -902,13 +901,7 @@ impl BulkSubmitRollbackProvider for CompositeSubmitJobs {
                     .read(tenant, &change.resource_type, &change.resource_id)
                     .await
                 {
-                    Ok(Some(stored)) => SyncEvent::Create {
-                        resource_type: change.resource_type.clone(),
-                        resource_id: change.resource_id.clone(),
-                        content: stored.content().clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                        fhir_version: stored.fhir_version(),
-                    },
+                    Ok(Some(stored)) => SyncEvent::created(stored),
                     _ => SyncEvent::Delete {
                         resource_type: change.resource_type.clone(),
                         resource_id: change.resource_id.clone(),

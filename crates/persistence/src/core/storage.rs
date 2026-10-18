@@ -34,6 +34,7 @@ pub struct WriteMarker {
     /// leave `latest` unchanged. `None` when no bound was asked for.
     pub recent_writes: Option<u64>,
 }
+use crate::search::ReindexTarget;
 use crate::types::StoredResource;
 
 /// A registered tenant, as returned by the tenant registry.
@@ -529,6 +530,19 @@ pub trait ResourceStorage: Send + Sync {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)>;
+
+    /// When this backend's stored document *is* the search index, composite
+    /// secondary sync writes through [`ReindexTarget::write_search_entries`]
+    /// so `version_id` and `last_modified` come from the primary's
+    /// [`StoredResource`].
+    ///
+    /// Elasticsearch returns `Some(self)`. SQL, S3 and Mongo return `None`
+    /// even though they implement [`ReindexTarget`]: their search writer
+    /// rebuilds derived rows from a resource they already store, and a
+    /// secondary replica still has to `create` / `create_or_update`.
+    fn as_search_index(&self) -> Option<&dyn ReindexTarget> {
+        None
+    }
 
     /// Reads a resource by type and ID.
     ///
