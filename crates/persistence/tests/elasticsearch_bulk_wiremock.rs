@@ -536,6 +536,30 @@ async fn a_rebuild_uses_its_own_refresh_policy() {
     );
 }
 
+/// Composite sync writes the same `_bulk` page as a rebuild, but under the
+/// ordinary write policy: a rebuild that skips the refresh wait must not cost
+/// a transaction bundle its read-your-writes search.
+#[tokio::test]
+async fn a_synced_page_uses_the_write_refresh_policy_not_the_rebuilds() {
+    let server = cluster().await;
+    on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+    let backend = backend_with(&server, |config| {
+        config.write_refresh = WriteRefreshPolicy::WaitFor;
+        config.reindex_refresh = Some(WriteRefreshPolicy::False);
+    });
+
+    assert_all_ok(
+        &backend
+            .write_synced_entries_page(&tenant(), &page(&["a"]))
+            .await,
+    );
+
+    let requests = bulk_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    let query = requests[0].url.query().unwrap_or_default().to_string();
+    assert!(query.contains("refresh=wait_for"), "{query}");
+}
+
 // ============================================================================
 // ensure_index: an outage is transient, a rejection is not
 // ============================================================================

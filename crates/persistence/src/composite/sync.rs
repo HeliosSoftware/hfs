@@ -257,7 +257,7 @@ async fn write_primary_resources(
 ) -> Vec<StorageResult<()>> {
     if let Some(index) = backend.as_search_index() {
         return index
-            .write_search_entries_page(tenant, resources)
+            .write_synced_entries_page(tenant, resources)
             .await
             .into_iter()
             .map(|result| result.map(|_| ()))
@@ -444,7 +444,7 @@ impl SyncManager {
     ///
     /// In the synchronous modes every backend receives the whole batch
     /// through [`write_primary_resources`]: Elasticsearch writes the page
-    /// with [`ReindexTarget::write_search_entries_page`], and a replica
+    /// with [`ReindexTarget::write_synced_entries_page`], and a replica
     /// uses [`ResourceStorage::create_many`]. A secondary with a native
     /// batch write (Elasticsearch `_bulk`) pays one round trip and, under
     /// `refresh=wait_for`, one refresh wait rather than one per resource.
@@ -812,7 +812,7 @@ impl SyncManager {
                     let tenant =
                         TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
                     if let Some(index) = backend.as_search_index() {
-                        for result in index.write_search_entries_page(&tenant, resources).await {
+                        for result in index.write_synced_entries_page(&tenant, resources).await {
                             result?;
                         }
                     } else {

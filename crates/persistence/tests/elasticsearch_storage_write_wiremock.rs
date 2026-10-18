@@ -397,7 +397,8 @@ async fn create_or_update_indexes_the_primarys_version_and_last_updated() {
     on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
     on(&server, "POST", DOC_PATH, |_| indexed()).await;
 
-    let (stored, _) = backend(&server)
+    let es = backend(&server);
+    let (stored, is_new) = es
         .create_or_update(
             &tenant(),
             "Patient",
@@ -409,10 +410,22 @@ async fn create_or_update_indexes_the_primarys_version_and_last_updated() {
         .expect("the stub accepts the write");
 
     assert_eq!(stored.version_id(), "4");
+    assert!(!is_new, "the primary's version 4 is an update");
     assert_eq!(stored.last_modified().to_rfc3339(), PRIMARY_INSTANT_INDEXED);
     let body = &indexed_bodies(&server).await[0];
     assert_eq!(body["version_id"], json!("4"));
     assert_eq!(body["last_updated"], json!(PRIMARY_INSTANT_INDEXED));
+    let (_, is_new) = es
+        .create_or_update(
+            &tenant(),
+            "Patient",
+            "p1",
+            patient_from_primary("p1", "1", PRIMARY_INSTANT),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the stub accepts the write");
+    assert!(is_new, "the primary's version 1 is a create");
     assert_eq!(
         requests_to(&server, "GET", DOC_PATH).await,
         0,

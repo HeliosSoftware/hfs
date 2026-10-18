@@ -1389,7 +1389,8 @@ impl ElasticsearchBackend {
     }
 
     /// PUT semantics. When the primary stamped `meta.versionId`, that version
-    /// and `meta.lastUpdated` are indexed and the existence GET is skipped.
+    /// and `meta.lastUpdated` are indexed and the existence GET is skipped;
+    /// the write is new exactly when the primary's version is 1.
     /// Without them this backend still counts its own versions — the seed
     /// path used by tests — and logs a warning.
     async fn upsert(
@@ -1407,7 +1408,9 @@ impl ElasticsearchBackend {
 
         let (version_id, now, is_new) =
             if let Some((version, last_updated)) = primary_write_meta(&resource) {
-                (version, last_updated.unwrap_or_else(Utc::now), true)
+                // The primary assigns versions, so its version 1 is a create.
+                let is_new = version == "1";
+                (version, last_updated.unwrap_or_else(Utc::now), is_new)
             } else {
                 tracing::warn!(
                     resource_type,
@@ -2485,127 +2488,20 @@ impl ElasticsearchBackend {
     }
 }
 
-#[async_trait]
-impl ReindexTarget for ElasticsearchBackend {
-    /// Deletes the resource's document and every contained document derived
-    /// from it; see [`Self::delete_search_entries_for_resources`].
-    ///
-    /// The page rebuild ([`Self::write_search_entries_page`]) does not call
-    /// this: there the entries are *fields of the resource document*, which the
-    /// rebuild re-indexes under the same `_id`, and deleting first would drop
-    /// the resource from search between the delete and the write. It is the
-    /// clear of a run named by resource IDs with `clearExisting`, where a named
-    /// resource may be gone from the source or may have dropped a `contained[]`
-    /// entry — neither of which the rebuild overwrites (#1629).
-    async fn delete_search_entries(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-    ) -> StorageResult<u64> {
-        self.delete_search_entries_for_resources(
-            tenant,
-            resource_type,
-            std::slice::from_ref(&resource_id.to_string()),
-        )
-        .await
-    }
-
-    /// Deletes the named resources' documents and their contained documents
-    /// in one delete-by-query per [`DELETE_IDS_PER_REQUEST`] IDs, rather than
-    /// a round trip per resource.
-    ///
-    /// Scoped like `clear_search_index_for_types`: a `tenant_id` term over the
-    /// tenant's index pattern (contained documents live in their own type's
-    /// index), a top-level document by its `resource_type`/`resource_id`, and
-    /// a contained one by its `container_type`/`container_id` — never by its
-    /// own `resource_type`, so a Patient contained in a named Observation goes
-    /// and a top-level Patient with the same ID stays. Missing documents and
-    /// missing indices are nothing to delete, not an error.
-    async fn delete_search_entries_for_resources(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        resource_ids: &[String],
-    ) -> StorageResult<u64> {
-        let tenant_id = tenant.tenant_id().as_str();
-        let pattern = tenant_index_pattern(self, tenant_id);
-        let mut deleted = 0;
-        for ids in resource_ids.chunks(DELETE_IDS_PER_REQUEST) {
-            let body = json!({ "query": { "bool": { "filter": [
-                { "term": { "tenant_id": tenant_id } },
-                { "bool": {
-                    "minimum_should_match": 1,
-                    "should": [
-                        { "bool": {
-                            "filter": [
-                                { "term": { "resource_type": resource_type } },
-                                { "terms": { "resource_id": ids } }
-                            ],
-                            "must_not": [{ "term": { "is_contained": true } }]
-                        } },
-                        { "bool": { "filter": [
-                            { "term": { "is_contained": true } },
-                            { "term": { "container_type": resource_type } },
-                            { "terms": { "container_id": ids } }
-                        ] } }
-                    ]
-                } }
-            ]}}});
-            deleted += delete_by_query_scoped(
-                self,
-                &pattern,
-                body,
-                &format!(
-                    "clear the search entries of {} {resource_type} resource(s)",
-                    ids.len()
-                ),
-            )
-            .await?;
-        }
-        Ok(deleted)
-    }
-
-    /// Rebuilds a page of resources in `_bulk` requests bounded by
-    /// [`BULK_OPS_PER_REQUEST`] documents and the configured byte budget, under
-    /// the rebuild's own refresh policy
-    /// ([`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh)).
-    ///
-    /// The default trait implementation walks the page one resource at a time,
-    /// which against Elasticsearch is one HTTP round trip each and held
-    /// `$reindex` to ~160 resources/s however fast the source read was — at
-    /// which a corpus-sized rebuild cannot finish, so the deferred-indexing
-    /// fast-load path had no usable recovery (#1021). SQLite already overrode
-    /// this for the same reason, batching a page into one transaction; this is
-    /// its Elasticsearch counterpart.
-    ///
-    /// Under `refresh=wait_for` the saving is larger still: that policy blocks
-    /// each write until the next scheduled refresh, so per-document writes cost
-    /// one refresh wait each while a bulk request costs one for the page.
-    /// Delegates to [`Self::write_search_entries_page_timed`] with a
-    /// throwaway `ReindexPageStats`, as the trait requires, so the driver's
-    /// path and the composite ingest sink's never diverge.
-    async fn write_search_entries_page(
-        &self,
-        tenant: &TenantContext,
-        resources: &[StoredResource],
-    ) -> Vec<StorageResult<usize>> {
-        let mut stats = ReindexPageStats::default();
-        self.write_search_entries_page_timed(tenant, resources, &mut stats)
-            .await
-    }
-
+impl ElasticsearchBackend {
     /// One page: extract every resource's documents (on the prepare pool
     /// when the page is large enough and the runtime allows, #1250), make
     /// sure each index touched exists, then send the documents in `_bulk`
     /// requests. `stats.extract` is the extraction, `stats.insert` the
     /// `_bulk` round trips, `inserted_entries` the documents sent;
-    /// `pool_sub_batches` says whether the page ran on the pool.
-    async fn write_search_entries_page_timed(
+    /// `pool_sub_batches` says whether the page ran on the pool. `refresh`
+    /// is the rebuild's policy or, for composite sync, the ordinary write one.
+    async fn write_search_page(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
+        refresh: Option<Refresh>,
     ) -> Vec<StorageResult<usize>> {
         if resources.is_empty() {
             return Vec::new();
@@ -2751,9 +2647,7 @@ impl ReindexTarget for ElasticsearchBackend {
             .collect();
         let documents = ops.len() as u64;
         let send_started = Instant::now();
-        let failures = self
-            .send_bulk_index(&ops, prepared.len(), self.reindex_refresh_param())
-            .await;
+        let failures = self.send_bulk_index(&ops, prepared.len(), refresh).await;
         stats.insert += send_started.elapsed();
         stats.inserted_entries += documents;
         stats.db_wait = Some(stats.insert);
@@ -2772,6 +2666,144 @@ impl ReindexTarget for ElasticsearchBackend {
                 (None, None) => Ok(p.values),
             })
             .collect()
+    }
+}
+
+#[async_trait]
+impl ReindexTarget for ElasticsearchBackend {
+    /// Deletes the resource's document and every contained document derived
+    /// from it; see [`Self::delete_search_entries_for_resources`].
+    ///
+    /// The page rebuild ([`Self::write_search_entries_page`]) does not call
+    /// this: there the entries are *fields of the resource document*, which the
+    /// rebuild re-indexes under the same `_id`, and deleting first would drop
+    /// the resource from search between the delete and the write. It is the
+    /// clear of a run named by resource IDs with `clearExisting`, where a named
+    /// resource may be gone from the source or may have dropped a `contained[]`
+    /// entry — neither of which the rebuild overwrites (#1629).
+    async fn delete_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> StorageResult<u64> {
+        self.delete_search_entries_for_resources(
+            tenant,
+            resource_type,
+            std::slice::from_ref(&resource_id.to_string()),
+        )
+        .await
+    }
+
+    /// Deletes the named resources' documents and their contained documents
+    /// in one delete-by-query per [`DELETE_IDS_PER_REQUEST`] IDs, rather than
+    /// a round trip per resource.
+    ///
+    /// Scoped like `clear_search_index_for_types`: a `tenant_id` term over the
+    /// tenant's index pattern (contained documents live in their own type's
+    /// index), a top-level document by its `resource_type`/`resource_id`, and
+    /// a contained one by its `container_type`/`container_id` — never by its
+    /// own `resource_type`, so a Patient contained in a named Observation goes
+    /// and a top-level Patient with the same ID stays. Missing documents and
+    /// missing indices are nothing to delete, not an error.
+    async fn delete_search_entries_for_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_ids: &[String],
+    ) -> StorageResult<u64> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let mut deleted = 0;
+        for ids in resource_ids.chunks(DELETE_IDS_PER_REQUEST) {
+            let body = json!({ "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "bool": {
+                    "minimum_should_match": 1,
+                    "should": [
+                        { "bool": {
+                            "filter": [
+                                { "term": { "resource_type": resource_type } },
+                                { "terms": { "resource_id": ids } }
+                            ],
+                            "must_not": [{ "term": { "is_contained": true } }]
+                        } },
+                        { "bool": { "filter": [
+                            { "term": { "is_contained": true } },
+                            { "term": { "container_type": resource_type } },
+                            { "terms": { "container_id": ids } }
+                        ] } }
+                    ]
+                } }
+            ]}}});
+            deleted += delete_by_query_scoped(
+                self,
+                &pattern,
+                body,
+                &format!(
+                    "clear the search entries of {} {resource_type} resource(s)",
+                    ids.len()
+                ),
+            )
+            .await?;
+        }
+        Ok(deleted)
+    }
+
+    /// Rebuilds a page of resources in `_bulk` requests bounded by
+    /// [`BULK_OPS_PER_REQUEST`] documents and the configured byte budget, under
+    /// the rebuild's own refresh policy
+    /// ([`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh)).
+    ///
+    /// The default trait implementation walks the page one resource at a time,
+    /// which against Elasticsearch is one HTTP round trip each and held
+    /// `$reindex` to ~160 resources/s however fast the source read was — at
+    /// which a corpus-sized rebuild cannot finish, so the deferred-indexing
+    /// fast-load path had no usable recovery (#1021). SQLite already overrode
+    /// this for the same reason, batching a page into one transaction; this is
+    /// its Elasticsearch counterpart.
+    ///
+    /// Under `refresh=wait_for` the saving is larger still: that policy blocks
+    /// each write until the next scheduled refresh, so per-document writes cost
+    /// one refresh wait each while a bulk request costs one for the page.
+    /// Delegates to [`Self::write_search_entries_page_timed`] with a
+    /// throwaway `ReindexPageStats`, as the trait requires, so the driver's
+    /// path and the composite ingest sink's never diverge.
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
+            .await
+    }
+
+    /// The rebuild's page, under
+    /// [`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh);
+    /// see `ElasticsearchBackend::write_search_page`.
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+    ) -> Vec<StorageResult<usize>> {
+        self.write_search_page(tenant, resources, stats, self.reindex_refresh_param())
+            .await
+    }
+
+    /// Composite sync of writes the primary just made: the same `_bulk`
+    /// page, under the ordinary write refresh policy, so a search right
+    /// after a transaction bundle sees it even when rebuilds skip the
+    /// refresh wait.
+    async fn write_synced_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_page(tenant, resources, &mut stats, self.write_refresh_param())
+            .await
     }
 
     async fn write_search_entries(

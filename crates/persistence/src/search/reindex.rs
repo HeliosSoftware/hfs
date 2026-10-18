@@ -552,6 +552,20 @@ pub trait ReindexTarget: Send + Sync {
         let _ = stats;
         self.write_search_entries_page(tenant, resources).await
     }
+
+    /// Writes a page the primary just stored, for composite secondary sync
+    /// rather than a rebuild. The default delegates to
+    /// [`Self::write_search_entries_page`]. Elasticsearch overrides it so the
+    /// page goes out under the ordinary write refresh policy, not the
+    /// rebuild's: `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` must not cost a
+    /// transaction bundle its read-your-writes search.
+    async fn write_synced_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        self.write_search_entries_page(tenant, resources).await
+    }
 }
 
 /// A backend that is both a [`ReindexSource`] and a [`ReindexTarget`] —
