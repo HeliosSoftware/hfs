@@ -692,6 +692,18 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_json_source_casts_only_the_root_document() {
+        assert_eq!(sqlite_json_source("r.data"), "CAST(r.data AS TEXT)");
+        assert_eq!(sqlite_json_source("fe.value"), "fe.value");
+        assert_eq!(sqlite_json_source("rec_0.node"), "rec_0.node");
+        // Non-root bases keep their plain form through the dialect too.
+        assert_eq!(
+            SqliteDialect.json_path("fe.value", &["code"]),
+            "json_extract(fe.value, '$.code')"
+        );
+    }
+
+    #[test]
     fn sqlite_path_dotted() {
         assert_eq!(
             SqliteDialect.json_path("r.data", &["subject", "reference"]),
