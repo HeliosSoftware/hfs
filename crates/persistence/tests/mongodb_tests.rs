@@ -10206,6 +10206,104 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
     );
 }
 
+/// The in-database aggregate (typed `ViewRow` cursor) and the patient/group
+/// fallback `find` both honour `sof_cursor_batch_size` (#2161): with 1,200
+/// Observations and a batch of 512 each scan needs three server replies, and
+/// the result must still be complete with no row repeated.
+#[tokio::test]
+async fn mongodb_integration_sof_scan_spans_several_cursor_batches() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    const OBSERVATIONS: usize = 1200;
+    const BATCH: u32 = 512;
+
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        eprintln!(
+            "Skipping mongodb_integration_sof_scan_spans_several_cursor_batches \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let Some(backend) = build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name("sof_scan_cursor_batches"),
+        data_dir: Some(repo_data_dir()),
+        sof_cursor_batch_size: BATCH,
+        ..Default::default()
+    })
+    .await
+    else {
+        return;
+    };
+    assert_eq!(backend.config().sof_cursor_batch_size, BATCH);
+    let tenant = create_tenant("tenant-sof-cursor-batches");
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient", "id": "cb-p1" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for i in 0..OBSERVATIONS {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": "Patient/cb-p1" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("obs {i}: {e}"));
+    }
+
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+    });
+    let runner = backend
+        .sof_runner()
+        .expect("MongoDB backend must provide a SOF runner");
+
+    for (label, filters) in [
+        ("in-database aggregate", ViewFilters::default()),
+        (
+            "patient fallback find",
+            ViewFilters {
+                patient: vec!["Patient/cb-p1".to_string()],
+                ..Default::default()
+            },
+        ),
+    ] {
+        let mut stream = runner
+            .run_view(&tenant, view.clone(), filters)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: run_view: {e}"));
+        let mut ids = Vec::new();
+        while let Some(row) = stream.next().await {
+            let row = row.unwrap_or_else(|e| panic!("{label}: row: {e}"));
+            ids.push(row["obs_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids.len(), OBSERVATIONS, "{label}: row count");
+        let distinct: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            OBSERVATIONS,
+            "{label}: ids must be distinct"
+        );
+    }
+}
+
 /// The HL7/sql-on-fhir PR #410 example views (plus the hand-checked corner
 /// cases) return exactly the in-process engine's rows through the native
 /// aggregation-pipeline runner.
