@@ -26,6 +26,7 @@ use axum::{
     extract::State,
     response::{IntoResponse, Response},
 };
+use helios_persistence::core::bulk_submit_input::redact_urls_in;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -325,7 +326,7 @@ async fn call_llm(
         .send()
         .await
         .map_err(|e| RestError::InternalError {
-            message: format!("LLM request failed: {e}"),
+            message: format!("LLM request failed: {}", redact_urls_in(&e.to_string())),
         })?;
 
     let status = response.status();
@@ -340,7 +341,10 @@ async fn call_llm(
         .json()
         .await
         .map_err(|e| RestError::InternalError {
-            message: format!("LLM response was not JSON: {e}"),
+            message: format!(
+                "LLM response was not JSON: {}",
+                redact_urls_in(&e.to_string())
+            ),
         })?;
 
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -755,5 +759,28 @@ mod tests {
         let prompt = build_system_prompt(FhirVersion::default(), &registry());
         assert!(prompt.contains("Patient: birthdate(date), gender(token), name(string)"));
         assert!(prompt.contains(FhirVersion::default().as_str()));
+    }
+
+    /// A failed LLM request names the URL it was sent to; the configured base
+    /// URL's query must not come along with it (#2149).
+    #[tokio::test]
+    async fn llm_request_error_omits_the_base_url_query() {
+        // Port 1 on loopback refuses the connection immediately.
+        let err = call_llm(
+            "http://127.0.0.1:1?key=QUERY-SECRET",
+            "sk-API-KEY-SECRET",
+            "model",
+            "system",
+            "text",
+        )
+        .await
+        .expect_err("nothing listens on port 1");
+        let RestError::InternalError { message } = err else {
+            panic!("expected InternalError, got {err:?}");
+        };
+        assert!(message.starts_with("LLM request failed"), "{message}");
+        assert!(!message.contains("SECRET"), "secret leaked: {message}");
+        // reqwest names the URL; it is still there, redacted.
+        assert!(message.contains("127.0.0.1:1"), "{message}");
     }
 }
