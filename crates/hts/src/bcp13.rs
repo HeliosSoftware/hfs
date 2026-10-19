@@ -162,6 +162,7 @@ mod tests {
     #[test]
     fn mimetypes_validate_success_without_system() {
         let req = ValidateCodeRequest {
+            selected_value_set_id: None,
             url: Some(format!("{MIMETYPES_VS_URL}|4.0.1")),
             value_set_version: Some("4.0.1".into()),
             system: None,

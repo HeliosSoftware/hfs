@@ -1,5 +1,6 @@
 //! Transaction support for SQLite backend.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -92,10 +93,30 @@ pub(super) fn bundle_begin_error(err: StorageError) -> TransactionError {
     }
 }
 
+/// Keep rollback responsibility with the pooled connection, including when a
+/// cancelled caller leaves extension work running on a blocking thread.
+struct TransactionConnection(PooledConnection<SqliteConnectionManager>);
+
+impl Deref for TransactionConnection {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TransactionConnection {
+    fn drop(&mut self) {
+        if !self.is_autocommit() {
+            let _ = self.execute("ROLLBACK", []);
+        }
+    }
+}
+
 /// A SQLite transaction.
 pub struct SqliteTransaction {
     /// The connection used for this transaction.
-    conn: Arc<Mutex<PooledConnection<SqliteConnectionManager>>>,
+    conn: Arc<Mutex<TransactionConnection>>,
     /// Whether the transaction is still active.
     active: bool,
     /// The tenant context for this transaction.
@@ -137,7 +158,7 @@ impl SqliteTransaction {
             .map_err(|e| begin_error(&e))?;
 
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(Mutex::new(TransactionConnection(conn))),
             active: true,
             tenant,
             backend,
@@ -161,6 +182,40 @@ impl SqliteTransaction {
         }
         let conn = self.conn.lock();
         f(&conn)
+    }
+
+    /// Run extension-table work on the active resource transaction, off the
+    /// async runtime. The callback must not begin, commit or roll back a
+    /// transaction. Its connection cannot escape the callback.
+    ///
+    /// Callers must roll back when extension work fails. If the awaiting task
+    /// is cancelled, connection ownership keeps queued work isolated from the
+    /// pool; work that starts after rollback is refused.
+    pub async fn run_on_connection<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Connection) -> StorageResult<T> + Send + 'static,
+    ) -> StorageResult<T> {
+        if !self.active {
+            return Err(StorageError::Transaction(
+                TransactionError::InvalidTransaction,
+            ));
+        }
+        let connection = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let connection = connection.lock();
+            if connection.is_autocommit() {
+                return Err(StorageError::Transaction(
+                    TransactionError::InvalidTransaction,
+                ));
+            }
+            operation(&connection)
+        })
+        .await
+        .map_err(|error| {
+            StorageError::Transaction(TransactionError::RolledBack {
+                reason: format!("Transaction extension task failed: {error}"),
+            })
+        })?
     }
 
     /// Generate a new ID for a resource.
@@ -701,10 +756,14 @@ impl Transaction for SqliteTransaction {
 
 impl Drop for SqliteTransaction {
     fn drop(&mut self) {
-        // If transaction wasn't explicitly committed or rolled back, roll it back
         if self.active {
-            let conn = self.conn.lock();
-            let _ = conn.execute("ROLLBACK", []);
+            // Never wait on a blocking callback from the async worker. If it
+            // owns the mutex, its Arc retains the connection and the final
+            // TransactionConnection drop rolls back before returning it to
+            // the pool. No runtime is needed to schedule that cleanup.
+            if let Some(conn) = self.conn.try_lock() {
+                let _ = conn.execute("ROLLBACK", []);
+            }
         }
     }
 }
@@ -1054,6 +1113,135 @@ mod tests {
         // Verify resource does NOT exist (auto-rollback)
         let result = backend.read(&tenant, "Patient", "patient-1").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_extension_work_does_not_block_the_runtime_and_rolls_back() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let mut transaction = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        transaction
+            .create(
+                "Patient",
+                json!({"resourceType":"Patient","id":"extension-cancel"}),
+            )
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            transaction
+                .run_on_connection(move |connection| {
+                    connection
+                        .execute_batch("CREATE TABLE extension_cancel_proof(value INTEGER)")
+                        .unwrap();
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    connection
+                        .execute("INSERT INTO extension_cancel_proof VALUES (1)", [])
+                        .unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            Box::new(transaction).commit().await.unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The external watchdog releases the callback even if the old blocking
+        // Drop stalls this single-thread runtime. A passing test must signal
+        // runtime progress while the callback is still held, before release.
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let progressed = progress_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok();
+            release_tx.send(()).unwrap();
+            progressed
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = progress_tx.send(());
+        })
+        .await
+        .unwrap();
+        assert!(
+            watchdog.join().unwrap(),
+            "cancellation blocked unrelated runtime work"
+        );
+
+        // Acquiring a new write transaction also proves that deferred cleanup
+        // released the old write lock, not merely that another reader cannot
+        // see the uncommitted changes.
+        let mut proof = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            proof
+                .read("Patient", "extension-cancel")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let tables: i64 =
+            proof
+                .with_connection(|connection| {
+                    connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'extension_cancel_proof'",
+                [], |row| row.get(0),
+            ).map_err(|error| internal_error(error.to_string()))
+                })
+                .unwrap();
+        assert_eq!(
+            tables, 0,
+            "extension DDL and resource must roll back together"
+        );
+        Box::new(proof).rollback().await.unwrap();
+    }
+
+    #[test]
+    fn dropped_transaction_rolls_back_without_a_runtime() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let transaction = runtime.block_on(async {
+            let mut transaction = backend
+                .begin_transaction(&tenant, TransactionOptions::default())
+                .await
+                .unwrap();
+            transaction
+                .create(
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"no-runtime"}),
+                )
+                .await
+                .unwrap();
+            transaction
+        });
+        drop(runtime);
+        drop(transaction);
+        let connection = backend.get_connection().unwrap();
+        assert!(connection.is_autocommit());
+        let resources: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM resources WHERE id = 'no-runtime'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resources, 0);
     }
 
     #[tokio::test]

@@ -44,6 +44,7 @@ fn error_status(e: &HtsError) -> &'static str {
         HtsError::NotSupported(_) => "501",
         HtsError::InvalidRequest(_) | HtsError::VsInvalid(_) => "400",
         HtsError::Internal(_) | HtsError::StorageError(_) => "500",
+        HtsError::Conflict(_) => "409",
         HtsError::PreconditionFailed(_) => "412",
         HtsError::TooCostly(_) => "422",
     }
@@ -62,7 +63,7 @@ fn error_to_outcome(e: &HtsError) -> Value {
         HtsError::InvalidRequest(msg) | HtsError::VsInvalid(msg) => ("invalid", msg.as_str()),
         HtsError::Internal(msg) => ("exception", msg.as_str()),
         HtsError::StorageError(msg) => ("exception", msg.as_str()),
-        HtsError::PreconditionFailed(msg) => ("conflict", msg.as_str()),
+        HtsError::Conflict(msg) | HtsError::PreconditionFailed(msg) => ("conflict", msg.as_str()),
         HtsError::TooCostly(msg) => ("too-costly", msg.as_str()),
     };
     json!({

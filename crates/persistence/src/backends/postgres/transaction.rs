@@ -293,6 +293,18 @@ impl PostgresTransaction {
         self.client()
     }
 
+    /// Borrow the active connection for extension tables that must commit with
+    /// resource writes. Buffered creates are flushed before it is returned.
+    ///
+    /// Callers must not issue transaction-control statements or retain the
+    /// connection beyond this borrow. Roll back the transaction if extension
+    /// work fails; committing remains the responsibility of `Transaction`.
+    pub async fn transaction_client(&mut self) -> StorageResult<&Client> {
+        self.ensure_usable()?;
+        self.flush().await?;
+        self.client()
+    }
+
     /// Opens a savepoint around one unit of work whose failure must not take
     /// the transaction down with it — the bulk-submit batch ingest wraps each
     /// entry in one (#872).
@@ -450,8 +462,13 @@ impl PostgresTransaction {
 }
 
 impl PostgresBackend {
-    /// Begins a bulk-submit batch whose complete resource keys are known.
-    pub(super) async fn begin_planned_transaction(
+    /// Begin a READ COMMITTED transaction for a complete set of resource keys.
+    ///
+    /// Each key is `(resource_type, logical_id)`. The transaction takes the
+    /// tenant gate shared and locks these keys in a consistent order before
+    /// reading. Reads and writes outside the declared set are rejected. Callers
+    /// must choose IDs for creates before beginning this transaction.
+    pub async fn begin_planned_transaction(
         &self,
         tenant: &TenantContext,
         options: TransactionOptions,
@@ -1517,6 +1534,101 @@ mod reindex_groups_tests {
         .expect("backend");
         backend.init_schema().await.expect("schema");
         backend
+    }
+
+    #[tokio::test]
+    async fn transaction_client_flushes_buffered_writes_and_rolls_back_extensions() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("transaction-client-extension"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        transaction
+            .create(
+                "Patient",
+                json!({"resourceType":"Patient","id":"buffered-extension"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            transaction.pending.len(),
+            1,
+            "fixture must exercise buffered create"
+        );
+        let before: i64 = transaction
+            .client()
+            .unwrap()
+            .query_one(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND id = 'buffered-extension'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            before, 0,
+            "create must not reach SQL before the extension accessor"
+        );
+
+        let table = format!("extension_{}", uuid::Uuid::new_v4().simple());
+        let client = transaction.transaction_client().await.unwrap();
+        let visible = client
+            .query_one(
+                "SELECT (SELECT COUNT(*) FROM resources WHERE tenant_id = $1 \
+                 AND id = 'buffered-extension'),
+                    (SELECT COUNT(*) FROM resource_history WHERE tenant_id = $1 \
+                    AND id = 'buffered-extension')",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible.get::<_, i64>(0), 1);
+        assert_eq!(visible.get::<_, i64>(1), 1);
+        client
+            .batch_execute(&format!("CREATE TABLE {table}(resource_id TEXT NOT NULL)"))
+            .await
+            .unwrap();
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {table} SELECT id FROM resources WHERE tenant_id = $1 \
+                     AND id = 'buffered-extension'"
+                ),
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        let extension_rows: i64 = client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(extension_rows, 1);
+        assert!(transaction.pending.is_empty());
+        Box::new(transaction).rollback().await.unwrap();
+
+        let observer = backend.get_client().await.unwrap();
+        let remaining = observer
+            .query_one(
+                "SELECT (SELECT COUNT(*) FROM resources WHERE tenant_id = $1 \
+                 AND id = 'buffered-extension'),
+                    (SELECT COUNT(*) FROM resource_history WHERE tenant_id = $1 \
+                    AND id = 'buffered-extension'),
+                    to_regclass($2::text) IS NULL",
+                &[&tenant.tenant_id().as_str(), &table],
+            )
+            .await
+            .unwrap();
+        assert_eq!(remaining.get::<_, i64>(0), 0);
+        assert_eq!(remaining.get::<_, i64>(1), 0);
+        assert!(
+            remaining.get::<_, bool>(2),
+            "extension DDL must roll back with raw/history writes"
+        );
     }
 
     #[tokio::test]

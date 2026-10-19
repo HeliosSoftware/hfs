@@ -1,14 +1,14 @@
 //! Introspection trait for terminology backends.
 //!
-//! [`TerminologyMetadata`] exposes the static metadata used by the `/metadata`
-//! endpoint to build a FHIR `TerminologyCapabilities` resource.
+//! [`TerminologyMetadata`] exposes capability metadata and indexed identity
+//! reads for stored terminology resources.
 #![allow(dead_code)]
 
 /// Introspection trait for terminology backends.
 ///
-/// Returns static metadata used by the `/metadata` endpoint to build a
-/// `TerminologyCapabilities` resource.  All methods are synchronous because
-/// the metadata is expected to be available in memory.
+/// Supplies capability metadata and stored resource identities. Implementations
+/// may query their terminology store; these methods are not limited to in-memory
+/// metadata.
 pub trait TerminologyMetadata: Send + Sync {
     /// A short name identifying this backend (e.g. `"sqlite"`, `"postgres"`).
     fn backend_name(&self) -> &'static str;
@@ -25,10 +25,27 @@ pub trait TerminologyMetadata: Send + Sync {
 
     /// Return the canonical URL for a resource identified by its FHIR `id`.
     ///
-    /// `resource_type` must be one of `"ValueSet"` or `"ConceptMap"`.
+    /// `resource_type` must be `"CodeSystem"`, `"ValueSet"`, or `"ConceptMap"`.
     /// Returns [`None`] when no resource with that ID exists.
     ///
-    /// Used by instance-level operation handlers (e.g. `GET /ValueSet/{id}/$expand`)
-    /// to resolve the canonical URL before delegating to system-level logic.
+    /// Used where a canonical URL uniquely identifies the stored resource, such
+    /// as ConceptMap translation. Versioned instance operations must retain the
+    /// exact public identity instead.
     fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String>;
+
+    /// Read an imported terminology resource by its unique public identity.
+    /// Unlike canonical resolution, this selects exactly one business version.
+    fn resource_by_id(
+        &self,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, crate::error::HtsError>;
+
+    /// Read only identity and language metadata for an exact public ID.
+    /// Avoids hydrating a full CodeSystem merely to route an instance operation.
+    fn resource_identity_by_id(
+        &self,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<Option<crate::types::ResourceIdentity>, crate::error::HtsError>;
 }

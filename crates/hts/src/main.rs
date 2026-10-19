@@ -74,7 +74,6 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     // on the final post-import data rather than on stale data the bootstrap
     // sync is about to change.
     let backend = SqliteTerminologyBackend::new_without_fts_prebuild(&config.database_url)?;
-    let hts_pool = backend.pool().clone();
 
     bootstrap_sync_sqlite(&backend, &config).await?;
 
@@ -95,7 +94,6 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
 
     let state = AppState::new(backend)
         .with_resource_store(resource_store)
-        .with_hts_pool(hts_pool)
         .with_max_expansion_size(config.max_expansion_size);
 
     let app = helios_hts::server::create_app(&config, state);
@@ -135,7 +133,6 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
 #[cfg(feature = "postgres")]
 async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     use helios_persistence::backends::postgres::PostgresBackend;
-    use std::sync::Arc;
 
     let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
 
@@ -166,9 +163,8 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     info!("PostgreSQL resource store (helios-persistence) initialized");
 
-    let state = helios_hts::state::AppState::new(backend.clone())
+    let state = helios_hts::state::AppState::new(backend)
         .with_resource_store_pg(resource_store)
-        .with_terminology_importer(Arc::new(backend))
         .with_max_expansion_size(config.max_expansion_size);
 
     let app = helios_hts::server::create_app(&config, state);

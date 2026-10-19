@@ -1174,8 +1174,8 @@ async fn reimport_changed_display_refreshes_filtered_expand_pg() {
 ///
 /// The SQLite twin of this test lives in `operations/crud.rs`; this one exists
 /// because the eviction seam is generic over the backend and the PostgreSQL CRUD
-/// path reaches it through a different re-index route (the async importer rather
-/// than the `hts_pool` blocking path).
+/// path uses a PostgreSQL transaction for raw and normalized data instead of
+/// the SQLite transaction connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_value_set_evicts_the_expand_negative_cache() {
     let app = TestAppPg::new().await;

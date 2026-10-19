@@ -7,8 +7,8 @@
 //! * **Type-level** — `GET /CodeSystem/$lookup?system=<url>&code=<code>` /
 //!   `POST /CodeSystem/$lookup` with a FHIR `Parameters` body.
 //! * **Instance-level** — `GET /CodeSystem/{id}/$lookup?code=<code>` /
-//!   `POST /CodeSystem/{id}/$lookup` — resolves the canonical URL from the
-//!   resource `id`, then delegates to the same logic as the type-level endpoint.
+//!   `POST /CodeSystem/{id}/$lookup` — selects the exact stored resource
+//!   by `id`, then delegates to the same logic as the type-level endpoint.
 //!
 //! ## Response shape
 //!
@@ -37,7 +37,7 @@ use crate::state::{
     AppState, LOOKUP_HANDLER_CACHE_MAX, LookupHandlerCache, NOT_FOUND_CACHE_MAX, NotFoundCache,
 };
 use crate::traits::{SupplementInfo, TerminologyBackend};
-use crate::types::{DesignationValue, LookupRequest};
+use crate::types::{DesignationValue, LookupRequest, ResourceIdentity};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
@@ -139,11 +139,21 @@ fn lookup_not_found_put(cache: &NotFoundCache, key: String) {
 /// not found, 501 when `expression` is supplied).
 async fn process_lookup<B: TerminologyBackend>(
     state: &AppState<B>,
+    params: Vec<Value>,
+) -> Result<Value, HtsError> {
+    process_lookup_selected(state, params, None).await
+}
+
+async fn process_lookup_selected<B: TerminologyBackend>(
+    state: &AppState<B>,
     mut params: Vec<Value>,
+    instance: Option<&ResourceIdentity>,
 ) -> Result<Value, HtsError> {
     // `system=X|V` is looked up as `system=X` + `version=V` (#2122). Done
     // before the cache key so both spellings share one entry.
-    split_versioned_canonical(&mut params, "system", "version");
+    if instance.is_none() {
+        split_versioned_canonical(&mut params, "system", "version");
+    }
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips supplement resolution, the backend `lookup` call, the
     // `code_system_language` lookup, and FHIR Parameters assembly when the
@@ -152,7 +162,11 @@ async fn process_lookup<B: TerminologyBackend>(
     // `clear_expand_cache`. LK01-04 hot path: each of 2 000 distinct codes is
     // hit ~hundreds of times by 50 VUs over a 30 s run, so the warm-hit ratio
     // is overwhelmingly favourable.
-    let cache_key = build_lookup_cache_key(&params);
+    let cache_key = build_lookup_cache_key(&params).map(|key| {
+        // Keep exact unversioned instances separate from canonical/latest calls.
+        serde_json::to_string(&(instance.map(|selected| &selected.id), key))
+            .expect("lookup cache key contains only strings")
+    });
     if let Some(ref key) = cache_key {
         // ── Iter 7i: positive cache first, then negative cache ──────────
         // LK05's pool of nonexistent codes hits the same ~200 keys
@@ -174,7 +188,7 @@ async fn process_lookup<B: TerminologyBackend>(
             return Err(HtsError::NotFound(format!("Concept not found: {code}")));
         }
     }
-    let result = process_lookup_inner(state, params).await;
+    let result = process_lookup_inner(state, params, instance).await;
     match (&result, cache_key) {
         (Ok(value), Some(key)) => {
             lookup_cache_put(&state.lookup_handler_cache, key, Arc::new(value.clone()));
@@ -190,6 +204,7 @@ async fn process_lookup<B: TerminologyBackend>(
 async fn process_lookup_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
+    instance: Option<&ResourceIdentity>,
 ) -> Result<Value, HtsError> {
     let system = find_str_param(&params, "system")
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: system".into()))?;
@@ -198,6 +213,7 @@ async fn process_lookup_inner<B: TerminologyBackend>(
         .ok_or_else(|| HtsError::InvalidRequest("Missing required parameter: code".into()))?;
 
     let req = LookupRequest {
+        selected_code_system_id: instance.map(|selected| selected.id.clone()),
         system: system.clone(),
         code: code.clone(),
         version: find_str_param(&params, "version"),
@@ -242,12 +258,16 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     // the dominant cost on the LK01-04 hot path under 50-VU load. The
     // dedicated trait method runs ONE `json_extract` query and is memoised
     // in a process-wide cache.
-    let cs_language: Option<String> = state
-        .backend()
-        .code_system_language(&ctx, &system)
-        .await
-        .ok()
-        .flatten();
+    let cs_language = if let Some(selected) = instance {
+        selected.language.clone()
+    } else {
+        state
+            .backend()
+            .code_system_language(&ctx, &system)
+            .await
+            .ok()
+            .flatten()
+    };
     if let (Some(lang), Some(disp)) = (cs_language.as_deref(), resp.display.clone()) {
         let already = resp
             .designations
@@ -457,32 +477,27 @@ fn collect_supplement_inputs(params: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// Inject (or replace) the `system` parameter in a FHIR params list.
-///
-/// Used by the instance-level handlers (`/CodeSystem/{id}/$lookup`) to ensure
-/// the canonical URL resolved from the resource `id` always takes precedence
-/// over any `system` value the caller may have supplied.
-///
-/// ## Parameters
-/// - `params` — existing parameter list (may contain a `system` entry).
-/// - `system` — canonical URL resolved from the CodeSystem's logical `id`.
-///
-/// ## Returns
-/// A new params list with the resolved `system` prepended and any prior
-/// `system` entry removed.
-fn inject_system(mut params: Vec<Value>, system: String) -> Vec<Value> {
-    params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("system"));
-    let mut with_system = vec![json!({"name": "system", "valueUri": system})];
-    with_system.append(&mut params);
-    with_system
+/// Replace canonical selectors with the exact route-selected identity.
+fn inject_instance(mut params: Vec<Value>, instance: &ResourceIdentity) -> Vec<Value> {
+    // The route identifies the resource; a caller cannot redirect it by URL or
+    // version. In particular, no version on this row must not mean latest.
+    params.retain(|p| {
+        !matches!(
+            p.get("name").and_then(Value::as_str),
+            Some("system" | "version")
+        )
+    });
+    params.push(json!({"name": "system", "valueUri": instance.url}));
+    if let Some(version) = &instance.version {
+        params.push(json!({"name": "version", "valueString": version}));
+    }
+    params
 }
 
 /// `POST /CodeSystem/{id}/$lookup`
 ///
-/// Instance-level variant of `$lookup`.  Resolves the CodeSystem canonical URL
-/// from its FHIR logical `id`, injects it as the `system` parameter (overriding
-/// any caller-supplied value), and delegates to the same processing pipeline as
-/// the type-level endpoint.
+/// Selects the exact CodeSystem by logical `id`, overrides conflicting
+/// canonical selectors, and delegates to the shared lookup pipeline.
 ///
 /// Returns 404 when no CodeSystem with the given `id` is found.
 pub async fn lookup_by_id_post<B: TerminologyBackend>(
@@ -494,23 +509,26 @@ pub async fn lookup_by_id_post<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let system = state
+    let instance = state
         .backend()
-        .resource_url_by_id("CodeSystem", &id)
+        .resource_identity_by_id("CodeSystem", &id)?
         .ok_or_else(|| HtsError::NotFound(format!("CodeSystem/{id}")))?;
 
     let raw_params = body
         .and_then(|Json(v)| extract_parameter_array(&v).ok())
         .unwrap_or_default();
-    let mut params = inject_system(raw_params, system);
+    let mut params = inject_instance(raw_params, &instance);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(process_lookup(&state, params).await?, format))
+    Ok(fhir_respond(
+        process_lookup_selected(&state, params, Some(&instance)).await?,
+        format,
+    ))
 }
 
 /// `GET /CodeSystem/{id}/$lookup?code=<code>`
 ///
-/// Instance-level GET variant.  Resolves the CodeSystem canonical URL from its
-/// FHIR logical `id` and merges it with the query-string parameters before
+/// Instance-level GET variant.  Selects the exact CodeSystem by its FHIR logical `id`
+/// and merges its identity with the query-string parameters before
 /// dispatching to the shared lookup pipeline.
 ///
 /// Returns 404 when no CodeSystem with the given `id` is found.
@@ -522,16 +540,19 @@ pub async fn get_lookup_by_id<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let system = state
+    let instance = state
         .backend()
-        .resource_url_by_id("CodeSystem", &id)
+        .resource_identity_by_id("CodeSystem", &id)?
         .ok_or_else(|| HtsError::NotFound(format!("CodeSystem/{id}")))?;
 
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    let mut params = inject_system(params, system);
+    let mut params = inject_instance(params, &instance);
     crate::operations::expand::inject_accept_language(&headers, &mut params);
-    Ok(fhir_respond(process_lookup(&state, params).await?, format))
+    Ok(fhir_respond(
+        process_lookup_selected(&state, params, Some(&instance)).await?,
+        format,
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

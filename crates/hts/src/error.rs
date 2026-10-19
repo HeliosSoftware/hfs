@@ -15,6 +15,7 @@
 //! | [`VsInvalid`] | 400 | `invalid` | `vs-invalid` |
 //! | [`Internal`] | 500 | `exception` | `exception` |
 //! | [`StorageError`] | 500 | `exception` | `exception` |
+//! | [`Conflict`] | 409 | `conflict` | `conflict` |
 //! | [`PreconditionFailed`] | 412 | `conflict` | `conflict` |
 //! | [`TooCostly`] | 422 | `too-costly` | `too-costly` |
 //!
@@ -24,6 +25,7 @@
 //! [`VsInvalid`]: HtsError::VsInvalid
 //! [`Internal`]: HtsError::Internal
 //! [`StorageError`]: HtsError::StorageError
+//! [`Conflict`]: HtsError::Conflict
 //! [`PreconditionFailed`]: HtsError::PreconditionFailed
 //! [`TooCostly`]: HtsError::TooCostly
 
@@ -76,6 +78,11 @@ pub enum HtsError {
     /// A database or connection-pool error.  Maps to HTTP 500.
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    /// The selected resource changed while the mutation acquired its locks.
+    /// The caller may read the current resource and retry. Maps to HTTP 409.
+    #[error("Resource conflict: {0}")]
+    Conflict(String),
 
     /// An optimistic-concurrency conflict: the `If-Match` version does not
     /// match the stored version.  Maps to HTTP 412.
@@ -167,6 +174,7 @@ impl IntoResponse for HtsError {
                 "exception",
                 msg.as_str(),
             ),
+            HtsError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", "conflict", msg.as_str()),
             HtsError::PreconditionFailed(msg) => (
                 StatusCode::PRECONDITION_FAILED,
                 "conflict",

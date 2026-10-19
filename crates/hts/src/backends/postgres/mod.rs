@@ -7,6 +7,7 @@ pub mod schema;
 
 mod code_system;
 mod concept_map;
+pub(crate) mod resource_identity;
 mod value_set;
 
 use async_trait::async_trait;
@@ -193,6 +194,7 @@ async fn search_resources_in_transaction<C>(
 where
     C: GenericClient + Sync,
 {
+    // Read large JSON bodies only after string filtering and pagination.
     let metadata_sql = format!(
         "SELECT id, url, version, name, title, status
          FROM {table}
@@ -208,6 +210,8 @@ where
         .into_iter()
         .map(|row| ResourceSearchRow {
             id: row.get(0),
+            #[cfg(feature = "sqlite")]
+            public_id: None,
             url: row.get(1),
             version: row.get(2),
             name: row.get(3),
@@ -256,8 +260,11 @@ where
                     &row.status,
                 )
             });
-        // The table id is authoritative after URL-conflict upserts.
-        if let Some(object) = resource.as_object_mut() {
+        // CodeSystem and ValueSet JSON already contains the assigned public ID.
+        // ConceptMap continues to use its unchanged table identity.
+        if table == "concept_maps"
+            && let Some(object) = resource.as_object_mut()
+        {
             object.insert("id".to_owned(), serde_json::Value::String(row.id));
         }
         results.push(resource);
@@ -319,6 +326,8 @@ impl PostgresTerminologyBackend {
             schema::apply(&client).await.map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply HTS schema: {}", error_chain(&e)))
             })?;
+
+            resource_identity::migrate(&mut client).await?;
 
             // Backfill `concept_closure` for any system that has hierarchy edges
             // but no closure rows yet. Idempotent and per-system, so existing
@@ -462,6 +471,66 @@ fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
 // ── TerminologyMetadata ────────────────────────────────────────────────────────
 
 impl TerminologyMetadata for PostgresTerminologyBackend {
+    fn resource_identity_by_id(
+        &self,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<Option<crate::types::ResourceIdentity>, HtsError> {
+        let Some(kind) =
+            crate::backends::resource_identity::ResourceKind::from_resource_type(resource_type)
+        else {
+            return Ok(None);
+        };
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let client = self
+                    .pool
+                    .get()
+                    .await
+                    .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+                let row = client
+                    .query_opt(
+                        &format!(
+                            "SELECT url, version, resource_json->>'language' FROM {} WHERE {} = $1",
+                            kind.table(),
+                            kind.postgres_identity_expression()
+                        ),
+                        &[&id],
+                    )
+                    .await
+                    .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+                Ok(row.map(|row| crate::types::ResourceIdentity {
+                    id: id.to_owned(),
+                    url: row.get(0),
+                    version: row.get(1),
+                    language: row.get(2),
+                }))
+            })
+        })
+    }
+
+    fn resource_by_id(
+        &self,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, HtsError> {
+        let Some(kind) =
+            crate::backends::resource_identity::ResourceKind::from_resource_type(resource_type)
+        else {
+            return Ok(None);
+        };
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let client = self
+                    .pool
+                    .get()
+                    .await
+                    .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+                resource_identity::read(&client, kind, id).await
+            })
+        })
+    }
+
     fn backend_name(&self) -> &'static str {
         "postgres"
     }
@@ -492,51 +561,15 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
     }
 
     fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String> {
-        let pool = self.pool.clone();
-        let resource_type = resource_type.to_owned();
-        let id = id.to_owned();
+        let kind =
+            crate::backends::resource_identity::ResourceKind::from_resource_type(resource_type)?;
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = pool.get().await.ok()?;
-                match resource_type.as_str() {
-                    "CodeSystem" => {
-                        // Storage id may be the synthetic `<id>|<version>` form,
-                        // so first try a direct hit, then fall back to matching
-                        // the FHIR resource id captured in `resource_json` and
-                        // pick the latest version.
-                        if let Ok(rows) = client
-                            .query("SELECT url FROM code_systems WHERE id = $1", &[&id])
-                            .await
-                        {
-                            if let Some(row) = rows.into_iter().next() {
-                                return Some(row.get::<_, String>(0));
-                            }
-                        }
-                        let sql = format!(
-                            "SELECT url FROM code_systems \
-                             WHERE (resource_json->>'id') = $1 \
-                             ORDER BY {} LIMIT 1",
-                            crate::backends::cs_precedence_order_by("code_systems")
-                        );
-                        let rows = client.query(&sql, &[&id]).await.ok()?;
-                        rows.into_iter().next().map(|r| r.get::<_, String>(0))
-                    }
-                    "ValueSet" => {
-                        let rows = client
-                            .query("SELECT url FROM value_sets WHERE id = $1", &[&id])
-                            .await
-                            .ok()?;
-                        rows.into_iter().next().map(|r| r.get::<_, String>(0))
-                    }
-                    "ConceptMap" => {
-                        let rows = client
-                            .query("SELECT url FROM concept_maps WHERE id = $1", &[&id])
-                            .await
-                            .ok()?;
-                        rows.into_iter().next().map(|r| r.get::<_, String>(0))
-                    }
-                    _ => None,
-                }
+            tokio::runtime::Handle::current().block_on(async {
+                let client = self.pool.get().await.ok()?;
+                resource_identity::url(&client, kind, id)
+                    .await
+                    .ok()
+                    .flatten()
             })
         })
     }
@@ -618,14 +651,46 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             systems_needing_closure.push((cs.url.clone(), cs.version.clone()));
         }
 
-        let tx = client.transaction().await.map_err(|e| {
-            HtsError::StorageError(format!("Begin transaction: {}", error_chain(&e)))
-        })?;
+        // Ownership reads after an advisory-lock wait must see its previous
+        // holder's commit even when the server defaults to REPEATABLE READ.
+        let tx = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await
+            .map_err(|e| {
+                HtsError::StorageError(format!("Begin transaction: {}", error_chain(&e)))
+            })?;
+
+        resource_identity::lock_import(&tx, &parsed).await?;
+        let has_resources: bool = tx
+            .query_one("SELECT to_regclass('resources') IS NOT NULL", &[])
+            .await
+            .map_err(|error| HtsError::StorageError(error_chain(&error)))?
+            .get(0);
 
         let mut stats = ImportStats::default();
         stats.errors.extend(parsed.parse_errors.iter().cloned());
 
         for cs in &parsed.code_systems {
+            if has_resources {
+                if let Err(error) = resource_identity::check_import_owner(
+                    &tx,
+                    crate::backends::resource_identity::ResourceKind::CodeSystem,
+                    &cs.id,
+                    &cs.url,
+                    cs.version.as_deref(),
+                )
+                .await
+                {
+                    stats
+                        .errors
+                        .push(format!("CodeSystem '{}' import failed: {error}", cs.url));
+                    systems_needing_closure
+                        .retain(|(url, version)| url != &cs.url || version != &cs.version);
+                    continue;
+                }
+            }
             if let Err(e) = write_code_system(&tx, cs, &mut stats, parsed.fresh_load).await {
                 stats
                     .errors
@@ -633,6 +698,22 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             }
         }
         for vs in &parsed.value_sets {
+            if has_resources {
+                if let Err(error) = resource_identity::check_import_owner(
+                    &tx,
+                    crate::backends::resource_identity::ResourceKind::ValueSet,
+                    &vs.id,
+                    &vs.url,
+                    vs.version.as_deref(),
+                )
+                .await
+                {
+                    stats
+                        .errors
+                        .push(format!("ValueSet '{}' import failed: {error}", vs.url));
+                    continue;
+                }
+            }
             if let Err(e) = write_value_set(&tx, vs, &mut stats).await {
                 stats
                     .errors
@@ -640,6 +721,22 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             }
         }
         for cm in &parsed.concept_maps {
+            if has_resources {
+                if let Err(error) = resource_identity::check_import_owner(
+                    &tx,
+                    crate::backends::resource_identity::ResourceKind::ConceptMap,
+                    &cm.id,
+                    &cm.url,
+                    cm.version.as_deref(),
+                )
+                .await
+                {
+                    stats
+                        .errors
+                        .push(format!("ConceptMap '{}' import failed: {error}", cm.url));
+                    continue;
+                }
+            }
             if let Err(e) = write_concept_map(&tx, cm, &mut stats).await {
                 stats
                     .errors
@@ -717,15 +814,6 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         Ok(row.get(0))
     }
 
-    /// Delete all HTS normalized rows for the resource identified by `resource_url`.
-    ///
-    /// For CodeSystem: purges expansion cache entries that include codes from
-    /// this system, then deletes the code_system row (FK CASCADE handles
-    /// concepts, hierarchy, properties, designations).
-    ///
-    /// For ValueSet: deletes the value_set row (FK CASCADE handles expansions).
-    ///
-    /// For ConceptMap: deletes the concept_map row (FK CASCADE handles elements).
     async fn delete_normalized(
         &self,
         resource_type: &str,
@@ -741,13 +829,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             "CodeSystem" => {
                 // Invalidate any cached ValueSet expansions that include codes
                 // from this system (not covered by FK cascade).
-                client
-                    .execute(
-                        "DELETE FROM value_set_expansions WHERE system_url = $1",
-                        &[&resource_url],
-                    )
-                    .await
-                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+                invalidate_expansion_cache_for_system(&client, resource_url).await?;
                 // Delete the system row; ON DELETE CASCADE removes concepts,
                 // concept_hierarchy, concept_properties, concept_designations.
                 client
@@ -780,7 +862,167 @@ impl BundleImportBackend for PostgresTerminologyBackend {
     }
 }
 
+/// Strict normalized replacement inside the active persistence transaction.
+pub(crate) async fn write_resource_in_transaction(
+    client: &deadpool_postgres::Client,
+    resource_type: &str,
+    content: &serde_json::Value,
+    replace_id: Option<&str>,
+) -> Result<(), HtsError> {
+    let parsed = crate::import::parse_crud_resource(resource_type, content)?;
+    let kind = crate::backends::resource_identity::ResourceKind::from_resource_type(resource_type)
+        .ok_or_else(|| {
+            HtsError::InvalidRequest(format!("Unsupported resource type: {resource_type}"))
+        })?;
+    let id = content["id"]
+        .as_str()
+        .ok_or_else(|| HtsError::InvalidRequest("Resource id is required".into()))?;
+    // The CRUD adapter acquired all old/new identity locks before raw writes.
+    let version_column = if matches!(
+        kind,
+        crate::backends::resource_identity::ResourceKind::ConceptMap
+    ) {
+        "''"
+    } else {
+        "version"
+    };
+    let canonical_version = if matches!(
+        kind,
+        crate::backends::resource_identity::ResourceKind::ConceptMap
+    ) {
+        None
+    } else {
+        content.get("version").and_then(serde_json::Value::as_str)
+    };
+    let owner = client
+        .query_opt(
+            &format!(
+                "SELECT {} FROM {} WHERE url = $1 AND COALESCE({version_column}, '') = \
+                 COALESCE($2, '')",
+                kind.postgres_identity_expression(),
+                kind.table()
+            ),
+            &[&content["url"].as_str(), &canonical_version],
+        )
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    if owner.is_some_and(|row| row.get::<_, String>(0) != id) {
+        return Err(HtsError::InvalidRequest(
+            "Canonical URL and version already belong to another resource id".into(),
+        ));
+    }
+    let public_owner = client
+        .query_opt(
+            &format!(
+                "SELECT url, version FROM {} WHERE {} = $1",
+                kind.table(),
+                kind.postgres_identity_expression()
+            ),
+            &[&id],
+        )
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    if replace_id.is_none() && public_owner.is_some() {
+        return Err(HtsError::InvalidRequest(
+            "Resource id already identifies an imported resource".into(),
+        ));
+    }
+    if let Some(id) = replace_id {
+        delete_resource_in_transaction(client, kind, id).await?;
+    }
+    let mut stats = ImportStats::default();
+    for cs in &parsed.code_systems {
+        write_code_system(client, cs, &mut stats, false).await?;
+        let row = client
+            .query_one(
+                "SELECT id FROM code_systems WHERE url = $1 AND \
+                 COALESCE(version, '') = COALESCE($2, '')",
+                &[&cs.url, &cs.version],
+            )
+            .await
+            .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+        let sid: String = row.get(0);
+        schema::build_concept_closure_in_transaction(&***client, &sid)
+            .await
+            .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    }
+    for vs in &parsed.value_sets {
+        write_value_set(client, vs, &mut stats).await?;
+    }
+    for cm in &parsed.concept_maps {
+        write_concept_map(client, cm, &mut stats).await?;
+    }
+    let assigned: String = client
+        .query_one(
+            &format!(
+                "SELECT {} FROM {} WHERE url = $1 AND COALESCE({version_column}, '') = \
+                 COALESCE($2, '')",
+                kind.postgres_identity_expression(),
+                kind.table()
+            ),
+            &[&content["url"].as_str(), &canonical_version],
+        )
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?
+        .get(0);
+    if assigned != id {
+        return Err(HtsError::InvalidRequest(
+            "Resource id is reserved by another terminology resource".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Exact public-ID deletion with all derived rows in the same transaction.
+pub(crate) async fn delete_resource_in_transaction(
+    client: &impl GenericClient,
+    kind: crate::backends::resource_identity::ResourceKind,
+    id: &str,
+) -> Result<(), HtsError> {
+    // Delete the parent first, matching schema and import lock order.
+    // RETURNING also avoids a separate read and a later lock upgrade.
+    let deleted = client
+        .query_opt(
+            &format!(
+                "DELETE FROM {} WHERE {} = $1 RETURNING url",
+                kind.table(),
+                kind.postgres_identity_expression()
+            ),
+            &[&id],
+        )
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    if let Some(row) = deleted
+        && matches!(
+            kind,
+            crate::backends::resource_identity::ResourceKind::CodeSystem
+        )
+    {
+        let url: String = row.get(0);
+        invalidate_expansion_cache_for_system(client, &url).await?;
+    }
+    Ok(())
+}
+
 // ── PostgreSQL write helpers ───────────────────────────────────────────────────
+
+/// Invalidate complete expansions containing this CodeSystem's concepts.
+/// A remaining row would otherwise mark a partial expansion as fully cached.
+async fn invalidate_expansion_cache_for_system(
+    client: &impl GenericClient,
+    system_url: &str,
+) -> Result<(), HtsError> {
+    client
+        .execute(
+            "DELETE FROM value_set_expansions WHERE value_set_id IN (
+                 SELECT value_set_id FROM value_set_expansions WHERE system_url = $1
+             )",
+            &[&system_url],
+        )
+        .await
+        .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+    Ok(())
+}
 
 fn utc_now() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -796,7 +1038,6 @@ async fn write_code_system(
     // See [`crate::import::bundle_parser::ParsedBundle::fresh_load`].
     skip_child_delete: bool,
 ) -> Result<(), HtsError> {
-    let resource_json = Some(cs.resource_json.clone());
     let now = utc_now();
 
     // Synthetic storage id encodes the version so multiple versions of the
@@ -823,7 +1064,8 @@ async fn write_code_system(
     } else {
         let preferred_taken: bool = client
             .query_one(
-                "SELECT EXISTS(SELECT 1 FROM code_systems WHERE id = $1)",
+                "SELECT EXISTS(SELECT 1 FROM code_systems WHERE id = $1 OR \
+                 COALESCE(resource_json->>'id', id) = $1)",
                 &[&preferred_id],
             )
             .await
@@ -835,6 +1077,19 @@ async fn write_code_system(
             preferred_id
         }
     };
+
+    let public_id = crate::backends::postgres::resource_identity::allocate(
+        client,
+        crate::backends::resource_identity::ResourceKind::CodeSystem,
+        &storage_id,
+        &cs.id,
+        &cs.url,
+        cs.version.as_deref(),
+    )
+    .await?;
+    let mut stored_resource = cs.resource_json.clone();
+    stored_resource["id"] = serde_json::Value::String(public_id);
+    let resource_json = Some(stored_resource);
 
     // Upsert keyed on (url, version). The composite UNIQUE index
     // `idx_code_systems_url_version` is the conflict arbiter; the legacy
@@ -1040,6 +1295,7 @@ async fn write_code_system(
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
+    invalidate_expansion_cache_for_system(client, &cs.url).await?;
     stats.code_systems += 1;
     Ok(())
 }
@@ -1067,7 +1323,6 @@ async fn write_value_set(
     vs: &ParsedValueSet,
     stats: &mut ImportStats,
 ) -> Result<(), HtsError> {
-    let resource_json = Some(vs.resource_json.clone());
     let now = utc_now();
 
     // Invalidate expansion cache on re-import.
@@ -1112,7 +1367,8 @@ async fn write_value_set(
     } else {
         let preferred_taken: bool = client
             .query_one(
-                "SELECT EXISTS(SELECT 1 FROM value_sets WHERE id = $1)",
+                "SELECT EXISTS(SELECT 1 FROM value_sets WHERE id = $1 OR \
+                 COALESCE(resource_json->>'id', id) = $1)",
                 &[&preferred_id],
             )
             .await
@@ -1124,6 +1380,19 @@ async fn write_value_set(
             preferred_id
         }
     };
+
+    let public_id = crate::backends::postgres::resource_identity::allocate(
+        client,
+        crate::backends::resource_identity::ResourceKind::ValueSet,
+        &storage_id,
+        &vs.id,
+        &vs.url,
+        vs.version.as_deref(),
+    )
+    .await?;
+    let mut stored_resource = vs.resource_json.clone();
+    stored_resource["id"] = serde_json::Value::String(public_id);
+    let resource_json = Some(stored_resource);
 
     client
         .execute(
