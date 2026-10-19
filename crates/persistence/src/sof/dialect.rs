@@ -403,7 +403,7 @@ impl Dialect for PgDialect {
     fn last_path_segment(&self, s: &str) -> String {
         // Everything after the last `/` (the whole string when there is none).
         // `split_part` with a negative position counts from the end (PG 14+,
-        // the minimum HFS supports) and is ~3x cheaper per row than the
+        // the minimum HFS supports) and is cheaper (no regex engine) than the
         // equivalent `regexp_replace({s}, '.*/', '')`, which returns the same
         // text for every input, NULL and the empty string included.
         format!("split_part({s}, '/', -1)")
