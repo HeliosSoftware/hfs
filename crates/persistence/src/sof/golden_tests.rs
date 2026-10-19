@@ -396,3 +396,45 @@ async fn sqlite_complete_sql_and_bindings() {
 async fn postgres_complete_sql_and_bindings() {
     check(SqlDialect::Postgres, "postgres").await;
 }
+
+/// Every SQLite JSON function or operator must read the root document through
+/// the TEXT cast (`CAST(r.data AS TEXT)`), never the bare `r.data` BLOB, so
+/// SQLite parses the document once per row instead of once per call.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_goldens_never_pass_bare_root_to_json() {
+    let bare =
+        regex::Regex::new(r"json_(extract|each|type)\(\s*r\.data\b|\(?r\.data\s*->").unwrap();
+    assert!(bare.is_match("json_extract(r.data, '$.id')"));
+    assert!(bare.is_match("json_each( r.data, '$.name')"));
+    assert!(bare.is_match("json_type(r.data, '$.name')"));
+    assert!(bare.is_match("(r.data ->> '$.id')"));
+    assert!(!bare.is_match("json_extract(CAST(r.data AS TEXT), '$.id')"));
+
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/sof");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&directory).unwrap() {
+        let path = entry.unwrap().path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".sqlite.sql"))
+        {
+            continue;
+        }
+        let sql = std::fs::read_to_string(&path).unwrap();
+        if let Some(found) = bare.find(&sql) {
+            panic!(
+                "{} passes a bare r.data to JSON: {}",
+                path.display(),
+                found.as_str()
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no sqlite goldens found in {}",
+        directory.display()
+    );
+}
