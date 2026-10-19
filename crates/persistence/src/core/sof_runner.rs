@@ -418,6 +418,20 @@ pub trait SofRunner: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    use super::*;
+
+    /// Creates a row channel and its `ReceiverStream` wrapper, mirroring the
+    /// buffer size and stream construction every real runner uses.
+    fn channel() -> (RowSender, RowStream) {
+        let (tx, rx) = mpsc::channel(8);
+        (tx, Box::pin(ReceiverStream::new(rx)))
+    }
 
     #[tokio::test]
     async fn batched_rows_keep_order_and_partial_batch_precedes_error() {
@@ -448,20 +462,6 @@ mod tests {
             alive = b.push(json!({"n": i})).await;
         }
         assert!(!alive);
-    }
-    use std::time::Duration;
-
-    use serde_json::json;
-    use tokio_stream::StreamExt;
-    use tokio_stream::wrappers::ReceiverStream;
-
-    use super::*;
-
-    /// Creates a row channel and its `ReceiverStream` wrapper, mirroring the
-    /// buffer size and stream construction every real runner uses.
-    fn channel() -> (RowSender, RowStream) {
-        let (tx, rx) = mpsc::channel(8);
-        (tx, Box::pin(ReceiverStream::new(rx)))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

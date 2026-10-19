@@ -1634,6 +1634,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn streaming_ndjson_flushes_pending_rows_when_next_row_is_not_ready() {
+        let (row_tx, row_rx) = tokio::sync::mpsc::channel::<Result<Value, SofError>>(4);
+        let stream: RowStream = Box::pin(futures::stream::unfold(row_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }));
+        let response = streaming_ndjson_response(stream, None);
+        let mut body = response.into_body().into_data_stream();
+        row_tx.send(Ok(json!({ "a": 1 }))).await.unwrap();
+        // The producer is idle, so the first row must arrive without waiting
+        // for the chunk to fill or the stream to end.
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::StreamExt::next(&mut body),
+        )
+        .await
+        .expect("first row was held back")
+        .unwrap()
+        .unwrap();
+        assert_eq!(&first[..], b"{\"a\":1}\n");
+    }
+
     fn typed_view() -> Value {
         json!({
             "resourceType": "ViewDefinition",
