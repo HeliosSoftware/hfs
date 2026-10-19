@@ -1064,12 +1064,6 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             )
         })?;
 
-        if let Some(resp) = crate::bcp13::validate_mimetypes_code(&url, &req)
-            .filter(|_| req.selected_value_set_id.is_none())
-        {
-            return Ok(resp);
-        }
-
         // TODO: cache — port the per-instance response cache from SQLite
         // (validate_code_response_cache). The SQLite cache key folds in
         //   url, value_set_version, system, code, version, display,
@@ -1118,6 +1112,23 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         let (all_codes, compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
             match resolution {
                 Ok((vs_id, compose_json)) => {
+                    if let Some(response) = crate::bcp13::validate_stored_mimetypes_code(
+                        &url,
+                        compose_json.as_deref(),
+                        &req,
+                    ) {
+                        let bcp13_loaded: bool = client
+                            .query_one(
+                                "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
+                                &[&crate::bcp13::BCP13_SYSTEM],
+                            )
+                            .await
+                            .map_err(|error| HtsError::StorageError(error_chain(&error)))?
+                            .get(0);
+                        if !bcp13_loaded {
+                            return Ok(response);
+                        }
+                    }
                     let saved = compose_json.clone();
                     // Bypass the value_set_expansions cache when the compose
                     // describes a multi-version overload (see expand path for
@@ -1190,7 +1201,22 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     };
                     (codes, saved)
                 }
-                Err(HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
+                Err(error @ HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
+                    // A version or date miss must not bypass a stored definition.
+                    if let Some(response) = crate::bcp13::validate_mimetypes_code(&url, &req) {
+                        let has_stored_definition: bool = client
+                            .query_one(
+                                "SELECT EXISTS(SELECT 1 FROM value_sets WHERE url = $1)",
+                                &[&url],
+                            )
+                            .await
+                            .map_err(|error| HtsError::StorageError(error_chain(&error)))?
+                            .get(0);
+                        if has_stored_definition {
+                            return Err(error);
+                        }
+                        return Ok(response);
+                    }
                     // ?fhir_vs implicit ValueSet: targeted O(1)/O(depth) lookup.
                     if let Some((cs_url, pattern)) = parse_fhir_vs_url(&url) {
                         let found = validate_fhir_vs(

@@ -370,3 +370,294 @@ async fn postgres_operations_preserve_exact_instance_identity() {
     ))
     .await;
 }
+
+const MIME_VS: &str = "http://hl7.org/fhir/ValueSet/mimetypes";
+const BCP13: &str = "urn:ietf:bcp:13";
+
+fn mime_value_set(id: &str, version: Option<&str>, compose: Value) -> Value {
+    let mut resource = json!({
+        "resourceType": "ValueSet", "id": id, "url": MIME_VS,
+        "status": "active", "date": "2020-01-01", "compose": compose
+    });
+    if let Some(version) = version {
+        resource["version"] = json!(version);
+    }
+    resource
+}
+
+async fn stored_mime_instance_contract(app: InstanceApp) {
+    // A genuinely unstored canonical MIME ValueSet retains syntax validation.
+    for (code, expected) in [("text/cql", true), ("not-a-mime", false)] {
+        let (status, body) = app
+            .get(&query(
+                "/ValueSet/$validate-code",
+                &[("url", MIME_VS), ("system", BCP13), ("code", code)],
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_valid(&body, expected);
+    }
+
+    let unrestricted = json!({"include": [{"system": BCP13}]});
+    let annotated = json!({
+        "id": "mime-compose", "inactive": false, "exclude": [],
+        "extension": [{"url": "http://example.org/source-note", "valueString": "Core MIME types"}],
+        "include": [{
+            "id": "all-mime-types", "system": BCP13,
+            "extension": [{"url": "http://example.org/source-note", "valueString": "Whole system"}]
+        }]
+    });
+    let restricted = json!({"include": [{
+        "system": BCP13, "concept": [{"code": "application/json"}]
+    }]});
+    let excluded = json!({
+        "include": [{"system": BCP13}],
+        "exclude": [{"system": BCP13, "concept": [{"code": "text/cql"}]}]
+    });
+    // No CodeSystem is imported: the unrestricted MIME definition must use
+    // syntax validation, without treating restricted siblings as unrestricted.
+    app.import(vec![
+        mime_value_set("mime-unversioned", None, annotated),
+        mime_value_set("mime-old", Some("1.0.0"), unrestricted.clone()),
+        mime_value_set("mime-restricted", Some("2.0.0"), restricted),
+        mime_value_set("mime-excluded", Some("3.0.0"), excluded.clone()),
+    ])
+    .await;
+
+    // Canonical requests follow the stored definition they select, so they
+    // agree with the instance requests below.
+    for (version, code, expected) in [
+        ("1.0.0", "text/cql", true),
+        ("1.0.0", "not-a-mime", false),
+        ("2.0.0", "text/cql", false),
+        ("3.0.0", "text/cql", false),
+    ] {
+        let piped_url = format!("{MIME_VS}|{version}");
+        for mut params in [
+            vec![("url", MIME_VS), ("valueSetVersion", version)],
+            vec![("url", piped_url.as_str())],
+        ] {
+            params.extend([("system", BCP13), ("code", code)]);
+            let (status, body) = app.get(&query("/ValueSet/$validate-code", &params)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_valid(&body, expected);
+        }
+    }
+
+    let (status, body) = app
+        .get("/ValueSet/mime-unversioned/$validate-code?code=text%2Fcql")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_valid(&body, true);
+
+    // Presentation metadata and a date that includes the selected definition
+    // do not turn a valid MIME code into a missing member.
+    let (status, body) = app
+        .get(&query(
+            "/ValueSet/mime-unversioned/$validate-code",
+            &[
+                ("system", BCP13),
+                ("code", "text/cql"),
+                ("display", "Clinical Quality Language"),
+                ("date", "2021-01-01"),
+            ],
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_valid(&body, true);
+    let (status, body) = app
+        .get(&query(
+            "/ValueSet/mime-unversioned/$validate-code",
+            &[
+                ("system", BCP13),
+                ("code", "text/cql"),
+                ("date", "2019-01-01"),
+            ],
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // A stored canonical definition must not become a synthetic ValueSet when
+    // its requested date or business version cannot be resolved.
+    for (version, date) in [("1.0.0", Some("2019-01-01")), ("missing-version", None)] {
+        let piped_url = format!("{MIME_VS}|{version}");
+        for mut params in [
+            vec![("url", MIME_VS), ("valueSetVersion", version)],
+            vec![("url", piped_url.as_str())],
+        ] {
+            params.extend([("system", BCP13), ("code", "text/cql")]);
+            if let Some(date) = date {
+                params.push(("date", date));
+            }
+            let (status, body) = app.get(&query("/ValueSet/$validate-code", &params)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(body["resourceType"], "OperationOutcome", "{body}");
+            assert!(
+                body["issue"][0]["diagnostics"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&piped_url),
+                "the selected canonical must remain in the resolver error: {body}"
+            );
+        }
+    }
+
+    // An explicit version overrides a piped version on canonical requests;
+    // neither caller-supplied selector may override the instance identity.
+    let piped_old = format!("{MIME_VS}|1.0.0");
+    for (path, expected) in [
+        ("/ValueSet/$validate-code", false),
+        ("/ValueSet/mime-old/$validate-code", true),
+    ] {
+        let (status, body) = app
+            .get(&query(
+                path,
+                &[
+                    ("url", piped_old.as_str()),
+                    ("valueSetVersion", "2.0.0"),
+                    ("system", BCP13),
+                    ("code", "text/cql"),
+                ],
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_valid(&body, expected);
+    }
+    let (status, body) = app
+        .post(
+            "/ValueSet/$validate-code",
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "url", "valueUri": piped_old},
+                {"name": "valueSetVersion", "valueString": "2.0.0"},
+                {"name": "system", "valueUri": BCP13},
+                {"name": "code", "valueCode": "text/cql"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_valid(&body, false);
+
+    // Alternating exact identities must not share cached membership decisions.
+    for _ in 0..2 {
+        for (id, expected) in [
+            ("mime-unversioned", true),
+            ("mime-restricted", false),
+            ("mime-old", true),
+            ("mime-excluded", false),
+        ] {
+            let (status, body) = app
+                .get(&query(
+                    &format!("/ValueSet/{id}/$validate-code"),
+                    &[
+                        ("system", BCP13),
+                        ("code", "text/cql"),
+                        ("url", "http://example.org/wrong-valueset"),
+                        ("valueSetVersion", "1.0.0"),
+                    ],
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_valid(&body, expected);
+        }
+    }
+    for id in ["mime-unversioned", "mime-old"] {
+        let (status, body) = app
+            .get(&query(
+                &format!("/ValueSet/{id}/$validate-code"),
+                &[("system", BCP13), ("code", "not-a-mime")],
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_valid(&body, false);
+    }
+
+    // Caller-supplied definitions and version pins cannot replace the instance,
+    // in either direction: a restricted body cannot narrow the selected all-MIME
+    // definition, and an all-MIME body cannot widen the selected restricted one.
+    for (id, expected, conflicting_compose, conflicting_version) in [
+        ("mime-old", true, &excluded, "3.0.0"),
+        ("mime-restricted", false, &unrestricted, "1.0.0"),
+    ] {
+        for coding in [
+            vec![
+                json!({"name": "system", "valueUri": BCP13}),
+                json!({"name": "code", "valueCode": "text/cql"}),
+            ],
+            vec![json!({
+                "name": "coding", "valueCoding": {"system": BCP13, "code": "text/cql"}
+            })],
+            vec![json!({
+                "name": "codeableConcept",
+                "valueCodeableConcept": {"coding": [{"system": BCP13, "code": "text/cql"}]}
+            })],
+        ] {
+            let mut params = coding;
+            params.extend([
+                json!({"name": "url", "valueUri": "http://example.org/wrong-valueset"}),
+                json!({"name": "valueSetVersion", "valueString": conflicting_version}),
+                json!({
+                    "name": "valueSet", "resource": mime_value_set(
+                        "caller-supplied", Some(conflicting_version), conflicting_compose.clone()
+                    )
+                }),
+                json!({
+                    "name": "default-valueset-version",
+                    "valueCanonical": format!("{MIME_VS}|{conflicting_version}")
+                }),
+            ]);
+            let (status, body) = app
+                .post(
+                    &format!("/ValueSet/{id}/$validate-code"),
+                    json!({"resourceType": "Parameters", "parameter": params}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_valid(&body, expected);
+        }
+    }
+
+    // Once a local definition exists, its membership is authoritative for
+    // canonical and instance requests. The earlier successful syntax-only
+    // responses must not survive this import.
+    app.import(vec![json!({
+        "resourceType": "CodeSystem", "id": "loaded-bcp13", "url": BCP13,
+        "status": "active", "content": "complete",
+        "concept": [{"code": "application/json", "display": "JSON"}]
+    })])
+    .await;
+    for (code, expected) in [("text/cql", false), ("application/json", true)] {
+        let (status, body) = app
+            .get(&query(
+                "/ValueSet/mime-old/$validate-code",
+                &[("system", BCP13), ("code", code)],
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_valid(&body, expected);
+        let piped_url = format!("{MIME_VS}|1.0.0");
+        for mut params in [
+            vec![("url", MIME_VS), ("valueSetVersion", "1.0.0")],
+            vec![("url", piped_url.as_str())],
+        ] {
+            params.extend([("system", BCP13), ("code", code)]);
+            let (status, body) = app.get(&query("/ValueSet/$validate-code", &params)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_valid(&body, expected);
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_stored_mime_validation_preserves_selected_definition() {
+    stored_mime_instance_contract(InstanceApp::Sqlite(common::TestApp::new())).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_stored_mime_validation_preserves_selected_definition() {
+    stored_mime_instance_contract(InstanceApp::Postgres(
+        common::TestAppPg::new_isolated().await,
+    ))
+    .await;
+}

@@ -1385,12 +1385,6 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-            if req.selected_value_set_id.is_none()
-                && let Some(resp) = crate::bcp13::validate_mimetypes_code(&url, &req)
-            {
-                return Ok(resp);
-            }
-
             let selected_vs_version = if let Some(id) = req.selected_value_set_id.as_deref() {
                 conn.query_row(
                     "SELECT version FROM value_sets WHERE \
@@ -1431,6 +1425,22 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let (all_codes, compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
                 match resolution {
                     Ok((vs_id, compose_json)) => {
+                        if let Some(response) = crate::bcp13::validate_stored_mimetypes_code(
+                            &url,
+                            compose_json.as_deref(),
+                            &req,
+                        ) {
+                            let bcp13_loaded: bool = conn
+                                .query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = ?1)",
+                                    [crate::bcp13::BCP13_SYSTEM],
+                                    |row| row.get(0),
+                                )
+                                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+                            if !bcp13_loaded {
+                                return Ok(response);
+                            }
+                        }
                         let saved = compose_json.clone();
                         // Bypass the `value_set_expansions` cache when the
                         // compose describes a multi-version overload — the
@@ -1490,7 +1500,21 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         };
                         (codes, saved)
                     }
-                    Err(HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
+                    Err(error @ HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
+                        // A version or date miss must not bypass a stored definition.
+                        if let Some(response) = crate::bcp13::validate_mimetypes_code(&url, &req) {
+                            let has_stored_definition: bool = conn
+                                .query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM value_sets WHERE url = ?1)",
+                                    [&url],
+                                    |row| row.get(0),
+                                )
+                                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+                            if has_stored_definition {
+                                return Err(error);
+                            }
+                            return Ok(response);
+                        }
                         // ?fhir_vs implicit ValueSet: do a targeted O(1)/O(depth) lookup
                         // instead of materializing all concepts (which times out for large
                         // code systems like SNOMED CT with ~350k concepts).
