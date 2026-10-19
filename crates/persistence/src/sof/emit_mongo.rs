@@ -495,23 +495,49 @@ fn root_ref(root: &str, ctx: &Ctx) -> Result<Bson, SofError> {
     Err(uncompilable(format!("unsupported value root '{root}'")))
 }
 
+/// A bare field or variable reference (`"$data"`, `"$__fe0"`, `"$$v_w0"`) or a
+/// `$literal`: cheap to evaluate again, so it is never bound with `$let`.
+fn is_cheap(v: &Bson) -> bool {
+    match v {
+        Bson::String(s) => s.starts_with('$'),
+        Bson::Document(d) => d.len() == 1 && d.contains_key("$literal"),
+        Bson::Null | Bson::Boolean(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => true,
+        _ => false,
+    }
+}
+
+/// Evaluates `value` once: MongoDB does not share common subexpressions, so an
+/// operand used more than once by `build` is bound with `$let` to `var` and
+/// `build` receives the `$$var` reference. Cheap operands pass through. `var`
+/// must start with a lowercase letter and differ from the emitter's own
+/// variables (`this`, `value`, `ns`, `obj`, `j`, `c`, `sf`, `v_<alias>`).
+fn bind_once(value: Bson, var: &str, build: impl FnOnce(Bson) -> Bson) -> Bson {
+    if is_cheap(&value) {
+        return build(value);
+    }
+    let body = build(Bson::String(format!("$${var}")));
+    doc! { "$let": { "vars": { var: value }, "in": body } }.into()
+}
+
 /// Coerces a value to an array: arrays pass through, null/missing → `[]`, and a
 /// scalar → a one-element array (the FHIRPath scalar-as-singleton model).
 fn ensure_array(v: Bson) -> Bson {
-    doc! {
-        "$cond": [
-            doc! { "$isArray": v.clone() },
-            v.clone(),
-            doc! {
-                "$cond": [
-                    doc! { "$eq": [doc! { "$ifNull": [v.clone(), Bson::Null] }, Bson::Null] },
-                    Bson::Array(Vec::new()),
-                    [v],
-                ]
-            },
-        ]
-    }
-    .into()
+    bind_once(v, "cse_arr", |v| {
+        doc! {
+            "$cond": [
+                doc! { "$isArray": v.clone() },
+                v.clone(),
+                doc! {
+                    "$cond": [
+                        doc! { "$eq": [doc! { "$ifNull": [v.clone(), Bson::Null] }, Bson::Null] },
+                        Bson::Array(Vec::new()),
+                        [v],
+                    ]
+                },
+            ]
+        }
+        .into()
+    })
 }
 
 /// Lowers a `forEach` source path to the array expression to unwind.
@@ -548,14 +574,16 @@ fn lower_json_path(root: &str, path: &JsonPath, ctx: &Ctx) -> Result<Bson, SofEr
     for step in &path.0 {
         match step {
             PathStep::Field(name) => {
-                let flattened = doc! {
-                    "$cond": [
-                        doc! { "$isArray": acc.clone() },
-                        doc! { "$first": acc.clone() },
-                        acc,
-                    ]
-                };
-                acc = doc! { "$getField": { "field": name.clone(), "input": flattened } }.into();
+                acc = bind_once(acc, "cse_nav", |acc| {
+                    let flattened = doc! {
+                        "$cond": [
+                            doc! { "$isArray": acc.clone() },
+                            doc! { "$first": acc.clone() },
+                            acc,
+                        ]
+                    };
+                    doc! { "$getField": { "field": name.clone(), "input": flattened } }.into()
+                });
             }
             PathStep::Index(n) => {
                 acc = index_step(acc, *n);
@@ -572,15 +600,17 @@ fn lower_json_path(root: &str, path: &JsonPath, ctx: &Ctx) -> Result<Bson, SofEr
 /// `$arrayElemAt` would raise a runtime error on a non-array (e.g. the scalar
 /// produced by `name.family.first()`), so the array case is guarded.
 fn index_step(acc: Bson, n: i64) -> Bson {
-    let non_array = if n == 0 { acc.clone() } else { Bson::Null };
-    doc! {
-        "$cond": [
-            doc! { "$isArray": acc.clone() },
-            doc! { "$arrayElemAt": [acc, n] },
-            non_array,
-        ]
-    }
-    .into()
+    bind_once(acc, "cse_nav", |acc| {
+        let non_array = if n == 0 { acc.clone() } else { Bson::Null };
+        doc! {
+            "$cond": [
+                doc! { "$isArray": acc.clone() },
+                doc! { "$arrayElemAt": [acc, n] },
+                non_array,
+            ]
+        }
+        .into()
+    })
 }
 
 /// Lowers a `LitValue` to a BSON literal value.
@@ -636,19 +666,21 @@ fn number_string(expr: Bson) -> Bson {
 /// Coerces a possibly-wrapped number to a real double for use as a comparison or
 /// arithmetic operand. Non-number values pass through unchanged.
 fn coerce_number(expr: Bson) -> Bson {
-    doc! {
-        "$let": {
-            "vars": { "ns": number_string(expr.clone()) },
-            "in": doc! {
-                "$cond": [
-                    doc! { "$ne": [doc! { "$ifNull": ["$$ns", Bson::Null] }, Bson::Null] },
-                    doc! { "$toDouble": "$$ns" },
-                    expr,
-                ]
+    bind_once(expr, "cse_num", |expr| {
+        doc! {
+            "$let": {
+                "vars": { "ns": number_string(expr.clone()) },
+                "in": doc! {
+                    "$cond": [
+                        doc! { "$ne": [doc! { "$ifNull": ["$$ns", Bson::Null] }, Bson::Null] },
+                        doc! { "$toDouble": "$$ns" },
+                        expr,
+                    ]
+                }
             }
         }
-    }
-    .into()
+        .into()
+    })
 }
 
 /// Lowers an IR value expression to a MongoDB aggregation expression.
@@ -726,10 +758,12 @@ fn lower_expr(expr: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
         SqlExpr::NullIf(a, b) => {
             let a = lower_expr(a, ctx)?;
             let b = lower_expr(b, ctx)?;
-            Ok(doc! {
-                "$cond": [ doc! { "$eq": [a.clone(), b] }, Bson::Null, a ]
-            }
-            .into())
+            Ok(bind_once(a, "cse_nif", |a| {
+                doc! {
+                    "$cond": [ doc! { "$eq": [a.clone(), b] }, Bson::Null, a ]
+                }
+                .into()
+            }))
         }
         SqlExpr::ReferenceKey {
             reference,
@@ -1140,16 +1174,20 @@ fn lower_binop(op: BinOp, lhs: &SqlExpr, rhs: &SqlExpr, ctx: &Ctx) -> Result<Bso
         // (null/missing) the result is null, not a boolean. SQL gets this from
         // `NULL = x → NULL`; Mongo's `$eq`/`$lt`/… return a boolean, so guard
         // explicitly. (Arithmetic/`$concat` already propagate null in Mongo.)
-        let either_null = doc! {
-            "$or": [
-                doc! { "$eq": [doc! { "$ifNull": [l.clone(), Bson::Null] }, Bson::Null] },
-                doc! { "$eq": [doc! { "$ifNull": [r.clone(), Bson::Null] }, Bson::Null] },
-            ]
-        };
-        Ok(doc! {
-            "$cond": [either_null, Bson::Null, doc! { key: [l, r] }]
-        }
-        .into())
+        Ok(bind_once(l, "cse_lhs", |l| {
+            bind_once(r, "cse_rhs", |r| {
+                let either_null = doc! {
+                    "$or": [
+                        doc! { "$eq": [doc! { "$ifNull": [l.clone(), Bson::Null] }, Bson::Null] },
+                        doc! { "$eq": [doc! { "$ifNull": [r.clone(), Bson::Null] }, Bson::Null] },
+                    ]
+                };
+                doc! {
+                    "$cond": [either_null, Bson::Null, doc! { key: [l, r] }]
+                }
+                .into()
+            })
+        }))
     } else {
         Ok(doc! { key: [l, r] }.into())
     }
@@ -1174,6 +1212,12 @@ fn lower_reference_key(
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
     let reference = lower_expr(reference, ctx)?;
+    Ok(bind_once(reference, "cse_rk", |reference| {
+        reference_key_body(reference, expected_type)
+    }))
+}
+
+fn reference_key_body(reference: Bson, expected_type: Option<&str>) -> Bson {
     // Guard against null references (`$split` of null errors).
     let last_segment = doc! {
         "$cond": [
@@ -1184,18 +1228,18 @@ fn lower_reference_key(
     };
 
     match expected_type {
-        None => Ok(last_segment.into()),
+        None => last_segment.into(),
         Some(ty) => {
             // Keep the key only when the reference points at `<ty>/...`.
             let regex = format!("(^|/){ty}/");
-            Ok(doc! {
+            doc! {
                 "$cond": [
                     doc! { "$regexMatch": { "input": reference, "regex": regex } },
                     last_segment,
                     Bson::Null,
                 ]
             }
-            .into())
+            .into()
         }
     }
 }
@@ -1204,15 +1248,17 @@ fn lower_reference_key(
 /// is truthy iff it is non-null, non-`false`, non-zero, and non-empty-string.
 /// Mirrors the SQL `truthy_predicate` dialect helper.
 fn truthy(expr: Bson) -> Bson {
-    doc! {
-        "$and": [
-            doc! { "$ne": [ doc! { "$ifNull": [expr.clone(), Bson::Null] }, Bson::Null ] },
-            doc! { "$ne": [expr.clone(), false] },
-            doc! { "$ne": [expr.clone(), 0i64] },
-            doc! { "$ne": [expr, ""] },
-        ]
-    }
-    .into()
+    bind_once(expr, "cse_tv", |expr| {
+        doc! {
+            "$and": [
+                doc! { "$ne": [ doc! { "$ifNull": [expr.clone(), Bson::Null] }, Bson::Null ] },
+                doc! { "$ne": [expr.clone(), false] },
+                doc! { "$ne": [expr.clone(), 0i64] },
+                doc! { "$ne": [expr, ""] },
+            ]
+        }
+        .into()
+    })
 }
 
 /// MongoDB forbids field names that are empty, start with `$`, or contain `.`.
@@ -1306,6 +1352,30 @@ mod tests {
 
         let negated = exists_where_pipeline("component.code.coding.where(code = '8480-6').empty()");
         assert!(negated.contains("$reduce"), "empty() must flatten too");
+    }
+
+    /// MongoDB does no common-subexpression elimination, so a path step that
+    /// repeated its operand grew the pipeline as 3^depth (91 KB for this filter).
+    /// Operands are bound once with `$let`: the size stays linear in the depth.
+    #[test]
+    fn multi_step_path_filter_stays_small() {
+        let pipeline = compile(json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }],
+            "where": [{ "path": "code.coding.first().code = '8302-2'" }],
+        }));
+        let bytes: usize = pipeline
+            .iter()
+            .map(|stage| mongodb::bson::to_vec(stage).unwrap().len())
+            .sum();
+        assert!(
+            bytes < 8 * 1024,
+            "where filter compiled to {bytes} bytes; operands are being copied"
+        );
+        let rendered = format!("{pipeline:?}");
+        assert!(rendered.contains("$let"), "expected $let bindings");
+        assert!(rendered.contains("$$cse_nav"), "expected bound navigation");
     }
 
     #[test]
