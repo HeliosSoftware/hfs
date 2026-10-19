@@ -234,9 +234,42 @@ impl ParameterCondition {
 /// the searched tenant (`?1`) and type (`?2`), that satisfy `condition`.
 fn parameter_rows(name: &str, condition: &str) -> String {
     format!(
-        "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} AND ({condition})",
+        "{PARAMETER_ROWS_HEAD}param_name = {} AND ({condition})",
         sql_string_literal(name)
     )
+}
+
+/// What every [`parameter_rows`] subquery starts with, up to its
+/// `param_name` test.
+const PARAMETER_ROWS_HEAD: &str =
+    "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND ";
+
+/// Whether `sql` is exactly one [`parameter_rows`] select: a single
+/// parameter's membership, nothing intersected with it.
+pub(crate) fn is_parameter_rows(sql: &str) -> bool {
+    sql.starts_with(PARAMETER_ROWS_HEAD) && !sql.contains(" INTERSECT ")
+}
+
+/// The same membership as a correlated `EXISTS` on the outer `resources` row,
+/// for a subquery built by [`parameter_rows`]: `rowid IN (<rows>)` becomes
+/// `EXISTS (<rows> for outer_key)`, which lets the outer query walk
+/// `resources` in page order and stop at the first full page instead of
+/// materializing every matching key first. Reuses the subquery's numbered
+/// placeholders, so the same parameters bind. `None` for anything that is not
+/// one plain `parameter_rows` select (a `UNION` of date ranges, an
+/// `INTERSECT`, a nested subquery), which keeps `rowid IN (…)`.
+pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
+    let rest = rows_sql.strip_prefix(PARAMETER_ROWS_HEAD)?;
+    if [" UNION ", " INTERSECT ", " EXCEPT ", "SELECT"]
+        .iter()
+        .any(|keyword| rest.contains(keyword))
+    {
+        return None;
+    }
+    Some(format!(
+        "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = {outer_key} AND {rest})"
+    ))
 }
 
 /// Builds SQL queries from FHIR search parameters.
@@ -1475,6 +1508,30 @@ fn positive_membership_subquery(condition: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exists_form_only_for_one_plain_parameter_select() {
+        let rows = parameter_rows("code", "value_token_code = ?3");
+        let exists = membership_exists_predicate(&rows, "w.rk").unwrap();
+        assert!(
+            exists
+                .starts_with("EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite")
+        );
+        assert!(
+            exists.contains(
+                "resource_key = w.rk AND param_name = 'code' AND (value_token_code = ?3)"
+            )
+        );
+        assert!(is_parameter_rows(&rows));
+        let union = format!("{rows} UNION ALL {rows}");
+        assert!(membership_exists_predicate(&union, "w.rk").is_none());
+        let intersect = format!("{rows} INTERSECT {rows}");
+        assert!(!is_parameter_rows(&intersect));
+        assert!(
+            membership_exists_predicate("SELECT DISTINCT resource_key FROM search_index", "w.rk")
+                .is_none()
+        );
+    }
 
     #[test]
     fn positive_membership_subquery_takes_exactly_one_membership() {

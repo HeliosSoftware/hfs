@@ -27,7 +27,10 @@ use crate::types::{
 };
 
 use super::SqliteBackend;
-use super::search::{KeysetKey, QueryBuilder, SortValueKind, SqlParam};
+use super::search::{
+    KeysetKey, QueryBuilder, SortValueKind, SqlParam, is_parameter_rows,
+    membership_exists_predicate,
+};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -383,6 +386,20 @@ impl SqliteBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
+        self.search_with_connection_probe(conn, tenant, query, total, probe_enabled())
+    }
+
+    /// [`Self::search_with_connection`] with the bounded probe forced on or
+    /// off (`HFS_SQLITE_SEARCH_PROBE` decides in production).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn search_with_connection_probe(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        total: Option<u64>,
+        probe: bool,
+    ) -> StorageResult<SearchResult> {
         reject_unsupported_metadata_modifier(query)?;
         reject_legacy_composites(conn, tenant, query)?;
 
@@ -428,7 +445,22 @@ impl SqliteBackend {
             .map(|f| format!(" AND rowid IN ({})", f.sql))
             .unwrap_or_default();
         let first_page_source = first_page_source(search_filter.is_some(), query, count);
-        let search_params = search_filter.map(|f| f.params).unwrap_or_default();
+        // First page of a one-parameter membership search: the probe may pick
+        // a cheaper plan for it (same rows, same order).
+        let first_page_plan = match &search_filter {
+            Some(f)
+                if probe
+                    && cursor.is_none()
+                    && query.offset.is_none()
+                    && query.sort.is_empty()
+                    && query.compartment.is_none()
+                    && query.parameters.len() == 1
+                    && count > 1 =>
+            {
+                choose_first_page_plan(conn, tenant_id, resource_type, &f.sql, &f.params)
+            }
+            _ => FirstPagePlan::Planner,
+        };
 
         // SELECT the sort key alongside the row so the next cursor can be built.
         let select_cols = match &keyset {
@@ -445,6 +477,27 @@ impl SqliteBackend {
         } else {
             QueryBuilder::new(tenant_id, resource_type).build_order_by(query)
         };
+
+        // The bounded early-exit attempt, tried before the page statement and
+        // kept only when it fills the page.
+        let window_sql = match (first_page_plan, &search_filter) {
+            (FirstPagePlan::ExistsDriven, Some(f)) => membership_exists_predicate(&f.sql, "w.rk")
+                .map(|exists| {
+                    format!(
+                        "SELECT {select_cols} FROM \
+                         (SELECT rowid AS rk, last_updated AS lu, id AS rid \
+                          FROM resources INDEXED BY idx_resources_reindex \
+                          WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                          ORDER BY last_updated DESC, id ASC LIMIT {WINDOW}) AS w \
+                         CROSS JOIN resources ON resources.rowid = w.rk \
+                         WHERE {exists} \
+                         ORDER BY w.lu DESC, w.rid ASC LIMIT {lim}",
+                        lim = count + 1,
+                    )
+                }),
+            _ => None,
+        };
+        let search_params = search_filter.map(|f| f.params).unwrap_or_default();
 
         // Build query based on pagination mode.
         let (sql, has_previous) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
@@ -474,21 +527,22 @@ impl SqliteBackend {
             );
             (sql, offset > 0)
         } else {
-            let sql = format!(
-                "SELECT {cols} FROM {first_page_source} \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
-                 {order} LIMIT {lim}",
-                cols = select_cols,
-                filter = filter_clause,
-                order = order_by,
-                lim = count + 1,
-            );
+            let page = |source: &str, filter: &str| {
+                format!(
+                    "SELECT {cols} FROM {source} \
+                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                     {order} LIMIT {lim}",
+                    cols = select_cols,
+                    order = order_by,
+                    lim = count + 1,
+                )
+            };
+            let sql = match first_page_plan {
+                FirstPagePlan::ListDriven => page("resources NOT INDEXED", &filter_clause),
+                _ => page(first_page_source, &filter_clause),
+            };
             (sql, false)
         };
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare search query")?;
 
         // Bind params: tenant, type, then (cursor) sort value + id, then filter params.
         let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -511,8 +565,11 @@ impl SqliteBackend {
 
         // The sort key (column 5) is selected only when keyset paging is active.
         let sort_kind = keyset.as_ref().map(|k| k.kind);
-        let raw_rows: Vec<(String, String, Vec<u8>, String, String, Option<CursorValue>)> = stmt
-            .query_map(param_refs.as_slice(), |row| {
+        let run = |sql: &str| -> StorageResult<Vec<RawRow>> {
+            let mut stmt = conn
+                .prepare(sql)
+                .or_query_error("Failed to prepare search query")?;
+            stmt.query_map(param_refs.as_slice(), |row| {
                 let id: String = row.get(0)?;
                 let version_id: String = row.get(1)?;
                 let data: Vec<u8> = row.get(2)?;
@@ -530,7 +587,19 @@ impl SqliteBackend {
             })
             .or_query_error("Failed to execute search")?
             .collect::<Result<Vec<_>, _>>()
-            .or_query_error("Failed to read row")?;
+            .or_query_error("Failed to read row")
+        };
+        // The window attempt may fail to prepare (an index dropped for a bulk
+        // load) or fall short of a full page: either way the page statement
+        // runs, so a miss costs at most the window.
+        let raw_rows = match window_sql
+            .as_deref()
+            .and_then(|window| run(window).ok())
+            .filter(|rows| rows.len() > count)
+        {
+            Some(rows) => rows,
+            None => run(&sql)?,
+        };
 
         // Parse rows, carrying the sort key for cursor construction.
         let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
@@ -621,6 +690,83 @@ impl SqliteBackend {
             total,
             scores: Default::default(),
         })
+    }
+}
+
+/// One `resources` row as the page statements return it, with its sort key.
+type RawRow = (String, String, Vec<u8>, String, String, Option<CursorValue>);
+
+/// Newest `resources` rows the early-exit attempt looks at.
+const WINDOW: usize = 512;
+
+/// Rows of a single parameter's index the probe reads at most. A filter with
+/// fewer rows is "selective": its whole key list is cheap to build.
+const PROBE_CAP: usize = 2001;
+
+/// Whether the bounded probe is on: `HFS_SQLITE_SEARCH_PROBE`, read once.
+/// Unset or empty means on; `0`, `false`, `off` or `no` turn it off.
+fn probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("HFS_SQLITE_SEARCH_PROBE") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// How the first page of a one-parameter membership search reaches its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstPagePlan {
+    /// The planner's choice: `rowid IN (<keys>)` with `resources` walked in
+    /// `last_updated` order.
+    Planner,
+    /// The key list is short (under [`PROBE_CAP`] index rows): drive from it
+    /// and read `resources` by rowid, sorting the few rows.
+    ListDriven,
+    /// The key list is long: try the newest [`WINDOW`] resources in page
+    /// order, each tested against the index with a correlated `EXISTS`; the
+    /// page is final when the window fills it, else the planner's plan runs.
+    ExistsDriven,
+}
+
+/// Picks the [`FirstPagePlan`] with one bounded probe over the filter's own
+/// index rows (`SELECT … FROM (<rows> LIMIT 2001)`, a seek that stops early).
+/// Any shape other than one plain parameter membership, and any probe error,
+/// is [`FirstPagePlan::Planner`]: the result of every plan is the same set in
+/// the same `ORDER BY last_updated DESC, id` order, so this only chooses cost.
+fn choose_first_page_plan(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    rows_sql: &str,
+    filter_params: &[SqlParam],
+) -> FirstPagePlan {
+    if !is_parameter_rows(rows_sql) {
+        return FirstPagePlan::Planner;
+    }
+    let probe = format!("SELECT count(*) FROM ({rows_sql} LIMIT {PROBE_CAP})");
+    let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(tenant_id.to_string()),
+        Box::new(resource_type.to_string()),
+    ];
+    for param in filter_params {
+        bound.push(match param {
+            SqlParam::String(s) => Box::new(s.clone()),
+            SqlParam::Integer(i) => Box::new(*i),
+            SqlParam::Float(f) => Box::new(*f),
+            SqlParam::Null => Box::new(Option::<String>::None),
+        });
+    }
+    let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|p| p.as_ref()).collect();
+    let rows = conn
+        .prepare(&probe)
+        .and_then(|mut stmt| stmt.query_row(refs.as_slice(), |row| row.get::<_, i64>(0)));
+    match rows {
+        Ok(rows) if rows < PROBE_CAP as i64 => FirstPagePlan::ListDriven,
+        Ok(_) => FirstPagePlan::ExistsDriven,
+        Err(_) => FirstPagePlan::Planner,
     }
 }
 
@@ -3118,7 +3264,7 @@ mod tests {
         ] {
             TRACED_SQL.with(|traced| traced.borrow_mut().clear());
             let result = backend
-                .search_with_connection(&conn, &tenant, &query(count), None)
+                .search_with_connection_probe(&conn, &tenant, &query(count), None, false)
                 .unwrap();
             let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
             assert_eq!(ids.len(), count.min(2) as usize, "{ids:?}");
@@ -3786,5 +3932,318 @@ mod tests {
         q.parameters[0].values = vec![SearchValue::eq("Jones")];
         let result = backend.search(&tenant, &q).await.unwrap();
         assert!(result.resources.items.is_empty());
+    }
+
+    // ---- bounded probe + first-page plan selection ----
+
+    use crate::types::{CompositeSearchComponent, SearchPrefix};
+
+    fn obs_param(
+        name: &str,
+        param_type: SearchParamType,
+        prefix: SearchPrefix,
+        value: &str,
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier: None,
+            values: vec![SearchValue::new(prefix, value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    /// 2,300 Observations: `B2001` is indexed on exactly 2,001 of them and
+    /// `B2000` on exactly 2,000, so a probe capped at 2,001 rows sees the
+    /// boundary on either side.
+    async fn probe_fixture() -> (SqliteBackend, TenantContext) {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 0..2300usize {
+            let mut codings =
+                vec![json!({"system": "http://loinc.org", "code": format!("C{}", i % 7)})];
+            if i < 2001 {
+                codings.push(json!({"system": "http://x.org", "code": "B2001"}));
+            }
+            if i < 2000 {
+                codings.push(json!({"system": "http://x.org", "code": "B2000"}));
+            }
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("o{i:04}"),
+                        "status": "final",
+                        "category": [{"coding": [{
+                            "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                            "code": if i % 10 == 0 { "vital-signs" } else { "laboratory" }}]}],
+                        "code": {"coding": codings},
+                        "subject": {"reference": format!("Patient/p{}", i % 50)},
+                        "effectiveDateTime": format!("{}-01-15T10:00:00Z", 2000 + i % 20),
+                        "valueQuantity": {"value": (i % 500) as f64, "unit": "mg",
+                            "system": "http://unitsofmeasure.org", "code": "mg"}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        (backend, tenant)
+    }
+
+    fn probe_plan_of(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> FirstPagePlan {
+        let conn = backend.get_connection().unwrap();
+        let fragment = QueryBuilder::new(tenant.tenant_id().as_str(), &query.resource_type)
+            .with_param_offset(2)
+            .build(query);
+        choose_first_page_plan(
+            &conn,
+            tenant.tenant_id().as_str(),
+            &query.resource_type,
+            &fragment.sql,
+            &fragment.params,
+        )
+    }
+
+    /// Every page of `query` through the planner path (probe off) and the
+    /// probe path, compared id by id.
+    fn assert_same_pages(backend: &SqliteBackend, tenant: &TenantContext, query: &SearchQuery) {
+        let conn = backend.get_connection().unwrap();
+        let mut cursor_old: Option<String> = None;
+        let mut cursor_new: Option<String> = None;
+        let mut seen = 0usize;
+        for page_no in 0..6 {
+            let mut q_old = query.clone();
+            q_old.cursor = cursor_old.clone();
+            let mut q_new = query.clone();
+            q_new.cursor = cursor_new.clone();
+            let old = backend
+                .search_with_connection_probe(&conn, tenant, &q_old, None, false)
+                .unwrap();
+            let new = backend
+                .search_with_connection_probe(&conn, tenant, &q_new, None, true)
+                .unwrap();
+            let ids = |r: &SearchResult| -> Vec<String> {
+                r.resources
+                    .items
+                    .iter()
+                    .map(|x| x.id().to_string())
+                    .collect()
+            };
+            assert_eq!(
+                ids(&old),
+                ids(&new),
+                "page {page_no} of {:?}",
+                query.parameters
+            );
+            assert_eq!(
+                old.resources.page_info.has_next,
+                new.resources.page_info.has_next
+            );
+            seen += ids(&new).len();
+            cursor_old = old.resources.page_info.next_cursor.clone();
+            cursor_new = new.resources.page_info.next_cursor.clone();
+            if cursor_old.is_none() {
+                break;
+            }
+        }
+        assert!(
+            seen > 0 || query.parameters.is_empty(),
+            "{:?} matched nothing",
+            query.parameters
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_plan_gives_the_same_pages_as_the_planner() {
+        let (backend, tenant) = probe_fixture().await;
+        let mut shapes: Vec<SearchParameter> = vec![
+            // token: selective, dense, boundary, rare
+            obs_param("code", SearchParamType::Token, SearchPrefix::Eq, "C3"),
+            obs_param(
+                "code",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "http://loinc.org|C5",
+            ),
+            obs_param("code", SearchParamType::Token, SearchPrefix::Eq, "B2000"),
+            obs_param("code", SearchParamType::Token, SearchPrefix::Eq, "B2001"),
+            obs_param(
+                "category",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "laboratory",
+            ),
+            obs_param(
+                "category",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "vital-signs",
+            ),
+            // quantity: dense, selective, empty
+            obs_param(
+                "value-quantity",
+                SearchParamType::Quantity,
+                SearchPrefix::Lt,
+                "460",
+            ),
+            obs_param(
+                "value-quantity",
+                SearchParamType::Quantity,
+                SearchPrefix::Gt,
+                "450",
+            ),
+            obs_param(
+                "value-quantity",
+                SearchParamType::Quantity,
+                SearchPrefix::Le,
+                "20",
+            ),
+            // date: dense, selective, union (le/ge), empty
+            obs_param(
+                "date",
+                SearchParamType::Date,
+                SearchPrefix::Gt,
+                "2005-01-01",
+            ),
+            obs_param(
+                "date",
+                SearchParamType::Date,
+                SearchPrefix::Gt,
+                "2018-01-01",
+            ),
+            obs_param("date", SearchParamType::Date, SearchPrefix::Le, "2003"),
+            obs_param("date", SearchParamType::Date, SearchPrefix::Ge, "2010"),
+            // reference
+            obs_param(
+                "subject",
+                SearchParamType::Reference,
+                SearchPrefix::Eq,
+                "Patient/p7",
+            ),
+        ];
+        // composite stays on the planner path but must still agree
+        shapes.push(SearchParameter {
+            name: "code-value-quantity".into(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq("C3$gt100")],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".into(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        for param in shapes {
+            for count in [2u32, 7, 50, 250] {
+                let mut query = SearchQuery::new("Observation").with_parameter(param.clone());
+                query.count = Some(count);
+                assert_same_pages(&backend, &tenant, &query);
+            }
+        }
+        // a value no row has: both plans return an empty page
+        let mut empty = SearchQuery::new("Observation").with_parameter(obs_param(
+            "code",
+            SearchParamType::Token,
+            SearchPrefix::Eq,
+            "no-such-code",
+        ));
+        empty.count = Some(20);
+        let conn = backend.get_connection().unwrap();
+        for probe in [false, true] {
+            let r = backend
+                .search_with_connection_probe(&conn, &tenant, &empty, None, probe)
+                .unwrap();
+            assert!(r.resources.items.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_boundary_is_2001_index_rows() {
+        let (backend, tenant) = probe_fixture().await;
+        let plan = |value: &str| {
+            let mut q = SearchQuery::new("Observation").with_parameter(obs_param(
+                "code",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                value,
+            ));
+            q.count = Some(10);
+            probe_plan_of(&backend, &tenant, &q)
+        };
+        assert_eq!(plan("B2000"), FirstPagePlan::ListDriven, "2000 rows");
+        assert_eq!(plan("B2001"), FirstPagePlan::ExistsDriven, "2001 rows");
+        assert_eq!(plan("C3"), FirstPagePlan::ListDriven);
+        assert_eq!(plan("no-such-code"), FirstPagePlan::ListDriven);
+        // composites, `:not` and two parameters never take the probe
+        let mut two = SearchQuery::new("Observation")
+            .with_parameter(obs_param(
+                "code",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "B2001",
+            ))
+            .with_parameter(obs_param(
+                "category",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                "laboratory",
+            ));
+        two.count = Some(10);
+        assert_eq!(
+            probe_plan_of(&backend, &tenant, &two),
+            FirstPagePlan::Planner
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_picks_the_measured_plans_for_the_page_statement() {
+        let (backend, tenant) = probe_fixture().await;
+        let conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        );
+        for (value, needle) in [
+            ("B2000", "resources NOT INDEXED"),
+            (
+                "B2001",
+                "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite",
+            ),
+        ] {
+            TRACED_SQL.with(|t| t.borrow_mut().clear());
+            let mut q = SearchQuery::new("Observation").with_parameter(obs_param(
+                "code",
+                SearchParamType::Token,
+                SearchPrefix::Eq,
+                value,
+            ));
+            q.count = Some(10);
+            backend
+                .search_with_connection_probe(&conn, &tenant, &q, None, true)
+                .unwrap();
+            let page = TRACED_SQL
+                .with(|t| {
+                    t.borrow()
+                        .iter()
+                        .find(|s| s.starts_with("SELECT id, version_id, data"))
+                        .cloned()
+                })
+                .expect("the page statement");
+            assert!(page.contains(needle), "{value}: {page}");
+        }
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
     }
 }
