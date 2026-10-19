@@ -45,6 +45,7 @@ helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.5" }
 # Shared SoF v2 spec parsing (ConstantValue, run-params extractor). Kept
 # default-features = false so persistence can pick its own FHIR-version set.
 helios-sof = { path = "../sof", version = "0.2.5", default-features = false }
+helios-observability = { path = "../observability", version = "0.2.5" }
 rust_decimal = "1"
 serde.workspace = true
 serde_json.workspace = true

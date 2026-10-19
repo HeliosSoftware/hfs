@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use dashmap::{DashMap, mapref::entry::Entry};
 use helios_fhir::FhirVersion;
+use helios_persistence::core::bulk_submit_input::redact_url;
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, warn};
 
@@ -86,7 +87,10 @@ impl ChannelType {
 }
 
 /// Channel configuration for a subscription.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the endpoint and the header values, which commonly carry
+/// a receiver's credentials (#2149).
+#[derive(Clone)]
 pub struct ChannelConfig {
     pub channel_type: ChannelType,
     pub endpoint: Option<String>,
@@ -96,6 +100,47 @@ pub struct ChannelConfig {
     pub heartbeat_period: Option<u32>,
     pub timeout: Option<u32>,
     pub max_count: Option<u32>,
+}
+
+impl ChannelConfig {
+    /// The endpoint with userinfo, query, and fragment removed, for logs and
+    /// error messages. Empty when the channel has no endpoint.
+    pub fn endpoint_for_log(&self) -> String {
+        self.endpoint.as_deref().map(redact_url).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for ChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            channel_type,
+            endpoint,
+            payload_mime_type,
+            payload_content,
+            headers,
+            heartbeat_period,
+            timeout,
+            max_count,
+        } = self;
+        // Header names stay (they show what was configured); values do not.
+        let headers: Vec<String> = headers
+            .iter()
+            .map(|h| match h.split_once(':') {
+                Some((name, _)) => format!("{}: [redacted]", name.trim()),
+                None => "[redacted]".to_string(),
+            })
+            .collect();
+        f.debug_struct("ChannelConfig")
+            .field("channel_type", channel_type)
+            .field("endpoint", &endpoint.as_deref().map(redact_url))
+            .field("payload_mime_type", payload_mime_type)
+            .field("payload_content", payload_content)
+            .field("headers", &headers)
+            .field("heartbeat_period", heartbeat_period)
+            .field("timeout", timeout)
+            .field("max_count", max_count)
+            .finish()
+    }
 }
 
 /// An active subscription tracked by the manager.
@@ -1245,6 +1290,48 @@ pub(crate) mod tests {
     #[cfg(all(not(feature = "R5"), not(feature = "R4B"), feature = "R6"))]
     fn non_r4_test_version() -> FhirVersion {
         FhirVersion::R6
+    }
+
+    fn channel_with_secrets() -> ChannelConfig {
+        ChannelConfig {
+            channel_type: ChannelType::RestHook,
+            endpoint: Some(
+                "https://user:PASSWORD@hooks.example.com/notify?token=QUERYSECRET".into(),
+            ),
+            payload_mime_type: None,
+            payload_content: PayloadContent::IdOnly,
+            headers: vec![
+                "Authorization: Bearer HEADERSECRET".into(),
+                "no-colon-HEADERSECRET2".into(),
+            ],
+            heartbeat_period: None,
+            timeout: None,
+            max_count: None,
+        }
+    }
+
+    #[test]
+    fn channel_config_debug_redacts_endpoint_and_header_values() {
+        let debug = format!("{:?}", channel_with_secrets());
+        for secret in ["PASSWORD", "QUERYSECRET", "HEADERSECRET"] {
+            assert!(!debug.contains(secret), "{secret} leaked: {debug}");
+        }
+        assert!(debug.contains("hooks.example.com/notify"), "{debug}");
+        assert!(debug.contains("Authorization: [redacted]"), "{debug}");
+    }
+
+    #[test]
+    fn endpoint_for_log_redacts_credentials_and_keeps_host() {
+        let channel = channel_with_secrets();
+        assert_eq!(
+            channel.endpoint_for_log(),
+            "https://[redacted]@hooks.example.com/notify?[redacted]"
+        );
+        let none = ChannelConfig {
+            endpoint: None,
+            ..channel
+        };
+        assert_eq!(none.endpoint_for_log(), "");
     }
 
     #[test]
