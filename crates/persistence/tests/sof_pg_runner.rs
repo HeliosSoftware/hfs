@@ -795,7 +795,13 @@ mod sof_pg_runner_tests {
         let runner = backend.sof_runner().expect("must have runner");
         let tenant = test_tenant();
         // (id, subject.reference or None, any_key, patient_key)
-        let cases: [(&str, Option<&str>, Option<&str>, Option<&str>); 9] = [
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let cases: [Case; 9] = [
             ("o1", Some("Patient/p1"), Some("p1"), Some("p1")),
             ("o2", Some("Group/g1"), Some("g1"), None),
             (
