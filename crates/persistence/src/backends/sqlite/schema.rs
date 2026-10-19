@@ -106,20 +106,63 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 17] = [
 pub(crate) fn ensure_search_value_indexes(conn: &Connection) -> StorageResult<usize> {
     let mut created = 0;
     for (name, sql) in SEARCH_VALUE_INDEXES {
-        let exists: bool = conn
+        let existing: Option<String> = conn
             .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
                 [name],
-                |_| Ok(()),
+                |row| row.get(0),
             )
-            .is_ok();
-        if !exists {
-            conn.execute(sql, [])
-                .map_err(|e| migration_err(format!("recreate {name}: {e}")))?;
-            created += 1;
+            .ok();
+        match existing {
+            None => {
+                conn.execute(sql, [])
+                    .map_err(|e| migration_err(format!("recreate {name}: {e}")))?;
+                created += 1;
+            }
+            // The covering indexes (v42) keep their name across shapes, so an
+            // older binary after a rollback, or an out-of-band step, can leave
+            // the pre-v42 non-covering form behind at v42 forever. Results stay
+            // correct but the covering speedup silently vanishes, so compare
+            // the shape and rebuild on a mismatch. One query per index when
+            // everything matches.
+            Some(current)
+                if COVERING_SEARCH_INDEXES.contains(&name)
+                    && normalise_index_sql(&current) != normalise_index_sql(sql) =>
+            {
+                let started = std::time::Instant::now();
+                conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                    .map_err(|e| migration_err(format!("drop stale {name}: {e}")))?;
+                conn.execute(sql, [])
+                    .map_err(|e| migration_err(format!("rebuild {name}: {e}")))?;
+                tracing::warn!(
+                    index = name,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "search_index value index had a stale (non-covering) shape and has been rebuilt"
+                );
+                created += 1;
+            }
+            Some(_) => {}
         }
     }
     Ok(created)
+}
+
+/// The v42 covering indexes whose shape [`ensure_search_value_indexes`] checks.
+const COVERING_SEARCH_INDEXES: [&str; 3] = [
+    "idx_search_quantity",
+    "idx_search_token",
+    "idx_search_composite_cov",
+];
+
+/// Lower-cases, drops `IF NOT EXISTS` (SQLite stores the statement without it)
+/// and collapses whitespace, so a stored definition compares with the canonical
+/// one regardless of formatting.
+fn normalise_index_sql(sql: &str) -> String {
+    sql.to_lowercase()
+        .replace("if not exists ", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Drops every [`SEARCH_VALUE_INDEXES`] entry. The bulk index rebuild's first
@@ -179,7 +222,7 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
     if recreated > 0 {
         tracing::warn!(
             recreated,
-            "search_index value indexes were missing at startup and have been rebuilt"
+            "search_index value indexes were missing or stale at startup and have been rebuilt"
         );
     }
 
@@ -2197,6 +2240,12 @@ fn migrate_v40_to_v41(conn: &Connection) -> StorageResult<()> {
 /// about +490 MB of file. Each build scans `search_index` and can take minutes
 /// on a large database, so progress is logged per index. An index already of
 /// the new shape is left alone, so a replay costs nothing.
+///
+/// Operational cost: `CREATE INDEX` needs temporary space about the size of the
+/// index being built and holds the write lock while it runs, so writes block
+/// for the duration (about 16 s at 6 GB). Plan the upgrade window accordingly.
+/// The startup self-repair ([`ensure_search_value_indexes`]) re-applies the
+/// same rebuild if these indexes are ever found in the old shape again.
 fn migrate_v41_to_v42(conn: &Connection) -> StorageResult<()> {
     for (name, current_marker) in [
         (
@@ -3374,6 +3423,63 @@ mod tests {
         );
         // Replay is a no-op.
         migrate_v41_to_v42(&conn).unwrap();
+    }
+
+    fn index_sql_and_rowid(conn: &Connection, name: &str) -> (String, i64) {
+        conn.query_row(
+            "SELECT sql, rowid FROM sqlite_master WHERE type='index' AND name=?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// An old-shape index left at v42 (rollback to a v41 binary, out-of-band
+    /// step) is detected and rebuilt covering by the startup self-repair; a
+    /// second pass changes nothing.
+    #[test]
+    #[tracing_test::traced_test]
+    fn startup_repair_rebuilds_stale_non_covering_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_search_quantity;
+             CREATE INDEX idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL;",
+        )
+        .unwrap();
+        assert!(
+            !index_sql_and_rowid(&conn, "idx_search_quantity")
+                .0
+                .contains("resource_key")
+        );
+
+        initialize_schema(&conn).unwrap();
+        let (sql, rowid) = index_sql_and_rowid(&conn, "idx_search_quantity");
+        assert!(sql.contains("resource_key"), "sql: {sql}");
+        assert!(logs_contain("stale (non-covering) shape"));
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT resource_key FROM search_index WHERE tenant_id = ?1 \
+                 AND resource_type = ?2 AND param_name = 'value-quantity' AND value_quantity_value > 100",
+            )
+            .unwrap()
+            .query_map(["t", "Observation"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("COVERING INDEX idx_search_quantity")),
+            "plan: {plan:?}"
+        );
+
+        // Idempotent: nothing rebuilt, the sqlite_master entry is untouched.
+        assert_eq!(ensure_search_value_indexes(&conn).unwrap(), 0);
+        initialize_schema(&conn).unwrap();
+        assert_eq!(
+            index_sql_and_rowid(&conn, "idx_search_quantity"),
+            (sql, rowid)
+        );
     }
 
     #[test]
