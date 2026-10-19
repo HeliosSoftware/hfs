@@ -214,7 +214,8 @@ where
         max_rows: state.config().sof_sqlquery_max_rows,
         timeout_secs: state.config().sof_sqlquery_timeout_secs,
     };
-    let executed = super::graph::execute_plan(
+    let materialized = std::sync::atomic::AtomicUsize::new(0);
+    let executed = super::graph::execute_plan_counting(
         engine,
         &runner,
         tenant.context(),
@@ -223,13 +224,19 @@ where
         &library.sql,
         &bindings,
         limits,
+        &materialized,
     )
     .await;
-    // `execute_plan` took the engine by value, so its materialized tables
-    // are freed by now, success or not. Hand the freed heap back to the OS
-    // before the response is built (one trim per run, off the request task).
-    crate::memory_trim::release_free_memory();
+    // `execute_plan_counting` took the engine by value, so its tables are
+    // freed by now, success or not. Once the result and the rendered body
+    // below are built too (this guard is dropped after them, on every return
+    // path), a run that materialized enough rows hands the freed heap back to
+    // the OS: one trim per run, off the request task, none for small queries.
+    let mut trim = crate::memory_trim::TrimOnDrop::new(
+        materialized.load(std::sync::atomic::Ordering::Relaxed),
+    );
     let (mut result, schemas_in_order) = executed.map_err(sqlquery_err_to_rest)?;
+    trim.add_rows(result.rows.len());
 
     // SoF v2 PR #353: apply caller-supplied `_limit` as a soft cap on the
     // final result set, AFTER SQL evaluation (including any in-query LIMIT).

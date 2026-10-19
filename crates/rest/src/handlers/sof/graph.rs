@@ -39,6 +39,7 @@
 //! see the `#[cfg(test)]` module below.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -769,6 +770,35 @@ pub(crate) struct ExecLimits {
 /// `503` (#2048).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan(
+    engine: InMemorySqlEngine,
+    runner: &Arc<dyn SofRunner>,
+    tenant: &TenantContext,
+    filters: &ViewFilters,
+    plan: &GraphPlan,
+    subject_sql: &str,
+    subject_bindings: &[BoundParam],
+    limits: ExecLimits,
+) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+    let materialized = AtomicUsize::new(0);
+    execute_plan_counting(
+        engine,
+        runner,
+        tenant,
+        filters,
+        plan,
+        subject_sql,
+        subject_bindings,
+        limits,
+        &materialized,
+    )
+    .await
+}
+
+/// [`execute_plan`], additionally adding to `materialized` the rows of every
+/// dependency node as it is loaded, so a caller can tell afterwards (also
+/// when the run fails) how much memory the engine held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_plan_counting(
     mut engine: InMemorySqlEngine,
     runner: &Arc<dyn SofRunner>,
     tenant: &TenantContext,
@@ -777,6 +807,7 @@ pub(crate) async fn execute_plan(
     subject_sql: &str,
     subject_bindings: &[BoundParam],
     limits: ExecLimits,
+    materialized: &AtomicUsize,
 ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
     let labels_by_target = labels_by_target(plan);
     let mut leaf_schemas: Vec<TableSchema> = Vec::new();
@@ -872,6 +903,7 @@ pub(crate) async fn execute_plan(
                     }
                 };
                 engine = returned_engine;
+                materialized.fetch_add(inserted, Ordering::Relaxed);
                 let elapsed_ms = start.elapsed().as_millis();
                 debug!(
                     table = %internal_name,
@@ -908,6 +940,7 @@ pub(crate) async fn execute_plan(
                     });
                 }
                 let rows = result.rows.len();
+                materialized.fetch_add(rows, Ordering::Relaxed);
                 engine = materialize_query_result(engine, internal_name, &result).await?;
                 let elapsed_ms = start.elapsed().as_millis();
                 debug!(
@@ -951,6 +984,7 @@ pub(crate) async fn execute_plan(
                         other => other,
                     })?;
                 engine = returned_engine;
+                materialized.fetch_add(inserted, Ordering::Relaxed);
                 debug!(
                     table = %internal_name,
                     dependency = %name,
