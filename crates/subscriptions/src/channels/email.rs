@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use helios_persistence::core::bulk_submit_input::redact_url;
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
@@ -233,7 +234,7 @@ impl EmailChannel {
 
         debug!(
             subscription_id = %subscription.id,
-            endpoint,
+            endpoint = %redact_url(endpoint),
             "Dispatching email notification"
         );
 
@@ -322,9 +323,12 @@ impl HeaderOverrides {
 }
 
 fn parse_mailto(endpoint: &str) -> Result<Mailbox, String> {
-    let rest = endpoint
-        .strip_prefix("mailto:")
-        .ok_or_else(|| format!("email endpoint must be a mailto: URI: {endpoint}"))?;
+    let rest = endpoint.strip_prefix("mailto:").ok_or_else(|| {
+        format!(
+            "email endpoint must be a mailto: URI: {}",
+            redact_url(endpoint)
+        )
+    })?;
     // RFC 6068 allows query strings like ?subject=...; drop anything after '?'.
     let address = rest.split('?').next().unwrap_or("").trim();
     if address.is_empty() {
@@ -450,6 +454,15 @@ mod tests {
     use crate::manager::{ChannelConfig, ChannelType, SubscriptionStatusCode};
     use helios_fhir::FhirVersion;
     use serde_json::json;
+
+    #[test]
+    fn non_mailto_endpoint_error_redacts_credentials() {
+        let err = parse_mailto("https://user:PASSWORD@hooks.example.com/x?token=QUERYSECRET")
+            .unwrap_err();
+        assert!(!err.contains("PASSWORD"), "{err}");
+        assert!(!err.contains("QUERYSECRET"), "{err}");
+        assert!(err.contains("hooks.example.com/x"), "{err}");
+    }
     use std::sync::Mutex;
 
     struct CapturingTransport {

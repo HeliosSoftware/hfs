@@ -3624,6 +3624,7 @@ dependencies = [
  "helios-fhir",
  "helios-fhirpath",
  "helios-fhirpath-support",
+ "helios-observability",
  "helios-sof",
  "humantime",
  "json-patch",

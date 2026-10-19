@@ -1083,7 +1083,11 @@ where
 
     // Build middleware stack
     let service_builder = ServiceBuilder::new()
-        .layer(TraceLayer::new_for_http())
+        // Method and path only: the default span logs the query string (#2149).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(helios_observability::middleware::request_span),
+        )
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(config.request_timeout),

@@ -156,7 +156,12 @@ pub(crate) fn split_file_progress(
 }
 
 /// The worker's view of a claimed manifest: everything needed to fetch + ingest it.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written (#2149): it prints request-header names but not
+/// their values (a provider's `Authorization`), only whether a
+/// `fileEncryptionKey` is present (its `value` is a symmetric key), and URLs
+/// through [`redact_url`].
+#[derive(Clone)]
 pub struct ManifestWorkerView {
     /// The manifest ID.
     pub manifest_id: String,
@@ -217,7 +222,9 @@ pub struct ManifestWorkerView {
 ///
 /// Bundled into a struct because they are written together by the kickoff handler
 /// and read back together by [`SubmitWorkerStorage::get_manifest_for_worker`].
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` redacts like [`ManifestWorkerView`]'s (#2149).
+#[derive(Clone, Default)]
 pub struct ManifestFetchParams<'a> {
     /// Base URL for resolving relative references in ingested resources.
     pub fhir_base_url: Option<&'a str>,
@@ -233,6 +240,87 @@ pub struct ManifestFetchParams<'a> {
     pub import_directives: &'a [(String, String)],
     /// `metadata` parts as `(parameterUrl, parameterValue)` pairs.
     pub metadata: &'a [(String, String)],
+}
+
+/// Header names only: values such as `Authorization` are credentials.
+fn header_names(headers: &[(String, String)]) -> Vec<&str> {
+    headers.iter().map(|(name, _)| name.as_str()).collect()
+}
+
+impl std::fmt::Debug for ManifestWorkerView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            manifest_id,
+            manifest_url,
+            fhir_base_url,
+            output_format,
+            file_request_headers,
+            oauth_metadata_urls,
+            file_encryption_key,
+            import_directives,
+            metadata,
+            last_processed_line,
+            file_resume_lines,
+            completed_output_files,
+            fhir_version,
+        } = self;
+        let file_resume_lines: Vec<(String, u64)> = file_resume_lines
+            .iter()
+            .map(|(url, line)| (redact_url(url), *line))
+            .collect();
+        let completed_output_files: Vec<String> = completed_output_files
+            .iter()
+            .map(|url| redact_url(url))
+            .collect();
+        f.debug_struct("ManifestWorkerView")
+            .field("manifest_id", manifest_id)
+            .field("manifest_url", &manifest_url.as_deref().map(redact_url))
+            .field("fhir_base_url", &fhir_base_url.as_deref().map(redact_url))
+            .field("output_format", output_format)
+            .field("file_request_headers", &header_names(file_request_headers))
+            .field("oauth_metadata_urls", oauth_metadata_urls)
+            .field(
+                "file_encryption_key",
+                &file_encryption_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("import_directives", import_directives)
+            .field("metadata", metadata)
+            .field("last_processed_line", last_processed_line)
+            .field("file_resume_lines", &file_resume_lines)
+            .field("completed_output_files", &completed_output_files)
+            .field("fhir_version", fhir_version)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ManifestFetchParams<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            fhir_base_url,
+            output_format,
+            file_request_headers,
+            oauth_metadata_urls,
+            file_encryption_key,
+            import_directives,
+            metadata,
+        } = self;
+        f.debug_struct("ManifestFetchParams")
+            .field("fhir_base_url", &fhir_base_url.map(redact_url))
+            .field("output_format", output_format)
+            .field("file_request_headers", &header_names(file_request_headers))
+            .field("oauth_metadata_urls", oauth_metadata_urls)
+            .field(
+                "file_encryption_key",
+                &file_encryption_key.map(|_| "[redacted]"),
+            )
+            .field("import_directives", import_directives)
+            .field("metadata", metadata)
+            .finish()
+    }
 }
 
 /// A finalized status-manifest artifact (output / error / deleted NDJSON part) to record.
@@ -3456,6 +3544,45 @@ fn tally_severity(oo: &Value, acc: &mut std::collections::BTreeMap<String, u64>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_views_debug_redact_headers_keys_and_urls() {
+        let headers = vec![("Authorization".to_string(), "Bearer hdr-s3cret".to_string())];
+        let key = json!({"kty": "oct", "k": "jwe-s3cret"});
+        let view = ManifestWorkerView {
+            manifest_id: "manifest-1".to_string(),
+            manifest_url: Some("https://provider.example/m.json?sig=url-s3cret".to_string()),
+            fhir_base_url: None,
+            output_format: None,
+            file_request_headers: headers.clone(),
+            oauth_metadata_urls: Vec::new(),
+            file_encryption_key: Some(key.clone()),
+            import_directives: Vec::new(),
+            metadata: Vec::new(),
+            last_processed_line: 0,
+            file_resume_lines: vec![("https://p.example/a.ndjson?sig=res-s3cret".to_string(), 3)],
+            completed_output_files: vec!["https://p.example/b.ndjson?sig=done-s3cret".to_string()],
+            fhir_version: FhirVersion::default(),
+        };
+        let params = ManifestFetchParams {
+            file_request_headers: &headers,
+            file_encryption_key: Some(&key),
+            ..Default::default()
+        };
+        for out in [format!("{view:?}"), format!("{params:?}")] {
+            for secret in [
+                "hdr-s3cret",
+                "jwe-s3cret",
+                "url-s3cret",
+                "res-s3cret",
+                "done-s3cret",
+            ] {
+                assert!(!out.contains(secret), "{secret} leaked: {out}");
+            }
+            assert!(out.contains("Authorization"), "{out}");
+        }
+        assert!(format!("{view:?}").contains("manifest-1"));
+    }
     use crate::backends::local_fs::LocalFsOutputStore;
     use crate::backends::sqlite::SqliteBackend;
     use crate::core::ManifestStatus;
