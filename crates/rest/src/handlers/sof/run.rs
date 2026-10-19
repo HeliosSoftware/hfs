@@ -546,7 +546,18 @@ where
         .await;
     }
 
-    // Buffered paths (csv, json array, enveloped parquet/arrow) — collect the stream first.
+    // Streaming path for csv and the json array: rows are encoded one at a
+    // time into the same bytes the buffered formatters produce. The envelope
+    // forfeits streaming for the same reason as above.
+    if matches!(
+        content_type,
+        ContentType::Csv | ContentType::CsvWithHeader | ContentType::Json
+    ) && !wants_envelope
+    {
+        return streaming_rows_response(stream, content_type, &view_json, runner_label).await;
+    }
+
+    // Buffered paths (enveloped csv/json/parquet/arrow) — collect the stream first.
     let (ct, body) =
         format_stream(stream, content_type, &view_json, parquet_options.as_ref()).await?;
     buffered_response(ct, body, wants_envelope, runner_label, &format)
@@ -1060,6 +1071,121 @@ fn streaming_ndjson_response(
     });
 
     channel_body_response(rx, "application/x-ndjson", runner_label)
+}
+
+/// Streams a `RowStream` as csv or a pretty-printed json array.
+///
+/// The bytes are those of `format_csv` / `format_json` (see
+/// [`helios_sof::RowStreamEncoder`]), produced row by row so the result set is
+/// never held in memory. The first [`SCHEMA_SAMPLE_ROWS`] rows are encoded
+/// before anything is sent, so an error inside that prefix still returns a real
+/// error status; past it the `200` is committed and a row error aborts the
+/// chunked body (no terminating chunk, so the client sees a failed body, not a
+/// truncated array) like the NDJSON path.
+async fn streaming_rows_response(
+    mut stream: helios_persistence::core::sof_runner::RowStream,
+    content_type: ContentType,
+    view_json: &Value,
+    runner_label: Option<&str>,
+) -> Result<Response, RestError> {
+    let mut encoder = helios_sof::RowStreamEncoder::new(content_type).ok_or_else(|| {
+        RestError::InternalError {
+            message: format!("{content_type:?} cannot be streamed row by row"),
+        }
+    })?;
+
+    let mut head: Vec<u8> = Vec::new();
+    let mut ended = false;
+    for _ in 0..SCHEMA_SAMPLE_ROWS {
+        match stream.next().await {
+            Some(Ok(row)) => {
+                encoder.push_row(row).map_err(map_sof_lib_error_to_rest)?;
+                head.extend(encoder.take().map_err(map_sof_lib_error_to_rest)?);
+            }
+            Some(Err(e)) => {
+                warn!(error = %e, "row error before the response started");
+                return Err(map_sof_error_to_rest(e));
+            }
+            None => {
+                ended = true;
+                break;
+            }
+        }
+    }
+    // The buffered path rejects a bad declared column once the rows are in.
+    try_declared_columns(view_json).map_err(map_sof_lib_error_to_rest)?;
+    // A stream that ended inside the prefix is already complete.
+    let encoder = if ended {
+        head.extend(encoder.finish().map_err(map_sof_lib_error_to_rest)?);
+        None
+    } else {
+        Some(encoder)
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let abort = |message: String| std::io::Error::other(message);
+        if !head.is_empty() && tx.send(Ok(axum::body::Bytes::from(head))).await.is_err() {
+            return;
+        }
+        let Some(mut encoder) = encoder else {
+            return;
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            // Stop as soon as the client is gone, even if the runner is slow.
+            let item = tokio::select! {
+                _ = tx.closed() => return,
+                item = stream.next() => item,
+            };
+            let Some(item) = item else { break };
+            let pushed = match item {
+                Ok(row) => encoder.push_row(row).and_then(|()| encoder.take()),
+                Err(e) => {
+                    warn!(error = %e, "row error while streaming rows");
+                    let _ = tx
+                        .send(Err(abort(format!("row error while streaming rows: {e}"))))
+                        .await;
+                    return;
+                }
+            };
+            match pushed {
+                Ok(bytes) => buf.extend(bytes),
+                Err(e) => {
+                    warn!(error = %e, "row encoding failed while streaming rows");
+                    let _ = tx
+                        .send(Err(abort(format!("row encoding failed: {e}"))))
+                        .await;
+                    return;
+                }
+            }
+            if buf.len() >= COLUMNAR_CHUNK_BYTES
+                && tx
+                    .send(Ok(axum::body::Bytes::from(std::mem::take(&mut buf))))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+        match encoder.finish() {
+            Ok(tail) => {
+                buf.extend(tail);
+                let _ = tx.send(Ok(axum::body::Bytes::from(buf))).await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Err(abort(format!("row encoding failed: {e}"))))
+                    .await;
+            }
+        }
+    });
+
+    Ok(channel_body_response(
+        rx,
+        content_type_headers(content_type).0,
+        runner_label,
+    ))
 }
 
 /// Wraps a channel of body chunks into a `200` response. An `Err` item aborts
@@ -1982,6 +2108,91 @@ mod tests {
             .expect("a clean stream should produce a collectable body");
         let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
         assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n");
+    }
+
+    async fn rows_response(
+        rows: Vec<Result<Value, SofError>>,
+        ct: ContentType,
+    ) -> Result<Response, RestError> {
+        streaming_rows_response(row_stream(rows), ct, &typed_view(), Some("test-runner")).await
+    }
+
+    #[tokio::test]
+    async fn streaming_json_and_csv_match_the_buffered_formatters() {
+        // More rows than the prefix and than one body chunk, so every phase runs.
+        let raw = numbered_rows(5_000);
+        let values: Vec<Value> = raw.iter().map(|r| r.as_ref().unwrap().clone()).collect();
+        for ct in [
+            ContentType::Json,
+            ContentType::Csv,
+            ContentType::CsvWithHeader,
+        ] {
+            let response = rows_response(numbered_rows(5_000), ct).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                content_type_headers(ct).0
+            );
+            let streamed = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let (_, buffered) =
+                format_stream(row_stream(numbered_rows(5_000)), ct, &typed_view(), None)
+                    .await
+                    .unwrap();
+            assert_eq!(streamed.to_vec(), buffered, "{ct:?}");
+            assert_eq!(
+                buffered,
+                helios_sof::format_output(
+                    helios_sof::rows_to_processed_result(values.clone()),
+                    ct,
+                    None
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_json_empty_result_is_an_empty_array() {
+        let response = rows_response(vec![], ContentType::Json).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"[]");
+    }
+
+    #[tokio::test]
+    async fn streaming_rows_error_inside_the_prefix_is_a_real_status() {
+        let mut rows = numbered_rows(3);
+        rows.push(Err(SofError::Cancelled));
+        for ct in [ContentType::Json, ContentType::Csv] {
+            assert!(
+                rows_response(rows_clone(&rows), ct).await.is_err(),
+                "{ct:?}"
+            );
+        }
+    }
+
+    fn rows_clone(rows: &[Result<Value, SofError>]) -> Vec<Result<Value, SofError>> {
+        rows.iter()
+            .map(|r| match r {
+                Ok(v) => Ok(v.clone()),
+                Err(_) => Err(SofError::Cancelled),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streaming_rows_error_after_the_prefix_aborts_the_body() {
+        let mut rows = numbered_rows(SCHEMA_SAMPLE_ROWS + 10);
+        rows.push(Err(SofError::Cancelled));
+        for ct in [ContentType::Json, ContentType::CsvWithHeader] {
+            let response = rows_response(rows_clone(&rows), ct).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let collected = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+            assert!(collected.is_err(), "{ct:?}: the aborted body must fail");
+        }
     }
 
     #[tokio::test]
