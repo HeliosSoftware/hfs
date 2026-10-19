@@ -10,9 +10,12 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 41;
+pub const SCHEMA_VERSION: i32 = 42;
 
-/// The `search_index` value indexes. Excludes `idx_search_composite`, which the
+/// The `search_index` value indexes. `idx_search_token`, `idx_search_quantity`
+/// and `idx_search_composite_cov` end in (or carry) `resource_key`, so the
+/// `rowid IN (SELECT resource_key FROM search_index ...)` membership
+/// subqueries are answered from the index alone (v42). Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
 /// dropped in v29 for write volume (#945): `value_token_display` is populated on
 /// most Coding rows but its only reader is the uncommon token `:text` /
@@ -24,14 +27,14 @@ pub const SCHEMA_VERSION: i32 = 41;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 16] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 17] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
     ),
     (
         "idx_search_token",
-        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code, resource_key) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
     ),
     (
         "idx_search_date",
@@ -51,7 +54,7 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 16] = [
     ),
     (
         "idx_search_quantity",
-        "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit, resource_key) WHERE value_quantity_value IS NOT NULL",
     ),
     (
         "idx_search_reference",
@@ -88,6 +91,10 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 16] = [
     (
         "idx_search_contained_composite_legacy",
         "CREATE INDEX IF NOT EXISTS idx_search_contained_composite_legacy ON search_index(tenant_id, contained_type, param_name) WHERE is_contained = 1 AND composite_group IS NOT NULL AND composite_slot IS NULL",
+    ),
+    (
+        "idx_search_composite_cov",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_cov ON search_index(tenant_id, resource_type, param_name, resource_key, composite_group, composite_slot, value_token_system, value_token_code, value_quantity_value, value_quantity_unit, value_quantity_system) WHERE composite_group IS NOT NULL AND is_contained = 0",
     ),
 ];
 
@@ -483,6 +490,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             38 => migrate_v38_to_v39(conn)?,
             39 => migrate_v39_to_v40(conn)?,
             40 => migrate_v40_to_v41(conn)?,
+            41 => migrate_v41_to_v42(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2176,6 +2184,56 @@ fn migrate_v40_to_v41(conn: &Connection) -> StorageResult<()> {
         .map_err(|e| migration_err(format!("v41 terminology tables: {e}")))
 }
 
+/// Migrate from schema version 41 to version 42.
+///
+/// Makes the value indexes behind the hottest search shapes covering by
+/// appending `resource_key`: `idx_search_quantity` and `idx_search_token` are
+/// extended in place (same names, same partial predicates), and
+/// `idx_search_composite_cov` is added beside `idx_search_composite`, which the
+/// delete-by-resource path still needs. Without `resource_key` every index hit
+/// costs a random read of its `search_index` row just to fetch the key for the
+/// membership subquery. Measured on a 30% corpus copy: value-quantity `lt`
+/// 3.3 s -> 0.04 s, category 0.54 s -> 0.025 s, composite 0.9 s -> 0.055 s, for
+/// about +490 MB of file. Each build scans `search_index` and can take minutes
+/// on a large database, so progress is logged per index. An index already of
+/// the new shape is left alone, so a replay costs nothing.
+fn migrate_v41_to_v42(conn: &Connection) -> StorageResult<()> {
+    for (name, current_marker) in [
+        (
+            "idx_search_quantity",
+            "%value_quantity_unit, resource_key)%",
+        ),
+        ("idx_search_token", "%value_token_code, resource_key)%"),
+        ("idx_search_composite_cov", "%"),
+    ] {
+        let started = std::time::Instant::now();
+        let is_current: bool = conn
+            .query_row(
+                "SELECT sql LIKE ?2 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                rusqlite::params![name, current_marker],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !is_current {
+            conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                .map_err(|e| migration_err(format!("v42 drop {name}: {e}")))?;
+            let sql = SEARCH_VALUE_INDEXES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, sql)| *sql)
+                .expect("v42 index is in SEARCH_VALUE_INDEXES");
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("v42 create {name}: {e}")))?;
+            tracing::info!(
+                index = name,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Built covering search index"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn migration_err(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(crate::error::BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -3266,6 +3324,58 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    /// v41 -> v42: the old-shape quantity/token indexes are rebuilt with
+    /// `resource_key`, the covering composite index is added, and a replay is a
+    /// no-op. A subquery over the new indexes must be answered covering.
+    #[test]
+    fn migrate_v41_to_v42_makes_value_indexes_covering() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_search_quantity;
+             DROP INDEX idx_search_token;
+             DROP INDEX idx_search_composite_cov;
+             CREATE INDEX idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL;
+             CREATE INDEX idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL;",
+        )
+        .unwrap();
+        set_schema_version(&conn, 41).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let sql_of = |name: &str| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(sql_of("idx_search_quantity").contains("value_quantity_unit, resource_key)"));
+        assert!(sql_of("idx_search_token").contains("value_token_code, resource_key)"));
+        assert!(
+            sql_of("idx_search_composite_cov")
+                .contains("param_name, resource_key, composite_group")
+        );
+        // The quantity subquery is covering.
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT resource_key FROM search_index WHERE tenant_id = ?1 \
+                 AND resource_type = ?2 AND param_name = 'value-quantity' AND value_quantity_value > 100",
+            )
+            .unwrap()
+            .query_map(["t", "Observation"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("COVERING INDEX idx_search_quantity")),
+            "plan: {plan:?}"
+        );
+        // Replay is a no-op.
+        migrate_v41_to_v42(&conn).unwrap();
+    }
+
     #[test]
     fn composite_slot_migration_preserves_legacy_rows_and_replays() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3278,6 +3388,7 @@ mod tests {
         conn.execute_batch(
             "DROP INDEX idx_search_composite_legacy;
              DROP INDEX idx_search_contained_composite_legacy;
+             DROP INDEX idx_search_composite_cov;
              ALTER TABLE search_index DROP COLUMN composite_slot;
              PRAGMA foreign_keys = OFF;
              INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
