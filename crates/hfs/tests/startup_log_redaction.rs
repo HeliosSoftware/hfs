@@ -163,7 +163,13 @@ fn malformed_mongodb_startup_url_is_redacted_wholesale() {
 #[test]
 fn postgres_startup_omits_password_delimiters() {
     const MARKER: &str = "Initializing PostgreSQL backend from connection string";
-    for separator in ["/", "?"] {
+    // hfs's connection-string parser stops at the first `?`, so with `?` in
+    // the password it falls back to its default server; the line names the
+    // server it contacts, not the driver's reading of the URL.
+    for (separator, redacted) in [
+        ("/", "postgres://127.0.0.1:9/hfs"),
+        ("?", "postgres://localhost:5432/helios"),
+    ] {
         let url = format!("postgres://hfs:{SECRET}{separator}suffix@127.0.0.1:9/hfs");
         let output = startup_output(
             &[
@@ -172,7 +178,7 @@ fn postgres_startup_omits_password_delimiters() {
             ],
             MARKER,
         );
-        assert_logged_redacted(&output, MARKER, "postgres://127.0.0.1:9/hfs");
+        assert_logged_redacted(&output, MARKER, redacted);
     }
 }
 

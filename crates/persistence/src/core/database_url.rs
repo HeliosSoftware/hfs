@@ -15,6 +15,8 @@ use mongodb::options::{ConnectionString, HostInfo, ServerAddress};
 use tokio_postgres::{Config, config::Host};
 
 const REDACTED: &str = "[redacted]";
+#[cfg(feature = "postgres")]
+const DEFAULT_POSTGRES_PORT: u16 = 5432;
 
 /// Return a database location without credentials or connection options.
 ///
@@ -38,6 +40,31 @@ pub fn redact_database_url(input: &str, backend: &str) -> String {
     }
 }
 
+/// Return the PostgreSQL server a connection string was resolved to, for logs.
+///
+/// `host`, `port` and `dbname` are what the caller parsed out of `url` and will
+/// connect with. Logging them rather than the driver's reading of `url` keeps
+/// the line truthful when the caller's parser and the driver's disagree, or
+/// when environment overrides apply. If the driver finds `url` invalid or
+/// ambiguous, the whole value is redacted: a caller's parser may then have
+/// read part of a password as the host or database.
+#[cfg(feature = "postgres")]
+pub fn redact_postgres_location(url: &str, host: &str, port: u16, dbname: &str) -> String {
+    if postgres_location(url).is_none() {
+        return REDACTED.to_owned();
+    }
+    let scheme = if url.starts_with("postgresql://") {
+        "postgresql"
+    } else {
+        "postgres"
+    };
+    location(
+        scheme,
+        &[format!("{}:{port}", encode_host(host))],
+        Some(dbname),
+    )
+}
+
 #[cfg(feature = "postgres")]
 fn postgres_location(input: &str) -> Option<String> {
     let uri = input.starts_with("postgres://") || input.starts_with("postgresql://");
@@ -50,35 +77,37 @@ fn postgres_location(input: &str) -> Option<String> {
     } else {
         "postgres"
     };
+    // `(location, is_tcp)`: a port only means something for a TCP host here.
     let mut hosts = config
         .get_hosts()
         .iter()
         .map(|host| match host {
-            Host::Tcp(host) => Some(encode_host(host)),
+            Host::Tcp(host) => Some((encode_host(host), true)),
             #[cfg(unix)]
-            Host::Unix(path) => Some(encode_component(path.to_str()?)),
+            Host::Unix(path) => Some((encode_component(path.to_str()?), false)),
         })
         .collect::<Option<Vec<_>>>()?;
     if hosts.is_empty() {
         hosts = config
             .get_hostaddrs()
             .iter()
-            .map(|address| encode_host(&address.to_string()))
+            .map(|address| (encode_host(&address.to_string()), true))
             .collect();
     }
-    for (index, host) in hosts.iter_mut().enumerate() {
-        // A single configured port applies to every host.
-        let ports = config.get_ports();
-        if let Some(port) = ports.get(index).or_else(|| {
-            if ports.len() == 1 {
-                ports.first()
-            } else {
-                None
-            }
-        }) {
+    let ports = config.get_ports();
+    for (index, (host, tcp)) in hosts.iter_mut().enumerate() {
+        // A single configured port applies to every host. With none, show the
+        // driver default so URI and keyword/value strings log alike.
+        let port = match ports.len() {
+            0 if *tcp => Some(&DEFAULT_POSTGRES_PORT),
+            1 => ports.first(),
+            _ => ports.get(index),
+        };
+        if let Some(port) = port {
             write!(host, ":{port}").ok()?;
         }
     }
+    let hosts = hosts.into_iter().map(|(host, _)| host).collect::<Vec<_>>();
     Some(location(scheme, &hosts, config.get_dbname()))
 }
 
@@ -203,7 +232,7 @@ mod tests {
             ),
             (
                 "host=db user=user password='escaped\\'secret' dbname=hts",
-                "postgres://db/hts",
+                "postgres://db:5432/hts",
             ),
             (
                 "postgres://user:secret/with/slashes@db:5432/hts",
@@ -242,7 +271,7 @@ mod tests {
                 "host='db@other,host' password=secret dbname='db?query#fragment\nline'",
                 "postgres"
             ),
-            "postgres://db%40other,host/db%3Fquery%23fragment%0Aline"
+            "postgres://db%40other:5432,host:5432/db%3Fquery%23fragment%0Aline"
         );
         #[cfg(unix)]
         assert_eq!(
@@ -266,6 +295,39 @@ mod tests {
         ] {
             assert_eq!(redact_database_url(input, "postgres"), "[redacted]");
         }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_location_names_the_resolved_server() {
+        use super::redact_postgres_location;
+
+        // The caller's parser stopped at `?` and fell back to its defaults:
+        // the line names that server, not the one the driver would read.
+        assert_eq!(
+            redact_postgres_location(
+                "postgresql://user:secret?suffix@db:5433/hts",
+                "localhost",
+                5432,
+                "helios"
+            ),
+            "postgresql://localhost:5432/helios"
+        );
+        assert_eq!(
+            redact_postgres_location("postgres://user:secret@db/hts", "db@x", 5432, "a/b"),
+            "postgres://db%40x:5432/a%2Fb"
+        );
+        // Ambiguous to the driver: the caller may have read the password's
+        // tail as the host.
+        assert_eq!(
+            redact_postgres_location(
+                "postgres://user:prefix@secret@db/hts",
+                "secret@db",
+                5432,
+                "hts"
+            ),
+            "[redacted]"
+        );
     }
 
     #[cfg(feature = "mongodb")]

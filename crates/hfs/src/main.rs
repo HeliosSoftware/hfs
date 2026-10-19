@@ -26,8 +26,10 @@ use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
 use helios_auth::{AuthConfig, JwksBearerAuthProvider, JwksCache};
-#[cfg(any(feature = "postgres", feature = "mongodb"))]
+#[cfg(feature = "mongodb")]
 use helios_persistence::core::database_url::redact_database_url;
+#[cfg(feature = "postgres")]
+use helios_persistence::core::database_url::redact_postgres_location;
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
 use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::{info, warn};
@@ -1267,11 +1269,19 @@ async fn create_postgres_backend(
 
     let mut backend_config = if let Some(ref url) = config.database_url {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            let backend_config = PostgresBackend::config_from_connection_string(url)?;
+            // Log the server the parsed config will contact, which can differ
+            // from the driver's reading of `url` (#2142).
             info!(
-                url = %redact_database_url(url, "postgres"),
+                url = %redact_postgres_location(
+                    url,
+                    &backend_config.host,
+                    backend_config.port,
+                    &backend_config.dbname
+                ),
                 "Initializing PostgreSQL backend from connection string"
             );
-            PostgresBackend::config_from_connection_string(url)?
+            backend_config
         } else {
             info!("Initializing PostgreSQL backend from environment variables");
             PostgresBackend::config_from_env()
