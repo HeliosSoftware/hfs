@@ -1852,33 +1852,24 @@ impl SqliteBackend {
         }
         match prepared.rows {
             Ok(rows) => {
-                // Rows are written eight at a time: a single-row INSERT stepped
-                // once per row spends a measurable share of its time entering
-                // and leaving the statement, and every resource writes ~10-30
-                // rows. The B-tree work is unchanged; only the per-statement
-                // overhead is amortized (measured +9% bulk-ingest throughput
-                // on the real 31 GB manifest).
+                // One multi-row INSERT carries the resource's whole index: a
+                // single-row INSERT stepped once per row spends a measurable
+                // share of its time entering and leaving the statement, and
+                // every resource writes ~10-30 rows (eight at a time left up
+                // to seven single-row steps behind). The rows, their order
+                // and the B-tree work are unchanged; only the per-statement
+                // overhead is amortized.
                 let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
-                let mut i = 0;
-                while i + 8 <= rows.len() {
-                    let refs: Vec<&dyn ToSql> = rows[i..i + 8]
+                for chunk in rows.chunks(SqliteSearchIndexWriter::MAX_ROWS_PER_INSERT) {
+                    let refs: Vec<&dyn ToSql> = chunk
                         .iter()
                         .flatten()
                         .map(|p| self.sql_value_to_ref(p))
                         .collect();
-                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows8())
+                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows(chunk.len()))
                         .and_then(|mut s| s.execute(refs.as_slice()))
                         .map_err(|e| internal_error(format!("multi-row index insert: {e}")))?;
-                    i += 8;
-                    count += 8;
-                }
-                for row in &rows[i..] {
-                    let refs: Vec<&dyn ToSql> =
-                        row.iter().map(|p| self.sql_value_to_ref(p)).collect();
-                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
-                        .and_then(|mut s| s.execute(refs.as_slice()))
-                        .map_err(|e| internal_error(format!("index insert: {e}")))?;
-                    count += 1;
+                    count += chunk.len();
                 }
                 for row in &prepared.contained_rows {
                     let refs: Vec<&dyn ToSql> =
