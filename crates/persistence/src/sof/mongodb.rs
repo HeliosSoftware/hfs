@@ -153,9 +153,13 @@ impl SofRunner for MongoInDbRunner {
 
             let mut count = 0usize;
             loop {
-                // `Cursor::advance` is not cancel-safe, so it is never dropped
-                // half-polled. Poll the pinned future once; if it is waiting on
-                // a getMore, deliver the pending rows first, then keep waiting.
+                // Poll the pinned `advance` future once; if it is waiting on a
+                // getMore, deliver the pending rows (without awaiting, so no
+                // pool connection is held while the consumer is slow), then
+                // keep polling the same future. It is never re-created after
+                // a partial poll, which would restart a half-started getMore.
+                // (Returning on a closed receiver drops it mid-poll; harmless
+                // because the cursor is dropped too.)
                 let advanced = {
                     let mut advance = std::pin::pin!(cursor.advance());
                     match (&mut advance).now_or_never() {

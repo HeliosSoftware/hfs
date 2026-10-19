@@ -32,8 +32,8 @@ use serde_json::{Map, Value};
 use tracing::debug;
 
 use crate::core::sof_runner::{
-    RowStream, SofError, SofRunner, ViewFilters, ViewRow, row_batch_channel, row_stream,
-    watch_row_producer,
+    ROW_BATCH_SIZE, RowStream, SofError, SofRunner, ViewFilters, ViewRow, row_batch_channel,
+    row_stream, watch_row_producer,
 };
 use crate::sof::reference_resolver::{StorageReferenceResolver, collect_missing_references};
 use crate::tenant::TenantContext;
@@ -523,7 +523,7 @@ impl SofRunner for InProcessSofRunner {
                     }
                 };
 
-                // One engine chunk is one channel message; the cap can end it early.
+                // The cap can end a chunk early.
                 let mut out: Vec<ViewRow> = Vec::with_capacity(result.rows.len());
                 let mut capped = false;
                 for row in &result.rows {
@@ -536,8 +536,14 @@ impl SofRunner for InProcessSofRunner {
                     emitted += 1;
                     out.push(row_to_view_row(&columns, &row.values));
                 }
-                if !out.is_empty() && row_tx.blocking_send(Ok(out)).is_err() {
-                    return;
+                // Pieces of ROW_BATCH_SIZE, so one chunk with many rows per
+                // resource cannot become one huge message.
+                while !out.is_empty() {
+                    let rest = out.split_off(out.len().min(ROW_BATCH_SIZE));
+                    let piece = std::mem::replace(&mut out, rest);
+                    if row_tx.blocking_send(Ok(piece)).is_err() {
+                        return;
+                    }
                 }
                 if capped {
                     return;

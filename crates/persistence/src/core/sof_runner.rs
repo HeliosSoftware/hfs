@@ -154,8 +154,9 @@ pub type RowSender = mpsc::Sender<Result<ViewRow, SofError>>;
 /// Rows per message on a runner's row channel.
 pub const ROW_BATCH_SIZE: usize = 256;
 
-/// Row-channel depth, in batches. Two batches of [`ROW_BATCH_SIZE`] rows keep
-/// about as many rows in flight as the old 256-row, one-row-per-message channel.
+/// Row-channel depth, in batches. In flight are about 4 batches of
+/// [`ROW_BATCH_SIZE`] rows: 2 queued, 1 being filled by the producer and 1
+/// being unpacked by the consumer.
 pub const ROW_CHANNEL_DEPTH: usize = 2;
 
 /// Longest a blocking producer holds a partial batch back. A selective view
