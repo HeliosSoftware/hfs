@@ -1137,6 +1137,22 @@ fn lower_boundary(
     }
 }
 
+/// `key(l, r)` that is null when either operand is null. The right operand is
+/// only bound (and so only evaluated) once the left is known to be non-null:
+/// `$let` evaluates its vars eagerly, while the old `$or` short-circuited, and
+/// `r` may throw (`$divide` by zero, `$concat` of a non-string). Bound variables
+/// are safe from capture because every operand is a closed expression.
+fn null_guarded_comparison(key: &str, l: Bson, r: Bson) -> Bson {
+    let is_null =
+        |v: &Bson| doc! { "$eq": [doc! { "$ifNull": [v.clone(), Bson::Null] }, Bson::Null] };
+    bind_once(l, "cse_lhs", |l| {
+        let on_non_null_left = bind_once(r, "cse_rhs", |r| {
+            doc! { "$cond": [is_null(&r), Bson::Null, doc! { key: [l.clone(), r] }] }.into()
+        });
+        doc! { "$cond": [is_null(&l), Bson::Null, on_non_null_left] }.into()
+    })
+}
+
 fn lower_binop(op: BinOp, lhs: &SqlExpr, rhs: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
     // AND/OR coerce their operands to booleans; the rest operate on values.
     if matches!(op, BinOp::And | BinOp::Or) {
@@ -1174,20 +1190,7 @@ fn lower_binop(op: BinOp, lhs: &SqlExpr, rhs: &SqlExpr, ctx: &Ctx) -> Result<Bso
         // (null/missing) the result is null, not a boolean. SQL gets this from
         // `NULL = x → NULL`; Mongo's `$eq`/`$lt`/… return a boolean, so guard
         // explicitly. (Arithmetic/`$concat` already propagate null in Mongo.)
-        Ok(bind_once(l, "cse_lhs", |l| {
-            bind_once(r, "cse_rhs", |r| {
-                let either_null = doc! {
-                    "$or": [
-                        doc! { "$eq": [doc! { "$ifNull": [l.clone(), Bson::Null] }, Bson::Null] },
-                        doc! { "$eq": [doc! { "$ifNull": [r.clone(), Bson::Null] }, Bson::Null] },
-                    ]
-                };
-                doc! {
-                    "$cond": [either_null, Bson::Null, doc! { key: [l, r] }]
-                }
-                .into()
-            })
-        }))
+        Ok(null_guarded_comparison(key, l, r))
     } else {
         Ok(doc! { key: [l, r] }.into())
     }
@@ -1276,8 +1279,9 @@ mod tests {
     use helios_fhir::FhirVersion;
     use serde_json::json;
 
+    use super::null_guarded_comparison;
     use crate::sof::compiler::compile_view_definition_mongo;
-    use mongodb::bson::{Bson, Document};
+    use mongodb::bson::{Bson, Document, doc};
 
     fn compile(view: serde_json::Value) -> Vec<mongodb::bson::Document> {
         compile_view_definition_mongo(&view, FhirVersion::R4)
@@ -1376,6 +1380,50 @@ mod tests {
         let rendered = format!("{pipeline:?}");
         assert!(rendered.contains("$let"), "expected $let bindings");
         assert!(rendered.contains("$$cse_nav"), "expected bound navigation");
+    }
+
+    #[test]
+    fn comparison_right_operand_is_not_evaluated_for_null_left() {
+        // A throwing right operand ($divide by zero) must stay inside the
+        // non-null branch, not in the outer $let vars.
+        let r = Bson::Document(doc! { "$divide": ["$a", 0] });
+        let out = null_guarded_comparison("$eq", Bson::Document(doc! { "$first": "$x" }), r);
+        let outer = out.as_document().unwrap().get_document("$let").unwrap();
+        let vars = outer.get_document("vars").unwrap();
+        assert!(vars.contains_key("cse_lhs") && !vars.contains_key("cse_rhs"));
+        let cond = outer
+            .get_document("in")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        assert!(
+            !format!("{:?}", cond[0]).contains("$divide"),
+            "guard must not touch r"
+        );
+        assert!(
+            format!("{:?}", cond[2]).contains("$divide"),
+            "r lives in the else branch"
+        );
+    }
+
+    #[test]
+    fn nested_comparisons_bind_only_the_left_outside() {
+        let inner = |k| {
+            null_guarded_comparison(
+                k,
+                doc! { "$first": "$a" }.into(),
+                doc! { "$first": "$b" }.into(),
+            )
+        };
+        let out = null_guarded_comparison("$eq", inner("$eq"), inner("$lt"));
+        let vars = out
+            .as_document()
+            .unwrap()
+            .get_document("$let")
+            .unwrap()
+            .get_document("vars")
+            .unwrap();
+        assert_eq!(vars.keys().collect::<Vec<_>>(), ["cse_lhs"]);
     }
 
     #[test]
