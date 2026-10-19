@@ -362,13 +362,21 @@ jobs:
     # runs a second full ES + Postgres + Mongo suite after `test-rust`; when this
     # job only needed `test-rust` it fired before `coverage` had even started, so
     # coverage's containers survived every sweep.
-    needs: [test-rust, coverage]
+    #
+    # On tag pushes `ci-extended` (beta + nightly full suites) runs as a reusable
+    # workflow inside *this* run, so its containers carry this `github.run_id`
+    # too. Without it in `needs`, the reap below fired as soon as coverage
+    # finished and killed the beta leg's live Mongo container mid-suite (v0.2.5,
+    # run 39168527669: 12 connection-refused failures). It is skipped on
+    # non-tag runs, which `always()` tolerates.
+    needs: [test-rust, coverage, ci-extended]
     if: always()
     env:
       # Orphan sweep only. Must comfortably exceed the longest CI job runtime so
       # a *concurrent* run's live containers on the shared docker host are never
-      # killed mid-test.
-      MAX_CONTAINER_AGE_MIN: 90
+      # killed mid-test. The extended beta/nightly legs run ~90 minutes, so 90
+      # was not enough; 180 matches the docker-host-gc default.
+      MAX_CONTAINER_AGE_MIN: 180
     steps:
       # Only the composite action is needed here, not the tree — a cone-mode
       # sparse checkout keeps this job as cheap as it was before it had any
