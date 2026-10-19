@@ -1670,6 +1670,13 @@ async fn build_backend(mut config: MongoBackendConfig) -> Option<MongoBackend> {
     // Generation-2 indexes are built after boot by default; tests assert
     // winning plans right after boot, so they wait for the build.
     config.index_build = IndexBuildMode::Inline;
+    // Second configuration of the whole suite: the batched Bundle write path
+    // (`HFS_TEST_MONGODB_BUNDLE_BATCH_WRITES=true`).
+    if std::env::var("HFS_TEST_MONGODB_BUNDLE_BATCH_WRITES")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        config.bundle_batch_writes = true;
+    }
     let mut attempt = 1;
     loop {
         let backend = MongoBackend::new(config.clone())
@@ -23929,6 +23936,9 @@ mod covered_membership;
 
 #[path = "mongodb/transaction_regressions.rs"]
 mod transaction_regressions;
+
+#[path = "mongodb/transaction_batch_writes.rs"]
+mod transaction_batch_writes;
 
 /// Runs one `bundle_identity_suite` scenario on a backend with the full
 /// registry, skipped where transactions are unavailable.

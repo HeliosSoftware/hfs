@@ -4988,8 +4988,15 @@ impl MongoBackend {
     ///    `resource_history`, `search_index` and `search_index_contained`.
     ///
     /// The per-entry path's `delete_many` on the search collections is
-    /// skipped: the ids are new, so no rows exist. The first failing entry is
-    /// the one reported, as in the per-entry path. On any failure the
+    /// skipped: the ids are new, so no rows exist. (Only orphan rows left by
+    /// an interrupted earlier write could exist for an id with no resource;
+    /// that is very unlikely and accepted for this opt-in path.)
+    ///
+    /// Memory: the whole Bundle's documents are held at once (payload twice, for
+    /// `resources` and `resource_history`, plus search rows). The per-entry
+    /// path bounds nothing either; the request body limit bounds the Bundle.
+    ///
+    /// The first failing entry is the one reported, as in the per-entry path. On any failure the
     /// transaction is aborted and the attempt error returned.
     #[allow(clippy::too_many_arguments)]
     async fn batch_create_bundle_entries(
@@ -5017,6 +5024,9 @@ impl MongoBackend {
         let mut history_docs: Vec<Document> = Vec::with_capacity(entry_count);
         let mut own_rows: Vec<Document> = Vec::new();
         let mut contained_rows: Vec<Document> = Vec::new();
+        // Entry index of each search row, so a write error maps back to its entry.
+        let mut own_owners: Vec<usize> = Vec::new();
+        let mut contained_owners: Vec<usize> = Vec::new();
         let mut identities: Vec<(String, String)> = Vec::with_capacity(entry_count);
         let mut seen: HashSet<(String, String)> = HashSet::with_capacity(entry_count);
         let mut failure: Option<(usize, Failure)> = None;
@@ -5116,6 +5126,8 @@ impl MongoBackend {
             {
                 deferred.record(&resource_type, &id);
             } else {
+                own_owners.extend(std::iter::repeat_n(idx, search_documents.own.len()));
+                contained_owners.extend(std::iter::repeat_n(idx, search_documents.contained.len()));
                 own_rows.extend(search_documents.own);
                 contained_rows.extend(search_documents.contained);
             }
@@ -5146,6 +5158,9 @@ impl MongoBackend {
         }
 
         // (2) Existence: one find per resource type over the prepared ids.
+        // The filter carries no `is_deleted` clause, exactly like the
+        // per-entry `find_one`: a tombstone still occupies its id, so
+        // re-creating a deleted id fails with `AlreadyExists` on both paths.
         // An existing row at or before the failing entry wins, because the
         // per-entry path checks an entry before it records it.
         let existing_index = {
@@ -5183,7 +5198,11 @@ impl MongoBackend {
                         }
                         Err(e) => {
                             let _ = session.abort_transaction().await;
-                            return Err(entry_attempt_error(0, entry_count, &e));
+                            return Err(entry_attempt_error(
+                                entry_count.saturating_sub(1),
+                                entry_count,
+                                &e,
+                            ));
                         }
                     }
                 }
@@ -5215,33 +5234,41 @@ impl MongoBackend {
         }
 
         // (3) Chunked unordered inserts, all in the Bundle's session.
-        let inserts: [(&str, Vec<Document>, &str, usize); 4] = [
+        // Each document list carries the entry index of every document, so the
+        // driver's write-error index maps back to the entry the per-entry path
+        // would have blamed.
+        let one_to_one: Vec<usize> = (0..resource_docs.len()).collect();
+        let inserts: [(&str, Vec<Document>, Vec<usize>, &str, usize); 4] = [
             (
                 MongoBackend::RESOURCES_COLLECTION,
                 resource_docs,
+                one_to_one.clone(),
                 "Failed to insert resource in transaction",
                 BATCH_RESOURCE_INSERT_CHUNK,
             ),
             (
                 MongoBackend::RESOURCE_HISTORY_COLLECTION,
                 history_docs,
+                one_to_one,
                 "Failed to insert history in transaction",
                 BATCH_RESOURCE_INSERT_CHUNK,
             ),
             (
                 MongoBackend::SEARCH_INDEX_COLLECTION,
                 own_rows,
+                own_owners,
                 "Failed to insert search index entries",
                 SEARCH_INDEX_INSERT_CHUNK,
             ),
             (
                 MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
                 contained_rows,
+                contained_owners,
                 "Failed to insert search_index_contained entries",
                 SEARCH_INDEX_INSERT_CHUNK,
             ),
         ];
-        for (collection_name, docs, context, chunk_size) in inserts {
+        for (collection_name, docs, owners, context, chunk_size) in inserts {
             let collection = db.collection::<Document>(collection_name);
             let mut offset = 0usize;
             for chunk in docs.chunks(chunk_size) {
@@ -5252,33 +5279,31 @@ impl MongoBackend {
                     .await
                 {
                     let _ = session.abort_transaction().await;
-                    // Blame the entry of the first attributed write error;
-                    // only the `resources` collection's rows map 1:1 to entries.
+                    // Blame the entry owning the first failed write. A failure
+                    // with no per-write index (network, transient abort) blames
+                    // the last entry of the batch, never entry 0.
                     let attributed = match e.kind.as_ref() {
                         MongoErrorKind::InsertMany(insert) => insert
                             .write_errors
                             .iter()
                             .flatten()
-                            .map(|w| offset + w.index)
+                            .filter_map(|w| owners.get(offset + w.index).copied())
                             .min(),
                         _ => None,
                     };
-                    let one_to_one = collection_name == MongoBackend::RESOURCES_COLLECTION
-                        || collection_name == MongoBackend::RESOURCE_HISTORY_COLLECTION;
-                    let idx = attributed.filter(|_| one_to_one);
-                    let error = match idx {
-                        Some(i)
-                            if collection_name == MongoBackend::RESOURCES_COLLECTION
-                                && is_duplicate_key_error(&e) =>
-                        {
-                            StorageError::Resource(ResourceError::AlreadyExists {
-                                resource_type: identities[i].0.clone(),
-                                id: identities[i].1.clone(),
-                            })
-                        }
-                        _ => internal_driver_error(context, e),
+                    let idx = attributed.unwrap_or(entry_count.saturating_sub(1));
+                    let error = if collection_name == MongoBackend::RESOURCES_COLLECTION
+                        && attributed.is_some()
+                        && is_duplicate_key_error(&e)
+                    {
+                        StorageError::Resource(ResourceError::AlreadyExists {
+                            resource_type: identities[idx].0.clone(),
+                            id: identities[idx].1.clone(),
+                        })
+                    } else {
+                        internal_driver_error(context, e)
                     };
-                    return Err(entry_attempt_error(idx.unwrap_or(0), entry_count, &error));
+                    return Err(entry_attempt_error(idx, entry_count, &error));
                 }
                 offset += chunk.len();
             }
