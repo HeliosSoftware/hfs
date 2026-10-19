@@ -4304,12 +4304,13 @@ pub fn format_json(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     Ok(serde_json::to_vec_pretty(&output)?)
 }
 
-/// Incremental encoder for the JSON-array and CSV outputs of a row stream.
+/// Incremental encoder for the JSON-array, CSV and `fhir` outputs of a row stream.
 ///
 /// [`format_json`] and [`format_csv`] need the whole result in memory. This
 /// encoder produces the same bytes one row at a time, so a caller holding a
 /// stream of flat JSON-object rows (the REST SoF runner) can forward the body
-/// in chunks instead of buffering every row. Feed rows with
+/// in chunks instead of buffering every row. [`fhir`](RowStreamEncoder::fhir)
+/// does the same for [`fhir_format::format_view_fhir_parameters`]. Feed rows with
 /// [`push_row`](RowStreamEncoder::push_row), drain the encoded bytes with
 /// [`take`](RowStreamEncoder::take), and close with
 /// [`finish`](RowStreamEncoder::finish).
@@ -4330,6 +4331,7 @@ enum RowStreamKind {
         writer: Box<csv::Writer<SharedBuf>>,
         out: SharedBuf,
     },
+    Fhir(fhir_format::FhirRowEncoder),
 }
 
 /// A byte sink whose contents the encoder can take while the `csv` writer
@@ -4377,8 +4379,23 @@ impl RowStreamEncoder {
         })
     }
 
+    /// An encoder for the `fhir` format: a `Parameters` resource with one
+    /// `row` parameter per row, typed by the ViewDefinition's declared columns.
+    /// Fails, as [`fhir_format::format_view_fhir_parameters`] does, when the
+    /// declared columns are invalid.
+    pub fn fhir(view_json: &serde_json::Value) -> Result<Self, SofError> {
+        Ok(Self {
+            kind: RowStreamKind::Fhir(fhir_format::FhirRowEncoder::new(view_json)?),
+            columns: None,
+            rows: 0,
+        })
+    }
+
     /// Encodes one row. The first row fixes the columns.
     pub fn push_row(&mut self, row: serde_json::Value) -> Result<(), SofError> {
+        if let RowStreamKind::Fhir(encoder) = &mut self.kind {
+            return encoder.push_row(&row);
+        }
         let mut map = match row {
             serde_json::Value::Object(map) => map,
             _ => serde_json::Map::new(),
@@ -4418,6 +4435,7 @@ impl RowStreamEncoder {
                     .collect();
                 writer.write_record(&record)?;
             }
+            RowStreamKind::Fhir(_) => {} // encoded above
         }
         self.rows += 1;
         Ok(())
@@ -4431,6 +4449,7 @@ impl RowStreamEncoder {
                 writer.flush()?;
                 Ok(std::mem::take(&mut *out.lock()))
             }
+            RowStreamKind::Fhir(encoder) => Ok(encoder.take()),
         }
     }
 
@@ -4439,6 +4458,7 @@ impl RowStreamEncoder {
     /// buffered formatters.
     pub fn finish(mut self) -> Result<Vec<u8>, SofError> {
         match &mut self.kind {
+            RowStreamKind::Fhir(encoder) => return Ok(encoder.finish()),
             RowStreamKind::Json(out) => {
                 out.extend_from_slice(if self.rows == 0 { b"[]" } else { b"\n]" });
             }

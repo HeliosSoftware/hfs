@@ -507,20 +507,13 @@ where
         .await
         .map_err(map_sof_error_to_rest)?;
 
-    // `_format=fhir`: buffer the rows and render the typed `Parameters`
-    // resource, using the ViewDefinition's declared column types.
+    // `_format=fhir`: stream the typed `Parameters` resource row by row, using
+    // the ViewDefinition's declared column types.
     let Some(content_type) = content_type else {
-        let rows = drain_stream(stream).await?;
-        let result = helios_sof::rows_to_processed_result(rows);
-        let body =
-            format_view_fhir_parameters(&result, &view_json).map_err(map_sof_lib_error_to_rest)?;
-        return Ok(build_response(
-            StatusCode::OK,
-            FHIR_JSON_MIME,
-            body,
-            runner_label,
-            "fhir",
-        ));
+        let encoder =
+            helios_sof::RowStreamEncoder::fhir(&view_json).map_err(map_sof_lib_error_to_rest)?;
+        return streaming_rows_response(stream, encoder, &view_json, FHIR_JSON_MIME, runner_label)
+            .await;
     };
 
     // Streaming path for ndjson: forward rows incrementally. An envelope
@@ -554,7 +547,19 @@ where
         ContentType::Csv | ContentType::CsvWithHeader | ContentType::Json
     ) && !wants_envelope
     {
-        return streaming_rows_response(stream, content_type, &view_json, runner_label).await;
+        let encoder = helios_sof::RowStreamEncoder::new(content_type).ok_or_else(|| {
+            RestError::InternalError {
+                message: format!("{content_type:?} cannot be streamed row by row"),
+            }
+        })?;
+        return streaming_rows_response(
+            stream,
+            encoder,
+            &view_json,
+            content_type_headers(content_type).0,
+            runner_label,
+        )
+        .await;
     }
 
     // Buffered paths (enveloped csv/json/parquet/arrow) — collect the stream first.
@@ -1073,27 +1078,23 @@ fn streaming_ndjson_response(
     channel_body_response(rx, "application/x-ndjson", runner_label)
 }
 
-/// Streams a `RowStream` as csv or a pretty-printed json array.
+/// Streams a `RowStream` through `encoder` as csv, a pretty-printed json array
+/// or the `fhir` `Parameters` resource, served under `content_type_header`.
 ///
-/// The bytes are those of `format_csv` / `format_json` (see
-/// [`helios_sof::RowStreamEncoder`]), produced row by row so the result set is
-/// never held in memory. The first [`SCHEMA_SAMPLE_ROWS`] rows are encoded
-/// before anything is sent, so an error inside that prefix still returns a real
-/// error status; past it the `200` is committed and a row error aborts the
-/// chunked body (no terminating chunk, so the client sees a failed body, not a
-/// truncated array) like the NDJSON path.
+/// The bytes are those of `format_csv` / `format_json` /
+/// `format_view_fhir_parameters` (see [`helios_sof::RowStreamEncoder`]),
+/// produced row by row so the result set is never held in memory. The first
+/// [`SCHEMA_SAMPLE_ROWS`] rows are encoded before anything is sent, so an error
+/// inside that prefix still returns a real error status; past it the `200` is
+/// committed and a row error aborts the chunked body (no terminating chunk, so
+/// the client sees a failed body, not a truncated array) like the NDJSON path.
 async fn streaming_rows_response(
     mut stream: helios_persistence::core::sof_runner::RowStream,
-    content_type: ContentType,
+    mut encoder: helios_sof::RowStreamEncoder,
     view_json: &Value,
+    content_type_header: &'static str,
     runner_label: Option<&str>,
 ) -> Result<Response, RestError> {
-    let mut encoder = helios_sof::RowStreamEncoder::new(content_type).ok_or_else(|| {
-        RestError::InternalError {
-            message: format!("{content_type:?} cannot be streamed row by row"),
-        }
-    })?;
-
     let mut head: Vec<u8> = Vec::new();
     let mut ended = false;
     for _ in 0..SCHEMA_SAMPLE_ROWS {
@@ -1181,11 +1182,7 @@ async fn streaming_rows_response(
         }
     });
 
-    Ok(channel_body_response(
-        rx,
-        content_type_headers(content_type).0,
-        runner_label,
-    ))
+    Ok(channel_body_response(rx, content_type_header, runner_label))
 }
 
 /// Wraps a channel of body chunks into a `200` response. An `Err` item aborts
@@ -2114,7 +2111,81 @@ mod tests {
         rows: Vec<Result<Value, SofError>>,
         ct: ContentType,
     ) -> Result<Response, RestError> {
-        streaming_rows_response(row_stream(rows), ct, &typed_view(), Some("test-runner")).await
+        let encoder = helios_sof::RowStreamEncoder::new(ct).unwrap();
+        streaming_rows_response(
+            row_stream(rows),
+            encoder,
+            &typed_view(),
+            content_type_headers(ct).0,
+            Some("test-runner"),
+        )
+        .await
+    }
+
+    async fn fhir_rows_response(
+        rows: Vec<Result<Value, SofError>>,
+        view: &Value,
+    ) -> Result<Response, RestError> {
+        let encoder =
+            helios_sof::RowStreamEncoder::fhir(view).map_err(map_sof_lib_error_to_rest)?;
+        streaming_rows_response(
+            row_stream(rows),
+            encoder,
+            view,
+            FHIR_JSON_MIME,
+            Some("test-runner"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn streaming_fhir_matches_the_buffered_parameters() {
+        // More rows than the prefix and than one body chunk, so every phase runs.
+        for count in [0, 1, 5_000] {
+            let rows = numbered_rows(count);
+            let values: Vec<Value> = rows.iter().map(|r| r.as_ref().unwrap().clone()).collect();
+            let response = fhir_rows_response(rows, &typed_view()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                FHIR_JSON_MIME
+            );
+            assert_eq!(
+                response.headers().get("x-hfs-runner").unwrap(),
+                "test-runner"
+            );
+            let streamed = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let buffered = format_view_fhir_parameters(
+                &helios_sof::rows_to_processed_result(values),
+                &typed_view(),
+            )
+            .unwrap();
+            assert_eq!(streamed.to_vec(), buffered, "{count} rows");
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_fhir_complex_value_in_the_prefix_is_a_real_status() {
+        let mut rows = numbered_rows(3);
+        rows.push(Ok(json!({ "id": { "family": "Smith" }, "n": 1 })));
+        assert!(fhir_rows_response(rows, &typed_view()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn streaming_fhir_error_after_the_prefix_aborts_the_body() {
+        for bad in [
+            Err(SofError::Cancelled),
+            Ok(json!({ "id": { "family": "Smith" }, "n": 1 })),
+        ] {
+            let mut rows = numbered_rows(SCHEMA_SAMPLE_ROWS + 10);
+            rows.push(bad);
+            let response = fhir_rows_response(rows, &typed_view()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let collected = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+            assert!(collected.is_err(), "the aborted body must fail");
+        }
     }
 
     #[tokio::test]
