@@ -8785,14 +8785,13 @@ pub(crate) fn compare_equality(
                             Ok(converted_val_r) => {
                                 EvaluationResult::boolean(val_l == &converted_val_r)
                             }
-                            Err(_) => {
-                                // If conversion fails, they're not equal
-                                EvaluationResult::boolean(false)
-                            }
+                            // Conversion returned empty, so the comparison is empty
+                            Err(_) => EvaluationResult::Empty,
                         }
                     } else {
-                        // Incompatible units, not equal
-                        EvaluationResult::boolean(false)
+                        // Spec (Quantity Equality): units that are not commensurable
+                        // (including a unit vs the default '1') make `=` empty, not false.
+                        EvaluationResult::Empty
                     }
                 }
                 // Quantity vs Integer (implicit conversion: Integer becomes Quantity with unit '1')
@@ -8803,8 +8802,8 @@ pub(crate) fn compare_equality(
                     if crate::ucum::units_are_comparable(unit, "1") {
                         EvaluationResult::boolean(*val == Decimal::from(*n))
                     } else {
-                        // Incompatible units - return false (not equal)
-                        EvaluationResult::boolean(false)
+                        // Not commensurable: equality is empty (spec: Quantity Equality)
+                        EvaluationResult::Empty
                     }
                 }
                 // Integer vs Quantity (implicit conversion: Integer becomes Quantity with unit '1')
@@ -8815,8 +8814,8 @@ pub(crate) fn compare_equality(
                     if crate::ucum::units_are_comparable("1", unit) {
                         EvaluationResult::boolean(Decimal::from(*n) == *val)
                     } else {
-                        // Incompatible units - return false (not equal)
-                        EvaluationResult::boolean(false)
+                        // Not commensurable: equality is empty (spec: Quantity Equality)
+                        EvaluationResult::Empty
                     }
                 }
                 // Quantity vs Decimal (implicit conversion: Decimal becomes Quantity with unit '1')
@@ -8827,8 +8826,8 @@ pub(crate) fn compare_equality(
                     if crate::ucum::units_are_comparable(unit, "1") {
                         EvaluationResult::boolean(*val == *d)
                     } else {
-                        // Incompatible units - return false (not equal)
-                        EvaluationResult::boolean(false)
+                        // Not commensurable: equality is empty (spec: Quantity Equality)
+                        EvaluationResult::Empty
                     }
                 }
                 // Decimal vs Quantity (implicit conversion: Decimal becomes Quantity with unit '1')
@@ -8839,8 +8838,8 @@ pub(crate) fn compare_equality(
                     if crate::ucum::units_are_comparable("1", unit) {
                         EvaluationResult::boolean(*d == *val)
                     } else {
-                        // Incompatible units - return false (not equal)
-                        EvaluationResult::boolean(false)
+                        // Not commensurable: equality is empty (spec: Quantity Equality)
+                        EvaluationResult::Empty
                     }
                 }
                 // Date vs Time comparison - these are different types that can never be equal
@@ -8992,9 +8991,25 @@ pub(crate) fn compare_equality(
                 }
                 // Object = Object comparison
                 (
-                    EvaluationResult::Object { map: map_l, .. },
-                    EvaluationResult::Object { map: map_r, .. },
+                    EvaluationResult::Object {
+                        map: map_l,
+                        type_info: type_l,
+                    },
+                    EvaluationResult::Object {
+                        map: map_r,
+                        type_info: type_r,
+                    },
                 ) => {
+                    // Two FHIR Quantities compare as System.Quantity (spec: Quantity
+                    // Equality), so a unit vs no unit is empty rather than a field-wise
+                    // false.
+                    if let (Some(q_l), Some(q_r)) = (
+                        fhir_quantity_from_object(map_l, type_l.as_ref()),
+                        fhir_quantity_from_object(map_r, type_r.as_ref()),
+                    ) {
+                        return compare_equality(&q_l, op, &q_r, context);
+                    }
+
                     // If both are FHIR primitive objects, compare their "value" fields.
                     if map_l.contains_key("fhirType")
                         && map_l.contains_key("value")
@@ -9242,9 +9257,31 @@ pub(crate) fn compare_equality(
                 | (EvaluationResult::DateTime(_, _, _), EvaluationResult::Date(_, _, _)) => {
                     EvaluationResult::boolean(false)
                 }
+                // Two FHIR Quantities are equivalent as System.Quantity values.
+                (
+                    EvaluationResult::Object {
+                        map: map_l,
+                        type_info: type_l,
+                    },
+                    EvaluationResult::Object {
+                        map: map_r,
+                        type_info: type_r,
+                    },
+                ) if fhir_quantity_from_object(map_l, type_l.as_ref()).is_some()
+                    && fhir_quantity_from_object(map_r, type_r.as_ref()).is_some() =>
+                {
+                    let q_l = fhir_quantity_from_object(map_l, type_l.as_ref()).unwrap();
+                    let q_r = fhir_quantity_from_object(map_r, type_r.as_ref()).unwrap();
+                    compare_equality(&q_l, "~", &q_r, context)?
+                }
                 // Primitive equivalence falls back to strict equality ('=') for other types
-                // Use original left/right for recursive call to ensure consistent behavior
-                _ => compare_equality(left, "=", right, context)?,
+                // Use original left/right for recursive call to ensure consistent behavior.
+                // Equivalence is never empty for non-empty operands, so an empty '='
+                // (e.g. quantities whose units are not commensurable) is false here.
+                _ => match compare_equality(left, "=", right, context)? {
+                    EvaluationResult::Empty => EvaluationResult::boolean(false),
+                    result => result,
+                },
             })
         }
         "!~" => {

@@ -208,7 +208,9 @@ pub enum SmtpEncryption {
 }
 
 /// SMTP client configuration for the email channel.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the password.
+#[derive(Clone)]
 pub struct SmtpSettings {
     /// SMTP relay host.
     pub host: String,
@@ -229,9 +231,52 @@ pub struct SmtpSettings {
     pub timeout_secs: u64,
 }
 
+impl std::fmt::Debug for SmtpSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            host,
+            port,
+            username,
+            password,
+            encryption,
+            from_address,
+            default_subject,
+            timeout_secs,
+        } = self;
+        f.debug_struct("SmtpSettings")
+            .field("host", host)
+            .field("port", port)
+            .field("username", username)
+            .field("password", &password.as_ref().map(|_| "[redacted]"))
+            .field("encryption", encryption)
+            .field("from_address", from_address)
+            .field("default_subject", default_subject)
+            .field("timeout_secs", timeout_secs)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smtp_settings_debug_redacts_password() {
+        let settings = SmtpSettings {
+            host: "smtp.example.com".into(),
+            port: 587,
+            username: Some("mailer".into()),
+            password: Some("SMTPSECRET".into()),
+            encryption: SmtpEncryption::StartTls,
+            from_address: "hfs@example.com".into(),
+            default_subject: None,
+            timeout_secs: 30,
+        };
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("SMTPSECRET"), "{debug}");
+        assert!(debug.contains("smtp.example.com"), "{debug}");
+        assert!(debug.contains("[redacted]"), "{debug}");
+    }
 
     #[test]
     fn invalid_dispatch_limits_use_defaults_without_a_runtime() {

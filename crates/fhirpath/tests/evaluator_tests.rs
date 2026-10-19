@@ -5537,13 +5537,18 @@ fn test_quantity_implicit_conversion_operations() {
         eval("5 '1' = 5.5", &context).unwrap(),
         EvaluationResult::boolean(false)
     );
-    // Incompatible units should return false (not equal)
+    // Units that are not commensurable make equality empty (spec: Quantity Equality)
     assert_eq!(
         eval("5 'mg' = 5", &context).unwrap(),
-        EvaluationResult::boolean(false)
+        EvaluationResult::Empty
     );
     assert_eq!(
         eval("5 = 5 'mg'", &context).unwrap(),
+        EvaluationResult::Empty
+    );
+    // ...but never equivalence, which is false
+    assert_eq!(
+        eval("5 'mg' ~ 5", &context).unwrap(),
         EvaluationResult::boolean(false)
     );
 

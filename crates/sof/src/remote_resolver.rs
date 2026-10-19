@@ -67,7 +67,9 @@ const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
 ///
 /// Defaults are **off**: an empty/default config never permits a fetch. Build one
 /// from the process environment with [`RemoteResolveConfig::from_env`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the hosts in `bearer_tokens` but not the tokens.
+#[derive(Clone)]
 pub struct RemoteResolveConfig {
     /// Master switch (`SOF_RESOLVE_REMOTE`). When `false`, nothing is ever fetched.
     pub enabled: bool,
@@ -103,6 +105,39 @@ pub struct RemoteResolveConfig {
     /// reused references are re-fetched. Ignored by the single-Bundle path, which
     /// holds all references in one pass.
     pub cache_max_entries: usize,
+}
+
+impl std::fmt::Debug for RemoteResolveConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            enabled,
+            allowed_base_urls,
+            timeout,
+            max_fetches,
+            max_depth,
+            max_response_bytes,
+            concurrency,
+            bearer_tokens,
+            allow_private_addresses,
+            cache_max_entries,
+        } = self;
+        let bearer_tokens: std::collections::BTreeMap<&str, &str> = bearer_tokens
+            .keys()
+            .map(|host| (host.as_str(), "[redacted]"))
+            .collect();
+        f.debug_struct("RemoteResolveConfig")
+            .field("enabled", enabled)
+            .field("allowed_base_urls", allowed_base_urls)
+            .field("timeout", timeout)
+            .field("max_fetches", max_fetches)
+            .field("max_depth", max_depth)
+            .field("max_response_bytes", max_response_bytes)
+            .field("concurrency", concurrency)
+            .field("bearer_tokens", &bearer_tokens)
+            .field("allow_private_addresses", allow_private_addresses)
+            .field("cache_max_entries", cache_max_entries)
+            .finish()
+    }
 }
 
 impl Default for RemoteResolveConfig {
@@ -431,15 +466,23 @@ pub fn parse_allowed_base_urls(csv: &str) -> Vec<AllowedBaseUrl> {
 fn parse_bearer_tokens(csv: &str) -> std::collections::HashMap<String, String> {
     csv.split(',')
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|pair| {
-            let (host, token) = pair.split_once('=')?;
-            let host = host.trim();
-            let token = token.trim();
-            if host.is_empty() || token.is_empty() {
-                tracing::warn!(pair, "ignoring malformed {} entry", env_keys::AUTH);
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty())
+        .filter_map(|(index, pair)| {
+            let parsed = pair
+                .split_once('=')
+                .map(|(host, token)| (host.trim(), token.trim()))
+                .filter(|(host, token)| !host.is_empty() && !token.is_empty());
+            let Some((host, token)) = parsed else {
+                // A malformed entry (`host:token`, say) may still hold the
+                // token, so name it by its 1-based position only (#2149).
+                tracing::warn!(
+                    entry = index + 1,
+                    "ignoring malformed {} entry; expected host=token",
+                    env_keys::AUTH
+                );
                 return None;
-            }
+            };
             Some((host.to_ascii_lowercase(), token.to_string()))
         })
         .collect()
@@ -454,7 +497,7 @@ fn parse_allowlist(csv: &str) -> Vec<AllowedBaseUrl> {
             Ok(base) => Some(base),
             Err(err) => {
                 tracing::warn!(
-                    entry,
+                    entry = %helios_observability::redact::redact_url(entry),
                     error = %err,
                     "ignoring invalid {} entry",
                     env_keys::ALLOWED_BASE_URLS
@@ -502,6 +545,56 @@ mod tests {
     }
 
     // ---- Phase 1: configuration parsing -------------------------------------
+
+    /// Runs `f` with a subscriber that records every event, and returns the text.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn malformed_auth_entry_warning_omits_the_token() {
+        let mut tokens = HashMap::new();
+        let logs = capture_logs(|| {
+            tokens =
+                parse_bearer_tokens("good.example=ok, typo.example:TOKENSECRET1, =TOKENSECRET2");
+        });
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens.get("good.example").map(String::as_str), Some("ok"));
+        assert!(!logs.contains("TOKENSECRET"), "{logs}");
+        assert!(logs.contains("entry=2"), "{logs}");
+        assert!(logs.contains("entry=3"), "{logs}");
+    }
+
+    #[test]
+    fn debug_omits_bearer_tokens_but_keeps_hosts() {
+        let mut c = cfg(true, &["https://fhir.example.org/r4"]);
+        c.bearer_tokens
+            .insert("fhir.example.org".into(), "BEARERSECRET".into());
+        let debug = format!("{c:?}");
+        assert!(!debug.contains("BEARERSECRET"), "{debug}");
+        assert!(debug.contains("fhir.example.org"), "{debug}");
+        assert!(debug.contains("[redacted]"), "{debug}");
+    }
 
     #[test]
     fn default_config_is_off() {
