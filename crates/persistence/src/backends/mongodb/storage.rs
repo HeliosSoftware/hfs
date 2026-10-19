@@ -2460,6 +2460,34 @@ async fn grouped_string_counts(
     Ok(out)
 }
 
+/// Documents per `insert_many` for the `resources` and `resource_history`
+/// collections on the batched Bundle path. Smaller than the search-row chunk
+/// because a document carries the whole resource payload.
+const BATCH_RESOURCE_INSERT_CHUNK: usize = 1_000;
+
+/// Whether a Bundle is a pure batch of plain POST creates, the only shape the
+/// batched write path accepts: every entry a POST with a resource carrying a
+/// `resourceType`, no `ifNoneExist`, no conditional criteria, and no resolved
+/// conditional target. Anything else (PUT, DELETE, PATCH, GET, conditional
+/// creates) keeps the per-entry path.
+fn bundle_is_plain_creates(
+    entries: &[BundleEntry],
+    targets: &HashMap<usize, crate::core::ConditionalTarget>,
+) -> bool {
+    !entries.is_empty()
+        && targets.is_empty()
+        && entries.iter().all(|entry| {
+            entry.method == BundleMethod::Post
+                && entry.if_none_exist.is_none()
+                && entry.criteria.is_none()
+                && entry
+                    .resource
+                    .as_ref()
+                    .and_then(|r| r.get("resourceType"))
+                    .is_some_and(Value::is_string)
+        })
+}
+
 /// One resource's `search_index` contribution, split by destination
 /// collection: its own rows go to `search_index`, and rows extracted from its
 /// `contained` entries go to `search_index_contained`.
@@ -4793,7 +4821,29 @@ impl MongoBackend {
         let mut writes = BundleWrites::new(deferral);
 
         let entry_count = entries.len();
-        for (idx, entry) in entries.iter_mut().enumerate() {
+        // Experimental fast path (`HFS_MONGODB_BUNDLE_BATCH_WRITES`): a Bundle
+        // of plain POST creates is written with batched round trips. It
+        // aborts the transaction itself on any failure.
+        let batch =
+            self.config().bundle_batch_writes && bundle_is_plain_creates(&entries, &targets);
+        if batch {
+            results = self
+                .batch_create_bundle_entries(
+                    db,
+                    session,
+                    tenant,
+                    fhir_version,
+                    &mut entries,
+                    &mut bundle_state,
+                    &mut writes,
+                )
+                .await?;
+        }
+        for (idx, entry) in entries
+            .iter_mut()
+            .enumerate()
+            .take(if batch { 0 } else { entry_count })
+        {
             let mut resource = entry.resource.take();
             let used_references = resource
                 .as_mut()
@@ -4923,6 +4973,318 @@ impl MongoBackend {
             search_parameter_changes: writes.search_parameter_changes,
             deferred,
         })
+    }
+
+    /// Writes a Bundle of plain POST creates (see [`bundle_is_plain_creates`])
+    /// with batched round trips, inside the open transaction:
+    ///
+    /// 1. every entry is prepared without a database call (reference
+    ///    resolution, id, search rows, documents), in entry order, because a
+    ///    later entry's `urn:uuid` reference resolves through the earlier
+    ///    entries' results;
+    /// 2. one `find` per resource type with `id: {$in: ...}` finds ids that
+    ///    already exist;
+    /// 3. chunked unordered `insert_many` into `resources`,
+    ///    `resource_history`, `search_index` and `search_index_contained`.
+    ///
+    /// The per-entry path's `delete_many` on the search collections is
+    /// skipped: the ids are new, so no rows exist. The first failing entry is
+    /// the one reported, as in the per-entry path. On any failure the
+    /// transaction is aborted and the attempt error returned.
+    #[allow(clippy::too_many_arguments)]
+    async fn batch_create_bundle_entries(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        fhir_version: helios_fhir::FhirVersion,
+        entries: &mut [BundleEntry],
+        bundle_state: &mut BundleTransactionState,
+        writes: &mut BundleWrites,
+    ) -> Result<Vec<BundleEntryResult>, BundleAttemptError> {
+        enum Failure {
+            Storage(StorageError),
+            Record(String),
+        }
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let entry_count = entries.len();
+        let fhir_version_str = fhir_version.as_mime_param().to_string();
+        let offloaded = self.is_search_offloaded();
+
+        let mut results: Vec<BundleEntryResult> = Vec::with_capacity(entry_count);
+        let mut resource_docs: Vec<Document> = Vec::with_capacity(entry_count);
+        let mut history_docs: Vec<Document> = Vec::with_capacity(entry_count);
+        let mut own_rows: Vec<Document> = Vec::new();
+        let mut contained_rows: Vec<Document> = Vec::new();
+        let mut identities: Vec<(String, String)> = Vec::with_capacity(entry_count);
+        let mut seen: HashSet<(String, String)> = HashSet::with_capacity(entry_count);
+        let mut failure: Option<(usize, Failure)> = None;
+
+        // (1) CPU-side preparation, no database call.
+        for (idx, entry) in entries.iter_mut().enumerate() {
+            let mut resource = entry.resource.take();
+            let used_references = resource
+                .as_mut()
+                .map(|resource| bundle_state.resolve(resource))
+                .unwrap_or_default();
+            let Some(resource) = resource else {
+                failure = Some((
+                    idx,
+                    Failure::Storage(StorageError::Validation(
+                        crate::error::ValidationError::MissingRequiredField {
+                            field: "resource".to_string(),
+                        },
+                    )),
+                ));
+                break;
+            };
+            let resource_type = resource
+                .get("resourceType")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_default();
+            let id = resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(crate::types::new_resource_id);
+
+            // The per-entry path finds the first entry's row when it checks
+            // the second, so a repeated identity fails at the repeat.
+            if !seen.insert((resource_type.clone(), id.clone())) {
+                failure = Some((
+                    idx,
+                    Failure::Storage(StorageError::Resource(ResourceError::AlreadyExists {
+                        resource_type,
+                        id,
+                    })),
+                ));
+                break;
+            }
+
+            let mut resource = resource;
+            ensure_resource_identity(&resource_type, &id, &mut resource);
+            let search_documents =
+                self.search_index_documents(tenant_id, &resource_type, &id, &resource);
+            let payload = match value_to_document(&resource) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    failure = Some((idx, Failure::Storage(e)));
+                    break;
+                }
+            };
+            let now = Utc::now();
+            let now_bson = chrono_to_bson(now);
+            let version_id = "1".to_string();
+
+            let mut current = search_documents.resource_document(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": &resource_type,
+                "id": &id,
+                "version_id": &version_id,
+                "data": Bson::Document(payload.clone()),
+                "created_at": now_bson,
+                "last_updated": now_bson,
+                "is_deleted": false,
+                "deleted_at": Bson::Null,
+                "fhir_version": &fhir_version_str,
+            });
+            if let Some(marker) = writes.pending_marker(&resource_type) {
+                current.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+            }
+            resource_docs.push(current);
+            history_docs.push(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": &resource_type,
+                "id": &id,
+                "version_id": &version_id,
+                "data": Bson::Document(payload),
+                "created_at": now_bson,
+                "last_updated": now_bson,
+                "is_deleted": false,
+                "deleted_at": Bson::Null,
+                "fhir_version": &fhir_version_str,
+            });
+
+            // Same rules as `index_resource_in_bundle_transaction`.
+            if offloaded {
+            } else if let Some(deferred) = writes
+                .deferred
+                .as_mut()
+                .filter(|deferred| deferred.defers(&resource_type))
+            {
+                deferred.record(&resource_type, &id);
+            } else {
+                own_rows.extend(search_documents.own);
+                contained_rows.extend(search_documents.contained);
+            }
+            if resource_type == "SearchParameter" {
+                writes
+                    .search_parameter_changes
+                    .push(PendingSearchParameterChange::Create);
+            }
+
+            let stored = StoredResource::from_storage(
+                &resource_type,
+                &id,
+                version_id,
+                tenant.tenant_id().clone(),
+                resource,
+                now,
+                now,
+                None,
+                fhir_version,
+            );
+            let entry_result = BundleEntryResult::created(stored);
+            identities.push((resource_type, id));
+            if let Err(message) = bundle_state.record(entry, &entry_result, None, used_references) {
+                failure = Some((idx, Failure::Record(message)));
+                break;
+            }
+            results.push(entry_result);
+        }
+
+        // (2) Existence: one find per resource type over the prepared ids.
+        // An existing row at or before the failing entry wins, because the
+        // per-entry path checks an entry before it records it.
+        let existing_index = {
+            let mut by_type: HashMap<&str, Vec<&str>> = HashMap::new();
+            for (resource_type, id) in &identities {
+                by_type.entry(resource_type).or_default().push(id);
+            }
+            let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+            let mut existing: HashSet<(String, String)> = HashSet::new();
+            for (resource_type, ids) in by_type {
+                for chunk in ids.chunks(SEARCH_INDEX_INSERT_CHUNK) {
+                    let cursor = resources
+                        .find(doc! {
+                            "tenant_id": tenant_id,
+                            "resource_type": resource_type,
+                            "id": { "$in": chunk.to_vec() },
+                        })
+                        .projection(doc! { "id": 1, "_id": 0 })
+                        .session(&mut *session)
+                        .await;
+                    let found = match cursor {
+                        Ok(cursor) => collect_session_documents(cursor, &mut *session).await,
+                        Err(e) => Err(internal_driver_error(
+                            "Failed to check resource existence in transaction",
+                            e,
+                        )),
+                    };
+                    match found {
+                        Ok(found) => {
+                            for document in found {
+                                if let Ok(id) = document.get_str("id") {
+                                    existing.insert((resource_type.to_string(), id.to_string()));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = session.abort_transaction().await;
+                            return Err(entry_attempt_error(0, entry_count, &e));
+                        }
+                    }
+                }
+            }
+            identities.iter().position(|key| existing.contains(key))
+        };
+        if let Some(idx) = existing_index
+            && failure.as_ref().is_none_or(|(failed, _)| idx <= *failed)
+        {
+            let (resource_type, id) = identities.swap_remove(idx);
+            let _ = session.abort_transaction().await;
+            return Err(entry_attempt_error(
+                idx,
+                entry_count,
+                &StorageError::Resource(ResourceError::AlreadyExists { resource_type, id }),
+            ));
+        }
+        if let Some((idx, failure)) = failure {
+            let _ = session.abort_transaction().await;
+            return Err(match failure {
+                Failure::Storage(e) => entry_attempt_error(idx, entry_count, &e),
+                Failure::Record(message) => {
+                    BundleAttemptError::Failed(TransactionError::BundleError {
+                        index: idx,
+                        message,
+                    })
+                }
+            });
+        }
+
+        // (3) Chunked unordered inserts, all in the Bundle's session.
+        let inserts: [(&str, Vec<Document>, &str, usize); 4] = [
+            (
+                MongoBackend::RESOURCES_COLLECTION,
+                resource_docs,
+                "Failed to insert resource in transaction",
+                BATCH_RESOURCE_INSERT_CHUNK,
+            ),
+            (
+                MongoBackend::RESOURCE_HISTORY_COLLECTION,
+                history_docs,
+                "Failed to insert history in transaction",
+                BATCH_RESOURCE_INSERT_CHUNK,
+            ),
+            (
+                MongoBackend::SEARCH_INDEX_COLLECTION,
+                own_rows,
+                "Failed to insert search index entries",
+                SEARCH_INDEX_INSERT_CHUNK,
+            ),
+            (
+                MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+                contained_rows,
+                "Failed to insert search_index_contained entries",
+                SEARCH_INDEX_INSERT_CHUNK,
+            ),
+        ];
+        for (collection_name, docs, context, chunk_size) in inserts {
+            let collection = db.collection::<Document>(collection_name);
+            let mut offset = 0usize;
+            for chunk in docs.chunks(chunk_size) {
+                if let Err(e) = collection
+                    .insert_many(chunk)
+                    .ordered(false)
+                    .session(&mut *session)
+                    .await
+                {
+                    let _ = session.abort_transaction().await;
+                    // Blame the entry of the first attributed write error;
+                    // only the `resources` collection's rows map 1:1 to entries.
+                    let attributed = match e.kind.as_ref() {
+                        MongoErrorKind::InsertMany(insert) => insert
+                            .write_errors
+                            .iter()
+                            .flatten()
+                            .map(|w| offset + w.index)
+                            .min(),
+                        _ => None,
+                    };
+                    let one_to_one = collection_name == MongoBackend::RESOURCES_COLLECTION
+                        || collection_name == MongoBackend::RESOURCE_HISTORY_COLLECTION;
+                    let idx = attributed.filter(|_| one_to_one);
+                    let error = match idx {
+                        Some(i)
+                            if collection_name == MongoBackend::RESOURCES_COLLECTION
+                                && is_duplicate_key_error(&e) =>
+                        {
+                            StorageError::Resource(ResourceError::AlreadyExists {
+                                resource_type: identities[i].0.clone(),
+                                id: identities[i].1.clone(),
+                            })
+                        }
+                        _ => internal_driver_error(context, e),
+                    };
+                    return Err(entry_attempt_error(idx.unwrap_or(0), entry_count, &error));
+                }
+                offset += chunk.len();
+            }
+        }
+
+        Ok(results)
     }
 
     /// Resolves every URL-borne conditional entry inside the session, before

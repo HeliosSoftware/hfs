@@ -337,6 +337,14 @@ pub struct MongoBackendConfig {
     #[serde(default = "default_bundle_transaction_budget")]
     pub bundle_transaction_budget: Duration,
 
+    /// Experimental: write a transaction Bundle made only of plain `POST`
+    /// creates (no `ifNoneExist`, no conditional criteria) with a handful of
+    /// batched round trips instead of about seven per entry
+    /// (`HFS_MONGODB_BUNDLE_BATCH_WRITES`, default `false`). Any other Bundle
+    /// keeps the per-entry path.
+    #[serde(default)]
+    pub bundle_batch_writes: bool,
+
     /// Upper bound on one transaction Bundle call, admission wait included,
     /// measured from when the call reaches the admission gate (#1806). Time
     /// spent before the backend (middleware, auth, body parsing) is covered
@@ -488,6 +496,20 @@ impl MongoBackendConfig {
         &mut self,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<(), String> {
+        if let Some(raw) = env("HFS_MONGODB_BUNDLE_BATCH_WRITES") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.bundle_batch_writes = match raw.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => true,
+                    "false" | "0" | "no" | "off" => false,
+                    _ => {
+                        return Err(format!(
+                            "HFS_MONGODB_BUNDLE_BATCH_WRITES must be true or false; got {raw:?}"
+                        ));
+                    }
+                };
+            }
+        }
         if let Some(raw) = env("HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES") {
             let raw = raw.trim();
             if !raw.is_empty() {
@@ -813,6 +835,7 @@ impl Default for MongoBackendConfig {
             reindex_prepare_threads: 0,
             reindex_prefetch: default_reindex_prefetch(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
+            bundle_batch_writes: false,
             bundle_transaction_deadline: None,
             max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
             broad_search_concurrency: None,
@@ -2513,6 +2536,28 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serializes");
         let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.count_by_tenant_max_time_ms, 1_500);
+    }
+
+    #[test]
+    fn apply_bundle_batch_writes_env_defaults_off_and_parses() {
+        let mut config = MongoBackendConfig::default();
+        assert!(!config.bundle_batch_writes);
+        config
+            .apply_transaction_bundle_env(|n| {
+                (n == "HFS_MONGODB_BUNDLE_BATCH_WRITES").then(|| " On ".to_string())
+            })
+            .expect("valid value");
+        assert!(config.bundle_batch_writes);
+        config
+            .apply_transaction_bundle_env(|_| None)
+            .expect("unset is ignored");
+        assert!(config.bundle_batch_writes);
+        let err = config
+            .apply_transaction_bundle_env(|n| {
+                (n == "HFS_MONGODB_BUNDLE_BATCH_WRITES").then(|| "maybe".to_string())
+            })
+            .expect_err("invalid value");
+        assert!(err.contains("HFS_MONGODB_BUNDLE_BATCH_WRITES"));
     }
 
     #[test]
