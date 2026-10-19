@@ -529,7 +529,10 @@ impl Dialect for SqliteDialect {
         // JSON booleans → integer 1/0, numbers → integer/real, strings → text.
         // Truthy is: non-NULL AND not zero/false. The explicit text-equality
         // check covers literal `'true'`/`'false'` text values just in case.
-        format!("({expr}) IS NOT NULL AND ({expr}) != 0 AND ({expr}) != 'false'")
+        // `NOT IN` evaluates `expr` once (SQLite does no common-subexpression
+        // elimination); NULL yields NULL, which WHERE treats as false. Only
+        // valid in WHERE-style contexts, never as a value or under negation.
+        format!("({expr}) NOT IN (0, 'false')")
     }
 
     fn last_path_segment(&self, s: &str) -> String {

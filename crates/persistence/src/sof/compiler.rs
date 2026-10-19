@@ -684,8 +684,9 @@ mod tests {
         });
         let q = compile(view).unwrap();
         // SQLite truthy boundary doesn't use `IS TRUE` (which is strict-typed
-        // in some dialects) — it checks IS NOT NULL + non-zero / not 'false'.
-        assert!(q.sql.contains("IS NOT NULL"), "{}", q.sql);
+        // in some dialects) — it checks NOT IN (0, 'false'), which is NULL
+        // (filtered out) for a missing value.
+        assert!(q.sql.contains("NOT IN (0, 'false')"), "{}", q.sql);
         assert!(
             q.sql.contains("json_extract(r.data, '$.active')"),
             "{}",
