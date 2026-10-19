@@ -2233,21 +2233,21 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_small_results_keep_the_buffered_headers() {
+        use http_body::Body as _;
         for count in [0, 1] {
             for ct in [ContentType::Json, ContentType::Csv] {
                 let response = rows_response(numbered_rows(count), ct).await.unwrap();
-                let length = response
-                    .headers()
-                    .get(header::CONTENT_LENGTH)
-                    .expect("small results carry Content-Length")
-                    .to_str()
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap();
+                // hyper turns an exact body size into Content-Length; a
+                // channel body has no exact size and would go out chunked.
+                let exact = response.body().size_hint().exact();
                 let streamed = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
                     .unwrap();
-                assert_eq!(length, streamed.len());
+                assert_eq!(
+                    exact,
+                    Some(streamed.len() as u64),
+                    "exact size, so Content-Length"
+                );
                 let (_, buffered) =
                     format_stream(row_stream(numbered_rows(count)), ct, &typed_view(), None)
                         .await
