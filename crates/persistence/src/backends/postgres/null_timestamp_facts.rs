@@ -41,6 +41,11 @@ use std::time::{Duration, Instant};
 
 /// How long a "no NULL rows" answer is trusted.
 const TTL: Duration = Duration::from_secs(30);
+/// After [`TTL`], an answer is still served for this long to requests that find
+/// another request already refreshing it, so a refresh never sends the whole
+/// request stream back to the per-statement probe. The loader itself waits for
+/// the fresh answer. Total staleness is therefore bounded by `TTL + GRACE`.
+const GRACE: Duration = Duration::from_secs(10);
 /// Upper bound on remembered keys; the table is cleared when it is exceeded.
 const MAX_KEYS: usize = 4096;
 
@@ -122,6 +127,8 @@ pub(crate) fn param_name_of(pred: &str) -> Option<String> {
 enum Cached {
     NoNulls,
     HasNulls,
+    /// Past [`TTL`] but within [`GRACE`]; carries whether NULL rows were known.
+    Stale { has_nulls: bool },
     Unknown,
 }
 
@@ -132,17 +139,36 @@ fn lookup(tenant: &str, resource_type: &str, param: &str) -> Cached {
     if f.pinned.contains(&key(tenant, resource_type, param)) {
         return Cached::HasNulls;
     }
-    match f.tenants.get(tenant) {
-        Some(t) if t.at.elapsed() < TTL => {
-            if t.with_nulls
-                .contains(&(resource_type.to_string(), param.to_string()))
-            {
-                Cached::HasNulls
-            } else {
-                Cached::NoNulls
-            }
+    let Some(t) = f.tenants.get(tenant) else {
+        return Cached::Unknown;
+    };
+    let has_nulls = t
+        .with_nulls
+        .contains(&(resource_type.to_string(), param.to_string()));
+    let age = t.at.elapsed();
+    if age < TTL {
+        if has_nulls {
+            Cached::HasNulls
+        } else {
+            Cached::NoNulls
         }
-        _ => Cached::Unknown,
+    } else if age < TTL + GRACE {
+        Cached::Stale { has_nulls }
+    } else {
+        Cached::Unknown
+    }
+}
+
+/// Releases the single-flight claim even if the loading request is cancelled
+/// mid-query (a dropped future would otherwise pin every later request to the
+/// probe).
+struct LoadClaim(String);
+
+impl Drop for LoadClaim {
+    fn drop(&mut self) {
+        if let Ok(mut f) = facts().lock() {
+            f.loading.remove(&self.0);
+        }
     }
 }
 
@@ -157,24 +183,27 @@ pub(crate) async fn param_has_no_null_rows(
     resource_type: &str,
     param: &str,
 ) -> bool {
-    match lookup(tenant, resource_type, param) {
+    let stale = match lookup(tenant, resource_type, param) {
         Cached::NoNulls => return true,
         Cached::HasNulls => return false,
-        Cached::Unknown => {}
-    }
+        Cached::Stale { has_nulls } => Some(has_nulls),
+        Cached::Unknown => None,
+    };
     {
         let Ok(mut f) = facts().lock() else {
             return false;
         };
         if !f.loading.insert(tenant.to_string()) {
-            return false;
+            // Someone else is refreshing: trust the recent answer if there is
+            // one, otherwise keep the probe.
+            return stale.is_some_and(|has_nulls| !has_nulls);
         }
     }
+    let _claim = LoadClaim(tenant.to_string());
     let loaded = client.query(LOAD_SQL, &[&tenant]).await;
     let Ok(mut f) = facts().lock() else {
         return false;
     };
-    f.loading.remove(tenant);
     let Ok(rows) = loaded else {
         return false;
     };
@@ -283,8 +312,18 @@ mod tests {
     }
 
     #[test]
-    fn expired_entries_are_unknown() {
-        if learn("t-old", &[], TTL + Duration::from_secs(1)) {
+    fn recently_expired_entries_are_stale_and_old_ones_unknown() {
+        if learn("t-stale", &[("Patient", "name")], TTL + Duration::from_secs(1)) {
+            assert!(matches!(
+                lookup("t-stale", "Patient", "name"),
+                Cached::Stale { has_nulls: true }
+            ));
+            assert!(matches!(
+                lookup("t-stale", "Patient", "gender"),
+                Cached::Stale { has_nulls: false }
+            ));
+        }
+        if learn("t-old", &[], TTL + GRACE + Duration::from_secs(1)) {
             assert!(matches!(
                 lookup("t-old", "Patient", "name"),
                 Cached::Unknown
