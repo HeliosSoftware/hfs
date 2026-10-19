@@ -194,10 +194,19 @@ pub fn row_stream(rx: mpsc::Receiver<Result<Vec<ViewRow>, SofError>>) -> RowStre
 /// `push*` return `false` once the receiver is gone, so the producer stops.
 /// An error is sent after the rows pushed before it, so the consumer sees the
 /// partial batch first. [`finish`](Self::finish) must be called on normal end.
+///
+/// The size target grows 1, 2, 4 ... [`ROW_BATCH_SIZE`] per sent batch. A
+/// blocking producer also sends a batch older than 50 ms when its next row
+/// arrives; async producers have no age limit and rely on `try_flush`.
 pub struct RowBatcher {
     tx: RowBatchSender,
     buf: Vec<ViewRow>,
     since: std::time::Instant,
+    /// Rows per size-triggered batch. Starts at 1 and doubles per sent batch
+    /// up to [`ROW_BATCH_SIZE`], so the first rows of a slow or selective
+    /// view reach the consumer at once.
+    target: usize,
+    finished: bool,
 }
 
 impl RowBatcher {
@@ -207,11 +216,14 @@ impl RowBatcher {
             tx,
             buf: Vec::with_capacity(ROW_BATCH_SIZE),
             since: std::time::Instant::now(),
+            target: 1,
+            finished: false,
         }
     }
 
     fn take(&mut self) -> Vec<ViewRow> {
         self.since = std::time::Instant::now();
+        self.target = (self.target * 2).min(ROW_BATCH_SIZE);
         std::mem::replace(&mut self.buf, Vec::with_capacity(ROW_BATCH_SIZE))
     }
 
@@ -231,7 +243,7 @@ impl RowBatcher {
             return false;
         }
         self.buf.push(row);
-        if self.buf.len() >= ROW_BATCH_SIZE {
+        if self.buf.len() >= self.target {
             return self.flush().await;
         }
         true
@@ -253,6 +265,7 @@ impl RowBatcher {
             Ok(()) => {
                 self.buf = Vec::with_capacity(ROW_BATCH_SIZE);
                 self.since = std::time::Instant::now();
+                self.target = (self.target * 2).min(ROW_BATCH_SIZE);
                 true
             }
             Err(mpsc::error::TrySendError::Full(Ok(batch))) => {
@@ -282,6 +295,7 @@ impl RowBatcher {
     /// Normal end of the stream.
     pub async fn finish(mut self) {
         self.flush().await;
+        self.finished = true;
     }
 
     /// Blocking push (`spawn_blocking` producers).
@@ -297,7 +311,7 @@ impl RowBatcher {
             return false;
         }
         self.buf.push(row);
-        if self.buf.len() >= ROW_BATCH_SIZE || self.since.elapsed() >= ROW_BATCH_MAX_AGE {
+        if self.buf.len() >= self.target || self.since.elapsed() >= ROW_BATCH_MAX_AGE {
             return self.blocking_flush();
         }
         true
@@ -323,6 +337,20 @@ impl RowBatcher {
     /// Blocking sibling of [`finish`](Self::finish).
     pub fn blocking_finish(mut self) {
         self.blocking_flush();
+        self.finished = true;
+    }
+}
+
+impl Drop for RowBatcher {
+    fn drop(&mut self) {
+        // Rows still buffered while the consumer is listening mean the
+        // producer returned without `finish`/`error`: a silently truncated
+        // result. (A closed receiver or an unwinding panic is expected.)
+        debug_assert!(
+            self.finished || self.buf.is_empty() || self.tx.is_closed() || std::thread::panicking(),
+            "RowBatcher dropped with {} unsent rows",
+            self.buf.len()
+        );
     }
 }
 
@@ -489,6 +517,94 @@ mod tests {
             assert_eq!(item.as_ref().unwrap(), &json!({"n": i}));
         }
         assert!(matches!(items.last(), Some(Err(SofError::Cancelled))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_path_keeps_order_and_partial_batch_precedes_error() {
+        let (tx, rx) = row_batch_channel();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut b = RowBatcher::new(tx);
+            for i in 0..(ROW_BATCH_SIZE * 2 + 5) {
+                assert!(b.blocking_push(json!({"n": i})));
+            }
+            b.blocking_error(SofError::Cancelled);
+        });
+        let items: Vec<_> = futures::StreamExt::collect(row_stream(rx)).await;
+        producer.await.unwrap();
+        assert_eq!(items.len(), ROW_BATCH_SIZE * 2 + 6);
+        for (i, item) in items[..items.len() - 1].iter().enumerate() {
+            assert_eq!(item.as_ref().unwrap(), &json!({"n": i}));
+        }
+        assert!(matches!(items.last(), Some(Err(SofError::Cancelled))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_finish_delivers_the_partial_batch() {
+        let (tx, rx) = row_batch_channel();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut b = RowBatcher::new(tx);
+            for i in 0..3 {
+                assert!(b.blocking_push(json!({"n": i})));
+            }
+            b.blocking_finish();
+        });
+        let items: Vec<_> = futures::StreamExt::collect(row_stream(rx)).await;
+        producer.await.unwrap();
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn blocking_age_flush_sends_a_held_batch() {
+        let (tx, mut rx) = row_batch_channel();
+        let mut b = RowBatcher::new(tx);
+        // Row 1 goes out at once (target 1); rows 2 is held (target 2) ...
+        assert!(b.blocking_push(json!({"n": 0})));
+        assert!(b.blocking_push(json!({"n": 1})));
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 1);
+        assert!(rx.try_recv().is_err());
+        // ... until a later row finds it older than the age limit.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(b.blocking_push(json!({"n": 2})));
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 2);
+        b.blocking_finish();
+    }
+
+    #[tokio::test]
+    async fn first_push_is_delivered_immediately_and_target_grows() {
+        let (tx, mut rx) = row_batch_channel();
+        let mut b = RowBatcher::new(tx);
+        assert!(b.push(json!({"n": 0})).await);
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 1);
+        assert!(b.push(json!({"n": 1})).await);
+        assert!(rx.try_recv().is_err(), "target is 2 now");
+        assert!(b.push(json!({"n": 2})).await);
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 2);
+        b.finish().await;
+    }
+
+    #[tokio::test]
+    async fn try_flush_keeps_the_batch_when_the_channel_is_full() {
+        let (tx, mut rx) = row_batch_channel();
+        // Fill the channel (depth 2) with other messages.
+        tx.send(Ok(vec![json!("a")])).await.unwrap();
+        tx.send(Ok(vec![json!("b")])).await.unwrap();
+        let mut b = RowBatcher::new(tx);
+        b.buf.push(json!({"n": 0}));
+        b.buf.push(json!({"n": 1}));
+        assert!(b.try_flush());
+        assert_eq!(b.buf.len(), 2, "batch kept, not lost");
+        // Make room: now the same batch goes out, in order.
+        rx.recv().await.unwrap().unwrap();
+        assert!(b.try_flush());
+        assert!(b.buf.is_empty());
+        rx.recv().await.unwrap().unwrap();
+        let sent = rx.recv().await.unwrap().unwrap();
+        assert_eq!(sent, vec![json!({"n": 0}), json!({"n": 1})]);
+        b.finish().await;
+        drop(rx);
+        let (tx2, rx2) = row_batch_channel();
+        drop(rx2);
+        assert!(!RowBatcher::new(tx2).try_flush());
     }
 
     #[tokio::test]
