@@ -10,6 +10,7 @@
 //! | Variant | HTTP status | FHIR issue code | tx-issue-type |
 //! |---------|-------------|-----------------|---------------|
 //! | [`NotFound`] | 404 | `not-found` | `not-found` |
+//! | [`Gone`] | 410 | `deleted` | `not-found` |
 //! | [`NotSupported`] | 501 | `not-supported` | `not-supported` |
 //! | [`InvalidRequest`] | 400 | `invalid` | `invalid` |
 //! | [`VsInvalid`] | 400 | `invalid` | `vs-invalid` |
@@ -20,6 +21,7 @@
 //! | [`TooCostly`] | 422 | `too-costly` | `too-costly` |
 //!
 //! [`NotFound`]: HtsError::NotFound
+//! [`Gone`]: HtsError::Gone
 //! [`NotSupported`]: HtsError::NotSupported
 //! [`InvalidRequest`]: HtsError::InvalidRequest
 //! [`VsInvalid`]: HtsError::VsInvalid
@@ -50,6 +52,10 @@ pub enum HtsError {
     /// not exist in the store.  Maps to HTTP 404.
     #[error("Resource not found: {0}")]
     NotFound(String),
+
+    /// The requested history revision records deletion. Maps to HTTP 410.
+    #[error("Resource version deleted: {0}")]
+    Gone(String),
 
     /// The operation or parameter is valid FHIR but is not implemented by this
     /// server (e.g., SNOMED post-coordination expressions).  Maps to HTTP 501.
@@ -147,6 +153,7 @@ impl IntoResponse for HtsError {
                 "not-found",
                 msg.as_str(),
             ),
+            HtsError::Gone(msg) => (StatusCode::GONE, "deleted", "not-found", msg.as_str()),
             HtsError::NotSupported(msg) => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",

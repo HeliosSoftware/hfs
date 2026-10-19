@@ -19,6 +19,7 @@ use helios_persistence::ResourceStorage;
 use helios_persistence::backends::postgres::PostgresBackend;
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
+use helios_persistence::core::VersionedStorage;
 
 /// Key for the in-process `$expand` result cache.
 ///
@@ -338,6 +339,19 @@ impl<B: TerminologyBackend> AppState<B> {
     /// Access the terminology backend directly (avoids cloning the `Arc`).
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Return the active history store, using the same backend priority as CRUD.
+    pub fn active_versioned_resource_store(&self) -> Option<Arc<dyn VersionedStorage>> {
+        #[cfg(feature = "sqlite")]
+        if let Some(ref store) = self.resource_store {
+            return Some(Arc::clone(store) as Arc<dyn VersionedStorage>);
+        }
+        #[cfg(feature = "postgres")]
+        if let Some(ref store) = self.resource_store_pg {
+            return Some(Arc::clone(store) as Arc<dyn VersionedStorage>);
+        }
+        None
     }
 
     /// Return the active raw FHIR resource store, if any.

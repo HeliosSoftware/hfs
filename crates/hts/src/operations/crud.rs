@@ -108,14 +108,11 @@ mod inner {
         })
     }
 
-    /// Imported resources become persistence-managed only inside the write
-    /// transaction. Their original content is version 1; the actual update or
-    /// delete follows through the normal persistence API in that transaction.
+    /// Imported resources acquire a history baseline before deletion.
     async fn current_resource(
         transaction: &mut dyn CrudTransaction,
         kind: ResourceKind,
         id: &str,
-        if_match: Option<&str>,
     ) -> Result<StoredResource, HtsError> {
         let resource_type = kind.resource_type();
         if let Some(current) = transaction
@@ -123,31 +120,46 @@ mod inner {
             .await
             .map_err(storage_error)?
         {
-            if let Some(etag) = if_match
-                && !current.matches_etag(etag)
-            {
-                return Err(HtsError::PreconditionFailed(format!(
-                    "ETag mismatch: supplied {etag}, current {}",
-                    current.etag()
-                )));
-            }
             return Ok(current);
         }
         let content = transaction
             .normalized_resource(kind, id)
             .await?
             .ok_or_else(|| HtsError::NotFound(format!("{resource_type}/{id}")))?;
-        if if_match.is_some() {
-            return Err(HtsError::PreconditionFailed(
-                "Imported resource has no persisted ETag; read \
-                 it and update without If-Match to establish history"
-                    .into(),
-            ));
-        }
         transaction
             .create(resource_type, content)
             .await
             .map_err(storage_error)
+    }
+
+    /// Version metadata belongs to persistence, not to the submitted resource.
+    fn clear_server_meta(body: &mut Value) {
+        if let Some(meta) = body.get_mut("meta").and_then(Value::as_object_mut) {
+            meta.remove("versionId");
+            meta.remove("lastUpdated");
+        }
+    }
+
+    fn resource_response(
+        stored: &StoredResource,
+        format: ResponseFormat,
+        status: StatusCode,
+    ) -> Response {
+        let mut response = fhir_respond(stored.content_with_meta(), format);
+        *response.status_mut() = status;
+        if let Ok(value) = HeaderValue::from_str(stored.etag()) {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+        let modified = stored.last_modified().format("%a, %d %b %Y %H:%M:%S GMT");
+        if let Ok(value) = HeaderValue::from_str(&modified.to_string()) {
+            response.headers_mut().insert(header::LAST_MODIFIED, value);
+        }
+        if status == StatusCode::CREATED
+            && let Ok(value) = HeaderValue::from_str(&format!("/{}", stored.versioned_url()))
+        {
+            response.headers_mut().insert(header::LOCATION, value);
+        }
+        response
     }
 
     /// Create raw content and normalized terminology in one transaction.
@@ -157,14 +169,13 @@ mod inner {
         mut body: Value,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
+        let id = helios_persistence::types::new_resource_id();
+        body.as_object_mut()
+            .ok_or_else(|| HtsError::InvalidRequest("Resource must be a JSON object".into()))?
+            .insert("id".into(), Value::String(id.clone()));
+        clear_server_meta(&mut body);
         crate::import::parse_crud_resource(resource_type, &body)?;
         let kind = resource_kind(resource_type)?;
-        let id = body
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(helios_persistence::types::new_resource_id);
-        body["id"] = Value::String(id.clone());
         let mut transaction = crud_transaction::begin(&state, kind, &id).await?;
         let result = async {
             transaction.prepare(kind, &id, Some(&body)).await?;
@@ -180,7 +191,7 @@ mod inner {
                 .await
                 .map_err(storage_error)?;
             transaction
-                .normalize(kind, stored.content().clone(), false)
+                .normalize(kind, stored.content_with_meta(), false)
                 .await?;
             Ok(stored)
         }
@@ -188,15 +199,7 @@ mod inner {
         let result = finish(transaction, result).await;
         evict_caches_after_write(&state);
         let stored = result?;
-        let mut response = fhir_respond(stored.content().clone(), format);
-        *response.status_mut() = StatusCode::CREATED;
-        if let Ok(value) = HeaderValue::from_str(&format!("/{resource_type}/{}", stored.id())) {
-            response.headers_mut().insert(header::LOCATION, value);
-        }
-        if let Ok(value) = HeaderValue::from_str(stored.etag()) {
-            response.headers_mut().insert(header::ETAG, value);
-        }
-        Ok(response)
+        Ok(resource_response(&stored, format, StatusCode::CREATED))
     }
 
     /// GET /<ResourceType>/:id — read stored FHIR JSON.
@@ -212,12 +215,7 @@ mod inner {
         if let Some(store) = state.active_resource_store() {
             match store.read(&ctx(), resource_type, &id).await {
                 Ok(Some(resource)) if !resource.is_deleted() => {
-                    let etag = resource.etag().to_string();
-                    let mut response = fhir_respond(resource.content().clone(), format);
-                    if let Ok(value) = HeaderValue::from_str(&etag) {
-                        response.headers_mut().insert(header::ETAG, value);
-                    }
-                    return Ok(response);
+                    return Ok(resource_response(&resource, format, StatusCode::OK));
                 }
                 Ok(Some(_)) => return Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
                 Ok(None) => {}
@@ -238,8 +236,32 @@ mod inner {
             .ok_or_else(|| HtsError::NotFound(format!("{resource_type}/{id}")))
     }
 
-    /// Replace an existing resource atomically, including history, terminology
-    /// rows and derived closure data. A never-used ID remains a 404.
+    /// Read the named persistence revision, never substituting current or
+    /// import-only content for a version that has no history entry.
+    async fn read_resource_version<B: TerminologyBackend>(
+        resource_type: &'static str,
+        state: AppState<B>,
+        id: String,
+        version: String,
+        format: ResponseFormat,
+    ) -> Result<Response, HtsError> {
+        let identity = format!("{resource_type}/{id}/_history/{version}");
+        let store = state
+            .active_versioned_resource_store()
+            .ok_or_else(|| HtsError::NotFound(identity.clone()))?;
+        let stored = store
+            .vread(&ctx(), resource_type, &id, &version)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| HtsError::NotFound(identity.clone()))?;
+        if stored.is_deleted() {
+            return Err(HtsError::Gone(identity));
+        }
+        Ok(resource_response(&stored, format, StatusCode::OK))
+    }
+
+    /// Create, update or restore a logical resource atomically, retaining its
+    /// history and keeping normalized terminology in the same transaction.
     async fn update_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
@@ -248,41 +270,84 @@ mod inner {
         mut body: Value,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        if let Some(body_id) = body.get("id")
-            && body_id.as_str() != Some(id.as_str())
-        {
+        if body.get("id").and_then(Value::as_str) != Some(id.as_str()) {
             return Err(HtsError::InvalidRequest(
-                "Body id must match the request URL".into(),
+                "Body id must be present and match the request URL".into(),
             ));
         }
-        body.as_object_mut()
-            .ok_or_else(|| HtsError::InvalidRequest("Resource must be a JSON object".into()))?
-            .insert("id".into(), Value::String(id.clone()));
+        clear_server_meta(&mut body);
         crate::import::parse_crud_resource(resource_type, &body)?;
         let kind = resource_kind(resource_type)?;
         let mut transaction = crud_transaction::begin(&state, kind, &id).await?;
         let result = async {
             transaction.prepare(kind, &id, Some(&body)).await?;
-            let current =
-                current_resource(&mut *transaction, kind, &id, if_match.as_deref()).await?;
-            let updated = transaction
-                .update(&current, body)
+            let mut current = transaction
+                .read_including_deleted(resource_type, &id)
                 .await
                 .map_err(storage_error)?;
+            if let Some(etag) = if_match.as_deref() {
+                let live = current.as_ref().filter(|resource| !resource.is_deleted());
+                match live {
+                    Some(resource) if resource.matches_etag(etag) => {}
+                    Some(resource) => {
+                        return Err(HtsError::PreconditionFailed(format!(
+                            "ETag mismatch: supplied {etag}, current {}",
+                            resource.etag()
+                        )));
+                    }
+                    None => {
+                        return Err(HtsError::PreconditionFailed(
+                            "If-Match requires an existing resource with a persisted ETag".into(),
+                        ));
+                    }
+                }
+            }
+            // Import-only content establishes version 1 before the update,
+            // preserving the original resource in persistence history.
+            if current.is_none()
+                && let Some(original) = transaction.normalized_resource(kind, &id).await?
+            {
+                current = Some(
+                    transaction
+                        .create(resource_type, original)
+                        .await
+                        .map_err(storage_error)?,
+                );
+            }
+            let replace = current.is_some();
+            let (stored, status) = match current {
+                Some(current) if current.is_deleted() => (
+                    transaction
+                        .restore(&current, body)
+                        .await
+                        .map_err(storage_error)?,
+                    StatusCode::CREATED,
+                ),
+                Some(current) => (
+                    transaction
+                        .update(&current, body)
+                        .await
+                        .map_err(storage_error)?,
+                    StatusCode::OK,
+                ),
+                None => (
+                    transaction
+                        .create(resource_type, body)
+                        .await
+                        .map_err(storage_error)?,
+                    StatusCode::CREATED,
+                ),
+            };
             transaction
-                .normalize(kind, updated.content().clone(), true)
+                .normalize(kind, stored.content_with_meta(), replace)
                 .await?;
-            Ok(updated)
+            Ok((stored, status))
         }
         .await;
         let result = finish(transaction, result).await;
         evict_caches_after_write(&state);
-        let updated = result?;
-        let mut response = fhir_respond(updated.content().clone(), format);
-        if let Ok(value) = HeaderValue::from_str(updated.etag()) {
-            response.headers_mut().insert(header::ETAG, value);
-        }
-        Ok(response)
+        let (stored, status) = result?;
+        Ok(resource_response(&stored, format, status))
     }
 
     /// Delete the resource and its exact normalized identity in one transaction.
@@ -295,7 +360,7 @@ mod inner {
         let mut transaction = crud_transaction::begin(&state, kind, &id).await?;
         let result = async {
             transaction.prepare(kind, &id, None).await?;
-            current_resource(&mut *transaction, kind, &id, None).await?;
+            current_resource(&mut *transaction, kind, &id).await?;
             transaction
                 .delete(resource_type, &id)
                 .await
@@ -343,6 +408,22 @@ mod inner {
             "CodeSystem",
             state,
             id,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
+    }
+
+    pub async fn read_code_system_version<B: TerminologyBackend>(
+        State(state): State<AppState<B>>,
+        Path((id, version)): Path<(String, String)>,
+        headers: HeaderMap,
+        RawQuery(raw): RawQuery,
+    ) -> Result<Response, HtsError> {
+        read_resource_version(
+            "CodeSystem",
+            state,
+            id,
+            version,
             crud_format(&headers, raw.as_deref()),
         )
         .await
@@ -396,6 +477,22 @@ mod inner {
         read_resource("ValueSet", state, id, crud_format(&headers, raw.as_deref())).await
     }
 
+    pub async fn read_value_set_version<B: TerminologyBackend>(
+        State(state): State<AppState<B>>,
+        Path((id, version)): Path<(String, String)>,
+        headers: HeaderMap,
+        RawQuery(raw): RawQuery,
+    ) -> Result<Response, HtsError> {
+        read_resource_version(
+            "ValueSet",
+            state,
+            id,
+            version,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
+    }
+
     pub async fn update_value_set<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
         Path(id): Path<String>,
@@ -445,6 +542,22 @@ mod inner {
             "ConceptMap",
             state,
             id,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
+    }
+
+    pub async fn read_concept_map_version<B: TerminologyBackend>(
+        State(state): State<AppState<B>>,
+        Path((id, version)): Path<(String, String)>,
+        headers: HeaderMap,
+        RawQuery(raw): RawQuery,
+    ) -> Result<Response, HtsError> {
+        read_resource_version(
+            "ConceptMap",
+            state,
+            id,
+            version,
             crud_format(&headers, raw.as_deref()),
         )
         .await
@@ -835,8 +948,8 @@ mod tests {
         assert_eq!(
             send_json(
                 &app,
-                "POST",
-                "/CodeSystem",
+                "PUT",
+                "/CodeSystem/cs-lk",
                 cs_with("cs-lk", json!([{ "code": "A", "display": "Alpha" }]))
             )
             .await
@@ -901,8 +1014,8 @@ mod tests {
         assert_eq!(
             send_json(
                 &app,
-                "POST",
-                "/CodeSystem",
+                "PUT",
+                "/CodeSystem/cs-disp",
                 cs_with("cs-disp", json!([{ "code": "A", "display": "Alpha" }]))
             )
             .await
@@ -971,8 +1084,8 @@ mod tests {
         assert_eq!(
             send_json(
                 &app,
-                "POST",
-                "/ValueSet",
+                "PUT",
+                "/ValueSet/vs-ver",
                 vs_including(
                     "vs-ver",
                     Some("1.0.0"),
@@ -1026,8 +1139,8 @@ mod tests {
         assert_eq!(
             send_json(
                 &app,
-                "POST",
-                "/ValueSet",
+                "PUT",
+                "/ValueSet/vs-upd",
                 vs_including("vs-upd", Some("1.0.0"), system, &["A"])
             )
             .await
@@ -1080,7 +1193,17 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert!(resp.headers().contains_key(header::ETAG));
-        assert!(resp.headers().contains_key(header::LOCATION));
+        assert!(resp.headers().contains_key(header::LAST_MODIFIED));
+        let location = resp.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = json_body(resp).await;
+        let id = body["id"].as_str().unwrap();
+        assert_ne!(id, "cs1");
+        assert_eq!(body["meta"]["versionId"], "1");
+        assert!(body["meta"]["lastUpdated"].is_string());
+        assert_eq!(location, format!("/CodeSystem/{id}/_history/1"));
     }
 
     #[tokio::test]
@@ -1108,23 +1231,26 @@ mod tests {
             .unwrap()
             .to_string();
 
+        let created = json_body(post_resp).await;
+        let id = created["id"].as_str().unwrap();
+        assert_ne!(id, "cs-read");
+
         // GET
         let get_resp = app
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/CodeSystem/cs-read")
+                    .uri(format!("/CodeSystem/{id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::OK);
+        assert_eq!(get_resp.headers()[header::ETAG], etag);
         let body = json_body(get_resp).await;
-        assert_eq!(body["id"], "cs-read");
+        assert_eq!(body["id"], id);
         assert_eq!(body["resourceType"], "CodeSystem");
-        // ETag on GET should match the one from POST.
-        let _ = etag; // used for the assertion above via headers
     }
 
     #[tokio::test]
@@ -1169,13 +1295,17 @@ mod tests {
             .unwrap()
             .to_string();
 
+        let created = json_body(post_resp).await;
+        let id = created["id"].as_str().unwrap();
+        let uri = format!("/CodeSystem/{id}");
+
         // 2. GET → 200
         let get_resp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1186,7 +1316,7 @@ mod tests {
         // 3. PUT → 200 with incremented ETag
         let updated = json!({
             "resourceType": "CodeSystem",
-            "id": "cs-rt",
+            "id": id,
             "url": "http://example.org/cs/cs-rt",
             "name": "UpdatedCS",
             "status": "active",
@@ -1198,7 +1328,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .header("content-type", "application/json")
                     .header(header::IF_MATCH, &etag_v1)
                     .body(Body::from(updated.to_string()))
@@ -1222,7 +1352,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1238,7 +1368,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1251,7 +1381,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1264,18 +1394,21 @@ mod tests {
     async fn cs_put_with_wrong_etag_returns_412() {
         let (_directory, app) = code_system_router();
 
-        // POST first
-        app.clone()
+        // Create the exact ID before testing a live-resource precondition.
+        let created = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/CodeSystem")
+                    .method("PUT")
+                    .uri("/CodeSystem/cs-etag")
                     .header("content-type", "application/json")
                     .body(Body::from(cs_body("cs-etag").to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
+
+        assert_eq!(created.status(), StatusCode::CREATED);
 
         // PUT with wrong ETag
         let resp = app
@@ -1318,20 +1451,21 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
 
+        let created = json_body(resp).await;
+        let public_id = created["id"].as_str().unwrap();
+
         // Verify HTS normalized tables were populated. The synthetic storage
         // id (`<fhir-id>|<version>`) is opaque, so we look up by URL.
         let conn = hts_pool.get().unwrap();
-        let storage_id: String = conn
+        let (storage_id, normalized_id): (String, String) = conn
             .query_row(
-                "SELECT id FROM code_systems WHERE url = 'http://example.org/cs/cs-index'",
+                "SELECT id, json_extract(resource_json, '$.id') FROM code_systems
+                 WHERE url = 'http://example.org/cs/cs-index'",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert!(
-            storage_id.starts_with("cs-index"),
-            "storage id should be derived from FHIR id, got {storage_id}"
-        );
+        assert_eq!(normalized_id, public_id);
 
         let concept_count: i64 = conn
             .query_row(
@@ -1360,7 +1494,8 @@ mod tests {
             .with_state(state);
 
         // Create
-        app.clone()
+        let created = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1372,13 +1507,26 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = json_body(created).await;
+        let id = created["id"].as_str().unwrap();
+        let storage_id: String = hts_pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = 'http://example.org/cs/cs-del'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
         // Delete
         let del = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/CodeSystem/cs-del")
+                    .uri(format!("/CodeSystem/{id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1400,8 +1548,8 @@ mod tests {
 
         let concept_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM concepts WHERE system_id LIKE 'cs-del%'",
-                [],
+                "SELECT COUNT(*) FROM concepts WHERE system_id = ?1",
+                [&storage_id],
                 |r| r.get(0),
             )
             .unwrap();
@@ -1429,13 +1577,17 @@ mod tests {
             .unwrap();
         assert_eq!(post_resp.status(), StatusCode::CREATED);
 
+        let created = json_body(post_resp).await;
+        let id = created["id"].as_str().unwrap();
+        let uri = format!("/ValueSet/{id}");
+
         // GET → 200
         let get_resp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ValueSet/vs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1449,7 +1601,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/ValueSet/vs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1462,7 +1614,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ValueSet/vs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1492,13 +1644,17 @@ mod tests {
             .unwrap();
         assert_eq!(post_resp.status(), StatusCode::CREATED);
 
+        let created = json_body(post_resp).await;
+        let id = created["id"].as_str().unwrap();
+        let uri = format!("/ConceptMap/{id}");
+
         // GET → 200
         let get_resp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ConceptMap/cm-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1512,7 +1668,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/ConceptMap/cm-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1525,7 +1681,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ConceptMap/cm-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )

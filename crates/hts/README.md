@@ -468,8 +468,31 @@ hts run --storage-backend postgres \
 | search | GET | `/CodeSystem`, `/ValueSet`, `/ConceptMap` |
 | create | POST | `/CodeSystem`, `/ValueSet`, `/ConceptMap` |
 | read | GET | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
+| version read | GET | `/{type}/{id}/_history/{versionId}` |
 | update | PUT | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
 | delete | DELETE | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
+
+POST assigns a new server-generated logical ID, ignoring any submitted `id`.
+PUT requires a body `id` matching the URL. It creates a new ID or restores a
+deleted resource with **201 Created**, and updates a live or imported resource
+with **200 OK**. Restoration continues the existing version history. These
+resources advertise `updateCreate: true` in the CapabilityStatement.
+
+Successful POST and PUT requests return server-managed `meta.versionId` and
+`meta.lastUpdated`, with `ETag` and `Last-Modified` headers. A 201 response also
+includes a version-specific `Location`, such as
+`/CodeSystem/{id}/_history/{versionId}`.
+`If-Match` requires a live persistence-managed resource and a matching ETag;
+absent, deleted, or imported-only resources return **412 Precondition Failed**.
+Canonical ownership checks still apply, so creating or restoring a resource
+cannot overwrite another ID's canonical resource.
+
+Version reads return the exact stored revision, including its `meta`, `ETag`,
+and `Last-Modified`, even after later updates or deletion. Unknown revisions
+return **404 Not Found**; a deletion revision returns **410 Gone**.
+Imported-only resources have no readable persistence revisions until a REST
+write establishes history. The CapabilityStatement advertises `vread`; history
+listing is not supported.
 
 ### Imported resource identities
 
@@ -517,10 +540,6 @@ CodeSystem or ValueSet with the same canonical URL and business version assigns
 a new logical ID; it does not restore the deleted ID. ConceptMap imports do not
 allocate replacement IDs: a reimport whose source ID is reserved must supply a
 different ID. Neither rule permanently prohibits importing that canonical URL.
-
-Create-through-PUT for unknown IDs and discarding client-supplied POST IDs
-remain separate work in #2137. For now, invalid supplied IDs and conflicts are
-rejected before committing either representation.
 
 ### Utility
 
