@@ -150,7 +150,7 @@ in-process fallback.
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for `s3`, seconds (spec requires ≥ 24h) |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs |
 | `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum queued + running export jobs per tenant; beyond it `$sql-export` returns `429` with `Retry-After: 5` |
-| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger results split across files |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger results split across files; `0` = a single shard held fully in memory |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory` in-process; `kafka`/`sqs` reserved) |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`) |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval, seconds (clamped to ≥ 1) |
