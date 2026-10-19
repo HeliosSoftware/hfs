@@ -1013,8 +1013,8 @@ impl MongoBackend {
         }
 
         if !Self::looks_like_mongodb_uri(uri) {
+            // Malformed connection strings may contain credentials (#2139).
             tracing::warn!(
-                uri = %uri,
                 "MongoDB connection string does not start with mongodb:// or mongodb+srv://"
             );
         }
