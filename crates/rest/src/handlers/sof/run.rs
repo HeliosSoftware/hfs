@@ -1088,6 +1088,8 @@ fn streaming_ndjson_response(
 /// inside that prefix still returns a real error status; past it the `200` is
 /// committed and a row error aborts the chunked body (no terminating chunk, so
 /// the client sees a failed body, not a truncated array) like the NDJSON path.
+/// A result of at most [`SCHEMA_SAMPLE_ROWS`] rows is answered as an ordinary
+/// buffered response (one extra row is read to tell the two apart).
 async fn streaming_rows_response(
     mut stream: helios_persistence::core::sof_runner::RowStream,
     mut encoder: helios_sof::RowStreamEncoder,
@@ -1115,7 +1117,16 @@ async fn streaming_rows_response(
     }
     // The buffered path rejects a bad declared column once the rows are in.
     try_declared_columns(view_json).map_err(map_sof_lib_error_to_rest)?;
-    // A stream that ended inside the prefix is already complete: answer like
+    // One row past the prefix tells a result of exactly `SCHEMA_SAMPLE_ROWS`
+    // rows (end of stream) from a longer one; the row is kept for the task.
+    let mut pending = None;
+    if !ended {
+        match stream.next().await {
+            None => ended = true,
+            item => pending = item,
+        }
+    }
+    // A stream that ended within the prefix is already complete: answer like
     // the buffered path (Content-Length, and the compression layer's small-body
     // rule) rather than as a chunked body.
     if ended {
@@ -1142,9 +1153,12 @@ async fn streaming_rows_response(
         let mut buf: Vec<u8> = Vec::new();
         loop {
             // Stop as soon as the client is gone, even if the runner is slow.
-            let item = tokio::select! {
-                _ = tx.closed() => return,
-                item = stream.next() => item,
+            let item = match pending.take() {
+                Some(item) => Some(item),
+                None => tokio::select! {
+                    _ = tx.closed() => return,
+                    item = stream.next() => item,
+                },
             };
             let Some(item) = item else { break };
             let pushed = match item {
@@ -2234,9 +2248,20 @@ mod tests {
     #[tokio::test]
     async fn streaming_small_results_keep_the_buffered_headers() {
         use http_body::Body as _;
-        for count in [0, 1] {
-            for ct in [ContentType::Json, ContentType::Csv] {
-                let response = rows_response(numbered_rows(count), ct).await.unwrap();
+        // `None` is the fhir Parameters output; the counts straddle the prefix.
+        let formats = [
+            Some(ContentType::Json),
+            Some(ContentType::Csv),
+            Some(ContentType::CsvWithHeader),
+            None,
+        ];
+        for count in [0, 1, SCHEMA_SAMPLE_ROWS - 1, SCHEMA_SAMPLE_ROWS] {
+            for ct in formats {
+                let response = match ct {
+                    Some(ct) => rows_response(numbered_rows(count), ct).await,
+                    None => fhir_rows_response(numbered_rows(count), &typed_view()).await,
+                }
+                .unwrap();
                 // hyper turns an exact body size into Content-Length; a
                 // channel body has no exact size and would go out chunked.
                 let exact = response.body().size_hint().exact();
@@ -2246,14 +2271,72 @@ mod tests {
                 assert_eq!(
                     exact,
                     Some(streamed.len() as u64),
-                    "exact size, so Content-Length"
+                    "exact size, so Content-Length: {count} rows {ct:?}"
                 );
-                let (_, buffered) =
-                    format_stream(row_stream(numbered_rows(count)), ct, &typed_view(), None)
-                        .await
-                        .unwrap();
+                let buffered = match ct {
+                    Some(ct) => {
+                        format_stream(row_stream(numbered_rows(count)), ct, &typed_view(), None)
+                            .await
+                            .unwrap()
+                            .1
+                    }
+                    None => {
+                        let values = numbered_rows(count)
+                            .into_iter()
+                            .map(|r| r.unwrap())
+                            .collect();
+                        format_view_fhir_parameters(
+                            &helios_sof::rows_to_processed_result(values),
+                            &typed_view(),
+                        )
+                        .unwrap()
+                    }
+                };
                 assert_eq!(streamed.to_vec(), buffered, "{count} rows {ct:?}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_rows_client_disconnect_drops_the_row_stream() {
+        // An endless stream: it can only stop if dropping the response body
+        // makes the forwarding task give up and release the row stream.
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let stream: RowStream = Box::pin(futures::stream::unfold(0usize, move |i| {
+            let _keep = &flag;
+            async move {
+                tokio::task::yield_now().await;
+                Some((Ok(json!({ "id": format!("p{i}"), "n": i })), i + 1))
+            }
+        }));
+        let encoder = helios_sof::RowStreamEncoder::new(ContentType::Json).unwrap();
+        let response = streaming_rows_response(
+            stream,
+            encoder,
+            &typed_view(),
+            content_type_headers(ContentType::Json).0,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.is_some(), "expected a first chunk");
+        drop(body);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "row stream still alive after the client disconnected"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 
