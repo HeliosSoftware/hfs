@@ -12,30 +12,39 @@
 /// scheme, host, port, and path stay, which is what an operator needs to find
 /// the file. Not a URL parser: anything without `://` keeps its path part.
 pub fn redact_url(url: &str) -> String {
-    let (base, tail) = match url.find(['?', '#']) {
-        Some(cut) if url[cut..].starts_with('?') => (&url[..cut], "?[redacted]"),
-        Some(cut) => (&url[..cut], "#[redacted]"),
-        None => (url, ""),
-    };
-    let mut out = String::with_capacity(base.len() + tail.len());
-    match base.find("://") {
+    // Userinfo first: a raw `?` or `#` in a password would otherwise be read
+    // as the start of the query and leave `user:pass-prefix` in place. An `@`
+    // anywhere before the first `/` ends the userinfo, so over-redaction (an
+    // `@` in a path-less query) can hide the host but never shows a secret.
+    let mut out = String::with_capacity(url.len());
+    let rest = match url.find("://") {
         Some(scheme_end) => {
             let authority_start = scheme_end + 3;
-            let authority_end = base[authority_start..]
+            let authority_end = url[authority_start..]
                 .find('/')
-                .map_or(base.len(), |i| authority_start + i);
-            match base[authority_start..authority_end].rfind('@') {
+                .map_or(url.len(), |i| authority_start + i);
+            out.push_str(&url[..authority_start]);
+            match url[authority_start..authority_end].rfind('@') {
                 Some(at) => {
-                    out.push_str(&base[..authority_start]);
                     out.push_str("[redacted]@");
-                    out.push_str(&base[authority_start + at + 1..]);
+                    &url[authority_start + at + 1..]
                 }
-                None => out.push_str(base),
+                None => &url[authority_start..],
             }
         }
-        None => out.push_str(base),
+        None => url,
+    };
+    match rest.find(['?', '#']) {
+        Some(cut) if rest[cut..].starts_with('?') => {
+            out.push_str(&rest[..cut]);
+            out.push_str("?[redacted]");
+        }
+        Some(cut) => {
+            out.push_str(&rest[..cut]);
+            out.push_str("#[redacted]");
+        }
+        None => out.push_str(rest),
     }
-    out.push_str(tail);
     out
 }
 
@@ -68,5 +77,18 @@ mod tests {
             "http://127.0.0.1:18080/Patient.ndjson"
         );
         assert_eq!(redact_url("not a url?x=1"), "not a url?[redacted]");
+    }
+
+    #[test]
+    fn redact_url_hides_passwords_containing_query_or_fragment_delimiters() {
+        assert_eq!(
+            redact_url("postgres://u:a?b@db:5432/x?sslmode=require"),
+            "postgres://[redacted]@db:5432/x?[redacted]"
+        );
+        assert_eq!(
+            redact_url("https://u:a#b@host/f"),
+            "https://[redacted]@host/f"
+        );
+        assert_eq!(redact_url("https://u:a?b@host"), "https://[redacted]@host");
     }
 }

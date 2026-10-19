@@ -111,6 +111,7 @@
 //! sof-server
 //! ```
 
+use helios_observability::redact::redact_url;
 use helios_sof::app::{ServerConfig, create_app_with_config};
 use std::net::SocketAddr;
 use tracing::{info, warn};
@@ -136,12 +137,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe {
                 std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
             }
-            info!(url = %ts_url, "SOF_TERMINOLOGY_SERVER wired to FHIRPath context");
+            info!(
+                url = %redact_url(ts_url),
+                "SOF_TERMINOLOGY_SERVER wired to FHIRPath context"
+            );
         }
     }
 
     info!("Starting SQL-on-FHIR server...");
-    info!("Configuration: {:?}", config);
+    info!("Configuration: {}", config_for_log(&config));
 
     // Build the application router with configuration
     let app = create_app_with_config(&config);
@@ -170,6 +174,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     helios_observability::telemetry::shutdown();
 
     Ok(())
+}
+
+/// The configuration for the startup log line. `ServerConfig`'s derived
+/// `Debug` would print the terminology server URL whole, credentials included
+/// (#2149), so the fields are listed here; destructuring without `..` makes a
+/// new field a compile error until it is added.
+fn config_for_log(config: &ServerConfig) -> String {
+    let ServerConfig {
+        port,
+        host,
+        log_level,
+        max_body_size,
+        request_timeout,
+        enable_cors,
+        cors_origins,
+        cors_methods,
+        cors_headers,
+        terminology_server,
+    } = config;
+    format!(
+        "ServerConfig {{ port: {port}, host: {host:?}, log_level: {log_level:?}, \
+         max_body_size: {max_body_size}, request_timeout: {request_timeout}, \
+         enable_cors: {enable_cors}, cors_origins: {cors_origins:?}, \
+         cors_methods: {cors_methods:?}, cors_headers: {cors_headers:?}, \
+         terminology_server: {:?} }}",
+        terminology_server.as_deref().map(redact_url)
+    )
 }
 
 /// Parse command line arguments for server configuration
@@ -239,7 +270,7 @@ fn parse_args() -> ServerConfig {
         cors_headers: String,
 
         /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
-        #[arg(long, env = "SOF_TERMINOLOGY_SERVER")]
+        #[arg(long, env = "SOF_TERMINOLOGY_SERVER", hide_env_values = true)]
         terminology_server: Option<String>,
     }
 
@@ -256,5 +287,25 @@ fn parse_args() -> ServerConfig {
         cors_methods: args.cors_methods,
         cors_headers: args.cors_headers,
         terminology_server: args.terminology_server,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_for_log_redacts_terminology_server_credentials() {
+        let config = ServerConfig {
+            terminology_server: Some(
+                "https://user:PASSWORD@tx.example.org/r4?api_key=QUERYSECRET".to_string(),
+            ),
+            ..ServerConfig::default()
+        };
+        let line = config_for_log(&config);
+        assert!(!line.contains("PASSWORD"), "{line}");
+        assert!(!line.contains("QUERYSECRET"), "{line}");
+        assert!(line.contains("tx.example.org/r4"), "{line}");
+        assert!(line.contains("port: 8080"), "{line}");
     }
 }

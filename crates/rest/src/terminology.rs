@@ -24,6 +24,7 @@
 
 use std::time::Duration;
 
+use helios_persistence::core::bulk_submit_input::redact_urls_in;
 use reqwest::Client;
 use serde_json::{Value, json};
 
@@ -154,7 +155,7 @@ impl TerminologyServiceClient {
             .header("Accept", "application/fhir+json")
             .send()
             .await
-            .map_err(|e| TerminologyError::Network(e.to_string()))?;
+            .map_err(|e| TerminologyError::Network(redact_urls_in(&e.to_string())))?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -174,7 +175,7 @@ impl TerminologyServiceClient {
         let value: Value = response
             .json()
             .await
-            .map_err(|e| TerminologyError::Parse(e.to_string()))?;
+            .map_err(|e| TerminologyError::Parse(redact_urls_in(&e.to_string())))?;
 
         extract_expansion_codes(&value)
     }
@@ -218,7 +219,7 @@ impl TerminologyServiceClient {
             .header("Accept", "application/fhir+json")
             .send()
             .await
-            .map_err(|e| TerminologyError::Network(e.to_string()))?;
+            .map_err(|e| TerminologyError::Network(redact_urls_in(&e.to_string())))?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -238,7 +239,7 @@ impl TerminologyServiceClient {
         let value: Value = response
             .json()
             .await
-            .map_err(|e| TerminologyError::Parse(e.to_string()))?;
+            .map_err(|e| TerminologyError::Parse(redact_urls_in(&e.to_string())))?;
 
         extract_expansion_codes(&value)
     }
@@ -315,7 +316,7 @@ impl TerminologyServiceClient {
             .header("Accept", "application/fhir+json")
             .send()
             .await
-            .map_err(|e| TerminologyError::Network(e.to_string()))?;
+            .map_err(|e| TerminologyError::Network(redact_urls_in(&e.to_string())))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -334,7 +335,7 @@ impl TerminologyServiceClient {
             .json()
             .await
             .map(Some)
-            .map_err(|e| TerminologyError::Parse(e.to_string()))
+            .map_err(|e| TerminologyError::Parse(redact_urls_in(&e.to_string())))
     }
 }
 
@@ -502,5 +503,23 @@ mod tests {
     fn test_client_no_trailing_slash() {
         let client = TerminologyServiceClient::new("http://localhost:8090".to_string());
         assert_eq!(client.base_url(), "http://localhost:8090");
+    }
+
+    /// A request error names the URL it failed on; the configured base URL's
+    /// query must not come along with it (#2149).
+    #[tokio::test]
+    async fn test_network_error_omits_the_url_query() {
+        // Port 1 on loopback refuses the connection immediately.
+        let client =
+            TerminologyServiceClient::new("http://127.0.0.1:1?token=QUERY-SECRET".to_string());
+        let err = client
+            .expand_value_set("http://hl7.org/fhir/ValueSet/administrative-gender")
+            .await
+            .expect_err("nothing listens on port 1");
+        let message = err.to_string();
+        assert!(matches!(err, TerminologyError::Network(_)), "{message}");
+        assert!(!message.contains("SECRET"), "query leaked: {message}");
+        // reqwest names the URL; it is still there, redacted.
+        assert!(message.contains("127.0.0.1:1"), "{message}");
     }
 }
