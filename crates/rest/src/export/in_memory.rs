@@ -1454,7 +1454,9 @@ async fn run_views_job<Sink: ExportSink>(
                 .finish()
                 .map_err(|e| format!("view '{}': {e}", named.name))?,
             (None, Some(enc)) => enc.take_shard().into_iter().collect(),
-            (None, None) => Vec::new(),
+            (None, None) => unreachable!(
+                "exactly one of the parquet and text encoders exists per view (format is parquet or not)"
+            ),
         };
         for (data, rows) in done {
             store_view_shard(
