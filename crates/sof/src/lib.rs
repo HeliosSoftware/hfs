@@ -4327,7 +4327,7 @@ enum RowStreamKind {
     Json(Vec<u8>),
     Csv {
         header: bool,
-        writer: csv::Writer<SharedBuf>,
+        writer: Box<csv::Writer<SharedBuf>>,
         out: SharedBuf,
     },
 }
@@ -4364,7 +4364,7 @@ impl RowStreamEncoder {
                 let out = SharedBuf::default();
                 RowStreamKind::Csv {
                     header: content_type == ContentType::CsvWithHeader,
-                    writer: csv::Writer::from_writer(out.clone()),
+                    writer: Box::new(csv::Writer::from_writer(out.clone())),
                     out,
                 }
             }
