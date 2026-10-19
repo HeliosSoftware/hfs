@@ -3,7 +3,7 @@ SELECT
   coalesce(json_extract(fe.value, '$.code[0].text'), json_extract(fe.value, '$.code.text')) AS "component_name",
   json_extract(fe.value, '$.code.coding[0].code') AS "component_code"
 FROM resources r
-JOIN json_each(r.data, '$.component') fe ON 1=1
+JOIN json_each(CAST(r.data AS TEXT), '$.component') fe ON 1=1
 WHERE r.tenant_id = ?1
   AND r.resource_type = ?2
   AND r.is_deleted = 0

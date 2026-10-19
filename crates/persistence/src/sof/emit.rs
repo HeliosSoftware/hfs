@@ -2244,7 +2244,8 @@ fn sqlite_array_unnest_source(root: &str, path: &JsonPath) -> Option<String> {
         return None;
     };
     Some(format!(
-        "json_each({root}, {})",
+        "json_each({}, {})",
+        super::dialect::sqlite_json_source(root),
         sqlite_json_path_literal(&[name.as_str()])
     ))
 }
@@ -2280,8 +2281,9 @@ fn emit_sqlite_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
             // Always type-guarded, also off `r.data`: the two-arg
             // `json_each(r.data, '$.code')` iterates the MEMBERS of a
             // singleton object (`Condition.code`), not the object itself.
-            let extracted = format!("json_extract({root}, {path_lit})");
-            let type_check = format!("json_type({root}, {path_lit})");
+            let json_root = super::dialect::sqlite_json_source(root);
+            let extracted = format!("json_extract({json_root}, {path_lit})");
+            let type_check = format!("json_type({json_root}, {path_lit})");
             // For non-array values, wrap with `json_array(json(<extract>))`
             // — `json(...)` re-parses the extracted text so the wrapped
             // value preserves its JSON shape (otherwise SQLite's `json_array`
@@ -3454,7 +3456,7 @@ mod tests {
         );
         let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
         assert!(
-            sqlite.contains("(json_extract(r.data, '$.gender') = 'male')"),
+            sqlite.contains("(json_extract(CAST(r.data AS TEXT), '$.gender') = 'male')"),
             "{sqlite}"
         );
         let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
@@ -3669,8 +3671,8 @@ mod tests {
         let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
         assert!(
             sqlite.contains(
-                "JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' \
-                 THEN json_extract(r.data, '$.name')"
+                "JOIN json_each(CASE WHEN json_type(CAST(r.data AS TEXT), '$.name') = 'array' \
+                 THEN json_extract(CAST(r.data AS TEXT), '$.name')"
             ),
             "{sqlite}"
         );
@@ -3708,7 +3710,7 @@ mod tests {
 
         let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
         assert!(
-            sqlite.contains("json_type(r.data, '$.component') = 'array'"),
+            sqlite.contains("json_type(CAST(r.data AS TEXT), '$.component') = 'array'"),
             "{sqlite}"
         );
         assert!(
@@ -3740,7 +3742,7 @@ mod tests {
         let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
         assert!(
             sqlite.contains(
-                "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_type(r.data, '$.coding') = 'array'"
+                "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_type(CAST(r.data AS TEXT), '$.coding') = 'array'"
             ),
             "{sqlite}"
         );

@@ -1,7 +1,7 @@
 SELECT
   json_extract(fe.value, '$.family') AS "family"
 FROM resources r
-LEFT JOIN json_each(r.data, '$.name') fe ON 1=1 AND (json_extract(fe.value, '$.use') = 'official')
+LEFT JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1 AND (json_extract(fe.value, '$.use') = 'official')
 WHERE r.tenant_id = ?1
   AND r.resource_type = ?2
   AND r.is_deleted = 0
