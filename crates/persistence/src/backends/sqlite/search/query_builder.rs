@@ -257,8 +257,9 @@ pub(crate) fn is_parameter_rows(sql: &str) -> bool {
 /// `resources` in page order and stop at the first full page instead of
 /// materializing every matching key first. Reuses the subquery's numbered
 /// placeholders, so the same parameters bind. `None` for anything that is not
-/// one plain `parameter_rows` select (a `UNION` of date ranges, an
-/// `INTERSECT`, a nested subquery), which keeps `rowid IN (…)`.
+/// one plain `parameter_rows` select or a `UNION ALL` of them (a date's
+/// ranges, tested as `EXISTS (…) OR EXISTS (…)`); an `INTERSECT` or a nested
+/// subquery keeps `rowid IN (…)`.
 pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
     // The code-first composite pairing: its one nested `EXISTS` stays inside,
     // and `c.resource_key = outer_key` joins the seek on `(…, code,
@@ -276,6 +277,21 @@ pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Op
              WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND c.resource_key = {outer_key} AND {rest})"
         ));
     }
+    // A `UNION ALL` of parameter selects (a date's `ne`/`le`/`ge` ranges): a
+    // resource is a member when any one range holds for it, so the branches
+    // are `EXISTS`-es joined by `OR`.
+    if rows_sql.contains(" UNION ALL ") {
+        let branches = rows_sql
+            .split(" UNION ALL ")
+            .map(|branch| parameter_exists_predicate(branch, outer_key))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(format!("({})", branches.join(" OR ")));
+    }
+    parameter_exists_predicate(rows_sql, outer_key)
+}
+
+/// [`membership_exists_predicate`] for one plain [`parameter_rows`] select.
+fn parameter_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
     let rest = rows_sql.strip_prefix(PARAMETER_ROWS_HEAD)?;
     if [" UNION ", " INTERSECT ", " EXCEPT ", "SELECT"]
         .iter()
@@ -1623,7 +1639,13 @@ mod tests {
         );
         assert!(is_parameter_rows(&rows));
         let union = format!("{rows} UNION ALL {rows}");
-        assert!(membership_exists_predicate(&union, "w.rk").is_none());
+        let exists_union = membership_exists_predicate(&union, "w.rk").unwrap();
+        assert!(exists_union.starts_with("(EXISTS (SELECT 1 FROM search_index INDEXED BY"));
+        assert_eq!(exists_union.matches(") OR EXISTS (").count(), 1);
+        let nested = format!("{rows} UNION ALL SELECT resource_key FROM search_index");
+        assert!(membership_exists_predicate(&nested, "w.rk").is_none());
+        let union_all_then_union = format!("{rows} UNION {rows}");
+        assert!(membership_exists_predicate(&union_all_then_union, "w.rk").is_none());
         let intersect = format!("{rows} INTERSECT {rows}");
         assert!(!is_parameter_rows(&intersect));
         assert!(

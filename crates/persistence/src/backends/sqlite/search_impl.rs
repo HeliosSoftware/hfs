@@ -496,24 +496,33 @@ impl SqliteBackend {
             QueryBuilder::new(tenant_id, resource_type).build_order_by(query)
         };
 
-        // The bounded early-exit attempt, tried before the page statement and
-        // kept only when it fills the page.
-        let window_sql = match (first_page_plan, &search_filter) {
+        // The bounded early-exit attempts, tried before the page statement and
+        // kept only when one fills the page: the newest [`WINDOWS`] resources
+        // in turn. A short window (the filter matches few of the newest
+        // resources) widens before the page statement runs, since a miss only
+        // costs the window.
+        let window_sqls: Vec<String> = match (first_page_plan, &search_filter) {
             (FirstPagePlan::ExistsDriven, Some(f)) => membership_exists_predicate(&f.sql, "w.rk")
                 .map(|exists| {
-                    format!(
-                        "SELECT {select_cols} FROM \
-                         (SELECT rowid AS rk, last_updated AS lu, id AS rid \
-                          FROM resources INDEXED BY idx_resources_reindex \
-                          WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                          ORDER BY last_updated DESC, id ASC LIMIT {WINDOW}) AS w \
-                         CROSS JOIN resources ON resources.rowid = w.rk \
-                         WHERE {exists} \
-                         ORDER BY w.lu DESC, w.rid ASC LIMIT {lim}",
-                        lim = count + 1,
-                    )
-                }),
-            _ => None,
+                    WINDOWS
+                        .iter()
+                        .map(|window| {
+                            format!(
+                                "SELECT {select_cols} FROM \
+                                 (SELECT rowid AS rk, last_updated AS lu, id AS rid \
+                                  FROM resources INDEXED BY idx_resources_reindex \
+                                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                                  ORDER BY last_updated DESC, id ASC LIMIT {window}) AS w \
+                                 CROSS JOIN resources ON resources.rowid = w.rk \
+                                 WHERE {exists} \
+                                 ORDER BY w.lu DESC, w.rid ASC LIMIT {lim}",
+                                lim = count + 1,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
         };
         let search_params = search_filter.map(|f| f.params).unwrap_or_default();
 
@@ -607,14 +616,13 @@ impl SqliteBackend {
             .collect::<Result<Vec<_>, _>>()
             .or_query_error("Failed to read row")
         };
-        // The window attempt may fail to prepare (an index dropped for a bulk
-        // load) or fall short of a full page: either way the page statement
-        // runs, so a miss costs at most the window.
-        let raw_rows = match window_sql
-            .as_deref()
-            .and_then(|window| run(window).ok())
-            .filter(|rows| rows.len() > count)
-        {
+        // A window attempt may fail to prepare (an index dropped for a bulk
+        // load) or fall short of a full page: either way the next, wider
+        // window and finally the page statement run.
+        let windowed = window_sqls
+            .iter()
+            .find_map(|window| run(window).ok().filter(|rows| rows.len() > count));
+        let raw_rows = match windowed {
             Some(rows) => rows,
             None => run(&sql)?,
         };
@@ -714,8 +722,10 @@ impl SqliteBackend {
 /// One `resources` row as the page statements return it, with its sort key.
 type RawRow = (String, String, Vec<u8>, String, String, Option<CursorValue>);
 
-/// Newest `resources` rows the early-exit attempt looks at.
-const WINDOW: usize = 512;
+/// Newest `resources` rows the early-exit attempts look at, narrowest first.
+/// A page the 512 newest cannot fill (a date range that the newest resources
+/// mostly miss) is retried on 4,096 before the planner's plan runs.
+const WINDOWS: [usize; 2] = [512, 4096];
 
 /// Rows of a single parameter's index the probe reads at most. A filter with
 /// fewer rows is "selective": its whole key list is cheap to build.
@@ -743,7 +753,7 @@ pub(crate) enum FirstPagePlan {
     /// The key list is short (under [`PROBE_CAP`] index rows): drive from it
     /// and read `resources` by rowid, sorting the few rows.
     ListDriven,
-    /// The key list is long: try the newest [`WINDOW`] resources in page
+    /// The key list is long: try the newest [`WINDOWS`] resources in page
     /// order, each tested against the index with a correlated `EXISTS`; the
     /// page is final when the window fills it, else the planner's plan runs.
     ExistsDriven,
@@ -4421,6 +4431,75 @@ mod tests {
             search_count_on(&conn, &tenant, &query).unwrap(),
             search_count_on_plan(&conn, &tenant, &query, false).unwrap()
         );
+    }
+
+    /// A broad date search (`le`: a `UNION ALL` of two ranges) whose matches
+    /// are all older than the newest 512 resources: the first window comes up
+    /// empty, the 4,096 window fills the page, and the page is the planner's.
+    #[tokio::test]
+    async fn union_date_search_widens_the_recency_window() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 0..2600usize {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("d{i:04}"),
+                        "status": "final",
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "X"}]},
+                        // the 2,050 oldest are the only matches of `le2000`
+                        "effectiveDateTime": if i < 2050 { "1990-01-15T10:00:00Z" } else { "2020-01-15T10:00:00Z" },
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let query = SearchQuery::new("Observation").with_parameter(obs_param(
+            "date",
+            SearchParamType::Date,
+            SearchPrefix::Le,
+            "2000",
+        ));
+        assert_eq!(
+            probe_plan_of(&backend, &tenant, &query),
+            FirstPagePlan::ExistsDriven
+        );
+        let conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        );
+        TRACED_SQL.with(|t| t.borrow_mut().clear());
+        let probed = backend
+            .search_with_connection_probe(&conn, &tenant, &query, None, true)
+            .unwrap();
+        let windows: Vec<String> = TRACED_SQL.with(|t| {
+            t.borrow()
+                .iter()
+                .filter(|s| s.contains("INDEXED BY idx_resources_reindex"))
+                .cloned()
+                .collect()
+        });
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        assert!(windows[0].contains("LIMIT 512)") && windows[1].contains("LIMIT 4096)"));
+        assert!(windows[1].contains(") OR EXISTS ("));
+        let planned = backend
+            .search_with_connection_probe(&conn, &tenant, &query, None, false)
+            .unwrap();
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&probed), ids(&planned));
+        assert_eq!(ids(&probed).len(), 100);
+        assert!(probed.resources.page_info.has_next);
     }
 
     #[tokio::test]
