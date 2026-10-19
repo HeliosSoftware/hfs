@@ -495,6 +495,10 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             }
             .await;
 
+            // The job's row buffers and SQL engines are gone; return the
+            // freed heap to the OS once per job, not per row or shard.
+            crate::memory_trim::release_free_memory();
+
             match outcome {
                 Ok((completed_files, total_rows)) => {
                     debug!(

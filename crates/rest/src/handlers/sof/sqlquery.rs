@@ -214,7 +214,7 @@ where
         max_rows: state.config().sof_sqlquery_max_rows,
         timeout_secs: state.config().sof_sqlquery_timeout_secs,
     };
-    let (mut result, schemas_in_order) = super::graph::execute_plan(
+    let executed = super::graph::execute_plan(
         engine,
         &runner,
         tenant.context(),
@@ -224,8 +224,12 @@ where
         &bindings,
         limits,
     )
-    .await
-    .map_err(sqlquery_err_to_rest)?;
+    .await;
+    // `execute_plan` took the engine by value, so its materialized tables
+    // are freed by now, success or not. Hand the freed heap back to the OS
+    // before the response is built (one trim per run, off the request task).
+    crate::memory_trim::release_free_memory();
+    let (mut result, schemas_in_order) = executed.map_err(sqlquery_err_to_rest)?;
 
     // SoF v2 PR #353: apply caller-supplied `_limit` as a soft cap on the
     // final result set, AFTER SQL evaluation (including any in-query LIMIT).
