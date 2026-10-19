@@ -1406,6 +1406,54 @@ mod tests {
         );
     }
 
+    /// Goes through the real compiler: a refactor of `lower_binop` that bypassed
+    /// the null guard would move the throwing `$divide` out of the guard's else
+    /// branch and fail this test.
+    #[test]
+    fn compiled_where_keeps_throwing_right_operand_under_the_guard() {
+        // Every `$divide` must sit under index 2 (else branch) of some `$cond`.
+        fn unguarded_divides(b: &Bson, guarded: bool, found: &mut usize) -> usize {
+            match b {
+                Bson::Document(d) => d
+                    .iter()
+                    .map(|(k, v)| {
+                        if k == "$divide" {
+                            *found += 1;
+                            usize::from(!guarded) + unguarded_divides(v, guarded, found)
+                        } else if k == "$cond" {
+                            match v {
+                                Bson::Array(a) => a
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, e)| unguarded_divides(e, guarded || i == 2, found))
+                                    .sum(),
+                                other => unguarded_divides(other, guarded, found),
+                            }
+                        } else {
+                            unguarded_divides(v, guarded, found)
+                        }
+                    })
+                    .sum(),
+                Bson::Array(a) => a.iter().map(|e| unguarded_divides(e, guarded, found)).sum(),
+                _ => 0,
+            }
+        }
+
+        let pipeline = compile(json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }],
+            "where": [{ "path": "value.ofType(Quantity).value > (1 / 0)" }],
+        }));
+        let mut found = 0;
+        let unguarded: usize = pipeline
+            .iter()
+            .map(|s| unguarded_divides(&Bson::Document(s.clone()), false, &mut found))
+            .sum();
+        assert!(found > 0, "expected a $divide in {pipeline:?}");
+        assert_eq!(unguarded, 0, "$divide escaped the null guard: {pipeline:?}");
+    }
+
     #[test]
     fn nested_comparisons_bind_only_the_left_outside() {
         let inner = |k| {
