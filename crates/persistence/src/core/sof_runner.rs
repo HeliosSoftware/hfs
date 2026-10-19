@@ -226,6 +226,9 @@ impl RowBatcher {
 
     /// Async push (async producers).
     pub async fn push(&mut self, row: ViewRow) -> bool {
+        if self.tx.is_closed() {
+            return false;
+        }
         self.buf.push(row);
         if self.buf.len() >= ROW_BATCH_SIZE {
             return self.flush().await;
@@ -254,9 +257,18 @@ impl RowBatcher {
         self.flush().await;
     }
 
-    /// Blocking push (`spawn_blocking` producers); also flushes a batch that
-    /// has been pending longer than [`ROW_BATCH_MAX_AGE`].
+    /// Blocking push (`spawn_blocking` producers).
+    ///
+    /// Also flushes a batch that has been pending longer than
+    /// [`ROW_BATCH_MAX_AGE`]. The age is only checked when the next row
+    /// arrives, so rows pending while the producer is stuck waiting for its
+    /// next row (a selective SQLite scan) are delivered once that row is found,
+    /// not after 50 ms; the bound is "at most one row-production step plus
+    /// 50 ms", not 50 ms.
     pub fn blocking_push(&mut self, row: ViewRow) -> bool {
+        if self.tx.is_closed() {
+            return false;
+        }
         self.buf.push(row);
         if self.buf.len() >= ROW_BATCH_SIZE || self.since.elapsed() >= ROW_BATCH_MAX_AGE {
             return self.blocking_flush();
@@ -457,11 +469,9 @@ mod tests {
         let (tx, rx) = row_batch_channel();
         drop(rx);
         let mut b = RowBatcher::new(tx);
-        let mut alive = true;
-        for i in 0..ROW_BATCH_SIZE {
-            alive = b.push(json!({"n": i})).await;
-        }
-        assert!(!alive);
+        // The very first push notices the closed channel; no batch has to fill.
+        assert!(!b.push(json!({"n": 0})).await);
+        assert!(!b.blocking_push(json!({"n": 1})));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

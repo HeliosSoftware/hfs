@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use futures::FutureExt as _;
 use mongodb::bson::{Bson, DateTime as BsonDateTime, Document, doc};
 use mongodb::{Client, Collection};
 use tokio::sync::OnceCell;
@@ -152,7 +153,22 @@ impl SofRunner for MongoInDbRunner {
 
             let mut count = 0usize;
             loop {
-                match cursor.advance().await {
+                // `Cursor::advance` is not cancel-safe, so it is never dropped
+                // half-polled. Poll the pinned future once; if it is waiting on
+                // a getMore, deliver the pending rows first, then keep waiting.
+                let advanced = {
+                    let mut advance = std::pin::pin!(cursor.advance());
+                    match (&mut advance).now_or_never() {
+                        Some(r) => r,
+                        None => {
+                            if !batcher.flush().await {
+                                return; // receiver dropped
+                            }
+                            advance.await
+                        }
+                    }
+                };
+                match advanced {
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(e) => {

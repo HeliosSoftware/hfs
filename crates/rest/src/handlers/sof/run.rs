@@ -1014,6 +1014,9 @@ fn map_sof_lib_error_to_rest(e: helios_sof::SofError) -> RestError {
 /// Body-chunk size the NDJSON streamer coalesces rows into.
 const NDJSON_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Body-channel depth, in chunks.
+const NDJSON_CHANNEL_DEPTH: usize = 4;
+
 /// Sends `pending` as one body chunk and leaves it empty. Returns `false`
 /// when the client is gone.
 async fn send_ndjson_chunk(
@@ -1038,7 +1041,11 @@ fn streaming_ndjson_response(
     mut stream: helios_persistence::core::sof_runner::RowStream,
     runner_label: Option<&str>,
 ) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
+    // Each message is a ~64 KiB chunk, so a small depth bounds what a slow
+    // client can make the server buffer (about 4 x 64 KiB).
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(
+        NDJSON_CHANNEL_DEPTH,
+    );
 
     tokio::spawn(async move {
         use futures::{FutureExt as _, StreamExt as _};
