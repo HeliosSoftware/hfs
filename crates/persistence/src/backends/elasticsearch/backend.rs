@@ -72,7 +72,10 @@ impl std::fmt::Display for WriteRefreshPolicy {
 }
 
 /// Authentication configuration for Elasticsearch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the password and token never reach a log line
+/// (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub enum ElasticsearchAuth {
     /// Basic username/password authentication.
     Basic {
@@ -89,7 +92,11 @@ pub enum ElasticsearchAuth {
 }
 
 /// Configuration for the Elasticsearch backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written: node URLs are printed without userinfo, query or
+/// fragment, and `auth` through [`ElasticsearchAuth`]'s redacting `Debug`
+/// (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ElasticsearchConfig {
     /// Elasticsearch node URLs (e.g., `["http://localhost:9200"]`).
     /// Currently uses the first node (single-node connection pool).
@@ -243,6 +250,77 @@ pub const DEFAULT_BULK_CONCURRENCY: usize = 1;
 
 fn default_bulk_concurrency() -> usize {
     DEFAULT_BULK_CONCURRENCY
+}
+
+impl Debug for ElasticsearchAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ElasticsearchAuth::Basic {
+                username,
+                password: _,
+            } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"[redacted]")
+                .finish(),
+            ElasticsearchAuth::Bearer { token: _ } => f
+                .debug_struct("Bearer")
+                .field("token", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
+impl Debug for ElasticsearchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            nodes,
+            index_prefix,
+            number_of_shards,
+            number_of_replicas,
+            refresh_interval,
+            write_refresh,
+            max_result_window,
+            max_terms_count,
+            nested_objects_limit,
+            request_timeout_ms,
+            bulk_max_bytes,
+            bulk_concurrency,
+            reindex_refresh,
+            reindex_prepare_threads,
+            auth,
+            disable_certificate_validation,
+            fhir_version,
+        } = self;
+        let nodes: Vec<String> = nodes
+            .iter()
+            .map(|node| crate::core::backend::redact_connection_string(node))
+            .collect();
+        f.debug_struct("ElasticsearchConfig")
+            .field("nodes", &nodes)
+            .field("index_prefix", index_prefix)
+            .field("number_of_shards", number_of_shards)
+            .field("number_of_replicas", number_of_replicas)
+            .field("refresh_interval", refresh_interval)
+            .field("write_refresh", write_refresh)
+            .field("max_result_window", max_result_window)
+            .field("max_terms_count", max_terms_count)
+            .field("nested_objects_limit", nested_objects_limit)
+            .field("request_timeout_ms", request_timeout_ms)
+            .field("bulk_max_bytes", bulk_max_bytes)
+            .field("bulk_concurrency", bulk_concurrency)
+            .field("reindex_refresh", reindex_refresh)
+            .field("reindex_prepare_threads", reindex_prepare_threads)
+            .field("auth", auth)
+            .field(
+                "disable_certificate_validation",
+                disable_certificate_validation,
+            )
+            .field("fhir_version", fhir_version)
+            .finish()
+    }
 }
 
 impl Default for ElasticsearchConfig {
@@ -1071,6 +1149,41 @@ impl ElasticsearchBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_debug_redacts_password_and_token() {
+        let basic = ElasticsearchAuth::Basic {
+            username: "elastic".to_string(),
+            password: "es-s3cret-pw".to_string(),
+        };
+        let out = format!("{basic:?}");
+        assert!(!out.contains("es-s3cret-pw"), "password leaked: {out}");
+        assert!(out.contains("elastic"), "{out}");
+
+        let bearer = ElasticsearchAuth::Bearer {
+            token: "es-bearer-tok".to_string(),
+        };
+        let out = format!("{bearer:?}");
+        assert!(!out.contains("es-bearer-tok"), "token leaked: {out}");
+        assert!(out.contains("Bearer"), "{out}");
+    }
+
+    #[test]
+    fn config_debug_redacts_node_userinfo_and_auth() {
+        let config = ElasticsearchConfig {
+            nodes: vec!["https://user:node-s3cret@es.internal:9200/?token=q-s3cret".to_string()],
+            auth: Some(ElasticsearchAuth::Bearer {
+                token: "es-bearer-tok".to_string(),
+            }),
+            ..Default::default()
+        };
+        let out = format!("{config:?}");
+        for secret in ["node-s3cret", "q-s3cret", "es-bearer-tok"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("es.internal"), "{out}");
+        assert!(out.contains("index_prefix"), "{out}");
+    }
     use serde_json::json;
 
     /// An unreachable cluster must not stop the server from starting.
