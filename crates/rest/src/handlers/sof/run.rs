@@ -1115,13 +1115,20 @@ async fn streaming_rows_response(
     }
     // The buffered path rejects a bad declared column once the rows are in.
     try_declared_columns(view_json).map_err(map_sof_lib_error_to_rest)?;
-    // A stream that ended inside the prefix is already complete.
-    let encoder = if ended {
+    // A stream that ended inside the prefix is already complete: answer like
+    // the buffered path (Content-Length, and the compression layer's small-body
+    // rule) rather than as a chunked body.
+    if ended {
         head.extend(encoder.finish().map_err(map_sof_lib_error_to_rest)?);
-        None
-    } else {
-        Some(encoder)
-    };
+        return Ok(build_response(
+            StatusCode::OK,
+            content_type_header,
+            head,
+            runner_label,
+            "",
+        ));
+    }
+    let encoder = Some(encoder);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -2221,6 +2228,32 @@ mod tests {
                 )
                 .unwrap()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_small_results_keep_the_buffered_headers() {
+        for count in [0, 1] {
+            for ct in [ContentType::Json, ContentType::Csv] {
+                let response = rows_response(numbered_rows(count), ct).await.unwrap();
+                let length = response
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .expect("small results carry Content-Length")
+                    .to_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                let streamed = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(length, streamed.len());
+                let (_, buffered) =
+                    format_stream(row_stream(numbered_rows(count)), ct, &typed_view(), None)
+                        .await
+                        .unwrap();
+                assert_eq!(streamed.to_vec(), buffered, "{count} rows {ct:?}");
+            }
         }
     }
 
