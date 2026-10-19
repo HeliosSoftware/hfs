@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::error::{FhirPathError, FhirPathResult};
 use helios_fhir::FhirVersion;
+use helios_observability::redact::redact_url;
 
 /// Default request timeout for terminology server calls.
 ///
@@ -57,7 +58,7 @@ async fn read_response(response: Response, failure: &str) -> FhirPathResult<Valu
         let body = response
             .bytes()
             .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .map_err(|e| FhirPathError::NetworkError(transport_error_text(e)))?;
         serde_json::from_slice(&body).map_err(|e| FhirPathError::ParseError(e.to_string()))
     } else {
         let status = response.status();
@@ -66,6 +67,21 @@ async fn read_response(response: Response, failure: &str) -> FhirPathResult<Valu
             status: status.as_u16(),
             message: format!("{failure} with status {status}: {body}"),
         })
+    }
+}
+
+/// Renders a reqwest error with its URL passed through [`redact_url`].
+///
+/// reqwest ends its message with `for url (...)`, query included, and the
+/// message reaches FHIRPath callers — including HTTP clients of
+/// fhirpath-server and HFS — so a credential in the configured terminology
+/// server URL must not ride along (#2149).
+fn transport_error_text(error: reqwest::Error) -> String {
+    let url = error.url().map(|url| redact_url(url.as_str()));
+    let error = error.without_url();
+    match url {
+        Some(url) => format!("{error} for url ({url})"),
+        None => error.to_string(),
     }
 }
 
@@ -107,9 +123,12 @@ impl TerminologyClient {
         loop {
             let response = request().send().await.map_err(|e| {
                 if e.is_builder() {
-                    FhirPathError::ConfigError(format!("Invalid terminology request: {e}"))
+                    FhirPathError::ConfigError(format!(
+                        "Invalid terminology request: {}",
+                        transport_error_text(e)
+                    ))
                 } else {
-                    FhirPathError::NetworkError(e.to_string())
+                    FhirPathError::NetworkError(transport_error_text(e))
                 }
             })?;
             // Cloudflare uses HTTP 530 for tunnel failures, including error 1033
@@ -576,6 +595,21 @@ fn build_translate_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_error_text_redacts_the_url_query() {
+        let error = Client::new()
+            .get("http://127.0.0.1:1/r4/ValueSet/$expand?api_key=QUERYSECRET")
+            .send()
+            .await
+            .unwrap_err();
+        let text = transport_error_text(error);
+        assert!(!text.contains("QUERYSECRET"), "{text}");
+        assert!(
+            text.contains("127.0.0.1:1/r4/ValueSet/$expand?[redacted]"),
+            "{text}"
+        );
+    }
 
     async fn call_operation(client: &TerminologyClient, operation: &str) -> FhirPathResult<Value> {
         match operation {

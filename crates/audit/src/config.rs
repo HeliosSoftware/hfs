@@ -32,7 +32,11 @@ impl fmt::Display for AuditBackend {
 }
 
 /// Top-level audit configuration.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written (#2149): `database_url` prints only as
+/// `[redacted]` when set. This crate has no driver to parse it with, and a
+/// connection string can carry a password in several syntaxes.
+#[derive(Clone)]
 pub struct AuditConfig {
     /// Active backend.
     pub backend: AuditBackend,
@@ -118,6 +122,43 @@ impl AuditConfig {
     }
 }
 
+impl fmt::Debug for AuditConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            backend,
+            file_path,
+            database_url,
+            mongodb_database,
+            s3_bucket,
+            s3_prefix,
+            s3_region,
+            s3_validate_buckets,
+            exclusions,
+            source_observer,
+            cloudwatch_log_group,
+            cloudwatch_log_stream,
+            cloudwatch_region,
+        } = self;
+        f.debug_struct("AuditConfig")
+            .field("backend", backend)
+            .field("file_path", file_path)
+            .field("database_url", &database_url.as_ref().map(|_| "[redacted]"))
+            .field("mongodb_database", mongodb_database)
+            .field("s3_bucket", s3_bucket)
+            .field("s3_prefix", s3_prefix)
+            .field("s3_region", s3_region)
+            .field("s3_validate_buckets", s3_validate_buckets)
+            .field("exclusions", exclusions)
+            .field("source_observer", source_observer)
+            .field("cloudwatch_log_group", cloudwatch_log_group)
+            .field("cloudwatch_log_stream", cloudwatch_log_stream)
+            .field("cloudwatch_region", cloudwatch_region)
+            .finish()
+    }
+}
+
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
@@ -144,6 +185,19 @@ mod tests {
     use std::sync::{LazyLock, Mutex};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn debug_redacts_database_url() {
+        let config = AuditConfig {
+            database_url: Some("postgres://audit:audit-s3cret@db.internal/audit".to_string()),
+            s3_bucket: Some("audit-bucket".to_string()),
+            ..AuditConfig::default()
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("audit-s3cret"), "{out}");
+        assert!(out.contains("[redacted]"), "{out}");
+        assert!(out.contains("audit-bucket"), "{out}");
+    }
 
     const AUDIT_ENV_KEYS: &[&str] = &[
         "HFS_AUDIT_BACKEND",

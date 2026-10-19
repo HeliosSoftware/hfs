@@ -249,7 +249,7 @@ struct Args {
     skip_invalid: bool,
 
     /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
-    #[arg(long, env = "SOF_TERMINOLOGY_SERVER")]
+    #[arg(long, env = "SOF_TERMINOLOGY_SERVER", hide_env_values = true)]
     terminology_server: Option<String>,
 
     /// Enable remote resolution of `Reference.resolve()` against trusted servers.

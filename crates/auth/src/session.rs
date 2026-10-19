@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::config::redact_url;
 use crate::error::AuthError;
 
 /// Name of the cookie carrying the session id.
@@ -60,7 +61,9 @@ const REFRESH_SKEW: Duration = Duration::from_secs(30);
 pub const TOUCH_WRITE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The IdP client configuration the login flow drives.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the client secret as `[redacted]` (#2149).
+#[derive(Clone)]
 pub struct LoginConfig {
     /// OAuth client id registered at the IdP for the web UI (e.g. `hfs-web`).
     pub client_id: String,
@@ -112,7 +115,10 @@ impl SessionPrincipal {
 }
 
 /// One established login.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the session id (the cookie value) and every token as
+/// `[redacted]` (#2149).
+#[derive(Clone)]
 pub struct Session {
     /// The session id — the cookie value. Opaque and random.
     pub id: String,
@@ -134,7 +140,9 @@ pub struct Session {
 
 /// A login that has been started (the browser was sent to the IdP) but not
 /// yet completed. Consumed exactly once by the callback.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the `state` and PKCE verifier as `[redacted]` (#2149).
+#[derive(Clone)]
 struct PendingLogin {
     /// CSRF `state` the IdP must echo back.
     state: String,
@@ -150,7 +158,8 @@ struct PendingLogin {
 }
 
 /// What the middleware learns when it resolves a session cookie.
-#[derive(Debug)]
+///
+/// `Debug` prints the bearer as `[redacted]` (#2149).
 pub enum AccessOutcome {
     /// A usable bearer for this request.
     Token(String),
@@ -159,7 +168,9 @@ pub enum AccessOutcome {
 }
 
 /// The token endpoint's answer to a code exchange or a refresh.
-#[derive(Debug, Deserialize)]
+///
+/// `Debug` prints every token as `[redacted]` (#2149).
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     #[serde(default)]
@@ -174,7 +185,10 @@ struct TokenResponse {
 /// place of [`Instant`], so another node, or this one after a restart, can
 /// read it back. The tokens are stored as they are — they never leave the
 /// server, and the IdP's own lifetimes bound them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` prints the session id (the cookie value) and every token as
+/// `[redacted]` (#2149).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSession {
     /// The session id — the cookie value.
     pub id: String,
@@ -239,7 +253,10 @@ impl PersistedSession {
 
 /// A pending login as it is kept outside the process, so the IdP's callback
 /// may land on a node other than the one that started the login.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` prints the pending id (the cookie value), the `state` and the PKCE
+/// verifier as `[redacted]` (#2149).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedPending {
     /// The pending id — the [`PENDING_COOKIE`] value.
     pub id: String,
@@ -788,7 +805,11 @@ impl SessionStore {
             .form(form)
             .send()
             .await
-            .map_err(|e| AuthError::InternalError(format!("token endpoint unreachable: {e}")))?;
+            // `without_url`: the error would otherwise print the configured
+            // endpoint, userinfo and query included (#2149).
+            .map_err(|e| {
+                AuthError::InternalError(format!("token endpoint unreachable: {}", e.without_url()))
+            })?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -906,6 +927,164 @@ pub fn store_timestamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// How a secret field prints in the redacting `Debug` impls below (#2149).
+const REDACTED: &str = "[redacted]";
+
+/// `Some("[redacted]")` for a present optional secret, so `Debug` still shows
+/// whether there was one.
+fn redacted_opt<T>(value: &Option<T>) -> Option<&'static str> {
+    value.as_ref().map(|_| REDACTED)
+}
+
+impl std::fmt::Debug for LoginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            client_id,
+            client_secret,
+            redirect_uri,
+            scopes,
+            authorization_endpoint,
+            token_endpoint,
+            end_session_endpoint,
+            cookie_secure,
+        } = self;
+        f.debug_struct("LoginConfig")
+            .field("client_id", client_id)
+            .field("client_secret", &redacted_opt(client_secret))
+            .field("redirect_uri", &redact_url(redirect_uri))
+            .field("scopes", scopes)
+            .field(
+                "authorization_endpoint",
+                &redact_url(authorization_endpoint),
+            )
+            .field("token_endpoint", &redact_url(token_endpoint))
+            .field(
+                "end_session_endpoint",
+                &end_session_endpoint.as_deref().map(redact_url),
+            )
+            .field("cookie_secure", cookie_secure)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            id: _,
+            principal,
+            access_token: _,
+            access_expires_at,
+            refresh_token,
+            id_token,
+            last_seen,
+            created_at,
+        } = self;
+        f.debug_struct("Session")
+            .field("id", &REDACTED)
+            .field("principal", principal)
+            .field("access_token", &REDACTED)
+            .field("access_expires_at", access_expires_at)
+            .field("refresh_token", &redacted_opt(refresh_token))
+            .field("id_token", &redacted_opt(id_token))
+            .field("last_seen", last_seen)
+            .field("created_at", created_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PendingLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            state: _,
+            code_verifier: _,
+            next,
+            started_at,
+            persisted,
+        } = self;
+        f.debug_struct("PendingLogin")
+            .field("state", &REDACTED)
+            .field("code_verifier", &REDACTED)
+            .field("next", next)
+            .field("started_at", started_at)
+            .field("persisted", persisted)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AccessOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccessOutcome::Token(_) => f.debug_tuple("Token").field(&REDACTED).finish(),
+            AccessOutcome::NoSession => f.write_str("NoSession"),
+        }
+    }
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            access_token: _,
+            refresh_token,
+            id_token,
+            expires_in,
+        } = self;
+        f.debug_struct("TokenResponse")
+            .field("access_token", &REDACTED)
+            .field("refresh_token", &redacted_opt(refresh_token))
+            .field("id_token", &redacted_opt(id_token))
+            .field("expires_in", expires_in)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PersistedSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            id: _,
+            principal,
+            access_token: _,
+            access_expires_at,
+            refresh_token,
+            id_token,
+            last_seen,
+            created_at,
+            version,
+        } = self;
+        f.debug_struct("PersistedSession")
+            .field("id", &REDACTED)
+            .field("principal", principal)
+            .field("access_token", &REDACTED)
+            .field("access_expires_at", access_expires_at)
+            .field("refresh_token", &redacted_opt(refresh_token))
+            .field("id_token", &redacted_opt(id_token))
+            .field("last_seen", last_seen)
+            .field("created_at", created_at)
+            .field("version", version)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PersistedPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            id: _,
+            state: _,
+            code_verifier: _,
+            next,
+            started_at,
+        } = self;
+        f.debug_struct("PersistedPending")
+            .field("id", &REDACTED)
+            .field("state", &REDACTED)
+            .field("code_verifier", &REDACTED)
+            .field("next", next)
+            .field("started_at", started_at)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for SessionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionStore")
@@ -963,25 +1142,44 @@ pub async fn discover_endpoints(
     let pick = |explicit: Option<String>, key: &str| -> Option<String> {
         explicit.or_else(|| doc.get(key).and_then(Value::as_str).map(str::to_string))
     };
-    let auth = pick(authorization_endpoint, "authorization_endpoint")
-        .ok_or_else(|| AuthError::InternalError(format!("{url} has no authorization_endpoint")))?;
-    let token = pick(token_endpoint, "token_endpoint")
-        .ok_or_else(|| AuthError::InternalError(format!("{url} has no token_endpoint")))?;
+    let auth = pick(authorization_endpoint, "authorization_endpoint").ok_or_else(|| {
+        AuthError::InternalError(format!(
+            "{} has no authorization_endpoint",
+            redact_url(&url)
+        ))
+    })?;
+    let token = pick(token_endpoint, "token_endpoint").ok_or_else(|| {
+        AuthError::InternalError(format!("{} has no token_endpoint", redact_url(&url)))
+    })?;
     let end_session = pick(end_session_endpoint, "end_session_endpoint");
     Ok((auth, token, end_session))
 }
 
 async fn fetch_discovery(url: &str) -> Result<Value, AuthError> {
+    // The URL is printed redacted, and stripped from reqwest's own error
+    // text, which would otherwise repeat it whole (#2149).
+    let shown = redact_url(url);
+    let failed = |e: reqwest::Error| {
+        AuthError::InternalError(format!(
+            "OIDC discovery at {shown} failed: {}",
+            e.without_url()
+        ))
+    };
     reqwest::Client::new()
         .get(url)
         .send()
         .await
-        .map_err(|e| AuthError::InternalError(format!("OIDC discovery at {url} failed: {e}")))?
+        .map_err(failed)?
         .error_for_status()
-        .map_err(|e| AuthError::InternalError(format!("OIDC discovery at {url} failed: {e}")))?
+        .map_err(failed)?
         .json()
         .await
-        .map_err(|e| AuthError::InternalError(format!("OIDC discovery at {url} unreadable: {e}")))
+        .map_err(|e| {
+            AuthError::InternalError(format!(
+                "OIDC discovery at {shown} unreadable: {}",
+                e.without_url()
+            ))
+        })
 }
 
 /// The value of `cookie_name` in a request's `Cookie` header(s), if present.
@@ -1110,6 +1308,71 @@ mod tests {
             end_session_endpoint: Some("https://idp.example.com/logout".to_string()),
             cookie_secure: true,
         }
+    }
+
+    #[test]
+    fn debug_impls_redact_secrets() {
+        let mut login = config();
+        login.client_secret = Some("client-s3cret".to_string());
+        let out = format!("{login:?}");
+        assert!(!out.contains("client-s3cret"), "{out}");
+        assert!(out.contains("hfs-web"), "{out}");
+
+        let principal = SessionPrincipal {
+            subject: "user-123".to_string(),
+            issuer: "https://idp.example.com".to_string(),
+            name: None,
+            preferred_username: None,
+            email: None,
+            picture: None,
+        };
+        let session = Session {
+            id: "sid-s3cret".to_string(),
+            principal,
+            access_token: "at-s3cret".to_string(),
+            access_expires_at: Instant::now(),
+            refresh_token: Some("rt-s3cret".to_string()),
+            id_token: Some("idt-s3cret".to_string()),
+            last_seen: Instant::now(),
+            created_at: Utc::now(),
+        };
+        let persisted = PersistedSession::from_session(&session, 7);
+        let token_response = TokenResponse {
+            access_token: "at-s3cret".to_string(),
+            refresh_token: Some("rt-s3cret".to_string()),
+            id_token: Some("idt-s3cret".to_string()),
+            expires_in: Some(300),
+        };
+        let pending = PendingLogin {
+            state: "state-s3cret".to_string(),
+            code_verifier: "pkce-s3cret".to_string(),
+            next: "/ui/next".to_string(),
+            started_at: Instant::now(),
+            persisted: false,
+        };
+        let persisted_pending = PersistedPending {
+            id: "pid-s3cret".to_string(),
+            state: "state-s3cret".to_string(),
+            code_verifier: "pkce-s3cret".to_string(),
+            next: "/ui/next".to_string(),
+            started_at: Utc::now(),
+        };
+        let cases = [
+            (format!("{session:?}"), "user-123"),
+            (format!("{persisted:?}"), "user-123"),
+            (format!("{token_response:?}"), "300"),
+            (format!("{pending:?}"), "/ui/next"),
+            (format!("{persisted_pending:?}"), "/ui/next"),
+            (
+                format!("{:?}", AccessOutcome::Token("at-s3cret".to_string())),
+                "Token",
+            ),
+        ];
+        for (out, kept) in cases {
+            assert!(!out.contains("s3cret"), "secret leaked: {out}");
+            assert!(out.contains(kept), "{out}");
+        }
+        assert_eq!(format!("{:?}", AccessOutcome::NoSession), "NoSession");
     }
 
     #[test]
