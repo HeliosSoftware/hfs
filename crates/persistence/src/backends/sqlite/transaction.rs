@@ -1180,11 +1180,23 @@ mod tests {
 
         // Acquiring a new write transaction also proves that deferred cleanup
         // released the old write lock, not merely that another reader cannot
-        // see the uncommitted changes.
-        let mut proof = backend
-            .begin_transaction(&tenant, TransactionOptions::default())
-            .await
-            .unwrap();
+        // see the uncommitted changes. The released callback still has to
+        // finish and roll back on its blocking thread, so retry until it has.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut proof = loop {
+            match backend
+                .begin_transaction(&tenant, TransactionOptions::default())
+                .await
+            {
+                Ok(proof) => break proof,
+                Err(StorageError::Transaction(TransactionError::Transient { .. }))
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("could not start verification transaction: {error}"),
+            }
+        };
         assert!(
             proof
                 .read("Patient", "extension-cancel")
@@ -1192,15 +1204,18 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let tables: i64 =
-            proof
-                .with_connection(|connection| {
-                    connection.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'extension_cancel_proof'",
-                [], |row| row.get(0),
-            ).map_err(|error| internal_error(error.to_string()))
-                })
-                .unwrap();
+        let tables: i64 = proof
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master \
+                         WHERE name = 'extension_cancel_proof'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| internal_error(error.to_string()))
+            })
+            .unwrap();
         assert_eq!(
             tables, 0,
             "extension DDL and resource must roll back together"
