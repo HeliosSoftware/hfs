@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 43;
+pub const SCHEMA_VERSION: i32 = 44;
 
 /// The `search_index` value indexes. `idx_search_token`, `idx_search_quantity`
 /// and `idx_search_composite_cov` end in (or carry) `resource_key`, so the
@@ -27,7 +27,7 @@ pub const SCHEMA_VERSION: i32 = 43;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 18] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 19] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -99,6 +99,10 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 18] = [
     (
         "idx_search_composite_code",
         "CREATE INDEX IF NOT EXISTS idx_search_composite_code ON search_index(tenant_id, resource_type, param_name, value_token_code, resource_key, composite_group, value_token_system) WHERE composite_group IS NOT NULL AND is_contained = 0 AND value_token_code IS NOT NULL",
+    ),
+    (
+        "idx_search_token_code",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_code ON search_index(tenant_id, resource_type, param_name, value_token_code, value_token_system, resource_key) WHERE value_token_code IS NOT NULL",
     ),
 ];
 
@@ -539,6 +543,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             40 => migrate_v40_to_v41(conn)?,
             41 => migrate_v41_to_v42(conn)?,
             42 => migrate_v42_to_v43(conn)?,
+            43 => migrate_v43_to_v44(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2318,6 +2323,38 @@ fn migrate_v42_to_v43(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 43 to version 44.
+///
+/// Adds `idx_search_token_code`, the code-first twin of `idx_search_token`
+/// `(tenant_id, resource_type, param_name, value_token_code,
+/// value_token_system, resource_key)`. `idx_search_token` starts its value
+/// columns with the system, so a token search without a system
+/// (`code=8302-2`, `category=laboratory`, `status=finished`) cannot seek it:
+/// `value_token_code = ?` read every row of the parameter (203 346 for
+/// `Observation?code`). The code-first index seeks it, and is covering for the
+/// membership subquery like its twin. `idx_search_token` stays as it is for
+/// the searches that have a system and no code (`system|`, an identifier's
+/// `system|`), which need the system as the seekable prefix. Cost: one more
+/// index entry per token row on every write, and about 300 MB per 200 000
+/// Observations. The build scans `search_index` and holds the write lock while
+/// it runs; `IF NOT EXISTS` makes a replay free.
+fn migrate_v43_to_v44(conn: &Connection) -> StorageResult<()> {
+    let started = std::time::Instant::now();
+    let sql = SEARCH_VALUE_INDEXES
+        .iter()
+        .find(|(n, _)| *n == "idx_search_token_code")
+        .map(|(_, sql)| *sql)
+        .expect("v44 index is in SEARCH_VALUE_INDEXES");
+    conn.execute(sql, [])
+        .map_err(|e| migration_err(format!("v44 create idx_search_token_code: {e}")))?;
+    tracing::info!(
+        index = "idx_search_token_code",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Built code-first token search index"
+    );
+    Ok(())
+}
+
 fn migration_err(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(crate::error::BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -3499,6 +3536,55 @@ mod tests {
             plan.iter().any(|l| l.contains("idx_search_composite_code (tenant_id=? AND resource_type=? AND param_name=? AND value_token_code=?)")),
             "plan: {plan:?}"
         );
+    }
+
+    /// v43 -> v44 builds the code-first token index; a token search without a
+    /// system seeks it by code, one with only a system still seeks
+    /// `idx_search_token`, and a replay is a no-op.
+    #[test]
+    fn migrate_v43_to_v44_adds_the_code_first_token_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch("DROP INDEX idx_search_token_code;")
+            .unwrap();
+        set_schema_version(&conn, 43).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let (sql, rowid) = index_sql_and_rowid(&conn, "idx_search_token_code");
+        assert!(sql.contains("param_name, value_token_code, value_token_system, resource_key)"));
+        migrate_v43_to_v44(&conn).unwrap();
+        assert_eq!(index_sql_and_rowid(&conn, "idx_search_token_code").1, rowid);
+        let plan_of = |predicate: &str| -> Vec<String> {
+            conn.prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT resource_key FROM search_index WHERE tenant_id = 't' \
+                 AND resource_type = 'Observation' AND param_name = 'code' AND {predicate}"
+            ))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        for (predicate, index) in [
+            (
+                "value_token_code = '8302-2'",
+                "COVERING INDEX idx_search_token_code (tenant_id=? AND resource_type=? AND param_name=? AND value_token_code=?",
+            ),
+            (
+                "value_token_system IN ('http://loinc.org', 'x') AND value_token_code = '8302-2'",
+                "COVERING INDEX idx_search_token_code (tenant_id=? AND resource_type=? AND param_name=? AND value_token_code=?",
+            ),
+            (
+                "value_token_system = 'http://loinc.org'",
+                "COVERING INDEX idx_search_token (tenant_id=? AND resource_type=? AND param_name=? AND value_token_system=?)",
+            ),
+        ] {
+            let plan = plan_of(predicate);
+            assert!(
+                plan.iter().any(|l| l.contains(index)),
+                "{predicate}: {plan:?}"
+            );
+        }
     }
 
     fn index_sql_and_rowid(conn: &Connection, name: &str) -> (String, i64) {
