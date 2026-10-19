@@ -2744,8 +2744,8 @@ mod eligible_cache_runtime_tests {
         // 3. A NULL row appears behind the cache's back (another process).
         client
             .execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code) \
-                 VALUES ($1, 'Patient', 'a', 'gender', 'male')",
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code, is_contained, contained_type, contained_local_id) \
+                 VALUES ($1, 'Patient', 'a', 'gender', 'male', TRUE, 'Patient', 'x')",
                 &[&tenant],
             )
             .await

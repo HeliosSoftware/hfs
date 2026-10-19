@@ -6,8 +6,8 @@
 //! (contained-resource rows are written with NULL, and so are rows older than
 //! schema v18). Every fast-path statement used to carry an `index_eligible` CTE
 //! that re-ran the whole search predicate to prove it, which on date searches
-//! cost as much as the search itself. This module answers the question once per
-//! `(tenant, type, param)` with a bounded index probe and remembers the answer.
+//! cost as much as the search itself. This module learns which `(type, param)`
+//! pairs of a tenant have such rows and remembers the answer.
 //!
 //! # Safety model
 //!
@@ -22,8 +22,18 @@
 //!   run several writers against one database and create contained resources
 //!   can opt out with `HFS_PG_ELIGIBLE_CACHE=0`.
 //!
-//! The per-parameter probe is one seek in the `(tenant_id, resource_type,
-//! param_name, last_updated DESC, ...)` indexes, where NULLs sort first.
+//! # Why a tenant-wide set, not a per-parameter probe
+//!
+//! No index serves `param_name = $3 AND last_updated IS NULL` (the recent-first
+//! indexes are partial on the value column), so a per-parameter probe scanned
+//! 280k buffers (~1 s) on the 30% benchmark corpus. Under the `Denormalized`
+//! layout the fast path already requires, the only rows without `last_updated`
+//! are the contained-resource memberships, which the writer flags
+//! `is_contained`; `idx_search_contained` is partial on exactly that flag. One
+//! `SELECT DISTINCT resource_type, param_name ... WHERE tenant_id = $1 AND
+//! is_contained` therefore yields every `(type, param)` with NULL rows, and the
+//! answer for all parameters of the tenant is cached together. Loading is
+//! single-flight: while one request loads, others keep the original SQL.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -36,9 +46,16 @@ const MAX_KEYS: usize = 4096;
 
 type Key = (String, String, String);
 
+struct TenantFact {
+    at: Instant,
+    /// `(resource_type, param_name)` pairs that have NULL-`last_updated` rows.
+    with_nulls: HashSet<(String, String)>,
+}
+
 #[derive(Default)]
 struct Facts {
-    checked: HashMap<Key, (Instant, bool)>,
+    tenants: HashMap<String, TenantFact>,
+    loading: HashSet<String>,
     pinned: HashSet<Key>,
 }
 
@@ -73,10 +90,8 @@ fn key(tenant: &str, resource_type: &str, param: &str) -> Key {
 /// Records that this process is writing a NULL-`last_updated` row for the key.
 pub(crate) fn note_null_rows(tenant: &str, resource_type: &str, param: &str) {
     if let Ok(mut f) = facts().lock() {
-        let k = key(tenant, resource_type, param);
-        f.checked.remove(&k);
         if f.pinned.len() < MAX_KEYS * 4 {
-            f.pinned.insert(k);
+            f.pinned.insert(key(tenant, resource_type, param));
         }
     }
 }
@@ -110,72 +125,107 @@ enum Cached {
     Unknown,
 }
 
-fn lookup(k: &Key) -> Cached {
+fn lookup(tenant: &str, resource_type: &str, param: &str) -> Cached {
     let Ok(f) = facts().lock() else {
         return Cached::HasNulls;
     };
-    if f.pinned.contains(k) {
+    if f.pinned.contains(&key(tenant, resource_type, param)) {
         return Cached::HasNulls;
     }
-    match f.checked.get(k) {
-        Some((at, none)) if at.elapsed() < TTL => {
-            if *none {
-                Cached::NoNulls
-            } else {
+    match f.tenants.get(tenant) {
+        Some(t) if t.at.elapsed() < TTL => {
+            if t.with_nulls
+                .contains(&(resource_type.to_string(), param.to_string()))
+            {
                 Cached::HasNulls
+            } else {
+                Cached::NoNulls
             }
         }
         _ => Cached::Unknown,
     }
 }
 
-const PROBE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM search_index \
-     WHERE tenant_id = $1 AND resource_type = $2 AND param_name = $3 \
-       AND last_updated IS NULL)";
+const LOAD_SQL: &str = "SELECT DISTINCT resource_type, param_name FROM search_index \
+     WHERE tenant_id = $1 AND is_contained";
 
 /// True only when it is known that the parameter has no NULL-`last_updated`
-/// rows. Errors and unknowns answer false.
+/// rows. Errors, unknowns and in-flight loads answer false.
 pub(crate) async fn param_has_no_null_rows(
     client: &deadpool_postgres::Client,
     tenant: &str,
     resource_type: &str,
     param: &str,
 ) -> bool {
-    let k = key(tenant, resource_type, param);
-    match lookup(&k) {
+    match lookup(tenant, resource_type, param) {
         Cached::NoNulls => return true,
         Cached::HasNulls => return false,
         Cached::Unknown => {}
     }
-    let Ok(row) = client
-        .query_one(PROBE_SQL, &[&tenant, &resource_type, &param])
-        .await
-    else {
-        return false;
-    };
-    let has_nulls: bool = row.get(0);
-    if let Ok(mut f) = facts().lock() {
-        if f.pinned.contains(&k) {
+    {
+        let Ok(mut f) = facts().lock() else {
+            return false;
+        };
+        if !f.loading.insert(tenant.to_string()) {
             return false;
         }
-        if f.checked.len() >= MAX_KEYS {
-            f.checked.clear();
-        }
-        f.checked.insert(k, (Instant::now(), !has_nulls));
     }
-    !has_nulls
+    let loaded = client.query(LOAD_SQL, &[&tenant]).await;
+    let Ok(mut f) = facts().lock() else {
+        return false;
+    };
+    f.loading.remove(tenant);
+    let Ok(rows) = loaded else {
+        return false;
+    };
+    if f.tenants.len() >= MAX_KEYS {
+        f.tenants.clear();
+    }
+    f.tenants.insert(
+        tenant.to_string(),
+        TenantFact {
+            at: Instant::now(),
+            with_nulls: rows
+                .iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect(),
+        },
+    );
+    let pinned = f.pinned.contains(&key(tenant, resource_type, param));
+    let hit = f.tenants.get(tenant).is_some_and(|t| {
+        t.with_nulls
+            .contains(&(resource_type.to_string(), param.to_string()))
+    });
+    !pinned && !hit
 }
 
 #[cfg(test)]
 pub(crate) fn forget_tenant_for_tests(tenant: &str) {
     let mut f = facts().lock().unwrap();
-    f.checked.retain(|k, _| k.0 != tenant);
+    f.tenants.remove(tenant);
     f.pinned.retain(|k| k.0 != tenant);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn learn(tenant: &str, nulls: &[(&str, &str)], age: Duration) -> bool {
+        let Some(at) = Instant::now().checked_sub(age) else {
+            return false;
+        };
+        facts().lock().unwrap().tenants.insert(
+            tenant.to_string(),
+            TenantFact {
+                at,
+                with_nulls: nulls
+                    .iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect(),
+            },
+        );
+        true
+    }
 
     #[test]
     fn parses_param_name_from_predicates() {
@@ -194,29 +244,51 @@ mod tests {
     }
 
     #[test]
+    fn learned_sets_answer_per_type_and_param() {
+        assert!(learn(
+            "t-set",
+            &[("Observation", "subject")],
+            Duration::ZERO
+        ));
+        assert!(matches!(
+            lookup("t-set", "Observation", "subject"),
+            Cached::HasNulls
+        ));
+        assert!(matches!(
+            lookup("t-set", "Observation", "code"),
+            Cached::NoNulls
+        ));
+        assert!(matches!(
+            lookup("t-set", "Patient", "subject"),
+            Cached::NoNulls
+        ));
+    }
+
+    #[test]
     fn pinned_keys_never_report_no_nulls() {
-        let k = key("t-pin", "Patient", "name");
-        facts()
-            .lock()
-            .unwrap()
-            .checked
-            .insert(k.clone(), (Instant::now(), true));
-        assert!(matches!(lookup(&k), Cached::NoNulls));
+        assert!(learn("t-pin", &[], Duration::ZERO));
+        assert!(matches!(
+            lookup("t-pin", "Patient", "name"),
+            Cached::NoNulls
+        ));
         note_null_rows("t-pin", "Patient", "name");
-        assert!(matches!(lookup(&k), Cached::HasNulls));
+        assert!(matches!(
+            lookup("t-pin", "Patient", "name"),
+            Cached::HasNulls
+        ));
+        assert!(matches!(
+            lookup("t-pin", "Patient", "other"),
+            Cached::NoNulls
+        ));
     }
 
     #[test]
     fn expired_entries_are_unknown() {
-        let k = key("t-old", "Patient", "name");
-        let Some(old) = Instant::now().checked_sub(TTL + Duration::from_secs(1)) else {
-            return; // monotonic clock too young to represent an expired entry
-        };
-        facts()
-            .lock()
-            .unwrap()
-            .checked
-            .insert(k.clone(), (old, true));
-        assert!(matches!(lookup(&k), Cached::Unknown));
+        if learn("t-old", &[], TTL + Duration::from_secs(1)) {
+            assert!(matches!(
+                lookup("t-old", "Patient", "name"),
+                Cached::Unknown
+            ));
+        }
     }
 }
