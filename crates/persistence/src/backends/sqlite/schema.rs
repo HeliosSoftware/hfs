@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 44;
+pub const SCHEMA_VERSION: i32 = 45;
 
 /// The `search_index` value indexes. `idx_search_token`, `idx_search_quantity`
 /// and `idx_search_composite_cov` end in (or carry) `resource_key`, so the
@@ -402,7 +402,6 @@ fn create_schema_v1(conn: &Connection) -> StorageResult<()> {
 fn create_indexes(conn: &Connection) -> StorageResult<()> {
     let indexes = [
         // Resources table indexes
-        "CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(tenant_id, resource_type)",
         "CREATE INDEX IF NOT EXISTS idx_resources_updated ON resources(tenant_id, last_updated)",
         "CREATE INDEX IF NOT EXISTS idx_resources_reindex ON resources(tenant_id, resource_type, last_updated, id)",
         // Covering index for the live-resource counts the dashboard runs
@@ -411,13 +410,13 @@ fn create_indexes(conn: &Connection) -> StorageResult<()> {
         // prefix, and `resource_type` then arrives already sorted *within*
         // that prefix — the `GROUP BY` needs no sort step and every column the
         // query mentions lives in the index, so the table is never touched.
-        // `idx_resources_type` cannot serve these: it lacks `is_deleted`, so
+        // A `(tenant_id, resource_type)` index (the former `idx_resources_type`,
+        // dropped in v45) cannot serve these: it lacks `is_deleted`, so
         // SQLite can walk it for the tenant but must then fetch each matching
         // row from the table just to test `is_deleted = 0` — millions of row
         // visits on a large corpus.
         "CREATE INDEX IF NOT EXISTS idx_resources_live_type ON resources(tenant_id, is_deleted, resource_type)",
         // History table indexes
-        "CREATE INDEX IF NOT EXISTS idx_history_resource ON resource_history(tenant_id, resource_type, id)",
         "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated)",
         // Search index indexes
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -544,6 +543,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             41 => migrate_v41_to_v42(conn)?,
             42 => migrate_v42_to_v43(conn)?,
             43 => migrate_v43_to_v44(conn)?,
+            44 => migrate_v44_to_v45(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2355,6 +2355,43 @@ fn migrate_v43_to_v44(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 44 to version 45.
+///
+/// Drops the two indexes that are exact prefixes of the key that already
+/// exists, so they only cost a b-tree insertion per write and a few MB each:
+/// `idx_resources_type (tenant_id, resource_type)` is a prefix of the primary
+/// key `(tenant_id, resource_type, id)` (and of `idx_resources_reindex`), and
+/// `idx_history_resource (tenant_id, resource_type, id)` is a prefix of
+/// `resource_history`'s primary key `(tenant_id, resource_type, id,
+/// version_id)`. Every lookup they served seeks the longer key on the same
+/// equality prefix. Dropped only when the stored definition is exactly the
+/// historical one: an index of that name with another shape is left alone.
+fn migrate_v44_to_v45(conn: &Connection) -> StorageResult<()> {
+    for (name, definition) in [
+        (
+            "idx_resources_type",
+            "CREATE INDEX idx_resources_type ON resources(tenant_id, resource_type)",
+        ),
+        (
+            "idx_history_resource",
+            "CREATE INDEX idx_history_resource ON resource_history(tenant_id, resource_type, id)",
+        ),
+    ] {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .ok();
+        if stored.is_some_and(|sql| normalise_index_sql(&sql) == normalise_index_sql(definition)) {
+            conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                .map_err(|e| migration_err(format!("v45 drop {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn migration_err(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(crate::error::BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -3585,6 +3622,67 @@ mod tests {
                 "{predicate}: {plan:?}"
             );
         }
+    }
+
+    /// v44 -> v45 drops the two exact-prefix indexes and nothing else; the
+    /// lookups they served seek the primary keys. A same-named index of
+    /// another shape is left alone, and a replay is a no-op.
+    #[test]
+    fn migrate_v44_to_v45_drops_the_prefix_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let exists = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        assert!(!exists("idx_resources_type") && !exists("idx_history_resource"));
+        // An older database has them; the ladder drops them.
+        conn.execute_batch(
+            "CREATE INDEX idx_resources_type ON resources(tenant_id, resource_type);
+             CREATE INDEX idx_history_resource ON resource_history(tenant_id, resource_type, id);",
+        )
+        .unwrap();
+        set_schema_version(&conn, 44).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert!(!exists("idx_resources_type") && !exists("idx_history_resource"));
+        // Other shapes under the same names survive.
+        conn.execute_batch(
+            "CREATE INDEX idx_resources_type ON resources(tenant_id, resource_type, id);",
+        )
+        .unwrap();
+        migrate_v44_to_v45(&conn).unwrap();
+        assert!(exists("idx_resources_type"));
+        conn.execute_batch("DROP INDEX idx_resources_type").unwrap();
+        migrate_v44_to_v45(&conn).unwrap();
+        // The lookups they served use the primary keys.
+        let plan_of = |sql: &str| -> String {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let resources =
+            plan_of("SELECT id FROM resources WHERE tenant_id = 't' AND resource_type = 'Patient'");
+        assert!(
+            resources.contains("sqlite_autoindex_resources_1")
+                || resources.contains("idx_resources_reindex"),
+            "{resources}"
+        );
+        let history = plan_of(
+            "SELECT version_id FROM resource_history WHERE tenant_id = 't' AND resource_type = 'Patient' AND id = 'x'",
+        );
+        assert!(
+            history.contains("sqlite_autoindex_resource_history_1"),
+            "{history}"
+        );
     }
 
     fn index_sql_and_rowid(conn: &Connection, name: &str) -> (String, i64) {
