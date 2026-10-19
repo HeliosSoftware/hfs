@@ -236,6 +236,32 @@ impl RowBatcher {
         true
     }
 
+    /// Sends the pending rows without waiting.
+    ///
+    /// If the channel is full the batch is kept and `true` is returned: a full
+    /// channel means the consumer is busy, so nothing is gained by flushing for
+    /// latency. Returns `false` once the receiver is gone. Use this where the
+    /// producer must not await the channel (for example while a driver call is
+    /// half-started).
+    pub fn try_flush(&mut self) -> bool {
+        if self.buf.is_empty() {
+            return !self.tx.is_closed();
+        }
+        let batch = std::mem::take(&mut self.buf);
+        match self.tx.try_send(Ok(batch)) {
+            Ok(()) => {
+                self.buf = Vec::with_capacity(ROW_BATCH_SIZE);
+                self.since = std::time::Instant::now();
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(Ok(batch))) => {
+                self.buf = batch;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Sends the pending rows, if any.
     pub async fn flush(&mut self) -> bool {
         if self.buf.is_empty() {

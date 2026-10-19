@@ -161,7 +161,7 @@ impl SofRunner for MongoInDbRunner {
                     match (&mut advance).now_or_never() {
                         Some(r) => r,
                         None => {
-                            if !batcher.flush().await {
+                            if !batcher.try_flush() {
                                 return; // receiver dropped
                             }
                             advance.await

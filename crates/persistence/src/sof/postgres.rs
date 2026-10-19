@@ -415,7 +415,7 @@ async fn stream_pg_rows_inner(
         let next = match raw.next().now_or_never() {
             Some(next) => next,
             None => {
-                if !batcher.flush().await {
+                if !batcher.try_flush() {
                     break; // receiver dropped
                 }
                 raw.next().await
