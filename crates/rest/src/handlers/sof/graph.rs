@@ -2312,7 +2312,11 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![
-                vec![Some(json!("integer")), Some(json!("integer")), Some(json!(1))],
+                vec![
+                    Some(json!("integer")),
+                    Some(json!("integer")),
+                    Some(json!(1))
+                ],
                 vec![Some(json!("integer")), Some(json!("text")), Some(json!(4))],
                 vec![Some(json!("null")), Some(json!("integer")), Some(json!(1))],
             ]
