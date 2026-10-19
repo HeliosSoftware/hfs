@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 42;
+pub const SCHEMA_VERSION: i32 = 43;
 
 /// The `search_index` value indexes. `idx_search_token`, `idx_search_quantity`
 /// and `idx_search_composite_cov` end in (or carry) `resource_key`, so the
@@ -27,7 +27,7 @@ pub const SCHEMA_VERSION: i32 = 42;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 17] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 18] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -95,6 +95,10 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 17] = [
     (
         "idx_search_composite_cov",
         "CREATE INDEX IF NOT EXISTS idx_search_composite_cov ON search_index(tenant_id, resource_type, param_name, resource_key, composite_group, composite_slot, value_token_system, value_token_code, value_quantity_value, value_quantity_unit, value_quantity_system) WHERE composite_group IS NOT NULL AND is_contained = 0",
+    ),
+    (
+        "idx_search_composite_code",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_code ON search_index(tenant_id, resource_type, param_name, value_token_code, resource_key, composite_group, value_token_system) WHERE composite_group IS NOT NULL AND is_contained = 0 AND value_token_code IS NOT NULL",
     ),
 ];
 
@@ -534,6 +538,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             39 => migrate_v39_to_v40(conn)?,
             40 => migrate_v40_to_v41(conn)?,
             41 => migrate_v41_to_v42(conn)?,
+            42 => migrate_v42_to_v43(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2283,6 +2288,36 @@ fn migrate_v41_to_v42(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 42 to version 43.
+///
+/// Adds `idx_search_composite_code`, the code-first index of the composite
+/// rows: `(tenant_id, resource_type, param_name, value_token_code,
+/// resource_key, composite_group, value_token_system)` over the rows that
+/// carry a code. A token+quantity composite search (`code-value-quantity`)
+/// seeks the token rows by code here and pairs each with the quantity row of
+/// its `composite_group` through `idx_search_composite_cov`, instead of
+/// grouping every row of the parameter (about 340 000 rows visited for 256
+/// groups on a 200 000-Observation store). The build scans `search_index` and
+/// holds the write lock while it runs; `IF NOT EXISTS` makes a replay free.
+/// The startup self-repair ([`ensure_search_value_indexes`]) recreates it if
+/// a bulk rebuild's drop is interrupted.
+fn migrate_v42_to_v43(conn: &Connection) -> StorageResult<()> {
+    let started = std::time::Instant::now();
+    let sql = SEARCH_VALUE_INDEXES
+        .iter()
+        .find(|(n, _)| *n == "idx_search_composite_code")
+        .map(|(_, sql)| *sql)
+        .expect("v43 index is in SEARCH_VALUE_INDEXES");
+    conn.execute(sql, [])
+        .map_err(|e| migration_err(format!("v43 create idx_search_composite_code: {e}")))?;
+    tracing::info!(
+        index = "idx_search_composite_code",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Built code-first composite search index"
+    );
+    Ok(())
+}
+
 fn migration_err(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(crate::error::BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -3423,6 +3458,47 @@ mod tests {
         );
         // Replay is a no-op.
         migrate_v41_to_v42(&conn).unwrap();
+    }
+
+    /// v42 -> v43 builds the code-first composite index, a replay is a no-op,
+    /// and the pairing it serves is answered from the two covering indexes.
+    #[test]
+    fn migrate_v42_to_v43_adds_the_code_first_composite_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch("DROP INDEX idx_search_composite_code;")
+            .unwrap();
+        set_schema_version(&conn, 42).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let (sql, rowid) = index_sql_and_rowid(&conn, "idx_search_composite_code");
+        assert!(sql.contains("param_name, value_token_code, resource_key, composite_group"));
+        migrate_v42_to_v43(&conn).unwrap();
+        assert_eq!(
+            index_sql_and_rowid(&conn, "idx_search_composite_code").1,
+            rowid
+        );
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT c.resource_key FROM search_index AS c \
+                 INDEXED BY idx_search_composite_code WHERE c.tenant_id = ?1 AND c.resource_type = ?2 \
+                 AND c.param_name = 'code-value-quantity' AND c.is_contained = 0 \
+                 AND c.composite_group IS NOT NULL AND c.value_token_code IS NOT NULL \
+                 AND (value_token_code = ?3) AND EXISTS (SELECT 1 FROM search_index AS q \
+                 INDEXED BY idx_search_composite_cov WHERE q.tenant_id = ?1 AND q.resource_type = ?2 \
+                 AND q.param_name = 'code-value-quantity' AND q.resource_key = c.resource_key \
+                 AND q.composite_group = c.composite_group AND q.composite_group IS NOT NULL \
+                 AND q.is_contained = 0 AND (value_quantity_value > ?4))",
+            )
+            .unwrap()
+            .query_map(["t", "Observation", "8302-2", "5"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter().any(|l| l.contains("idx_search_composite_code (tenant_id=? AND resource_type=? AND param_name=? AND value_token_code=?)")),
+            "plan: {plan:?}"
+        );
     }
 
     fn index_sql_and_rowid(conn: &Connection, name: &str) -> (String, i64) {

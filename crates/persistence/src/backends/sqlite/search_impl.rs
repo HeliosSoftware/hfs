@@ -400,6 +400,23 @@ impl SqliteBackend {
         total: Option<u64>,
         probe: bool,
     ) -> StorageResult<SearchResult> {
+        with_composite_rewrite(conn, query, |rewrite| {
+            self.search_with_connection_plan(conn, tenant, query, total, probe, rewrite)
+        })
+    }
+
+    /// [`Self::search_with_connection_probe`] with the code-first composite
+    /// pairing forced on or off.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn search_with_connection_plan(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        total: Option<u64>,
+        probe: bool,
+        composite_rewrite: bool,
+    ) -> StorageResult<SearchResult> {
         reject_unsupported_metadata_modifier(query)?;
         reject_legacy_composites(conn, tenant, query)?;
 
@@ -429,8 +446,9 @@ impl SqliteBackend {
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
         let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
-            let builder =
-                QueryBuilder::new(tenant_id, resource_type).with_param_offset(param_offset);
+            let builder = QueryBuilder::new(tenant_id, resource_type)
+                .with_param_offset(param_offset)
+                .with_composite_rewrite(composite_rewrite);
             let fragment = builder.build(query);
             if !fragment.sql.is_empty() {
                 Some(fragment)
@@ -790,6 +808,46 @@ fn first_page_source(filtered: bool, query: &SearchQuery, count: usize) -> &'sta
     }
 }
 
+/// Whether `query` can use the code-first composite pairing: it has a
+/// composite parameter and both indexes the pairing is hinted to exist.
+/// `INDEXED BY` makes a statement fail to prepare against a missing index, and
+/// a bulk rebuild drops the value indexes for its duration.
+fn composite_rewrite_available(conn: &rusqlite::Connection, query: &SearchQuery) -> bool {
+    use crate::types::SearchParamType;
+    if !query
+        .parameters
+        .iter()
+        .any(|p| p.param_type == SearchParamType::Composite)
+    {
+        return false;
+    }
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' \
+         AND name IN ('idx_search_composite_code', 'idx_search_composite_cov')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n == 2)
+    .unwrap_or(false)
+}
+
+/// Runs `run(rewrite)` with the composite pairing on when
+/// [`composite_rewrite_available`], and again with it off if an index was
+/// dropped between that check and the statement's prepare.
+fn with_composite_rewrite<T>(
+    conn: &rusqlite::Connection,
+    query: &SearchQuery,
+    run: impl Fn(bool) -> StorageResult<T>,
+) -> StorageResult<T> {
+    if !composite_rewrite_available(conn, query) {
+        return run(false);
+    }
+    match run(true) {
+        Err(error) if error.to_string().contains("no such index") => run(false),
+        result => result,
+    }
+}
+
 /// The id-only page of [`SearchProvider::search_ids`], run on a blocking
 /// thread by the caller.
 fn search_ids_on(
@@ -798,12 +856,25 @@ fn search_ids_on(
     query: &SearchQuery,
     cursor: Option<PageCursor>,
 ) -> StorageResult<Page<String>> {
+    with_composite_rewrite(conn, query, |rewrite| {
+        search_ids_on_plan(conn, tenant, query, cursor.clone(), rewrite)
+    })
+}
+
+fn search_ids_on_plan(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    cursor: Option<PageCursor>,
+    composite_rewrite: bool,
+) -> StorageResult<Page<String>> {
     let tenant_id = tenant.tenant_id().as_str();
     let resource_type = &query.resource_type;
     let param_offset = if cursor.is_some() { 4 } else { 2 };
     let search_filter = if !query.parameters.is_empty() {
         let fragment = QueryBuilder::new(tenant_id, resource_type)
             .with_param_offset(param_offset)
+            .with_composite_rewrite(composite_rewrite)
             .build(query);
         if fragment.sql.is_empty() {
             None
@@ -973,6 +1044,17 @@ fn search_count_on(
     tenant: &TenantContext,
     query: &SearchQuery,
 ) -> StorageResult<u64> {
+    with_composite_rewrite(conn, query, |rewrite| {
+        search_count_on_plan(conn, tenant, query, rewrite)
+    })
+}
+
+fn search_count_on_plan(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    composite_rewrite: bool,
+) -> StorageResult<u64> {
     reject_legacy_composites(conn, tenant, query)?;
     let tenant_id = tenant.tenant_id().as_str();
     let resource_type = &query.resource_type;
@@ -981,7 +1063,9 @@ fn search_count_on(
     let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query.parameters.is_empty()
         || query.compartment.is_some()
     {
-        let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
+        let builder = QueryBuilder::new(tenant_id, resource_type)
+            .with_param_offset(2)
+            .with_composite_rewrite(composite_rewrite);
         let fragment = builder.build(query);
 
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -4168,6 +4252,175 @@ mod tests {
                 .unwrap();
             assert!(r.resources.items.is_empty());
         }
+    }
+
+    fn cvq(values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "code-value-quantity".into(),
+            param_type: SearchParamType::Composite,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".into(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".into(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// The code-first composite pairing returns the pages, the page flags and
+    /// the total of the whole-parameter `GROUP BY`, with the probe on and off,
+    /// for a selective code, a code past the probe cap (the `EXISTS`-driven
+    /// window), an empty one, an OR of values, and the shapes that keep the
+    /// `GROUP BY` (`system|` without a code).
+    #[tokio::test]
+    async fn composite_pairing_gives_the_same_pages_as_the_group_by() {
+        let (backend, tenant) = probe_fixture().await;
+        let conn = backend.get_connection().unwrap();
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        let mut paired_somewhere = false;
+        for values in [
+            vec!["C3$gt100"],
+            vec!["http://loinc.org|C5$lt20"],
+            vec!["B2001$ge0"],
+            vec!["B2001$gt400"],
+            vec!["B2000$lt3"],
+            vec!["C1$gt1000"],
+            vec!["no-such$gt1"],
+            vec!["C3$gt480", "C5$lt3"],
+            vec!["http://loinc.org|$gt490"],
+            vec!["|C2$gt490"],
+        ] {
+            for count in [2u32, 7, 50] {
+                for probe in [false, true] {
+                    let mut query = SearchQuery::new("Observation").with_parameter(cvq(&values));
+                    query.count = Some(count);
+                    let mut cursor: Option<String> = None;
+                    for page_no in 0..4 {
+                        query.cursor = cursor.clone();
+                        let old = backend
+                            .search_with_connection_plan(&conn, &tenant, &query, None, probe, false)
+                            .unwrap();
+                        let new = backend
+                            .search_with_connection_plan(&conn, &tenant, &query, None, probe, true)
+                            .unwrap();
+                        assert_eq!(
+                            ids(&old),
+                            ids(&new),
+                            "{values:?} count {count} probe {probe} page {page_no}"
+                        );
+                        assert_eq!(
+                            old.resources.page_info.has_next,
+                            new.resources.page_info.has_next
+                        );
+                        paired_somewhere |= !ids(&new).is_empty();
+                        cursor = old.resources.page_info.next_cursor.clone();
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let query = SearchQuery::new("Observation").with_parameter(cvq(&values));
+            assert_eq!(
+                search_count_on_plan(&conn, &tenant, &query, false).unwrap(),
+                search_count_on_plan(&conn, &tenant, &query, true).unwrap(),
+                "{values:?} total"
+            );
+        }
+        assert!(paired_somewhere);
+    }
+
+    /// The pairing is chosen only for a token(code)+quantity composite; the
+    /// wide one past the probe cap is `EXISTS`-driven, and a missing hinted
+    /// index falls back to the `GROUP BY` instead of failing the search.
+    #[tokio::test]
+    async fn composite_pairing_plan_and_missing_index_fallback() {
+        let (backend, tenant) = probe_fixture().await;
+        let conn = backend.get_connection().unwrap();
+        let build = |values: &[&str], rewrite: bool| {
+            QueryBuilder::new(tenant.tenant_id().as_str(), "Observation")
+                .with_param_offset(2)
+                .with_composite_rewrite(rewrite)
+                .build(&SearchQuery::new("Observation").with_parameter(cvq(values)))
+        };
+        assert!(
+            build(&["C3$gt1"], true)
+                .sql
+                .contains("INDEXED BY idx_search_composite_code")
+        );
+        assert!(!build(&["C3$gt1"], false).sql.contains("INDEXED BY"));
+        assert!(
+            !build(&["http://loinc.org|$gt1"], true)
+                .sql
+                .contains("INDEXED BY")
+        );
+        // An OR of values keeps the GROUP BY (the pairing measured slower there).
+        assert!(
+            !build(&["C3$gt1", "C5$gt1"], true)
+                .sql
+                .contains("INDEXED BY")
+        );
+        let wide = build(&["B2001$ge0"], true);
+        assert_eq!(
+            choose_first_page_plan(&conn, "test-tenant", "Observation", &wide.sql, &wide.params),
+            FirstPagePlan::ExistsDriven
+        );
+        assert!(
+            membership_exists_predicate(&wide.sql, "w.rk")
+                .unwrap()
+                .contains("c.resource_key = w.rk")
+        );
+        let narrow = build(&["C3$gt400"], true);
+        assert_eq!(
+            choose_first_page_plan(
+                &conn,
+                "test-tenant",
+                "Observation",
+                &narrow.sql,
+                &narrow.params
+            ),
+            FirstPagePlan::ListDriven
+        );
+
+        let mut query = SearchQuery::new("Observation").with_parameter(cvq(&["C3$gt100"]));
+        query.count = Some(5);
+        let with_index = backend
+            .search_with_connection(&conn, &tenant, &query, None)
+            .unwrap();
+        assert!(!with_index.resources.items.is_empty());
+        conn.execute("DROP INDEX idx_search_composite_code", [])
+            .unwrap();
+        let without = backend
+            .search_with_connection(&conn, &tenant, &query, None)
+            .unwrap();
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&with_index), ids(&without));
+        // Forcing the pairing against the missing index is the error the
+        // fallback absorbs.
+        let forced = backend.search_with_connection_plan(&conn, &tenant, &query, None, false, true);
+        assert!(forced.unwrap_err().to_string().contains("no such index"));
+        assert_eq!(
+            search_count_on(&conn, &tenant, &query).unwrap(),
+            search_count_on_plan(&conn, &tenant, &query, false).unwrap()
+        );
     }
 
     #[tokio::test]

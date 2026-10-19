@@ -8,8 +8,8 @@ use std::collections::HashSet;
 
 use crate::error::SearchError;
 use crate::types::{
-    CompartmentMembership, ContainedMode, SearchModifier, SearchParamType, SearchParameter,
-    SearchQuery, SearchValue, strip_reference_version,
+    CompartmentMembership, CompositeSearchComponent, ContainedMode, SearchModifier,
+    SearchParamType, SearchParameter, SearchQuery, SearchValue, strip_reference_version,
 };
 
 use super::modifier_handlers::{build_missing_condition, get_missing_value, is_missing_modifier};
@@ -247,7 +247,8 @@ const PARAMETER_ROWS_HEAD: &str =
 /// Whether `sql` is exactly one [`parameter_rows`] select: a single
 /// parameter's membership, nothing intersected with it.
 pub(crate) fn is_parameter_rows(sql: &str) -> bool {
-    sql.starts_with(PARAMETER_ROWS_HEAD) && !sql.contains(" INTERSECT ")
+    (sql.starts_with(PARAMETER_ROWS_HEAD) || sql.starts_with(COMPOSITE_PAIR_HEAD))
+        && !sql.contains(" INTERSECT ")
 }
 
 /// The same membership as a correlated `EXISTS` on the outer `resources` row,
@@ -259,6 +260,22 @@ pub(crate) fn is_parameter_rows(sql: &str) -> bool {
 /// one plain `parameter_rows` select (a `UNION` of date ranges, an
 /// `INTERSECT`, a nested subquery), which keeps `rowid IN (…)`.
 pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
+    // The code-first composite pairing: its one nested `EXISTS` stays inside,
+    // and `c.resource_key = outer_key` joins the seek on `(…, code,
+    // resource_key)`.
+    if let Some(rest) = rows_sql.strip_prefix(COMPOSITE_PAIR_HEAD) {
+        if [" UNION ", " INTERSECT ", " EXCEPT ", " GROUP BY "]
+            .iter()
+            .any(|keyword| rest.contains(keyword))
+            || rest.matches("SELECT").count() != 1
+        {
+            return None;
+        }
+        return Some(format!(
+            "EXISTS (SELECT 1 FROM search_index AS c INDEXED BY idx_search_composite_code \
+             WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND c.resource_key = {outer_key} AND {rest})"
+        ));
+    }
     let rest = rows_sql.strip_prefix(PARAMETER_ROWS_HEAD)?;
     if [" UNION ", " INTERSECT ", " EXCEPT ", "SELECT"]
         .iter()
@@ -269,6 +286,57 @@ pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Op
     Some(format!(
         "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
          WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = {outer_key} AND {rest})"
+    ))
+}
+
+/// What a [`composite_pair_rows`] subquery starts with, up to its
+/// `param_name` test.
+const COMPOSITE_PAIR_HEAD: &str = "SELECT c.resource_key FROM search_index AS c INDEXED BY idx_search_composite_code WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND ";
+
+/// The keys of the resources with a composite group in which a token row
+/// matches the token component and a row of the same group matches the
+/// quantity component: the rows of the whole-parameter
+/// `GROUP BY resource_key, composite_group HAVING MAX(CASE token) AND
+/// MAX(CASE quantity)` for a two-component token+quantity composite, without
+/// reading every row of the parameter. The code-first index
+/// (`idx_search_composite_code`) finds the token rows by code; each one is
+/// then paired by a probe of `idx_search_composite_cov` on `(resource_key,
+/// composite_group)`. A key can be listed once per matching token row, which
+/// the `rowid IN (…)` callers ignore.
+///
+/// `None` (keep the `GROUP BY`) unless the composite is exactly one token and
+/// one quantity component and the token part tests `value_token_code = ?`: a
+/// `system|` token has no code to seek, and the partial index holds code rows
+/// only. The fragments' columns are unqualified; the token part sits in the
+/// outer select, so it binds to `c`, and the quantity part in the `EXISTS`,
+/// so it binds to `q`. Both `INDEXED BY` hints need the partial-index terms
+/// spelled out in the `WHERE`.
+fn composite_pair_rows(
+    name: &str,
+    components: &[CompositeSearchComponent],
+    fragments: &[SqlFragment],
+) -> Option<String> {
+    if components.len() != 2 || fragments.len() != 2 {
+        return None;
+    }
+    let (token, quantity) = match (components[0].param_type, components[1].param_type) {
+        (SearchParamType::Token, SearchParamType::Quantity) => (&fragments[0], &fragments[1]),
+        (SearchParamType::Quantity, SearchParamType::Token) => (&fragments[1], &fragments[0]),
+        _ => return None,
+    };
+    if !token.sql.contains("value_token_code = ?") {
+        return None;
+    }
+    let name = sql_string_literal(name);
+    Some(format!(
+        "{COMPOSITE_PAIR_HEAD}c.param_name = {name} AND c.is_contained = 0 \
+         AND c.composite_group IS NOT NULL AND c.value_token_code IS NOT NULL AND ({token_sql}) \
+         AND EXISTS (SELECT 1 FROM search_index AS q INDEXED BY idx_search_composite_cov \
+         WHERE q.tenant_id = ?1 AND q.resource_type = ?2 AND q.param_name = {name} \
+         AND q.resource_key = c.resource_key AND q.composite_group = c.composite_group \
+         AND q.composite_group IS NOT NULL AND q.is_contained = 0 AND ({quantity_sql}))",
+        token_sql = token.sql,
+        quantity_sql = quantity.sql,
     ))
 }
 
@@ -285,6 +353,12 @@ pub struct QueryBuilder {
     param_offset: usize,
     /// Whether to skip tenant/resource type params (they're shared with outer query).
     skip_base_params: bool,
+    /// Whether a token+quantity composite is built as the code-first pairing
+    /// ([`composite_pair_rows`], hinted to `idx_search_composite_code` and
+    /// `idx_search_composite_cov`) instead of a whole-parameter `GROUP BY`.
+    /// Off unless the caller has seen both indexes exist: `INDEXED BY` fails
+    /// to prepare against a missing one (a bulk rebuild drops them).
+    composite_rewrite: bool,
 }
 
 impl QueryBuilder {
@@ -295,7 +369,16 @@ impl QueryBuilder {
             resource_type: resource_type.into(),
             param_offset: 0,
             skip_base_params: false,
+            composite_rewrite: false,
         }
+    }
+
+    /// Builds a token+quantity composite as the code-first pairing, which
+    /// needs `idx_search_composite_code` and `idx_search_composite_cov` to
+    /// exist (see [`composite_pair_rows`]). The rows are the same set.
+    pub fn with_composite_rewrite(mut self, enabled: bool) -> Self {
+        self.composite_rewrite = enabled;
+        self
     }
 
     /// Sets the parameter offset for embedded subqueries.
@@ -1010,6 +1093,22 @@ impl QueryBuilder {
                 param_offset + total_params,
             ) {
                 Some(fragments) if !fragments.is_empty() => {
+                    // One value only: an OR of values is wrapped by the caller
+                    // in a scan of the type's rows (not a positive membership),
+                    // and there the pairing measured slower than the GROUP BY
+                    // (0.30 s -> 0.59 s for two wide codes).
+                    if self.composite_rewrite
+                        && param.values.len() == 1
+                        && let Some(rows) =
+                            composite_pair_rows(&param.name, &param.components, &fragments)
+                    {
+                        for f in fragments {
+                            total_params += f.params.len();
+                            params.extend(f.params);
+                        }
+                        or_conditions.push(format!("resource_key IN ({rows})"));
+                        continue;
+                    }
                     let havings: Vec<String> = fragments
                         .iter()
                         .map(|f| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", f.sql))
