@@ -707,6 +707,15 @@ impl PostgresBackend {
         })
     }
 
+    /// Sets how long a write trusts a validated SearchParameter overlay
+    /// without probing the database (see `HFS_PG_SP_FINGERPRINT_TTL_MS`).
+    /// `Duration::ZERO` probes on every write.
+    #[doc(hidden)]
+    pub fn with_overlay_fingerprint_ttl(mut self, ttl: Duration) -> Self {
+        self.overlay_fingerprint_ttl = ttl;
+        self
+    }
+
     /// Selects the maximum number of concurrent reindex writers on this instance.
     /// Clones share one semaphore, including manual jobs, automatic jobs, and
     /// per-resource fallback. The effective width is capped by the connection

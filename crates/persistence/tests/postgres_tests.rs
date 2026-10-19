@@ -28633,6 +28633,8 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_write_indexes_with_cluster_mates_search_parameter_without_refresh() {
         let (writer, _dbname) = isolated_reindex_backend().await;
+        // TTL 0: probe on every write (the TTL fast path has its own test below).
+        let writer = writer.with_overlay_fingerprint_ttl(std::time::Duration::ZERO);
         let tenant = create_tenant("sp-fingerprint-mate");
         // Warm the writer's cached overlay with an ordinary write.
         writer
@@ -28678,6 +28680,67 @@ mod postgres_integration {
                 .await
                 .is_empty(),
             "the write before it is not (nothing reindexed)"
+        );
+    }
+
+    /// A write within the fingerprint TTL trusts its validated overlay
+    /// without probing, so a cluster-mate's SearchParameter is not indexed
+    /// until the TTL lapses; the first write after that picks it up.
+    #[tokio::test]
+    async fn postgres_write_skips_fingerprint_probe_within_ttl() {
+        let (writer, _dbname) = isolated_reindex_backend().await;
+        let writer = writer.with_overlay_fingerprint_ttl(std::time::Duration::from_millis(1500));
+        let tenant = create_tenant("sp-fingerprint-ttl");
+        // Warms and validates the overlay.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"warm","name":[{"given":["Warm"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let mate = PostgresBackend::new(writer.config().clone()).await.unwrap();
+        mate.create(
+            &tenant,
+            "SearchParameter",
+            custom_given_search_parameter("givenfp", "givenfp"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"early","name":[{"given":["Early"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            search_patients_by(&mate, &tenant, "givenfp", "Early")
+                .await
+                .is_empty(),
+            "within the TTL the write does not probe, so it is not indexed with the mate's parameter"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"late","name":[{"given":["Late"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_patients_by(&mate, &tenant, "givenfp", "Late").await,
+            vec!["late".to_string()],
+            "after the TTL the next write probes and indexes with the new parameter"
         );
     }
 
