@@ -36,23 +36,6 @@ use super::compiler::compile_view_definition_mongo;
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
 const CHANNEL_BUFFER: usize = 256;
 
-/// Documents per cursor batch for a SQL-on-FHIR scan.
-///
-/// Without a `batch_size` the server answers the first request with 101
-/// documents and every `getMore` with up to 16 MiB, and the driver holds each
-/// reply in memory until the consumer has drained it. A scan streams its rows
-/// at the consumer's pace, so that window is pure buffering: 256 documents
-/// bound it to well under 1 MiB at the cost of one `getMore` round trip per
-/// 256 rows, which is free on localhost and one RTT each against a remote
-/// server.
-///
-/// The driver applies one `batch_size` to the first batch and to every
-/// `getMore`, so the first row of a selective view waits until the server has
-/// matched a full batch. Keep this small: at 4096 a view returning ~2,500 of
-/// 1.8M rows sent its first row only at the end of the scan (6.5 s instead of
-/// 0.3 s), while 256 costs about 0.35 s and keeps the same memory bound.
-pub(crate) const SOF_CURSOR_BATCH_SIZE: u32 = 256;
-
 /// SQL-on-FHIR runner that compiles ViewDefinitions to MongoDB aggregation
 /// pipelines.
 pub struct MongoInDbRunner {
@@ -158,10 +141,11 @@ impl SofRunner for MongoInDbRunner {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
         let guard_tx = tx.clone();
 
+        let batch_size = self.config.sof_cursor_batch_size;
         let producer = tokio::spawn(async move {
             let mut cursor = match collection
                 .aggregate(pipeline)
-                .batch_size(SOF_CURSOR_BATCH_SIZE)
+                .batch_size(batch_size)
                 .with_type::<ViewRow>()
                 .await
             {

@@ -449,6 +449,58 @@ pub struct MongoBackendConfig {
     /// rejects anything else.
     #[serde(default = "default_count_by_tenant_max_time_ms")]
     pub count_by_tenant_max_time_ms: u64,
+
+    /// Documents per cursor batch of a SQL-on-FHIR scan (#2161;
+    /// `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE`).
+    ///
+    /// Without a `batch_size` the server answers the first request with 101
+    /// documents and every `getMore` with up to 16 MiB, and the driver holds
+    /// each reply in memory until the consumer has drained it. A scan streams
+    /// its rows at the consumer's pace, so that window is pure buffering. This
+    /// bounds it to `batch size` documents per reply.
+    ///
+    /// The value is a trade-off. Lower means lower first-row latency on a
+    /// selective view: the driver applies one `batch_size` to the first batch
+    /// and every `getMore`, so the first row waits until the server has
+    /// matched a full batch (about 1.15 s at 512 on the 1.8M-row test, against
+    /// 0.24 s with no `batch_size`). Higher means fewer round trips, which
+    /// matters against a remote MongoDB (about 3,500 `getMore` per 1.8M rows at
+    /// 512, about 7,000 at 256).
+    ///
+    /// Memory: "well under 1 MiB" holds only for the projected view rows of
+    /// the in-database aggregate. The patient/group fallback `find` returns
+    /// full stored resources, so its buffer is bounded by this many resources
+    /// (still capped by the server's 16 MiB reply).
+    ///
+    /// Default 512. Must be between 1 and 100 000; [`MongoBackend::new`]
+    /// rejects anything else.
+    #[serde(default = "default_sof_cursor_batch_size")]
+    pub sof_cursor_batch_size: u32,
+}
+
+/// Environment variable that sets
+/// [`MongoBackendConfig::sof_cursor_batch_size`] (#2161).
+pub(crate) const SOF_CURSOR_BATCH_SIZE_ENV: &str = "HFS_MONGODB_SOF_CURSOR_BATCH_SIZE";
+
+/// Default [`MongoBackendConfig::sof_cursor_batch_size`]. Measured on a 1.8M-row
+/// collection on localhost: flat 37-40 MB peak RSS at every size tried, first
+/// row of a selective view 0.59 s at 256, 1.15 s at 512, 2.27 s at 1024.
+pub(crate) const DEFAULT_SOF_CURSOR_BATCH_SIZE: u32 = 512;
+
+/// Largest accepted [`MongoBackendConfig::sof_cursor_batch_size`].
+const MAX_SOF_CURSOR_BATCH_SIZE: u32 = 100_000;
+
+fn check_sof_cursor_batch_size(size: u32) -> Result<u32, String> {
+    if size == 0 || size > MAX_SOF_CURSOR_BATCH_SIZE {
+        return Err(format!(
+            "{SOF_CURSOR_BATCH_SIZE_ENV} must be between 1 and {MAX_SOF_CURSOR_BATCH_SIZE}; got {size}"
+        ));
+    }
+    Ok(size)
+}
+
+fn default_sof_cursor_batch_size() -> u32 {
+    DEFAULT_SOF_CURSOR_BATCH_SIZE
 }
 
 /// Environment variable that sets
@@ -523,8 +575,9 @@ impl MongoBackendConfig {
         Ok(())
     }
 
-    /// Applies `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` from `env` (#1748). The
-    /// value is trimmed; an unset variable, or one empty after trimming,
+    /// Applies `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (#1748) and
+    /// `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` (1 to 100 000; #2161) from `env`.
+    /// Each value is trimmed; an unset variable, or one empty after trimming,
     /// leaves the field unchanged. Anything but a positive integer is an `Err`
     /// naming the variable.
     pub fn apply_search_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<(), String> {
@@ -577,6 +630,15 @@ impl MongoBackendConfig {
                         )
                     })?;
                 self.broad_search_concurrency = Some(limit);
+            }
+        }
+        if let Some(raw) = env(SOF_CURSOR_BATCH_SIZE_ENV) {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                let size = raw.parse::<u32>().map_err(|_| {
+                    format!("{SOF_CURSOR_BATCH_SIZE_ENV} must be a positive integer; got {raw:?}")
+                })?;
+                self.sof_cursor_batch_size = check_sof_cursor_batch_size(size)?;
             }
         }
         Ok(())
@@ -743,6 +805,7 @@ impl Default for MongoBackendConfig {
             transaction_bundle_weight_entries: default_transaction_bundle_weight_entries(),
             transaction_bundle_deferred_index_entries: None,
             count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
+            sof_cursor_batch_size: default_sof_cursor_batch_size(),
         }
     }
 }
@@ -820,6 +883,13 @@ impl MongoBackend {
                 source: None,
             }));
         }
+        check_sof_cursor_batch_size(config.sof_cursor_batch_size).map_err(|message| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message,
+                source: None,
+            })
+        })?;
         check_count_by_tenant_max_time_ms(config.count_by_tenant_max_time_ms).map_err(
             |message| {
                 StorageError::Backend(BackendError::Internal {
@@ -935,6 +1005,7 @@ impl MongoBackend {
     ///   this on must call `MongoBackend::repair_deferred_search_index` periodically.
     /// - `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (default: unset, no limit)
     /// - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` (default: `25000`)
+    /// - `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` (default: `512`; 1 to 100000)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -2420,6 +2491,52 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serializes");
         let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.count_by_tenant_max_time_ms, 1_500);
+    }
+
+    #[test]
+    fn sof_cursor_batch_size_defaults_parses_and_rejects() {
+        let default = MongoBackendConfig::default();
+        assert_eq!(default.sof_cursor_batch_size, 512);
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(from_empty.sof_cursor_batch_size, 512);
+
+        let mut config = MongoBackendConfig::default();
+        config
+            .apply_search_env(|name| (name == SOF_CURSOR_BATCH_SIZE_ENV).then(|| " 1024 ".into()))
+            .expect("valid value");
+        assert_eq!(config.sof_cursor_batch_size, 1024);
+        for edge in ["1", "100000"] {
+            config
+                .apply_search_env(|name| (name == SOF_CURSOR_BATCH_SIZE_ENV).then(|| edge.into()))
+                .expect("range edge");
+            assert_eq!(config.sof_cursor_batch_size.to_string(), edge);
+        }
+
+        let mut config = MongoBackendConfig {
+            sof_cursor_batch_size: 64,
+            ..Default::default()
+        };
+        config
+            .apply_search_env(|name| (name == SOF_CURSOR_BATCH_SIZE_ENV).then(|| "  ".into()))
+            .expect("blank is ignored");
+        config.apply_search_env(|_| None).expect("unset is ignored");
+        assert_eq!(config.sof_cursor_batch_size, 64);
+
+        for invalid in ["0", "-1", "many", "1.5", "100001", "4294967296"] {
+            let err = MongoBackendConfig::default()
+                .apply_search_env(|name| {
+                    (name == SOF_CURSOR_BATCH_SIZE_ENV).then(|| invalid.into())
+                })
+                .expect_err("invalid value");
+            assert!(err.contains(SOF_CURSOR_BATCH_SIZE_ENV), "{invalid}: {err}");
+        }
+
+        let rejected = MongoBackend::new(MongoBackendConfig {
+            sof_cursor_batch_size: 0,
+            ..Default::default()
+        });
+        assert!(rejected.is_err(), "zero batch size must be refused");
     }
 
     #[test]

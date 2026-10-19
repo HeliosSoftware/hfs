@@ -749,6 +749,10 @@ MongoDB runtime configuration also supports:
   the cross-tenant `count_by_tenant` aggregate, and of no other command (default: `25000`; must
   be 1 to 2147483647). Past it the call fails with `BackendError::Timeout`. It does not bound
   server selection, waiting for a pooled connection or socket time.
+- `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` for the documents per cursor batch of a SQL-on-FHIR scan
+  (default: `512`; must be 1 to 100000). Lower means lower first-row latency on selective views,
+  higher means fewer round trips against a remote MongoDB. It applies to the in-database
+  aggregate and to the patient/group fallback `find`.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 
