@@ -2089,6 +2089,32 @@ mod tests {
         assert!(body.frame().await.expect("a frame").is_err());
     }
 
+    /// The client is gone before the streamer runs: every send fails and the
+    /// streamer must stop quietly, whichever send notices first.
+    #[tokio::test]
+    async fn streaming_ndjson_stops_when_the_client_is_gone() {
+        let settle = || tokio::time::sleep(std::time::Duration::from_millis(50));
+
+        // Size-triggered chunk send fails.
+        let response = streaming_ndjson_response(row_stream(numbered_rows(20_000)), None);
+        drop(response);
+        settle().await;
+
+        // Row error: the pending chunk cannot be sent.
+        let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
+        drop(streaming_ndjson_response(stream, None));
+        settle().await;
+
+        // Idle stream: the latency flush of the pending row cannot be sent.
+        let (row_tx, row_rx) = tokio::sync::mpsc::channel::<Result<Value, SofError>>(4);
+        let stream: RowStream = Box::pin(futures::stream::unfold(row_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }));
+        row_tx.send(Ok(json!({ "a": 1 }))).await.unwrap();
+        drop(streaming_ndjson_response(stream, None));
+        settle().await;
+    }
+
     #[tokio::test]
     async fn drain_stream_errors_on_row_error() {
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);

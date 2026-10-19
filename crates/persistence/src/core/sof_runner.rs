@@ -607,6 +607,52 @@ mod tests {
         assert!(!RowBatcher::new(tx2).try_flush());
     }
 
+    #[test]
+    fn blocking_error_without_pending_rows_sends_only_the_error() {
+        let (tx, mut rx) = row_batch_channel();
+        let mut b = RowBatcher::new(tx);
+        b.blocking_error(SofError::Cancelled);
+        assert!(matches!(rx.try_recv(), Ok(Err(SofError::Cancelled))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn blocking_error_sends_pending_rows_first() {
+        let (tx, mut rx) = row_batch_channel();
+        let mut b = RowBatcher::new(tx);
+        assert!(b.blocking_push(json!({"n": 0}))); // target 1: sent
+        assert!(b.blocking_push(json!({"n": 1}))); // held
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 1); // keep depth free
+        b.blocking_error(SofError::Cancelled);
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 1);
+        assert!(matches!(rx.try_recv(), Ok(Err(SofError::Cancelled))));
+    }
+
+    fn closed_batcher() -> RowBatcher {
+        let (tx, rx) = row_batch_channel();
+        drop(rx);
+        let mut b = RowBatcher::new(tx);
+        b.buf.push(json!({"n": 0}));
+        b
+    }
+
+    #[tokio::test]
+    async fn async_send_paths_report_a_dropped_receiver() {
+        assert!(!closed_batcher().try_flush());
+        assert!(!closed_batcher().flush().await);
+        closed_batcher().error(SofError::Cancelled).await;
+        assert!(closed_batcher().is_closed());
+        closed_batcher().closed().await;
+        closed_batcher().finish().await;
+    }
+
+    #[test]
+    fn blocking_send_paths_report_a_dropped_receiver() {
+        assert!(!closed_batcher().blocking_flush());
+        closed_batcher().blocking_error(SofError::Cancelled);
+        closed_batcher().blocking_finish();
+    }
+
     #[tokio::test]
     async fn batcher_stops_when_receiver_is_dropped() {
         let (tx, rx) = row_batch_channel();
