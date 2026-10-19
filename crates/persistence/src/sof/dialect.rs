@@ -905,4 +905,42 @@ mod tests {
             assert_eq!(got, *value, "{sql}");
         }
     }
+
+    /// The single-evaluation truthy form must filter exactly like the old
+    /// three-term form (`IS NOT NULL AND != 0 AND != 'false'`) in a WHERE.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_truthy_predicate_filters_like_the_three_term_form() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let values = [
+            "0",
+            "0.0",
+            "-0.0",
+            "json_extract('{\"a\":false}', '$.a')",
+            "'false'",
+            "'0'",
+            "'False'",
+            "''",
+            "'[]'",
+            "'{}'",
+            "json_extract('{\"a\":true}', '$.a')",
+            "1",
+            "'true'",
+            "NULL",
+            "json_extract('{\"a\":null}', '$.a')",
+        ];
+        for v in values {
+            let old = format!("({v}) IS NOT NULL AND ({v}) != 0 AND ({v}) != 'false'");
+            let new = SqliteDialect.truthy_predicate(v);
+            let kept = |pred: &str| -> i64 {
+                conn.query_row(
+                    &format!("SELECT count(*) FROM (SELECT 1) WHERE {pred}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("{pred}: {e}"))
+            };
+            assert_eq!(kept(&old), kept(&new), "value {v}");
+        }
+    }
 }
