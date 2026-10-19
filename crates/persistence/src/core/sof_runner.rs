@@ -151,6 +151,142 @@ impl SofError {
 /// Sender half of a runner's row channel.
 pub type RowSender = mpsc::Sender<Result<ViewRow, SofError>>;
 
+/// Rows per message on a runner's row channel.
+pub const ROW_BATCH_SIZE: usize = 256;
+
+/// Row-channel depth, in batches. Two batches of [`ROW_BATCH_SIZE`] rows keep
+/// about as many rows in flight as the old 256-row, one-row-per-message channel.
+pub const ROW_CHANNEL_DEPTH: usize = 2;
+
+/// Longest a blocking producer holds a partial batch back. A selective view
+/// can take long to find its next row; its first rows must not wait for 256.
+const ROW_BATCH_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Sender half of a runner's batched row channel.
+pub type RowBatchSender = mpsc::Sender<Result<Vec<ViewRow>, SofError>>;
+
+/// Creates a batched row channel.
+pub fn row_batch_channel() -> (
+    RowBatchSender,
+    mpsc::Receiver<Result<Vec<ViewRow>, SofError>>,
+) {
+    mpsc::channel(ROW_CHANNEL_DEPTH)
+}
+
+/// Turns the receiver of a batched row channel into a [`RowStream`]: batches
+/// are flattened in order, an `Err` item is yielded as one `Err` row.
+pub fn row_stream(rx: mpsc::Receiver<Result<Vec<ViewRow>, SofError>>) -> RowStream {
+    use futures::StreamExt;
+    Box::pin(
+        tokio_stream::wrappers::ReceiverStream::new(rx).flat_map(|item| {
+            let rows: Vec<Result<ViewRow, SofError>> = match item {
+                Ok(batch) => batch.into_iter().map(Ok).collect(),
+                Err(e) => vec![Err(e)],
+            };
+            futures::stream::iter(rows)
+        }),
+    )
+}
+
+/// Accumulates rows and sends them as [`ROW_BATCH_SIZE`] batches.
+///
+/// `push*` return `false` once the receiver is gone, so the producer stops.
+/// An error is sent after the rows pushed before it, so the consumer sees the
+/// partial batch first. [`finish`](Self::finish) must be called on normal end.
+pub struct RowBatcher {
+    tx: RowBatchSender,
+    buf: Vec<ViewRow>,
+    since: std::time::Instant,
+}
+
+impl RowBatcher {
+    /// Creates a batcher over `tx`.
+    pub fn new(tx: RowBatchSender) -> Self {
+        Self {
+            tx,
+            buf: Vec::with_capacity(ROW_BATCH_SIZE),
+            since: std::time::Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> Vec<ViewRow> {
+        self.since = std::time::Instant::now();
+        std::mem::replace(&mut self.buf, Vec::with_capacity(ROW_BATCH_SIZE))
+    }
+
+    /// True once the receiver is gone.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Completes when the receiver is gone.
+    pub async fn closed(&self) {
+        self.tx.closed().await
+    }
+
+    /// Async push (async producers).
+    pub async fn push(&mut self, row: ViewRow) -> bool {
+        self.buf.push(row);
+        if self.buf.len() >= ROW_BATCH_SIZE {
+            return self.flush().await;
+        }
+        true
+    }
+
+    /// Sends the pending rows, if any.
+    pub async fn flush(&mut self) -> bool {
+        if self.buf.is_empty() {
+            return true;
+        }
+        let batch = self.take();
+        self.tx.send(Ok(batch)).await.is_ok()
+    }
+
+    /// Flushes pending rows, then sends the error.
+    pub async fn error(&mut self, e: SofError) {
+        if self.flush().await {
+            let _ = self.tx.send(Err(e)).await;
+        }
+    }
+
+    /// Normal end of the stream.
+    pub async fn finish(mut self) {
+        self.flush().await;
+    }
+
+    /// Blocking push (`spawn_blocking` producers); also flushes a batch that
+    /// has been pending longer than [`ROW_BATCH_MAX_AGE`].
+    pub fn blocking_push(&mut self, row: ViewRow) -> bool {
+        self.buf.push(row);
+        if self.buf.len() >= ROW_BATCH_SIZE || self.since.elapsed() >= ROW_BATCH_MAX_AGE {
+            return self.blocking_flush();
+        }
+        true
+    }
+
+    /// Blocking sibling of [`flush`](Self::flush).
+    pub fn blocking_flush(&mut self) -> bool {
+        if self.buf.is_empty() {
+            self.since = std::time::Instant::now();
+            return true;
+        }
+        let batch = self.take();
+        self.tx.blocking_send(Ok(batch)).is_ok()
+    }
+
+    /// Blocking sibling of [`error`](Self::error).
+    pub fn blocking_error(&mut self, e: SofError) {
+        if self.blocking_flush() {
+            let _ = self.tx.blocking_send(Err(e));
+        }
+    }
+
+    /// Blocking sibling of [`finish`](Self::finish).
+    pub fn blocking_finish(mut self) {
+        self.blocking_flush();
+    }
+}
+
 /// A pinned, heap-allocated, `Send + 'static` stream of Arrow record batches.
 ///
 /// Returned by [`SofRunner::run_view_columnar`]. Every batch has the same
@@ -282,6 +418,37 @@ pub trait SofRunner: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn batched_rows_keep_order_and_partial_batch_precedes_error() {
+        let (tx, rx) = row_batch_channel();
+        let producer = tokio::spawn(async move {
+            let mut b = RowBatcher::new(tx);
+            for i in 0..(ROW_BATCH_SIZE * 2 + 5) {
+                assert!(b.push(json!({"n": i})).await);
+            }
+            b.error(SofError::Cancelled).await;
+        });
+        let items: Vec<_> = futures::StreamExt::collect(row_stream(rx)).await;
+        producer.await.unwrap();
+        assert_eq!(items.len(), ROW_BATCH_SIZE * 2 + 6);
+        for (i, item) in items[..items.len() - 1].iter().enumerate() {
+            assert_eq!(item.as_ref().unwrap(), &json!({"n": i}));
+        }
+        assert!(matches!(items.last(), Some(Err(SofError::Cancelled))));
+    }
+
+    #[tokio::test]
+    async fn batcher_stops_when_receiver_is_dropped() {
+        let (tx, rx) = row_batch_channel();
+        drop(rx);
+        let mut b = RowBatcher::new(tx);
+        let mut alive = true;
+        for i in 0..ROW_BATCH_SIZE {
+            alive = b.push(json!({"n": i})).await;
+        }
+        assert!(!alive);
+    }
     use std::time::Duration;
 
     use serde_json::json;

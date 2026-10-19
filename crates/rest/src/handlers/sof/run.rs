@@ -1011,6 +1011,25 @@ fn map_sof_lib_error_to_rest(e: helios_sof::SofError) -> RestError {
     }
 }
 
+/// Body-chunk size the NDJSON streamer coalesces rows into.
+const NDJSON_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Sends `pending` as one body chunk and leaves it empty. Returns `false`
+/// when the client is gone.
+async fn send_ndjson_chunk(
+    tx: &tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+    pending: &mut Vec<u8>,
+) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    let chunk = axum::body::Bytes::from(std::mem::replace(
+        pending,
+        Vec::with_capacity(NDJSON_CHUNK_BYTES + 4096),
+    ));
+    tx.send(Ok(chunk)).await.is_ok()
+}
+
 /// Builds a chunked-transfer-encoding response that streams NDJSON rows as
 /// they arrive from the runner. Each row is serialised once and pushed
 /// through an mpsc channel into the response body, so the full result set
@@ -1022,41 +1041,66 @@ fn streaming_ndjson_response(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
 
     tokio::spawn(async move {
-        while let Some(row) = futures::StreamExt::next(&mut stream).await {
-            let mut buf = match row {
-                Ok(r) => match serde_json::to_vec(&r) {
-                    Ok(v) => v,
-                    Err(e) => {
+        use futures::{FutureExt as _, StreamExt as _};
+        // Rows are serialised into `pending` and sent in ~64 KiB chunks. When
+        // the next row is not ready, the pending bytes go out first, so a slow
+        // or selective stream still delivers its first rows promptly.
+        let mut pending: Vec<u8> = Vec::with_capacity(NDJSON_CHUNK_BYTES + 4096);
+        loop {
+            let next = match stream.next().now_or_never() {
+                Some(next) => next,
+                None => {
+                    if !send_ndjson_chunk(&tx, &mut pending).await {
+                        return;
+                    }
+                    stream.next().await
+                }
+            };
+            let Some(row) = next else { break };
+            match row {
+                Ok(r) => {
+                    let start = pending.len();
+                    if let Err(e) = serde_json::to_writer(&mut pending, &r) {
                         // Abort the body: an unserializable row is a server
                         // fault, and silently dropping it would hand the
                         // client a clean — but lossy — 200.
                         warn!(error = %e, "ndjson row serialization failed");
+                        pending.truncate(start);
+                        if !send_ndjson_chunk(&tx, &mut pending).await {
+                            return;
+                        }
                         let _ = tx
                             .send(Err(std::io::Error::other(format!(
                                 "ndjson row serialization failed: {e}"
                             ))))
                             .await;
-                        break;
+                        return;
                     }
-                },
+                    pending.push(b'\n');
+                    if pending.len() >= NDJSON_CHUNK_BYTES
+                        && !send_ndjson_chunk(&tx, &mut pending).await
+                    {
+                        return;
+                    }
+                }
                 Err(e) => {
                     // Yield an error into the body so hyper aborts the
                     // chunked transfer (no terminating chunk). Without this
                     // the client sees a cleanly-ended, silently-truncated 200.
                     warn!(error = %e, "row error while streaming ndjson");
+                    if !send_ndjson_chunk(&tx, &mut pending).await {
+                        return;
+                    }
                     let _ = tx
                         .send(Err(std::io::Error::other(format!(
                             "row error while streaming ndjson: {e}"
                         ))))
                         .await;
-                    break;
+                    return;
                 }
-            };
-            buf.push(b'\n');
-            if tx.send(Ok(axum::body::Bytes::from(buf))).await.is_err() {
-                break;
             }
         }
+        send_ndjson_chunk(&tx, &mut pending).await;
     });
 
     channel_body_response(rx, "application/x-ndjson", runner_label)
@@ -1982,6 +2026,38 @@ mod tests {
             .expect("a clean stream should produce a collectable body");
         let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
         assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n");
+    }
+
+    #[tokio::test]
+    async fn streaming_ndjson_coalesces_chunks_with_identical_bytes() {
+        use http_body_util::BodyExt as _;
+        let rows = numbered_rows(20_000);
+        let expected: String = (0..20_000)
+            .map(|i| format!("{}\n", json!({ "id": format!("p{i}"), "n": i })))
+            .collect();
+        let response = streaming_ndjson_response(row_stream(rows), Some("test-runner"));
+        let mut body = response.into_body();
+        let (mut bytes, mut frames) = (Vec::new(), 0usize);
+        while let Some(frame) = body.frame().await {
+            let frame = frame.expect("clean body");
+            if let Some(data) = frame.data_ref() {
+                bytes.extend_from_slice(data);
+                frames += 1;
+            }
+        }
+        assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+        assert!(frames < 100, "rows must be coalesced, got {frames} frames");
+    }
+
+    #[tokio::test]
+    async fn streaming_ndjson_delivers_rows_before_a_row_error() {
+        use http_body_util::BodyExt as _;
+        let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
+        let response = streaming_ndjson_response(stream, None);
+        let mut body = response.into_body();
+        let first = body.frame().await.expect("a frame").expect("data first");
+        assert_eq!(first.data_ref().unwrap().as_ref(), b"{\"a\":1}\n");
+        assert!(body.frame().await.expect("a frame").is_err());
     }
 
     #[tokio::test]
