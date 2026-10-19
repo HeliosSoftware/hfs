@@ -56,6 +56,41 @@
       "groupName": "testMiscellaneousAccessorTests",
       "testName": "testPatientHasBirthDate",
       "reason": "Unsure how the predicate=true capability works"
+    },
+    {
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent1",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent3",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent4",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent1",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent2",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent4",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent5",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
     }
   ]
 }

@@ -1,13 +1,17 @@
-//! `hfs` logs its database connection string at startup without the
-//! credentials in it (#2139).
+//! `hfs` logs its database connection string (#2139), Elasticsearch nodes and
+//! terminology server URL (#2149) at startup without the credentials in them.
 //!
 //! Each test starts the real binary with a password in the connection string,
 //! reads its output until the startup line that names the backend, and stops
 //! it. The database is never reachable: the line is written before `hfs`
 //! connects. Run with:
-//! `cargo test -p helios-hfs --features mongodb,postgres --test startup_log_redaction`
+//! `cargo test -p helios-hfs --features mongodb,postgres,elasticsearch --test startup_log_redaction`
 
-#![cfg(any(feature = "mongodb", feature = "postgres"))]
+#![cfg(any(
+    feature = "mongodb",
+    feature = "postgres",
+    all(feature = "sqlite", feature = "elasticsearch")
+))]
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
@@ -83,6 +87,7 @@ fn forward_lines(
     })
 }
 
+#[cfg(any(feature = "mongodb", feature = "postgres"))]
 fn assert_logged_redacted(output: &str, marker: &str, redacted: &str) {
     assert!(
         output.contains(marker),
@@ -195,4 +200,47 @@ fn ambiguous_postgres_userinfo_is_redacted_wholesale() {
         MARKER,
     );
     assert_logged_redacted(&output, MARKER, "[redacted]");
+}
+
+/// Credentials in `HFS_ELASTICSEARCH_NODES` and `HFS_TERMINOLOGY_SERVER` are
+/// real credentials (elasticsearch-rs and reqwest turn `user:pass@` into Basic
+/// auth), so neither the node list nor the terminology URL is logged whole.
+#[cfg(all(feature = "sqlite", feature = "elasticsearch"))]
+#[test]
+fn elasticsearch_nodes_and_terminology_server_are_logged_without_credentials() {
+    const MARKER: &str = "Initializing Elasticsearch backend";
+    let dir =
+        std::env::temp_dir().join(format!("hfs-startup-log-redaction-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let db = dir.join("fhir.db");
+    let nodes = format!("https://elastic:{SECRET}@127.0.0.1:9,http://127.0.0.1:10/?token={SECRET}");
+    let terminology = format!("http://tx:{SECRET}@127.0.0.1:11/fhir?token={SECRET}");
+    let output = startup_output(
+        &[
+            ("HFS_STORAGE_BACKEND", "sqlite-elasticsearch"),
+            ("HFS_DATABASE_URL", db.to_str().expect("utf-8 temp path")),
+            ("HFS_ELASTICSEARCH_NODES", &nodes),
+            ("HFS_TERMINOLOGY_SERVER", &terminology),
+        ],
+        MARKER,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.contains(MARKER),
+        "hfs never logged `{MARKER}`; output:\n{output}"
+    );
+    assert!(
+        !output.contains(SECRET),
+        "hfs logged a credential; output:\n{output}"
+    );
+    for expected in [
+        "https://[redacted]@127.0.0.1:9",
+        "http://127.0.0.1:10/?[redacted]",
+        "http://[redacted]@127.0.0.1:11/fhir?[redacted]",
+    ] {
+        assert!(
+            output.contains(expected),
+            "expected `{expected}` in the startup log; output:\n{output}"
+        );
+    }
 }

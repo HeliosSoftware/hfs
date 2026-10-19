@@ -202,7 +202,10 @@ impl MongoBackend {
 }
 
 /// Configuration for the MongoDB backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the connection string's credentials and options
+/// never reach a log line (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MongoBackendConfig {
     /// Samples eligible no-total offsets and caches their execution strategy.
     /// `false` disables adaptive offset selection; other search plans are unchanged.
@@ -775,6 +778,79 @@ fn default_transaction_bundle_weight_entries() -> usize {
 
 fn default_count_by_tenant_max_time_ms() -> u64 {
     DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS
+}
+
+impl Debug for MongoBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            adaptive_offset_paging,
+            probe_timeout_ms,
+            search_timeout_ms,
+            connection_string,
+            database_name,
+            max_connections,
+            connect_timeout_ms,
+            server_selection_timeout_ms,
+            fhir_version,
+            data_dir,
+            search_offloaded,
+            max_included_resources,
+            app_name,
+            index_build,
+            reindex_catch_up_margin_ms,
+            reindex_overlap,
+            reindex_prepare_threads,
+            reindex_prefetch,
+            bundle_transaction_budget,
+            bundle_transaction_deadline,
+            max_concurrent_transaction_bundles,
+            broad_search_concurrency,
+            transaction_bundle_weight_entries,
+            transaction_bundle_deferred_index_entries,
+            count_by_tenant_max_time_ms,
+        } = self;
+        f.debug_struct("MongoBackendConfig")
+            .field("adaptive_offset_paging", adaptive_offset_paging)
+            .field("probe_timeout_ms", probe_timeout_ms)
+            .field("search_timeout_ms", search_timeout_ms)
+            .field(
+                "connection_string",
+                &crate::core::database_url::redact_database_url(connection_string, "mongodb"),
+            )
+            .field("database_name", database_name)
+            .field("max_connections", max_connections)
+            .field("connect_timeout_ms", connect_timeout_ms)
+            .field("server_selection_timeout_ms", server_selection_timeout_ms)
+            .field("fhir_version", fhir_version)
+            .field("data_dir", data_dir)
+            .field("search_offloaded", search_offloaded)
+            .field("max_included_resources", max_included_resources)
+            .field("app_name", app_name)
+            .field("index_build", index_build)
+            .field("reindex_catch_up_margin_ms", reindex_catch_up_margin_ms)
+            .field("reindex_overlap", reindex_overlap)
+            .field("reindex_prepare_threads", reindex_prepare_threads)
+            .field("reindex_prefetch", reindex_prefetch)
+            .field("bundle_transaction_budget", bundle_transaction_budget)
+            .field("bundle_transaction_deadline", bundle_transaction_deadline)
+            .field(
+                "max_concurrent_transaction_bundles",
+                max_concurrent_transaction_bundles,
+            )
+            .field("broad_search_concurrency", broad_search_concurrency)
+            .field(
+                "transaction_bundle_weight_entries",
+                transaction_bundle_weight_entries,
+            )
+            .field(
+                "transaction_bundle_deferred_index_entries",
+                transaction_bundle_deferred_index_entries,
+            )
+            .field("count_by_tenant_max_time_ms", count_by_tenant_max_time_ms)
+            .finish()
+    }
 }
 
 impl Default for MongoBackendConfig {
@@ -2051,6 +2127,23 @@ mod capability_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_debug_redacts_connection_string_credentials() {
+        let config = MongoBackendConfig {
+            connection_string:
+                "mongodb://admin:m0ngo-s3cret@mongo.internal:27017/fhir?authSource=x-opt-tok"
+                    .to_string(),
+            database_name: "fhir_db".to_string(),
+            ..Default::default()
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("m0ngo-s3cret"), "password leaked: {out}");
+        assert!(!out.contains("admin"), "user leaked: {out}");
+        assert!(!out.contains("x-opt-tok"), "options leaked: {out}");
+        assert!(out.contains("mongo.internal"), "{out}");
+        assert!(out.contains("fhir_db"), "{out}");
+    }
 
     #[test]
     fn app_name_defaults_to_the_historical_constant() {

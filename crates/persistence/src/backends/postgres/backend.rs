@@ -106,7 +106,9 @@ impl Debug for PostgresBackend {
 }
 
 /// Configuration for the PostgreSQL backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the password never reaches a log line (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PostgresConfig {
     /// PostgreSQL host.
     #[serde(default = "default_host")]
@@ -400,6 +402,50 @@ fn check_count_by_tenant_statement_timeout_ms(ms: u64) -> Result<(), String> {
 /// unbounded latency tail instead of an honest rejection.
 fn default_pool_wait_timeout_secs() -> u64 {
     10
+}
+
+impl Debug for PostgresConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            host,
+            port,
+            dbname,
+            user,
+            password,
+            ssl_mode,
+            max_connections,
+            connect_timeout_secs,
+            statement_timeout_ms,
+            count_by_tenant_statement_timeout_ms,
+            plan_cache_mode,
+            pool_wait_timeout_secs,
+            fhir_version,
+            data_dir,
+            search_offloaded,
+        } = self;
+        f.debug_struct("PostgresConfig")
+            .field("host", host)
+            .field("port", port)
+            .field("dbname", dbname)
+            .field("user", user)
+            .field("password", &password.as_ref().map(|_| "[redacted]"))
+            .field("ssl_mode", ssl_mode)
+            .field("max_connections", max_connections)
+            .field("connect_timeout_secs", connect_timeout_secs)
+            .field("statement_timeout_ms", statement_timeout_ms)
+            .field(
+                "count_by_tenant_statement_timeout_ms",
+                count_by_tenant_statement_timeout_ms,
+            )
+            .field("plan_cache_mode", plan_cache_mode)
+            .field("pool_wait_timeout_secs", pool_wait_timeout_secs)
+            .field("fhir_version", fhir_version)
+            .field("data_dir", data_dir)
+            .field("search_offloaded", search_offloaded)
+            .finish()
+    }
 }
 
 impl Default for PostgresConfig {
@@ -1649,6 +1695,19 @@ fn is_transient_connect_failure(e: &deadpool_postgres::PoolError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_debug_redacts_password() {
+        let config = PostgresConfig {
+            host: "db.internal".to_string(),
+            password: Some("pg-s3cret-pw".to_string()),
+            ..Default::default()
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("pg-s3cret-pw"), "password leaked: {out}");
+        assert!(out.contains("[redacted]"), "{out}");
+        assert!(out.contains("db.internal"), "{out}");
+    }
 
     /// #1793: only a connect that failed before reaching the server is
     /// retried; pool exhaustion, a closed pool and timeouts are not.

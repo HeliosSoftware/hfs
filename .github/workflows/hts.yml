@@ -691,7 +691,7 @@ jobs:
       # killed mid-test. hts test containers carry `io.helios.hts.test-pool`
       # rather than `github.run_id`, so an age-guarded sweep is the safe option:
       # it can never race a concurrent hts run (e.g. nightly + a release tag).
-      MAX_CONTAINER_AGE_MIN: 90
+      MAX_CONTAINER_AGE_MIN: 180
     steps:
       - name: Check out the Docker host GC action
         uses: actions/checkout@v5
