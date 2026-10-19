@@ -810,6 +810,7 @@ impl Debug for MongoBackendConfig {
             transaction_bundle_weight_entries,
             transaction_bundle_deferred_index_entries,
             count_by_tenant_max_time_ms,
+            sof_cursor_batch_size,
         } = self;
         f.debug_struct("MongoBackendConfig")
             .field("adaptive_offset_paging", adaptive_offset_paging)
@@ -849,6 +850,7 @@ impl Debug for MongoBackendConfig {
                 transaction_bundle_deferred_index_entries,
             )
             .field("count_by_tenant_max_time_ms", count_by_tenant_max_time_ms)
+            .field("sof_cursor_batch_size", sof_cursor_batch_size)
             .finish()
     }
 }
