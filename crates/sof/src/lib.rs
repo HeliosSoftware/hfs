@@ -4659,6 +4659,7 @@ pub fn format_parquet_multi_file_with_schema(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// Rows that exercise every shape the buffered formatters see: a later
     /// row missing a key, an extra key, nested values, quoting, formula-like
@@ -4717,7 +4718,6 @@ mod tests {
         assert!(RowStreamEncoder::new(ContentType::NdJson).is_none());
         assert!(RowStreamEncoder::new(ContentType::Parquet).is_none());
     }
-    use super::*;
 
     /// `compartment_reference_ids` accepts both reference forms the SoF spec
     /// allows, ignores a version suffix, drops an id-less reference, and
