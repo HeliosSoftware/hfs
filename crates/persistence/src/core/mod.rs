@@ -103,6 +103,7 @@ pub(crate) mod bulk_submit_receipts;
 pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
+pub mod database_url;
 pub mod history;
 pub mod patch;
 pub mod patient_compartment;

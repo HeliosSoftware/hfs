@@ -26,6 +26,8 @@ use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
 use helios_auth::{AuthConfig, JwksBearerAuthProvider, JwksCache};
+#[cfg(any(feature = "postgres", feature = "mongodb"))]
+use helios_persistence::core::database_url::redact_database_url;
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
 use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::{info, warn};
@@ -1265,7 +1267,10 @@ async fn create_postgres_backend(
 
     let mut backend_config = if let Some(ref url) = config.database_url {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            info!(url = %url, "Initializing PostgreSQL backend from connection string");
+            info!(
+                url = %redact_database_url(url, "postgres"),
+                "Initializing PostgreSQL backend from connection string"
+            );
             PostgresBackend::config_from_connection_string(url)?
         } else {
             info!("Initializing PostgreSQL backend from environment variables");
@@ -1376,7 +1381,7 @@ async fn start_mongodb(
 ) -> anyhow::Result<()> {
     let backend_config = build_mongodb_config(&config, false)?;
     info!(
-        url = %backend_config.connection_string,
+        url = %redact_database_url(&backend_config.connection_string, "mongodb"),
         database = %backend_config.database_name,
         "Initializing MongoDB backend"
     );
@@ -4040,7 +4045,7 @@ async fn start_mongodb_elasticsearch(
     // Create MongoDB backend
     let backend_config = build_mongodb_config(&config, true)?;
     info!(
-        url = %backend_config.connection_string,
+        url = %redact_database_url(&backend_config.connection_string, "mongodb"),
         database = %backend_config.database_name,
         "Initializing MongoDB backend"
     );
