@@ -1904,3 +1904,199 @@ async fn mongodb_missing_index_follows_index_build_mode() {
         .await;
     }
 }
+
+#[tokio::test]
+async fn mongodb_missing_results_survive_searchparameter_create_update_delete() {
+    let Some(backend) = create_backend("missing_fp_lifecycle").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-fp-lifecycle");
+    register_parameters(&backend, &tenant).await;
+    let full = backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("lifecycle-full", extensions(false)),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let empty = backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("lifecycle-empty", vec![]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = backend.get_database().await.unwrap();
+    let stamped = db
+        .collection::<Document>("resources")
+        .find_one(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "id": "lifecycle-full",
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let stamp = stamped.get_str("missing_params_fp").unwrap();
+    assert_eq!(stamp.len(), 16, "{stamp}");
+    assert!(stamp.bytes().all(|b| b.is_ascii_hexdigit()), "{stamp}");
+
+    let token = &PARAMETERS[1];
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(token, true),
+        &["lifecycle-empty"],
+    )
+    .await;
+
+    let added = TypedParameter {
+        name: "fp-added",
+        kind: SearchParamType::Token,
+        fhir_type: "token",
+        extension_field: "valueCode",
+        index_field: "value_token_code",
+    };
+    backend
+        .create(
+            &tenant,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter", "id": added.name,
+                "url": format!("urn:hfs:test:{}", added.name),
+                "name": added.name, "status": "active", "code": added.name,
+                "base": ["Observation"], "type": added.fhir_type,
+                "expression": format!(
+                    "Observation.extension.where(url = 'urn:hfs:test:{}').value",
+                    added.name
+                )
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(&added, true),
+        &["lifecycle-empty", "lifecycle-full"],
+    )
+    .await;
+    assert_results(&backend, &tenant, &missing_query(&added, false), &[]).await;
+
+    let rewritten = backend
+        .write_search_entries_page(&tenant, &[full.clone(), empty.clone()])
+        .await;
+    assert!(rewritten.iter().all(Result::is_ok), "{rewritten:?}");
+    assert_missing_metadata(&db, &tenant, "lifecycle-empty", &added, true).await;
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(&added, true),
+        &["lifecycle-empty", "lifecycle-full"],
+    )
+    .await;
+
+    let current = backend
+        .read(&tenant, "SearchParameter", "missing-string")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &current,
+            json!({
+                "resourceType": "SearchParameter", "id": "missing-string",
+                "url": "urn:hfs:test:missing-string",
+                "name": "missing-string", "status": "active", "code": "missing-string",
+                "base": ["Observation"], "type": "string",
+                "expression":
+                    "Observation.extension.where(url = 'urn:hfs:test:missing-string-v2').value"
+            }),
+        )
+        .await
+        .unwrap();
+    let string = &PARAMETERS[0];
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(string, true),
+        &["lifecycle-empty"],
+    )
+    .await;
+    let rewritten = backend
+        .write_search_entries_page(&tenant, &[full.clone(), empty.clone()])
+        .await;
+    assert!(rewritten.iter().all(Result::is_ok), "{rewritten:?}");
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(string, true),
+        &["lifecycle-empty", "lifecycle-full"],
+    )
+    .await;
+
+    backend
+        .delete(&tenant, "SearchParameter", "fp-added")
+        .await
+        .unwrap();
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(&added, true),
+        &["lifecycle-empty", "lifecycle-full"],
+    )
+    .await;
+    db.drop().await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_missing_metadata_stamped_by_another_registry_is_distrusted() {
+    let Some(backend) = create_backend("missing_fp_foreign_stamp").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-fp-foreign");
+    register_parameters(&backend, &tenant).await;
+    let original = backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("node-a", vec![]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let token = &PARAMETERS[1];
+    assert_results(&backend, &tenant, &missing_query(token, true), &["node-a"]).await;
+
+    let db = backend.get_database().await.unwrap();
+    db.collection::<Document>("resources")
+        .update_one(
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "id": "node-a",
+            },
+            doc! { "$set": {
+                "missing_params": Vec::<String>::new(),
+                "missing_params_fp": "0000000000000000",
+            } },
+        )
+        .await
+        .unwrap();
+    assert_results(&backend, &tenant, &missing_query(token, true), &["node-a"]).await;
+    assert_results(&backend, &tenant, &missing_query(token, false), &[]).await;
+
+    let rewritten = backend
+        .write_search_entries_page(&tenant, std::slice::from_ref(&original))
+        .await;
+    assert!(rewritten.iter().all(Result::is_ok), "{rewritten:?}");
+    assert_missing_metadata(&db, &tenant, "node-a", token, true).await;
+    assert_results(&backend, &tenant, &missing_query(token, true), &["node-a"]).await;
+    db.drop().await.unwrap();
+}

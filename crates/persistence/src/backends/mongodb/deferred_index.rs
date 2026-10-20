@@ -285,6 +285,7 @@ pub(super) fn deferred_resource_update(
     resource_type: &str,
     id: &str,
     missing_params: Option<&[String]>,
+    missing_fp: Option<&str>,
 ) -> Document {
     doc! {
         "q": {
@@ -296,6 +297,7 @@ pub(super) fn deferred_resource_update(
         "u": with_missing_metadata_update(
             doc! { "$unset": { SEARCH_ROWS_PENDING_FIELD: "" } },
             missing_params,
+            missing_fp,
         ),
         "multi": false,
         "upsert": false,
@@ -515,6 +517,7 @@ impl MongoBackend {
                     resource_type,
                     &id,
                     rows.missing_params.as_deref(),
+                    rows.missing_fp.as_deref(),
                 ));
                 own.extend(rows.own);
                 contained.extend(rows.contained);
@@ -524,6 +527,11 @@ impl MongoBackend {
                     resource_type,
                     &id,
                     Some(&[]),
+                    Some(
+                        &self
+                            .tenant_extractor(tenant_id)
+                            .missing_fingerprint(resource_type),
+                    ),
                 ));
             }
             marked.push(id);
@@ -1374,27 +1382,42 @@ mod tests {
         let cases = [
             (
                 Some(names.as_slice()),
+                Some("fp1"),
                 doc! {
                     "$unset": { SEARCH_ROWS_PENDING_FIELD: "" },
+                    "$set": { "missing_params": ["a", "b"], "missing_params_fp": "fp1" },
+                },
+            ),
+            (
+                Some(names.as_slice()),
+                None,
+                doc! {
+                    "$unset": { SEARCH_ROWS_PENDING_FIELD: "", "missing_params_fp": "" },
                     "$set": { "missing_params": ["a", "b"] },
                 },
             ),
             // A failed extraction removes the field instead of claiming absence.
             (
                 None,
-                doc! { "$unset": { SEARCH_ROWS_PENDING_FIELD: "", "missing_params": "" } },
+                None,
+                doc! { "$unset": {
+                    SEARCH_ROWS_PENDING_FIELD: "",
+                    "missing_params": "",
+                    "missing_params_fp": "",
+                } },
             ),
             // A deleted resource has nothing missing, as a soft delete writes it.
             (
                 Some(&[][..]),
+                Some("fp1"),
                 doc! {
                     "$unset": { SEARCH_ROWS_PENDING_FIELD: "" },
-                    "$set": { "missing_params": Vec::<String>::new() },
+                    "$set": { "missing_params": Vec::<String>::new(), "missing_params_fp": "fp1" },
                 },
             ),
         ];
-        for (missing, update) in cases {
-            let statement = deferred_resource_update("t1", "Patient", "p1", missing);
+        for (missing, fp, update) in cases {
+            let statement = deferred_resource_update("t1", "Patient", "p1", missing, fp);
             assert_eq!(statement.get_document("u").unwrap(), &update, "{missing:?}");
             assert_eq!(
                 statement.get_document("q").unwrap(),

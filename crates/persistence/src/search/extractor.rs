@@ -322,6 +322,46 @@ impl SearchParameterExtractor {
         self.extract_internal(resource, resource_type, None)
     }
 
+    pub(crate) fn missing_fingerprint(&self, resource_type: &str) -> String {
+        use sha2::{Digest, Sha256};
+
+        let params = {
+            let registry = self.registry.read();
+            let mut params = registry.get_active_params(resource_type);
+            for base in ABSTRACT_BASE_TYPES {
+                params.extend(registry.get_active_params(base));
+            }
+            params
+        };
+        let mut entries: Vec<String> = params
+            .iter()
+            .filter(|param| self.supports_missing(resource_type, param))
+            .map(|param| {
+                let mut entry = format!(
+                    "{}\u{1}{:?}\u{1}{}",
+                    param.code, param.param_type, param.expression
+                );
+                if let Some(components) = &param.component {
+                    for component in components {
+                        entry.push('\u{1}');
+                        entry.push_str(&component.definition);
+                        entry.push('\u{1}');
+                        entry.push_str(&component.expression);
+                    }
+                }
+                entry
+            })
+            .collect();
+        entries.sort();
+        let mut hasher = Sha256::new();
+        for entry in &entries {
+            hasher.update(entry.as_bytes());
+            hasher.update([0u8]);
+        }
+        let digest = hasher.finalize();
+        digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// Also report absent parameters for backends that index absence.
     pub fn extract_with_missing(
         &self,

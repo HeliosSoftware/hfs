@@ -99,6 +99,12 @@ results can remain incomplete until the extraction problem is corrected and
 the resource is rewritten or reindexed. This metadata describes top-level
 resources; it does not add contained `:missing` support.
 
+Next to the array, `missing_params_fp` stamps the definition fingerprint it
+was computed from, and the scalar `idx_resources_missing_fp` index
+(`{ tenant_id: 1, resource_type: 1, is_deleted: 1, missing_params_fp: 1 }`,
+created at startup, never hinted) serves the per-search staleness probe — see
+"Definition changes" below.
+
 The shared `idx_resources_missing_params` multikey index has this key order:
 
 ```javascript
@@ -197,32 +203,45 @@ time is included in the insert timing statistic.
    Poll `GET /$reindex-status/{job_id}` on the same node and resolve reported
    failures before treating the rebuild as complete.
 
-There is no definition fingerprint or automatic metadata invalidation when a
-SearchParameter is added, changed or removed. Coordinate definition
-maintenance across all nodes serving the affected tenant:
+### Definition changes (#1999)
 
-1. Pause affected searches and drain writers, including background indexing.
-2. Apply the definition change and refresh or restart every affected node so
-   they use the same definitions.
-3. Remove the complete `missing_params` field for the affected tenant and
-   resource types, using an explicitly scoped MongoDB update, for example:
+Every writer stamps `missing_params_fp` next to `missing_params`: a
+deterministic fingerprint of the tenant's active definitions for the resource
+type (and its abstract bases) at write time. Before each `:missing=true`
+search the server probes for any live resource of the tenant and type whose
+stamp exists and differs from the current registry's fingerprint — one bounded
+seek of `idx_resources_missing_fp`. When one exists, the metadata route is
+off for that search and the value-index route answers, so creating, changing
+or retiring a SearchParameter gives correct results immediately, on every
+node, with no manual steps: a node still holding the older registry stamps
+its writes with the older fingerprint, which the other nodes distrust.
 
-   ```javascript
-   db.resources.updateMany(
-     { tenant_id: "TENANT_ID", resource_type: { $in: ["Observation"] } },
-     { $unset: { missing_params: "" } }
-   );
-   ```
+The stamp cannot repair value-index rows: after changing an existing
+definition's *expression*, resources written under the old expression answer
+from their old rows (exactly as ordinary value searches do) until a
+`POST /$reindex` of the affected types rewrites them. `$reindex` also
+restamps the metadata, which restores the metadata fast path; until then
+every `:missing=true` on an affected type pays the value-index route.
 
-4. Reindex the affected resources with the new definitions, check job errors,
-   and resume requests after the rebuild succeeds.
+Resources written before the stamp existed carry `missing_params` without
+`missing_params_fp` and remain trusted, preserving their pre-upgrade behavior
+and cost. Stale-definition detection covers them once a write or `$reindex`
+stamps them, so run one `$reindex` after upgrading to bring the whole corpus
+under detection.
 
-Do not merely remove one parameter name from the array: a present array would
-still be trusted, so that would claim the parameter is not absent instead of
-marking its state unknown. Unsetting the field restores compatibility checks,
-but those checks cannot repair value-index rows extracted from old definitions;
-the rebuild is still required. Include every affected type when a definition
-applies to an abstract base or multiple resource types.
+Recovery, when metadata is suspected wrong despite the stamp (a restore from
+backup, a manual edit): `$unset` both fields together for the affected tenant
+and resource types and `$reindex`. Do not merely remove one parameter name
+from the array, and do not unset one field without the other: a present array
+with a current stamp is trusted. Include every affected type when a
+definition applies to an abstract base or multiple resource types.
+
+```javascript
+db.resources.updateMany(
+  { tenant_id: "TENANT_ID", resource_type: { $in: ["Observation"] } },
+  { $unset: { missing_params: "", missing_params_fp: "" } }
+);
+```
 
 ## Composite parameters
 

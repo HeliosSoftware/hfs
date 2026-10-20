@@ -132,6 +132,7 @@ pub(crate) const RESOURCES_MISSING_INDEX: &str = "idx_resources_missing_params";
 /// cross-tenant `count_by_tenant` aggregate is a covered scan of it (#1910).
 /// Not hinted, so not in [`REQUIRED_QUERY_INDEXES`].
 pub(crate) const RESOURCES_LIVE_TENANT_INDEX: &str = "idx_resources_live_tenant";
+pub(crate) const RESOURCES_MISSING_FP_INDEX: &str = "idx_resources_missing_fp";
 
 /// The indexes that queries name in `.hint(...)`, by collection. A hinted
 /// query fails when its index is missing, so readiness requires all of them.
@@ -298,6 +299,19 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
         &resources,
         doc! { "is_deleted": 1_i32, "tenant_id": 1_i32 },
         RESOURCES_LIVE_TENANT_INDEX,
+        false,
+    )
+    .await?;
+
+    create_index(
+        &resources,
+        doc! {
+            "tenant_id": 1_i32,
+            "resource_type": 1_i32,
+            "is_deleted": 1_i32,
+            "missing_params_fp": 1_i32,
+        },
+        RESOURCES_MISSING_FP_INDEX,
         false,
     )
     .await?;

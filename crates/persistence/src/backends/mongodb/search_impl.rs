@@ -970,6 +970,8 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
         let Some(timeout) = self
             .config()
             .search_timeout_ms
@@ -985,6 +987,8 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
         let Some(timeout) = self
             .config()
             .search_timeout_ms
@@ -1627,6 +1631,75 @@ fn contained_composite_value_stages(
 }
 
 impl MongoBackend {
+    pub(super) fn missing_fingerprint(&self, tenant_id: &str, resource_type: &str) -> String {
+        self.tenant_extractor(tenant_id)
+            .missing_fingerprint(resource_type)
+    }
+
+    fn missing_metadata_fresh(&self, tenant_id: &str, resource_type: &str) -> bool {
+        let key = (tenant_id.to_string(), resource_type.to_string());
+        match self.missing_meta_fresh.read().get(&key) {
+            Some((fingerprint, fresh))
+                if *fingerprint == self.missing_fingerprint(tenant_id, resource_type) =>
+            {
+                *fresh
+            }
+            _ => true,
+        }
+    }
+
+    pub(super) async fn refresh_missing_metadata_freshness(
+        &self,
+        tenant_id: &str,
+        query: &SearchQuery,
+    ) {
+        let has_missing_true = query.parameters.iter().any(|param| {
+            matches!(param.modifier, Some(SearchModifier::Missing))
+                && param
+                    .values
+                    .first()
+                    .is_some_and(|value| value.value == "true")
+        });
+        if !has_missing_true || !self.missing_params_index_ready() {
+            return;
+        }
+        let fingerprint = self.missing_fingerprint(tenant_id, &query.resource_type);
+        let key = (tenant_id.to_string(), query.resource_type.clone());
+        let stale = match self.get_database().await {
+            Ok(db) => db
+                .collection::<Document>(Self::RESOURCES_COLLECTION)
+                .find_one(doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": &query.resource_type,
+                    "is_deleted": false,
+                    "missing_params_fp": { "$exists": true, "$ne": &fingerprint },
+                })
+                .projection(doc! { "_id": 1 })
+                .await
+                .map(|found| found.is_some())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match stale {
+            Ok(stale) => {
+                self.missing_meta_fresh
+                    .write()
+                    .insert(key, (fingerprint, !stale));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error,
+                    tenant_id,
+                    resource_type = %query.resource_type,
+                    "Missing-metadata staleness probe failed; using the value-index route"
+                );
+                self.missing_meta_fresh
+                    .write()
+                    .insert(key, (fingerprint, false));
+            }
+        }
+    }
+
     fn supports_indexed_missing(
         &self,
         tenant_id: &str,
@@ -1654,7 +1727,7 @@ impl MongoBackend {
                 && self
                     .tenant_extractor(tenant_id)
                     .supports_missing(resource_type, &definition)
-        })
+        }) && self.missing_metadata_fresh(tenant_id, resource_type)
     }
 
     fn is_missing_resource_parameter(

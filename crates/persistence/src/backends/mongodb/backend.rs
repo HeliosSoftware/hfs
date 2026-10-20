@@ -132,6 +132,8 @@ pub struct MongoBackend {
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
     reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    pub(super) missing_meta_fresh:
+        parking_lot::RwLock<std::collections::HashMap<(String, String), (String, bool)>>,
 }
 
 impl Debug for MongoBackend {
@@ -979,6 +981,7 @@ impl MongoBackend {
             broad_search_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
+            missing_meta_fresh: parking_lot::RwLock::new(std::collections::HashMap::new()),
         })
     }
 
