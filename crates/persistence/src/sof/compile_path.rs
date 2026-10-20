@@ -1069,10 +1069,8 @@ fn lower_function_call(
         }
         "getReferenceKey" if args.is_empty() => {
             // `Reference.reference` looks like `Type/id`; extract the id —
-            // the substring after the LAST `/`. The simplest portable form
-            // applies to both PG `regexp_replace` (POSIX) and SQLite's
-            // built-in `instr`/`substr` shimmed via a registered UDF in
-            // stage 6; for now both dialects use a SQL-only expression.
+            // the substring after the LAST `/`. The dialect-specific SQL for
+            // that tail comes from `Dialect::last_path_segment`.
             let reference =
                 extend_path(focus.clone(), PathStep::Field("reference".to_string()), env)?;
             Ok(SqlExpr::ReferenceKey {
