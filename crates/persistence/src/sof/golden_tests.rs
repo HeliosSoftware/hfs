@@ -235,6 +235,17 @@ fn cases() -> Vec<Case> {
         filters: ViewFilters::default(),
         paged: false,
     });
+    cases.push(Case {
+        name: "reference-key",
+        view: view(
+            "Observation",
+            json!([{"column":[{"path":"id","name":"id"},
+            {"path":"subject.getReferenceKey()","name":"any_key","type":"string"},
+            {"path":"subject.getReferenceKey(Patient)","name":"patient_key","type":"string"}]}]),
+        ),
+        filters: ViewFilters::default(),
+        paged: false,
+    });
     cases.push(patient(
         "union-in-foreach",
         json!([{"column":[{"path":"id","name":"id"}]},
@@ -326,7 +337,7 @@ async fn check(dialect: SqlDialect, name: &str) {
         std::fs::create_dir_all(&directory).unwrap();
     }
     let cases = cases();
-    assert_eq!(cases.len(), 34, "all golden cases must execute");
+    assert_eq!(cases.len(), 35, "all golden cases must execute");
     for case in cases {
         let groups = || {
             vec![
