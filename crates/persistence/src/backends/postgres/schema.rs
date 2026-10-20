@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 49;
+pub const SCHEMA_VERSION: i32 = 50;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -513,6 +513,12 @@ async fn migrate_schema(
                 continue;
             }
             48 => migrate_v48_to_v49(client).await?,
+            49 => {
+                // Stamps the v50 marker inside its own transaction, like v48.
+                migrate_v49_to_v50(client).await?;
+                version += 1;
+                continue;
+            }
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4745,6 +4751,24 @@ async fn migrate_v48_to_v49(client: &deadpool_postgres::Client) -> StorageResult
     }
 }
 
+/// v49 -> v50: the SQL-on-FHIR terminology tables (#2185), PostgreSQL's
+/// counterpart of SQLite's v41. New, empty tables only, so the step is one
+/// transaction that stamps its own marker.
+async fn migrate_v49_to_v50(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v50 migration: {e}")))?;
+    tx.batch_execute(super::sof_terminology::CREATE_TABLES_SQL)
+        .await
+        .map_err(|e| pg_error(format!("Migration v49->v50 failed: {e}")))?;
+    set_schema_version(&tx, 50).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v50 migration: {e}")))?;
+    Ok(())
+}
+
 /// Fresh denormalized databases do not create ordinary legacy probes. Legacy
 /// writers populate slots; its nullable rows may be folded during a transition,
 /// so family-specific predicates distinguish those from ambiguous unfolded rows.
@@ -7878,7 +7902,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 49);
+        assert_eq!(SCHEMA_VERSION, 50);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)

@@ -49,6 +49,9 @@ mod tenant_id_fidelity_suite;
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 
+#[path = "common/sof_terminology_suite.rs"]
+mod sof_terminology_suite;
+
 /// The backend-agnostic full-text purge-completeness scenarios (issue #386),
 /// shared verbatim with the SQLite suite that owns the file.
 ///
@@ -32615,6 +32618,33 @@ mod postgres_integration {
             &unique_base("fidelity_purge"),
         )
         .await;
+    }
+
+    /// #2185: the SQL-on-FHIR terminology store contract, with the tenant's
+    /// remaining relation, chunk and reference rows as the residue.
+    #[tokio::test]
+    async fn postgres_integration_sof_terminology_store_suite() {
+        let backend = create_backend().await;
+        let base = unique_base("sof_term");
+        let client = std::sync::Arc::new(backend.get_client().await.unwrap());
+        let residue = move |tenant: String| {
+            let client = std::sync::Arc::clone(&client);
+            Box::pin(async move {
+                let row = client
+                    .query_one(
+                        "SELECT (SELECT COUNT(*) FROM sof_terminology_relations WHERE tenant_id = $1)
+                              + (SELECT COUNT(*) FROM sof_terminology_refs WHERE tenant_id = $1)
+                              + (SELECT COUNT(*) FROM sof_terminology_chunks c
+                                   JOIN sof_terminology_relations r ON r.id = c.relation_id
+                                  WHERE r.tenant_id = $1)",
+                        &[&tenant],
+                    )
+                    .await
+                    .unwrap();
+                row.get::<_, i64>(0) as usize
+            }) as futures::future::BoxFuture<'static, usize>
+        };
+        super::sof_terminology_suite::run_all(&backend, &base, Some(&residue)).await;
     }
 
     /// #1912: the tenant-scoped existence probe answers as `count_by_tenant`

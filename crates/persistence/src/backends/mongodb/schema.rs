@@ -31,12 +31,13 @@ use super::search_index_catalog::{
 /// index. v12 adds `idx_resources_live_tenant`, which serves the
 /// cross-tenant `count_by_tenant` as a covered index scan (#1910). v13 adds
 /// the `search_index_pending` ledger of deferred search rows and its
-/// `not_before` index (#1975).
+/// `not_before` index (#1975). v14 adds the SQL-on-FHIR terminology
+/// collections `sof_terminology_registry` and `sof_terminology_rows` (#2185).
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
 /// not change for them.
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 14;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -72,6 +73,7 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
     ensure_login_sessions_indexes(database).await?;
     ensure_tenants_indexes(database).await?;
     ensure_bulk_submit_indexes(database).await?;
+    ensure_sof_terminology_indexes(database).await?;
     set_schema_version(database, SCHEMA_VERSION).await?;
     Ok(())
 }
@@ -88,6 +90,7 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
         ensure_login_sessions_indexes(database).await?;
         ensure_tenants_indexes(database).await?;
         ensure_bulk_submit_indexes(database).await?;
+        ensure_sof_terminology_indexes(database).await?;
         set_schema_version(database, SCHEMA_VERSION).await?;
     }
     Ok(())
@@ -450,6 +453,31 @@ async fn ensure_user_settings_indexes(database: &Database) -> StorageResult<()> 
     )
     .await?;
 
+    Ok(())
+}
+
+/// Indexes for the SQL-on-FHIR terminology store (#2185): the registry is one
+/// document per tenant, and its unique `tenant_id` index is what makes a lost
+/// first-insert race a duplicate-key error; row chunks are read per
+/// generation in `seq` order.
+async fn ensure_sof_terminology_indexes(database: &Database) -> StorageResult<()> {
+    use super::sof_terminology::{
+        SOF_TERMINOLOGY_REGISTRY_COLLECTION, SOF_TERMINOLOGY_ROWS_COLLECTION,
+    };
+    create_index(
+        &database.collection::<Document>(SOF_TERMINOLOGY_REGISTRY_COLLECTION),
+        doc! { "tenant_id": 1_i32 },
+        "idx_sof_terminology_registry_tenant",
+        true,
+    )
+    .await?;
+    create_index(
+        &database.collection::<Document>(SOF_TERMINOLOGY_ROWS_COLLECTION),
+        doc! { "tenant_id": 1_i32, "generation": 1_i32, "seq": 1_i32 },
+        "idx_sof_terminology_rows_generation",
+        true,
+    )
+    .await?;
     Ok(())
 }
 

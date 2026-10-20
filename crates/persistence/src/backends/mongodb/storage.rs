@@ -1526,6 +1526,14 @@ impl ResourceStorage for MongoBackend {
         true
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        Some(std::sync::Arc::new(
+            super::sof_terminology::MongoTerminologyStore::new(self),
+        ))
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::in_process::{InProcessSofRunner, ResourceScan};
         use crate::sof::mongodb::MongoInDbRunner;
@@ -2385,6 +2393,8 @@ impl ResourceStorage for MongoBackend {
         .delete_many(doc! { "tenant_id": id })
         .await
         .or_query_error("purge delete (bulk_provider_submissions)")?;
+        // SQL query terminology relations are tenant-keyed documents (#2185).
+        self.purge_tenant_sof_terminology(id).await?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
         // do not reach them — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313).
