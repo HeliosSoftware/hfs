@@ -109,8 +109,8 @@ name: FHIR Server Benchmark
 # Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
 #   • Rust toolchain buildable (clang + lld linker, configured below).
 #   • k6 is auto-installed if not already present.
-#   • Docker reachable via a REMOTE daemon — DOCKER_HOST (TCP endpoint) and
-#     DOCKER_HOST_IP (IP to reach published container ports) secrets wire it up.
+#   • Docker reachable via a REMOTE daemon — the DOCKER_HOST secret (TCP
+#     endpoint). Published container ports are reached on its host part.
 #
 # NOTE: getting numbers that are directly comparable to the public report
 # requires running on hardware matched to the benchmark host (8 vCPU / 30G for
@@ -231,9 +231,9 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   # Remote Docker daemon wiring — postgres / mongo / elasticsearch + tgz
   # containers run here, and the runner reaches their published ports via
-  # DOCKER_HOST_IP.
+  # DOCKER_HOST_IP, derived from DOCKER_HOST in "Resolve Docker host and
+  # runner IP".
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   # Pin the benchmark repo/ref so a run is reproducible.
   BENCHMARK_REPO: HealthSamurai/fhir-server-performance-benchmark
   BENCHMARK_REF: main
@@ -410,18 +410,18 @@ jobs:
       # host-side port; we read it back via `docker port` and connect through
       # `$DOCKER_HOST_IP:<port>`. Same pattern as hts-benchmark.yml /
       # audit-events.yml.
-      - name: Determine runner / Docker host IP
+      - name: Resolve Docker host and runner IP
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
           # The leg clock: bulk-import.sh caps itself to what is left of the
           # job timeout (BENCH_LEG_TIMEOUT_MIN), counted from here.
           echo "BENCH_LEG_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"

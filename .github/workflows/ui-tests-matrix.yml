@@ -38,7 +38,6 @@ env:
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   # Keep in step with @playwright/test in crates/ui/e2e/package.json.
   PLAYWRIGHT_IMAGE: mcr.microsoft.com/playwright:v1.49.1-noble
 
@@ -142,18 +141,18 @@ jobs:
       - name: Make HFS binary executable
         run: chmod +x target/debug/hfs
 
-      - name: Determine runner and Docker host IP
+      - name: Resolve Docker host and runner IP
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
 
       - name: Start Elasticsearch
         if: contains(matrix.backend, 'elasticsearch')
