@@ -24,6 +24,7 @@ use crate::traits::{TerminologyCaches, TerminologyMetadata};
 use crate::types::{
     ExpansionContains, LookupResponse, ResourceSearchQuery, SubsumesResponse, TranslateResponse,
 };
+use helios_persistence::core::database_url::redact_database_url;
 use helios_persistence::tenant::TenantContext;
 
 /// Per-compose in-memory expansion index. Mirrors SQLite's
@@ -335,7 +336,10 @@ impl PostgresTerminologyBackend {
                 })?;
         }
 
-        info!(database_url, "PostgreSQL terminology backend initialized");
+        info!(
+            database_url = %redact_database_url(database_url, "postgres"),
+            "PostgreSQL terminology backend initialized"
+        );
 
         Ok(Self {
             pool,

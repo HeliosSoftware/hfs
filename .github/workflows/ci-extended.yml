@@ -51,14 +51,20 @@ jobs:
     needs: [test-rust]
     if: always()
     env:
-      MAX_CONTAINER_AGE_MIN: 90
+      # Must exceed the longest CI job runtime (these legs run ~90 minutes).
+      MAX_CONTAINER_AGE_MIN: 180
     steps:
       - name: Check out the Docker host GC action
         uses: actions/checkout@v5
         with:
           sparse-checkout: .github/actions
 
+      # Skipped under `workflow_call`: there this job shares `github.run_id` with
+      # ci.yml's `test-rust`/`coverage`, so reaping by run_id could kill their
+      # live containers. ci.yml's own cleanup job waits for this workflow and
+      # does the reap. (`github.event_name` is the caller's event there.)
       - name: Remove testcontainers from this run
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
           docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" | xargs -r docker rm -fv || true
 
