@@ -451,7 +451,8 @@ mod tests {
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["id"]);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.id') AS \"id\""),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.id') AS \"id\""),
             "{}",
             q.sql
         );
@@ -477,19 +478,20 @@ mod tests {
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["id", "gender", "dob"]);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.id') AS \"id\""),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.id') AS \"id\""),
             "{}",
             q.sql
         );
         assert!(
             q.sql
-                .contains("json_extract(r.data, '$.gender') AS \"gender\""),
+                .contains("json_extract(CAST(r.data AS TEXT), '$.gender') AS \"gender\""),
             "{}",
             q.sql
         );
         assert!(
             q.sql
-                .contains("json_extract(r.data, '$.birthDate') AS \"dob\""),
+                .contains("json_extract(CAST(r.data AS TEXT), '$.birthDate') AS \"dob\""),
             "{}",
             q.sql
         );
@@ -528,7 +530,8 @@ mod tests {
         assert_eq!(q.columns, vec!["family", "use"]);
         // `Patient.name` repeats, so it is iterated in place.
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -554,7 +557,7 @@ mod tests {
         let q = compile(view).unwrap();
         assert!(
             q.sql
-                .contains("LEFT JOIN json_each(r.data, '$.name') fe ON 1=1"),
+                .contains("LEFT JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -574,7 +577,8 @@ mod tests {
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["id", "family"]);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.id') AS \"id\""),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.id') AS \"id\""),
             "{}",
             q.sql
         );
@@ -586,7 +590,8 @@ mod tests {
         );
         // `Patient.name` repeats, so it is iterated in place.
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -659,12 +664,14 @@ mod tests {
         assert_eq!(q.columns, vec!["family", "city"]);
         // First unnest keeps the `fe` alias (legacy), second uses `fe2`.
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.name') fe ON"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON"),
             "{}",
             q.sql
         );
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.address') fe2 ON"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.address') fe2 ON"),
             "{}",
             q.sql
         );
@@ -687,7 +694,8 @@ mod tests {
         // in some dialects) — it checks IS NOT NULL + non-zero / not 'false'.
         assert!(q.sql.contains("IS NOT NULL"), "{}", q.sql);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.active')"),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.active')"),
             "{}",
             q.sql
         );
@@ -1361,7 +1369,7 @@ mod tests {
         let q = compile(view.clone()).unwrap();
         assert!(
             q.sql
-                .contains("(json_extract(r.data, '$.gender') = 'male')"),
+                .contains("(json_extract(CAST(r.data AS TEXT), '$.gender') = 'male')"),
             "{}",
             q.sql
         );
@@ -1612,7 +1620,11 @@ mod tests {
                 ColumnDecode::Json
             ]
         );
-        assert!(q.sql.contains("(r.data -> '$.notAField')"), "{}", q.sql);
+        assert!(
+            q.sql.contains("(CAST(r.data AS TEXT) -> '$.notAField')"),
+            "{}",
+            q.sql
+        );
     }
 
     #[test]

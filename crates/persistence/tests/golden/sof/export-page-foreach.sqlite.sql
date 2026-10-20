@@ -1,8 +1,8 @@
 SELECT
-  json_extract(r.data, '$.id') AS "r",
+  json_extract(CAST(r.data AS TEXT), '$.id') AS "r",
   json_extract(fe.value, '$.family') AS "u0"
 FROM resources r
-JOIN json_each(r.data, '$.name') fe ON 1=1
+JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1
 WHERE r.tenant_id = ?1
   AND r.resource_type = ?2
   AND r.is_deleted = 0

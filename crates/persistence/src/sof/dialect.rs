@@ -410,6 +410,25 @@ impl Dialect for PgDialect {
 // SQLite
 // ============================================================================
 
+/// The root resource document in the generated SQL (`resources.data`).
+const SQLITE_ROOT_DATA: &str = "r.data";
+
+/// Wraps the root document as `CAST(r.data AS TEXT)` for SQLite's JSON
+/// functions, and passes any other base (`fe.value`, `rec_0.node`, ...)
+/// through unchanged.
+///
+/// `resources.data` is a BLOB holding JSON text, and SQLite's `json_*`
+/// functions only cache the parsed document for TEXT arguments. Handing them
+/// the BLOB re-parses the whole resource once per call (about nine times per
+/// row for a typical ViewDefinition); the cast lets one parse serve them all.
+pub(crate) fn sqlite_json_source(base: &str) -> std::borrow::Cow<'_, str> {
+    if base == SQLITE_ROOT_DATA {
+        "CAST(r.data AS TEXT)".into()
+    } else {
+        base.into()
+    }
+}
+
 /// SQLite JSON1 dialect.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SqliteDialect;
@@ -432,7 +451,11 @@ impl Dialect for SqliteDialect {
         // key is all digits (`json_path` would read that as an array index).
         let mut path = String::from("$");
         push_sqlite_member(&mut path, key);
-        format!("json_extract({base}, {})", sqlite_string_literal(&path))
+        format!(
+            "json_extract({}, {})",
+            sqlite_json_source(base),
+            sqlite_string_literal(&path)
+        )
     }
 
     fn json_field_text(&self, base: &str, key: &str) -> String {
@@ -447,7 +470,8 @@ impl Dialect for SqliteDialect {
         // object members. Numeric-only segments are array indices and must
         // not be preceded by a dot.
         format!(
-            "json_extract({base}, {})",
+            "json_extract({}, {})",
+            sqlite_json_source(base),
             sqlite_json_path_literal(segments)
         )
     }
@@ -459,7 +483,11 @@ impl Dialect for SqliteDialect {
     fn json_path_repr(&self, base: &str, segments: &[&str]) -> String {
         // The `->` operator (SQLite 3.38+) returns the JSON representation,
         // where `json_extract` would unquote strings.
-        format!("({base} -> {})", sqlite_json_path_literal(segments))
+        format!(
+            "({} -> {})",
+            sqlite_json_source(base),
+            sqlite_json_path_literal(segments)
+        )
     }
 
     fn unnest_array(&self, expr: &str) -> String {
@@ -659,7 +687,19 @@ mod tests {
     fn sqlite_field() {
         assert_eq!(
             SqliteDialect.json_field("r.data", "id"),
-            "json_extract(r.data, '$.id')"
+            "json_extract(CAST(r.data AS TEXT), '$.id')"
+        );
+    }
+
+    #[test]
+    fn sqlite_json_source_casts_only_the_root_document() {
+        assert_eq!(sqlite_json_source("r.data"), "CAST(r.data AS TEXT)");
+        assert_eq!(sqlite_json_source("fe.value"), "fe.value");
+        assert_eq!(sqlite_json_source("rec_0.node"), "rec_0.node");
+        // Non-root bases keep their plain form through the dialect too.
+        assert_eq!(
+            SqliteDialect.json_path("fe.value", &["code"]),
+            "json_extract(fe.value, '$.code')"
         );
     }
 
@@ -667,7 +707,7 @@ mod tests {
     fn sqlite_path_dotted() {
         assert_eq!(
             SqliteDialect.json_path("r.data", &["subject", "reference"]),
-            "json_extract(r.data, '$.subject.reference')"
+            "json_extract(CAST(r.data AS TEXT), '$.subject.reference')"
         );
     }
 
@@ -744,26 +784,26 @@ mod tests {
     fn sqlite_field_is_quoted_and_escaped() {
         assert_eq!(
             SqliteDialect.json_field("r.data", "a'b"),
-            "json_extract(r.data, '$.\"a''b\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"a''b\"')"
         );
         assert_eq!(
             SqliteDialect.json_field("r.data", "x.y"),
-            "json_extract(r.data, '$.\"x.y\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"x.y\"')"
         );
         assert_eq!(
             SqliteDialect.json_field("r.data", "x') OR 1=1 --"),
-            "json_extract(r.data, '$.\"x'') OR 1=1 --\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"x'') OR 1=1 --\"')"
         );
         // An embedded double quote or backslash is backslash-escaped inside
         // the quoted label so it cannot close the label early.
         assert_eq!(
             SqliteDialect.json_field("r.data", "a\"b\\c"),
-            "json_extract(r.data, '$.\"a\\\"b\\\\c\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"a\\\"b\\\\c\"')"
         );
         // A field accessor never reads an all-digit key as an array index.
         assert_eq!(
             SqliteDialect.json_field("r.data", "0"),
-            "json_extract(r.data, '$.\"0\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"0\"')"
         );
     }
 
@@ -771,11 +811,11 @@ mod tests {
     fn sqlite_path_quotes_special_segments_and_keeps_indices() {
         assert_eq!(
             SqliteDialect.json_path("r.data", &["name", "0", "family"]),
-            "json_extract(r.data, '$.name[0].family')"
+            "json_extract(CAST(r.data AS TEXT), '$.name[0].family')"
         );
         assert_eq!(
             SqliteDialect.json_path("r.data", &["a b", "0", "c'd"]),
-            "json_extract(r.data, '$.\"a b\"[0].\"c''d\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"a b\"[0].\"c''d\"')"
         );
     }
 
