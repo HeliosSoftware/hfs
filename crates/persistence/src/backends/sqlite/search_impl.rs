@@ -458,13 +458,14 @@ impl SqliteBackend {
         } else {
             None
         };
-        let filter_clause = search_filter
+        let mut filter_clause = search_filter
             .as_ref()
             .map(|f| format!(" AND rowid IN ({})", f.sql))
             .unwrap_or_default();
         let first_page_source = first_page_source(search_filter.is_some(), query, count);
         // First page of a one-parameter membership search: the probe may pick
         // a cheaper plan for it (same rows, same order).
+        let mut probed_keys: Option<Vec<i64>> = None;
         let first_page_plan = match &search_filter {
             Some(f)
                 if probe
@@ -475,10 +476,25 @@ impl SqliteBackend {
                     && query.parameters.len() == 1
                     && count > 1 =>
             {
-                choose_first_page_plan(conn, tenant_id, resource_type, &f.sql, &f.params)
+                let (plan, keys) =
+                    probe_first_page(conn, tenant_id, resource_type, &f.sql, &f.params);
+                if plan == FirstPagePlan::ListDriven {
+                    probed_keys = Some(keys);
+                }
+                plan
             }
             _ => FirstPagePlan::Planner,
         };
+        // A short key list is already in hand: the page reads those rows by
+        // rowid instead of evaluating the filter a second time (a pairing of
+        // token and quantity rows costs as much as the probe did).
+        if let Some(keys) = &probed_keys {
+            let placeholders = (0..keys.len())
+                .map(|i| format!("?{}", param_offset + 1 + i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            filter_clause = format!(" AND rowid IN ({placeholders})");
+        }
 
         // SELECT the sort key alongside the row so the next cursor can be built.
         let select_cols = match &keyset {
@@ -524,7 +540,10 @@ impl SqliteBackend {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        let search_params = search_filter.map(|f| f.params).unwrap_or_default();
+        let search_params = match probed_keys {
+            Some(keys) => keys.into_iter().map(SqlParam::Integer).collect(),
+            None => search_filter.map(|f| f.params).unwrap_or_default(),
+        };
 
         // Build query based on pagination mode.
         let (sql, has_previous) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
@@ -751,7 +770,8 @@ pub(crate) enum FirstPagePlan {
     /// `last_updated` order.
     Planner,
     /// The key list is short (under [`PROBE_CAP`] index rows): drive from it
-    /// and read `resources` by rowid, sorting the few rows.
+    /// and read `resources` by rowid, sorting the few rows. The probe's own
+    /// keys are bound to the page statement, so the filter runs once.
     ListDriven,
     /// The key list is long: try the newest [`WINDOWS`] resources in page
     /// order, each tested against the index with a correlated `EXISTS`; the
@@ -771,10 +791,23 @@ fn choose_first_page_plan(
     rows_sql: &str,
     filter_params: &[SqlParam],
 ) -> FirstPagePlan {
+    probe_first_page(conn, tenant_id, resource_type, rows_sql, filter_params).0
+}
+
+/// [`choose_first_page_plan`], and for [`FirstPagePlan::ListDriven`] the
+/// distinct `resource_key`s the probe read (under [`PROBE_CAP`] of them), so
+/// the page can be read by rowid without evaluating the filter again.
+fn probe_first_page(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    rows_sql: &str,
+    filter_params: &[SqlParam],
+) -> (FirstPagePlan, Vec<i64>) {
     if !is_parameter_rows(rows_sql) {
-        return FirstPagePlan::Planner;
+        return (FirstPagePlan::Planner, Vec::new());
     }
-    let probe = format!("SELECT count(*) FROM ({rows_sql} LIMIT {PROBE_CAP})");
+    let probe = format!("SELECT resource_key FROM ({rows_sql} LIMIT {PROBE_CAP})");
     let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
         Box::new(tenant_id.to_string()),
         Box::new(resource_type.to_string()),
@@ -788,13 +821,19 @@ fn choose_first_page_plan(
         });
     }
     let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|p| p.as_ref()).collect();
-    let rows = conn
-        .prepare(&probe)
-        .and_then(|mut stmt| stmt.query_row(refs.as_slice(), |row| row.get::<_, i64>(0)));
-    match rows {
-        Ok(rows) if rows < PROBE_CAP as i64 => FirstPagePlan::ListDriven,
-        Ok(_) => FirstPagePlan::ExistsDriven,
-        Err(_) => FirstPagePlan::Planner,
+    let keys = conn.prepare(&probe).and_then(|mut stmt| {
+        stmt.query_map(refs.as_slice(), |row| row.get::<_, Option<i64>>(0))?
+            .collect::<Result<Vec<_>, _>>()
+    });
+    match keys {
+        Ok(keys) if keys.len() < PROBE_CAP => {
+            let mut keys: Vec<i64> = keys.into_iter().flatten().collect();
+            keys.sort_unstable();
+            keys.dedup();
+            (FirstPagePlan::ListDriven, keys)
+        }
+        Ok(_) => (FirstPagePlan::ExistsDriven, Vec::new()),
+        Err(_) => (FirstPagePlan::Planner, Vec::new()),
     }
 }
 
