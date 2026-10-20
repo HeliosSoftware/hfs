@@ -28744,6 +28744,77 @@ mod postgres_integration {
         );
     }
 
+    /// Bulk submit takes its overlay snapshot under the tenant gate and must
+    /// see every SearchParameter committed before it, so unlike an ordinary
+    /// write it ignores the fingerprint TTL: even with a TTL far longer than
+    /// the test, a batch indexes with a cluster-mate's new parameter.
+    #[tokio::test]
+    async fn postgres_bulk_submit_probes_fingerprint_despite_ttl() {
+        use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
+
+        let (writer, _dbname) = isolated_reindex_backend().await;
+        let writer = writer.with_overlay_fingerprint_ttl(std::time::Duration::from_secs(600));
+        let tenant = create_tenant("sp-fingerprint-bulk");
+        // Warms and validates the overlay: ordinary writes now skip the probe.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"warm","name":[{"given":["Warm"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let mate = PostgresBackend::new(writer.config().clone()).await.unwrap();
+        mate.create(
+            &tenant,
+            "SearchParameter",
+            custom_given_search_parameter("givenfp", "givenfp"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        // Control: the ordinary write is still inside the TTL and skips the probe.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"ordinary","name":[{"given":["Ordinary"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            search_patients_by(&mate, &tenant, "givenfp", "Ordinary")
+                .await
+                .is_empty()
+        );
+
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&writer, &tenant, "fingerprint-ttl").await;
+        writer
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"bulk","name":[{"given":["Bulked"]}]}),
+                )],
+                &grouped_create_options(std::sync::Arc::new(RecordingBulkSubmitBatches::default()))
+                    .with_defer_indexing(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_patients_by(&mate, &tenant, "givenfp", "Bulked").await,
+            vec!["bulk".to_string()],
+            "the bulk batch probes despite the TTL and indexes with the new parameter"
+        );
+    }
+
     /// #1897: the fingerprint is what a write trusts. A change to a stored
     /// SearchParameter's body that leaves the tenant's live count and newest
     /// `last_updated` untouched — only raw SQL can do that; every HFS write

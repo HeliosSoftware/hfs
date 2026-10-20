@@ -65,6 +65,27 @@ fn overlay_fingerprint_ttl_from_env() -> Duration {
         .unwrap_or(DEFAULT_OVERLAY_FINGERPRINT_TTL)
 }
 
+/// How fresh the overlay a write extracts with must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayFreshness {
+    /// An overlay validated within the fingerprint TTL is reused without a
+    /// probe. For ordinary single-resource and Bundle writes, where a
+    /// SearchParameter committed by another process may take up to the TTL to
+    /// be seen (the same bound every other backend's cache has).
+    WithinTtl,
+    /// Always probe the database fingerprint, whatever the TTL. For callers
+    /// whose batch takes its overlay snapshot under the tenant gate and must
+    /// see every SearchParameter committed before that point (bulk submit).
+    Authoritative,
+}
+
+impl OverlayFreshness {
+    /// Whether a recently validated cached overlay may stand in for a probe.
+    fn may_skip_probe(self, ttl: Duration, pending_search_parameter: bool) -> bool {
+        self == Self::WithinTtl && !pending_search_parameter && !ttl.is_zero()
+    }
+}
+
 /// The tenant's validated overlay registry, if it was confirmed against the
 /// database within `ttl`. `None` means the caller must probe.
 fn fresh_overlay_registry(
@@ -1343,6 +1364,32 @@ impl PostgresBackend {
     where
         C: GenericClient + Sync + ?Sized,
     {
+        self.write_extractor_with(
+            client,
+            tenant_id,
+            extracts,
+            pending_search_parameter,
+            OverlayFreshness::WithinTtl,
+        )
+        .await
+    }
+
+    /// [`Self::write_extractor`] with the freshness the caller needs. Callers
+    /// that must see every SearchParameter committed before their snapshot
+    /// pass [`OverlayFreshness::Authoritative`], which always runs the
+    /// fingerprint probe (and so fails if the database cannot answer it);
+    /// the full overlay read still happens only when the fingerprint moved.
+    pub(crate) async fn write_extractor_with<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        extracts: bool,
+        pending_search_parameter: bool,
+        freshness: OverlayFreshness,
+    ) -> StorageResult<SearchParameterExtractor>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
         if !extracts {
             return Ok(SearchParameterExtractor::new(
                 self.registries.base().clone(),
@@ -1352,7 +1399,7 @@ impl PostgresBackend {
         // transaction has no uncommitted SearchParameter of its own, so skip
         // the probe. Local SearchParameter writes drop the entry on commit;
         // other processes' are seen within the TTL.
-        if !pending_search_parameter && !self.overlay_fingerprint_ttl.is_zero() {
+        if freshness.may_skip_probe(self.overlay_fingerprint_ttl, pending_search_parameter) {
             if let Some(registry) = fresh_overlay_registry(
                 &self.stored_by_tenant,
                 tenant_id,
@@ -1788,6 +1835,19 @@ mod tests {
             registry: Some(Arc::new(RwLock::new(SearchParameterRegistry::new()))),
             validated_at,
         }
+    }
+
+    /// Only `WithinTtl` may skip the probe, and never with a pending
+    /// SearchParameter or a zero TTL; `Authoritative` always probes.
+    #[test]
+    fn authoritative_freshness_never_skips_the_probe() {
+        let ttl = Duration::from_secs(60);
+        assert!(OverlayFreshness::WithinTtl.may_skip_probe(ttl, false));
+        assert!(!OverlayFreshness::WithinTtl.may_skip_probe(ttl, true));
+        assert!(!OverlayFreshness::WithinTtl.may_skip_probe(Duration::ZERO, false));
+        assert!(!OverlayFreshness::Authoritative.may_skip_probe(ttl, false));
+        assert!(!OverlayFreshness::Authoritative.may_skip_probe(ttl, true));
+        assert!(!OverlayFreshness::Authoritative.may_skip_probe(Duration::ZERO, false));
     }
 
     /// The write-path fast path skips the fingerprint probe only for an
