@@ -273,7 +273,7 @@ pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Op
             return None;
         }
         return Some(format!(
-            "EXISTS (SELECT 1 FROM search_index AS c INDEXED BY idx_search_composite_code \
+            "EXISTS (SELECT 1 FROM search_index AS c INDEXED BY idx_search_token \
              WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND c.resource_key = {outer_key} AND {rest})"
         ));
     }
@@ -307,23 +307,23 @@ fn parameter_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String>
 
 /// What a [`composite_pair_rows`] subquery starts with, up to its
 /// `param_name` test.
-const COMPOSITE_PAIR_HEAD: &str = "SELECT c.resource_key FROM search_index AS c INDEXED BY idx_search_composite_code WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND ";
+const COMPOSITE_PAIR_HEAD: &str = "SELECT c.resource_key FROM search_index AS c INDEXED BY idx_search_token WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND ";
 
 /// The keys of the resources with a composite group in which a token row
 /// matches the token component and a row of the same group matches the
 /// quantity component: the rows of the whole-parameter
 /// `GROUP BY resource_key, composite_group HAVING MAX(CASE token) AND
 /// MAX(CASE quantity)` for a two-component token+quantity composite, without
-/// reading every row of the parameter. The code-first index
-/// (`idx_search_composite_code`) finds the token rows by code; each one is
+/// reading every row of the parameter. The code-first token index
+/// (`idx_search_token`, which carries `composite_group` and `is_contained`)
+/// finds the token rows by code; each one is
 /// then paired by a probe of `idx_search_composite_cov` on `(resource_key,
 /// composite_group)`. A key can be listed once per matching token row, which
 /// the `rowid IN (…)` callers ignore.
 ///
 /// `None` (keep the `GROUP BY`) unless the composite is exactly one token and
 /// one quantity component and the token part tests `value_token_code = ?`: a
-/// `system|` token has no code to seek, and the partial index holds code rows
-/// only. The fragments' columns are unqualified; the token part sits in the
+/// `system|` token has no code to seek. The fragments' columns are unqualified; the token part sits in the
 /// outer select, so it binds to `c`, and the quantity part in the `EXISTS`,
 /// so it binds to `q`. Both `INDEXED BY` hints need the partial-index terms
 /// spelled out in the `WHERE`.
@@ -370,7 +370,7 @@ pub struct QueryBuilder {
     /// Whether to skip tenant/resource type params (they're shared with outer query).
     skip_base_params: bool,
     /// Whether a token+quantity composite is built as the code-first pairing
-    /// ([`composite_pair_rows`], hinted to `idx_search_composite_code` and
+    /// ([`composite_pair_rows`], hinted to `idx_search_token` and
     /// `idx_search_composite_cov`) instead of a whole-parameter `GROUP BY`.
     /// Off unless the caller has seen both indexes exist: `INDEXED BY` fails
     /// to prepare against a missing one (a bulk rebuild drops them).
@@ -390,8 +390,8 @@ impl QueryBuilder {
     }
 
     /// Builds a token+quantity composite as the code-first pairing, which
-    /// needs `idx_search_composite_code` and `idx_search_composite_cov` to
-    /// exist (see [`composite_pair_rows`]). The rows are the same set.
+    /// needs `idx_search_token` (in its code-first shape) and
+    /// `idx_search_composite_cov` to exist (see [`composite_pair_rows`]). The rows are the same set.
     pub fn with_composite_rewrite(mut self, enabled: bool) -> Self {
         self.composite_rewrite = enabled;
         self

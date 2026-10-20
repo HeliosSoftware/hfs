@@ -819,9 +819,12 @@ fn first_page_source(filtered: bool, query: &SearchQuery, count: usize) -> &'sta
 }
 
 /// Whether `query` can use the code-first composite pairing: it has a
-/// composite parameter and both indexes the pairing is hinted to exist.
-/// `INDEXED BY` makes a statement fail to prepare against a missing index, and
-/// a bulk rebuild drops the value indexes for its duration.
+/// composite parameter and both indexes the pairing is hinted to exist, the
+/// token index in its code-first shape (a database still carrying the earlier,
+/// system-first `idx_search_token` would answer the hinted statement with a
+/// table lookup per token row). `INDEXED BY` makes a statement fail to prepare
+/// against a missing index, and a bulk rebuild drops the value indexes for its
+/// duration.
 fn composite_rewrite_available(conn: &rusqlite::Connection, query: &SearchQuery) -> bool {
     use crate::types::SearchParamType;
     if !query
@@ -832,8 +835,9 @@ fn composite_rewrite_available(conn: &rusqlite::Connection, query: &SearchQuery)
         return false;
     }
     conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'index' \
-         AND name IN ('idx_search_composite_code', 'idx_search_composite_cov')",
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND ( \
+            name = 'idx_search_composite_cov' \
+            OR (name = 'idx_search_token' AND sql LIKE '%value_token_code, resource_key, value_token_system, composite_group%'))",
         [],
         |row| row.get::<_, i64>(0),
     )
@@ -4368,7 +4372,7 @@ mod tests {
         assert!(
             build(&["C3$gt1"], true)
                 .sql
-                .contains("INDEXED BY idx_search_composite_code")
+                .contains("INDEXED BY idx_search_token")
         );
         assert!(!build(&["C3$gt1"], false).sql.contains("INDEXED BY"));
         assert!(
@@ -4410,7 +4414,7 @@ mod tests {
             .search_with_connection(&conn, &tenant, &query, None)
             .unwrap();
         assert!(!with_index.resources.items.is_empty());
-        conn.execute("DROP INDEX idx_search_composite_code", [])
+        conn.execute("DROP INDEX idx_search_token", [])
             .unwrap();
         let without = backend
             .search_with_connection(&conn, &tenant, &query, None)
