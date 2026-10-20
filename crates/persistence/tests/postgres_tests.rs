@@ -28272,6 +28272,9 @@ mod postgres_integration {
         use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
 
         let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        // A long TTL: were bulk submit to honour it, the overlay warmed by the
+        // create below would skip the probe and this batch would not fail.
+        let backend = backend.with_overlay_fingerprint_ttl(std::time::Duration::from_secs(600));
         let tenant = create_tenant("grouped-snapshot-failure");
         let tenant_id = tenant.tenant_id().as_str().to_string();
         backend
