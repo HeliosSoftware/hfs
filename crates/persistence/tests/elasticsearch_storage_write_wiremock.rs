@@ -887,9 +887,10 @@ async fn delete_surfaces_a_failed_contained_sweep() {
         "the error names what is out of sync: {}",
         detail(&error)
     );
+    // The sweep is repeated on its own: 4 rounds of the write retries.
     assert_eq!(
         requests_to(&server, "POST", TENANT_DBQ_PATH).await,
-        WRITE_ATTEMPTS
+        WRITE_ATTEMPTS * 4
     );
 }
 
