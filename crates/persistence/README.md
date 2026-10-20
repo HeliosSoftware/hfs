@@ -745,6 +745,13 @@ MongoDB runtime configuration also supports:
   the task that finishes search-index entries a large Bundle left unwritten (default: `60`; `0`
   turns the task off). It also runs once at startup. A pass takes only ledger documents older
   than the larger of 60 s and the Bundle deadline (`HFS_REQUEST_TIMEOUT` less 2 s).
+- `HFS_MONGODB_BUNDLE_BATCH_WRITES` (`true` or `false`, default `false`) to write a transaction
+  Bundle made only of plain `POST` creates (no `ifNoneExist`, no conditional criteria) with
+  batched round trips: one existence `find` per resource type and chunked unordered
+  `insert_many` calls, instead of about seven round trips per entry. Any other Bundle keeps the
+  per-entry path, and both paths store the same documents. The batched path holds the whole
+  Bundle's documents in memory at once, and it does not delete orphan search rows left under a
+  new id by an earlier interrupted write. An invalid value is a configuration error.
 - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` for the server execution budget (`maxTimeMS`) of
   the cross-tenant `count_by_tenant` aggregate, and of no other command (default: `25000`; must
   be 1 to 2147483647). Past it the call fails with `BackendError::Timeout`. It does not bound
