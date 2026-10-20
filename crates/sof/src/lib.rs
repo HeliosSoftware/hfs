@@ -2137,7 +2137,7 @@ fn write_csv_chunk<W: Write>(result: &ChunkedResult, writer: &mut W) -> Result<(
     let mut wtr = csv::Writer::from_writer(writer);
 
     for row in &result.rows {
-        let record: Vec<String> = row.values.iter().map(csv_field).collect();
+        let record: Vec<String> = row.values.iter().map(|v| csv_field(v.as_ref())).collect();
         wtr.write_record(&record)?;
     }
 
@@ -4248,7 +4248,7 @@ pub fn neutralize_csv_formula(cell: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Renders one CSV cell from a row value (shared by the buffered and chunk writers).
-fn csv_field(v: &Option<serde_json::Value>) -> String {
+fn csv_field(v: Option<&serde_json::Value>) -> String {
     match v {
         // A missing value is an empty cell whether the row carried
         // the key as JSON null or not at all (#1569).
@@ -4274,7 +4274,7 @@ pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u
     }
 
     for row in result.rows {
-        let record: Vec<String> = row.values.iter().map(csv_field).collect();
+        let record: Vec<String> = row.values.iter().map(|v| csv_field(v.as_ref())).collect();
         wtr.write_record(&record)?;
     }
 
@@ -4302,6 +4302,175 @@ pub fn format_json(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     }
 
     Ok(serde_json::to_vec_pretty(&output)?)
+}
+
+/// Incremental encoder for the JSON-array, CSV and `fhir` outputs of a row stream.
+///
+/// [`format_json`] and [`format_csv`] need the whole result in memory. This
+/// encoder produces the same bytes one row at a time, so a caller holding a
+/// stream of flat JSON-object rows (the REST SoF runner) can forward the body
+/// in chunks instead of buffering every row. [`fhir`](RowStreamEncoder::fhir)
+/// does the same for [`fhir_format::format_view_fhir_parameters`]. Feed rows with
+/// [`push_row`](RowStreamEncoder::push_row), drain the encoded bytes with
+/// [`take`](RowStreamEncoder::take), and close with
+/// [`finish`](RowStreamEncoder::finish).
+///
+/// Like [`rows_to_processed_result`], the columns are the keys of the first
+/// row: later rows fill missing keys with `null` (JSON) or an empty cell (CSV),
+/// and keys the first row did not carry are dropped.
+pub struct RowStreamEncoder {
+    kind: RowStreamKind,
+    columns: Option<Vec<String>>,
+    rows: usize,
+}
+
+enum RowStreamKind {
+    Json(Vec<u8>),
+    Csv {
+        header: bool,
+        writer: Box<csv::Writer<SharedBuf>>,
+        out: SharedBuf,
+    },
+    Fhir(fhir_format::FhirRowEncoder),
+}
+
+/// A byte sink whose contents the encoder can take while the `csv` writer
+/// keeps its handle (`csv::Writer` does not expose its inner writer mutably).
+#[derive(Clone, Default)]
+struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl SharedBuf {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Write for SharedBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.lock().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl RowStreamEncoder {
+    /// An encoder for [`ContentType::Json`], [`ContentType::Csv`] or
+    /// [`ContentType::CsvWithHeader`]; `None` for every other content type.
+    pub fn new(content_type: ContentType) -> Option<Self> {
+        let kind = match content_type {
+            ContentType::Json => RowStreamKind::Json(Vec::new()),
+            ContentType::Csv | ContentType::CsvWithHeader => {
+                let out = SharedBuf::default();
+                RowStreamKind::Csv {
+                    header: content_type == ContentType::CsvWithHeader,
+                    writer: Box::new(csv::Writer::from_writer(out.clone())),
+                    out,
+                }
+            }
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            columns: None,
+            rows: 0,
+        })
+    }
+
+    /// An encoder for the `fhir` format: a `Parameters` resource with one
+    /// `row` parameter per row, typed by the ViewDefinition's declared columns.
+    /// Fails, as [`fhir_format::format_view_fhir_parameters`] does, when the
+    /// declared columns are invalid.
+    pub fn fhir(view_json: &serde_json::Value) -> Result<Self, SofError> {
+        Ok(Self {
+            kind: RowStreamKind::Fhir(fhir_format::FhirRowEncoder::new(view_json)?),
+            columns: None,
+            rows: 0,
+        })
+    }
+
+    /// Encodes one row. The first row fixes the columns.
+    pub fn push_row(&mut self, row: serde_json::Value) -> Result<(), SofError> {
+        if let RowStreamKind::Fhir(encoder) = &mut self.kind {
+            return encoder.push_row(&row);
+        }
+        let mut map = match row {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        if self.columns.is_none() {
+            let columns: Vec<String> = map.keys().cloned().collect();
+            if let RowStreamKind::Csv {
+                header: true,
+                writer,
+                ..
+            } = &mut self.kind
+            {
+                writer.write_record(&columns)?;
+            }
+            self.columns = Some(columns);
+        }
+        let columns = self.columns.as_deref().unwrap_or_default();
+        match &mut self.kind {
+            RowStreamKind::Json(out) => {
+                let mut row_obj = serde_json::Map::new();
+                for column in columns {
+                    let value = map.remove(column).unwrap_or(serde_json::Value::Null);
+                    row_obj.insert(column.clone(), value);
+                }
+                // The row sits one level inside the array, so pretty-print it
+                // as the only element of one and cut the array's own lines off:
+                // the indentation is then exactly what `to_vec_pretty` gives
+                // the whole array.
+                let element = serde_json::to_vec_pretty(&[serde_json::Value::Object(row_obj)])?;
+                out.extend_from_slice(if self.rows == 0 { b"[\n" } else { b",\n" });
+                out.extend_from_slice(&element[2..element.len() - 2]);
+            }
+            RowStreamKind::Csv { writer, .. } => {
+                let record: Vec<String> = columns
+                    .iter()
+                    .map(|column| csv_field(map.get(column)))
+                    .collect();
+                writer.write_record(&record)?;
+            }
+            RowStreamKind::Fhir(_) => {} // encoded above
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// Hands back the bytes encoded since the last call.
+    pub fn take(&mut self) -> Result<Vec<u8>, SofError> {
+        match &mut self.kind {
+            RowStreamKind::Json(out) => Ok(std::mem::take(out)),
+            RowStreamKind::Csv { writer, out, .. } => {
+                writer.flush()?;
+                Ok(std::mem::take(&mut *out.lock()))
+            }
+            RowStreamKind::Fhir(encoder) => Ok(encoder.take()),
+        }
+    }
+
+    /// Closes the output and returns the remaining bytes. A result without
+    /// rows is `[]` for JSON and the (empty) header record for CSV, as in the
+    /// buffered formatters.
+    pub fn finish(mut self) -> Result<Vec<u8>, SofError> {
+        match &mut self.kind {
+            RowStreamKind::Fhir(encoder) => return Ok(encoder.finish()),
+            RowStreamKind::Json(out) => {
+                out.extend_from_slice(if self.rows == 0 { b"[]" } else { b"\n]" });
+            }
+            RowStreamKind::Csv {
+                header: true,
+                writer,
+                ..
+            } if self.columns.is_none() => writer.write_record(Vec::<String>::new())?,
+            RowStreamKind::Csv { .. } => {}
+        }
+        self.take()
+    }
 }
 
 /// Encodes a [`ProcessedResult`] as newline-delimited JSON. One row per
@@ -4491,6 +4660,64 @@ pub fn format_parquet_multi_file_with_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rows that exercise every shape the buffered formatters see: a later
+    /// row missing a key, an extra key, nested values, quoting, formula-like
+    /// text, non-ASCII, and a non-object row.
+    fn mixed_stream_rows() -> Vec<serde_json::Value> {
+        use serde_json::json;
+        vec![
+            json!({"id": "a1", "n": 1, "tags": ["x", "y"], "o": {"k": [1, {"z": null}], "e": {}}, "empty": []}),
+            json!({"n": 2, "id": "b,2", "tags": [], "o": null}),
+            json!({"id": "c\"3\"\nline", "n": -4.5, "extra": "dropped", "tags": ["é", "\u{1F600}"]}),
+            json!({"id": "=SUM(A1)", "n": true, "o": {}}),
+            json!("not an object"),
+            json!({"id": "-", "n": 1e3, "tags": null, "empty": [[]], "o": {"a": {"b": {}}}}),
+        ]
+    }
+
+    fn encode_streamed(ct: ContentType, rows: &[serde_json::Value], chunk: usize) -> Vec<u8> {
+        let mut enc = RowStreamEncoder::new(ct).expect("streamable");
+        let mut out = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            enc.push_row(row.clone()).unwrap();
+            if chunk != 0 && (i + 1) % chunk == 0 {
+                out.extend(enc.take().unwrap());
+            }
+        }
+        out.extend(enc.finish().unwrap());
+        out
+    }
+
+    #[test]
+    fn row_stream_encoder_matches_the_buffered_formatters() {
+        let all = mixed_stream_rows();
+        for n in 0..=all.len() {
+            let rows = &all[..n];
+            for ct in [
+                ContentType::Json,
+                ContentType::Csv,
+                ContentType::CsvWithHeader,
+            ] {
+                let buffered =
+                    format_output(rows_to_processed_result(rows.to_vec()), ct, None).unwrap();
+                for chunk in [0, 1, 2] {
+                    assert_eq!(
+                        String::from_utf8_lossy(&encode_streamed(ct, rows, chunk)),
+                        String::from_utf8_lossy(&buffered),
+                        "{ct:?} with {n} rows, chunk {chunk}"
+                    );
+                    assert_eq!(encode_streamed(ct, rows, chunk), buffered);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_stream_encoder_rejects_other_content_types() {
+        assert!(RowStreamEncoder::new(ContentType::NdJson).is_none());
+        assert!(RowStreamEncoder::new(ContentType::Parquet).is_none());
+    }
 
     /// `compartment_reference_ids` accepts both reference forms the SoF spec
     /// allows, ignores a version suffix, drops an id-less reference, and

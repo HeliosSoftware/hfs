@@ -278,7 +278,7 @@ The server is configured via environment variables:
 | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `HFS_LOG_LEVEL` | info | Log level |
 | `HFS_MAX_BODY_SIZE` | 134217728 | Max request body (bytes; applies to the decompressed body for compressed requests). 128 MiB covers the largest per-patient Synthea Bundle (#1662); lower it on small hosts. Large bundles take minutes to process, so raise `HFS_REQUEST_TIMEOUT` too |
-| `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
+| `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds). It bounds the handler, not a streamed body: a `$sql-run` (ViewDefinition subject) that streams parquet, arrow, json, csv or fhir is no longer bounded after the first 100 rows |
 | `HFS_DASHBOARD_RECONCILE_SECS` | 30 | Seconds between dashboard count reconcile passes (whole seconds, > 0; `0` or non-numeric fails startup) |
 | `HFS_DASHBOARD_REFRESH_SECS` | 5 | Seconds between refreshes of a Home dashboard whose figures are moving (whole seconds, > 0, <= `HFS_DASHBOARD_IDLE_REFRESH_SECS`) |
 | `HFS_DASHBOARD_IDLE_REFRESH_SECS` | 10 | Seconds between watch ticks of a Home dashboard whose figures are settled (whole seconds, > 0, >= `HFS_DASHBOARD_REFRESH_SECS`) |
