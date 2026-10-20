@@ -52,11 +52,6 @@ const MAX_LOAD_ATTEMPTS: usize = 4;
 /// Base unit of the jittered backoff between compare-and-swap attempts.
 const BACKOFF_BASE: Duration = Duration::from_millis(5);
 
-/// Rows per stored chunk, for stores that split a generation into several
-/// objects or documents (MongoDB's 16 MiB document limit). A relation may hold
-/// up to `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` rows.
-pub(crate) const CHUNK_ROWS: usize = 1000;
-
 /// One tenant's registry: which generation holds each canonical's rows, and
 /// which Libraries depend on it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

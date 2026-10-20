@@ -29,10 +29,15 @@ use super::retry::retry_transient;
 use super::user_settings::is_duplicate_key_error;
 use super::{MongoBackend, MongoBackendConfig};
 use crate::backends::sof_terminology_cas::{
-    CHUNK_ROWS, GenerationStore, TerminologyRegistry, impl_sof_terminology_store,
+    GenerationStore, TerminologyRegistry, impl_sof_terminology_store,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+
+/// Rows per `sof_terminology_rows` document: MongoDB caps a document at
+/// 16 MiB, and a relation may hold up to
+/// `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` rows.
+const CHUNK_ROWS: usize = 1000;
 
 /// Collection holding one registry document per tenant.
 pub(crate) const SOF_TERMINOLOGY_REGISTRY_COLLECTION: &str = "sof_terminology_registry";

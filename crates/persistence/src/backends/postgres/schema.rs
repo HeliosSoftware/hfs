@@ -4753,12 +4753,17 @@ async fn migrate_v48_to_v49(client: &deadpool_postgres::Client) -> StorageResult
 
 /// v49 -> v50: the SQL-on-FHIR terminology tables (#2185), PostgreSQL's
 /// counterpart of SQLite's v41. New, empty tables only, so the step is one
-/// transaction that stamps its own marker.
+/// transaction that stamps its own marker. `SET LOCAL statement_timeout = 0`,
+/// like the other transactional steps: a deployment-wide timeout must not fail
+/// the DDL.
 async fn migrate_v49_to_v50(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
     let tx = client
         .transaction()
         .await
         .map_err(|e| pg_error(format!("begin v50 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v50 migration: {e}")))?;
     tx.batch_execute(super::sof_terminology::CREATE_TABLES_SQL)
         .await
         .map_err(|e| pg_error(format!("Migration v49->v50 failed: {e}")))?;
