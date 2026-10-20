@@ -8,6 +8,7 @@
 
 #![allow(dead_code)] // Stage 1 scaffold; consumers land in stages 2–5.
 
+use super::decode::ColumnDecode;
 use super::ir::{JsonType, SqlType};
 
 // ============================================================================
@@ -212,6 +213,14 @@ pub trait Dialect: Send + Sync {
     /// without losing the string/number distinction.
     fn json_path_repr(&self, base: &str, segments: &[&str]) -> String;
 
+    /// Turns an already-projected output column `col`, as produced under
+    /// `decode`, into the JSON text representation of its value, keeping SQL
+    /// NULL as NULL. Used where `unionAll` branches decode the same column
+    /// differently: the union column is then decoded as
+    /// [`ColumnDecode::Json`], so a string branch must arrive quoted
+    /// (`"2.1"`) while number and boolean branches arrive bare.
+    fn column_json_repr(&self, col: &str, decode: ColumnDecode) -> String;
+
     /// Emit a lateral unnest source clause (e.g. `jsonb_array_elements(<expr>)`
     /// or `json_each(<expr>)`).
     fn unnest_array(&self, expr: &str) -> String;
@@ -313,6 +322,15 @@ impl Dialect for PgDialect {
 
     fn json_path_repr(&self, base: &str, segments: &[&str]) -> String {
         format!("({})::text", self.json_path(base, segments))
+    }
+
+    fn column_json_repr(&self, col: &str, decode: ColumnDecode) -> String {
+        match decode {
+            ColumnDecode::Text => format!("to_jsonb(({col})::text)::text"),
+            // Number and `'true'`/`'false'` text is already JSON; Json and
+            // Auto columns are parsed as JSON already.
+            _ => col.to_string(),
+        }
     }
 
     fn unnest_array(&self, expr: &str) -> String {
@@ -460,6 +478,25 @@ impl Dialect for SqliteDialect {
         // The `->` operator (SQLite 3.38+) returns the JSON representation,
         // where `json_extract` would unquote strings.
         format!("({base} -> {})", sqlite_json_path_literal(segments))
+    }
+
+    fn column_json_repr(&self, col: &str, decode: ColumnDecode) -> String {
+        match decode {
+            // `json_quote(NULL)` is the text `null`, hence the guard.
+            ColumnDecode::Text => {
+                format!("CASE WHEN {col} IS NOT NULL THEN json_quote(CAST({col} AS TEXT)) END")
+            }
+            // `json_extract` yields INTEGER 1/0 for a JSON boolean, which the
+            // row mapper only reports as a boolean under `Boolean` decode.
+            ColumnDecode::Boolean => format!(
+                "CASE WHEN typeof({col}) = 'integer' THEN \
+                 CASE {col} WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE {col} END \
+                 ELSE {col} END"
+            ),
+            // INTEGER/REAL values pass through the row mapper as numbers;
+            // Json and Auto columns are parsed as JSON already.
+            _ => col.to_string(),
+        }
     }
 
     fn unnest_array(&self, expr: &str) -> String {

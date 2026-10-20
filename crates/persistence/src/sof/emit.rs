@@ -1034,6 +1034,14 @@ fn column_refers_to_resource(expr: &SqlExpr) -> bool {
 /// and trailing `ORDER BY` is stripped from each. The compound query is left
 /// unordered: row order is not part of the SoF contract, and a sort would hold
 /// back every row until the whole result is built.
+///
+/// A column that every branch decodes the same way keeps that mode. One that
+/// the branches decode differently (a `string` in one, an `integer` in
+/// another) is decoded as [`ColumnDecode::Json`], and each branch whose own
+/// mode differs is wrapped to project that column's JSON representation (see
+/// [`Dialect::column_json_repr`]). The runners cannot tell which branch a row
+/// came from, so this keeps a string `"2.1"` a string and a number `2.1` a
+/// number, rather than guessing from the text (#1947).
 fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql, SofError> {
     if branches.is_empty() {
         return Err(SofError::InvalidViewDefinition(
@@ -1041,48 +1049,76 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
         ));
     }
 
-    let mut branch_sqls: Vec<String> = Vec::with_capacity(branches.len());
-    let mut columns: Option<Vec<String>> = None;
-    let mut column_decodes: Vec<ColumnDecode> = Vec::new();
-    let mut next_param = 3usize;
-
+    let mut emitted_branches: Vec<EmittedSql> = Vec::with_capacity(branches.len());
     for branch in branches {
         let emitted = emit_plan(branch, dialect)?;
-
-        match &columns {
-            None => {
-                columns = Some(emitted.columns.clone());
-                column_decodes = emitted.column_decodes.clone();
-            }
-            Some(expected) if *expected != emitted.columns => {
-                return Err(SofError::Uncompilable {
-                    reason: format!(
-                        "unionAll branches produce different column schemas: {:?} vs {:?}",
-                        expected, emitted.columns
-                    ),
-                });
-            }
-            _ => {
-                // Same column names: reconcile decode modes by position.
-                for (acc, d) in column_decodes.iter_mut().zip(&emitted.column_decodes) {
-                    *acc = acc.merge(*d);
-                }
-            }
+        if let Some(first) = emitted_branches.first()
+            && first.columns != emitted.columns
+        {
+            return Err(SofError::Uncompilable {
+                reason: format!(
+                    "unionAll branches produce different column schemas: {:?} vs {:?}",
+                    first.columns, emitted.columns
+                ),
+            });
         }
+        emitted_branches.push(emitted);
+    }
 
+    // Same column names in every branch: reconcile decode modes by position.
+    let first = &emitted_branches[0];
+    let columns = first.columns.clone();
+    let column_decodes: Vec<ColumnDecode> = (0..columns.len())
+        .map(|i| {
+            let mode = first.column_decodes[i];
+            if emitted_branches.iter().all(|e| e.column_decodes[i] == mode) {
+                mode
+            } else {
+                ColumnDecode::Json
+            }
+        })
+        .collect();
+
+    let quoted: Vec<String> = columns
+        .iter()
+        .map(|name| Ok(format!("\"{}\"", sanitize_ident(name)?)))
+        .collect::<Result<_, SofError>>()?;
+    let mut branch_sqls: Vec<String> = Vec::with_capacity(emitted_branches.len());
+    let mut next_param = 3usize;
+    for emitted in &emitted_branches {
         next_param = next_param.max(emitted.next_param_index);
-        // Branches containing a `WITH RECURSIVE` (emitted for `repeat:`)
-        // can't appear bare in a compound SELECT — neither dialect allows
-        // `WITH ... UNION ALL WITH ...`. Wrap as `SELECT * FROM (WITH ...
-        // SELECT ...)` so each branch is a plain SELECT operand.
         let body = strip_trailing_order_by(&emitted.sql).to_string();
-        let needs_wrap = body.trim_start().starts_with("WITH");
-        if needs_wrap {
-            // PG requires every parenthesised subquery in `FROM` to have an
-            // alias; SQLite allows it bare. Tag with a unique alias so PG
-            // is happy without affecting SQLite (which ignores it).
-            let alias = format!("_recurse_{}", branch_sqls.len());
-            branch_sqls.push(format!("SELECT * FROM ({body}) AS {alias}"));
+        // PG requires every parenthesised subquery in `FROM` to have an
+        // alias; SQLite allows it bare. Tag with a unique alias so PG is
+        // happy without affecting SQLite (which ignores it).
+        let alias = branch_sqls.len();
+        let select: Vec<String> = quoted
+            .iter()
+            .zip(emitted.column_decodes.iter().zip(&column_decodes))
+            .map(|(col, (&own, &union))| {
+                let repr = if own == union {
+                    col.clone()
+                } else {
+                    dialect.column_json_repr(col, own)
+                };
+                if repr == *col {
+                    repr
+                } else {
+                    format!("{repr} AS {col}")
+                }
+            })
+            .collect();
+        if select.iter().zip(&quoted).any(|(s, col)| s != col) {
+            branch_sqls.push(format!(
+                "SELECT {} FROM ({body}) AS _union_{alias}",
+                select.join(", ")
+            ));
+        } else if body.trim_start().starts_with("WITH") {
+            // Branches containing a `WITH RECURSIVE` (emitted for `repeat:`)
+            // can't appear bare in a compound SELECT — neither dialect allows
+            // `WITH ... UNION ALL WITH ...`. Wrap as `SELECT * FROM (WITH ...
+            // SELECT ...)` so each branch is a plain SELECT operand.
+            branch_sqls.push(format!("SELECT * FROM ({body}) AS _recurse_{alias}"));
         } else {
             branch_sqls.push(body);
         }
@@ -1091,7 +1127,7 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
     let sql = branch_sqls.join("\nUNION ALL\n");
     Ok(EmittedSql {
         sql,
-        columns: columns.unwrap_or_default(),
+        columns,
         column_decodes,
         next_param_index: next_param,
     })

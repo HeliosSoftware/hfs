@@ -1632,7 +1632,21 @@ mod tests {
                 ]}
             ]}]
         });
-        assert_eq!(decodes(view), vec![ColumnDecode::Text, ColumnDecode::Auto]);
+        let q = compile(view).unwrap();
+        // #1947: `b` differs between branches, so it is decoded as JSON and
+        // only the `string` branch needs wrapping to quote its value; the
+        // integer branch's text is already JSON.
+        assert_eq!(
+            q.column_decodes,
+            vec![ColumnDecode::Text, ColumnDecode::Json]
+        );
+        assert_eq!(
+            q.sql.matches("json_quote(CAST(\"b\" AS TEXT))").count(),
+            1,
+            "{}",
+            q.sql
+        );
+        assert_eq!(q.sql.matches(") AS _union_").count(), 1, "{}", q.sql);
     }
 
     #[test]
