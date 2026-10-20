@@ -2488,6 +2488,14 @@ fn bundle_is_plain_creates(
         })
 }
 
+/// Everything a Bundle `POST` create writes, prepared without a database call.
+struct PreparedCreate {
+    resource_doc: Document,
+    history_doc: Document,
+    search_documents: SearchIndexDocuments,
+    stored: StoredResource,
+}
+
 /// One resource's `search_index` contribution, split by destination
 /// collection: its own rows go to `search_index`, and rows extracted from its
 /// `contained` entries go to `search_index_contained`.
@@ -5016,8 +5024,6 @@ impl MongoBackend {
 
         let tenant_id = tenant.tenant_id().as_str();
         let entry_count = entries.len();
-        let fhir_version_str = fhir_version.as_mime_param().to_string();
-        let offloaded = self.is_search_offloaded();
 
         let mut results: Vec<BundleEntryResult> = Vec::with_capacity(entry_count);
         let mut resource_docs: Vec<Document> = Vec::with_capacity(entry_count);
@@ -5073,63 +5079,35 @@ impl MongoBackend {
                 break;
             }
 
-            let mut resource = resource;
-            ensure_resource_identity(&resource_type, &id, &mut resource);
-            let search_documents =
-                self.search_index_documents(tenant_id, &resource_type, &id, &resource);
-            let payload = match value_to_document(&resource) {
-                Ok(payload) => payload,
+            let prepared = match self.prepare_create_documents(
+                tenant,
+                &resource_type,
+                &id,
+                resource,
+                fhir_version,
+                writes,
+            ) {
+                Ok(prepared) => prepared,
                 Err(e) => {
                     failure = Some((idx, Failure::Storage(e)));
                     break;
                 }
             };
-            let now = Utc::now();
-            let now_bson = chrono_to_bson(now);
-            let version_id = "1".to_string();
-
-            let mut current = search_documents.resource_document(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": &resource_type,
-                "id": &id,
-                "version_id": &version_id,
-                "data": Bson::Document(payload.clone()),
-                "created_at": now_bson,
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            });
-            if let Some(marker) = writes.pending_marker(&resource_type) {
-                current.insert(SEARCH_ROWS_PENDING_FIELD, marker);
-            }
-            resource_docs.push(current);
-            history_docs.push(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": &resource_type,
-                "id": &id,
-                "version_id": &version_id,
-                "data": Bson::Document(payload),
-                "created_at": now_bson,
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            });
-
-            // Same rules as `index_resource_in_bundle_transaction`.
-            if offloaded {
-            } else if let Some(deferred) = writes
-                .deferred
-                .as_mut()
-                .filter(|deferred| deferred.defers(&resource_type))
+            let PreparedCreate {
+                resource_doc,
+                history_doc,
+                search_documents,
+                stored,
+            } = prepared;
+            resource_docs.push(resource_doc);
+            history_docs.push(history_doc);
+            if let Some(rows) =
+                self.route_bundle_search_rows(&resource_type, &id, search_documents, writes)
             {
-                deferred.record(&resource_type, &id);
-            } else {
-                own_owners.extend(std::iter::repeat_n(idx, search_documents.own.len()));
-                contained_owners.extend(std::iter::repeat_n(idx, search_documents.contained.len()));
-                own_rows.extend(search_documents.own);
-                contained_rows.extend(search_documents.contained);
+                own_owners.extend(std::iter::repeat_n(idx, rows.own.len()));
+                contained_owners.extend(std::iter::repeat_n(idx, rows.contained.len()));
+                own_rows.extend(rows.own);
+                contained_rows.extend(rows.contained);
             }
             if resource_type == "SearchParameter" {
                 writes
@@ -5137,17 +5115,6 @@ impl MongoBackend {
                     .push(PendingSearchParameterChange::Create);
             }
 
-            let stored = StoredResource::from_storage(
-                &resource_type,
-                &id,
-                version_id,
-                tenant.tenant_id().clone(),
-                resource,
-                now,
-                now,
-                None,
-                fhir_version,
-            );
             let entry_result = BundleEntryResult::created(stored);
             identities.push((resource_type, id));
             if let Err(message) = bundle_state.record(entry, &entry_result, None, used_references) {
@@ -5718,37 +5685,22 @@ impl MongoBackend {
             }));
         }
 
-        let mut resource = resource;
-        ensure_resource_identity(resource_type, &id, &mut resource);
-        let search_documents =
-            self.search_index_documents(tenant_id, resource_type, &id, &resource);
-        let payload = value_to_document(&resource)?;
-
-        let now = Utc::now();
-        let now_bson = chrono_to_bson(now);
-        let version_id = "1".to_string();
-        let fhir_version_str = fhir_version.as_mime_param().to_string();
-
-        let mut current = search_documents.resource_document(doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": &id,
-            "version_id": &version_id,
-            "data": Bson::Document(payload.clone()),
-            "created_at": now_bson,
-            "last_updated": now_bson,
-            "is_deleted": false,
-            "deleted_at": Bson::Null,
-            "fhir_version": &fhir_version_str,
-        });
-        // A Bundle that defers its search rows marks the resource until they
-        // are written (#1975). The history document carries no marker.
-        if let Some(marker) = writes.pending_marker(resource_type) {
-            current.insert(SEARCH_ROWS_PENDING_FIELD, marker);
-        }
+        let PreparedCreate {
+            resource_doc,
+            history_doc,
+            search_documents,
+            stored,
+        } = self.prepare_create_documents(
+            tenant,
+            resource_type,
+            &id,
+            resource,
+            fhir_version,
+            writes,
+        )?;
 
         resources
-            .insert_one(current)
+            .insert_one(resource_doc)
             .session(&mut *session)
             .await
             .map_err(|e| {
@@ -5763,18 +5715,7 @@ impl MongoBackend {
             })?;
 
         history
-            .insert_one(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": &id,
-                "version_id": &version_id,
-                "data": Bson::Document(payload),
-                "created_at": now_bson,
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            })
+            .insert_one(history_doc)
             .session(&mut *session)
             .await
             .map_err(|e| internal_driver_error("Failed to insert history in transaction", e))?;
@@ -5796,9 +5737,66 @@ impl MongoBackend {
                 .push(PendingSearchParameterChange::Create);
         }
 
-        Ok(StoredResource::from_storage(
+        Ok(stored)
+    }
+
+    /// Builds everything a Bundle `POST` create writes, without a database
+    /// call: the `resources` document (with the pending-rows marker when the
+    /// Bundle defers this type's search rows, #1975), the version 1
+    /// `resource_history` document, the search rows and the returned
+    /// [`StoredResource`]. Shared by the per-entry create and the batched
+    /// create (`HFS_MONGODB_BUNDLE_BATCH_WRITES`) so the two paths cannot
+    /// diverge on what a created resource looks like.
+    fn prepare_create_documents(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        mut resource: Value,
+        fhir_version: helios_fhir::FhirVersion,
+        writes: &BundleWrites,
+    ) -> StorageResult<PreparedCreate> {
+        let tenant_id = tenant.tenant_id().as_str();
+        ensure_resource_identity(resource_type, id, &mut resource);
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
+        let payload = value_to_document(&resource)?;
+
+        let now = Utc::now();
+        let now_bson = chrono_to_bson(now);
+        let version_id = "1".to_string();
+        let fhir_version_str = fhir_version.as_mime_param().to_string();
+
+        let mut resource_doc = search_documents.resource_document(doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &version_id,
+            "data": Bson::Document(payload.clone()),
+            "created_at": now_bson,
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        });
+        // The history document carries no marker.
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            resource_doc.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
+        let history_doc = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &version_id,
+            "data": Bson::Document(payload),
+            "created_at": now_bson,
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        };
+        let stored = StoredResource::from_storage(
             resource_type,
-            &id,
+            id,
             version_id,
             tenant.tenant_id().clone(),
             resource,
@@ -5806,7 +5804,39 @@ impl MongoBackend {
             now,
             None,
             fhir_version,
-        ))
+        );
+        Ok(PreparedCreate {
+            resource_doc,
+            history_doc,
+            search_documents,
+            stored,
+        })
+    }
+
+    /// Decides what a Bundle write does with a resource's search rows,
+    /// without a database call. `None`: nothing to write now (search is
+    /// offloaded, or the Bundle defers this type and has noted the resource
+    /// for the post-commit step). `Some(rows)`: write them inside the
+    /// transaction.
+    fn route_bundle_search_rows(
+        &self,
+        resource_type: &str,
+        resource_id: &str,
+        docs: SearchIndexDocuments,
+        writes: &mut BundleWrites,
+    ) -> Option<SearchIndexDocuments> {
+        if self.is_search_offloaded() {
+            return None;
+        }
+        if let Some(deferred) = writes
+            .deferred
+            .as_mut()
+            .filter(|deferred| deferred.defers(resource_type))
+        {
+            deferred.record(resource_type, resource_id);
+            return None;
+        }
+        Some(docs)
     }
 
     async fn update_resource_in_bundle_transaction(
@@ -6715,18 +6745,10 @@ impl MongoBackend {
         docs: SearchIndexDocuments,
         writes: &mut BundleWrites,
     ) -> StorageResult<()> {
-        if self.is_search_offloaded() {
+        let Some(docs) = self.route_bundle_search_rows(resource_type, resource_id, docs, writes)
+        else {
             return Ok(());
-        }
-
-        if let Some(deferred) = writes
-            .deferred
-            .as_mut()
-            .filter(|deferred| deferred.defers(resource_type))
-        {
-            deferred.record(resource_type, resource_id);
-            return Ok(());
-        }
+        };
 
         self.delete_search_index_rows_for(
             db,
