@@ -2130,7 +2130,8 @@ cleared once a generation finishes; backends that do not implement the three
 defaulted methods simply never resume, as before #1125.
 
 The `hfs` binary exposes these as `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS`,
-`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY` and
+`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY`,
+`HFS_ELASTICSEARCH_CONTAINED_SWEEP_CONCURRENCY` and
 `HFS_ELASTICSEARCH_REINDEX_REFRESH`, and the deferred rebuild's page as
 `HFS_REINDEX_BATCH_SIZE` plus `HFS_REINDEX_BATCH_BYTES` (see the
 [hfs README](../hfs/README.md#environment-variables)).
