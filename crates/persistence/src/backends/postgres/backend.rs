@@ -51,11 +51,12 @@ struct StoredOverlay {
 }
 
 /// Default window in which a write trusts a validated overlay without probing
-/// the database again. A SearchParameter committed by this process invalidates
-/// the cache immediately; only one committed by another HFS process can take up
-/// to this long to be seen. Override with `HFS_PG_SP_FINGERPRINT_TTL_MS`
-/// (`0` probes on every write, the previous behavior).
-const DEFAULT_OVERLAY_FINGERPRINT_TTL: Duration = Duration::from_millis(1000);
+/// the database again: zero, i.e. every write probes (the exact, previous
+/// behavior). Opt in with `HFS_PG_SP_FINGERPRINT_TTL_MS=<ms>` (for example
+/// `1000`): a SearchParameter committed by this process still invalidates the
+/// cache immediately; only one committed by another HFS process can then take
+/// up to that long to be seen by ordinary writes.
+const DEFAULT_OVERLAY_FINGERPRINT_TTL: Duration = Duration::ZERO;
 
 fn overlay_fingerprint_ttl_from_env() -> Duration {
     std::env::var("HFS_PG_SP_FINGERPRINT_TTL_MS")
@@ -71,7 +72,7 @@ pub(crate) enum OverlayFreshness {
     /// An overlay validated within the fingerprint TTL is reused without a
     /// probe. For ordinary single-resource and Bundle writes, where a
     /// SearchParameter committed by another process may take up to the TTL to
-    /// be seen (the same bound every other backend's cache has).
+    /// be seen.
     WithinTtl,
     /// Always probe the database fingerprint, whatever the TTL. For callers
     /// whose batch takes its overlay snapshot under the tenant gate and must
