@@ -908,7 +908,7 @@ pub(crate) async fn execute_plan(
                     });
                 }
                 let rows = result.rows.len();
-                engine = materialize_query_result(engine, internal_name, &result).await?;
+                engine = materialize_query_result(engine, internal_name, result).await?;
                 let elapsed_ms = start.elapsed().as_millis();
                 debug!(
                     table = %internal_name,
@@ -1083,29 +1083,36 @@ fn schema_from_query_result(result: &QueryResult) -> TableSchema {
 
 /// Materializes a [`QueryResult`] into a fresh physical table named
 /// `table_name`.
+///
+/// Takes the result by value and feeds `insert_rows` a lazy stream that moves
+/// each cell out of its row, so a second full copy of the result (one JSON
+/// object per row) never exists at once: each object is built on the insert
+/// thread just before its INSERT and dropped right after, and the source row
+/// is freed as it is consumed.
 async fn materialize_query_result(
     engine: InMemorySqlEngine,
     table_name: &str,
-    result: &QueryResult,
+    result: QueryResult,
 ) -> Result<InMemorySqlEngine, SqlQueryError> {
-    let schema = schema_from_query_result(result);
+    let schema = schema_from_query_result(&result);
     engine.create_table(table_name, &schema)?;
-    let rows: Vec<Result<Value, String>> = result
-        .rows
-        .iter()
-        .map(|row| {
-            let mut obj = serde_json::Map::new();
-            for (i, col) in result.columns.iter().enumerate() {
-                let v = row.get(i).cloned().flatten().unwrap_or(Value::Null);
-                obj.insert(col.clone(), v);
-            }
-            Ok(Value::Object(obj))
-        })
-        .collect();
     let cap = result.rows.len();
-    let stream = futures::stream::iter(rows);
+    let columns = result.columns;
+    let rows = result.rows.into_iter().map(move |row| {
+        let mut cells = row.into_iter();
+        let mut obj = serde_json::Map::with_capacity(columns.len());
+        for col in &columns {
+            obj.insert(col.clone(), cells.next().flatten().unwrap_or(Value::Null));
+        }
+        Ok(Value::Object(obj))
+    });
     let (returned_engine, _inserted) = engine
-        .insert_rows(table_name, &schema, Box::pin(stream), cap)
+        .insert_rows(
+            table_name,
+            &schema,
+            Box::pin(futures::stream::iter(rows)),
+            cap,
+        )
         .await?;
     Ok(returned_engine)
 }
@@ -2268,6 +2275,52 @@ mod tests {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
         assert!(!text.contains("(ViewDefinition pairs)"), "{text}");
+    }
+
+    /// The SQLView node table is fed by moving the result's cells, so the
+    /// values and their SQLite storage classes must match the result's:
+    /// a column whose first value is NULL and a column mixing integers and
+    /// text keep the same `typeof()` per row, and no row is lost.
+    #[tokio::test]
+    async fn sqlview_node_keeps_cell_values_and_storage_classes() {
+        let plan = GraphPlan {
+            nodes: vec![
+                PlanNode::Leaf {
+                    internal_name: "__sof_node_0".to_string(),
+                    view: named_view_definition("patients"),
+                },
+                PlanNode::SqlView {
+                    internal_name: "__sof_node_1".to_string(),
+                    sql: "SELECT CASE WHEN id = 'p0' THEN NULL ELSE 7 END AS n, \
+                          CASE WHEN id IN ('p0', 'p1') THEN 1 ELSE 'x' END AS m, \
+                          id FROM base"
+                        .to_string(),
+                    edges: vec![edge("base", "__sof_node_0")],
+                    name: "mixed".to_string(),
+                },
+            ],
+            subject_edges: vec![edge("mixed_t", "__sof_node_1")],
+        };
+        let (result, _) = run_plan(
+            6,
+            limits(100, 100),
+            &plan,
+            "SELECT typeof(n), typeof(m), COUNT(*) FROM mixed_t GROUP BY 1, 2 ORDER BY 1, 2",
+        )
+        .await
+        .expect("the SQLView node must materialize");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Some(json!("integer")),
+                    Some(json!("integer")),
+                    Some(json!(1))
+                ],
+                vec![Some(json!("integer")), Some(json!("text")), Some(json!(4))],
+                vec![Some(json!("null")), Some(json!("integer")), Some(json!(1))],
+            ]
+        );
     }
 
     /// The subject's own result is not a dependency: it is silently
