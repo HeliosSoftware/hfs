@@ -15,7 +15,7 @@
 # and indexing.txt instead of a k6 summary; bulk-import also adds a bulk
 # detail table after the leg-health table. The Throughput table also splits the
 # bulk-import row into its two phases, directly under it: ingest (resources/s and
-# seconds, how long loading the corpus takes) and initial index (seconds of the
+# seconds, how long loading the corpus takes) and index rebuild (seconds of the
 # deferred search-index rebuild after it, `inline (during ingest)` when the
 # backend indexed while ingesting; BULK_PHASES_NOTE). Display only: it never
 # decides anything, it always exits 0 and every problem goes out as a `::warning`
@@ -88,6 +88,8 @@ KNOWN_LEGS = [
 # is opt-in and not in it; its row still shows when `tests` names it or a leg
 # wrote indexing.txt (_render's extras).
 CANONICAL_SUITES = ["prewarm", "import", "crud", "search", "insert", "bulk-import"]
+# Shown in every comparison, as n/a (not requested) when the run did not ask for them.
+CORE_ROWS = ("crud", "search")
 # bulk-import is not a k6 suite: bulk-import.sh writes bulk-import.txt (key=value),
 # and it runs after search against its own fresh database.
 BULK_SUITE = "bulk-import"
@@ -117,14 +119,14 @@ TITLE = "Leg comparison"
 
 LEGEND = (
     "`†` crud/search/reindex ran on an incomplete corpus (import below 1000/1000 bundles or not "
-    "run before it, or the ES index not drained); on bulk-import and its initial index, search "
+    "run before it, or the ES index not drained); on Bulk Import and its index rebuild, search "
     "did not return every resource it ingested · `‡` more than 1% errors or failed checks in "
-    "that suite (on bulk-import and its ingest, any resource not ingested; on its initial "
+    "that suite (on Bulk Import and its ingest, any resource not ingested; on its initial "
     "index, a rebuild that did not complete or reported errors; on reindex, any reindex error "
     "or a failed job) · `⚠` contended host (postgres crud above 3 ms/call) or a backend "
     "container died · **bold** = best in its row, shown only when no leg in that row carries a "
-    "marker or `(partial)` (on the bulk-import ingest and initial index rows, also only when "
-    "every leg indexed the same way) · bulk-import is resources/s through `$bulk-submit` into a "
+    "marker or `(partial)` (on the Bulk Import ingest and index rebuild rows, also only when "
+    "every leg indexed the same way) · Bulk Import is resources/s through `$bulk-submit` into a "
     "fresh database, kick-off until the search index covers it, and its ingest and initial "
     "index rows split that time (see the note below the tables); reindex is resources/s of one "
     "`$reindex` of the "
@@ -143,15 +145,15 @@ FOOTER = (
 # The loading rows also name the operation they time, in every table: HFS has
 # no `$import`, and `import` is k6 POSTing transaction Bundles to the base URL.
 ROW_LABELS = {
-    ("import", "rps"): "import, `POST /` transaction Bundles (resources/s)",
-    ("import", "p95"): "import, `POST /` transaction Bundles (per Bundle)",
-    ("import", "err"): "import, `POST /` transaction Bundles",
+    ("import", "rps"): "Batch/Transaction Import, `POST /` Bundles (resources/s)",
+    ("import", "p95"): "Batch/Transaction Import, `POST /` Bundles (per Bundle)",
+    ("import", "err"): "Batch/Transaction Import, `POST /` Bundles",
     # every insert.js request is one create
     ("insert", "rps"): "insert (creates/s)",
     # one $bulk-submit job: resources ingested per second until searchable
-    ("bulk-import", "rps"): "bulk-import, `$bulk-submit` (resources/s)",
-    ("bulk-import", "p95"): "bulk-import, `$bulk-submit`",
-    ("bulk-import", "err"): "bulk-import, `$bulk-submit`",
+    ("bulk-import", "rps"): "Bulk Import, `$bulk-submit` (resources/s)",
+    ("bulk-import", "p95"): "Bulk Import, `$bulk-submit`",
+    ("bulk-import", "err"): "Bulk Import, `$bulk-submit`",
     # one $reindex job; %s is " <type>" when every leg reindexed the same type (_reindex_type)
     ("indexing", "rps"): "reindex, `$reindex`%s (resources/s)",
     ("indexing", "p95"): "reindex, `$reindex`%s",
@@ -159,25 +161,27 @@ ROW_LABELS = {
 }
 # The two phases of the bulk-import job, as Throughput rows right under the
 # combined bulk-import row (_bulk_phase_lines).
-BULK_INGEST_LABEL = "bulk-import ingest (resources/s, seconds)"
-BULK_INDEX_LABEL = "bulk-import initial index (seconds)"
+BULK_INGEST_LABEL = "Bulk Import: ingest (resources/s, seconds)"
+BULK_INDEX_LABEL = "Bulk Import: index rebuild (seconds)"
 # index_seconds is 0 when HFS indexed while ingesting; that is not a free index.
 INLINE_INDEX = "inline (during ingest)"
 # bulk_import.py index_status values that mean the deferred rebuild did not finish cleanly.
 _BULK_INDEX_BAD = ("failed", "permanent-errors", "cancelled")
 IMPORT_NOTE = (
-    "Import row: **resources/s** = entries of the transaction Bundles that committed (k6 "
+    "Batch/Transaction Import row (suite `import`): **resources/s** = entries of the transaction Bundles that committed (k6 "
     "`bundle_size`) per second of the import scenario's own clock, which starts after k6 "
     "setup() has loaded the two seed Bundles (that time is in Leg health) — the unit "
     "upstream's report uses. Its p95 is **per Bundle**: one k6 iteration, the corpus fetch "
     "plus the transaction POST. k6's `http_reqs` is not used for import: it counts a corpus "
-    "GET beside every Bundle POST. Bundles/s is in Leg health."
+    "GET beside every Bundle POST. Bundles/s is in Leg health. Its resources/s is not "
+    "comparable with the Bulk Import row's: committed Bundle entries per second of the k6 "
+    "scenario, against resources until the search index covers them."
 )
 BULK_PHASES_NOTE = (
-    "Bulk-import ingest and initial index rows: the same `$bulk-submit` load as the "
-    "`bulk-import` row, split into the two times a user waits for. **Ingest** = resources "
+    "Bulk Import ingest and index rebuild rows: the same `$bulk-submit` load as the "
+    "Bulk Import row, split into the two times a user waits for. **Ingest** = resources "
     "ingested ÷ seconds from kick-off until the status manifest is final, those seconds in "
-    "brackets: how long loading the corpus takes. **Initial index** = seconds from then until "
+    "brackets: how long loading the corpus takes. **Index rebuild** = seconds from then until "
     "HFS's deferred search-index rebuild of that freshly loaded data has finished "
     "(HFS_BULK_SUBMIT_DEFER_INDEXING, the default); the Search check in the Bulk import table "
     "then confirms it is searchable. `inline (during ingest)` = the backend indexed each batch "
@@ -185,7 +189,7 @@ BULK_PHASES_NOTE = (
     "— it is not a zero-second index; `+ N s rebuild` is a follow-up rebuild of the types the "
     "index rejected. No best is marked on either row when legs indexed differently. Both rows "
     "are in the Throughput table only (one asynchronous job: no p95; failed resources are in "
-    "the bulk-import Errors row)."
+    "the Bulk Import Errors row)."
 )
 INSERT_NOTE = (
     "`insert` is HFS's own suite (`.github/scripts/fhir-bench/k6/insert.js`, load shape "
@@ -201,8 +205,8 @@ REINDEX_NOTE = (
     "parameters and rewrites the index that serves search (the primary's own index on "
     "sqlite/postgres/mongodb, Elasticsearch on the +ES legs). **resources/s** = processed ÷ "
     "(completedAt − startedAt) from `$reindex-status`. This is not the index cost paid inside "
-    "import, which stays in the import row, nor the initial index time of freshly loaded "
-    "data, which is the bulk-import initial index row; it rewrites the index right before "
+    "import, which stays in the Batch/Transaction Import row, nor the index rebuild time of freshly loaded "
+    "data, which is the Bulk Import index rebuild row; it rewrites the index right before "
     "`insert` and `bulk-import`, so a run that includes it may skew both. A job still running "
     "at the budget (`budget_s` in indexing.txt) is cancelled and its rate covers the part that "
     "ran (`(partial)`). Its seconds, resources reindexed, index entries per resource and phase "
@@ -1021,12 +1025,12 @@ BULK_CAPTION = (
     "per-resource-type NDJSON) through `$bulk-submit`, in a fresh database served by a second HFS, "
     "after the search suite. **Ingest** is kick-off until the status manifest is final; **Index** "
     "is the deferred search-index rebuild that follows (followed in the second HFS's log); "
-    "**Total** is both, and is what the `bulk-import` row above divides the ingested resources "
-    "by; the ingest and initial index rows above show **Ingest** and **Index** on their own. "
+    "**Total** is both, and is what the Bulk Import row above divides the ingested resources "
+    "by; the ingest and index rebuild rows above show **Ingest** and **Index** on their own. "
     "**Index** reads `inline (during ingest)` when HFS indexed while ingesting, so that time is "
     "inside **Ingest**. **Search check** compares Patient and Observation totals and two "
     "indexed queries with the "
-    "converted corpus. It counts the 3,349 seed resources the `import` row's entries do not."
+    "converted corpus. It counts the 3,349 seed resources the Batch/Transaction Import row's entries do not."
 )
 
 _BULK_CHECKS = (("patient", "Patient"), ("observation", "Observation"),
@@ -1281,6 +1285,13 @@ def _render(root, env, warn, zips):
         if INDEXING_FILE in names and INDEXING_SUITE not in requested:
             extras.add(INDEXING_SUITE)
     rows = requested + sorted(extras)
+    # crud and search are what a run is compared on: a run that did not ask for
+    # them still shows their rows, as n/a (not requested), so a trimmed run
+    # does not read as a report that lost them.
+    not_requested = [x for x in CORE_ROWS if x not in rows]
+    for x in not_requested:
+        after = [r for r in CANONICAL_SUITES[:CANONICAL_SUITES.index(x)] if r in rows]
+        rows.insert(rows.index(after[-1]) + 1 if after else 0, x)
 
     datas = []
     for leg in legs:
@@ -1297,6 +1308,10 @@ def _render(root, env, warn, zips):
             d = {"leg": leg, "status": "unreadable"}
         else:
             d = {"leg": leg, "status": "no-artifact"}
+        for x in not_requested:
+            sx = d.get("suites", {}).get(x)
+            if sx is not None and sx.get("reason") == "not run":
+                sx["reason"] = "not requested"
         datas.append(d)
     loaded = [d for d in datas if d["status"] in ("ok", "no-summaries")]
     k = sum(1 for d in datas if d["status"] == "ok")
