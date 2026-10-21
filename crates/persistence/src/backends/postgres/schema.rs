@@ -8240,4 +8240,192 @@ mod postgres_integration_migrations {
             None
         );
     }
+
+    /// `idx_search_date_recent_end` is partial (`WHERE value_date_end IS NOT NULL`).
+    /// The writer always sets both date columns, but the table does not enforce
+    /// it, so a row missing one bound must come back from every date prefix
+    /// exactly as it does without the index: same ids, same order, whether the
+    /// planner is steered onto the index or the index is dropped.
+    #[tokio::test]
+    async fn postgres_integration_v50_date_index_keeps_rows_with_a_missing_bound() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_v50_null_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("fresh database reaches the current schema");
+        assert!(
+            index_definition(&client, "idx_search_date_recent_end")
+                .await
+                .is_some()
+        );
+
+        // Case A: both bounds; B: start only; C: end only; D: neither. Each case
+        // carries the same ten ranges around the searched day, 2020-06-15.
+        let ranges = [
+            ("2020-06-10", "2020-06-11"),
+            ("2020-06-15", "2020-06-16"),
+            ("2020-06-15 06:00", "2020-06-15 07:00"),
+            ("2020-06-14", "2020-06-17"),
+            ("2020-06-16", "2020-06-17"),
+            ("2020-06-20", "2020-06-21"),
+            ("2020-06-15", "2020-06-15 12:00"),
+            ("2020-06-01", "2020-07-01"),
+            ("2020-06-14", "2020-06-15"),
+            ("2021-01-01", "2021-01-02"),
+        ];
+        let mut values = Vec::new();
+        for (k, (case, (start, end))) in ["A", "B", "C", "D"]
+            .iter()
+            .flat_map(|c| ranges.iter().map(move |r| (c, r)))
+            .enumerate()
+        {
+            let start = if matches!(*case, "A" | "B") {
+                format!("'{start}+00'")
+            } else {
+                "NULL".to_string()
+            };
+            let end = if matches!(*case, "A" | "C") {
+                format!("'{end}+00'")
+            } else {
+                "NULL".to_string()
+            };
+            // Distinct, interleaved `last_updated` values make the order meaningful.
+            let minutes = (k * 7) % 41;
+            values.push(format!(
+                "('nulltest', 'Encounter', '{case}{n}', 'nulltest-date', {start}, {end}, \
+                 timestamptz '2026-01-01+00' + interval '{minutes} minutes')",
+                n = k % ranges.len(),
+            ));
+        }
+        client
+            .batch_execute(&format!(
+                "INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_date, value_date_end, last_updated)
+                 VALUES {}",
+                values.join(",")
+            ))
+            .await
+            .expect("insert fixture rows");
+
+        // The predicates `date_range_predicate` emits for `date=<prefix>2020-06-15`,
+        // with the binds written out: (prefix, SQL, B rows match, C rows match).
+        let s = "'2020-06-15T00:00:00Z'";
+        let e = "'2020-06-16T00:00:00Z'";
+        let contained =
+            format!("(value_date >= {s} AND value_date < {e} AND value_date_end <= {e})");
+        let cases: Vec<(&str, String, bool, bool)> =
+            vec![
+            (
+                "eq",
+                format!("value_date >= {s} AND value_date < {e} AND value_date_end <= {e}"),
+                false,
+                false,
+            ),
+            ("ne", format!("(value_date < {s} OR value_date_end > {e})"), true, true),
+            ("gt", format!("value_date_end > {e}"), false, true),
+            ("lt", format!("value_date < {s}"), true, false),
+            ("ge", format!("(value_date_end > {e} OR ({contained}))"), false, true),
+            ("le", format!("(value_date < {s} OR ({contained}))"), true, false),
+            ("sa", format!("value_date >= {e}"), true, false),
+            ("eb", format!("value_date < {s} AND value_date_end <= {s}"), false, false),
+            (
+                "ap",
+                "value_date < '2020-06-17T00:00:00Z' AND value_date_end > '2020-06-14T00:00:00Z'"
+                    .to_string(),
+                false,
+                false,
+            ),
+        ];
+
+        // "default": index present, planner free. "forced": the other date indexes
+        // are gone and scans are steered onto the index. "dropped": the baseline.
+        // Each runs inside a transaction that is rolled back.
+        let setup = |mode: &str| match mode {
+            "default" => "BEGIN".to_string(),
+            "forced" => "BEGIN; DROP INDEX idx_search_date; DROP INDEX idx_search_date_recent; \
+                         DROP INDEX idx_search_date_end; SET LOCAL enable_seqscan = off; \
+                         SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = on; \
+                         SET LOCAL enable_sort = off"
+                .to_string(),
+            _ => "BEGIN; DROP INDEX idx_search_date_recent_end".to_string(),
+        };
+        let select = |pred: &str, limit: u32| {
+            format!(
+                "SELECT DISTINCT resource_id, last_updated FROM search_index
+                 WHERE tenant_id = 'nulltest' AND resource_type = 'Encounter'
+                   AND param_name = 'nulltest-date' AND {pred}
+                 ORDER BY last_updated DESC, resource_id ASC LIMIT {limit}"
+            )
+        };
+
+        for (prefix, pred, with_b, with_c) in &cases {
+            let mut results: Vec<(&str, u32, Vec<String>)> = Vec::new();
+            for mode in ["default", "forced", "dropped"] {
+                for limit in [5u32, 1000] {
+                    client.batch_execute(&setup(mode)).await.unwrap();
+                    let rows = client.query(&select(pred, limit), &[]).await;
+                    let plan = if mode == "forced" && limit == 1000 {
+                        client
+                            .query(&format!("EXPLAIN {}", select(pred, limit)), &[])
+                            .await
+                            .map(|r| {
+                                r.iter()
+                                    .map(|x| x.get::<_, String>(0))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .ok()
+                    } else {
+                        None
+                    };
+                    client.batch_execute("ROLLBACK").await.unwrap();
+                    let ids = rows
+                        .unwrap_or_else(|e| panic!("{prefix} {mode}: {e}"))
+                        .iter()
+                        .map(|r| r.get::<_, String>(0))
+                        .collect::<Vec<_>>();
+                    if let Some(plan) = plan
+                        && matches!(*prefix, "gt" | "ge")
+                    {
+                        assert!(
+                            plan.contains("idx_search_date_recent_end"),
+                            "{prefix}: the forced plan must really use the index:\n{plan}"
+                        );
+                    }
+                    results.push((mode, limit, ids));
+                }
+            }
+            let of = |mode: &str, limit: u32| {
+                results
+                    .iter()
+                    .find(|(m, l, _)| *m == mode && *l == limit)
+                    .map(|(_, _, ids)| ids.clone())
+                    .unwrap()
+            };
+            for limit in [5u32, 1000] {
+                let baseline = of("dropped", limit);
+                assert_eq!(
+                    of("default", limit),
+                    baseline,
+                    "{prefix} limit {limit}: default"
+                );
+                assert_eq!(
+                    of("forced", limit),
+                    baseline,
+                    "{prefix} limit {limit}: forced"
+                );
+            }
+            let full = of("dropped", 1000);
+            let has = |case: &str| full.iter().any(|id| id.starts_with(case));
+            assert!(!has("D"), "{prefix}: rows with no date never match");
+            assert_eq!(has("B"), *with_b, "{prefix}: start-only rows in {full:?}");
+            assert_eq!(has("C"), *with_c, "{prefix}: end-only rows in {full:?}");
+            assert!(has("A"), "{prefix}: the fixture has complete matching rows");
+        }
+    }
 }
