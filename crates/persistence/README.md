@@ -630,6 +630,13 @@ Past the budget the call fails with `BackendError::Timeout` (`504` on the REST e
 the budget, plus the pool checkout and the handler's earlier work, is below `HFS_REQUEST_TIMEOUT`). The session stays owned by the count until
 PostgreSQL ends it, even if the caller is dropped first (#1826, #1911).
 
+Every indexed write confirms its tenant's SearchParameter overlay with a cheap
+`SELECT COUNT(*), MAX(last_updated)` fingerprint probe. `HFS_PG_SP_FINGERPRINT_TTL_MS`
+(default: `0`, every write probes) lets ordinary writes reuse an overlay validated within
+that many milliseconds (for example `1000`) and skip the probe. A SearchParameter written by
+this process invalidates the cache immediately; one committed by another HFS process is seen by
+ordinary writes within the TTL. Bulk submit always probes, whatever the TTL.
+
 Schema v49 adds the partial index `idx_resources_live_tenant ON resources (tenant_id) WHERE
 is_deleted = FALSE`, so the count is an index-only scan of a narrow index instead of the wider
 `idx_resources_reindex_id`. The first startup on v49 builds it with `CREATE INDEX CONCURRENTLY`
@@ -646,6 +653,33 @@ version:
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_resources_live_tenant
   ON resources (tenant_id) WHERE is_deleted = FALSE;
 ```
+
+Schema v50 adds `idx_search_date_recent_end` on `search_index (tenant_id, resource_type, param_name,
+last_updated DESC, resource_id) INCLUDE (value_date, value_date_end) WHERE value_date_end IS NOT NULL`,
+which lets date `gt`/`ge` searches walk the newest-first order and stop at the first qualifying rows
+(Observation, Encounter and Patient `gt`/`ge`: 0.07-0.11 ms on a 7M-row `search_index`; 66 MB). It is
+built the same way as the v49 index (`CREATE INDEX CONCURRENTLY` under the migration lock, recorded only
+once the index is valid, an interrupted build is dropped and rebuilt on the next startup) and runs no
+`ANALYZE`: the planner keeps using the table's per-column statistics, which the index does not change.
+The index is additive and has no opt-out. To keep the build out of the startup path, run it beforehand;
+v50 then finds it and only records the version:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_search_date_recent_end
+  ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+  INCLUDE (value_date, value_date_end) WHERE value_date_end IS NOT NULL;
+```
+
+The newest-first search fast path is only valid when no `search_index` row of the searched parameter
+has `last_updated IS NULL` (contained-resource memberships are written that way). Each fast-path
+statement used to re-run the whole search predicate in an `index_eligible` CTE to prove it. The
+backend now learns, per tenant, which `(resource type, parameter)` pairs have such rows with one
+`SELECT DISTINCT ... WHERE is_contained` and caches the answer for 30 s (plus a 10 s grace window
+served while one request refreshes it). A cached "NULL rows exist" answer, any probe failure, or a
+write by this process that creates contained rows keeps the original SQL, so the cache can only
+remove the probe, never add results. Writes by other processes are noticed after the TTL, so a
+deployment with several writers that create contained resources against one database can turn the
+cache off with `HFS_PG_ELIGIBLE_CACHE=0` (default on; `0`, `false`, `off` and `no` disable it).
 
 ### PostgreSQL + Elasticsearch
 
@@ -2130,7 +2164,8 @@ cleared once a generation finishes; backends that do not implement the three
 defaulted methods simply never resume, as before #1125.
 
 The `hfs` binary exposes these as `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS`,
-`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY` and
+`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY`,
+`HFS_ELASTICSEARCH_CONTAINED_SWEEP_CONCURRENCY` and
 `HFS_ELASTICSEARCH_REINDEX_REFRESH`, and the deferred rebuild's page as
 `HFS_REINDEX_BATCH_SIZE` plus `HFS_REINDEX_BATCH_BYTES` (see the
 [hfs README](../hfs/README.md#environment-variables)).
