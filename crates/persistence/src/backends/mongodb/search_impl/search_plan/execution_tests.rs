@@ -778,6 +778,9 @@ async fn stale_probe_changes_only_driver_order_and_refresh_clears_it() {
             &fixture.db,
             PLAN_TENANT,
             &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
             None,
@@ -825,6 +828,9 @@ async fn stale_probe_changes_only_driver_order_and_refresh_clears_it() {
             &fixture.db,
             PLAN_TENANT,
             &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
             None,
@@ -1128,6 +1134,7 @@ async fn configured_probe_budget_reaches_the_plan_that_probes() {
             &fixture.db,
             PLAN_TENANT,
             &query,
+            &configured.classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
             None,
@@ -1507,6 +1514,9 @@ async fn request_reuses_untimed_selective_probe_across_planning_calls() {
                 &fixture.db,
                 PLAN_TENANT,
                 &query,
+                &fixture
+                    .backend
+                    .classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2158,6 +2168,9 @@ async fn missing_metadata_selection_preserves_other_candidate_routes() {
             &fixture.db,
             PLAN_TENANT,
             &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
             None,
@@ -2171,7 +2184,15 @@ async fn missing_metadata_selection_preserves_other_candidate_routes() {
     ));
     let (selected, ids) = fixture
         .backend
-        .plan_or_matching_ids(&fixture.db, PLAN_TENANT, &query, plan)
+        .plan_or_matching_ids(
+            &fixture.db,
+            PLAN_TENANT,
+            &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
+            plan,
+        )
         .await
         .unwrap();
     assert!(
@@ -2191,7 +2212,12 @@ async fn missing_metadata_selection_preserves_other_candidate_routes() {
     assert!(
         fixture
             .backend
-            .is_missing_resource_parameter(PLAN_TENANT, "Observation", &absent)
+            .classify_missing(
+                PLAN_TENANT,
+                "Observation",
+                &SearchQuery::new("Observation").with_parameter(absent.clone()),
+            )
+            .is_resource_parameter(&absent)
     );
     let mut subject = parameter("subject", "urn:selector-test|unknown");
     subject.param_type = SearchParamType::Reference;
@@ -2205,6 +2231,9 @@ async fn missing_metadata_selection_preserves_other_candidate_routes() {
             &fixture.db,
             PLAN_TENANT,
             &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
             None,
@@ -2218,7 +2247,15 @@ async fn missing_metadata_selection_preserves_other_candidate_routes() {
     );
     let (selected, ids) = fixture
         .backend
-        .plan_or_matching_ids(&fixture.db, PLAN_TENANT, &query, plan)
+        .plan_or_matching_ids(
+            &fixture.db,
+            PLAN_TENANT,
+            &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
+            plan,
+        )
         .await
         .unwrap();
     assert!(

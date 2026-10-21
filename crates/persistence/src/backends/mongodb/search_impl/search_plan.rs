@@ -858,6 +858,7 @@ impl MongoBackend {
         db: &mongodb::Database,
         tenant_id: &str,
         query: &SearchQuery,
+        missing_support: &super::MissingSupport,
         purpose: SearchFilterPurpose,
         page_policy: NoTotalPagePolicy,
         index_cursor_filter: Option<&Document>,
@@ -879,9 +880,10 @@ impl MongoBackend {
         {
             return Ok(None);
         }
-        let missing_resource_filter = query.parameters.iter().any(|param| {
-            self.is_missing_resource_parameter(tenant_id, &query.resource_type, param)
-        });
+        let missing_resource_filter = query
+            .parameters
+            .iter()
+            .any(|param| missing_support.is_resource_parameter(param));
         let indexed: Vec<_> = query
             .parameters
             .iter()
@@ -905,11 +907,7 @@ impl MongoBackend {
                 matches!(param.modifier, Some(SearchModifier::Not))
                     || (matches!(param.modifier, Some(SearchModifier::Missing))
                         && (param.param_type == SearchParamType::Composite
-                            || !self.supports_indexed_missing(
-                                tenant_id,
-                                &query.resource_type,
-                                param,
-                            )))
+                            || !missing_support.supports(param)))
             });
         if !has_complement {
             let probe_timeout = self.probe_timeout();
@@ -971,9 +969,9 @@ impl MongoBackend {
             && self.search_indexes_ready()
             && missing_resource_filter
             && matches!(query.sort.as_slice(), [sort] if sort.parameter == "_id")
-            && indexed.iter().any(|param| {
-                !self.is_missing_resource_parameter(tenant_id, &query.resource_type, param)
-            });
+            && indexed
+                .iter()
+                .any(|param| !missing_support.is_resource_parameter(param));
         let batch_page = timestamp_batch_page || id_batch_page;
         // Keep selective positive predicates on the index-first path. A
         // bounded count transfers only a scalar; broad searches never collect
@@ -981,12 +979,12 @@ impl MongoBackend {
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let mut driver = None;
         for (position, param) in indexed.iter().enumerate() {
-            if self.is_missing_resource_parameter(tenant_id, &query.resource_type, param) {
+            if missing_support.is_resource_parameter(param) {
                 continue;
             }
             if matches!(param.modifier, Some(SearchModifier::Missing))
                 && (param.param_type == SearchParamType::Composite
-                    || !self.supports_indexed_missing(tenant_id, &query.resource_type, param))
+                    || !missing_support.supports(param))
             {
                 // Presence is a positive predicate: drive from its typed partial
                 // index, rather than enumerating resources with no value.
@@ -1037,7 +1035,7 @@ impl MongoBackend {
         let mut missing = Vec::new();
         let mut stages = Vec::new();
         for (position, param) in indexed.into_iter().enumerate() {
-            if self.is_missing_resource_parameter(tenant_id, &query.resource_type, param) {
+            if missing_support.is_resource_parameter(param) {
                 let presence = missing_presence_filter(tenant_id, &query.resource_type, param);
                 if batch_page {
                     missing.push(presence.clone());

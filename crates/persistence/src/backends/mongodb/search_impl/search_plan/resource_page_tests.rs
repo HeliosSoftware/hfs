@@ -198,6 +198,11 @@ async fn missing_membership_work_is_bounded_by_candidate_ids() {
                         db,
                         PLAN_TENANT,
                         &query,
+                        &fixture.backend.classify_missing(
+                            PLAN_TENANT,
+                            &query.resource_type,
+                            &query,
+                        ),
                         SearchFilterPurpose::Page,
                         NoTotalPagePolicy::Streaming,
                         None,
@@ -262,6 +267,11 @@ async fn missing_membership_work_is_bounded_by_candidate_ids() {
                                 db,
                                 PLAN_TENANT,
                                 &query,
+                                &fixture.backend.classify_missing(
+                                    PLAN_TENANT,
+                                    &query.resource_type,
+                                    &query
+                                ),
                                 SearchFilterPurpose::Count,
                                 NoTotalPagePolicy::Streaming,
                                 None,
@@ -452,6 +462,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -464,7 +475,14 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
         };
         assert_eq!(facts.reuses, 1);
         let filter = backend
-            .build_resource_filter(PLAN_TENANT, "Observation", &query, None, None)
+            .build_resource_filter(
+                PLAN_TENANT,
+                "Observation",
+                &query,
+                &backend.classify_missing(PLAN_TENANT, "Observation", &query),
+                None,
+                None,
+            )
             .unwrap();
         let actual = plan
             .execute_page(db, filter, None, doc! { "id": 1 }, 0, 21)
@@ -488,6 +506,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 purpose,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -511,7 +530,13 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
             "small and count routes must not add a bounded probe"
         );
         let (selected, ids) = backend
-            .plan_or_matching_ids(db, PLAN_TENANT, &query, plan)
+            .plan_or_matching_ids(
+                db,
+                PLAN_TENANT,
+                &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
+                plan,
+            )
             .await
             .unwrap();
         if small {
@@ -551,6 +576,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -573,7 +599,13 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
             "pure missing pages must not acquire a probe"
         );
         let (selected, ids) = backend
-            .plan_or_matching_ids(db, PLAN_TENANT, &query, plan)
+            .plan_or_matching_ids(
+                db,
+                PLAN_TENANT,
+                &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
+                plan,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -602,6 +634,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -728,6 +761,7 @@ async fn missing_id_cursor_candidates_bound_probes_reads_and_cache_keys() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 Some(&boundary),
@@ -762,6 +796,7 @@ async fn missing_id_cursor_candidates_bound_probes_reads_and_cache_keys() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
                 Some(&boundary),
@@ -1027,6 +1062,11 @@ async fn missing_id_batches_navigate_fifty_pages_with_independent_date_bounds() 
                         db,
                         PLAN_TENANT,
                         &query,
+                        &fixture.backend.classify_missing(
+                            PLAN_TENANT,
+                            &query.resource_type,
+                            &query
+                        ),
                         SearchFilterPurpose::Page,
                         NoTotalPagePolicy::Streaming,
                         None,
@@ -1042,6 +1082,9 @@ async fn missing_id_batches_navigate_fifty_pages_with_independent_date_bounds() 
                     db,
                     PLAN_TENANT,
                     &query,
+                    &fixture
+                        .backend
+                        .classify_missing(PLAN_TENANT, &query.resource_type, &query),
                     SearchFilterPurpose::Count,
                     NoTotalPagePolicy::Streaming,
                     None,
@@ -1557,6 +1600,11 @@ async fn timestamp_pages_filter_before_offsets_and_preserve_cursor_totals() {
                         &data.fixture.db,
                         PLAN_TENANT,
                         &query,
+                        &data.fixture.backend.classify_missing(
+                            PLAN_TENANT,
+                            &query.resource_type,
+                            &query
+                        ),
                         SearchFilterPurpose::Page,
                         NoTotalPagePolicy::Streaming,
                         None,
@@ -2085,6 +2133,11 @@ async fn complement_pages_batch_exclusions_and_preserve_absence_and_cursors() {
                     db,
                     PLAN_TENANT,
                     &query,
+                    &data.fixture.backend.classify_missing(
+                        PLAN_TENANT,
+                        &query.resource_type,
+                        &query,
+                    ),
                     SearchFilterPurpose::Page,
                     NoTotalPagePolicy::Streaming,
                     None,
@@ -2245,6 +2298,7 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2282,6 +2336,7 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2309,6 +2364,7 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2384,6 +2440,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2425,6 +2482,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2462,6 +2520,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
             db,
             PLAN_TENANT,
             &query,
+            &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Page,
             NoTotalPagePolicy::Streaming,
             None,
