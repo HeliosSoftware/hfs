@@ -250,6 +250,10 @@ pub trait Dialect: Send + Sync {
     /// out. The expression `expr` may be a text projection (PG `->>`), a JSON
     /// value (PG `->`), or a SQLite JSON1 extracted scalar; the dialect picks
     /// an appropriate form.
+    ///
+    /// Contract: the result may be NULL on SQLite (PostgreSQL never returns
+    /// NULL). Only consume it as an AND-joined WHERE term; never negate it,
+    /// use it as a value, or put it in CASE/HAVING.
     fn truthy_predicate(&self, expr: &str) -> String;
 
     /// Substring of `s` after the last `/` — used by `getReferenceKey()` to
@@ -557,11 +561,11 @@ impl Dialect for SqliteDialect {
     }
 
     fn truthy_predicate(&self, expr: &str) -> String {
-        // `json_extract` returns the JSON value's native SQLite type:
-        // JSON booleans → integer 1/0, numbers → integer/real, strings → text.
-        // Truthy is: non-NULL AND not zero/false. The explicit text-equality
-        // check covers literal `'true'`/`'false'` text values just in case.
-        format!("({expr}) IS NOT NULL AND ({expr}) != 0 AND ({expr}) != 'false'")
+        // `json_extract` yields native SQLite types (JSON booleans -> 1/0).
+        // `0` covers false/zero; `'false'` in the IN list covers literal text
+        // values. `NOT IN` evaluates `expr` once; NULL stays NULL (see the
+        // trait doc for the WHERE-only contract).
+        format!("({expr}) NOT IN (0, 'false')")
     }
 
     fn last_path_segment(&self, s: &str) -> String {
@@ -956,5 +960,59 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{sql}: {e}"));
             assert_eq!(got, *value, "{sql}");
         }
+    }
+
+    /// The single-evaluation truthy form must filter exactly like the old
+    /// three-term form (`IS NOT NULL AND != 0 AND != 'false'`) in a WHERE.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_truthy_predicate_filters_like_the_three_term_form() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let values = [
+            "0",
+            "0.0",
+            "-0.0",
+            "json_extract('{\"a\":false}', '$.a')",
+            "'false'",
+            "'0'",
+            "'False'",
+            "''",
+            "'[]'",
+            "'{}'",
+            "json_extract('{\"a\":true}', '$.a')",
+            "1",
+            "'true'",
+            "NULL",
+            "json_extract('{\"a\":null}', '$.a')",
+        ];
+        for v in values {
+            let old = format!("({v}) IS NOT NULL AND ({v}) != 0 AND ({v}) != 'false'");
+            let new = SqliteDialect.truthy_predicate(v);
+            let kept = |pred: &str| -> i64 {
+                conn.query_row(
+                    &format!("SELECT count(*) FROM (SELECT 1) WHERE {pred}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("{pred}: {e}"))
+            };
+            assert_eq!(kept(&old), kept(&new), "value {v}");
+        }
+
+        // The shape the EXISTS subqueries consume: a row set from json_each.
+        let rows = |pred: &str| -> Vec<String> {
+            let mut st = conn
+                .prepare(&format!(
+                    "SELECT value FROM json_each('[0,false,\"false\",null,1]') WHERE {pred}"
+                ))
+                .unwrap_or_else(|e| panic!("{pred}: {e}"));
+            st.query_map([], |r| r.get::<_, rusqlite::types::Value>(0))
+                .unwrap()
+                .map(|v| format!("{:?}", v.unwrap()))
+                .collect()
+        };
+        let old = "(value) IS NOT NULL AND (value) != 0 AND (value) != 'false'";
+        let new = SqliteDialect.truthy_predicate("value");
+        assert_eq!(rows(old), rows(&new), "json_each rows");
     }
 }

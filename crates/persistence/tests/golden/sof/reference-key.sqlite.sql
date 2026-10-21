@@ -1,7 +1,7 @@
 SELECT
-  json_extract(r.data, '$.id') AS "id",
-  CAST(fhir_last_segment(coalesce(json_extract(r.data, '$.subject[0].reference'), json_extract(r.data, '$.subject.reference'))) AS TEXT) AS "any_key",
-  CAST(CASE WHEN coalesce(json_extract(r.data, '$.subject[0].reference'), json_extract(r.data, '$.subject.reference')) LIKE 'Patient/%' OR coalesce(json_extract(r.data, '$.subject[0].reference'), json_extract(r.data, '$.subject.reference')) LIKE '%/Patient/%' THEN fhir_last_segment(coalesce(json_extract(r.data, '$.subject[0].reference'), json_extract(r.data, '$.subject.reference'))) ELSE NULL END AS TEXT) AS "patient_key"
+  json_extract(CAST(r.data AS TEXT), '$.id') AS "id",
+  CAST(fhir_last_segment(coalesce(json_extract(CAST(r.data AS TEXT), '$.subject[0].reference'), json_extract(CAST(r.data AS TEXT), '$.subject.reference'))) AS TEXT) AS "any_key",
+  CAST(CASE WHEN coalesce(json_extract(CAST(r.data AS TEXT), '$.subject[0].reference'), json_extract(CAST(r.data AS TEXT), '$.subject.reference')) LIKE 'Patient/%' OR coalesce(json_extract(CAST(r.data AS TEXT), '$.subject[0].reference'), json_extract(CAST(r.data AS TEXT), '$.subject.reference')) LIKE '%/Patient/%' THEN fhir_last_segment(coalesce(json_extract(CAST(r.data AS TEXT), '$.subject[0].reference'), json_extract(CAST(r.data AS TEXT), '$.subject.reference'))) ELSE NULL END AS TEXT) AS "patient_key"
 FROM resources r
 WHERE r.tenant_id = ?1
   AND r.resource_type = ?2
