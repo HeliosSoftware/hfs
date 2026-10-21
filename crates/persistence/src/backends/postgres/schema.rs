@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 49;
+pub const SCHEMA_VERSION: i32 = 50;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -513,6 +513,7 @@ async fn migrate_schema(
                 continue;
             }
             48 => migrate_v48_to_v49(client).await?,
+            49 => migrate_v49_to_v50(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4147,7 +4148,7 @@ async fn rebuild_date_range_ends(client: &mut deadpool_postgres::Client) -> Stor
     .await?;
     backfill_date_range_ends(client, DATE_END_BACKFILL_BLOCKS).await?;
     for spec in &DATE_END_INDEXES {
-        rebuild_date_index(client, spec).await?;
+        rebuild_date_index(client, spec, "v42->v43").await?;
     }
     sweep_date_range_ends(client).await
 }
@@ -4327,10 +4328,11 @@ async fn date_index_state(
 async fn rebuild_date_index(
     client: &mut deadpool_postgres::Client,
     spec: &DateIndexSpec,
+    label: &str,
 ) -> StorageResult<()> {
     let failed = |e: &dyn std::fmt::Display| {
         pg_error(format!(
-            "Migration v42->v43 failed (index {}): {e}",
+            "Migration {label} failed (index {}): {e}",
             spec.name
         ))
     };
@@ -4743,6 +4745,102 @@ async fn migrate_v48_to_v49(client: &deadpool_postgres::Client) -> StorageResult
             "{LIVE_TENANT_COUNT_INDEX_NAME} is not a usable index after the build ({state:?})"
         ))),
     }
+}
+
+/// The index v50 adds for date `gt`/`ge` on the newest-first fast path. It
+/// reuses the v43 machinery ([`rebuild_date_index`]): built `CONCURRENTLY`
+/// under a temporary name, then swapped in by a short transaction.
+const DATE_RECENT_END_INDEX: DateIndexSpec = DateIndexSpec {
+    name: "idx_search_date_recent_end",
+    temp_name: "idx_search_date_recent_end_v50_new",
+    create: "(tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+             INCLUDE (value_date, value_date_end)
+             WHERE value_date_end IS NOT NULL",
+    definition: "USING btree (tenant_id, resource_type, param_name, last_updated DESC, resource_id) INCLUDE (value_date, value_date_end) WHERE (value_date_end IS NOT NULL)",
+};
+
+/// v49 -> v50: `idx_search_date_recent_end`, the newest-first date index for
+/// `gt`/`ge`.
+///
+/// The newest-first walk over `idx_search_date_recent` has to probe each entry
+/// for `value_date_end`, and a sparse match made it long. This partial index
+/// has the same key and payload but is partial on `value_date_end IS NOT NULL`,
+/// which `value_date_end > $n` implies, so the walk stops at the first rows that
+/// qualify. Measured on a 7M-row date slice: 66 MB, 0.75 s to build, `gt`/`ge`
+/// 0.07-0.11 ms for Observation, Encounter and Patient.
+///
+/// The index is additive and harmless to every other query, so it has no
+/// opt-out. Like v43 it runs in autocommit with `statement_timeout` disabled
+/// and restored with `set_config`, builds `CONCURRENTLY` (writes continue,
+/// other DDL and `VACUUM` on `search_index` wait), and stamps the marker only
+/// after the index is verified, so a failure retries at the next startup.
+///
+/// There is deliberately no `ANALYZE` here. The migration runs before the
+/// server listens, and an `ANALYZE` of a ~30M-row `search_index` could hold
+/// startup for minutes (the benchmark health gate waits 300 s). Postgres keeps
+/// no separate statistics for a plain-column partial index: the planner uses
+/// the table's per-column statistics, which this index does not change, and
+/// autovacuum's auto-analyze refreshes them on its own schedule.
+///
+/// A crashed or cancelled `CONCURRENTLY` build leaves an INVALID index; the
+/// next startup sees it is not usable and drops and rebuilds it
+/// ([`rebuild_date_index`]).
+async fn migrate_v49_to_v50(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let previous_timeout: String = client
+        .query_one("SELECT current_setting('statement_timeout')", &[])
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v49->v50 failed: read statement_timeout: {e}"
+            ))
+        })?
+        .get(0);
+    client
+        .batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v49->v50 failed: disable statement_timeout: {e}"
+            ))
+        })?;
+    tracing::info!(
+        index = DATE_RECENT_END_INDEX.name,
+        "Migration v49->v50: building the index CONCURRENTLY (startup waits for it; large search_index tables take a while)"
+    );
+    let started = std::time::Instant::now();
+    let result = rebuild_date_index(client, &DATE_RECENT_END_INDEX, "v49->v50").await;
+    let elapsed_s = started.elapsed().as_secs_f64();
+    match &result {
+        Ok(()) => tracing::info!(
+            index = DATE_RECENT_END_INDEX.name,
+            elapsed_s,
+            "Migration v49->v50: index ready"
+        ),
+        Err(error) => tracing::error!(
+            index = DATE_RECENT_END_INDEX.name,
+            elapsed_s,
+            %error,
+            "Migration v49->v50: index build failed; it is retried at the next startup"
+        ),
+    }
+    let restore = client
+        .execute(
+            "SELECT set_config('statement_timeout', $1, false)",
+            &[&previous_timeout],
+        )
+        .await;
+    if let Err(error) = result {
+        if let Err(restore_error) = restore {
+            tracing::warn!(%restore_error, "Could not restore statement_timeout after v50 failure");
+        }
+        return Err(error);
+    }
+    restore.map_err(|e| {
+        pg_error(format!(
+            "Migration v49->v50 failed: restore statement_timeout: {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 /// Fresh denormalized databases do not create ordinary legacy probes. Legacy
@@ -7878,7 +7976,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 49);
+        assert_eq!(SCHEMA_VERSION, 50);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)
@@ -8049,5 +8147,285 @@ mod postgres_integration_migrations {
             Some(true)
         );
         assert_eq!(statement_timeout(&client).await, "900ms");
+    }
+
+    /// v49 -> v50 builds `idx_search_date_recent_end` (also on a fresh database,
+    /// which migrates from v1), restores the session timeout, and is a no-op on
+    /// a repeat run.
+    #[tokio::test]
+    async fn postgres_integration_v49_to_v50_builds_recent_end_index() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_v50_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("fresh database reaches the current schema");
+        let expected = DATE_RECENT_END_INDEX.definition;
+        let fresh = index_definition(&client, "idx_search_date_recent_end")
+            .await
+            .expect("a fresh database has the index");
+        assert!(fresh.ends_with(expected), "{fresh}");
+
+        client
+            .batch_execute("DROP INDEX idx_search_date_recent_end; SET statement_timeout = '777ms'")
+            .await
+            .unwrap();
+        set_schema_version(&client, 49).await.unwrap();
+        initialize_schema(&mut client).await.expect("v49 to v50");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(statement_timeout(&client).await, "777ms");
+        let rebuilt = index_definition(&client, "idx_search_date_recent_end")
+            .await
+            .expect("v50 rebuilds the index");
+        assert!(rebuilt.ends_with(expected), "{rebuilt}");
+
+        set_schema_version(&client, 49).await.unwrap();
+        initialize_schema(&mut client).await.expect("repeat v50");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+    }
+
+    /// A crashed `CONCURRENTLY` build leaves INVALID indexes under the temporary
+    /// and/or final name; the next startup must replace both with a usable one.
+    #[tokio::test]
+    async fn postgres_integration_v49_to_v50_recovers_from_invalid_index() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_v50_inv_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("fresh database");
+        let spec = &DATE_RECENT_END_INDEX;
+        client
+            .batch_execute(&format!(
+                "DROP INDEX {name};
+                 CREATE INDEX {tmp} ON search_index {create};
+                 CREATE INDEX {name} ON search_index {create};
+                 UPDATE pg_index SET indisvalid = false
+                   WHERE indexrelid IN ('{tmp}'::regclass, '{name}'::regclass);",
+                name = spec.name,
+                tmp = spec.temp_name,
+                create = spec.create,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            date_index_state(&client, spec.temp_name, spec.definition)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        set_schema_version(&client, 49).await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("v50 repairs invalid indexes");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            date_index_state(&client, spec.name, spec.definition)
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            date_index_state(&client, spec.temp_name, spec.definition)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// `idx_search_date_recent_end` is partial (`WHERE value_date_end IS NOT NULL`).
+    /// The writer always sets both date columns, but the table does not enforce
+    /// it, so a row missing one bound must come back from every date prefix
+    /// exactly as it does without the index: same ids, same order, whether the
+    /// planner is steered onto the index or the index is dropped.
+    #[tokio::test]
+    async fn postgres_integration_v50_date_index_keeps_rows_with_a_missing_bound() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_v50_null_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("fresh database reaches the current schema");
+        assert!(
+            index_definition(&client, "idx_search_date_recent_end")
+                .await
+                .is_some()
+        );
+
+        // Case A: both bounds; B: start only; C: end only; D: neither. Each case
+        // carries the same ten ranges around the searched day, 2020-06-15.
+        let ranges = [
+            ("2020-06-10", "2020-06-11"),
+            ("2020-06-15", "2020-06-16"),
+            ("2020-06-15 06:00", "2020-06-15 07:00"),
+            ("2020-06-14", "2020-06-17"),
+            ("2020-06-16", "2020-06-17"),
+            ("2020-06-20", "2020-06-21"),
+            ("2020-06-15", "2020-06-15 12:00"),
+            ("2020-06-01", "2020-07-01"),
+            ("2020-06-14", "2020-06-15"),
+            ("2021-01-01", "2021-01-02"),
+        ];
+        let mut values = Vec::new();
+        for (k, (case, (start, end))) in ["A", "B", "C", "D"]
+            .iter()
+            .flat_map(|c| ranges.iter().map(move |r| (c, r)))
+            .enumerate()
+        {
+            let start = if matches!(*case, "A" | "B") {
+                format!("'{start}+00'")
+            } else {
+                "NULL".to_string()
+            };
+            let end = if matches!(*case, "A" | "C") {
+                format!("'{end}+00'")
+            } else {
+                "NULL".to_string()
+            };
+            // Distinct, interleaved `last_updated` values make the order meaningful.
+            let minutes = (k * 7) % 41;
+            values.push(format!(
+                "('nulltest', 'Encounter', '{case}{n}', 'nulltest-date', {start}, {end}, \
+                 timestamptz '2026-01-01+00' + interval '{minutes} minutes')",
+                n = k % ranges.len(),
+            ));
+        }
+        client
+            .batch_execute(&format!(
+                "INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_date, value_date_end, last_updated)
+                 VALUES {}",
+                values.join(",")
+            ))
+            .await
+            .expect("insert fixture rows");
+
+        // The predicates `date_range_predicate` emits for `date=<prefix>2020-06-15`,
+        // with the binds written out: (prefix, SQL, B rows match, C rows match).
+        let s = "'2020-06-15T00:00:00Z'";
+        let e = "'2020-06-16T00:00:00Z'";
+        let contained =
+            format!("(value_date >= {s} AND value_date < {e} AND value_date_end <= {e})");
+        let cases: Vec<(&str, String, bool, bool)> =
+            vec![
+            (
+                "eq",
+                format!("value_date >= {s} AND value_date < {e} AND value_date_end <= {e}"),
+                false,
+                false,
+            ),
+            ("ne", format!("(value_date < {s} OR value_date_end > {e})"), true, true),
+            ("gt", format!("value_date_end > {e}"), false, true),
+            ("lt", format!("value_date < {s}"), true, false),
+            ("ge", format!("(value_date_end > {e} OR ({contained}))"), false, true),
+            ("le", format!("(value_date < {s} OR ({contained}))"), true, false),
+            ("sa", format!("value_date >= {e}"), true, false),
+            ("eb", format!("value_date < {s} AND value_date_end <= {s}"), false, false),
+            (
+                "ap",
+                "value_date < '2020-06-17T00:00:00Z' AND value_date_end > '2020-06-14T00:00:00Z'"
+                    .to_string(),
+                false,
+                false,
+            ),
+        ];
+
+        // "default": index present, planner free. "forced": the other date indexes
+        // are gone and scans are steered onto the index. "dropped": the baseline.
+        // Each runs inside a transaction that is rolled back.
+        let setup = |mode: &str| match mode {
+            "default" => "BEGIN".to_string(),
+            "forced" => "BEGIN; DROP INDEX idx_search_date; DROP INDEX idx_search_date_recent; \
+                         DROP INDEX idx_search_date_end; SET LOCAL enable_seqscan = off; \
+                         SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = on; \
+                         SET LOCAL enable_sort = off"
+                .to_string(),
+            _ => "BEGIN; DROP INDEX idx_search_date_recent_end".to_string(),
+        };
+        let select = |pred: &str, limit: u32| {
+            format!(
+                "SELECT DISTINCT resource_id, last_updated FROM search_index
+                 WHERE tenant_id = 'nulltest' AND resource_type = 'Encounter'
+                   AND param_name = 'nulltest-date' AND {pred}
+                 ORDER BY last_updated DESC, resource_id ASC LIMIT {limit}"
+            )
+        };
+
+        for (prefix, pred, with_b, with_c) in &cases {
+            let mut results: Vec<(&str, u32, Vec<String>)> = Vec::new();
+            for mode in ["default", "forced", "dropped"] {
+                for limit in [5u32, 1000] {
+                    client.batch_execute(&setup(mode)).await.unwrap();
+                    let rows = client.query(&select(pred, limit), &[]).await;
+                    let plan = if mode == "forced" && limit == 1000 {
+                        client
+                            .query(&format!("EXPLAIN {}", select(pred, limit)), &[])
+                            .await
+                            .map(|r| {
+                                r.iter()
+                                    .map(|x| x.get::<_, String>(0))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .ok()
+                    } else {
+                        None
+                    };
+                    client.batch_execute("ROLLBACK").await.unwrap();
+                    let ids = rows
+                        .unwrap_or_else(|e| panic!("{prefix} {mode}: {e}"))
+                        .iter()
+                        .map(|r| r.get::<_, String>(0))
+                        .collect::<Vec<_>>();
+                    if let Some(plan) = plan
+                        && matches!(*prefix, "gt" | "ge")
+                    {
+                        assert!(
+                            plan.contains("idx_search_date_recent_end"),
+                            "{prefix}: the forced plan must really use the index:\n{plan}"
+                        );
+                    }
+                    results.push((mode, limit, ids));
+                }
+            }
+            let of = |mode: &str, limit: u32| {
+                results
+                    .iter()
+                    .find(|(m, l, _)| *m == mode && *l == limit)
+                    .map(|(_, _, ids)| ids.clone())
+                    .unwrap()
+            };
+            for limit in [5u32, 1000] {
+                let baseline = of("dropped", limit);
+                assert_eq!(
+                    of("default", limit),
+                    baseline,
+                    "{prefix} limit {limit}: default"
+                );
+                assert_eq!(
+                    of("forced", limit),
+                    baseline,
+                    "{prefix} limit {limit}: forced"
+                );
+            }
+            let full = of("dropped", 1000);
+            let has = |case: &str| full.iter().any(|id| id.starts_with(case));
+            assert!(!has("D"), "{prefix}: rows with no date never match");
+            assert_eq!(has("B"), *with_b, "{prefix}: start-only rows in {full:?}");
+            assert_eq!(has("C"), *with_c, "{prefix}: end-only rows in {full:?}");
+            assert!(has("A"), "{prefix}: the fixture has complete matching rows");
+        }
     }
 }

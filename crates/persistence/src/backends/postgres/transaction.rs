@@ -21,6 +21,7 @@ use crate::tenant::{Operation, TenantContext};
 use crate::types::{SearchParameter, StoredResource};
 
 use super::PostgresBackend;
+use super::backend::OverlayFreshness;
 use super::bundle_lock_plan::LockPlan;
 use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::cleanup::GuardedClient;
@@ -192,6 +193,7 @@ impl PostgresTransaction {
         tenant: TenantContext,
         plan: Option<LockPlan>,
         options: TransactionOptions,
+        freshness: OverlayFreshness,
     ) -> StorageResult<Self> {
         // Start the transaction.
         //
@@ -241,7 +243,7 @@ impl PostgresTransaction {
         }
         let extracts = !backend.is_search_offloaded() && !options.defer_search_indexing;
         let extractor = match backend
-            .write_extractor(&*guarded, tenant_id, extracts, false)
+            .write_extractor_with(&*guarded, tenant_id, extracts, false, freshness)
             .await
         {
             Ok(extractor) => extractor,
@@ -457,8 +459,19 @@ impl PostgresBackend {
         options: TransactionOptions,
         keys: Vec<(String, String)>,
     ) -> StorageResult<PostgresTransaction> {
-        self.begin_bundle_transaction(tenant, options, LockPlan::resources_only(keys))
-            .await
+        // Bulk submit takes its overlay snapshot under the tenant gate and
+        // must see every SearchParameter committed before it, so it bypasses
+        // the fingerprint TTL that ordinary writes use.
+        let client = self.get_client().await?;
+        PostgresTransaction::new(
+            self,
+            client,
+            tenant.clone(),
+            Some(LockPlan::resources_only(keys)),
+            options,
+            OverlayFreshness::Authoritative,
+        )
+        .await
     }
 
     /// Begins a transaction under `plan`: the tenant gate shared, then the
@@ -474,7 +487,15 @@ impl PostgresBackend {
         plan: LockPlan,
     ) -> StorageResult<PostgresTransaction> {
         let client = self.get_client().await?;
-        PostgresTransaction::new(self, client, tenant.clone(), Some(plan), options).await
+        PostgresTransaction::new(
+            self,
+            client,
+            tenant.clone(),
+            Some(plan),
+            options,
+            OverlayFreshness::WithinTtl,
+        )
+        .await
     }
 }
 
@@ -1462,7 +1483,15 @@ impl TransactionProvider for PostgresBackend {
         options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
         let client = self.get_client().await?;
-        PostgresTransaction::new(self, client, tenant.clone(), None, options).await
+        PostgresTransaction::new(
+            self,
+            client,
+            tenant.clone(),
+            None,
+            options,
+            OverlayFreshness::WithinTtl,
+        )
+        .await
     }
 }
 
