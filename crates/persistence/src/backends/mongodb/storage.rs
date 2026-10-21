@@ -1331,6 +1331,7 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
             .database(&self.config.database_name)
             .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
             .find(filter)
+            .batch_size(self.config.sof_cursor_batch_size)
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
 

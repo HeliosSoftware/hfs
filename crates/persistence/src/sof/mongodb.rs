@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use futures::FutureExt as _;
-use mongodb::bson::{Bson, DateTime as BsonDateTime, Document, doc};
+use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
 use mongodb::{Client, Collection};
 use tokio::sync::OnceCell;
 use tracing::debug;
@@ -139,9 +139,15 @@ impl SofRunner for MongoInDbRunner {
         let (tx, rx) = row_batch_channel();
         let guard_tx = tx.clone();
 
+        let batch_size = self.config.sof_cursor_batch_size;
         let producer = tokio::spawn(async move {
             let mut batcher = RowBatcher::new(tx);
-            let mut cursor = match collection.aggregate(pipeline).await {
+            let mut cursor = match collection
+                .aggregate(pipeline)
+                .batch_size(batch_size)
+                .with_type::<ViewRow>()
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     batcher
@@ -183,17 +189,8 @@ impl SofRunner for MongoInDbRunner {
                     }
                 }
 
-                let doc = match cursor.deserialize_current() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        batcher
-                            .error(SofError::Backend(format!("cursor deserialize: {e}")))
-                            .await;
-                        return;
-                    }
-                };
-
-                let row = match mongodb::bson::from_bson::<ViewRow>(Bson::Document(doc)) {
+                // Decoded straight from the raw BSON reply: no intermediate `Document`.
+                let row = match cursor.deserialize_current() {
                     Ok(v) => v,
                     Err(e) => {
                         batcher
@@ -220,5 +217,66 @@ impl SofRunner for MongoInDbRunner {
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
         Ok(row_stream(rx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mongodb::bson::{self, Bson, doc};
+
+    use super::ViewRow;
+
+    /// The cursor decodes each reply document straight from its raw bytes. For
+    /// the JSON-origin values a view column can hold, that must produce the
+    /// same `serde_json::Value` as the `Document` -> `from_bson` route it
+    /// replaced.
+    #[test]
+    fn raw_row_decode_matches_the_document_route() {
+        let row = doc! {
+            "id": "obs-1",
+            "text": "a \u{e9} string",
+            "int": 42_i32,
+            "long": 9_007_199_254_740_993_i64,
+            "double": 1.5_f64,
+            "flag": true,
+            "nothing": Bson::Null,
+            "nested": [[1_i32, [2_i32, Bson::Null]], [], ["x"]],
+            "object": { "k": [ { "a": 1_i32 }, { "b": Bson::Null } ], "empty": {} },
+            // serde_json arbitrary-precision number wrapper, as stored for decimals.
+            "decimal": { "$serde_json::private::Number": "0.10" },
+        };
+        let bytes = bson::to_vec(&row).unwrap();
+
+        let raw: ViewRow = bson::from_slice(&bytes).unwrap();
+        let via_document: ViewRow = bson::from_bson(Bson::Document(row)).unwrap();
+
+        assert_eq!(raw, via_document);
+        assert_eq!(raw["nested"][0][1][1], serde_json::Value::Null);
+        assert_eq!(raw["long"], serde_json::json!(9_007_199_254_740_993_i64));
+    }
+
+    /// BSON-only types never come out of the pipeline today (the emitter only
+    /// produces JSON-derived values). Pin how the two routes treat them: a
+    /// `DateTime` keeps a different extended-JSON spelling on the raw route,
+    /// and `Decimal128` is rejected by both.
+    #[test]
+    fn raw_row_decode_of_bson_only_types_is_pinned() {
+        use mongodb::bson::{DateTime, Decimal128};
+
+        let row = doc! { "v": DateTime::from_millis(1_700_000_000_000) };
+        let raw: ViewRow = bson::from_slice(&bson::to_vec(&row).unwrap()).unwrap();
+        let via_document: ViewRow = bson::from_bson(Bson::Document(row)).unwrap();
+        assert_eq!(
+            raw["v"],
+            serde_json::json!({"$date": {"$numberLong": "1700000000000"}})
+        );
+        assert_eq!(
+            via_document["v"],
+            serde_json::json!({"$date": "2023-11-14T22:13:20Z"})
+        );
+
+        let row = doc! { "v": "1.5".parse::<Decimal128>().unwrap() };
+        assert!(bson::from_slice::<ViewRow>(&bson::to_vec(&row).unwrap()).is_err());
+        assert!(bson::from_bson::<ViewRow>(Bson::Document(row)).is_err());
     }
 }
