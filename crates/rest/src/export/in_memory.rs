@@ -1049,35 +1049,6 @@ fn record_subject_finished(
     );
 }
 
-/// Writes one shard of a view's rows: the #1704 checkpoint, the formatting and
-/// the sink write, then records the file in `completed_files`.
-#[allow(clippy::too_many_arguments)]
-fn write_view_shard<Sink: ExportSink>(
-    jobs: &DashMap<String, JobStatus>,
-    jid: &str,
-    sink: &Sink,
-    name: &str,
-    rows: &[serde_json::Value],
-    format: &str,
-    header: bool,
-    ext: &str,
-    completed_files: &mut Vec<CompletedFile>,
-) -> Result<(), JobFailure> {
-    ensure_running(jobs, jid)?;
-
-    let data = format_rows(rows, format, header).map_err(|e| format!("view '{name}': {e}"))?;
-    store_view_shard(
-        jobs,
-        jid,
-        sink,
-        name,
-        data,
-        rows.len(),
-        ext,
-        completed_files,
-    )
-}
-
 /// Hands one encoded shard to the sink and records it in `completed_files`.
 #[allow(clippy::too_many_arguments)]
 fn store_view_shard<Sink: ExportSink>(
@@ -1129,6 +1100,81 @@ struct ParquetShardEncoder {
 
 /// An encoded shard and its row count.
 type EncodedShard = (Vec<u8>, usize);
+
+/// Encodes one view's ndjson, json and csv shards as rows arrive, so a subject
+/// holds the encoded bytes of the shard being built instead of its rows as JSON
+/// values. The bytes equal `format_rows` over the same rows.
+struct TextShardEncoder {
+    format: String,
+    header: bool,
+    buf: Vec<u8>,
+    rows: usize,
+    /// csv only: the columns of the shard's first row.
+    cols: Vec<String>,
+}
+
+impl TextShardEncoder {
+    fn new(format: &str, header: bool) -> Self {
+        Self {
+            format: format.to_string(),
+            header,
+            buf: Vec::new(),
+            rows: 0,
+            cols: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, row: &serde_json::Value) -> Result<(), ExportError> {
+        let ser = |e: serde_json::Error| ExportError::Serialization(e.to_string());
+        match self.format.as_str() {
+            "json" => {
+                self.buf.push(if self.rows == 0 { b'[' } else { b',' });
+                serde_json::to_writer(&mut self.buf, row).map_err(ser)?;
+            }
+            "csv" => {
+                if self.rows == 0 {
+                    self.cols = row
+                        .as_object()
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    if self.header {
+                        self.buf.extend_from_slice(self.cols.join(",").as_bytes());
+                        self.buf.push(b'\n');
+                    }
+                }
+                if let Some(obj) = row.as_object() {
+                    let values: Vec<String> = self
+                        .cols
+                        .iter()
+                        .map(|c| csv_cell(obj.get(c).unwrap_or(&serde_json::Value::Null)))
+                        .collect();
+                    self.buf.extend_from_slice(values.join(",").as_bytes());
+                    self.buf.push(b'\n');
+                }
+            }
+            _ => {
+                serde_json::to_writer(&mut self.buf, row).map_err(ser)?;
+                self.buf.push(b'\n');
+            }
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// Ends the current shard and returns its bytes and row count; `None`
+    /// when no row arrived since the last shard.
+    fn take_shard(&mut self) -> Option<EncodedShard> {
+        if self.rows == 0 {
+            return None;
+        }
+        if self.format == "json" {
+            self.buf.push(b']');
+        }
+        self.cols.clear();
+        let rows = std::mem::take(&mut self.rows);
+        Some((std::mem::take(&mut self.buf), rows))
+    }
+}
 
 struct ParquetShardState {
     columns: Vec<String>,
@@ -1337,18 +1383,17 @@ async fn run_views_job<Sink: ExportSink>(
             .await
             .map_err(|e| JobFailure::from_sof(&format!("view '{}'", named.name), e))?;
 
-        // Rows are written as soon as `shard_rows` of them have arrived, so a
-        // subject holds at most one shard's rows in memory (#1705). Cutting
-        // every `shard_rows` rows and once at the end gives exactly the ranges
-        // `planner::plan` gives over the whole result (and `shard_rows == 0`
-        // gives one shard, as there), so shard boundaries, file names and
-        // bytes are unchanged. A stream error after some shards were written
-        // still fails the job, and the worker deletes them.
-        let mut shard: Vec<serde_json::Value> = Vec::new();
-        // Parquet shards are encoded as rows arrive instead of being buffered
-        // as JSON values first (#1812).
+        // Rows are encoded as they arrive and a shard is written as soon as
+        // `shard_rows` of them have, so a subject holds at most one shard's
+        // encoded bytes in memory (#1705, #1812). Cutting every `shard_rows`
+        // rows and once at the end gives exactly the ranges `planner::plan`
+        // gives over the whole result (and `shard_rows == 0` gives one shard,
+        // as there), so shard boundaries, file names and bytes are unchanged.
+        // A stream error after some shards were written still fails the job,
+        // and the worker deletes them.
         let mut parquet =
             (format == "parquet").then(|| ParquetShardEncoder::new(&named.view, shard_rows));
+        let mut text = (format != "parquet").then(|| TextShardEncoder::new(&format, task.header));
         let mut stream = stream;
         while let Some(item) = stream.next().await {
             match item {
@@ -1370,23 +1415,24 @@ async fn run_views_job<Sink: ExportSink>(
                             )?;
                             total_rows += rows;
                         }
-                        continue;
-                    }
-                    shard.push(v);
-                    if shard.len() == shard_rows {
-                        write_view_shard(
-                            jobs,
-                            jid,
-                            sink,
-                            &named.name,
-                            &shard,
-                            &format,
-                            task.header,
-                            ext,
-                            &mut completed_files,
-                        )?;
-                        total_rows += shard.len();
-                        shard.clear();
+                    } else if let Some(enc) = text.as_mut() {
+                        enc.push(&v)
+                            .map_err(|e| format!("view '{}': {e}", named.name))?;
+                        if enc.rows == shard_rows
+                            && let Some((data, rows)) = enc.take_shard()
+                        {
+                            store_view_shard(
+                                jobs,
+                                jid,
+                                sink,
+                                &named.name,
+                                data,
+                                rows,
+                                ext,
+                                &mut completed_files,
+                            )?;
+                            total_rows += rows;
+                        }
                     }
                 }
                 Err(e) => {
@@ -1400,41 +1446,30 @@ async fn run_views_job<Sink: ExportSink>(
             }
         }
 
-        if let Some(enc) = parquet {
-            let done = enc
-                .finish()
-                .map_err(|e| format!("view '{}': {e}", named.name))?;
-            for (data, rows) in done {
-                store_view_shard(
-                    jobs,
-                    jid,
-                    sink,
-                    &named.name,
-                    data,
-                    rows,
-                    ext,
-                    &mut completed_files,
-                )?;
-                total_rows += rows;
-            }
-        }
-
         // Spec: `output` is 0..*. Views with zero rows simply contribute no
         // `output` entries rather than emitting an empty shard with a
         // download URL pointing at zero bytes.
-        if !shard.is_empty() {
-            write_view_shard(
+        let done = match (parquet, text.as_mut()) {
+            (Some(enc), _) => enc
+                .finish()
+                .map_err(|e| format!("view '{}': {e}", named.name))?,
+            (None, Some(enc)) => enc.take_shard().into_iter().collect(),
+            (None, None) => unreachable!(
+                "exactly one of the parquet and text encoders exists per view (format is parquet or not)"
+            ),
+        };
+        for (data, rows) in done {
+            store_view_shard(
                 jobs,
                 jid,
                 sink,
                 &named.name,
-                &shard,
-                &format,
-                task.header,
+                data,
+                rows,
                 ext,
                 &mut completed_files,
             )?;
-            total_rows += shard.len();
+            total_rows += rows;
         }
 
         record_subject_finished(
@@ -1584,7 +1619,9 @@ async fn execute_sql_query(
 // Row serialization helpers
 // ============================================================================
 
-/// Serializes a shard of view-output rows (column → value JSON objects).
+/// Serializes a shard of view-output rows (column → value JSON objects): the
+/// oracle the tests compare `TextShardEncoder`'s bytes with.
+#[cfg(test)]
 fn format_rows(
     rows: &[serde_json::Value],
     format: &str,
@@ -1644,10 +1681,12 @@ fn format_query_rows(
 }
 
 /// Serialises rows as a single JSON array (`_format=json`).
+#[cfg(test)]
 fn format_json_array(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
     serde_json::to_vec(rows).map_err(|e| ExportError::Serialization(e.to_string()))
 }
 
+#[cfg(test)]
 fn format_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
     let mut out = Vec::new();
     for row in rows {
@@ -1659,6 +1698,7 @@ fn format_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn format_csv(rows: &[serde_json::Value], include_header: bool) -> Result<Vec<u8>, ExportError> {
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -3075,6 +3115,54 @@ mod tests {
             (json!("=a,b"), "\"'=a,b\""),
         ] {
             assert_eq!(csv_cell(&input), expected, "input {input}");
+        }
+    }
+
+    /// The encoder cuts a shard every `shard_rows` rows (never for 0) and once
+    /// at the end; each shard's bytes equal `format_rows` over its rows.
+    #[test]
+    fn text_shard_encoder_matches_format_rows() {
+        use serde_json::json;
+        let rows = vec![
+            json!({"id": "a", "n": 1, "note": "plain"}),
+            json!({"id": "b", "n": 2}),
+            json!({"id": "c", "n": 3, "note": "x", "extra": true}),
+            json!("not an object"),
+            json!({"id": "d", "n": null, "note": "say \"hi\", then\nleave"}),
+            json!({"id": "=1+2", "n": 4.5, "note": "-5"}),
+            json!({"id": "e", "n": 5, "note": {"nested": [1, {"k": "v,w"}]}}),
+            json!({"id": "f", "n": 6, "note": ["a", "b"]}),
+            json!({"id": "@SUM(A1)", "n": -7, "note": "+3.5"}),
+        ];
+        for format in ["ndjson", "json", "csv"] {
+            for header in [true, false] {
+                for shard_rows in [0usize, 1, 2, 3, 5, 7] {
+                    let mut enc = TextShardEncoder::new(format, header);
+                    let mut shards = Vec::new();
+                    for row in &rows {
+                        enc.push(row).unwrap();
+                        if enc.rows == shard_rows {
+                            shards.push(enc.take_shard().unwrap());
+                        }
+                    }
+                    shards.extend(enc.take_shard());
+                    assert!(enc.take_shard().is_none(), "a taken shard leaves nothing");
+
+                    let size = if shard_rows == 0 {
+                        rows.len()
+                    } else {
+                        shard_rows
+                    };
+                    let expected: Vec<EncodedShard> = rows
+                        .chunks(size)
+                        .map(|c| (format_rows(c, format, header).unwrap(), c.len()))
+                        .collect();
+                    assert_eq!(
+                        shards, expected,
+                        "{format} header={header} shard_rows={shard_rows}"
+                    );
+                }
+            }
         }
     }
 
