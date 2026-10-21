@@ -19,9 +19,9 @@ env:
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   HFS_PORT: 8088
-  # Remote Docker host (set via GitHub repository secrets or variables; leave unset for local Docker)
+  # Remote Docker daemon (required repository secret). Published container ports are
+  # reached on its host part, exported as DOCKER_HOST_IP by each job's first step.
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   # S3+Elasticsearch backend configuration (optional; s3-elasticsearch tests are skipped when not set)
   HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
 
@@ -63,6 +63,15 @@ jobs:
       port: ${{ steps.up.outputs.port }}
       project: ${{ steps.up.outputs.project }}
     steps:
+      - name: Resolve Docker host
+        run: |
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
+          fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+
       - name: Checkout us-core-test-kit
         uses: actions/checkout@v5
         with:
@@ -124,7 +133,7 @@ jobs:
             exit 1
           fi
 
-          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_HOST="$DOCKER_HOST_IP"
           echo "Waiting for Inferno test kit to respond on $INFERNO_HOST:$INFERNO_PORT..."
           for i in {1..60}; do
             if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1; then
@@ -206,8 +215,14 @@ jobs:
             exit 1
           fi
 
-      - name: Determine runner IP
+      - name: Resolve Docker host and runner IP
         run: |
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
+          fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
           # Get the runner's IP so the persistent Inferno container can reach HFS on this runner.
           RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
@@ -528,14 +543,14 @@ jobs:
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
-            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            MONGO_HOST="$DOCKER_HOST_IP"
             HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_inferno_${{ matrix.suite_id }}_${{ github.run_id }}_${{ github.run_attempt }}" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
-            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            MONGO_HOST="$DOCKER_HOST_IP"
             HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=mongodb-elasticsearch \
             HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
@@ -626,7 +641,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           FALLBACK_PROJECT: inferno-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_HOST="$DOCKER_HOST_IP"
           echo "INFERNO_HOST=$INFERNO_HOST" >> $GITHUB_ENV
 
           # Retry briefly. The shared stack is already proven healthy by

@@ -1303,6 +1303,70 @@ mod sqlite_runner_tests {
         }
     }
 
+    /// The `unionAll` view of #1947: one column that is a `string` in one
+    /// branch, an `integer` in another and an untyped boolean in a third.
+    fn mixed_union_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "QuestionnaireResponse",
+            "select": [{"forEach": "item", "unionAll": [
+                {"column": [{"name": "code", "path": "linkId", "type": "string"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueInteger",
+                             "type": "integer"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueBoolean"}]}
+            ]}]
+        })
+    }
+
+    async fn seed_mixed_union(backend: &SqliteBackend, tenant: &TenantContext) {
+        backend
+            .create(
+                tenant,
+                "QuestionnaireResponse",
+                json!({
+                    "resourceType": "QuestionnaireResponse",
+                    "id": "qr1",
+                    "status": "completed",
+                    "item": [
+                        {"linkId": "2.1", "answer": [{"valueInteger": 7}]},
+                        {"linkId": "true", "answer": [{"valueBoolean": true}]},
+                        {"linkId": "007"}
+                    ]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed questionnaire response");
+    }
+
+    /// #1947: when `unionAll` branches type a column differently, each value
+    /// keeps the type its own branch declares instead of being guessed from
+    /// its text.
+    #[tokio::test]
+    async fn test_union_branches_with_different_types_keep_each_type() {
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        seed_mixed_union(&backend, &tenant).await;
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let rows = collect_rows(runner.as_ref(), &tenant, mixed_union_view()).await;
+        let mut got: Vec<Value> = rows.iter().map(|r| r["code"].clone()).collect();
+        got.sort_by_key(|v| v.to_string());
+        let mut want = vec![
+            json!("2.1"),
+            json!("true"),
+            json!("007"),
+            json!(7),
+            json!(true),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ];
+        want.sort_by_key(|v| v.to_string());
+        assert_eq!(got, want);
+    }
+
     #[tokio::test]
     async fn test_untyped_columns_keep_json_shape() {
         let backend = make_backend().await;
@@ -2941,6 +3005,50 @@ mod columnar_parity {
         )
         .await;
         assert!(batches.is_empty());
+    }
+
+    /// #1947: a column the `unionAll` branches type differently is deferred
+    /// on the columnar path and still matches the row path cell for cell.
+    #[tokio::test]
+    async fn columnar_matches_rows_for_union_branches_with_different_types() {
+        let backend = backend().await;
+        let tenant = tenant();
+        backend
+            .create(
+                &tenant,
+                "QuestionnaireResponse",
+                json!({
+                    "resourceType": "QuestionnaireResponse",
+                    "id": "qr1",
+                    "status": "completed",
+                    "item": [
+                        {"linkId": "2.1", "answer": [{"valueInteger": 7}]},
+                        {"linkId": "true", "answer": [{"valueBoolean": true}]}
+                    ]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed questionnaire response");
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "QuestionnaireResponse",
+            "select": [{"forEach": "item", "unionAll": [
+                {"column": [{"name": "code", "path": "linkId", "type": "string"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueInteger",
+                             "type": "integer"}]}
+            ]}]
+        });
+        assert_columnar_parity(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+            "mixed union",
+        )
+        .await;
     }
 
     #[tokio::test]

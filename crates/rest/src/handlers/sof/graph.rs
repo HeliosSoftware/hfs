@@ -39,6 +39,7 @@
 //! see the `#[cfg(test)]` module below.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -769,6 +770,35 @@ pub(crate) struct ExecLimits {
 /// `503` (#2048).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan(
+    engine: InMemorySqlEngine,
+    runner: &Arc<dyn SofRunner>,
+    tenant: &TenantContext,
+    filters: &ViewFilters,
+    plan: &GraphPlan,
+    subject_sql: &str,
+    subject_bindings: &[BoundParam],
+    limits: ExecLimits,
+) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+    let materialized = AtomicUsize::new(0);
+    execute_plan_counting(
+        engine,
+        runner,
+        tenant,
+        filters,
+        plan,
+        subject_sql,
+        subject_bindings,
+        limits,
+        &materialized,
+    )
+    .await
+}
+
+/// [`execute_plan`], additionally adding to `materialized` the rows of every
+/// dependency node as it is loaded, so a caller can tell afterwards (also
+/// when the run fails) how much memory the engine held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_plan_counting(
     mut engine: InMemorySqlEngine,
     runner: &Arc<dyn SofRunner>,
     tenant: &TenantContext,
@@ -777,6 +807,7 @@ pub(crate) async fn execute_plan(
     subject_sql: &str,
     subject_bindings: &[BoundParam],
     limits: ExecLimits,
+    materialized: &AtomicUsize,
 ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
     let labels_by_target = labels_by_target(plan);
     let mut leaf_schemas: Vec<TableSchema> = Vec::new();
@@ -842,6 +873,9 @@ pub(crate) async fn execute_plan(
                         // dependency nor the setting; name both (#1473).
                         let e = match e {
                             SqlQueryError::RowCapExceeded { max } => {
+                                // The engine held `max` rows when it gave up;
+                                // count them, so a failed run is trimmed too.
+                                materialized.fetch_add(max, Ordering::Relaxed);
                                 SqlQueryError::DependencyRowCapExceeded {
                                     label: dependency_label(
                                         &labels_by_target,
@@ -872,6 +906,7 @@ pub(crate) async fn execute_plan(
                     }
                 };
                 engine = returned_engine;
+                materialized.fetch_add(inserted, Ordering::Relaxed);
                 let elapsed_ms = start.elapsed().as_millis();
                 debug!(
                     table = %internal_name,
@@ -900,6 +935,7 @@ pub(crate) async fn execute_plan(
                 .await?;
                 engine = returned_engine;
                 if result.rows.len() > limits.max_source_rows_per_vd {
+                    materialized.fetch_add(result.rows.len(), Ordering::Relaxed);
                     return Err(SqlQueryError::DependencyRowCapExceeded {
                         label: dependency_label(&labels_by_target, internal_name, name).to_string(),
                         kind: DependencyKind::SqlView,
@@ -908,7 +944,8 @@ pub(crate) async fn execute_plan(
                     });
                 }
                 let rows = result.rows.len();
-                engine = materialize_query_result(engine, internal_name, &result).await?;
+                materialized.fetch_add(rows, Ordering::Relaxed);
+                engine = materialize_query_result(engine, internal_name, result).await?;
                 let elapsed_ms = start.elapsed().as_millis();
                 debug!(
                     table = %internal_name,
@@ -937,6 +974,7 @@ pub(crate) async fn execute_plan(
                     .await
                     .map_err(|e| match e {
                         SqlQueryError::RowCapExceeded { max } => {
+                            materialized.fetch_add(max, Ordering::Relaxed);
                             SqlQueryError::DependencyRowCapExceeded {
                                 label: dependency_label(&labels_by_target, internal_name, name)
                                     .to_string(),
@@ -951,6 +989,7 @@ pub(crate) async fn execute_plan(
                         other => other,
                     })?;
                 engine = returned_engine;
+                materialized.fetch_add(inserted, Ordering::Relaxed);
                 debug!(
                     table = %internal_name,
                     dependency = %name,
@@ -1083,29 +1122,36 @@ fn schema_from_query_result(result: &QueryResult) -> TableSchema {
 
 /// Materializes a [`QueryResult`] into a fresh physical table named
 /// `table_name`.
+///
+/// Takes the result by value and feeds `insert_rows` a lazy stream that moves
+/// each cell out of its row, so a second full copy of the result (one JSON
+/// object per row) never exists at once: each object is built on the insert
+/// thread just before its INSERT and dropped right after, and the source row
+/// is freed as it is consumed.
 async fn materialize_query_result(
     engine: InMemorySqlEngine,
     table_name: &str,
-    result: &QueryResult,
+    result: QueryResult,
 ) -> Result<InMemorySqlEngine, SqlQueryError> {
-    let schema = schema_from_query_result(result);
+    let schema = schema_from_query_result(&result);
     engine.create_table(table_name, &schema)?;
-    let rows: Vec<Result<Value, String>> = result
-        .rows
-        .iter()
-        .map(|row| {
-            let mut obj = serde_json::Map::new();
-            for (i, col) in result.columns.iter().enumerate() {
-                let v = row.get(i).cloned().flatten().unwrap_or(Value::Null);
-                obj.insert(col.clone(), v);
-            }
-            Ok(Value::Object(obj))
-        })
-        .collect();
     let cap = result.rows.len();
-    let stream = futures::stream::iter(rows);
+    let columns = result.columns;
+    let rows = result.rows.into_iter().map(move |row| {
+        let mut cells = row.into_iter();
+        let mut obj = serde_json::Map::with_capacity(columns.len());
+        for col in &columns {
+            obj.insert(col.clone(), cells.next().flatten().unwrap_or(Value::Null));
+        }
+        Ok(Value::Object(obj))
+    });
     let (returned_engine, _inserted) = engine
-        .insert_rows(table_name, &schema, Box::pin(stream), cap)
+        .insert_rows(
+            table_name,
+            &schema,
+            Box::pin(futures::stream::iter(rows)),
+            cap,
+        )
         .await?;
     Ok(returned_engine)
 }
@@ -1938,6 +1984,75 @@ mod tests {
         }
     }
 
+    async fn run_plan_counting(
+        runner_rows: usize,
+        limits: ExecLimits,
+        plan: &GraphPlan,
+        subject_sql: &str,
+        materialized: &AtomicUsize,
+    ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+        let runner: Arc<dyn SofRunner> = Arc::new(RowsRunner { rows: runner_rows });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        execute_plan_counting(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            plan,
+            subject_sql,
+            &[],
+            limits,
+            materialized,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_run_that_fails_on_the_row_cap_still_counts_its_rows_for_the_trim() {
+        use crate::memory_trim::{TRIM_AFTER_ROWS, should_trim_after_rows};
+        // ViewDefinition dependency: the cap is hit with `cap` rows loaded.
+        let cap = TRIM_AFTER_ROWS;
+        let counted = AtomicUsize::new(0);
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        run_plan_counting(
+            cap + 10,
+            limits(cap, 1000),
+            &plan,
+            "SELECT * FROM obs",
+            &counted,
+        )
+        .await
+        .err()
+        .expect("the dependency exceeds its cap");
+        let n = counted.load(Ordering::Relaxed);
+        assert_eq!(n, cap);
+        assert!(should_trim_after_rows(n));
+
+        // SQLView: the over-cap result is counted before the error returns.
+        let plan = GraphPlan {
+            nodes: vec![
+                PlanNode::Leaf {
+                    internal_name: "__sof_node_0".to_string(),
+                    view: named_view_definition("patients"),
+                },
+                PlanNode::SqlView {
+                    internal_name: "__sof_node_1".to_string(),
+                    sql: "SELECT a.id FROM base a, base b".to_string(),
+                    edges: vec![edge("base", "__sof_node_0")],
+                    name: "pairs".to_string(),
+                },
+            ],
+            subject_edges: vec![edge("pairs_t", "__sof_node_1")],
+        };
+        let counted = AtomicUsize::new(0);
+        run_plan_counting(3, limits(5, 1000), &plan, "SELECT * FROM pairs_t", &counted)
+            .await
+            .err()
+            .expect("the 9-row SQLView exceeds the cap");
+        // 3 leaf rows, then the cap + 1 rows the SQLView query was allowed.
+        assert_eq!(counted.load(Ordering::Relaxed), 3 + 6);
+    }
+
     #[tokio::test]
     async fn leaf_dependency_over_the_cap_names_label_view_cap_and_setting() {
         let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
@@ -2268,6 +2383,52 @@ mod tests {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
         assert!(!text.contains("(ViewDefinition pairs)"), "{text}");
+    }
+
+    /// The SQLView node table is fed by moving the result's cells, so the
+    /// values and their SQLite storage classes must match the result's:
+    /// a column whose first value is NULL and a column mixing integers and
+    /// text keep the same `typeof()` per row, and no row is lost.
+    #[tokio::test]
+    async fn sqlview_node_keeps_cell_values_and_storage_classes() {
+        let plan = GraphPlan {
+            nodes: vec![
+                PlanNode::Leaf {
+                    internal_name: "__sof_node_0".to_string(),
+                    view: named_view_definition("patients"),
+                },
+                PlanNode::SqlView {
+                    internal_name: "__sof_node_1".to_string(),
+                    sql: "SELECT CASE WHEN id = 'p0' THEN NULL ELSE 7 END AS n, \
+                          CASE WHEN id IN ('p0', 'p1') THEN 1 ELSE 'x' END AS m, \
+                          id FROM base"
+                        .to_string(),
+                    edges: vec![edge("base", "__sof_node_0")],
+                    name: "mixed".to_string(),
+                },
+            ],
+            subject_edges: vec![edge("mixed_t", "__sof_node_1")],
+        };
+        let (result, _) = run_plan(
+            6,
+            limits(100, 100),
+            &plan,
+            "SELECT typeof(n), typeof(m), COUNT(*) FROM mixed_t GROUP BY 1, 2 ORDER BY 1, 2",
+        )
+        .await
+        .expect("the SQLView node must materialize");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Some(json!("integer")),
+                    Some(json!("integer")),
+                    Some(json!(1))
+                ],
+                vec![Some(json!("integer")), Some(json!("text")), Some(json!(4))],
+                vec![Some(json!("null")), Some(json!("integer")), Some(json!(1))],
+            ]
+        );
     }
 
     /// The subject's own result is not a dependency: it is silently

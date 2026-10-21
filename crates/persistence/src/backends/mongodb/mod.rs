@@ -21,6 +21,7 @@ mod bulk_export;
 mod bulk_ingest;
 pub(crate) mod bulk_provider;
 mod bulk_submit;
+mod bundle_creates;
 mod composite_search;
 mod deferred_index;
 mod login_sessions;

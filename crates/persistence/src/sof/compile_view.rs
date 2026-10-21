@@ -28,7 +28,9 @@ use super::compile_path::{
     split_for_each_where, walk_fhir_type, walk_fhir_type_from,
 };
 use super::decode::ColumnDecode;
-use super::dialect::{pg_key_literal, pg_path_array_literal, sqlite_json_path_literal};
+use super::dialect::{
+    pg_key_literal, pg_path_array_literal, sqlite_json_path_literal, sqlite_json_source,
+};
 use super::ir::{Column, LitValue, PathStep, PlanNode, SqlExpr, SqlType};
 
 const ROOT_ALIAS: &str = "r";
@@ -1089,8 +1091,9 @@ fn build_degenerate_chain_sql(
             // Type-guarded even off `r.data`: the two-arg form would iterate
             // the members of a singleton object instead of the object.
             let path_lit = sqlite_json_path_literal(&segs);
-            let extracted = format!("json_extract({prev}, {path_lit})");
-            let type_check = format!("json_type({prev}, {path_lit})");
+            let json_prev = sqlite_json_source(&prev);
+            let extracted = format!("json_extract({json_prev}, {path_lit})");
+            let type_check = format!("json_type({json_prev}, {path_lit})");
             format!(
                 "json_each(CASE WHEN {type_check} = 'array' THEN {extracted} \
                  WHEN {type_check} IN ('object', 'array') THEN json_array(json({extracted})) \
@@ -1281,8 +1284,8 @@ mod tests {
             build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &SqliteDialect);
         assert!(
             sqlite.starts_with(
-                "json_each(CASE WHEN json_type(r.data, '$.name') = 'array' \
-                 THEN json_extract(r.data, '$.name')"
+                "json_each(CASE WHEN json_type(CAST(r.data AS TEXT), '$.name') = 'array' \
+                 THEN json_extract(CAST(r.data AS TEXT), '$.name')"
             ),
             "{sqlite}"
         );

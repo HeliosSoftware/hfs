@@ -35,9 +35,9 @@ use crate::bulk_submit::FailPoint;
 
 /// The deferral threshold of every test (except where stated): a Bundle of 5 or
 /// more entries defers its rows.
-const THRESHOLD: usize = 5;
+pub(super) const THRESHOLD: usize = 5;
 
-const MRN_SYSTEM: &str = "http://example.org/mrn";
+pub(super) const MRN_SYSTEM: &str = "http://example.org/mrn";
 
 // ---------------------------------------------------------------------------
 // Backends
@@ -47,7 +47,7 @@ const MRN_SYSTEM: &str = "http://example.org/mrn";
 /// (for failpoints), with `transaction_bundle_deferred_index_entries` set to
 /// `min_entries` (`Some(0)` = never defer, `None` = the gate's room).
 /// `configure` adjusts the config just before the backend is built.
-async fn deferred_backend(
+pub(super) async fn deferred_backend(
     test: &str,
     app: &str,
     min_entries: Option<usize>,
@@ -83,7 +83,7 @@ async fn same_db_backend(backend: &MongoBackend, app: &str) -> Option<MongoBacke
 
 /// True when the topology cannot run transactions and the test must skip (only
 /// possible against an external standalone `HFS_TEST_MONGODB_URL`).
-fn lacks_transactions<T>(result: &Result<T, TransactionError>) -> bool {
+pub(super) fn lacks_transactions<T>(result: &Result<T, TransactionError>) -> bool {
     if !matches!(
         result,
         Err(TransactionError::UnsupportedIsolationLevel { .. })
@@ -102,7 +102,7 @@ fn lacks_transactions<T>(result: &Result<T, TransactionError>) -> bool {
 // Bundles
 // ---------------------------------------------------------------------------
 
-fn post(url: &str, resource: Value, full_url: &str) -> BundleEntry {
+pub(super) fn post(url: &str, resource: Value, full_url: &str) -> BundleEntry {
     BundleEntry {
         method: BundleMethod::Post,
         url: url.to_string(),
@@ -112,14 +112,19 @@ fn post(url: &str, resource: Value, full_url: &str) -> BundleEntry {
     }
 }
 
-fn post_if_none_exist(url: &str, resource: Value, full_url: &str, criteria: &str) -> BundleEntry {
+pub(super) fn post_if_none_exist(
+    url: &str,
+    resource: Value,
+    full_url: &str,
+    criteria: &str,
+) -> BundleEntry {
     BundleEntry {
         if_none_exist: Some(criteria.to_string()),
         ..post(url, resource, full_url)
     }
 }
 
-fn patient_json(family: &str, mrn: &str) -> Value {
+pub(super) fn patient_json(family: &str, mrn: &str) -> Value {
     json!({
         "resourceType": "Patient",
         "identifier": [{"system": MRN_SYSTEM, "value": mrn}],
@@ -127,7 +132,7 @@ fn patient_json(family: &str, mrn: &str) -> Value {
     })
 }
 
-fn observation_json(subject: &str, n: usize) -> Value {
+pub(super) fn observation_json(subject: &str, n: usize) -> Value {
     json!({
         "resourceType": "Observation",
         "status": "final",
@@ -144,7 +149,7 @@ fn observation_json(subject: &str, n: usize) -> Value {
 
 /// A MedicationRequest whose `contained` holds the Medication its
 /// `medicationReference` points at, so it has `search_index_contained` rows.
-fn medication_request_json(subject: &str) -> Value {
+pub(super) fn medication_request_json(subject: &str) -> Value {
     json!({
         "resourceType": "MedicationRequest",
         "status": "active",
@@ -169,7 +174,7 @@ fn medication_request_json(subject: &str) -> Value {
 /// `n_obs` Observations whose subject is that urn, and one MedicationRequest
 /// with a contained Medication for the same patient: `n_obs + 2` POST entries,
 /// in that order.
-fn patient_bundle(n_obs: usize, family: &str, mrn: &str) -> Vec<BundleEntry> {
+pub(super) fn patient_bundle(n_obs: usize, family: &str, mrn: &str) -> Vec<BundleEntry> {
     let urn = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     let mut entries = vec![post("Patient", patient_json(family, mrn), &urn)];
     for n in 0..n_obs {
@@ -188,7 +193,7 @@ fn patient_bundle(n_obs: usize, family: &str, mrn: &str) -> Vec<BundleEntry> {
 }
 
 /// `(resource type, id)` of every entry of a result, from its `location`.
-fn located(result: &BundleResult) -> Vec<(String, String)> {
+pub(super) fn located(result: &BundleResult) -> Vec<(String, String)> {
     result
         .entries
         .iter()
@@ -210,7 +215,7 @@ fn located(result: &BundleResult) -> Vec<(String, String)> {
 // What the database holds
 // ---------------------------------------------------------------------------
 
-async fn raw_db(backend: &MongoBackend) -> mongodb::Database {
+pub(super) async fn raw_db(backend: &MongoBackend) -> mongodb::Database {
     raw_test_client(&backend.config().connection_string)
         .await
         .expect("raw client")
@@ -233,7 +238,7 @@ pub(super) async fn marker_count(backend: &MongoBackend, tenant_id: &str) -> u64
 }
 
 /// `(search_index, search_index_contained)` rows of one resource.
-async fn row_counts(
+pub(super) async fn row_counts(
     backend: &MongoBackend,
     tenant_id: &str,
     resource_type: &str,
@@ -327,7 +332,7 @@ async fn row_fingerprints(
 /// [`row_fingerprints`] of each resource, with the Bundle's own ids replaced by
 /// `<idN>` (N = the resource's position), so Bundles run on different backends
 /// compare equal when their rows do.
-async fn normalized_fingerprints(
+pub(super) async fn normalized_fingerprints(
     backend: &MongoBackend,
     tenant_id: &str,
     resources: &[(String, String)],
@@ -408,12 +413,16 @@ fn string_param(name: &str, value: &str) -> SearchParameter {
     param(name, SearchParamType::String, value)
 }
 
-fn reference_param(name: &str, value: &str) -> SearchParameter {
+pub(super) fn reference_param(name: &str, value: &str) -> SearchParameter {
     param(name, SearchParamType::Reference, value)
 }
 
 /// Ids of the Patients with identifier `MRN_SYSTEM|<mrn>`.
-async fn patients_by_mrn(backend: &MongoBackend, tenant: &TenantContext, mrn: &str) -> Vec<String> {
+pub(super) async fn patients_by_mrn(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    mrn: &str,
+) -> Vec<String> {
     search_ids(
         backend,
         tenant,
@@ -423,7 +432,7 @@ async fn patients_by_mrn(backend: &MongoBackend, tenant: &TenantContext, mrn: &s
     .await
 }
 
-async fn patients_by_family(
+pub(super) async fn patients_by_family(
     backend: &MongoBackend,
     tenant: &TenantContext,
     family: &str,
