@@ -512,6 +512,21 @@ jobs:
         working-directory: crates/pysof
         run: uv run maturin develop
 
+      # The sdist is otherwise only built by the tag-only `build` job, so a
+      # packaging break (#2192: dropping crates/pysof/Cargo.lock made the
+      # `include = ["Cargo.toml", ...]` entry collide with the workspace-root
+      # Cargo.toml) would first surface in a release. pysof resolves against
+      # the root Cargo.lock, so the sdist must ship it. Packaging only, no
+      # compile.
+      - name: Check pysof sdist ships Cargo.lock
+        working-directory: crates/pysof
+        shell: bash
+        run: |
+          out="$(mktemp -d)"
+          uv run maturin sdist -o "$out"
+          uv run python -I -c 'import sys, tarfile, glob; t = tarfile.open(glob.glob(sys.argv[1] + "/pysof-*.tar.gz")[0]); n = [m for m in t.getnames() if m.count("/") == 1 and m.endswith("/Cargo.lock")]; print(n); sys.exit(0 if n else "sdist is missing the root Cargo.lock")' "$out"
+          rm -rf "$out"
+
       # Runs pysof's Rust suites in the job that owns the crate. (test-rust's
       # `cargo test --workspace` does also select pysof — `--workspace`
       # overrides default-members — but this keeps a pysof-scoped signal next
