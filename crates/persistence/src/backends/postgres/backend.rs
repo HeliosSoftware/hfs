@@ -1400,14 +1400,14 @@ impl PostgresBackend {
         // transaction has no uncommitted SearchParameter of its own, so skip
         // the probe. Local SearchParameter writes drop the entry on commit;
         // other processes' are seen within the TTL.
-        if freshness.may_skip_probe(self.overlay_fingerprint_ttl, pending_search_parameter) {
-            if let Some(registry) = fresh_overlay_registry(
+        if freshness.may_skip_probe(self.overlay_fingerprint_ttl, pending_search_parameter)
+            && let Some(registry) = fresh_overlay_registry(
                 &self.stored_by_tenant,
                 tenant_id,
                 self.overlay_fingerprint_ttl,
-            ) {
-                return Ok(SearchParameterExtractor::new(registry));
-            }
+            )
+        {
+            return Ok(SearchParameterExtractor::new(registry));
         }
         let fingerprint = self.overlay_fingerprint(client, tenant_id).await?;
         let cached = self
