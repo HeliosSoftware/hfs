@@ -1904,3 +1904,159 @@ async fn mongodb_missing_index_follows_index_build_mode() {
         .await;
     }
 }
+
+/// `_id` and `_lastUpdated` are columns of every resource document and
+/// `:missing` on them never reads `missing_params`, so they are not recorded
+/// even though Synthea-style resources carry no `meta.lastUpdated` (#2006).
+#[tokio::test]
+async fn mongodb_missing_metadata_omits_resource_columns() {
+    let Some(backend) = create_backend("missing_columns").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-columns");
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("no-meta", vec![]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = backend.get_database().await.unwrap();
+    let names = missing_parameters(&db, &tenant, "Observation", "no-meta").await;
+    assert!(
+        names.iter().any(|name| name == "_tag"),
+        "other absent meta parameters are still recorded: {names:?}"
+    );
+    for column in ["_id", "_lastUpdated"] {
+        assert!(
+            !names.iter().any(|name| name == column),
+            "{column}: {names:?}"
+        );
+    }
+}
+
+/// `missing_metadata: false` (#2006): writes leave no `missing_params` and
+/// clear what an enabled writer left, the index is not built, and
+/// `:missing` answers exactly as with metadata.
+#[tokio::test]
+async fn mongodb_missing_metadata_disabled_keeps_missing_results() {
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        return;
+    };
+    let database_name = build_test_database_name("missing_disabled");
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: database_name.clone(),
+        data_dir: Some(repo_data_dir()),
+        ..Default::default()
+    };
+    let tenant = create_tenant("missing-disabled");
+
+    // An enabled writer first, as on a deployment that later opts out.
+    let Some(enabled) = build_backend(config.clone()).await else {
+        return;
+    };
+    register_parameters(&enabled, &tenant).await;
+    enabled
+        .create(
+            &tenant,
+            "Observation",
+            observation("written-enabled", vec![]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = enabled.get_database().await.unwrap();
+    assert!(
+        !missing_parameters(&db, &tenant, "Observation", "written-enabled")
+            .await
+            .is_empty()
+    );
+    db.collection::<Document>("resources")
+        .drop_index("idx_resources_missing_params")
+        .await
+        .unwrap();
+    drop(enabled);
+
+    let Some(disabled) = build_backend(MongoBackendConfig {
+        missing_metadata: false,
+        ..config
+    })
+    .await
+    else {
+        return;
+    };
+    assert!(matches!(
+        disabled.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+    let listed = db
+        .collection::<Document>("resources")
+        .list_index_names()
+        .await
+        .unwrap();
+    assert!(
+        !listed
+            .iter()
+            .any(|name| name == "idx_resources_missing_params"),
+        "the disabled backend must not build the index: {listed:?}"
+    );
+
+    for (id, values) in [
+        ("absent", vec![]),
+        ("null", extensions(true)),
+        ("present", extensions(false)),
+    ] {
+        disabled
+            .create(
+                &tenant,
+                "Observation",
+                observation(id, values),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let current = disabled
+        .read(&tenant, "Observation", "written-enabled")
+        .await
+        .unwrap()
+        .unwrap();
+    disabled
+        .update(
+            &tenant,
+            &current,
+            observation("written-enabled", extensions(false)),
+        )
+        .await
+        .unwrap();
+    let without_metadata = db
+        .collection::<Document>("resources")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation",
+            "missing_params": { "$exists": false },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        without_metadata, 4,
+        "no Observation may keep missing_params"
+    );
+
+    for parameter in &PARAMETERS {
+        for missing in [true, false] {
+            let expected: &[&str] = if missing {
+                &["absent", "null"]
+            } else {
+                &["present", "written-enabled"]
+            };
+            let mut query = missing_query(parameter, missing);
+            for total in [TotalMode::Accurate, TotalMode::Estimate] {
+                query.total = Some(total);
+                assert_results(&disabled, &tenant, &query, expected).await;
+            }
+        }
+    }
+}

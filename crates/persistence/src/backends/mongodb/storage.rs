@@ -3557,6 +3557,7 @@ impl MongoBackend {
                                 })
                                 .map(|parameter| parameter.name),
                         )
+                        .filter(|name| super::search_impl::records_missing_metadata(name))
                         .collect::<Vec<_>>()
                 });
                 (
