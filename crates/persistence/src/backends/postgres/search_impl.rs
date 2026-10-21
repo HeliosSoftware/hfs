@@ -651,6 +651,20 @@ impl PostgresBackend {
             // (normal contained memberships carry NULL). Probe that timestamp
             // range using the same predicate, rather than scanning all contained
             // rows of the tenant, and materialize only the eligibility boolean.
+            //
+            // There is deliberately no `EXISTS (... resources ... is_deleted =
+            // FALSE)` inside the pre-`LIMIT` subquery: the outer join to
+            // `resources` already filters `is_deleted = FALSE`, and every path
+            // that sets `is_deleted` (soft delete in `storage.rs`/`transaction.rs`)
+            // or removes a resource (`purge`, `purge_all`, tenant purge) deletes
+            // the resource's `search_index` rows in the same transaction, so the
+            // candidate set holds no deleted resources. The per-candidate probe
+            // cost one `resources_pkey` lookup per matching row. Orphaned index
+            // rows (which no HFS write path creates, but a restored dump or a
+            // hand-edited database can) are still handled: the join is a
+            // `LEFT JOIN` whose `ON` carries `is_deleted = FALSE`, so a dead
+            // candidate surfaces as a row with `needs_fallback = TRUE` and the
+            // caller re-runs the page with the general statement.
             let sql = format!(
                 "WITH index_eligible AS MATERIALIZED ( \
                    SELECT NOT EXISTS (SELECT 1 FROM search_index \
@@ -658,18 +672,16 @@ impl PostgresBackend {
                                         AND last_updated IS NULL AND {pred}) AS usable \
                  ) \
                  SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
-                        r.last_updated AS sort_key, FALSE AS needs_fallback \
+                        r.last_updated AS sort_key, (r.id IS NULL) AS needs_fallback \
                  FROM ( \
                    SELECT DISTINCT resource_id, last_updated FROM search_index \
                    WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard}{boundary} \
-                     AND EXISTS (SELECT 1 FROM resources live \
-                                 WHERE live.tenant_id = $1 AND live.resource_type = $2 \
-                                   AND live.id = search_index.resource_id AND live.is_deleted = FALSE) \
                    ORDER BY {order} LIMIT {lim}{offset} \
                  ) c \
-                 JOIN resources r \
+                 LEFT JOIN resources r \
                    ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
-                 WHERE r.is_deleted = FALSE AND (SELECT usable FROM index_eligible) \
+                  AND r.is_deleted = FALSE \
+                 WHERE (SELECT usable FROM index_eligible) \
                  UNION ALL \
                  SELECT NULL::text, NULL::text, NULL::jsonb, NULL::timestamptz, \
                         NULL::text, NULL::timestamptz, TRUE AS needs_fallback \
@@ -723,7 +735,7 @@ impl PostgresBackend {
         // Contained memberships normally carry NULL under their parent's identity.
         // The same-statement sentinel preserves unique parent identities and
         // contained-only matches even when CRUD changes the representation.
-        if fast_index_pred.is_some() && rows.first().is_some_and(|row| row.get::<_, bool>(6)) {
+        if fast_index_pred.is_some() && rows.iter().any(|row| row.get::<_, bool>(6)) {
             let (sql, _) = general_page_sql();
             rows = if statement_is_reusable(query) {
                 query_dyn_cached(client, &sql, &param_refs).await

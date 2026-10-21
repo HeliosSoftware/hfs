@@ -11127,13 +11127,13 @@ mod postgres_integration {
                     && !eligibility.contains("contained_type = $2")
                     && !eligibility.contains("resource_id > $4")
                     && !eligibility.contains("resource_id < $4")
-                    && sql.contains("FALSE AS needs_fallback")
+                    && sql.contains("(r.id IS NULL) AS needs_fallback")
                     && sql.contains("TRUE AS needs_fallback"),
                 "representation eligibility must cover matching NULL timestamps in the same snapshot, before any page boundary: {sql}"
             );
             let candidate_page = sql
                 .split_once("FROM ( ")
-                .and_then(|(_, tail)| tail.split_once(") c JOIN resources r"))
+                .and_then(|(_, tail)| tail.split_once(") c LEFT JOIN resources r"))
                 .map(|(page, _)| page)
                 .expect("the production page must select index identities before loading bodies");
             assert!(
@@ -11141,20 +11141,14 @@ mod postgres_integration {
                     .starts_with("SELECT DISTINCT resource_id, last_updated FROM search_index"),
                 "duplicate memberships must be eliminated in the candidate page: {sql}"
             );
-            let live_check = candidate_page
-                .find("EXISTS (SELECT 1 FROM resources live")
-                .expect("page selection must check live identities");
-            let page_limit = candidate_page.find("LIMIT 6").unwrap();
+            // The live check is the outer LEFT JOIN, not a per-candidate probe
+            // before LIMIT; dead candidates surface as `needs_fallback` rows.
             assert!(
-                live_check < page_limit,
-                "dead candidates must be excluded before LIMIT: {sql}"
-            );
-            assert!(
-                candidate_page.contains("live.tenant_id = $1 AND live.resource_type = $2")
-                    && candidate_page
-                        .contains("live.id = search_index.resource_id AND live.is_deleted = FALSE")
-                    && !candidate_page.contains(".data"),
-                "the pre-limit check must be scoped to a live identity without loading bodies: {sql}"
+                !candidate_page.contains("resources live")
+                    && !candidate_page.contains(".data")
+                    && sql.contains("LEFT JOIN resources r")
+                    && sql.contains("AND r.is_deleted = FALSE"),
+                "live identities are checked by the outer join: {sql}"
             );
             let mut args = vec![
                 format!("'{}'", tenant.tenant_id().as_str()),
