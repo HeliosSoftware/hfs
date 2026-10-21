@@ -4453,8 +4453,7 @@ mod tests {
             .search_with_connection(&conn, &tenant, &query, None)
             .unwrap();
         assert!(!with_index.resources.items.is_empty());
-        conn.execute("DROP INDEX idx_search_token", [])
-            .unwrap();
+        conn.execute("DROP INDEX idx_search_token", []).unwrap();
         let without = backend
             .search_with_connection(&conn, &tenant, &query, None)
             .unwrap();

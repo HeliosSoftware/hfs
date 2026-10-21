@@ -3526,7 +3526,10 @@ mod tests {
             .unwrap()
         };
         assert!(sql_of("idx_search_quantity").contains("value_quantity_unit, resource_key)"));
-        assert!(sql_of("idx_search_token").contains("value_token_code, resource_key, value_token_system"));
+        assert!(
+            sql_of("idx_search_token")
+                .contains("value_token_code, resource_key, value_token_system")
+        );
         assert!(
             sql_of("idx_search_composite_cov")
                 .contains("param_name, resource_key, composite_group")
