@@ -2421,9 +2421,15 @@ async fn index(
     let types: Vec<String> = query_value(query.as_deref(), "types")
         .or_else(|| query_value(query.as_deref(), "type"))
         .map(|csv| {
+            // Deduplicated and capped at what the chart can plot, so a
+            // repeated or overlong list cannot become a distinct cached
+            // snapshot of its own (#2186).
+            let mut seen = std::collections::HashSet::new();
             csv.split(',')
                 .map(str::trim)
                 .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                .filter(|t| seen.insert(*t))
+                .take(CHART_MAX_SERIES)
                 .map(str::to_string)
                 .collect()
         })
