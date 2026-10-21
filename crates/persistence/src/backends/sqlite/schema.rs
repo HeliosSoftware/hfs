@@ -2293,8 +2293,8 @@ fn migrate_v41_to_v42(conn: &Connection) -> StorageResult<()> {
 
 /// Migrate from schema version 42 to version 43.
 ///
-/// A no-op. The branch that introduced v43 built `idx_search_composite_code`
-/// here; v46 supersedes it (the token half of a composite is read from the
+/// A no-op that keeps the version number. An earlier build of this change built
+/// `idx_search_composite_code` here; v46 supersedes it (the token half of a composite is read from the
 /// reshaped `idx_search_token`), so a database coming from v42 skips the build
 /// instead of paying for an index that v46 would drop. A database that already
 /// carries the index (it ran the original v43) has it dropped by v46.
@@ -2304,7 +2304,7 @@ fn migrate_v42_to_v43(_conn: &Connection) -> StorageResult<()> {
 
 /// Migrate from schema version 43 to version 44.
 ///
-/// A no-op, for the same reason as v43: the branch that introduced v44 built
+/// A no-op, for the same reason as v43: an earlier build built
 /// `idx_search_token_code`, a second code-first copy of every token row. It
 /// cost about a third more WAL per create (one more b-tree page per token row)
 /// and v46 gets the same code seek by reshaping `idx_search_token` itself, so

@@ -151,7 +151,8 @@ const RECENT_WRITES_SQL: &str = "SELECT COUNT(*) FROM (SELECT 1 FROM resource_hi
 
 /// One type's bucketed history deltas (`count_deltas_by_bucket`): `?1`
 /// tenant, `?2` type, `?3` window bound, `?4` bucket width. The unary `+` keeps
-/// the planner off `idx_history_resource`, whose `(tenant_id, resource_type)`
+/// the planner off `idx_history_resource` (present on databases created before
+/// schema v45, which drops it), whose `(tenant_id, resource_type)`
 /// equality looks better unanalysed but visits every version of the type with
 /// a table read each; `idx_history_updated` covers the query (schema v40,
 /// #2107), so it reads only the window, from the index alone.
@@ -5378,7 +5379,8 @@ mod tests {
 
     /// #2107: the dashboard's bucketed history counts read only the window,
     /// from `idx_history_updated` alone — never a table row per version, and
-    /// never every version of a type through `idx_history_resource`.
+    /// never every version of a type through `idx_history_resource` (databases
+    /// below schema v45 still have it).
     #[test]
     fn test_count_deltas_query_plans_are_covered_by_the_history_index() {
         let backend = create_test_backend();
