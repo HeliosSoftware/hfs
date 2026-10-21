@@ -146,10 +146,10 @@ if ic:
     except ValueError:
         imp_entries = 0
     imp_warn = "" if imp_ok >= 1000 else (
-        " ⚠ **import incomplete — crud/search on this leg ran on a smaller corpus "
-        "and are not comparable to a 1000/1000 leg** (and abandoned import requests "
+        " ⚠ **Batch/Transaction Import incomplete — crud/search on this leg ran on a smaller corpus "
+        "and are not comparable to a 1000/1000 leg** (and abandoned Batch/Transaction Import requests "
         "may still have been running server-side)")
-    print(f"\n**Import:** {imp_ok:,}/1000 bundles, {imp_entries:,} entries in "
+    print(f"\n**Batch/Transaction Import** (`POST /` Bundles): {imp_ok:,}/1000 bundles, {imp_entries:,} entries in "
           f"{ic.get('wall_seconds', '?')} s{import_rate(ic, imp_ok, imp_entries)}.{imp_warn}")
 
 # Bulk import ($bulk-submit into a fresh database, bulk-import.sh): the
@@ -171,16 +171,16 @@ if bi:
     if bi_status == "complete":
         # index_seconds=0 with index_status=inline means HFS indexed while ingesting,
         # not that indexing was free; say so instead of printing a zero-second rebuild.
-        bi_ingest = f"ingest {bi.get('ingest_seconds', '?')} s"
+        bi_ingest = f"Bulk Import: ingest {bi.get('ingest_seconds', '?')} s"
         if bi.get("index_status") == "inline" or bi.get("defer_indexing") == "false":
             bi_phases = f"{bi_ingest}, search index built inline during ingest"
             if bi.get("index_status") not in ("inline", "", None):
                 bi_phases += (f" + {bi.get('index_seconds', '?')} s rebuild of rejected types, "
                               f"`{bi.get('index_status')}`")
         else:
-            bi_phases = (f"{bi_ingest} + search-index rebuild {bi.get('index_seconds', '?')} s, "
+            bi_phases = (f"{bi_ingest} + Bulk Import: index rebuild {bi.get('index_seconds', '?')} s, "
                          f"`{bi.get('index_status', '?')}`")
-        print(f"\n**Bulk import (`$bulk-submit`):** {bi_n('resources_ok')}/{bi_n('resources_submitted')} "
+        print(f"\n**Bulk Import (`$bulk-submit`):** {bi_n('resources_ok')}/{bi_n('resources_submitted')} "
               f"resources in {bi.get('total_seconds', '?')} s ({bi_phases}) = "
               f"**{bi.get('resources_per_s', '?')} resources/s** end to end, "
               f"{bi.get('ingest_resources_per_s', '?')} resources/s ingest only; fresh database, "
@@ -193,7 +193,7 @@ if bi:
               f"`Encounter?class=AMB,EMER` {bi_n('check_encounter_class')}/{bi_n('expect_encounter_class')} "
               + ("✓" if bi_ok else "⚠ **not every ingested resource is searchable**"))
     else:
-        print(f"\n⚠ **Bulk import (`$bulk-submit`):** `{bi_status}` — {bi.get('reason') or 'no reason recorded'} "
+        print(f"\n⚠ **Bulk Import (`$bulk-submit`):** `{bi_status}` — {bi.get('reason') or 'no reason recorded'} "
               f"(reached phase `{bi.get('phase', '?')}`; {bi_n('resources_ok')} of "
               f"{bi_n('resources_submitted')} resources ingested). Details in `bulk-import.log` / "
               "`bulk-import-hfs.log`.")
@@ -292,7 +292,7 @@ if backend.endswith("-elasticsearch"):
         print("\n**How to read this leg.** Every search is answered by Elasticsearch; the primary's "
               "own search index is not written. In `synchronous` mode a write returns only after "
               "Elasticsearch has indexed it — bundles go through a per-resource-type `_bulk` request "
-              "with `refresh=wait_for` against a 200ms `refresh_interval`, so **import/crud/insert latency "
+              "with `refresh=wait_for` against a 200ms `refresh_interval`, so **Batch/Transaction Import/crud/insert latency "
               "on this leg includes Elasticsearch indexing plus that refresh wait**, not just the "
               "primary. Every update and delete also runs a `_delete_by_query` with a forced refresh "
               "across all of the tenant's indices. Cluster health `yellow` is expected (1 replica per "
@@ -303,13 +303,13 @@ if backend.endswith("-elasticsearch"):
               "own search index is not written. Writes commit on the primary first. In `asynchronous` "
               "mode ONE background worker then forwards each resource to Elasticsearch individually "
               "(an index-exists check plus an index request per resource) through a 1,000-event queue "
-              "that blocks writers when full, so **import, crud and insert throughput on this leg is "
+              "that blocks writers when full, so **Batch/Transaction Import, crud and insert throughput on this leg is "
               "that worker's rate, not the primary's**. Every update and delete also runs a "
               "`_delete_by_query` with a forced refresh across all of the tenant's indices. Cluster "
               "health `yellow` is expected (1 replica per index, 1 node). Compare search latency with "
               "another leg only if both imported the same entry count and the ES drain above says "
-              "`drained`. **This worker's rate is expected to make import hit k6's 60-minute cap "
-              "before the corpus finishes, leaving the index incomplete** (see the Import and ES "
+              "`drained`. **This worker's rate is expected to make Batch/Transaction Import hit k6's 60-minute cap "
+              "before the corpus finishes, leaving the index incomplete** (see the Batch/Transaction Import and ES "
               "drain lines above / `es-drain.txt`; run 36412022609 imported 313/1000 bundles and "
               "the drain gate reported status=incomplete with 194,664 resources never indexed).")
 if backend.startswith("mongodb"):
@@ -319,7 +319,7 @@ if backend.startswith("mongodb"):
           f"{pg_shared_buffers}; both also use the host page cache). Each FHIR "
           "transaction bundle is one multi-document transaction (lifetime "
           f"{ri.get('mongo_txn_lifetime_s', '900')} s); an aborted transaction fails that bundle's "
-          "`Bundle import` check — see Checks ✗ on the import row (in Results, below) and "
+          "`Bundle import` check — see Checks ✗ on the Batch/Transaction Import row (in Results, below) and "
           "`txn.aborted` in `import-mongostat.txt`.")
 
 # Result-size cross-check (F5): a composite search that silently
@@ -352,7 +352,7 @@ if os.path.exists(sc_path):
             residue_total = 0
         patient_residue = cr.get("Patient", "0")
         print(f"\n_totals include {residue_total} crud/prewarm leftovers "
-              f"(Patient: {patient_residue}) and any import shortfall; a composite "
+              f"(Patient: {patient_residue}) and any Batch/Transaction Import shortfall; a composite "
               "total equal to the Observation total means the name-only fallback; "
               "seconds after a 000 row overlap the previous query (HFS keeps "
               "executing after curl's --max-time)._")
@@ -421,7 +421,7 @@ if os.path.exists(mte_path):
     if mte_n > 0:
         print(f"\n⚠ **Mongo transaction errors (heuristic):** {mte_n} HFS log line(s) matching "
               "WriteConflict/TransientTransactionError/TransactionTooLargeForCache/NoSuchTransaction/"
-              "commit-failed — bundle failures are the import row's Checks ✗ (in Results, below), "
+              "commit-failed — bundle failures are the Batch/Transaction Import row's Checks ✗ (in Results, below), "
               "not this count.")
 
 # Final ES sync failures (spec §15d): composite_secondary_sync_failures_total

@@ -21,12 +21,12 @@ import compare_legs as cl  # noqa: E402
 RUN = "100"
 SUITES = ("prewarm", "import", "crud", "search")
 INSERT_ROW = "insert (creates/s)"
-IMPORT = "import, `POST /` transaction Bundles"  # Errors label; Throughput and p95 add a unit
+IMPORT = "Batch/Transaction Import, `POST /` Bundles"  # Errors label; Throughput and p95 add a unit
 IMPORT_ROW = IMPORT + " (resources/s)"
-BULK = "bulk-import, `$bulk-submit`"
+BULK = "Bulk Import, `$bulk-submit`"
 BULK_ROW = BULK + " (resources/s)"
-INGEST_ROW = "bulk-import ingest (resources/s, seconds)"
-INDEX_ROW = "bulk-import initial index (seconds)"
+INGEST_ROW = "Bulk Import: ingest (resources/s, seconds)"
+INDEX_ROW = "Bulk Import: index rebuild (seconds)"
 REINDEX = "reindex, `$reindex` Encounter"
 REINDEX_ROW = REINDEX + " (resources/s)"
 _guard = {"on": False}
@@ -261,7 +261,22 @@ class CompareLegsTest(unittest.TestCase):
         put_dir(only, "postgres", {"insert.json": summary(640.0, 120.0), "insert.log": "k6\n"})
         md = render(only, ["sqlite", "postgres"], tests="insert")
         self.assertEqual(row(md, "Throughput", INSERT_ROW), "| insert (creates/s) | **812** | 640 |")
-        self.assertNotIn("| crud", md)
+        # crud and search are always listed, so a trimmed run does not look like a report
+        # that lost them
+        self.assertEqual(row(md, "Throughput", "crud"),
+                         "| crud | n/a (not requested) | n/a (not requested) |")
+        self.assertEqual(row(md, "Throughput", "search"),
+                         "| search | n/a (not requested) | n/a (not requested) |")
+
+    def test_bulk_import_only_run_still_lists_crud_and_search(self):
+        for leg in ("sqlite", "postgres"):
+            put_dir(self.root, leg, {"bulk-import.txt": bulk_txt(), "bulk-import.log": "x\n"})
+        md = render(self.root, ["sqlite", "postgres"], tests="bulk-import")
+        for table in ("Throughput", "p95", "Errors"):
+            for suite in ("crud", "search"):
+                self.assertTrue(row(md, table, suite).endswith(
+                    "| n/a (not requested) | n/a (not requested) |"), (table, suite))
+        self.assertIn(BULK_ROW, md)
 
     def test_insert_not_run_and_not_requested(self):
         put_dir(self.root, "sqlite", leg_files("sqlite"))
