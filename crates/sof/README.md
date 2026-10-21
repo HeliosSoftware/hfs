@@ -1013,6 +1013,7 @@ The SOF implementation supports Apache Parquet format for efficient columnar dat
 - **Optimized for Large Datasets**:
   - Incremental encoding in batches of 8,192 rows; the schema is fixed before the first row
   - Row groups are cut by encoded size, so memory stays bounded by about one row group (see `docs/sof-parquet-streaming-benchmark.md`)
+  - For a ViewDefinition subject, `$sql-run` also streams `json`, `csv` and `fhir` once a result has more than 100 rows (SQL Query (Library) subjects still buffer); a row error after the first 100 rows aborts the body, and the request timeout no longer bounds a streamed run after that point
   - The `$sql-run` HTTP response is streamed as row groups are written; an error after the first bytes aborts the body instead of returning a truncated file with a clean `200`
   - Configurable row group size (default: 256MB, range: 64-1024MB), measured in encoded bytes
   - File splitting (`--max-file-size`) has the granularity of one batch: a file can overshoot the limit by one batch plus the footer

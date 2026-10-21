@@ -766,6 +766,30 @@ write set; see
 [Deferred search indexing for large MongoDB transaction Bundles](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
 The measurements below predate that change and describe Bundles under the threshold.
 
+**How a Bundle sends its creates (#1977).** Creating a resource (a POST, or a PUT or conditional
+PUT that creates) no longer starts with a read of `resources` to see whether the id is taken; a
+PUT still looks up its target to choose between create and update. The unique
+`idx_resources_identity` refuses a reused id, live or deleted, and the Bundle fails at that entry
+with the same `400` ("resource already exists") as before. The creates are kept in memory and sent
+in chunks: a chunk goes out once it holds 100 entries, 16 MiB of resource payload (counted as BSON
+once for the `resources` document and once for its history copy, not the memory held) or 5,000
+search rows, and a
+resource of 1 MiB or more is sent on its own. These bounds are fixed in code, not configurable. A
+chunk is one ordered `insert_many` into `resources`, one into `resource_history` and, for natively
+indexed resources, one delete of any old rows of the created ids from each of `search_index` and
+`search_index_contained`, followed by one `insert_many` of the new rows into each that has any. A
+chunk is also sent before any entry that reads what the Bundle wrote (a GET, PUT, PATCH, DELETE,
+or a POST with `ifNoneExist`), before an entry's failure is reported, before the deferred-index
+ledger and before the commit. HFS runs a Bundle's entries in the order DELETE, POST, PUT or PATCH,
+GET, so its plain POSTs are normally one run. A run of plain POSTs within the bounds sends at most
+6 commands per 100 entries, where it sent 6 to 7 per entry before (3 per entry on
+`mongodb-elasticsearch` and above the deferral threshold, which now send 2 per 100); a bound can
+cut a chunk short. A PUT or conditional PUT that creates, and a POST with `ifNoneExist`, make the
+Bundle send what it holds first, so such creates are sent one at a time and save only the
+existence read. The Bundle writes the same documents and index keys, so this shortens how long it
+runs and holds the admission room. For the same reason the cache ceiling below is not expected to
+move; that is inferred. Neither the speed-up nor the ceiling has been measured on the benchmark.
+
 Past what the cache can hold, MongoDB aborts the oldest transaction ("oldest pinned transaction
 ID rolled back for eviction"). HFS replays such aborts (#1641, #1700), except for a Bundle that
 runs alone (see below), and returns `503` with `Retry-After` when the replays run out, but
@@ -870,12 +894,15 @@ that an unchanged resubmit will fail: the room bounds only this instance's trans
 while single-resource writes, batch Bundles, other HFS instances and other clients share the same
 cache, so a resubmit is unlikely to succeed but can (#1993). It logs one `WARN`, "transaction bundle
 rolled back for eviction while running alone; not retrying", with `lone=true`, `entries`,
-`failed_entry` (absent at commit), `error_code` and `attempt` (#1895). The `Transaction failed`
-`ERROR` line names the cause: `write set too large` for 388, `lone eviction rollback` here. Bundles
-that shared the room, and plain write conflicts, are still replayed. With a weight of `0` or no
-limit no Bundle counts as alone. Raising the limit x the weight above the largest Bundle restores
-the replays, at the cost of sharing the cache. The room is per backend instance: Bundles sent to
-another HFS instance on the same MongoDB are not seen.
+`failed_entry` (absent at commit), `error_code` and `attempt` (#1895). With chunked creates
+(#1977), `failed_entry`, and the "Entry N" of the log-only reasons, is the entry whose document the
+server refused when the error names one, and otherwise the first entry of the chunk being sent, so
+an abort position reads up to 99 entries before the entry the server was writing. The
+`Transaction failed` `ERROR` line names the cause: `write set too large` for 388,
+`lone eviction rollback` here. Bundles that shared the room, and plain write conflicts, are still
+replayed. With a weight of `0` or no limit no Bundle counts as alone. Raising the limit x the
+weight above the largest Bundle restores the replays, at the cost of sharing the cache. The room is
+per backend instance: Bundles sent to another HFS instance on the same MongoDB are not seen.
 
 Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less
 2 s, capped at 120 s) counts from admission. The whole call, wait included, stays within
@@ -1092,16 +1119,17 @@ which MongoDB rolls a lone Bundle back for cache eviction (see
 
 **What the transaction writes.** The `resources` documents and the history rows, as always. Each
 `resources` document whose rows are deferred also carries a transient field,
-`search_rows_pending: <bundle id>`, until its rows are written. The transaction adds a ledger,
-the `search_index_pending` collection, with one document per 5,000 resources (50,000 resources
-write ten), each naming its resources as `Type/id` together with `tenant_id`, `bundle_id`,
-`chunk`, `chunks`, `entries`, `created_at`, `not_before` and `attempts`. The ledger commits or
-aborts with the Bundle, so an aborted or replayed attempt leaves neither a ledger nor markers. A
-failure to write the ledger is a server-side failure of the Bundle and answers `500`, with nothing
-applied (a cache failure still ends as `500` `too-costly`, and a transient abort is replayed as
-before); no entry is blamed for it. The transaction does not insert `search_index` or
-`search_index_contained` rows, and it skips the two deletes of old rows per entry. It still runs
-the search extraction, and each `resources` document still gets its `missing_params`
+`search_rows_pending: <bundle id>`, until its rows are written. The transaction adds a ledger, the
+`search_index_pending` collection, with one document per 5,000 resources (50,000 resources write
+ten), each naming its resources as `Type/id` together with `tenant_id`, `bundle_id`, `chunk`,
+`chunks`, `entries`, `created_at`, `not_before` and `attempts`. The ledger goes in after the last
+chunk of creates (#1977) and before the commit, and it commits or aborts with the Bundle, so an
+aborted or replayed attempt leaves neither a ledger nor markers. A failure to write the ledger is a
+server-side failure of the Bundle and answers `500`, with nothing applied (a cache failure still
+ends as `500` `too-costly`, and a transient abort is replayed as before); no entry is blamed for
+it. The transaction does not insert `search_index` or `search_index_contained` rows, and it skips
+the deletes of old rows that an inline Bundle sends once per chunk of creates (or per update). It
+still runs the search extraction, and each `resources` document still gets its `missing_params`
 ([missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata))
 inside the transaction. That array and its `idx_resources_missing_params` entries are part of the
 transaction's write set; only the rows are deferred. The collection and its `not_before` index

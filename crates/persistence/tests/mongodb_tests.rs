@@ -1280,6 +1280,11 @@ mod transaction_bundle_load;
 #[path = "mongodb/deferred_search_index.rs"]
 mod deferred_search_index;
 
+/// #1977: a transaction Bundle sends its creates in chunks with no existence
+/// read; command counts from the profiler, reused ids, read-after-create.
+#[path = "mongodb/bundle_create_chunks.rs"]
+mod bundle_create_chunks;
+
 /// #1748: potentially broad searches wait for a permit, so a read can still get
 /// a pooled connection while they run.
 #[path = "mongodb/broad_search_admission.rs"]

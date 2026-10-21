@@ -94,7 +94,7 @@ cdrs-tokio-helpers-derive = { version = "5", optional = true }
 mongodb = { version = "3", optional = true }
 
 # Neo4j backend
-neo4rs = { version = "0.8", optional = true }
+neo4rs = { version = "0.9.0-rc.10", optional = true }
 
 # Elasticsearch backend
 elasticsearch = { version = "8.15.0-alpha.1", optional = true }
