@@ -647,6 +647,22 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_resources_live_tenant
   ON resources (tenant_id) WHERE is_deleted = FALSE;
 ```
 
+Schema v50 adds `idx_search_date_recent_end` on `search_index (tenant_id, resource_type, param_name,
+last_updated DESC, resource_id) INCLUDE (value_date, value_date_end) WHERE value_date_end IS NOT NULL`,
+which lets date `gt`/`ge` searches walk the newest-first order and stop at the first qualifying rows
+(Observation, Encounter and Patient `gt`/`ge`: 0.07-0.11 ms on a 7M-row `search_index`; 66 MB). It is
+built the same way as the v49 index (`CREATE INDEX CONCURRENTLY` under the migration lock, recorded only
+once the index is valid, an interrupted build is dropped and rebuilt on the next startup) and runs no
+`ANALYZE`: the planner keeps using the table's per-column statistics, which the index does not change.
+The index is additive and has no opt-out. To keep the build out of the startup path, run it beforehand;
+v50 then finds it and only records the version:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_search_date_recent_end
+  ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+  INCLUDE (value_date, value_date_end) WHERE value_date_end IS NOT NULL;
+```
+
 ### PostgreSQL + Elasticsearch
 
 PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarantees. Elasticsearch handles all search operations. Combines PostgreSQL's production-grade storage with Elasticsearch's search capabilities.
