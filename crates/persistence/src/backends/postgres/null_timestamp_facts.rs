@@ -128,7 +128,9 @@ enum Cached {
     NoNulls,
     HasNulls,
     /// Past [`TTL`] but within [`GRACE`]; carries whether NULL rows were known.
-    Stale { has_nulls: bool },
+    Stale {
+        has_nulls: bool,
+    },
     Unknown,
 }
 
@@ -313,7 +315,11 @@ mod tests {
 
     #[test]
     fn recently_expired_entries_are_stale_and_old_ones_unknown() {
-        if learn("t-stale", &[("Patient", "name")], TTL + Duration::from_secs(1)) {
+        if learn(
+            "t-stale",
+            &[("Patient", "name")],
+            TTL + Duration::from_secs(1),
+        ) {
             assert!(matches!(
                 lookup("t-stale", "Patient", "name"),
                 Cached::Stale { has_nulls: true }
