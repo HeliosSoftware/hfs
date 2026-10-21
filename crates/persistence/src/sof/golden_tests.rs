@@ -223,6 +223,29 @@ fn cases() -> Vec<Case> {
         json!([{"repeat":["item"],"column":[{"path":"linkId","name":"a"}]},
         {"repeat":["item"],"column":[{"path":"linkId","name":"b"}]}]),
     ));
+    // `ObservationComponent` has no `component`: lowered as a `forEach`.
+    cases.push(Case {
+        name: "repeat-single-level",
+        view: view(
+            "Observation",
+            json!([{"column":[{"path":"getResourceKey()","name":"observation_id","type":"id"}]},
+            {"repeat":["component"],"column":[{"path":"code.text","name":"component_name","type":"string"},
+                {"path":"code.coding.first().code","name":"component_code","type":"string"}]}]),
+        ),
+        filters: ViewFilters::default(),
+        paged: false,
+    });
+    cases.push(Case {
+        name: "reference-key",
+        view: view(
+            "Observation",
+            json!([{"column":[{"path":"id","name":"id"},
+            {"path":"subject.getReferenceKey()","name":"any_key","type":"string"},
+            {"path":"subject.getReferenceKey(Patient)","name":"patient_key","type":"string"}]}]),
+        ),
+        filters: ViewFilters::default(),
+        paged: false,
+    });
     cases.push(patient(
         "union-in-foreach",
         json!([{"column":[{"path":"id","name":"id"}]},
@@ -260,6 +283,13 @@ fn cases() -> Vec<Case> {
         ..Default::default()
     };
     cases.push(anchors);
+    let mut exists_multi_step = patient(
+        "exists-multi-step",
+        json!([{"column":[{"path":"id","name":"id"}]}]),
+    );
+    exists_multi_step.view["where"] =
+        json!([{"path":"contact.telecom.exists(system = 'phone' and value = '555')"}]);
+    cases.push(exists_multi_step);
     // Keyset pages of an export read: range slots come last, no SQL LIMIT.
     for (name, source) in [
         ("export-page-flat", "flat"),
@@ -307,7 +337,7 @@ async fn check(dialect: SqlDialect, name: &str) {
         std::fs::create_dir_all(&directory).unwrap();
     }
     let cases = cases();
-    assert_eq!(cases.len(), 32, "all golden cases must execute");
+    assert_eq!(cases.len(), 35, "all golden cases must execute");
     for case in cases {
         let groups = || {
             vec![
@@ -376,4 +406,46 @@ async fn sqlite_complete_sql_and_bindings() {
 #[tokio::test]
 async fn postgres_complete_sql_and_bindings() {
     check(SqlDialect::Postgres, "postgres").await;
+}
+
+/// Every SQLite JSON function or operator must read the root document through
+/// the TEXT cast (`CAST(r.data AS TEXT)`), never the bare `r.data` BLOB, so
+/// SQLite parses the document once per row instead of once per call.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_goldens_never_pass_bare_root_to_json() {
+    let bare =
+        regex::Regex::new(r"json_(extract|each|type)\(\s*r\.data\b|\(?r\.data\s*->").unwrap();
+    assert!(bare.is_match("json_extract(r.data, '$.id')"));
+    assert!(bare.is_match("json_each( r.data, '$.name')"));
+    assert!(bare.is_match("json_type(r.data, '$.name')"));
+    assert!(bare.is_match("(r.data ->> '$.id')"));
+    assert!(!bare.is_match("json_extract(CAST(r.data AS TEXT), '$.id')"));
+
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/sof");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&directory).unwrap() {
+        let path = entry.unwrap().path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".sqlite.sql"))
+        {
+            continue;
+        }
+        let sql = std::fs::read_to_string(&path).unwrap();
+        if let Some(found) = bare.find(&sql) {
+            panic!(
+                "{} passes a bare r.data to JSON: {}",
+                path.display(),
+                found.as_str()
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no sqlite goldens found in {}",
+        directory.display()
+    );
 }

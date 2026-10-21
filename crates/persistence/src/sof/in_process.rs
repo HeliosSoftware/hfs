@@ -29,17 +29,14 @@ use helios_sof::{
     parse_view_definition_for_version,
 };
 use serde_json::{Map, Value};
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use crate::core::sof_runner::{
-    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+    ROW_BATCH_SIZE, RowStream, SofError, SofRunner, ViewFilters, ViewRow, row_batch_channel,
+    row_stream, watch_row_producer,
 };
 use crate::sof::reference_resolver::{StorageReferenceResolver, collect_missing_references};
 use crate::tenant::TenantContext;
-
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
 
 /// Number of resources handed to the engine per [`PreparedViewDefinition::process_chunk`]
 /// call. Bounds peak memory when scanning large resource types.
@@ -248,6 +245,9 @@ fn map_engine_error(e: helios_sof::SofError) -> SofError {
     match e {
         E::InvalidViewDefinition(m) => SofError::InvalidViewDefinition(m),
         E::ReferencedResourceNotFound(m) => SofError::InvalidViewDefinition(m),
+        // A path the view's author wrote that FHIRPath rejects is a problem with
+        // the ViewDefinition, not a backend failure.
+        E::FhirPathError(m) => SofError::InvalidViewDefinition(m),
         other => SofError::Backend(other.to_string()),
     }
 }
@@ -374,8 +374,7 @@ impl SofRunner for InProcessSofRunner {
         >(RESOURCE_CHANNEL_BUFFER);
 
         // Row channel: output rows from the blocking engine to the caller.
-        let (row_tx, row_rx) =
-            tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let (row_tx, row_rx) = row_batch_channel();
         let guard_tx = row_tx.clone();
 
         // Async scan task: drive the cursor, apply the `since` filter per resource,
@@ -524,17 +523,30 @@ impl SofRunner for InProcessSofRunner {
                     }
                 };
 
+                // The cap can end a chunk early.
+                let mut out: Vec<ViewRow> = Vec::with_capacity(result.rows.len());
+                let mut capped = false;
                 for row in &result.rows {
                     if let Some(cap) = limit {
                         if emitted >= cap {
-                            return;
+                            capped = true;
+                            break;
                         }
                     }
                     emitted += 1;
-                    let view_row = row_to_view_row(&columns, &row.values);
-                    if row_tx.blocking_send(Ok(view_row)).is_err() {
+                    out.push(row_to_view_row(&columns, &row.values));
+                }
+                // Pieces of ROW_BATCH_SIZE, so one chunk with many rows per
+                // resource cannot become one huge message.
+                while !out.is_empty() {
+                    let rest = out.split_off(out.len().min(ROW_BATCH_SIZE));
+                    let piece = std::mem::replace(&mut out, rest);
+                    if row_tx.blocking_send(Ok(piece)).is_err() {
                         return;
                     }
+                }
+                if capped {
+                    return;
                 }
             }
 
@@ -542,7 +554,7 @@ impl SofRunner for InProcessSofRunner {
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
-        Ok(Box::pin(ReceiverStream::new(row_rx)))
+        Ok(row_stream(row_rx))
     }
 }
 
@@ -688,6 +700,34 @@ mod tests {
         assert_eq!(rows, 0, "no row may be emitted for an unresolved batch");
         assert!(
             matches!(error, Some(SofError::ResolutionLimit(_))),
+            "got {error:?}"
+        );
+    }
+
+    /// #640: a leading identifier that is neither a type nor an element fails
+    /// the run as an invalid ViewDefinition (4xx), not a backend error (500).
+    #[tokio::test]
+    async fn unresolvable_leading_identifier_is_an_invalid_view_definition() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![patient()]), FhirVersion::R4, "test");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"name": "x", "path": "Bogus.name.family"}]}]
+        });
+        let mut stream = runner
+            .run_view(&tenant(), view, ViewFilters::default())
+            .await
+            .expect("run_view");
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                error = Some(e);
+            }
+        }
+        assert!(
+            matches!(error, Some(SofError::InvalidViewDefinition(ref m)) if m.contains("Bogus")),
             "got {error:?}"
         );
     }
@@ -1143,6 +1183,37 @@ mod tests {
             )
             .await;
             assert_eq!(ids.len(), cap, "limit {cap}");
+        }
+    }
+
+    /// An invalid `ansi/type` tag is rejected up front, naming the column.
+    #[tokio::test]
+    async fn invalid_ansi_type_tag_is_rejected_naming_the_column() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![patient()]), FhirVersion::R4, "test");
+        for (col, ty, tag) in [
+            ("unknown_tag", "string", json!("NOT_A_TYPE")),
+            ("incompat_tag", "decimal", json!("INT")),
+            ("nonstring_tag", "string", json!(42)),
+        ] {
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "status": "active",
+                "select": [{"column": [{"name": col, "path": "id", "type": ty,
+                    "tag": [{"name": "ansi/type", "value": tag}]}]}]
+            });
+            let err = match runner
+                .run_view(&tenant(), view, ViewFilters::default())
+                .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("{col}: invalid tag accepted"),
+            };
+            // A non-string tag value fails in serde before the column is known.
+            if col != "nonstring_tag" {
+                assert!(err.to_string().contains(col), "{col}: {err}");
+            }
         }
     }
 }

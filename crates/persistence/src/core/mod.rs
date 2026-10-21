@@ -103,12 +103,14 @@ pub(crate) mod bulk_submit_receipts;
 pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
+pub mod database_url;
 pub mod history;
 pub mod patch;
 pub mod patient_compartment;
 pub mod preconditions;
 pub mod search;
 pub mod sof_runner;
+pub mod sof_terminology;
 pub mod storage;
 pub mod tenant_discovery;
 pub mod transaction;
@@ -180,12 +182,12 @@ pub use search::{
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
-pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
+pub use sof_runner::{BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
     ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
-    ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
+    ResourceStorage, TenantRecord, WriteMarker, bucket_floor, restore_cas_miss,
 };
 pub use tenant_discovery::{
     CountBasis, DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,

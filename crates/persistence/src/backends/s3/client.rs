@@ -11,6 +11,8 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::{DateTime, Utc};
 
+use super::get_retry::{GET_OBJECT_RETRY, GetAttemptError, get_with_body_retry};
+
 /// Metadata returned from S3 object head and put operations.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -97,6 +99,17 @@ pub enum S3ClientError {
     /// A conditional write failed because the ETag or existence precondition
     /// was not satisfied (`If-Match` or `If-None-Match: *`).
     PreconditionFailed,
+    /// S3 refused a conditional write because a conflicting operation on the
+    /// same key was in progress (HTTP 409 `ConditionalRequestConflict` /
+    /// `OperationAborted`, #2047).
+    ///
+    /// Transient, and deliberately not [`Self::PreconditionFailed`]: nothing was
+    /// written, but S3 said nothing about whether the stored object still
+    /// matches. The manifest compare-and-swap loops re-read and retry it.
+    /// Everywhere else it maps to `Unavailable` (503), never to the
+    /// `AlreadyExists`/`VersionConflict` a failed precondition becomes on the
+    /// resource paths.
+    ConditionalConflict(String),
     /// The request was rate-limited by S3.
     Throttled(String),
     /// The service was unreachable (timeout, dispatch failure, etc.).
@@ -137,7 +150,9 @@ pub trait S3Api: Send + Sync {
     ///
     /// `if_match` enforces that the existing ETag matches before overwriting.
     /// `if_none_match = Some("*")` prevents overwriting an existing object.
-    /// Both conditions return `PreconditionFailed` on mismatch.
+    /// Both conditions return `PreconditionFailed` on mismatch. A conflicting
+    /// conditional write in flight on the same key may instead return
+    /// `ConditionalConflict` (HTTP 409); nothing is written in either case.
     async fn put_object(
         &self,
         bucket: &str,
@@ -161,6 +176,41 @@ pub trait S3Api: Send + Sync {
         continuation: Option<&str>,
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError>;
+
+    /// Like [`Self::list_objects`], but starting after the key `start_after`
+    /// (S3 `StartAfter`; ignored by S3 once a `continuation` token is given).
+    ///
+    /// The default walks the whole listing and filters, which is correct but
+    /// not cheaper; the AWS client overrides it with a real `StartAfter`.
+    async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: &str,
+        continuation: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
+        let mut items = Vec::new();
+        let mut token = continuation.map(str::to_string);
+        loop {
+            let page = self
+                .list_objects(bucket, prefix, token.as_deref(), max_keys)
+                .await?;
+            items.extend(
+                page.items
+                    .into_iter()
+                    .filter(|i| i.key.as_str() > start_after),
+            );
+            token = page.next_continuation_token;
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(ListObjectsResult {
+            items,
+            next_continuation_token: None,
+        })
+    }
 
     /// Lists the distinct key groups directly under `prefix` (S3
     /// `CommonPrefixes` with `delimiter`), following continuation tokens to
@@ -440,43 +490,48 @@ impl S3Api for AwsS3Client {
         bucket: &str,
         key: &str,
     ) -> Result<Option<ObjectData>, S3ClientError> {
-        match self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(out) => {
-                let etag = out.e_tag().map(|s| s.to_string());
-                let bytes = out
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|e| {
-                        S3ClientError::Internal(format!("failed to collect object body: {e}"))
-                    })?
-                    .into_bytes()
-                    .to_vec();
-                Ok(Some(ObjectData {
-                    metadata: ObjectMetadata {
-                        etag,
-                        last_modified: None,
-                        size: bytes.len() as i64,
-                    },
-                    bytes,
-                }))
-            }
-            Err(err) => {
-                let mapped = map_sdk_error(err);
-                if matches!(mapped, S3ClientError::NotFound) {
-                    Ok(None)
-                } else {
-                    Err(mapped)
+        // The SDK retries a request only until the response headers arrive, and
+        // `GetObject` hands the body back unread, so a failure while the body is
+        // read is never retried by the SDK (#2048). A GET is idempotent: re-issue
+        // the whole request. Each attempt is send plus collect, so the ETag and
+        // the bytes always come from one response.
+        get_with_body_retry(&GET_OBJECT_RETRY, bucket, key, || async move {
+            let out = match self
+                .client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+            {
+                Ok(out) => out,
+                Err(err) => {
+                    let mapped = map_sdk_error(err);
+                    return if matches!(mapped, S3ClientError::NotFound) {
+                        Ok(None)
+                    } else {
+                        Err(GetAttemptError::Request(mapped))
+                    };
                 }
-            }
-        }
+            };
+            let etag = out.e_tag().map(|s| s.to_string());
+            let bytes = out
+                .body
+                .collect()
+                .await
+                .map_err(|e| GetAttemptError::body(&e))?
+                .into_bytes()
+                .to_vec();
+            Ok(Some(ObjectData {
+                metadata: ObjectMetadata {
+                    etag,
+                    last_modified: None,
+                    size: bytes.len() as i64,
+                },
+                bytes,
+            }))
+        })
+        .await
     }
 
     async fn put_object(
@@ -532,8 +587,23 @@ impl S3Api for AwsS3Client {
         continuation: Option<&str>,
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError> {
+        self.list_objects_after(bucket, prefix, "", continuation, max_keys)
+            .await
+    }
+
+    async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: &str,
+        continuation: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
         let mut req = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
 
+        if !start_after.is_empty() {
+            req = req.start_after(start_after);
+        }
         if let Some(token) = continuation {
             req = req.continuation_token(token);
         }
@@ -703,10 +773,20 @@ where
                 // through `map_client_error` into `BackendError::QueryError`,
                 // which the resource paths convert into `AlreadyExists` /
                 // `VersionConflict` (see `storage.rs`) — i.e. it would state a
-                // *falsehood about stored state* to a FHIR client. It currently
-                // surfaces as a 500, which is also wrong but is at least not a
-                // lie; giving it a retryable classification is tracked separately.
+                // *falsehood about stored state* to a FHIR client. Instead it gets
+                // its own transient classification, `ConditionalConflict` (#2047):
+                // the manifest CAS loops retry it and everything else returns 503.
                 "PreconditionFailed" => S3ClientError::PreconditionFailed,
+                // The two transient 409 codes. AWS documents both as "a
+                // conflicting operation is in progress, retry". Matched on the
+                // code only: other 409s stay `Internal` (see the status fallback).
+                "ConditionalRequestConflict" | "OperationAborted" => {
+                    S3ClientError::ConditionalConflict(if message.is_empty() {
+                        format!("S3 reported {code} (HTTP 409)")
+                    } else {
+                        message
+                    })
+                }
                 "SlowDown" | "Throttling" | "ThrottlingException" => {
                     S3ClientError::Throttled(message)
                 }
@@ -730,11 +810,14 @@ where
                         // `put_object` calls that carry `If-Match`/`If-None-Match`
                         // — so a 412 can only ever answer a compare-and-swap we
                         // ourselves asked for. A 409 deliberately does *not* map
-                        // here: it is shared by *transient* conflicts
-                        // (`OperationAborted`, `ConditionalRequestConflict`), and
-                        // the resource paths turn `PreconditionFailed` into
-                        // `AlreadyExists`/`VersionConflict`, so classifying one as
-                        // a precondition failure would report a false fact about
+                        // here: the two transient 409 codes
+                        // (`OperationAborted`, `ConditionalRequestConflict`) are
+                        // classified by code above as `ConditionalConflict`, and
+                        // any other 409 (a different code, or no code at all)
+                        // deliberately stays `Internal`. The resource paths turn
+                        // `PreconditionFailed` into `AlreadyExists`/
+                        // `VersionConflict`, so classifying a 409 as a
+                        // precondition failure would report a false fact about
                         // stored state.
                         412 => S3ClientError::PreconditionFailed,
                         _ => {
@@ -758,5 +841,98 @@ where
             S3ClientError::Unavailable(format!("connection failed: {err:?}"))
         }
         _ => S3ClientError::Internal(format!("{err}")),
+    }
+}
+
+#[cfg(test)]
+mod sdk_error_mapping_tests {
+    //! `map_sdk_error` classification of HTTP 409/412 service errors (#2047).
+
+    use super::*;
+    use aws_sdk_s3::config::http::HttpResponse;
+    use aws_sdk_s3::error::{ErrorMetadata, SdkError};
+    use aws_sdk_s3::operation::put_object::PutObjectError;
+    use aws_sdk_s3::primitives::SdkBody;
+
+    /// Builds the SDK error a `PutObject` returns for `status` / `code`.
+    fn put_error(
+        status: u16,
+        code: Option<&str>,
+        message: &str,
+    ) -> SdkError<PutObjectError, HttpResponse> {
+        let mut meta = ErrorMetadata::builder().message(message);
+        if let Some(code) = code {
+            meta = meta.code(code);
+        }
+        SdkError::service_error(
+            PutObjectError::generic(meta.build()),
+            HttpResponse::new(
+                status.try_into().expect("valid HTTP status"),
+                SdkBody::empty(),
+            ),
+        )
+    }
+
+    #[test]
+    fn conditional_request_conflict_is_a_conditional_conflict() {
+        let mapped = map_sdk_error(put_error(
+            409,
+            Some("ConditionalRequestConflict"),
+            "The conditional request cannot succeed due to a conflicting operation against this resource.",
+        ));
+        match mapped {
+            S3ClientError::ConditionalConflict(m) => {
+                assert!(m.contains("conflicting operation"), "message was: {m}")
+            }
+            other => panic!("expected ConditionalConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operation_aborted_is_a_conditional_conflict() {
+        let mapped = map_sdk_error(put_error(
+            409,
+            Some("OperationAborted"),
+            "A conflicting conditional operation is currently in progress against this resource. Try again.",
+        ));
+        assert!(
+            matches!(mapped, S3ClientError::ConditionalConflict(_)),
+            "expected ConditionalConflict, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_conflict_without_a_message_names_the_code() {
+        let mapped = map_sdk_error(put_error(409, Some("ConditionalRequestConflict"), ""));
+        match mapped {
+            S3ClientError::ConditionalConflict(m) => {
+                assert!(m.contains("ConditionalRequestConflict"), "message was: {m}")
+            }
+            other => panic!("expected ConditionalConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_409s_stay_internal() {
+        for (code, message) in [(Some("BucketNotEmpty"), "x"), (None, "")] {
+            let mapped = map_sdk_error(put_error(409, code, message));
+            match mapped {
+                S3ClientError::Internal(m) => {
+                    assert!(m.contains("HTTP 409"), "message was: {m}")
+                }
+                other => panic!("expected Internal for 409 code {code:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_412_is_a_precondition_failure() {
+        for (code, message) in [(Some("PreconditionFailed"), "x"), (None, "")] {
+            let mapped = map_sdk_error(put_error(412, code, message));
+            assert!(
+                matches!(mapped, S3ClientError::PreconditionFailed),
+                "expected PreconditionFailed for 412 code {code:?}, got {mapped:?}"
+            );
+        }
     }
 }

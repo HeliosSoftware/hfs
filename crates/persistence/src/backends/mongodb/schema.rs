@@ -29,12 +29,14 @@ use super::search_index_catalog::{
 /// keyset order, so outcome-filtered receipt pages need no in-memory sort
 /// (#1046). v11 adds the `login_sessions` collection and its `expires_at`
 /// index. v12 adds `idx_resources_live_tenant`, which serves the
-/// cross-tenant `count_by_tenant` as a covered index scan (#1910).
+/// cross-tenant `count_by_tenant` as a covered index scan (#1910). v13 adds
+/// the `search_index_pending` ledger of deferred search rows and its
+/// `not_before` index (#1975).
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
 /// not change for them.
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -65,6 +67,7 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
     ensure_resources_indexes(database).await?;
     ensure_history_indexes(database).await?;
     ensure_search_indexes(database).await?;
+    ensure_search_index_pending_indexes(database).await?;
     ensure_user_settings_indexes(database).await?;
     ensure_login_sessions_indexes(database).await?;
     ensure_tenants_indexes(database).await?;
@@ -80,6 +83,7 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
         ensure_resources_indexes(database).await?;
         ensure_history_indexes(database).await?;
         ensure_search_indexes(database).await?;
+        ensure_search_index_pending_indexes(database).await?;
         ensure_user_settings_indexes(database).await?;
         ensure_login_sessions_indexes(database).await?;
         ensure_tenants_indexes(database).await?;
@@ -120,7 +124,9 @@ pub(crate) const RESOURCES_IDENTITY_INDEX: &str = "idx_resources_identity";
 /// index on `resources`; the `$reindex` catch-up rounds and newest-live
 /// probe hint it (#1021, #1403).
 pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
-/// Shared per-resource absence membership and timestamp paging index.
+/// Shared per-resource absence membership and timestamp paging index. Built
+/// after boot by `MissingIndexBuilder` (#2001), so it is required for
+/// readiness only once that builder has reported it ready and searches hint it.
 pub(crate) const RESOURCES_MISSING_INDEX: &str = "idx_resources_missing_params";
 /// Name of the `(is_deleted, tenant_id)` index on `resources`; the
 /// cross-tenant `count_by_tenant` aggregate is a covered scan of it (#1910).
@@ -135,11 +141,7 @@ pub(crate) const RESOURCES_LIVE_TENANT_INDEX: &str = "idx_resources_live_tenant"
 const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
     (
         "resources",
-        &[
-            RESOURCES_IDENTITY_INDEX,
-            RESOURCES_TYPE_SCAN_INDEX,
-            RESOURCES_MISSING_INDEX,
-        ],
+        &[RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX],
     ),
     (
         SEARCH_INDEX_COLLECTION,
@@ -155,7 +157,14 @@ const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
 /// [`REQUIRED_QUERY_INDEXES`] that a query could not hint: missing, still being
 /// built, or hidden. Startup creates these indexes; this catches one dropped,
 /// rebuilt or hidden (or lost in a restore) while the server runs.
-pub(super) async fn check_required_query_indexes(database: &Database) -> Result<(), BackendError> {
+///
+/// `missing_index_ready` adds [`RESOURCES_MISSING_INDEX`]: before its post-boot
+/// build completes no query hints it, so a node serves (and is ready) while it
+/// builds; afterwards losing it would fail `:missing=true` searches (#2001).
+pub(super) async fn check_required_query_indexes(
+    database: &Database,
+    missing_index_ready: bool,
+) -> Result<(), BackendError> {
     for (collection, required) in REQUIRED_QUERY_INDEXES {
         let listed = match database.run_command(list_indexes_command(collection)).await {
             Ok(reply) => listed_indexes(&reply, collection).map_err(|error| {
@@ -170,7 +179,11 @@ pub(super) async fn check_required_query_indexes(database: &Database) -> Result<
                 )));
             }
         };
-        if let Some(problem) = first_unusable_index(collection, required, &listed) {
+        let mut required = required.to_vec();
+        if missing_index_ready && collection == "resources" {
+            required.push(RESOURCES_MISSING_INDEX);
+        }
+        if let Some(problem) = first_unusable_index(collection, &required, &listed) {
             return Err(unavailable(problem));
         }
     }
@@ -207,20 +220,9 @@ fn unavailable(message: String) -> BackendError {
 async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     let resources = database.collection::<Document>("resources");
 
-    create_index(
-        &resources,
-        doc! {
-            "tenant_id": 1_i32,
-            "resource_type": 1_i32,
-            "is_deleted": 1_i32,
-            "missing_params": 1_i32,
-            "last_updated": 1_i32,
-            "id": 1_i32,
-        },
-        RESOURCES_MISSING_INDEX,
-        false,
-    )
-    .await?;
+    // `idx_resources_missing_params` is not created here: it is a full
+    // `resources` scan on an existing deployment, so `MissingIndexBuilder`
+    // builds it after boot under `HFS_MONGODB_INDEX_BUILD` (#2001).
 
     create_index(
         &resources,
@@ -408,6 +410,25 @@ async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
     for spec in contained_specs() {
         contained.create_index(spec.index_model()).await?;
     }
+    Ok(())
+}
+
+/// Index for the ledger of deferred search rows (#1975): one document per
+/// chunk of a deferred transaction Bundle's resources, read by the repair
+/// through `not_before`. Creating the index also creates the collection, so a
+/// Bundle's transaction never has to create it implicitly.
+async fn ensure_search_index_pending_indexes(database: &Database) -> StorageResult<()> {
+    let pending =
+        database.collection::<Document>(super::deferred_index::SEARCH_INDEX_PENDING_COLLECTION);
+
+    create_index(
+        &pending,
+        doc! { "not_before": 1_i32 },
+        super::deferred_index::SEARCH_INDEX_PENDING_DUE_INDEX,
+        false,
+    )
+    .await?;
+
     Ok(())
 }
 

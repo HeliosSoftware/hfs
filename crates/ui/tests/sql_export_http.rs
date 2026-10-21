@@ -964,7 +964,7 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
         "resourceType": "Parameters",
         "parameter": [{"name": "output", "part": [
             {"name": "name", "valueString": "patients"},
-            {"name": "location", "valueUri": "http://s/export/job-1/patients-0.csv"},
+            {"name": "location", "valueUri": "http://localhost:8080/export/job-1/patients-0.csv"},
         ]}]
     });
     let source = StaticConformanceSource::empty()
@@ -990,8 +990,8 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
     assert_eq!(job["status"], "complete");
     assert_eq!(
         job["outputs"],
-        // The manifest's absolute location is persisted as a same-origin
-        // path (#833).
+        // A location under the server's own `HFS_BASE_URL` (the mount's
+        // `http://localhost:8080`) is persisted as a same-origin path (#833).
         serde_json::json!([{"name": "patients", "locations": ["/export/job-1/patients-0.csv"]}])
     );
     assert!(!job["finishedAt"].as_str().unwrap_or_default().is_empty());
@@ -1000,6 +1000,46 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
     assert!(job["subjectsDone"].is_null());
     assert!(job["subjectsTotal"].is_null());
     assert!(job["currentSubject"].is_null());
+}
+
+/// #2050: with `HFS_EXPORT_SINK=s3` the manifest's locations are S3
+/// pre-signed URLs on another host. They must be persisted and linked
+/// byte-for-byte; stripping the host sent the browser to HFS, which 404ed.
+#[tokio::test]
+async fn a_done_job_keeps_an_s3_presigned_location_verbatim_and_links_to_it() {
+    const PRESIGNED: &str = "https://my-bucket.s3.us-east-2.amazonaws.com/exports/job-1/shard-0.ndjson?x-id=GetObject&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20261014%2Fus-east-2%2Fs3%2Faws4_request&X-Amz-Date=20261014T120000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=0123abcd";
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": PRESIGNED},
+        ]}]
+    });
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_manifest(Ok(manifest));
+    let app = app(&backend, source);
+
+    // `load_detail` polls once and renders the post-poll job.
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body_text(response).await;
+    let dom = html::Dom::page(&page);
+    assert_eq!(
+        dom.one("a[download]").attr("href"),
+        Some(PRESIGNED),
+        "the file link must be the pre-signed URL, not an HFS path"
+    );
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "complete");
+    assert_eq!(
+        job["outputs"],
+        serde_json::json!([{"name": "patients", "locations": [PRESIGNED]}])
+    );
 }
 
 #[tokio::test]
@@ -1905,6 +1945,92 @@ async fn new_page_shows_parameter_chips_and_open_values_rows_only_for_parameteri
 }
 
 #[tokio::test]
+async fn numeric_parameter_fields_preserve_steps_defaults_required_and_native_submission() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with("Library", FhirVersion::R4, vec![
+        library_with_parameters("numeric", "numeric", "sql-query", "active", serde_json::json!([
+            {"name": "amount", "use": "in", "type": "decimal"},
+            {"name": "whole", "use": "in", "type": "integer", "defaultInteger": 30},
+            {"name": "big", "use": "in", "type": "integer64", "defaultInteger64": "9007199254740993"}
+        ]))
+    ]);
+    let response = app(&backend, source)
+        .oneshot(get("/ui/sql/export/new?subject=Library/numeric"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = html::Dom::page(&html);
+    for (name, step, value, required) in [
+        ("amount", "any", "", true),
+        ("whole", "1", "30", false),
+        ("big", "1", "9007199254740993", false),
+    ] {
+        let field = dom.one(&format!("input[name='param:Library/numeric:{name}']"));
+        assert!(field.has_class("field__input--number"));
+        assert_eq!(field.attr("type"), Some("number"));
+        assert_eq!(field.attr("step"), Some(step));
+        assert_eq!(field.attr("value"), Some(value));
+        assert_eq!(field.has_attr("required"), required);
+        assert!(!field.has_attr("form"));
+        assert!(!field.has_attr("disabled"));
+    }
+}
+
+/// #2049: `sql-export-form.js` shows "This value is required." by finding the
+/// field's own `.field__hint--error` span inside its `label.field`, because
+/// the control's `aria-describedby` is rendered only alongside a server-side
+/// error. This pins that contract on a fresh page: every parameter field
+/// carries its error span, hidden and empty, while the control itself has
+/// neither `aria-invalid` nor `aria-describedby` (the no-JavaScript markup
+/// is unchanged).
+#[tokio::test]
+async fn new_page_renders_each_parameter_fields_error_span_hidden_inside_its_field() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, parameterized_subjects_source());
+
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = html::Dom::page(&html);
+
+    for (reference, name) in [
+        ("Library/q1", "ward"),
+        ("Library/q2", "days"),
+        ("Library/q2", "from"),
+    ] {
+        let field = dom.one(&format!(
+            r#"tr.row--params[data-subject="{reference}"] label.field[data-param-name="{name}"]"#
+        ));
+        let control = field.one(&format!(r#"[name="param:{reference}:{name}"]"#));
+        assert!(
+            !control.has_attr("aria-invalid"),
+            "{reference} {name}: a fresh page marks nothing invalid: {control:?}"
+        );
+        assert!(
+            !control.has_attr("aria-describedby"),
+            "{reference} {name}: aria-describedby is rendered only with a server error: {control:?}"
+        );
+
+        let error = field.one(".field__hint--error");
+        assert_eq!(
+            error.attr("id"),
+            Some(format!("param:{reference}:{name}-error").as_str()),
+            "{reference} {name}: the error span keeps its `{{prefix}}:{{name}}-error` id"
+        );
+        assert!(
+            error.has_attr("hidden"),
+            "{reference} {name}: the error span renders hidden: {error:?}"
+        );
+        assert_eq!(
+            error.text(),
+            "",
+            "{reference} {name}: the error span renders empty"
+        );
+    }
+}
+
+#[tokio::test]
 async fn marking_a_parameterized_query_sends_its_value_as_a_typed_subject_parameter() {
     let backend = backend_with_schema().await;
     let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
@@ -2025,6 +2151,22 @@ async fn a_missing_required_parameter_rerenders_with_an_inline_error_and_no_kick
         source.export_calls().is_empty(),
         "no kickoff on a validation error"
     );
+
+    // #2049: the no-JavaScript, server-rendered path is unchanged — the
+    // control is flagged and described by its own visible error span.
+    let dom = html::Dom::page(&html);
+    let control = dom.one(r#"[name="param:Library/q1:ward"]"#);
+    assert_eq!(control.attr("aria-invalid"), Some("true"));
+    assert_eq!(
+        control.attr("aria-describedby"),
+        Some("param:Library/q1:ward-error")
+    );
+    let error = dom.one(r#"[id="param:Library/q1:ward-error"]"#);
+    assert!(
+        !error.has_attr("hidden"),
+        "the server-rendered error is visible: {error:?}"
+    );
+    assert_eq!(error.text(), "This value is required.");
 }
 
 #[tokio::test]

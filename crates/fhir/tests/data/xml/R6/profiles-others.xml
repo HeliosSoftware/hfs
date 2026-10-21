@@ -3,7 +3,7 @@
 <Bundle xmlns="http://hl7.org/fhir">
   <id value="profiles-others"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <type value="collection"/>
   <entry>
@@ -1269,7 +1269,7 @@
           </element>
           <element id="FamilyMemberHistory.condition.outcome">
             <path value="FamilyMemberHistory.condition.outcome"/>
-            <short value="deceased | permanent disability | etc"/>
+            <short value="E.g. deceased, permanent disability"/>
             <definition value="Indicates what happened following the condition.  If the condition resulted in death, deceased date is captured on the relation."/>
             <min value="0"/>
             <max value="1"/>
@@ -1352,6 +1352,9 @@
             </type>
             <type>
               <code value="string"/>
+            </type>
+            <type>
+              <code value="dateTime"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -6444,6 +6447,10 @@
             <type>
               <code value="Attachment"/>
             </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
+            </type>
             <condition value="obs-10"/>
             <constraint>
               <key value="ele-1"/>
@@ -9480,6 +9487,10 @@
             <type>
               <code value="Attachment"/>
             </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
+            </type>
             <condition value="obs-10"/>
             <constraint>
               <key value="ele-1"/>
@@ -12460,6 +12471,10 @@
             </type>
             <type>
               <code value="Attachment"/>
+            </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
             </type>
             <condition value="obs-10"/>
             <constraint>
@@ -15453,6 +15468,10 @@
             <type>
               <code value="Attachment"/>
             </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
+            </type>
             <condition value="obs-10"/>
             <constraint>
               <key value="ele-1"/>
@@ -18444,6 +18463,10 @@
             </type>
             <type>
               <code value="Attachment"/>
+            </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
             </type>
             <condition value="obs-10"/>
             <constraint>
@@ -21437,6 +21460,10 @@
             <type>
               <code value="Attachment"/>
             </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
+            </type>
             <condition value="obs-10"/>
             <constraint>
               <key value="ele-1"/>
@@ -21790,7 +21817,7 @@
           <element id="Observation">
             <path value="Observation"/>
             <short value="FHIR Blood Pressure Profile"/>
-            <definition value="This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity but contains at least one component (systolic and/or diastolic)."/>
+            <definition value="This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity and contains two components (systolic and diastolic). If one or both are not performed, that is reflected in the dataAbsentReason of the corresponding component."/>
             <comment value="Used for simple observations such as device measurements, laboratory atomic results, vital signs, height, weight, smoking status, comments, etc.  Other resources are used to provide context for observations such as laboratory reports, etc."/>
             <alias value="Vital Sign"/>
             <alias value="Measurement"/>
@@ -24362,6 +24389,10 @@
             <type>
               <code value="Attachment"/>
             </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
+            </type>
             <condition value="obs-10"/>
             <constraint>
               <key value="ele-1"/>
@@ -25478,7 +25509,7 @@
           <element id="Observation">
             <path value="Observation"/>
             <short value="FHIR Blood Pressure Profile"/>
-            <definition value="This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity but contains at least one component (systolic and/or diastolic)."/>
+            <definition value="This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity and contains two components (systolic and diastolic). If one or both are not performed, that is reflected in the dataAbsentReason of the corresponding component."/>
           </element>
           <element id="Observation.code">
             <path value="Observation.code"/>
@@ -28376,6 +28407,10 @@
             </type>
             <type>
               <code value="Attachment"/>
+            </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
             </type>
             <condition value="obs-10"/>
             <constraint>
@@ -31369,6 +31404,10 @@
             <type>
               <code value="Attachment"/>
             </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
+            </type>
             <condition value="obs-10"/>
             <constraint>
               <key value="ele-1"/>
@@ -34361,6 +34400,10 @@
             <type>
               <code value="Attachment"/>
             </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
+            </type>
             <condition value="obs-10"/>
             <constraint>
               <key value="ele-1"/>
@@ -37352,6 +37395,10 @@
             </type>
             <type>
               <code value="Attachment"/>
+            </type>
+            <type>
+              <code value="Reference"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
             </type>
             <condition value="obs-10"/>
             <constraint>
@@ -40608,7 +40655,7 @@
         <title value="History bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-09-14T16:43:45+00:00"/>
+        <date value="2026-10-17T20:58:40+00:00"/>
         <description value="This profile holds all the requirements and constraints related to a FHIR history bundle."/>
         <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
@@ -47334,7 +47381,7 @@
         <title value="Search Set Bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-09-14T16:43:45+00:00"/>
+        <date value="2026-10-17T20:58:40+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -51049,7 +51096,7 @@
         <title value="Subscription Notification bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-09-14T16:43:45+00:00"/>
+        <date value="2026-10-17T20:58:40+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -54757,7 +54804,7 @@
         <title value="Batch bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-09-14T16:43:45+00:00"/>
+        <date value="2026-10-17T20:58:40+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -62524,7 +62571,7 @@
         <title value="Batch response bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-09-14T16:43:45+00:00"/>
+        <date value="2026-10-17T20:58:40+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -64220,7 +64267,7 @@
         <title value="Transaction bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-09-14T16:43:45+00:00"/>
+        <date value="2026-10-17T20:58:40+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -71987,7 +72034,7 @@
         <title value="Transaction response bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-09-14T16:43:45+00:00"/>
+        <date value="2026-10-17T20:58:40+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -73683,7 +73730,7 @@
         <title value="Document bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-09-14T16:43:45+00:00"/>
+        <date value="2026-10-17T20:58:40+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>

@@ -2939,7 +2939,17 @@ async fn apply_compose_filters_pg(
         let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
 
+        // `in` / `not-in` on the concept identifier (`concept` / `code`) list
+        // codes, not values of a property named `concept` — the property
+        // lookup below would match nothing. Mirrors SQLite's
+        // `query_property_in` / `is_concept_prop`.
+        let is_concept_prop = property == "concept" || property == "code";
+
         let matches: Vec<(String, Option<String>)> = match op {
+            "in" if is_concept_prop => pg_filter_code_in(client, system_id, value, true).await?,
+            "not-in" if is_concept_prop => {
+                pg_filter_code_in(client, system_id, value, false).await?
+            }
             "=" => pg_filter_property_eq(client, system_url, system_id, property, value).await?,
             // Single-value `in` reduces to equality. Multi-value (comma-
             // separated) `in` is a TODO: parity gap.
@@ -3100,6 +3110,36 @@ async fn pg_filter_property_eq(
                 )",
             &[&system_id, &property_aliases, &value],
         )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// `in` (`include = true`) / `not-in` (`include = false`) on the concept
+/// identifier: the concepts of `system_id` whose code is (or is not) one of
+/// the comma-separated `values`.
+async fn pg_filter_code_in(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    values: &str,
+    include: bool,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    let codes: Vec<&str> = values
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect();
+    let sql = if include {
+        "SELECT code, display FROM concepts WHERE system_id = $1 AND code = ANY($2::text[])"
+    } else {
+        "SELECT code, display FROM concepts WHERE system_id = $1 AND NOT (code = ANY($2::text[]))"
+    };
+    let rows = client
+        .query(sql, &[&system_id, &codes])
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
@@ -3289,10 +3329,11 @@ async fn pg_filter_child_of(
 }
 
 /// Regex match against the named property using PG's POSIX `~` operator.
-/// `property` may be `code`, `display`, or any concept property name. For
-/// non-code/display properties the SQL pre-narrows by `concept_properties`
-/// rows for that property name (resolving FHIR-canonical aliases via
-/// `cs_property_local_codes`), then anchored regex is applied to the value.
+/// `property` may be `code` / `concept` (the concept code), `display`, or any
+/// concept property name. For non-code/display properties the SQL
+/// pre-narrows by `concept_properties` rows for that property name (resolving
+/// FHIR-canonical aliases via `cs_property_local_codes`), then anchored regex
+/// is applied to the value.
 async fn pg_filter_regex(
     client: &tokio_postgres::Client,
     system_id: &str,
@@ -3306,7 +3347,7 @@ async fn pg_filter_regex(
     let anchored_sql = format!("^(?:{value})$");
 
     match property {
-        "code" | "" => {
+        "code" | "concept" | "" => {
             let rows = client
                 .query(
                     "SELECT c.code, c.display FROM concepts c
@@ -3490,12 +3531,6 @@ async fn build_hierarchical_expansion(
         return Ok(flat);
     }
 
-    let items_map: HashMap<(String, String), ExpansionContains> = flat
-        .iter()
-        .cloned()
-        .map(|c| ((c.system.clone(), c.code.clone()), c))
-        .collect();
-
     let expansion_set: HashSet<(String, String)> = flat
         .iter()
         .map(|c| (c.system.clone(), c.code.clone()))
@@ -3518,7 +3553,6 @@ async fn build_hierarchical_expansion(
     }
 
     let mut parent_to_children: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
-    let mut has_parent: HashSet<(String, String)> = HashSet::new();
 
     for (sys_url, sys_id) in &system_id_map {
         let edge_rows = client
@@ -3538,44 +3572,15 @@ async fn build_hierarchical_expansion(
                 parent_to_children
                     .entry(parent_key)
                     .or_default()
-                    .push(child_key.clone());
-                has_parent.insert(child_key);
+                    .push(child_key);
             }
         }
     }
 
-    let mut roots: Vec<ExpansionContains> = flat
-        .iter()
-        .filter(|c| !has_parent.contains(&(c.system.clone(), c.code.clone())))
-        .map(|c| {
-            build_subtree(
-                &(c.system.clone(), c.code.clone()),
-                &items_map,
-                &parent_to_children,
-            )
-        })
-        .collect();
-
-    roots.sort_by(|a, b| a.code.cmp(&b.code));
-    Ok(roots)
-}
-
-/// Recursively build an [`ExpansionContains`] node with all its nested children.
-fn build_subtree(
-    key: &(String, String),
-    items_map: &HashMap<(String, String), ExpansionContains>,
-    parent_to_children: &HashMap<(String, String), Vec<(String, String)>>,
-) -> ExpansionContains {
-    let mut item = items_map[key].clone();
-    if let Some(children) = parent_to_children.get(key) {
-        let mut child_items: Vec<ExpansionContains> = children
-            .iter()
-            .map(|ck| build_subtree(ck, items_map, parent_to_children))
-            .collect();
-        child_items.sort_by(|a, b| a.code.cmp(&b.code));
-        item.contains = child_items;
-    }
-    item
+    Ok(crate::backends::hierarchy::nest_expansion(
+        flat,
+        &parent_to_children,
+    ))
 }
 
 /// Write computed expansion entries into the `value_set_expansions` cache.

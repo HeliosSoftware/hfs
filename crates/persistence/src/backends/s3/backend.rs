@@ -16,7 +16,7 @@ use crate::tenant::{TenantContext, TenantId};
 
 use super::client::{AwsS3Client, AwsS3ClientOptions, S3Api, S3ClientError};
 use super::config::{S3BackendConfig, S3TenancyMode};
-use super::keyspace::S3Keyspace;
+use super::keyspace::{KeyspaceLayout, ResourceKeyspace, S3Keyspace};
 
 /// Sync in-memory cache of each tenant's stored (POSTed) active SearchParameter
 /// definitions, keyed by tenant id. S3 has no query capability of its own for
@@ -52,6 +52,16 @@ pub struct S3Backend {
     /// LIST plus its live objects rather than every delete the type has ever
     /// seen. A rewrite changes the ETag and forces a fresh read.
     pub(crate) tombstone_etags: Arc<RwLock<HashMap<(String, String), String>>>,
+    /// Resolved [`KeyspaceLayout`] per tenant location, keyed by bucket and the
+    /// tenant's marker key (which is unique per bucket + tenant prefix). Only
+    /// settled layouts are cached; an empty tenant read under a `V2` default is
+    /// answered `V2` without being remembered, so a later write stamps it.
+    pub(crate) layouts: Arc<RwLock<HashMap<(String, String), KeyspaceLayout>>>,
+    /// The backend-wide read limit (`HFS_S3_SCAN_CONCURRENCY`, #2063): one
+    /// permit per `GetObject` a read fan-out has in flight. Shared by every
+    /// clone, so concurrent scans split one budget instead of each fanning out
+    /// on its own. See [`S3Backend::get_json_object_limited`].
+    pub(crate) scan_limit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Upper bound on remembered tombstones; past it scans simply read them.
@@ -85,6 +95,20 @@ pub(crate) struct TenantLocation {
     pub bucket: String,
     /// Keyspace builder scoped to this tenant's prefix hierarchy.
     pub keyspace: S3Keyspace,
+}
+
+/// A tenant's bucket and layout-resolved resource/history keys.
+///
+/// Unlike [`TenantLocation`], this can only be obtained from
+/// [`S3Backend::resource_location`] or
+/// [`S3Backend::resource_location_for_write`], so building a resource or
+/// history key without having resolved the tenant's layout does not compile.
+#[derive(Debug, Clone)]
+pub(crate) struct ResourceLocation {
+    /// S3 bucket that holds this tenant's data.
+    pub bucket: String,
+    /// Resource and history key builder bound to the tenant's layout.
+    pub keyspace: ResourceKeyspace,
 }
 
 impl S3Backend {
@@ -239,6 +263,8 @@ impl S3Backend {
         ));
 
         let (registries, stored_by_tenant) = Self::new_registries();
+        // Built before the literal: `config` is moved into its first field.
+        let scan_limit = Arc::new(tokio::sync::Semaphore::new(config.scan_concurrency));
         let backend = Self {
             config,
             fhir_version: FhirVersion::default_enabled(),
@@ -246,6 +272,8 @@ impl S3Backend {
             registries,
             stored_by_tenant,
             tombstone_etags: Arc::default(),
+            layouts: Arc::default(),
+            scan_limit,
         };
 
         if backend.config.validate_buckets_on_startup {
@@ -265,6 +293,7 @@ impl S3Backend {
     ) -> StorageResult<Self> {
         config.validate()?;
         let (registries, stored_by_tenant) = Self::new_registries();
+        let scan_limit = Arc::new(tokio::sync::Semaphore::new(config.scan_concurrency));
         Ok(Self {
             config,
             fhir_version: FhirVersion::default_enabled(),
@@ -272,6 +301,8 @@ impl S3Backend {
             registries,
             stored_by_tenant,
             tombstone_etags: Arc::default(),
+            layouts: Arc::default(),
+            scan_limit,
         })
     }
 
@@ -329,6 +360,169 @@ impl S3Backend {
                     bucket,
                     keyspace: S3Keyspace::new(global_prefix),
                 })
+            }
+        }
+    }
+
+    /// Resolves the tenant's location together with its keyspace layout, for
+    /// reads and sweeps. Never writes: a tenant with no marker and no data is
+    /// reported under the configured default layout without stamping it.
+    pub(crate) async fn resource_location(
+        &self,
+        tenant: &TenantContext,
+    ) -> StorageResult<ResourceLocation> {
+        self.resolve_resource_location(tenant, false).await
+    }
+
+    /// Like [`resource_location`](Self::resource_location), but an empty tenant
+    /// with no marker is stamped with the configured default layout (a
+    /// conditional `If-None-Match: *` PUT; a lost race adopts the winner's).
+    pub(crate) async fn resource_location_for_write(
+        &self,
+        tenant: &TenantContext,
+    ) -> StorageResult<ResourceLocation> {
+        self.resolve_resource_location(tenant, true).await
+    }
+
+    async fn resolve_resource_location(
+        &self,
+        tenant: &TenantContext,
+        for_write: bool,
+    ) -> StorageResult<ResourceLocation> {
+        let location = self.tenant_location(tenant)?;
+        let layout = self.resolve_layout(&location, for_write).await?;
+        Ok(ResourceLocation {
+            bucket: location.bucket,
+            keyspace: location.keyspace.with_layout(layout),
+        })
+    }
+
+    /// Settles a tenant location's layout.
+    ///
+    /// 1. Cached → done.
+    /// 2. Marker present → its layout (an unknown version is an error, never a
+    ///    guess).
+    /// 3. Marker absent, default `V1` → `V1`, nothing written or probed.
+    /// 4. Marker absent, default `V2` → a tenant holding any object under
+    ///    `resources/` or `history/` is a legacy `V1` tenant; an empty one is
+    ///    `V2`, stamped only when `for_write`.
+    async fn resolve_layout(
+        &self,
+        location: &TenantLocation,
+        for_write: bool,
+    ) -> StorageResult<KeyspaceLayout> {
+        let marker_key = location.keyspace.layout_marker_key();
+        let cache_key = (location.bucket.clone(), marker_key.clone());
+        if let Some(layout) = self.layouts.read().get(&cache_key).copied() {
+            return Ok(layout);
+        }
+
+        if let Some(layout) = self
+            .read_layout_marker(&location.bucket, &marker_key)
+            .await?
+        {
+            self.layouts.write().insert(cache_key, layout);
+            return Ok(layout);
+        }
+
+        let default = self.config.default_keyspace_layout;
+        if default == KeyspaceLayout::V1 {
+            self.layouts.write().insert(cache_key, KeyspaceLayout::V1);
+            return Ok(KeyspaceLayout::V1);
+        }
+
+        let occupied = self
+            .prefix_has_objects(&location.bucket, &location.keyspace.resources_prefix())
+            .await?
+            || self
+                .prefix_has_objects(&location.bucket, &location.keyspace.history_root_prefix())
+                .await?;
+        if occupied {
+            self.layouts.write().insert(cache_key, KeyspaceLayout::V1);
+            return Ok(KeyspaceLayout::V1);
+        }
+        if !for_write {
+            return Ok(default);
+        }
+
+        let layout = match self
+            .client
+            .put_object(
+                &location.bucket,
+                &marker_key,
+                default.marker_body(),
+                Some("application/json"),
+                None,
+                Some("*"),
+            )
+            .await
+        {
+            Ok(_) => default,
+            // Lost the create race (412), or the store reported a conflicting
+            // concurrent create (409): adopt whatever the winner stamped.
+            Err(put_error) => match self
+                .read_layout_marker(&location.bucket, &marker_key)
+                .await?
+            {
+                Some(winner) => winner,
+                None => return Err(self.map_client_error(put_error)),
+            },
+        };
+        self.layouts.write().insert(cache_key, layout);
+        Ok(layout)
+    }
+
+    /// Reads the marker object; `Ok(None)` when absent.
+    async fn read_layout_marker(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> StorageResult<Option<KeyspaceLayout>> {
+        let Some(object) = self
+            .client
+            .get_object(bucket, key)
+            .await
+            .map_err(|e| self.map_client_error(e))?
+        else {
+            return Ok(None);
+        };
+        KeyspaceLayout::from_marker_body(&object.bytes)
+            .map(Some)
+            .ok_or_else(|| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "s3".to_string(),
+                    message: format!(
+                        "unrecognised keyspace layout marker at s3://{bucket}/{key}; \
+                         refusing to guess the layout"
+                    ),
+                    source: None,
+                })
+            })
+    }
+
+    /// Whether any object exists under `prefix`: `MaxKeys=1` listings that
+    /// follow continuation tokens, since a page can be empty yet truncated.
+    async fn prefix_has_objects(&self, bucket: &str, prefix: &str) -> StorageResult<bool> {
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .client
+                .list_objects(bucket, prefix, token.as_deref(), Some(1))
+                .await
+                .map_err(|e| self.map_client_error(e))?;
+            if !page.items.is_empty() {
+                return Ok(true);
+            }
+            match page.next_continuation_token {
+                None => return Ok(false),
+                Some(next) if token.as_deref() == Some(next.as_str()) => {
+                    return Err(StorageError::Backend(BackendError::Internal {
+                        backend_name: "s3".to_string(),
+                        message: format!("S3 repeated the continuation token listing {prefix}"),
+                        source: None,
+                    }));
+                }
+                Some(next) => token = Some(next),
             }
         }
     }
@@ -485,6 +679,18 @@ impl S3Backend {
             S3ClientError::PreconditionFailed => StorageError::Backend(BackendError::QueryError {
                 message: "S3 precondition failed".to_string(),
             }),
+            // Transient (#2047): S3 had a conflicting conditional write in flight
+            // and wrote nothing. Deliberately NOT `QueryError`, which the
+            // resource paths read as a lost precondition (AlreadyExists /
+            // VersionConflict). `Unavailable` is served as 503 with Retry-After.
+            S3ClientError::ConditionalConflict(message) => {
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "s3".to_string(),
+                    message: format!(
+                        "S3 reported a conflicting concurrent write (HTTP 409); retry: {message}"
+                    ),
+                })
+            }
             S3ClientError::Throttled(message) => StorageError::Backend(BackendError::Unavailable {
                 backend_name: "s3".to_string(),
                 message,

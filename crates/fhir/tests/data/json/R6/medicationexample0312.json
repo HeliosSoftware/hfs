@@ -1,23 +1,6 @@
 {
   "resourceType": "Medication",
   "id": "med0312",
-  "contained": [
-    {
-      "resourceType": "Substance",
-      "id": "sub02",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "387048002",
-              "display": "Nystatin (substance)"
-            }
-          ]
-        }
-      }
-    }
-  ],
   "code": {
     "coding": [
       {
@@ -39,8 +22,14 @@
   "ingredient": [
     {
       "item": {
-        "reference": {
-          "reference": "#sub02"
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "387048002",
+              "display": "Nystatin (substance)"
+            }
+          ]
         }
       },
       "strengthRatio": {

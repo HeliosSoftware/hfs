@@ -21,7 +21,7 @@
   <membership value="enumerated"/>
   <code>
     <coding>
-      <system value="http://hl7.org/fhir/ValueSet/group-code"/>
+      <system value="http://hl7.org/fhir/group-code"/>
       <code value="household"/>
     </coding>
   </code>

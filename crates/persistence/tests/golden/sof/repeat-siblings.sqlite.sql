@@ -1,7 +1,7 @@
 WITH RECURSIVE rec_0(rid, node, ord_path, pkey) AS (
   SELECT r.id AS rid, je.value AS node, printf('%010d', je.key) AS ord_path, '' AS pkey
   FROM resources r
-  JOIN json_each(CASE WHEN json_type(r.data, '$.item') = 'array' THEN json_extract(r.data, '$.item') WHEN json_type(r.data, '$.item') IN ('object', 'array') THEN json_array(json(json_extract(r.data, '$.item'))) WHEN json_type(r.data, '$.item') IS NOT NULL THEN json_array(json_extract(r.data, '$.item')) ELSE '[]' END) je ON 1=1
+  JOIN json_each(CASE WHEN json_type(CAST(r.data AS TEXT), '$.item') = 'array' THEN json_extract(CAST(r.data AS TEXT), '$.item') WHEN json_type(CAST(r.data AS TEXT), '$.item') IN ('object', 'array') THEN json_array(json(json_extract(CAST(r.data AS TEXT), '$.item'))) WHEN json_type(CAST(r.data AS TEXT), '$.item') IS NOT NULL THEN json_array(json_extract(CAST(r.data AS TEXT), '$.item')) ELSE '[]' END) je ON 1=1
   WHERE r.tenant_id = ?1
   AND r.resource_type = ?2
   AND r.is_deleted = 0
@@ -12,7 +12,7 @@ WITH RECURSIVE rec_0(rid, node, ord_path, pkey) AS (
 rec_1(rid, node, ord_path, pkey) AS (
   SELECT r.id AS rid, je.value AS node, printf('%010d', je.key) AS ord_path, '' AS pkey
   FROM resources r
-  JOIN json_each(CASE WHEN json_type(r.data, '$.item') = 'array' THEN json_extract(r.data, '$.item') WHEN json_type(r.data, '$.item') IN ('object', 'array') THEN json_array(json(json_extract(r.data, '$.item'))) WHEN json_type(r.data, '$.item') IS NOT NULL THEN json_array(json_extract(r.data, '$.item')) ELSE '[]' END) je ON 1=1
+  JOIN json_each(CASE WHEN json_type(CAST(r.data AS TEXT), '$.item') = 'array' THEN json_extract(CAST(r.data AS TEXT), '$.item') WHEN json_type(CAST(r.data AS TEXT), '$.item') IN ('object', 'array') THEN json_array(json(json_extract(CAST(r.data AS TEXT), '$.item'))) WHEN json_type(CAST(r.data AS TEXT), '$.item') IS NOT NULL THEN json_array(json_extract(CAST(r.data AS TEXT), '$.item')) ELSE '[]' END) je ON 1=1
   WHERE r.tenant_id = ?1
   AND r.resource_type = ?2
   AND r.is_deleted = 0
@@ -29,7 +29,6 @@ JOIN rec_1 ON rec_1.rid = r.id AND rec_1.pkey = ''
 WHERE r.tenant_id = ?1
   AND r.resource_type = ?2
   AND r.is_deleted = 0
-ORDER BY 1
 
 /* Runner bindings and output metadata:
 {

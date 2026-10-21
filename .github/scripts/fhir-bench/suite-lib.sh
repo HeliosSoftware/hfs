@@ -81,8 +81,9 @@
 #                                     what it creates) when that suite is
 #                                     listed; re-runs es_drain_gate first
 #                                     if it never ran this leg.
-#   run_indexing_suite               the `indexing` suite (every leg, after
-#                                     search, before insert):
+#   run_indexing_suite               the `indexing` suite (opt-in: only
+#                                     when tests names it, never in `all`;
+#                                     after search, before insert):
 #                                     one timed POST /<type>/$reindex,
 #                                     cancelled at $INDEXING_BUDGET_S. Writes
 #                                     indexing.txt, indexing-status.txt and
@@ -481,7 +482,7 @@ write_search_counts() {
   } > "$RESULTS_DIR/search-counts.txt" || echo "::warning::search-counts cross-check failed"
 }
 
-# ── Indexing suite (`indexing`, every leg, after search) ─────────────
+# ── Indexing suite (`indexing`, opt-in via tests, after search) ──────
 # One timed `POST /$INDEXING_TYPE/$reindex` against the corpus import
 # loaded: HFS re-reads every stored resource of that type, re-extracts
 # its search parameters and rewrites the index that serves search —
@@ -492,6 +493,12 @@ write_search_counts() {
 # Same operation, resource type and page size on every leg, so
 # resources/s is comparable across all six; it is NOT the index cost
 # paid inside import (that stays folded into the import row).
+#
+# Opt-in: it runs only when `tests` names it and is not part of `all`.
+# Users never run a $reindex when they load data, and it rewrites the
+# index right before insert and bulk-import, so a run that includes it
+# may skew both; bulk-import's initial-index row is the default
+# indexing number.
 #
 # Timing is the job's own `$reindex-status` startedAt → completedAt
 # (seconds=), not this 2 s poll loop (wall_seconds=). Bounded: past

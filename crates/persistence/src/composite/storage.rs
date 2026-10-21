@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -94,6 +95,69 @@ pub type DynGroupExportProvider = Arc<dyn GroupExportProvider + Send + Sync>;
 
 /// Type alias for a purgable backend.
 pub type DynPurgableStorage = Arc<dyn PurgableStorage + Send + Sync>;
+
+/// Rebuilds the primary's [`StoredResource`] from a bundle entry body.
+///
+/// Production bundle results use [`StoredResource::content_with_meta`], so
+/// `meta.versionId` and `meta.lastUpdated` are present. Older or partial
+/// entries still have to fan out — dropping them leaves the secondary
+/// missing a write that sits beside a delete in the same bundle. Version
+/// then comes from `Location` (`Type/id/_history/{vid}`), then `"1"`;
+/// `lastUpdated` from the entry header, then now.
+fn stored_from_synced_body(
+    resource: &Value,
+    tenant_id: crate::tenant::TenantId,
+    fhir_version: FhirVersion,
+    location: Option<&str>,
+    last_modified: Option<&str>,
+) -> Option<StoredResource> {
+    let resource_type = resource.get("resourceType")?.as_str()?;
+    let id = resource.get("id")?.as_str()?;
+    let version = resource
+        .pointer("/meta/versionId")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+        .or_else(|| version_from_location(location))
+        .unwrap_or_else(|| {
+            warn!(
+                resource_type,
+                resource_id = id,
+                "Bundle entry has no primary versionId; syncing as version 1"
+            );
+            "1".to_string()
+        });
+    let last_updated = resource
+        .pointer("/meta/lastUpdated")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .or_else(|| last_modified.and_then(parse_rfc3339))
+        .unwrap_or_else(Utc::now);
+    Some(StoredResource::from_storage(
+        resource_type,
+        id,
+        version,
+        tenant_id,
+        resource.clone(),
+        last_updated,
+        last_updated,
+        None,
+        fhir_version,
+    ))
+}
+
+fn parse_rfc3339(instant: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(instant)
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
+}
+
+fn version_from_location(location: Option<&str>) -> Option<String> {
+    let location = location?;
+    let (_, after) = location.split_once("/_history/")?;
+    let version = after.split(['/', '?']).next()?.trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
 
 /// Composite storage that coordinates multiple backends.
 ///
@@ -823,7 +887,7 @@ impl CompositeStorage {
         result: &BundleResult,
         fhir_version: FhirVersion,
     ) {
-        let mut by_type: Vec<(String, Vec<(String, Value)>)> = Vec::new();
+        let mut by_type: Vec<(String, Vec<StoredResource>)> = Vec::new();
         let mut deletes: Vec<(String, String)> = Vec::new();
         for (entry_url, entry_result) in entry_urls.iter().zip(&result.entries) {
             if entry_result.effect == BundleEntryEffect::Deleted {
@@ -837,7 +901,7 @@ impl CompositeStorage {
                     continue;
                 };
                 if let Some((_, group)) = by_type.iter_mut().find(|(t, _)| *t == resource_type) {
-                    group.retain(|(id, _)| *id != resource_id);
+                    group.retain(|resource| resource.id() != resource_id);
                 }
                 deletes.push((resource_type, resource_id));
                 continue;
@@ -864,9 +928,15 @@ impl CompositeStorage {
                     by_type.last_mut().expect("just pushed")
                 }
             };
-            group
-                .1
-                .push((resource_id.to_string(), resource_json.clone()));
+            if let Some(stored) = stored_from_synced_body(
+                resource_json,
+                tenant.tenant_id().clone(),
+                fhir_version,
+                entry_result.location.as_deref(),
+                entry_result.last_modified.as_deref(),
+            ) {
+                group.1.push(stored);
+            }
         }
         // Deletes go first, in the primary's own processing order: a create
         // that preceded a delete of the same resource was dropped from
@@ -893,7 +963,7 @@ impl CompositeStorage {
             // rejection; the per-backend statuses are for callers that do
             // (bulk-submit), so this one discards them.
             let _ = self
-                .sync_creates_to_secondaries(tenant, &resource_type, fhir_version, resources)
+                .sync_creates_to_secondaries(tenant, &resource_type, resources)
                 .await;
         }
     }
@@ -912,8 +982,7 @@ impl CompositeStorage {
         &self,
         tenant: &TenantContext,
         resource_type: &str,
-        fhir_version: FhirVersion,
-        resources: Vec<(String, Value)>,
+        resources: Vec<StoredResource>,
     ) -> Vec<SyncStatus> {
         if resources.is_empty() {
             return Vec::new();
@@ -925,7 +994,6 @@ impl CompositeStorage {
             .sync_creates(
                 tenant.tenant_id(),
                 resource_type,
-                fhir_version,
                 resources,
                 &self.secondaries,
             )
@@ -1018,6 +1086,14 @@ impl ResourceStorage for CompositeStorage {
         self.primary.sof_runner()
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        // Terminology relations live beside the SQL-on-FHIR runner, in the
+        // primary store.
+        self.primary.sof_terminology_store()
+    }
+
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type))]
     async fn create(
         &self,
@@ -1043,13 +1119,7 @@ impl ResourceStorage for CompositeStorage {
 
         // Sync to secondaries
         if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::Create {
-                resource_type: resource_type.to_string(),
-                resource_id: stored.id().to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                fhir_version,
-            })
+            .sync_to_secondaries(SyncEvent::created(stored.clone()))
             .await
         {
             warn!(error = %e, "Failed to sync create to secondaries");
@@ -1088,16 +1158,16 @@ impl ResourceStorage for CompositeStorage {
         });
         self.update_health(primary_id, backend_failure.is_none(), backend_failure);
 
-        let created: Vec<(String, Value)> = results
+        let created: Vec<StoredResource> = results
             .iter()
             .filter_map(|result| result.as_ref().ok())
-            .map(|stored| (stored.id().to_string(), stored.content().clone()))
+            .cloned()
             .collect();
         // `create_many` has no per-entry receipt to correct either — that is
         // `CompositeSubmitJobs::sync_ingested`'s job, which calls
         // `sync_creates_to_secondaries` itself and inspects the statuses.
         let _ = self
-            .sync_creates_to_secondaries(tenant, resource_type, fhir_version, created)
+            .sync_creates_to_secondaries(tenant, resource_type, created)
             .await;
 
         results
@@ -1135,22 +1205,9 @@ impl ResourceStorage for CompositeStorage {
         // backends whose `create` rejects an existing id would otherwise drop
         // the write and go stale.
         let event = if created && stored.version_id() == "1" {
-            SyncEvent::Create {
-                resource_type: resource_type.to_string(),
-                resource_id: id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                fhir_version,
-            }
+            SyncEvent::created(stored.clone())
         } else {
-            SyncEvent::Update {
-                resource_type: resource_type.to_string(),
-                resource_id: id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                version: stored.version_id().to_string(),
-                fhir_version,
-            }
+            SyncEvent::updated(stored.clone())
         };
 
         if let Err(e) = self.sync_to_secondaries(event).await {
@@ -1200,14 +1257,7 @@ impl ResourceStorage for CompositeStorage {
 
         // Sync to secondaries
         if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::Update {
-                resource_type: current.resource_type().to_string(),
-                resource_id: current.id().to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                version: stored.version_id().to_string(),
-                fhir_version: stored.fhir_version(),
-            })
+            .sync_to_secondaries(SyncEvent::updated(stored.clone()))
             .await
         {
             warn!(error = %e, "Failed to sync update to secondaries");
@@ -1549,6 +1599,48 @@ impl SearchProvider for CompositeStorage {
         result
     }
 
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        // Same selection as `search_ids`. A routed auxiliary merge filters the
+        // page by id sets, which a one-pass distinct-value read would skip, so
+        // the resolver keeps paging in that case.
+        if !self.has_dedicated_search_backend() {
+            let decision = self
+                .router
+                .route(query)
+                .map_err(|error| self.routing_error_to_storage_error(error))?;
+            if !decision.auxiliary_targets.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        let preferred_id = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            .map(|backend| backend.id.as_str());
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        let backend_id = preferred_id
+            .filter(|id| self.search_providers.contains_key(*id))
+            .unwrap_or(primary_id);
+        let Some(provider) = self.search_providers.get(backend_id) else {
+            return Ok(None);
+        };
+        let result = provider
+            .search_reference_values(tenant, query, reference_param)
+            .await;
+        self.update_health(
+            backend_id,
+            result.is_ok(),
+            result.as_ref().err().map(|error| error.to_string()),
+        );
+        result
+    }
+
     async fn search_count(
         &self,
         tenant: &TenantContext,
@@ -1757,13 +1849,7 @@ impl ConditionalStorage for CompositeStorage {
                         .await?;
 
                     if let Err(e) = self
-                        .sync_to_secondaries(SyncEvent::Create {
-                            resource_type: resource_type.to_string(),
-                            resource_id: created.id().to_string(),
-                            content: created.content().clone(),
-                            tenant_id: tenant.tenant_id().clone(),
-                            fhir_version,
-                        })
+                        .sync_to_secondaries(SyncEvent::created(created.clone()))
                         .await
                     {
                         warn!(error = %e, "Failed to sync conditional_create to secondaries");
@@ -1792,13 +1878,7 @@ impl ConditionalStorage for CompositeStorage {
         // Sync created resource to secondaries
         if let ConditionalCreateResult::Created(ref stored) = result {
             if let Err(e) = self
-                .sync_to_secondaries(SyncEvent::Create {
-                    resource_type: resource_type.to_string(),
-                    resource_id: stored.id().to_string(),
-                    content: stored.content().clone(),
-                    tenant_id: tenant.tenant_id().clone(),
-                    fhir_version,
-                })
+                .sync_to_secondaries(SyncEvent::created(stored.clone()))
                 .await
             {
                 warn!(error = %e, "Failed to sync conditional_create to secondaries");
@@ -1836,13 +1916,7 @@ impl ConditionalStorage for CompositeStorage {
                             .await?;
 
                         if let Err(e) = self
-                            .sync_to_secondaries(SyncEvent::Create {
-                                resource_type: resource_type.to_string(),
-                                resource_id: created.id().to_string(),
-                                content: created.content().clone(),
-                                tenant_id: tenant.tenant_id().clone(),
-                                fhir_version,
-                            })
+                            .sync_to_secondaries(SyncEvent::created(created.clone()))
                             .await
                         {
                             warn!(
@@ -1870,14 +1944,7 @@ impl ConditionalStorage for CompositeStorage {
                     let updated = self.primary.update(tenant, &current, resource).await?;
 
                     if let Err(e) = self
-                        .sync_to_secondaries(SyncEvent::Update {
-                            resource_type: resource_type.to_string(),
-                            resource_id: updated.id().to_string(),
-                            content: updated.content().clone(),
-                            tenant_id: tenant.tenant_id().clone(),
-                            version: updated.version_id().to_string(),
-                            fhir_version: updated.fhir_version(),
-                        })
+                        .sync_to_secondaries(SyncEvent::updated(updated.clone()))
                         .await
                     {
                         warn!(error = %e, "Failed to sync conditional_update to secondaries");
@@ -1912,13 +1979,7 @@ impl ConditionalStorage for CompositeStorage {
         match &result {
             ConditionalUpdateResult::Created(stored) => {
                 if let Err(e) = self
-                    .sync_to_secondaries(SyncEvent::Create {
-                        resource_type: resource_type.to_string(),
-                        resource_id: stored.id().to_string(),
-                        content: stored.content().clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                        fhir_version,
-                    })
+                    .sync_to_secondaries(SyncEvent::created(stored.clone()))
                     .await
                 {
                     warn!(error = %e, "Failed to sync conditional_update create to secondaries");
@@ -1926,14 +1987,7 @@ impl ConditionalStorage for CompositeStorage {
             }
             ConditionalUpdateResult::Updated(stored) => {
                 if let Err(e) = self
-                    .sync_to_secondaries(SyncEvent::Update {
-                        resource_type: resource_type.to_string(),
-                        resource_id: stored.id().to_string(),
-                        content: stored.content().clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                        version: stored.version_id().to_string(),
-                        fhir_version: stored.fhir_version(),
-                    })
+                    .sync_to_secondaries(SyncEvent::updated(stored.clone()))
                     .await
                 {
                     warn!(error = %e, "Failed to sync conditional_update to secondaries");
@@ -2066,14 +2120,7 @@ impl VersionedStorage for CompositeStorage {
 
         // Sync to secondaries
         if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::Update {
-                resource_type: resource_type.to_string(),
-                resource_id: id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: tenant.tenant_id().clone(),
-                version: stored.version_id().to_string(),
-                fhir_version: stored.fhir_version(),
-            })
+            .sync_to_secondaries(SyncEvent::updated(stored.clone()))
             .await
         {
             warn!(error = %e, "Failed to sync update_with_match to secondaries");
@@ -3524,6 +3571,8 @@ mod tests {
         /// When set, `search` answers `UnsupportedCapability`, as a primary
         /// without the routed feature does.
         unsupported: std::sync::atomic::AtomicBool,
+        /// Reference parameters passed to `search_reference_values`.
+        reference_calls: Mutex<Vec<String>>,
     }
 
     impl RecordingSearchProvider {
@@ -3535,7 +3584,15 @@ mod tests {
                 registry: None,
                 native_reverse: std::sync::atomic::AtomicBool::new(false),
                 unsupported: std::sync::atomic::AtomicBool::new(false),
+                reference_calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn reference_call_count(&self) -> usize {
+            self.reference_calls
+                .lock()
+                .expect("reference_calls mutex poisoned")
+                .len()
         }
 
         /// Attaches a search-parameter registry so `search_param_registry`
@@ -3656,6 +3713,19 @@ mod tests {
                 SearchResult::new(Page::new(self.results.clone(), PageInfo::end()))
                     .with_total(self.results.len() as u64),
             )
+        }
+
+        async fn search_reference_values(
+            &self,
+            _tenant: &TenantContext,
+            _query: &SearchQuery,
+            reference_param: &str,
+        ) -> StorageResult<Option<Vec<String>>> {
+            self.reference_calls
+                .lock()
+                .expect("reference_calls mutex poisoned")
+                .push(reference_param.to_string());
+            Ok(Some(vec![format!("Patient/{}", self.name)]))
         }
 
         async fn search_count(
@@ -3782,6 +3852,99 @@ mod tests {
             StorageError::Backend(BackendError::UnsupportedCapability { backend_name, .. })
                 if backend_name == "primary"
         ));
+    }
+
+    #[tokio::test]
+    async fn search_reference_values_uses_the_same_provider_fallback_as_search_ids() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Observation");
+        let (mut composite, primary, search) = make_composite_with_dedicated_search(vec![], vec![]);
+
+        let values = composite
+            .search_reference_values(&tenant, &query, "subject")
+            .await
+            .unwrap();
+        assert_eq!(values, Some(vec!["Patient/search".to_string()]));
+        assert_eq!(search.reference_call_count(), 1);
+        assert_eq!(primary.reference_call_count(), 0);
+
+        composite.search_providers.remove("search");
+        let values = composite
+            .search_reference_values(&tenant, &query, "subject")
+            .await
+            .unwrap();
+        assert_eq!(values, Some(vec!["Patient/primary".to_string()]));
+        assert_eq!(primary.reference_call_count(), 1);
+
+        composite.search_providers.remove("primary");
+        let values = composite
+            .search_reference_values(&tenant, &query, "subject")
+            .await
+            .unwrap();
+        assert_eq!(values, None, "no provider means the resolver pages");
+    }
+
+    #[tokio::test]
+    async fn search_reference_values_without_dedicated_backend_uses_primary() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let (composite, primary) = make_composite_no_search_backend(vec![]);
+        let values = composite
+            .search_reference_values(&tenant, &SearchQuery::new("Observation"), "patient")
+            .await
+            .unwrap();
+        assert_eq!(values, Some(vec!["Patient/primary".to_string()]));
+        assert_eq!(primary.reference_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_reference_values_is_none_when_routing_has_auxiliary_targets() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .graph_backend("graph", BackendKind::Sqlite)
+            .with_routing_rule(
+                super::super::config::RoutingRule::new("reverse", "graph")
+                    .with_trigger(super::super::analyzer::QueryFeature::ReverseChaining),
+            )
+            .build()
+            .unwrap();
+        let primary = Arc::new(RecordingSearchProvider::new("primary", vec![]));
+        let graph = Arc::new(RecordingSearchProvider::new("graph", vec![]));
+        let mut backends = HashMap::new();
+        backends.insert("primary".into(), primary.clone() as DynStorage);
+        backends.insert("graph".into(), graph.clone() as DynStorage);
+        let mut providers = HashMap::new();
+        providers.insert("primary".into(), primary.clone() as DynSearchProvider);
+        providers.insert("graph".into(), graph.clone() as DynSearchProvider);
+        let merged = CompositeStorage::new(config, backends)
+            .unwrap()
+            .with_search_providers(providers);
+
+        let mut query = SearchQuery::new("Patient");
+        query
+            .reverse_chains
+            .push(crate::types::ReverseChainedParameter::terminal(
+                "Observation",
+                "patient",
+                "code",
+                SearchValue::eq("http://loinc.org|8302-2"),
+            ));
+        let values = merged
+            .search_reference_values(&tenant, &query, "patient")
+            .await
+            .unwrap();
+        assert_eq!(values, None);
+        assert_eq!(primary.reference_call_count(), 0);
+        assert_eq!(graph.reference_call_count(), 0);
     }
 
     #[test]

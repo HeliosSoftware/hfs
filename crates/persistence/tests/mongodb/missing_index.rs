@@ -1000,6 +1000,18 @@ async fn mongodb_missing_metadata_composite_and_derived_definitions_preserve_pre
     db.drop().await.unwrap();
 }
 
+/// Empties the profiler so the next capture holds only the next search's
+/// operations. Profiling must be off. A `ts` window against the client clock
+/// does not isolate searches: mongod's clock and timestamp semantics differ
+/// from the runner's by milliseconds, which let the previous search's work in
+/// or dropped the next search's first reads.
+async fn clear_profile(db: &mongodb::Database) {
+    db.collection::<Document>("system.profile")
+        .drop()
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages() {
     use futures::TryStreamExt;
@@ -1138,9 +1150,9 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             eprintln!("Dense ID page compatibility work: {field}={examined}");
         }
     }
-    let since = mongodb::bson::DateTime::now();
     let mut ordered = query.clone();
     ordered.sort.clear();
+    clear_profile(&db).await;
     db.run_command(doc! {"profile": 2}).await.unwrap();
     let result = backend.search(&tenant, &ordered).await;
     db.run_command(doc! {"profile": 0}).await.unwrap();
@@ -1155,7 +1167,6 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
         ["row-1199", "row-1198"]
     );
     let ordered_operations: Vec<Document> = db.collection("system.profile").find(doc! {
-        "ts": {"$gte": since},
         "ns": {"$in": [format!("{}.resources", db.name()), format!("{}.search_index", db.name())]},
         "op": {"$in": ["query", "command", "getmore"]}, "nreturned": {"$exists": true},
     }).await.unwrap().try_collect().await.unwrap();
@@ -1214,7 +1225,7 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             chain: vec![],
             components: vec![],
         });
-        let since = mongodb::bson::DateTime::now();
+        clear_profile(&db).await;
         db.run_command(doc! {"profile": 2}).await.unwrap();
         let result = backend.search(&tenant, &selective).await;
         db.run_command(doc! {"profile": 0}).await.unwrap();
@@ -1229,7 +1240,6 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             expected
         );
         let operations: Vec<Document> = db.collection("system.profile").find(doc! {
-            "ts": {"$gte": since},
             "ns": {"$in": [format!("{}.resources", db.name()), format!("{}.search_index", db.name())]},
             "op": {"$in": ["query", "command", "getmore"]},
             "nreturned": {"$exists": true},
@@ -1607,4 +1617,290 @@ async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
         .await;
     }
     db.drop().await.unwrap();
+}
+
+fn date_extensions(values: Vec<Value>) -> Vec<Value> {
+    values
+        .into_iter()
+        .map(|value| {
+            let field = if value.is_object() {
+                "valuePeriod"
+            } else {
+                "valueDateTime"
+            };
+            json!({"url": "urn:hfs:test:missing-date", (field): value})
+        })
+        .collect()
+}
+
+/// #2000: a value the extractor yields but the MongoDB writer cannot build a
+/// row for leaves the parameter as absent as one that extracted nothing.
+#[tokio::test]
+async fn mongodb_missing_metadata_unbuildable_dates_are_missing() {
+    let Some(backend) = create_backend("missing_unbuildable").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-unbuildable");
+    register_parameters(&backend, &tenant).await;
+    for (id, values) in [
+        ("invalid-date", vec![json!("not-a-date")]),
+        (
+            "invalid-period-end",
+            vec![json!({"start": "2026-01-01", "end": "not-a-date"})],
+        ),
+        ("mixed", vec![json!("not-a-date"), json!("2026-01-01")]),
+        ("valid", vec![json!("2026-01-01")]),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                observation(id, date_extensions(values)),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = backend.get_database().await.unwrap();
+    let date = &PARAMETERS[2];
+    assert_eq!(date.name, "missing-date");
+    let rows = db
+        .collection::<Document>("search_index")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation",
+            "resource_id": "invalid-date", "param_name": date.name,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "an invalid date must not build an index row");
+    for (id, missing) in [
+        ("invalid-date", true),
+        ("invalid-period-end", true),
+        ("mixed", false),
+        ("valid", false),
+    ] {
+        assert_missing_metadata(&db, &tenant, id, date, missing).await;
+    }
+    for (missing, expected) in [
+        (true, vec!["invalid-date", "invalid-period-end"]),
+        (false, vec!["mixed", "valid"]),
+    ] {
+        let mut query = missing_query(date, missing);
+        query.total = Some(TotalMode::Accurate);
+        assert_results(&backend, &tenant, &query, &expected).await;
+    }
+    db.drop().await.unwrap();
+}
+
+/// For every resource and every parameter family, exactly one of
+/// `:missing=true` and `:missing=false` matches (#2000).
+#[tokio::test]
+async fn mongodb_missing_metadata_true_and_false_are_complements() {
+    let Some(backend) = create_backend_with_full_registry("missing_complement").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-complement");
+    register_parameters(&backend, &tenant).await;
+    let mut resources = vec![
+        ("absent", observation("absent", vec![])),
+        ("null", observation("null", extensions(true))),
+        ("present", observation("present", extensions(false))),
+        (
+            "invalid-date",
+            observation("invalid-date", date_extensions(vec![json!("not-a-date")])),
+        ),
+        (
+            "invalid-period-end",
+            observation(
+                "invalid-period-end",
+                date_extensions(vec![json!({"start": "2026-01-01", "end": "not-a-date"})]),
+            ),
+        ),
+    ];
+    resources[2].1["effectiveDateTime"] = json!("2026-01-01");
+    resources[2].1["component"] =
+        json!([{"code": {"coding": [{"code": "x"}]}, "valueQuantity": {"value": 5}}]);
+    resources[3].1["effectiveDateTime"] = json!("not-a-date");
+    resources[3].1["component"] = json!([{"code": {"coding": [{"code": "x"}]}}]);
+    resources[4].1["effectivePeriod"] = json!({"start": "2026-01-01", "end": "not-a-date"});
+    let ids: Vec<_> = resources.iter().map(|(id, _)| *id).collect();
+    for (_, resource) in resources {
+        backend
+            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let parameters = PARAMETERS
+        .iter()
+        .map(|parameter| (parameter.name, parameter.kind))
+        .chain([
+            ("date", SearchParamType::Date),
+            ("component-code-value-quantity", SearchParamType::Composite),
+        ]);
+    for (name, kind) in parameters {
+        let mut matched = Vec::new();
+        for missing in [true, false] {
+            let mut query = SearchQuery::new("Observation")
+                .with_count(20)
+                .with_parameter(SearchParameter {
+                    name: name.into(),
+                    param_type: kind,
+                    modifier: Some(SearchModifier::Missing),
+                    values: vec![SearchValue::eq(if missing { "true" } else { "false" })],
+                    chain: vec![],
+                    components: vec![],
+                })
+                .with_sort(SortDirective::parse("_id"));
+            query.total = Some(TotalMode::Accurate);
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(
+                result.total,
+                Some(result.resources.items.len() as u64),
+                "{name}:missing={missing}"
+            );
+            matched.extend(result.resources.items.iter().map(|row| row.id().to_owned()));
+        }
+        matched.sort();
+        let mut expected: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            matched, expected,
+            "{name}: each resource must match exactly once"
+        );
+    }
+    let db = backend.get_database().await.unwrap();
+    db.drop().await.unwrap();
+}
+
+async fn resources_index_names(db: &mongodb::Database) -> Vec<String> {
+    db.collection::<Document>("resources")
+        .list_index_names()
+        .await
+        .unwrap()
+}
+
+/// #2001: `idx_resources_missing_params` follows `HFS_MONGODB_INDEX_BUILD`
+/// instead of blocking startup. With `off` the node starts and is ready
+/// without it, `:missing=true` takes the value-index route (a hint naming the
+/// absent index would fail the search), and results are identical once a
+/// later boot has built it.
+#[tokio::test]
+async fn mongodb_missing_index_follows_index_build_mode() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("missing_index_mode");
+    let index = "idx_resources_missing_params".to_string();
+
+    let off = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
+    assert_eq!(
+        off.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Skipped {
+            missing: vec![index.clone()]
+        })
+    );
+    let db = off.get_database().await.unwrap();
+    assert!(!resources_index_names(&db).await.contains(&index));
+    off.readiness_check()
+        .await
+        .expect("ready while the missing_params index is absent");
+
+    let tenant = create_tenant("missing-index-mode");
+    register_parameters(&off, &tenant).await;
+    for (id, values) in [
+        ("absent", vec![]),
+        ("null", extensions(true)),
+        ("present", extensions(false)),
+    ] {
+        off.create(
+            &tenant,
+            "Observation",
+            observation(id, values),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    }
+    for parameter in &PARAMETERS {
+        assert_results(
+            &off,
+            &tenant,
+            &missing_query(parameter, true),
+            &["absent", "null"],
+        )
+        .await;
+        assert_results(
+            &off,
+            &tenant,
+            &missing_query(parameter, false),
+            &["present"],
+        )
+        .await;
+    }
+
+    let inline = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert_eq!(
+        inline.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built {
+            created: vec![index.clone()],
+            dropped: vec![],
+        })
+    );
+    assert!(resources_index_names(&db).await.contains(&index));
+    inline.readiness_check().await.expect("ready once built");
+    for parameter in &PARAMETERS {
+        assert_results(
+            &inline,
+            &tenant,
+            &missing_query(parameter, true),
+            &["absent", "null"],
+        )
+        .await;
+        assert_results(
+            &inline,
+            &tenant,
+            &missing_query(parameter, false),
+            &["present"],
+        )
+        .await;
+    }
+
+    // Built and visible: readiness now guards the index searches hint.
+    set_test_index_hidden(&inline, "resources", &index, true).await;
+    let error = inline
+        .readiness_check()
+        .await
+        .expect_err("a hidden hinted index fails readiness");
+    assert!(error.to_string().contains(&index), "{error}");
+    set_test_index_hidden(&inline, "resources", &index, false).await;
+    inline.readiness_check().await.expect("ready once unhidden");
+    db.collection::<Document>("resources")
+        .drop_index(&index)
+        .await
+        .unwrap();
+    let error = inline
+        .readiness_check()
+        .await
+        .expect_err("a dropped hinted index fails readiness");
+    assert!(error.to_string().contains(&index), "{error}");
+
+    let background = boot_with_mode(&cs, &db_name, IndexBuildMode::Background).await;
+    assert!(matches!(
+        background.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    background
+        .readiness_check()
+        .await
+        .expect("rebuilt in the background");
+    for parameter in &PARAMETERS {
+        assert_results(
+            &background,
+            &tenant,
+            &missing_query(parameter, true),
+            &["absent", "null"],
+        )
+        .await;
+    }
 }

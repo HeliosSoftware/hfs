@@ -1,23 +1,6 @@
 {
   "resourceType": "Medication",
   "id": "med0321",
-  "contained": [
-    {
-      "resourceType": "Substance",
-      "id": "sub03",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "386906001",
-              "display": "Capecitabine (substance)"
-            }
-          ]
-        }
-      }
-    }
-  ],
   "code": {
     "coding": [
       {
@@ -39,8 +22,14 @@
   "ingredient": [
     {
       "item": {
-        "reference": {
-          "reference": "#sub03"
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "386906001",
+              "display": "Capecitabine (substance)"
+            }
+          ]
         }
       },
       "strengthRatio": {

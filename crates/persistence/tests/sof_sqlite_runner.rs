@@ -14,6 +14,10 @@ mod sof_prefix_matrix;
 #[path = "common/sof_pr410_views.rs"]
 mod sof_pr410_views;
 
+#[cfg(all(feature = "sqlite", feature = "R4"))]
+#[path = "common/sof_columnar.rs"]
+mod sof_columnar;
+
 #[cfg(feature = "sqlite")]
 mod sqlite_runner_tests {
     use futures::StreamExt;
@@ -965,6 +969,152 @@ mod sqlite_runner_tests {
     }
 
     #[tokio::test]
+    async fn test_declared_integer64_instant_decimal_types() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "issued": "2024-01-02T03:04:05.123+01:00",
+                    "valueInteger": 5_000_000_000_i64,
+                    "valueQuantity": {"value": 42.5}
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed o1");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{"column": [
+                {"path": "value.ofType(integer)", "name": "big", "type": "integer64"},
+                {"path": "issued", "name": "at", "type": "instant"},
+                {"path": "value.ofType(Quantity).value", "name": "dec", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        // integer64 is a JSON number beyond the i32 range, not a string.
+        assert_eq!(rows[0]["big"].as_i64(), Some(5_000_000_000));
+        // instant keeps its lexical form.
+        assert_eq!(rows[0]["at"], json!("2024-01-02T03:04:05.123+01:00"));
+        assert_eq!(rows[0]["dec"].as_f64(), Some(42.5));
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_sqlite_typed_columnar_values_and_parity() {
+        use super::sof_columnar as sc;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().expect("runner");
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::patient_typed_view(),
+            "patient",
+        )
+        .await;
+        sc::assert_patient_typed(&b);
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::observation_typed_view(),
+            "observation",
+        )
+        .await;
+        sc::assert_observation_typed(&b);
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_sqlite_typed_columnar_strict_and_invalid_tags() {
+        use super::sof_columnar as sc;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "tp2", "birthDate": "1980"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed tp2");
+        let runner = backend.sof_runner().expect("runner");
+        sc::assert_strict_and_rejected(runner.as_ref(), &tenant).await;
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_sqlite_declared_numeric_over_text_documented_limitation() {
+        use super::sof_columnar as sc;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Garcia"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().expect("runner");
+        // Documented limitation: the declared type is applied by a SQL CAST,
+        // and SQLite's CAST turns non-numeric text into 0 instead of failing
+        // (changing it would also change the constant/row-index casts the
+        // golden SQL pins). The columnar builder cannot tell this 0 from data.
+        // If this starts failing the limitation was lifted: update the docs.
+        let out = sc::row_outcome(runner.as_ref(), &tenant, &sc::text_declared_as("integer"))
+            .await
+            .expect("sqlite casts text to 0");
+        assert_eq!(out[0]["family"], json!(0));
+        let out = sc::row_outcome(runner.as_ref(), &tenant, &sc::text_declared_as("decimal"))
+            .await
+            .expect("sqlite casts text to 0.0");
+        assert_eq!(out[0]["family"].as_f64(), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_ansi_type_tag_is_rejected() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        for (ty, tag) in [("string", "NOT_A_TYPE"), ("decimal", "INT")] {
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "select": [{"column": [
+                    {"path": "id", "name": "id", "type": ty,
+                     "tag": [{"name": "ansi/type", "value": tag}]}
+                ]}]
+            });
+            let result = runner.run_view(&tenant, view, ViewFilters::default()).await;
+            assert!(result.is_err(), "tag {tag} on {ty} must be rejected");
+        }
+    }
+
+    #[tokio::test]
     async fn test_decimal_low_high_boundary() {
         let backend = make_backend().await;
         let runner = backend.sof_runner().expect("must have runner");
@@ -1153,6 +1303,70 @@ mod sqlite_runner_tests {
         }
     }
 
+    /// The `unionAll` view of #1947: one column that is a `string` in one
+    /// branch, an `integer` in another and an untyped boolean in a third.
+    fn mixed_union_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "QuestionnaireResponse",
+            "select": [{"forEach": "item", "unionAll": [
+                {"column": [{"name": "code", "path": "linkId", "type": "string"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueInteger",
+                             "type": "integer"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueBoolean"}]}
+            ]}]
+        })
+    }
+
+    async fn seed_mixed_union(backend: &SqliteBackend, tenant: &TenantContext) {
+        backend
+            .create(
+                tenant,
+                "QuestionnaireResponse",
+                json!({
+                    "resourceType": "QuestionnaireResponse",
+                    "id": "qr1",
+                    "status": "completed",
+                    "item": [
+                        {"linkId": "2.1", "answer": [{"valueInteger": 7}]},
+                        {"linkId": "true", "answer": [{"valueBoolean": true}]},
+                        {"linkId": "007"}
+                    ]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed questionnaire response");
+    }
+
+    /// #1947: when `unionAll` branches type a column differently, each value
+    /// keeps the type its own branch declares instead of being guessed from
+    /// its text.
+    #[tokio::test]
+    async fn test_union_branches_with_different_types_keep_each_type() {
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        seed_mixed_union(&backend, &tenant).await;
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let rows = collect_rows(runner.as_ref(), &tenant, mixed_union_view()).await;
+        let mut got: Vec<Value> = rows.iter().map(|r| r["code"].clone()).collect();
+        got.sort_by_key(|v| v.to_string());
+        let mut want = vec![
+            json!("2.1"),
+            json!("true"),
+            json!("007"),
+            json!(7),
+            json!(true),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ];
+        want.sort_by_key(|v| v.to_string());
+        assert_eq!(got, want);
+    }
+
     #[tokio::test]
     async fn test_untyped_columns_keep_json_shape() {
         let backend = make_backend().await;
@@ -1231,6 +1445,18 @@ mod sqlite_runner_tests {
     #[tokio::test]
     async fn test_pr410_exists_with_criteria() {
         assert_pr410_cases(&["UsCoreBloodPressures"]).await;
+    }
+
+    /// `exists(criteria)` over a path with more than one repeating step
+    /// (`component` and `coding`) sees every element (#1946).
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_exists_over_repeating_steps() {
+        assert_pr410_cases(&[
+            "ExistsAcrossRepeatingStepsWhere",
+            "ExistsAcrossRepeatingStepsColumns",
+        ])
+        .await;
     }
 
     /// `forEach: "name.where(use = 'official').first()"` — the criterion's own
@@ -2626,6 +2852,246 @@ mod total_order_acceptance {
                 "SELECT 'x',fe.rowid,CAST(fe.value AS TEXT) FROM json_each('[7,8]') fe ORDER BY fe.rowid"
             ),
             ["x:0:7", "x:1:8"]
+        );
+    }
+}
+
+/// The columnar path (`run_view_columnar`) must return the same columns, rows
+/// and values as `run_view`, for the same views, filters and limits.
+#[cfg(all(feature = "sqlite", feature = "R4"))]
+mod columnar_parity {
+    use super::sof_columnar::{assert_columnar_parity, column_types, row_path_cells};
+    use super::sof_pr410_views as pr410;
+    use super::sof_prefix_matrix as matrix;
+    use helios_fhir::FhirVersion;
+    use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::core::ResourceStorage;
+    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    use helios_sof::arrow::array::Array;
+    use helios_sof::arrow::datatypes::DataType;
+    use helios_sof::arrow::record_batch::RecordBatch;
+    use helios_sof::arrow::util::display::array_value_to_string;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn cells_of_batches(batches: &[RecordBatch]) -> Vec<Vec<Option<String>>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            for r in 0..batch.num_rows() {
+                out.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|c| (!c.is_null(r)).then(|| array_value_to_string(c, r).unwrap()))
+                        .collect(),
+                );
+            }
+        }
+        out
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(TenantId::new("columnar"), TenantPermissions::full_access())
+    }
+
+    async fn backend() -> Arc<SqliteBackend> {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        Arc::new(backend)
+    }
+
+    #[tokio::test]
+    async fn columnar_matches_rows_for_pr410_views() {
+        let backend = backend().await;
+        let tenant = tenant();
+        for (resource_type, resource) in pr410::resources() {
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .expect("seed PR #410 resource");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        for case in pr410::pr410_cases().into_iter().chain(pr410::extra_cases()) {
+            if case.name == "UsCoreBloodPressures" {
+                // Declared `decimal` columns are `Float64` on the columnar
+                // path (`120.0`) but vote to `Int32` on the row path (`120`):
+                // compare those cells numerically instead of as text.
+                numeric_parity(runner.as_ref(), &tenant, &case.view, case.name).await;
+                continue;
+            }
+            assert_columnar_parity(
+                runner.as_ref(),
+                &tenant,
+                &case.view,
+                &ViewFilters::default(),
+                case.name,
+            )
+            .await;
+        }
+    }
+
+    async fn numeric_parity(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        view: &serde_json::Value,
+        ctx: &str,
+    ) {
+        let (columns, expected) =
+            row_path_cells(runner, tenant, view, &ViewFilters::default()).await;
+        let batches =
+            super::sof_columnar::columnar_batches(runner, tenant, view, &ViewFilters::default())
+                .await;
+        let actual = cells_of_batches(&batches);
+        assert_eq!(actual.len(), expected.len(), "{ctx}: row count differs");
+        assert!(!columns.is_empty());
+        for (a_row, e_row) in actual.iter().zip(&expected) {
+            for (a, e) in a_row.iter().zip(e_row) {
+                match (a, e) {
+                    (Some(a), Some(e)) => match (a.parse::<f64>(), e.parse::<f64>()) {
+                        (Ok(a), Ok(e)) => assert_eq!(a, e, "{ctx}"),
+                        _ => assert_eq!(a, e, "{ctx}"),
+                    },
+                    _ => assert_eq!(a, e, "{ctx}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn columnar_matches_rows_for_prefix_matrix_with_limits() {
+        let backend = backend().await;
+        let tenant = tenant();
+        for record in matrix::fixture().into_iter().filter(|r| !r.deleted) {
+            backend
+                .create(&tenant, record.resource_type, record.data, FhirVersion::R4)
+                .await
+                .expect("seed matrix resource");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        for case in matrix::ordering_cases() {
+            for limit in [None, Some(0), Some(1), Some(50), Some(usize::MAX)] {
+                let mut filters = case.filters.clone();
+                filters.limit = limit;
+                assert_columnar_parity(
+                    runner.as_ref(),
+                    &tenant,
+                    &case.view,
+                    &filters,
+                    &format!("{} limit={limit:?}", case.name),
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn columnar_empty_group_yields_no_batches() {
+        let backend = backend().await;
+        let tenant = tenant();
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let case = pr410::case_named("PatientDemographics");
+        let filters = ViewFilters {
+            group: vec!["Group/does-not-exist".to_string()],
+            ..Default::default()
+        };
+        let batches = assert_columnar_parity(
+            runner.as_ref(),
+            &tenant,
+            &case.view,
+            &filters,
+            "empty group",
+        )
+        .await;
+        assert!(batches.is_empty());
+    }
+
+    /// #1947: a column the `unionAll` branches type differently is deferred
+    /// on the columnar path and still matches the row path cell for cell.
+    #[tokio::test]
+    async fn columnar_matches_rows_for_union_branches_with_different_types() {
+        let backend = backend().await;
+        let tenant = tenant();
+        backend
+            .create(
+                &tenant,
+                "QuestionnaireResponse",
+                json!({
+                    "resourceType": "QuestionnaireResponse",
+                    "id": "qr1",
+                    "status": "completed",
+                    "item": [
+                        {"linkId": "2.1", "answer": [{"valueInteger": 7}]},
+                        {"linkId": "true", "answer": [{"valueBoolean": true}]}
+                    ]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed questionnaire response");
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "QuestionnaireResponse",
+            "select": [{"forEach": "item", "unionAll": [
+                {"column": [{"name": "code", "path": "linkId", "type": "string"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueInteger",
+                             "type": "integer"}]}
+            ]}]
+        });
+        assert_columnar_parity(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+            "mixed union",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn columnar_types_columns_from_the_view_and_keeps_nulls() {
+        let backend = backend().await;
+        let tenant = tenant();
+        for (id, active) in [("a", Some(true)), ("b", Some(false)), ("c", None)] {
+            let mut patient = json!({"resourceType": "Patient", "id": id});
+            if let Some(active) = active {
+                patient["active"] = json!(active);
+            }
+            backend
+                .create(&tenant, "Patient", patient, FhirVersion::R4)
+                .await
+                .expect("seed patient");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "active", "path": "active", "type": "boolean"},
+                {"name": "birth", "path": "birthDate", "type": "date"}
+            ]}]
+        });
+        let batches = assert_columnar_parity(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+            "typed columns",
+        )
+        .await;
+        let types = column_types(&batches);
+        assert_eq!(
+            types,
+            vec![
+                ("id".to_string(), DataType::Utf8),
+                ("active".to_string(), DataType::Boolean),
+                ("birth".to_string(), DataType::Utf8),
+            ]
         );
     }
 }

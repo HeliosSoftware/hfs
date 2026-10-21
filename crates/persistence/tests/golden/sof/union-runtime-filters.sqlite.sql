@@ -15,7 +15,6 @@ WHERE r.tenant_id = ?1
   AND r.is_deleted = 0
   AND r.last_updated >= ?5
   AND r.id IN (SELECT value FROM json_each(?6))
-ORDER BY 1
 LIMIT 50
 
 /* Runner bindings and output metadata:

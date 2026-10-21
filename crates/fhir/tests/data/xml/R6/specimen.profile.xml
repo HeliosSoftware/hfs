@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Specimen"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -46,8 +46,6 @@
             <a href="domainresource.html">DomainResource</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Sample for analysis
-            <br/>
-            <span style="font-style: italic" title="spm-1">+ Rule: Specimen.collection.collector SHALL only be present if Specimen.collection.procedure is not present</span>
             <br/>
             <br/>Elements defined in Ancestors: 
             <a href="resource.html#Resource" title="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes.">id</a>, 
@@ -123,7 +121,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Kind of material that forms the specimen
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v2-0487.html">hl7VS-specimenType</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v2-0487.html">hl7VS-specimenType</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -151,7 +149,7 @@
             <a href="location.html">Location</a> | 
             <a href="nutritionproduct.html">NutritionProduct</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Who or what this specimen is from (subject of record)
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Subject (who or what) of record this specimen is associated with
             <br/>
           </td>
         </tr>
@@ -280,7 +278,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The role the specimen serves
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-specimen-role.html" title="Codes describing specimen role.">Specimen Role</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-specimen-role.html" title="Codes describing specimen role.">Specimen Role</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -371,12 +369,11 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="Specimen.collection.collector : Person who collected the specimen.">collector</span>
+            <span title="Specimen.collection.collector : The person, organization, or device that collected the specimen.">collector</span>
             <a name="Specimen.collection.collector"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
-            <a style="padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;; padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;" href="conformance-rules.html#constraints" title="This element has or is affected by some invariants">C</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -385,9 +382,10 @@
             <a href="practitioner.html">Practitioner</a> | 
             <a href="practitionerrole.html">PractitionerRole</a> | 
             <a href="patient.html">Patient</a> | 
-            <a href="relatedperson.html">RelatedPerson</a>)
+            <a href="relatedperson.html">RelatedPerson</a> | 
+            <a href="device.html">Device</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Who collected the specimen
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Who or what collected the specimen
             <br/>
           </td>
         </tr>
@@ -539,9 +537,7 @@
             <span title="Specimen.collection.procedure : The procedure event during which the specimen was collected (e.g. the surgery leading to the collection of a pathology sample).">procedure</span>
             <a name="Specimen.collection.procedure"> </a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;; padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;" href="conformance-rules.html#constraints" title="This element has or is affected by some invariants">C</a>
-          </td>
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="references.html#Reference">Reference</a>(
@@ -592,7 +588,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"></td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Whether or how long patient abstained from food and/or drink
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v2-0916.html">hl7VS-relevantClincialInformation</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v2-0916.html">hl7VS-relevantClincialInformation</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -709,8 +705,10 @@
             <a href="references.html#Reference">Reference</a>(
             <a href="practitioner.html">Practitioner</a> | 
             <a href="practitionerrole.html">PractitionerRole</a> | 
+            <a href="organization.html">Organization</a> | 
             <a href="patient.html">Patient</a> | 
-            <a href="relatedperson.html">RelatedPerson</a>)
+            <a href="relatedperson.html">RelatedPerson</a> | 
+            <a href="device.html">Device</a>)
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Entity processing specimen
             <br/>
@@ -951,7 +949,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">State of the specimen
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.3.0/ValueSet-v2-0493.html">hl7VS-specimenCondition</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v2-0493.html">hl7VS-specimenCondition</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -1005,7 +1003,7 @@
   <name value="Specimen"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -1100,13 +1098,6 @@
         <human value="A resource should have narrative for robust management"/>
         <expression value="text.`div`.exists()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/DomainResource"/>
-      </constraint>
-      <constraint>
-        <key value="spm-1"/>
-        <severity value="error"/>
-        <human value="Specimen.collection.collector SHALL only be present if Specimen.collection.procedure is not present"/>
-        <expression value="collection.collector.empty() or collection.procedure.empty()"/>
-        <source value="http://hl7.org/fhir/StructureDefinition/Specimen"/>
       </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
@@ -1516,7 +1507,7 @@
     </element>
     <element id="Specimen.subject">
       <path value="Specimen.subject"/>
-      <short value="Who or what this specimen is from (subject of record)"/>
+      <short value="Subject (who or what) of record this specimen is associated with"/>
       <definition value="The subject of record that the specimen is associated with.  This subject may be a patient, group, location, device, or another entity. If the specimen is collected from an entity different from the subject of record (Specimen.subject), that entity should be recorded using Specimen.focus. For example, a specimen may be collected from an animal for the purpose of providing care to a person rather than the animal itself."/>
       <comment value="If a specimen is from a BiologicallyDerivedProduct, it must be conveyed as the 'focus' (with patient as the subject) if the referenced record identifies a source patient.&#xD;&#xD;Group must only appear as a subject if it is an appropriate 'record target' for the system. This will be true for animal herds and for families in certain types of systems. If the record is for a specific patient, then the group must be conveyed as the 'focus' with the patient as the subject."/>
       <requirements value="Must know the subject context."/>
@@ -2129,8 +2120,9 @@
     </element>
     <element id="Specimen.collection.collector">
       <path value="Specimen.collection.collector"/>
-      <short value="Who collected the specimen"/>
-      <definition value="Person who collected the specimen."/>
+      <short value="Who or what collected the specimen"/>
+      <definition value="The person, organization, or device that collected the specimen."/>
+      <comment value="If both Specimen.collection.collector and Specimen.collection.procedure.performer are valued, they are expected to be consistent."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2145,8 +2137,8 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/PractitionerRole"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Patient"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
-      <condition value="spm-1"/>
       <constraint>
         <key value="ele-1"/>
         <severity value="error"/>
@@ -2360,6 +2352,7 @@
       <path value="Specimen.collection.procedure"/>
       <short value="The procedure that collects the specimen"/>
       <definition value="The procedure event during which the specimen was collected (e.g. the surgery leading to the collection of a pathology sample)."/>
+      <comment value="If both Specimen.collection.collector and Specimen.collection.procedure.performer are valued, they are expected to be consistent."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2371,7 +2364,6 @@
         <code value="Reference"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Procedure"/>
       </type>
-      <condition value="spm-1"/>
       <constraint>
         <key value="ele-1"/>
         <severity value="error"/>
@@ -2689,8 +2681,10 @@
         <code value="Reference"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Practitioner"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/PractitionerRole"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Organization"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Patient"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -3287,13 +3281,6 @@
       <definition value="A sample to be used for analysis."/>
       <min value="0"/>
       <max value="*"/>
-      <constraint>
-        <key value="spm-1"/>
-        <severity value="error"/>
-        <human value="Specimen.collection.collector SHALL only be present if Specimen.collection.procedure is not present"/>
-        <expression value="collection.collector.empty() or collection.procedure.empty()"/>
-        <source value="http://hl7.org/fhir/StructureDefinition/Specimen"/>
-      </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <mapping>
@@ -3402,7 +3389,7 @@
     </element>
     <element id="Specimen.subject">
       <path value="Specimen.subject"/>
-      <short value="Who or what this specimen is from (subject of record)"/>
+      <short value="Subject (who or what) of record this specimen is associated with"/>
       <definition value="The subject of record that the specimen is associated with.  This subject may be a patient, group, location, device, or another entity. If the specimen is collected from an entity different from the subject of record (Specimen.subject), that entity should be recorded using Specimen.focus. For example, a specimen may be collected from an animal for the purpose of providing care to a person rather than the animal itself."/>
       <comment value="If a specimen is from a BiologicallyDerivedProduct, it must be conveyed as the 'focus' (with patient as the subject) if the referenced record identifies a source patient.&#xD;&#xD;Group must only appear as a subject if it is an appropriate 'record target' for the system. This will be true for animal herds and for families in certain types of systems. If the record is for a specific patient, then the group must be conveyed as the 'focus' with the patient as the subject."/>
       <requirements value="Must know the subject context."/>
@@ -3667,8 +3654,9 @@
     </element>
     <element id="Specimen.collection.collector">
       <path value="Specimen.collection.collector"/>
-      <short value="Who collected the specimen"/>
-      <definition value="Person who collected the specimen."/>
+      <short value="Who or what collected the specimen"/>
+      <definition value="The person, organization, or device that collected the specimen."/>
+      <comment value="If both Specimen.collection.collector and Specimen.collection.procedure.performer are valued, they are expected to be consistent."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -3678,8 +3666,8 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/PractitionerRole"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Patient"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
-      <condition value="spm-1"/>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="true"/>
@@ -3826,13 +3814,13 @@
       <path value="Specimen.collection.procedure"/>
       <short value="The procedure that collects the specimen"/>
       <definition value="The procedure event during which the specimen was collected (e.g. the surgery leading to the collection of a pathology sample)."/>
+      <comment value="If both Specimen.collection.collector and Specimen.collection.procedure.performer are valued, they are expected to be consistent."/>
       <min value="0"/>
       <max value="1"/>
       <type>
         <code value="Reference"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Procedure"/>
       </type>
-      <condition value="spm-1"/>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
@@ -3970,8 +3958,10 @@
         <code value="Reference"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Practitioner"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/PractitionerRole"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Organization"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Patient"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>

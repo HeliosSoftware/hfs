@@ -43,14 +43,39 @@
       "reason": "Contested upstream: same cause as testFHIRPathAsFunction11 but via ofType(string). Was previously counted as a PASS by the in-body `contested_tests` allowlist (#307)."
     },
     {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityMonthLiteralToQuantity",
-      "reason": "Our defect, previously mislabelled 'test is wrong' and counted as a PASS (#307). '1 \\'mo\\''.toQuantity() = 1 month must be empty because UCUM 'mo' and the calendar month are not comparable; we return true, conflating UCUM units with calendar durations. Removable when Quantity comparison distinguishes calendar from UCUM duration units."
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent1",
+      "reason": "Decimal written with a positive exponent (e.g. 9.5e2): the precision is in the mantissa, but Decimal::from_scientific normalizes to 950 at scale 0 and EvaluationResult::Decimal carries no other precision, so the boundary is computed at units precision. Remove when #2173 lands. Negative exponents (LowBoundaryDecimalExponent2, HighBoundaryDecimalExponent3) already pass, because they survive as scale."
     },
     {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityYearLiteralToQuantity",
-      "reason": "Our defect, previously mislabelled 'test is wrong' and counted as a PASS (#307). Same cause as testStringQuantityMonthLiteralToQuantity, for UCUM 'a' versus the calendar year."
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent3",
+      "reason": "Decimal written with a positive exponent (e.g. 9.5e2): the precision is in the mantissa, but Decimal::from_scientific normalizes to 950 at scale 0 and EvaluationResult::Decimal carries no other precision, so the boundary is computed at units precision. Remove when #2173 lands. Negative exponents (LowBoundaryDecimalExponent2, HighBoundaryDecimalExponent3) already pass, because they survive as scale."
+    },
+    {
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent4",
+      "reason": "Decimal written with a positive exponent (e.g. 9.5e2): the precision is in the mantissa, but Decimal::from_scientific normalizes to 950 at scale 0 and EvaluationResult::Decimal carries no other precision, so the boundary is computed at units precision. Remove when #2173 lands. Negative exponents (LowBoundaryDecimalExponent2, HighBoundaryDecimalExponent3) already pass, because they survive as scale."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent1",
+      "reason": "Decimal written with a positive exponent (e.g. 9.5e2): the precision is in the mantissa, but Decimal::from_scientific normalizes to 950 at scale 0 and EvaluationResult::Decimal carries no other precision, so the boundary is computed at units precision. Remove when #2173 lands. Negative exponents (LowBoundaryDecimalExponent2, HighBoundaryDecimalExponent3) already pass, because they survive as scale."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent2",
+      "reason": "Decimal written with a positive exponent (e.g. 9.5e2): the precision is in the mantissa, but Decimal::from_scientific normalizes to 950 at scale 0 and EvaluationResult::Decimal carries no other precision, so the boundary is computed at units precision. Remove when #2173 lands. Negative exponents (LowBoundaryDecimalExponent2, HighBoundaryDecimalExponent3) already pass, because they survive as scale."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent4",
+      "reason": "Decimal written with a positive exponent (e.g. 9.5e2): the precision is in the mantissa, but Decimal::from_scientific normalizes to 950 at scale 0 and EvaluationResult::Decimal carries no other precision, so the boundary is computed at units precision. Remove when #2173 lands. Negative exponents (LowBoundaryDecimalExponent2, HighBoundaryDecimalExponent3) already pass, because they survive as scale."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent5",
+      "reason": "Decimal written with a positive exponent (e.g. 9.5e2): the precision is in the mantissa, but Decimal::from_scientific normalizes to 950 at scale 0 and EvaluationResult::Decimal carries no other precision, so the boundary is computed at units precision. Remove when #2173 lands. Negative exponents (LowBoundaryDecimalExponent2, HighBoundaryDecimalExponent3) already pass, because they survive as scale."
     }
   ]
 }

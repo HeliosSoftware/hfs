@@ -3,6 +3,7 @@
 //! Delivers notification bundles via HTTP POST to the subscriber's endpoint.
 
 use async_trait::async_trait;
+use helios_persistence::core::bulk_submit_input::{redact_url, redact_urls_in};
 use reqwest::Client;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -73,7 +74,7 @@ impl RestHookChannel {
 
         debug!(
             subscription_id = %subscription.id,
-            endpoint,
+            endpoint = %redact_url(endpoint),
             "Dispatching rest-hook notification"
         );
 
@@ -104,6 +105,8 @@ impl RestHookChannel {
                 }
             }
             Err(e) => {
+                // reqwest's message ends with `for url (...)`, query included.
+                let error = redact_urls_in(&e.to_string());
                 if e.is_timeout() {
                     warn!(
                         subscription_id = %subscription.id,
@@ -113,19 +116,19 @@ impl RestHookChannel {
                 } else if e.is_connect() {
                     warn!(
                         subscription_id = %subscription.id,
-                        error = %e,
+                        error = %error,
                         "Connection failed"
                     );
                     Ok(DispatchResult::RetryableError(format!(
-                        "connection error: {e}"
+                        "connection error: {error}"
                     )))
                 } else {
                     warn!(
                         subscription_id = %subscription.id,
-                        error = %e,
+                        error = %error,
                         "Notification delivery failed"
                     );
-                    Ok(DispatchResult::RetryableError(e.to_string()))
+                    Ok(DispatchResult::RetryableError(error))
                 }
             }
         }
@@ -312,6 +315,22 @@ mod tests {
         let result = channel.handshake(&sub, &bundle).await.unwrap();
 
         assert!(matches!(result, DispatchResult::Success));
+    }
+
+    #[tokio::test]
+    async fn connection_error_message_redacts_endpoint_query() {
+        let channel = RestHookChannel::new();
+        let sub = test_subscription(
+            "http://127.0.0.1:1/webhook?token=QUERYSECRET",
+            PayloadContent::IdOnly,
+        );
+        let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
+
+        let DispatchResult::RetryableError(msg) = result else {
+            panic!("expected a retryable error, got {result:?}");
+        };
+        assert!(!msg.contains("QUERYSECRET"), "{msg}");
+        assert!(msg.contains("127.0.0.1:1/webhook"), "{msg}");
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime, SslMode};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,36 @@ use crate::search::{
 /// definitions, keyed by tenant id. Postgres queries are async but the per-tenant
 /// registry loader must be sync, so async paths (startup, TTL refresh, and
 /// SearchParameter writes) populate this map and the loader reads it.
-type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
+type StoredByTenant = Arc<RwLock<HashMap<String, StoredOverlay>>>;
+
+/// One tenant's cached stored-SearchParameter overlay.
+struct StoredOverlay {
+    /// The persisted rows this overlay was read from, when a write validated
+    /// it (see [`PostgresBackend::write_extractor`]). `None` after the
+    /// all-tenant refresh, which does not fingerprint: the next write for the
+    /// tenant re-reads and fingerprints once.
+    fingerprint: Option<OverlayFingerprint>,
+    /// The tenant's stored active definitions, read by the registry loader.
+    definitions: Vec<SearchParameterDefinition>,
+    /// The registry a validated write extracts with: the shared base when the
+    /// overlay is empty, otherwise the base with the overlay registered on
+    /// top. Built once per fingerprint, never per write.
+    registry: Option<Arc<RwLock<SearchParameterRegistry>>>,
+}
+
+/// A cheap summary of a tenant's live `SearchParameter` rows (#1897).
+///
+/// Every mutation of a live row moves it: a create or update bumps the newest
+/// `last_updated`, a delete lowers the live count (or, for the newest row,
+/// the maximum). Only a delete paired with a create whose timestamp does not
+/// exceed the previous maximum — clock skew between HFS processes within one
+/// write — leaves both unchanged, and the TTL refresh bounds that case as it
+/// does every other backend's cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OverlayFingerprint {
+    live: i64,
+    newest: Option<DateTime<Utc>>,
+}
 
 /// PostgreSQL backend for FHIR resource storage.
 ///
@@ -76,7 +106,9 @@ impl Debug for PostgresBackend {
 }
 
 /// Configuration for the PostgreSQL backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the password never reaches a log line (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PostgresConfig {
     /// PostgreSQL host.
     #[serde(default = "default_host")]
@@ -372,6 +404,50 @@ fn default_pool_wait_timeout_secs() -> u64 {
     10
 }
 
+impl Debug for PostgresConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            host,
+            port,
+            dbname,
+            user,
+            password,
+            ssl_mode,
+            max_connections,
+            connect_timeout_secs,
+            statement_timeout_ms,
+            count_by_tenant_statement_timeout_ms,
+            plan_cache_mode,
+            pool_wait_timeout_secs,
+            fhir_version,
+            data_dir,
+            search_offloaded,
+        } = self;
+        f.debug_struct("PostgresConfig")
+            .field("host", host)
+            .field("port", port)
+            .field("dbname", dbname)
+            .field("user", user)
+            .field("password", &password.as_ref().map(|_| "[redacted]"))
+            .field("ssl_mode", ssl_mode)
+            .field("max_connections", max_connections)
+            .field("connect_timeout_secs", connect_timeout_secs)
+            .field("statement_timeout_ms", statement_timeout_ms)
+            .field(
+                "count_by_tenant_statement_timeout_ms",
+                count_by_tenant_statement_timeout_ms,
+            )
+            .field("plan_cache_mode", plan_cache_mode)
+            .field("pool_wait_timeout_secs", pool_wait_timeout_secs)
+            .field("fhir_version", fhir_version)
+            .field("data_dir", data_dir)
+            .field("search_offloaded", search_offloaded)
+            .finish()
+    }
+}
+
 impl Default for PostgresConfig {
     fn default() -> Self {
         Self {
@@ -565,7 +641,7 @@ impl PostgresBackend {
                     loader_cache
                         .read()
                         .get(tenant_id)
-                        .cloned()
+                        .map(|overlay| overlay.definitions.clone())
                         .unwrap_or_default(),
                 )
             },
@@ -1022,7 +1098,7 @@ impl PostgresBackend {
             .map_err(|e| internal("Failed to finish SearchParameter refresh", e))?;
 
         let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut by_tenant: HashMap<String, Vec<SearchParameterDefinition>> = HashMap::new();
+        let mut by_tenant: HashMap<String, StoredOverlay> = HashMap::new();
         let mut count = 0;
         for row in rows {
             let tenant_id: String = row.get(0);
@@ -1031,7 +1107,15 @@ impl PostgresBackend {
                 && def.status == SearchParameterStatus::Active
             {
                 def.source = SearchParameterSource::Stored;
-                by_tenant.entry(tenant_id).or_default().push(def);
+                by_tenant
+                    .entry(tenant_id)
+                    .or_insert_with(|| StoredOverlay {
+                        fingerprint: None,
+                        definitions: Vec::new(),
+                        registry: None,
+                    })
+                    .definitions
+                    .push(def);
                 count += 1;
             }
         }
@@ -1040,18 +1124,55 @@ impl PostgresBackend {
         Ok(count)
     }
 
-    /// Builds a fresh tenant registry using the caller's guarded transaction.
+    /// The statement a write runs to validate its cached overlay (#1897):
+    /// the tenant's live `SearchParameter` count and newest `last_updated`.
+    /// Both come from `idx_resources_search (tenant_id, resource_type,
+    /// last_updated DESC, id) WHERE is_deleted = FALSE`, so this is an
+    /// index-only scan of the tenant's ~1,400 seeded entries, not a read and
+    /// decode of their ~1.5 MB of JSONB.
     ///
-    /// The process-local overlay cache can lag writes from another HFS process.
-    /// Reindex groups and guarded mutations therefore read the persisted overlay
-    /// after taking the tenant gate. The caller keeps this extractor for one
-    /// immutable extraction phase; this method never writes the cache or checks
-    /// out another connection.
-    pub(crate) async fn authoritative_extractor<C>(
+    /// `#[doc(hidden)] pub` only so the integration tests can `EXPLAIN` the
+    /// exact statement and pin that plan.
+    #[doc(hidden)]
+    pub const OVERLAY_FINGERPRINT_SQL: &'static str = "SELECT COUNT(*)::bigint, MAX(last_updated) \
+         FROM resources \
+         WHERE tenant_id = $1 AND resource_type = 'SearchParameter' \
+           AND is_deleted = FALSE";
+
+    async fn overlay_fingerprint<C>(
         &self,
         client: &C,
         tenant_id: &str,
-    ) -> StorageResult<SearchParameterExtractor>
+    ) -> StorageResult<OverlayFingerprint>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
+        let row = client
+            .query_one(Self::OVERLAY_FINGERPRINT_SQL, &[&tenant_id])
+            .await
+            .map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::Internal {
+                    backend_name: "postgres".to_string(),
+                    message: format!("Failed to fingerprint tenant SearchParameters: {e}"),
+                    source: None,
+                })
+            })?;
+        Ok(OverlayFingerprint {
+            live: row.get(0),
+            newest: row.get(1),
+        })
+    }
+
+    /// Reads the tenant's stored overlay on the caller's connection: every
+    /// live `SearchParameter` row that is active and whose canonical URL is
+    /// not already in the shared base. Seeded core definitions cannot
+    /// override their canonical URL in the base, so they are skipped before
+    /// parsing.
+    async fn read_stored_overlay<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+    ) -> StorageResult<Vec<SearchParameterDefinition>>
     where
         C: GenericClient + Sync + ?Sized,
     {
@@ -1072,14 +1193,11 @@ impl PostgresBackend {
                 })
             })?;
 
-        let base = self.registries.base().clone();
         let overlays: Vec<serde_json::Value> = {
-            let registry = base.read();
+            let registry = self.registries.base().read();
             rows.into_iter()
                 .filter_map(|row| {
                     let data: serde_json::Value = row.get(0);
-                    // Seeded core definitions cannot override their canonical
-                    // URL in the base. Skip parsing them on every write.
                     let duplicate = data
                         .get("url")
                         .and_then(serde_json::Value::as_str)
@@ -1088,52 +1206,128 @@ impl PostgresBackend {
                 })
                 .collect()
         };
-        if overlays.is_empty() {
-            // The common case has no tenant overlay. The base is loaded at
-            // construction and remains shared, so a write need not clone its
-            // 1,389 definitions before extracting one resource.
-            return Ok(SearchParameterExtractor::new(base));
-        }
         let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut registry = base.read().clone();
-        for data in overlays {
-            if let Ok(mut definition) = loader.parse_resource(&data) {
-                if definition.status == SearchParameterStatus::Active {
-                    definition.source = SearchParameterSource::Stored;
-                    // Match TenantSearchRegistries::build_and_cache: a stored
-                    // duplicate canonical URL cannot override the base entry.
-                    let _ = registry.register(definition);
-                }
-            }
+        Ok(overlays
+            .iter()
+            .filter_map(|data| loader.parse_resource(data).ok())
+            .filter(|definition| definition.status == SearchParameterStatus::Active)
+            .map(|mut definition| {
+                definition.source = SearchParameterSource::Stored;
+                definition
+            })
+            .collect())
+    }
+
+    /// The registry for a stored overlay: the shared base itself when the
+    /// overlay is empty — the common case, loaded at construction and shared,
+    /// so a write need not clone its 1,389 definitions before extracting one
+    /// resource — otherwise a clone of the base with the overlay registered.
+    fn overlay_registry(
+        &self,
+        definitions: &[SearchParameterDefinition],
+    ) -> Arc<RwLock<SearchParameterRegistry>> {
+        let base = self.registries.base();
+        if definitions.is_empty() {
+            return base.clone();
         }
-        Ok(SearchParameterExtractor::new(Arc::new(RwLock::new(
-            registry,
-        ))))
+        let mut registry = base.read().clone();
+        for definition in definitions {
+            // Match TenantSearchRegistries::build_and_cache: a stored
+            // duplicate canonical URL cannot override the base entry.
+            let _ = registry.register(definition.clone());
+        }
+        Arc::new(RwLock::new(registry))
+    }
+
+    /// Builds a fresh tenant registry using the caller's guarded transaction.
+    ///
+    /// The process-local overlay cache can lag writes from another HFS process.
+    /// Reindex groups therefore read the persisted overlay after taking the
+    /// tenant gate, and never through the cache. The caller keeps this
+    /// extractor for one immutable extraction phase; this method never writes
+    /// the cache or checks out another connection.
+    pub(crate) async fn authoritative_extractor<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+    ) -> StorageResult<SearchParameterExtractor>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
+        let definitions = self.read_stored_overlay(client, tenant_id).await?;
+        Ok(SearchParameterExtractor::new(
+            self.overlay_registry(&definitions),
+        ))
     }
 
     /// The extractor a write hands to its index step.
     ///
     /// When `extracts` is false the write indexes nothing in PostgreSQL —
     /// search is offloaded (#939) or deferred to a later rebuild (#903) — so
-    /// reading the persisted overlay would be pure cost: one query and one
-    /// JSONB decode per stored SearchParameter (1,375 seeded, ~1.5 MB) on
-    /// every call. The shared base stands in; nothing extracts with it.
+    /// reading the persisted overlay would be pure cost. The shared base
+    /// stands in; nothing extracts with it.
+    ///
+    /// Otherwise the write validates the cached overlay instead of re-reading
+    /// it (#1897). Before this, every indexed write ran the authoritative
+    /// read: one query and one JSONB decode per stored SearchParameter (1,372
+    /// seeded, ~1.5 MB) per call, 93% of the database's time in the benchmark
+    /// crud suite at 24.8 ms a call. Now it fingerprints the tenant's live
+    /// `SearchParameter` rows with one index-only probe
+    /// ([`Self::OVERLAY_FINGERPRINT_SQL`]) on the same guarded connection, so
+    /// a SearchParameter committed by another HFS process is still seen by the
+    /// next write here, and only a changed fingerprint pays the full read,
+    /// which then re-fingerprints the cache for the tenant.
+    ///
+    /// `pending_search_parameter` says the caller's transaction has itself
+    /// written a `SearchParameter` it has not committed. The fingerprint and
+    /// the read both see that row, so the extractor is right either way, but
+    /// the cache must not: the transaction may still roll back, and the
+    /// search path reads the same cache. The caller reloads the cache after
+    /// its commit, as every SearchParameter write path does.
     pub(crate) async fn write_extractor<C>(
         &self,
         client: &C,
         tenant_id: &str,
         extracts: bool,
+        pending_search_parameter: bool,
     ) -> StorageResult<SearchParameterExtractor>
     where
         C: GenericClient + Sync + ?Sized,
     {
-        if extracts {
-            self.authoritative_extractor(client, tenant_id).await
-        } else {
-            Ok(SearchParameterExtractor::new(
+        if !extracts {
+            return Ok(SearchParameterExtractor::new(
                 self.registries.base().clone(),
-            ))
+            ));
         }
+        let fingerprint = self.overlay_fingerprint(client, tenant_id).await?;
+        let cached = self
+            .stored_by_tenant
+            .read()
+            .get(tenant_id)
+            .and_then(|overlay| {
+                (overlay.fingerprint == Some(fingerprint))
+                    .then(|| overlay.registry.clone())
+                    .flatten()
+            });
+        if let Some(registry) = cached {
+            return Ok(SearchParameterExtractor::new(registry));
+        }
+        let definitions = self.read_stored_overlay(client, tenant_id).await?;
+        let registry = self.overlay_registry(&definitions);
+        if !pending_search_parameter {
+            self.stored_by_tenant.write().insert(
+                tenant_id.to_string(),
+                StoredOverlay {
+                    fingerprint: Some(fingerprint),
+                    definitions,
+                    registry: Some(registry.clone()),
+                },
+            );
+            // The search path's registry for this tenant was built from the
+            // previous overlay; drop it so it rebuilds from the fresh one.
+            self.registries.invalidate(tenant_id);
+        }
+        Ok(SearchParameterExtractor::new(registry))
     }
 
     /// TTL-cache refresh (#235): reload the stored-param cache from storage and
@@ -1501,6 +1695,19 @@ fn is_transient_connect_failure(e: &deadpool_postgres::PoolError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_debug_redacts_password() {
+        let config = PostgresConfig {
+            host: "db.internal".to_string(),
+            password: Some("pg-s3cret-pw".to_string()),
+            ..Default::default()
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("pg-s3cret-pw"), "password leaked: {out}");
+        assert!(out.contains("[redacted]"), "{out}");
+        assert!(out.contains("db.internal"), "{out}");
+    }
 
     /// #1793: only a connect that failed before reaching the server is
     /// retried; pool exhaustion, a closed pool and timeouts are not.

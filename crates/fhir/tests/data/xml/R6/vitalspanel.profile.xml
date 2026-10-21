@@ -2646,6 +2646,10 @@
       <type>
         <code value="Attachment"/>
       </type>
+      <type>
+        <code value="Reference"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Location"/>
+      </type>
       <condition value="obs-10"/>
       <constraint>
         <key value="ele-1"/>

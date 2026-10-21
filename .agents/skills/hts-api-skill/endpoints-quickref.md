@@ -75,7 +75,7 @@ Notable: no CodeSystem instance-level `$validate-code` route.
 
 | Method | Path | Body | Purpose |
 |---|---|---|---|
-| GET | `/ValueSet/$expand` | – | Expand by `url` (canonical, `url|version` supported) |
+| GET | `/ValueSet/$expand` | – | Expand by `url` (canonical, `url|version` supported; or VCL implicit URL `http://fhir.org/VCL?v1=<percent-encoded expr>`, 400 with position if malformed, 501 for unsupported operators) |
 | POST | `/ValueSet/$expand` | Params | Expand + inline `valueSet` and full param matrix |
 | GET | `/ValueSet/$validate-code` | – | Membership validation |
 | POST | `/ValueSet/$validate-code` | Params | Coding / CodeableConcept / inline ValueSet |

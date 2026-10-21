@@ -129,11 +129,12 @@ overrides fall back. Unsupported versions, legacy indexes, contained searches,
 compartment/list constraints, includes, sorting, and additional filters also fall
 back; plain equality `_id` augmentation is supported.
 
-The same correlated predicate serves page and count. Reference IDs are read
-inside `referenced_observations AS MATERIALIZED`; a resource-scoped code slice
-then supplies a scalar source ID. The source resource lookup depends on that
-code-qualified ID, rather than selecting all referenced Observation bodies
-first. Tenant boundaries, live source and target resources, and the original raw
+Page and `_id`-restricted count share a correlated predicate. Reference IDs are
+read inside `referenced_observations AS MATERIALIZED`; a resource-scoped code
+slice supplies a code-qualified `LIMIT 1` relation joined to the live source
+resource. Broad native counts now add the [#2075 bounded membership prefilter](postgres-has-exact-total-2075.md)
+before that same exact guard, rather than opening every referenced code slice.
+Tenant boundaries, live source and target resources, and the original raw
 `subject.reference = 'Patient/' || resources.id` comparison are preserved.
 Absolute and versioned references retain the shared resolver's existing behavior.
 Both reference and code index rows must be non-contained: this deliberately fixes

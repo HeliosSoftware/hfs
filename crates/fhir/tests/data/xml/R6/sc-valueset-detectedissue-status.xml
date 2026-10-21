@@ -46,6 +46,13 @@
           <td>draft</td>
         </tr>
         <tr>
+          <td>processing-error</td>
+          <td>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
+          </td>
+          <td>failed</td>
+        </tr>
+        <tr>
           <td>final</td>
           <td>
             <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
@@ -111,6 +118,13 @@
       <code value="preliminary"/>
       <target>
         <code value="draft"/>
+        <relationship value="equivalent"/>
+      </target>
+    </element>
+    <element>
+      <code value="processing-error"/>
+      <target>
+        <code value="failed"/>
         <relationship value="equivalent"/>
       </target>
     </element>

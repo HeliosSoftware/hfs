@@ -320,14 +320,53 @@ impl TestAppPg {
     /// Schema initialization (HTS + persistence) is serialized via
     /// [`ensure_pg_schemas`] so concurrent tests never race on DDL.
     pub async fn new() -> Self {
-        use helios_hts::backends::PostgresTerminologyBackend;
-        use helios_persistence::backends::postgres::PostgresBackend;
-        use std::sync::Arc;
-
         let url = pg_http_url().await;
 
         // Ensure schemas are applied exactly once (no concurrent DDL races).
         ensure_pg_schemas(url).await;
+
+        Self::connect(url).await
+    }
+
+    /// Create a `TestAppPg` backed by a fresh database of its own in the
+    /// shared container.
+    ///
+    /// For tests that observe database-wide state. Every
+    /// `PostgresTerminologyBackend::new` rebuilds any missing
+    /// `concept_closure` across the whole database, so a test that leaves a
+    /// closure missing on purpose would otherwise race every other test in
+    /// the binary starting up concurrently.
+    pub async fn new_isolated() -> Self {
+        use helios_persistence::backends::postgres::PostgresBackend;
+
+        let shared = pg_http_url().await;
+        let db = format!("hts_{}", uuid::Uuid::new_v4().simple());
+        let (client, conn) = tokio_postgres::connect(shared, tokio_postgres::NoTls)
+            .await
+            .expect("Failed to connect to PostgreSQL to create an isolated database");
+        tokio::spawn(conn);
+        client
+            .batch_execute(&format!("CREATE DATABASE {db}"))
+            .await
+            .expect("Failed to create isolated test database");
+
+        let (base, _) = shared.rsplit_once('/').expect("database URL has a path");
+        let url = format!("{base}/{db}");
+        // `connect` applies the HTS schema; the resource store needs its own.
+        PostgresBackend::from_connection_string(&url)
+            .await
+            .expect("Failed to open PostgreSQL resource store (isolated)")
+            .init_schema()
+            .await
+            .expect("Failed to initialize PostgreSQL resource store schema (isolated)");
+
+        Self::connect(&url).await
+    }
+
+    async fn connect(url: &str) -> Self {
+        use helios_hts::backends::PostgresTerminologyBackend;
+        use helios_persistence::backends::postgres::PostgresBackend;
+        use std::sync::Arc;
 
         let backend = PostgresTerminologyBackend::new(url)
             .await

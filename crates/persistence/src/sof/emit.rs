@@ -370,28 +370,12 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     // Iterate `extra_unnests` in reverse since we collected from outermost
     // (closest to Project) downward.
     for layer in extra_unnests.iter().rev() {
-        if let PlanNode::LateralUnnest {
-            source,
-            out_alias: alias,
-            left_join,
-            on_filter,
-            flat_index,
-            ..
-        } = layer
-        {
+        if let PlanNode::LateralUnnest { .. } = layer {
             // Rendered through the shared unnest renderer so PostgreSQL keeps
             // `WITH ORDINALITY` (needed by `%rowIndex`) over a repeat.
             let mut scratch = Frame::new();
             scratch.next_param = frame.next_param;
-            push_lateral_unnest(
-                source,
-                alias,
-                left_join,
-                on_filter,
-                flat_index,
-                dialect,
-                &mut scratch,
-            )?;
+            push_lateral_unnest(layer, dialect, &mut scratch)?;
             frame.next_param = scratch.next_param;
             for join in scratch.joins {
                 from_clause.push('\n');
@@ -408,7 +392,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         "rid, node".to_string()
     };
     let sql = format!(
-        "WITH RECURSIVE {out_alias}({cte_cols}) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}\nORDER BY 1",
+        "WITH RECURSIVE {out_alias}({cte_cols}) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}",
         select_parts.join(",\n  ")
     );
 
@@ -751,25 +735,10 @@ fn render_step_join(
 ) -> Result<String, SofError> {
     let step = &steps[i];
     match step.node {
-        PlanNode::LateralUnnest {
-            source,
-            out_alias,
-            left_join,
-            on_filter,
-            flat_index,
-            ..
-        } => {
+        PlanNode::LateralUnnest { .. } => {
             let mut scratch = Frame::new();
             scratch.next_param = *next_param;
-            push_lateral_unnest(
-                source,
-                out_alias,
-                left_join,
-                on_filter,
-                flat_index,
-                dialect,
-                &mut scratch,
-            )?;
+            push_lateral_unnest(step.node, dialect, &mut scratch)?;
             *next_param = scratch.next_param;
             scratch
                 .joins
@@ -1009,7 +978,7 @@ fn emit_recurse_general(
     }
 
     let sql = format!(
-        "WITH RECURSIVE {}\nSELECT\n  {}\nFROM {from_clause}\nWHERE {}\nORDER BY 1",
+        "WITH RECURSIVE {}\nSELECT\n  {}\nFROM {from_clause}\nWHERE {}",
         ctes.join(",\n"),
         select_parts.join(",\n  "),
         where_parts.join("\n  AND "),
@@ -1028,6 +997,7 @@ fn emit_recurse_general(
 fn column_refers_to_resource(expr: &SqlExpr) -> bool {
     match expr {
         SqlExpr::JsonPath { root, .. } => root == "r.data" || root.starts_with("r.data"),
+        SqlExpr::ColRef(name) => name == super::compile_path::RESOURCE_ID_COLUMN,
         SqlExpr::Cast { inner, .. }
         | SqlExpr::UnaryOp { inner, .. }
         | SqlExpr::AsJson(inner)
@@ -1061,8 +1031,17 @@ fn column_refers_to_resource(expr: &SqlExpr) -> bool {
 }
 
 /// Emit a `UNION ALL` query — each branch is emitted as a standalone SELECT,
-/// trailing `ORDER BY` is stripped from each, and a single `ORDER BY 1` is
-/// appended at the end of the compound query.
+/// and trailing `ORDER BY` is stripped from each. The compound query is left
+/// unordered: row order is not part of the SoF contract, and a sort would hold
+/// back every row until the whole result is built.
+///
+/// A column that every branch decodes the same way keeps that mode. One that
+/// the branches decode differently (a `string` in one, an `integer` in
+/// another) is decoded as [`ColumnDecode::Json`], and each branch whose own
+/// mode differs is wrapped to project that column's JSON representation (see
+/// [`Dialect::column_json_repr`]). The runners cannot tell which branch a row
+/// came from, so this keeps a string `"2.1"` a string and a number `2.1` a
+/// number, rather than guessing from the text (#1947).
 fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql, SofError> {
     if branches.is_empty() {
         return Err(SofError::InvalidViewDefinition(
@@ -1070,57 +1049,85 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
         ));
     }
 
-    let mut branch_sqls: Vec<String> = Vec::with_capacity(branches.len());
-    let mut columns: Option<Vec<String>> = None;
-    let mut column_decodes: Vec<ColumnDecode> = Vec::new();
-    let mut next_param = 3usize;
-
+    let mut emitted_branches: Vec<EmittedSql> = Vec::with_capacity(branches.len());
     for branch in branches {
         let emitted = emit_plan(branch, dialect)?;
-
-        match &columns {
-            None => {
-                columns = Some(emitted.columns.clone());
-                column_decodes = emitted.column_decodes.clone();
-            }
-            Some(expected) if *expected != emitted.columns => {
-                return Err(SofError::Uncompilable {
-                    reason: format!(
-                        "unionAll branches produce different column schemas: {:?} vs {:?}",
-                        expected, emitted.columns
-                    ),
-                });
-            }
-            _ => {
-                // Same column names: reconcile decode modes by position.
-                for (acc, d) in column_decodes.iter_mut().zip(&emitted.column_decodes) {
-                    *acc = acc.merge(*d);
-                }
-            }
+        if let Some(first) = emitted_branches.first()
+            && first.columns != emitted.columns
+        {
+            return Err(SofError::Uncompilable {
+                reason: format!(
+                    "unionAll branches produce different column schemas: {:?} vs {:?}",
+                    first.columns, emitted.columns
+                ),
+            });
         }
+        emitted_branches.push(emitted);
+    }
 
+    // Same column names in every branch: reconcile decode modes by position.
+    let first = &emitted_branches[0];
+    let columns = first.columns.clone();
+    let column_decodes: Vec<ColumnDecode> = (0..columns.len())
+        .map(|i| {
+            let mode = first.column_decodes[i];
+            if emitted_branches.iter().all(|e| e.column_decodes[i] == mode) {
+                mode
+            } else {
+                ColumnDecode::Json
+            }
+        })
+        .collect();
+
+    let quoted: Vec<String> = columns
+        .iter()
+        .map(|name| Ok(format!("\"{}\"", sanitize_ident(name)?)))
+        .collect::<Result<_, SofError>>()?;
+    let mut branch_sqls: Vec<String> = Vec::with_capacity(emitted_branches.len());
+    let mut next_param = 3usize;
+    for emitted in &emitted_branches {
         next_param = next_param.max(emitted.next_param_index);
-        // Branches containing a `WITH RECURSIVE` (emitted for `repeat:`)
-        // can't appear bare in a compound SELECT — neither dialect allows
-        // `WITH ... UNION ALL WITH ...`. Wrap as `SELECT * FROM (WITH ...
-        // SELECT ...)` so each branch is a plain SELECT operand.
         let body = strip_trailing_order_by(&emitted.sql).to_string();
-        let needs_wrap = body.trim_start().starts_with("WITH");
-        if needs_wrap {
-            // PG requires every parenthesised subquery in `FROM` to have an
-            // alias; SQLite allows it bare. Tag with a unique alias so PG
-            // is happy without affecting SQLite (which ignores it).
-            let alias = format!("_recurse_{}", branch_sqls.len());
-            branch_sqls.push(format!("SELECT * FROM ({body}) AS {alias}"));
+        // PG requires every parenthesised subquery in `FROM` to have an
+        // alias; SQLite allows it bare. Tag with a unique alias so PG is
+        // happy without affecting SQLite (which ignores it).
+        let alias = branch_sqls.len();
+        let select: Vec<String> = quoted
+            .iter()
+            .zip(emitted.column_decodes.iter().zip(&column_decodes))
+            .map(|(col, (&own, &union))| {
+                let repr = if own == union {
+                    col.clone()
+                } else {
+                    dialect.column_json_repr(col, own)
+                };
+                if repr == *col {
+                    repr
+                } else {
+                    format!("{repr} AS {col}")
+                }
+            })
+            .collect();
+        if select.iter().zip(&quoted).any(|(s, col)| s != col) {
+            branch_sqls.push(format!(
+                "SELECT {} FROM ({body}) AS _union_{alias}",
+                select.join(", ")
+            ));
+        } else if body.trim_start().starts_with("WITH") {
+            // Branches containing a `WITH RECURSIVE` (emitted for `repeat:`)
+            // can't appear bare in a compound SELECT — neither dialect allows
+            // `WITH ... UNION ALL WITH ...`. Wrap as `SELECT * FROM (WITH ...
+            // SELECT ...)` so each branch is a plain SELECT operand.
+            branch_sqls.push(format!("SELECT * FROM ({body}) AS _recurse_{alias}"));
         } else {
             branch_sqls.push(body);
         }
     }
 
-    let sql = format!("{}\nORDER BY 1", branch_sqls.join("\nUNION ALL\n"));
+    let sql = branch_sqls.join("\nUNION ALL\n");
     Ok(EmittedSql {
         sql,
-        columns: columns.unwrap_or_default(),
+        columns,
         column_decodes,
         next_param_index: next_param,
     })
@@ -1200,14 +1207,12 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
             source,
             out_alias,
             left_join,
-            on_filter,
             flat_index,
+            ..
         } => {
             walk_body(parent, dialect, frame)?;
             let joins_before = frame.joins.len();
-            push_lateral_unnest(
-                source, out_alias, left_join, on_filter, flat_index, dialect, frame,
-            )?;
+            push_lateral_unnest(node, dialect, frame)?;
             // A plain `forEach` below an EMPTY `forEachOrNull` keeps the null
             // row: LEFT-join it and accept "no match" only when the ancestor
             // missed (a present ancestor with no match still drops the row).
@@ -1247,14 +1252,22 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
 /// Renders one `LateralUnnest` as a FROM-clause join and pushes it onto
 /// `frame.joins`. Shared by [`walk_body`] and the recursive-CTE emitter.
 fn push_lateral_unnest(
-    source: &SqlExpr,
-    out_alias: &String,
-    left_join: &bool,
-    on_filter: &Option<SqlExpr>,
-    flat_index: &Option<i64>,
+    unnest: &PlanNode,
     dialect: &dyn Dialect,
     frame: &mut Frame,
 ) -> Result<(), SofError> {
+    let PlanNode::LateralUnnest {
+        source,
+        out_alias,
+        left_join,
+        on_filter,
+        flat_index,
+        array_source,
+        ..
+    } = unnest
+    else {
+        unreachable!("push_lateral_unnest called with a non-LateralUnnest node");
+    };
     let join_kw = if *left_join { "LEFT JOIN" } else { "JOIN" };
     let lateral = dialect.lateral_keyword();
     // Lower the optional ON-clause filter (used by `forEach` paths
@@ -1271,7 +1284,16 @@ fn push_lateral_unnest(
         // SQLite — `json_each(<root>, '$.path')` two-arg form when the
         // source is a simple JSON path off the resource document;
         // falls back to `json_each(<sql_expr>)` for anything richer.
-        let source_sql = emit_sqlite_unnest_source(source)?;
+        let array_sql = match source {
+            SqlExpr::JsonPath { root, path } if *array_source => {
+                sqlite_array_unnest_source(root, path)
+            }
+            _ => None,
+        };
+        let source_sql = match array_sql {
+            Some(sql) => sql,
+            None => emit_sqlite_unnest_source(source)?,
+        };
         let on = match &extra_on {
             Some(f) => format!("1=1 AND {f}"),
             None => "1=1".to_string(),
@@ -1773,17 +1795,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
             predicate,
             negate,
         } => {
-            let unnest = if ctx.dialect.lateral_keyword().is_empty() {
-                let src = emit_sqlite_unnest_source(focus)?;
-                format!("FROM {src} {iter_alias}")
-            } else {
-                let src = emit_pg_unnest_source(focus)?;
-                format!(
-                    "FROM {}{} AS {iter_alias}(value)",
-                    ctx.dialect.lateral_keyword(),
-                    ctx.dialect.unnest_array(&src)
-                )
-            };
+            let unnest = emit_where_exists_unnest(focus, iter_alias, ctx)?;
             let pred_sql = lower_expr(predicate, ctx)?;
             let kw = if *negate { "NOT EXISTS" } else { "EXISTS" };
             Ok(format!("{kw} (SELECT 1 {unnest} WHERE {pred_sql})"))
@@ -2202,6 +2214,78 @@ fn cast_pg_numeric(expr: &SqlExpr, lowered: &str) -> String {
 // Helpers
 // ============================================================================
 
+/// Emits the `FROM ...` clause of a `WhereExists` subquery.
+///
+/// A `JsonPath` focus with more than one `Field` step is unnested once per
+/// step (each step rooted on the previous alias's `.value`), so an array
+/// anywhere along the path (`component.code.coding`) is flattened. The last
+/// step keeps `iter_alias`, which the pre-lowered criterion is rooted on; the
+/// intermediate aliases are derived from it (`w0_0`, `w0_1`, ...) so nested
+/// `exists` subqueries cannot collide. Single-step and computed foci keep the
+/// one-unnest form.
+fn emit_where_exists_unnest(
+    focus: &SqlExpr,
+    iter_alias: &str,
+    ctx: &ExprCtx,
+) -> Result<String, SofError> {
+    let sqlite = ctx.dialect.lateral_keyword().is_empty();
+    let one = |source: &SqlExpr, alias: &str| -> Result<String, SofError> {
+        if sqlite {
+            Ok(format!("{} {alias}", emit_sqlite_unnest_source(source)?))
+        } else {
+            let src = emit_pg_unnest_source(source)?;
+            Ok(format!(
+                "{}{} AS {alias}(value)",
+                ctx.dialect.lateral_keyword(),
+                ctx.dialect.unnest_array(&src)
+            ))
+        }
+    };
+    if let SqlExpr::JsonPath { root, path } = focus {
+        let segments = super::compile_view::split_path_into_segments(path);
+        let fields = path
+            .0
+            .iter()
+            .filter(|s| matches!(s, PathStep::Field(_)))
+            .count();
+        if fields > 1 && segments.len() == fields {
+            let last = segments.len() - 1;
+            let mut parts = Vec::with_capacity(segments.len());
+            let mut prev_root = root.clone();
+            for (i, seg) in segments.into_iter().enumerate() {
+                let alias = if i == last {
+                    iter_alias.to_string()
+                } else {
+                    format!("{iter_alias}_{i}")
+                };
+                let source = SqlExpr::JsonPath {
+                    root: prev_root.clone(),
+                    path: seg,
+                };
+                parts.push(one(&source, &alias)?);
+                prev_root = format!("{alias}.value");
+            }
+            return Ok(format!("FROM {}", parts.join(", ")));
+        }
+    }
+    Ok(format!("FROM {}", one(focus, iter_alias)?))
+}
+
+/// Two-argument `json_each(<root>, '$.field')` over a field the schema says is
+/// an array: iterates the stored array in place, without extracting it as
+/// text and re-parsing it as the guarded form does. `None` for anything but a
+/// single field step.
+fn sqlite_array_unnest_source(root: &str, path: &JsonPath) -> Option<String> {
+    let [PathStep::Field(name)] = path.0.as_slice() else {
+        return None;
+    };
+    Some(format!(
+        "json_each({}, {})",
+        super::dialect::sqlite_json_source(root),
+        sqlite_json_path_literal(&[name.as_str()])
+    ))
+}
+
 /// Emits the SQLite `json_each(...)` source clause for a lateral unnest.
 ///
 /// Paths wrap with a type guard: arrays iterate; non-array singletons (FHIR
@@ -2233,8 +2317,9 @@ fn emit_sqlite_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
             // Always type-guarded, also off `r.data`: the two-arg
             // `json_each(r.data, '$.code')` iterates the MEMBERS of a
             // singleton object (`Condition.code`), not the object itself.
-            let extracted = format!("json_extract({root}, {path_lit})");
-            let type_check = format!("json_type({root}, {path_lit})");
+            let json_root = super::dialect::sqlite_json_source(root);
+            let extracted = format!("json_extract({json_root}, {path_lit})");
+            let type_check = format!("json_type({json_root}, {path_lit})");
             // For non-array values, wrap with `json_array(json(<extract>))`
             // — `json(...)` re-parses the extracted text so the wrapped
             // value preserves its JSON shape (otherwise SQLite's `json_array`
@@ -2487,17 +2572,16 @@ fn lower_boundary(
     }
 }
 
-/// Strips a trailing `ORDER BY …` clause (case-insensitive). Used when
+/// Strips a trailing `ORDER BY …` line (case-insensitive). Used when
 /// assembling UNION ALL branches — `ORDER BY` inside an individual compound
-/// SELECT term is not portable.
+/// SELECT term is not portable. Only a final line counts: recursive branches
+/// end without one and carry `ORDER BY` inside window functions and
+/// subqueries, which must stay.
 fn strip_trailing_order_by(sql: &str) -> &str {
     let upper = sql.to_ascii_uppercase();
-    if let Some(pos) = upper.rfind("\nORDER BY") {
-        &sql[..pos]
-    } else if let Some(pos) = upper.rfind(" ORDER BY") {
-        &sql[..pos]
-    } else {
-        sql
+    match upper.rfind("\nORDER BY") {
+        Some(pos) if !sql[pos + 1..].contains('\n') => &sql[..pos],
+        _ => sql,
     }
 }
 
@@ -2625,6 +2709,7 @@ mod tests {
             left_join: false,
             on_filter: None,
             flat_index: None,
+            array_source: false,
         }
     }
 
@@ -2866,6 +2951,7 @@ mod tests {
                 left_join: false,
                 on_filter: None,
                 flat_index: None,
+                array_source: false,
             },
             SqlExpr::RowIndex(RowIndexScope::ForEach("fe".into())),
         );
@@ -2893,6 +2979,7 @@ mod tests {
                 left_join,
                 on_filter: None,
                 flat_index: None,
+                array_source: false,
             };
         }
         let plan = project(parent, json_path("a_inner.value", vec![]));
@@ -2930,6 +3017,7 @@ mod tests {
             left_join: false,
             on_filter: None,
             flat_index: Some(0),
+            array_source: false,
         };
         let plan = project(
             PlanNode::LateralUnnest {
@@ -2939,6 +3027,7 @@ mod tests {
                 left_join: false,
                 on_filter: None,
                 flat_index: None,
+                array_source: false,
             },
             json_path("picked.value", vec![]),
         );
@@ -3241,6 +3330,7 @@ mod tests {
                             lit(value),
                         )),
                         flat_index: None,
+                        array_source: false,
                     },
                     json_path("fe.value", vec![field("family")]),
                 ),
@@ -3402,7 +3492,7 @@ mod tests {
         );
         let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
         assert!(
-            sqlite.contains("(json_extract(r.data, '$.gender') = 'male')"),
+            sqlite.contains("(json_extract(CAST(r.data AS TEXT), '$.gender') = 'male')"),
             "{sqlite}"
         );
         let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
@@ -3617,8 +3707,8 @@ mod tests {
         let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
         assert!(
             sqlite.contains(
-                "JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' \
-                 THEN json_extract(r.data, '$.name')"
+                "JOIN json_each(CASE WHEN json_type(CAST(r.data AS TEXT), '$.name') = 'array' \
+                 THEN json_extract(CAST(r.data AS TEXT), '$.name')"
             ),
             "{sqlite}"
         );
@@ -3629,5 +3719,72 @@ mod tests {
         let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
         assert!(pg.contains("r.data->'name'"), "{pg}");
         assert!(pg.contains("fe.value->>'family' AS \"c\""), "{pg}");
+    }
+
+    fn where_exists(focus_fields: &[&str]) -> PlanNode {
+        project(
+            filtered(SqlExpr::WhereExists {
+                focus: Box::new(json_path(
+                    "r.data",
+                    focus_fields.iter().map(|f| field(f)).collect(),
+                )),
+                iter_alias: "w0".to_string(),
+                predicate: Box::new(binop(
+                    BinOp::Eq,
+                    json_path("w0.value", vec![field("code")]),
+                    lit("8480-6"),
+                )),
+                negate: false,
+            }),
+            json_path("r.data", vec![field("id")]),
+        )
+    }
+
+    #[test]
+    fn where_exists_unnests_every_repeating_step_of_the_focus() {
+        let plan = where_exists(&["component", "code", "coding"]);
+
+        let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
+        assert!(
+            sqlite.contains("json_type(CAST(r.data AS TEXT), '$.component') = 'array'"),
+            "{sqlite}"
+        );
+        assert!(
+            sqlite.contains("json_type(w0_0.value, '$.code') = 'array'"),
+            "{sqlite}"
+        );
+        assert!(
+            sqlite.contains("json_type(w0_1.value, '$.coding') = 'array'"),
+            "{sqlite}"
+        );
+        assert!(sqlite.contains(" w0_0, json_each("), "{sqlite}");
+        assert!(sqlite.contains(" w0_1, json_each("), "{sqlite}");
+        assert!(sqlite.contains(" w0 WHERE "), "{sqlite}");
+        assert!(!sqlite.contains("'$.component.code"), "{sqlite}");
+
+        let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
+        assert!(pg.contains("r.data->'component'"), "{pg}");
+        assert!(pg.contains("w0_0.value->'code'"), "{pg}");
+        assert!(pg.contains("w0_1.value->'coding'"), "{pg}");
+        assert!(pg.contains("AS w0_0(value), "), "{pg}");
+        assert!(pg.contains("AS w0_1(value), "), "{pg}");
+        assert!(pg.contains("AS w0(value) WHERE "), "{pg}");
+        assert!(!pg.contains("#>"), "{pg}");
+    }
+
+    #[test]
+    fn where_exists_with_a_single_step_focus_is_unchanged() {
+        let plan = where_exists(&["coding"]);
+        let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
+        assert!(
+            sqlite.contains(
+                "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_type(CAST(r.data AS TEXT), '$.coding') = 'array'"
+            ),
+            "{sqlite}"
+        );
+        assert!(!sqlite.contains("w0_0"), "{sqlite}");
+        let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
+        assert!(pg.contains("AS w0(value) WHERE "), "{pg}");
+        assert!(!pg.contains("w0_0"), "{pg}");
     }
 }

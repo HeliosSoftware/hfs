@@ -51,7 +51,8 @@ use helios_persistence::core::{
     SearchProvider, SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
-    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TransactionError,
+    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError,
+    TooLargeForCacheCause, TransactionError,
 };
 use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -62,6 +63,12 @@ use helios_persistence::types::{
 use mongodb::Client;
 use mongodb::bson::{Bson, Document, doc};
 use serde_json::json;
+
+/// The T2 cluster harness (two independently constructed backends over one
+/// shared store); path-included rather than placed in a `mod common`, which no
+/// test target declares.
+#[path = "common/cluster_harness.rs"]
+mod cluster_harness;
 
 const MONGODB_MAX_DATABASE_NAME_LEN: usize = 63;
 const MONGODB_TEST_DB_PREFIX: &str = "hfs_phase2_mongo_";
@@ -127,6 +134,9 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.transaction_bundle_weight_entries, 1000);
     // #1806: no separate deadline unless the embedder sets one.
     assert_eq!(config.bundle_transaction_deadline, None);
+    // #1975: the deferred-index threshold follows the gate's entry room unless
+    // the embedder sets it.
+    assert_eq!(config.transaction_bundle_deferred_index_entries, None);
 }
 
 #[test]
@@ -1248,6 +1258,11 @@ mod reindex_id_range;
 #[path = "mongodb/transaction_retry.rs"]
 mod transaction_retry;
 
+/// A single-resource write whose transaction the server aborts without a
+/// conflicting writer (a chunk migration's `StaleConfig`) is run again.
+#[path = "mongodb/write_abort_retry.rs"]
+mod write_abort_retry;
+
 /// #1776: transaction Bundles beyond `max_concurrent_transaction_bundles` wait
 /// their turn. #1806: the gate's room is counted in entries, so small Bundles
 /// share a slot and large ones take more than one.
@@ -1259,6 +1274,16 @@ mod transaction_bundle_admission;
 /// (entries per standard Bundle) the gate's room is counted in.
 #[path = "mongodb/transaction_bundle_load.rs"]
 mod transaction_bundle_load;
+
+/// #1975: transaction Bundles of N+ entries write their search rows after the
+/// commit; ledger, repair, conditional rule, ceiling.
+#[path = "mongodb/deferred_search_index.rs"]
+mod deferred_search_index;
+
+/// #1977: a transaction Bundle sends its creates in chunks with no existence
+/// read; command counts from the profiler, reused ids, read-after-create.
+#[path = "mongodb/bundle_create_chunks.rs"]
+mod bundle_create_chunks;
 
 /// #1748: potentially broad searches wait for a permit, so a read can still get
 /// a pooled connection while they run.
@@ -1780,6 +1805,22 @@ async fn create_backend_with_full_registry(test_name: &str) -> Option<MongoBacke
     create_backend(test_name).await
 }
 
+/// A [`create_backend`] whose plan probes do not time out. The default probe
+/// timeout is short enough that a loaded host times a probe out, and the
+/// search then takes a different (still correct) plan than the one a
+/// winning-plan assertion expects; a generous timeout keeps the plan fixed.
+async fn create_backend_with_stable_probes(test_name: &str) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        data_dir: Some(repo_data_dir()),
+        probe_timeout_ms: 10_000,
+        ..Default::default()
+    })
+    .await
+}
+
 async fn search_index_entry_count(
     backend: &MongoBackend,
     tenant: &TenantContext,
@@ -1838,10 +1879,12 @@ async fn mongodb_integration_readiness_check() {
 
 /// The indexes queries hint by name, written out here rather than read from
 /// the production list, so the test catches the list losing an entry.
-const HINTED_INDEXES: [(&str, &str); 6] = [
+/// `idx_resources_missing_params` is built after boot and required only once
+/// built (#2001); `missing_index::mongodb_missing_index_follows_index_build_mode`
+/// covers it.
+const HINTED_INDEXES: [(&str, &str); 5] = [
     ("resources", "idx_resources_identity"),
     ("resources", "idx_resources_type_scan"),
-    ("resources", "idx_resources_missing_params"),
     ("search_index", "idx_search_composite"),
     ("search_index", "idx_search_composite_slot_probe"),
     (
@@ -7624,7 +7667,7 @@ async fn mongodb_integration_uri_below_and_above_are_segment_aware() {
 /// stays bounded rather than falling back to a full collection scan.
 #[tokio::test]
 async fn mongodb_integration_uri_below_search_is_a_covered_v2_scan() {
-    let Some(backend) = create_backend_with_full_registry("covered_uri_below").await else {
+    let Some(backend) = create_backend_with_stable_probes("covered_uri_below").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -10168,6 +10211,104 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
     );
 }
 
+/// The in-database aggregate (typed `ViewRow` cursor) and the patient/group
+/// fallback `find` both honour `sof_cursor_batch_size` (#2161): with 1,200
+/// Observations and a batch of 512 each scan needs three server replies, and
+/// the result must still be complete with no row repeated.
+#[tokio::test]
+async fn mongodb_integration_sof_scan_spans_several_cursor_batches() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use tokio_stream::StreamExt;
+
+    const OBSERVATIONS: usize = 1200;
+    const BATCH: u32 = 512;
+
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        eprintln!(
+            "Skipping mongodb_integration_sof_scan_spans_several_cursor_batches \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let Some(backend) = build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name("sof_scan_cursor_batches"),
+        data_dir: Some(repo_data_dir()),
+        sof_cursor_batch_size: BATCH,
+        ..Default::default()
+    })
+    .await
+    else {
+        return;
+    };
+    assert_eq!(backend.config().sof_cursor_batch_size, BATCH);
+    let tenant = create_tenant("tenant-sof-cursor-batches");
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient", "id": "cb-p1" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for i in 0..OBSERVATIONS {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": "Patient/cb-p1" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("obs {i}: {e}"));
+    }
+
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Observation",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+    });
+    let runner = backend
+        .sof_runner()
+        .expect("MongoDB backend must provide a SOF runner");
+
+    for (label, filters) in [
+        ("in-database aggregate", ViewFilters::default()),
+        (
+            "patient fallback find",
+            ViewFilters {
+                patient: vec!["Patient/cb-p1".to_string()],
+                ..Default::default()
+            },
+        ),
+    ] {
+        let mut stream = runner
+            .run_view(&tenant, view.clone(), filters)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: run_view: {e}"));
+        let mut ids = Vec::new();
+        while let Some(row) = stream.next().await {
+            let row = row.unwrap_or_else(|e| panic!("{label}: row: {e}"));
+            ids.push(row["obs_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids.len(), OBSERVATIONS, "{label}: row count");
+        let distinct: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            OBSERVATIONS,
+            "{label}: ids must be distinct"
+        );
+    }
+}
+
 /// The HL7/sql-on-fhir PR #410 example views (plus the hand-checked corner
 /// cases) return exactly the in-process engine's rows through the native
 /// aggregation-pipeline runner.
@@ -11359,10 +11500,21 @@ async fn mongodb_integration_reindex_page_batches_index_writes() {
             inserts <= 1,
             "a reindex page must issue at most one insert_many, got {inserts}: {entries:?}"
         );
+        let writes = entries
+            .iter()
+            .filter(|e| matches!(e.get_str("op").ok(), Some("remove" | "insert" | "update")))
+            .count();
         assert!(
-            entries.len() <= 2,
-            "a reindex page must issue at most 2 write commands total, got {}: {entries:?}",
-            entries.len()
+            writes <= 2,
+            "a reindex page must issue at most 2 write commands total, got {writes}: {entries:?}"
+        );
+        // The only other commands are the page's two verification reads of
+        // this collection: the row ids left after its delete and the row ids
+        // present after its insert.
+        let reads = entries.len() - writes;
+        assert!(
+            reads <= 2,
+            "a reindex page issues two verification reads besides its writes, got {reads}: {entries:?}"
         );
     }
 
@@ -18888,7 +19040,7 @@ async fn assert_search_index_ops_are_covered(
 /// scan on `idx_search_date_v3`, which carries both.
 #[tokio::test]
 async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
-    let Some(backend) = create_backend_with_full_registry("covered_date").await else {
+    let Some(backend) = create_backend_with_stable_probes("covered_date").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -19140,7 +19292,7 @@ async fn mongodb_integration_period_with_unreadable_end_is_dropped_not_open() {
 
 #[tokio::test]
 async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
-    let Some(backend) = create_backend_with_full_registry("covered_token").await else {
+    let Some(backend) = create_backend_with_stable_probes("covered_token").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -19195,7 +19347,7 @@ async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
 /// key — the scan is fully covered.
 #[tokio::test]
 async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
-    let Some(backend) = create_backend_with_full_registry("missing_false").await else {
+    let Some(backend) = create_backend_with_stable_probes("missing_false").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
@@ -22226,7 +22378,7 @@ async fn mongodb_date_sort_honors_all_explicit_date_and_id_directions() {
 
 #[tokio::test]
 async fn mongodb_selective_reference_search_uses_existing_ordered_index() {
-    let Some(backend) = create_backend("reference_plan").await else {
+    let Some(backend) = create_backend_with_stable_probes("reference_plan").await else {
         return;
     };
     let tenant = create_tenant("reference-plan");
@@ -23875,6 +24027,9 @@ async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
     );
 }
 
+#[path = "mongodb/covered_membership.rs"]
+mod covered_membership;
+
 #[path = "mongodb/transaction_regressions.rs"]
 mod transaction_regressions;
 
@@ -23939,3 +24094,209 @@ mongodb_bundle_identity_test!(
 
 #[path = "mongodb/missing_index.rs"]
 mod missing_index;
+
+#[path = "mongodb/reindex_failures.rs"]
+mod reindex_failures;
+
+// ============================================================================
+// T2 cluster suite — F5 resource version-id race (restore path).
+// ============================================================================
+//
+// Two independently constructed `MongoBackend`s on ONE database play
+// "instance A" and "instance B"; `create_backend` mints a fresh database per
+// call, so the second handle is built from the first's config instead. Mongo's
+// restore was already a version-guarded CAS; what these rows pin is that a
+// lost race is *retried* by `create_or_update` rather than surfacing a 404 on
+// a PUT, and that the loser reports `VersionConflict` with the stored version.
+
+use cluster_harness as harness;
+
+/// Two fresh handles, one database. `None` when Mongo is unavailable (the
+/// suite's usual skip convention).
+async fn two_mongo_handles(test_name: &str) -> Option<(MongoBackend, MongoBackend)> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let a = build_backend(MongoBackendConfig {
+        connection_string: connection_string.clone(),
+        database_name: build_test_database_name(test_name),
+        max_connections: 1,
+        ..Default::default()
+    })
+    .await?;
+    let b = build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: a.config().database_name.clone(),
+        max_connections: 1,
+        ..Default::default()
+    })
+    .await?;
+    Some((a, b))
+}
+
+/// Asserts a resource's history holds every version exactly once,
+/// contiguous from 1 — no duplicate version_ids, no lost history rows.
+async fn assert_mongo_history_versions(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    resource_type: &str,
+    id: &str,
+    expected_len: u64,
+) {
+    let history = backend
+        .history_instance(
+            tenant,
+            resource_type,
+            id,
+            &HistoryParams::new().include_deleted(true),
+        )
+        .await
+        .unwrap();
+    let mut versions: Vec<u64> = history
+        .items
+        .iter()
+        .map(|e| e.resource.version_id().parse().unwrap())
+        .collect();
+    versions.sort_unstable();
+    assert_eq!(
+        versions,
+        (1..=expected_len).collect::<Vec<_>>(),
+        "history must hold every version exactly once"
+    );
+}
+
+/// Creates a Patient and soft-deletes it, returning its id: version 1 is the
+/// create, version 2 the tombstone.
+async fn seed_mongo_tombstone(backend: &MongoBackend, tenant: &TenantContext) -> String {
+    let created = backend
+        .create(
+            tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Seed"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .delete(tenant, "Patient", created.id())
+        .await
+        .unwrap();
+    created.id().to_string()
+}
+
+/// DoD rows (F5, restore path): two instances race unconditional PUTs onto
+/// one soft-deleted id; both succeed (winner restores, loser converges through
+/// the update arm), history is contiguous 1..=4 and the newest entry carries
+/// the live body. Without the retry the loser's CAS miss surfaced as a 404.
+#[tokio::test]
+async fn mongodb_integration_cluster_restore_deleted_race_keeps_history_coherent() {
+    let Some((a, b)) = two_mongo_handles("cluster_restore_race").await else {
+        return;
+    };
+    let (a, b) = (Arc::new(a), Arc::new(b));
+    let tenant = create_tenant("cluster-f5-restore");
+
+    for round in 0..5 {
+        let id = seed_mongo_tombstone(&a, &tenant).await;
+
+        let (ra, rb) = (Arc::clone(&a), Arc::clone(&b));
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let (id_a, id_b) = (id.clone(), id.clone());
+        let (res_a, res_b) = harness::race2(
+            async move {
+                ra.create_or_update(
+                    &tenant_a,
+                    "Patient",
+                    &id_a,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+            async move {
+                rb.create_or_update(
+                    &tenant_b,
+                    "Patient",
+                    &id_b,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+        )
+        .await;
+
+        let (stored_a, created_a) =
+            res_a.unwrap_or_else(|e| panic!("round {round}: PUT via A must succeed: {e:?}"));
+        let (stored_b, created_b) =
+            res_b.unwrap_or_else(|e| panic!("round {round}: PUT via B must succeed: {e:?}"));
+
+        let restored = |flag: bool| flag.then_some(());
+        harness::assert_exactly_one(
+            &restored(created_a),
+            &restored(created_b),
+            &format!("round {round}: the restore of one tombstone"),
+        );
+        assert_ne!(
+            stored_a.version_id(),
+            stored_b.version_id(),
+            "round {round}: racing writers must never assign the same version"
+        );
+
+        let current = a.read(&tenant, "Patient", &id).await.unwrap().unwrap();
+        assert_eq!(current.version_id(), "4", "round {round}");
+        assert!(!current.is_deleted(), "round {round}");
+        assert_mongo_history_versions(&b, &tenant, "Patient", &id, 4).await;
+
+        let history = b
+            .history_instance(
+                &tenant,
+                "Patient",
+                &id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        let newest = history
+            .items
+            .iter()
+            .max_by_key(|e| e.resource.version_id().parse::<u64>().unwrap())
+            .unwrap();
+        assert_eq!(
+            newest.resource.content(),
+            current.content(),
+            "round {round}: newest history entry must carry the live body"
+        );
+    }
+}
+
+/// DoD row (F5, restore path): isolation — a PUT onto the same id under
+/// another tenant creates a fresh version-1 resource there and leaves the
+/// first tenant's tombstone untouched.
+#[tokio::test]
+async fn mongodb_integration_cluster_restore_deleted_wrong_tenant_creates_not_restores() {
+    let Some((a, b)) = two_mongo_handles("cluster_restore_iso").await else {
+        return;
+    };
+    let tenant = create_tenant("cluster-f5-restore-iso");
+    let id = seed_mongo_tombstone(&a, &tenant).await;
+
+    let other = create_tenant("cluster-f5-restore-other");
+    let (stored, created) = b
+        .create_or_update(
+            &other,
+            "Patient",
+            &id,
+            json!({"resourceType": "Patient", "name": [{"family": "Other"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert!(created, "the other tenant must get a fresh resource");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(stored.tenant_id().as_str(), other.tenant_id().as_str());
+
+    match a.read(&tenant, "Patient", &id).await {
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+        got => panic!("first tenant's resource must still be deleted, got {got:?}"),
+    }
+    assert_mongo_history_versions(&a, &tenant, "Patient", &id, 2).await;
+}

@@ -20,6 +20,8 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 #[cfg(feature = "sqlite")]
 use rusqlite::{Connection, OptionalExtension};
+#[cfg(feature = "sqlite")]
+use std::collections::HashSet;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -50,41 +52,39 @@ pub(crate) fn import_parsed_sync(
         .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
     let mut stats = ImportStats::default();
 
-    // Before the transaction: record which code systems currently have zero
-    // concepts in the DB. After the transaction commits, only these systems
-    // get an immediate closure rebuild — they are either brand-new systems or
-    // empty stubs, so the build is fast (at most a few thousand pairs).
+    // Before the transaction: decide which code systems get their closure
+    // rebuilt once the bundle commits. `write_code_system` deletes a system's
+    // closure on every write, so any system left out of this list answers
+    // `$subsumes` / `is-a` from an empty closure until the next
+    // `migrate_concept_closure` (issue #2128).
     //
-    // Systems that already have concepts are being updated in a batch (e.g.
-    // SNOMED RF2 chunks). Building the closure after every batch is O(n²) for
-    // SNOMED CT (~640K concepts, ~1 280 batches = hours). Skipping per-batch
-    // rebuilds is safe: write_code_system deletes the stale closure, and
-    // migrate_concept_closure at server startup rebuilds it exactly once.
+    // A plain import rebuilds every code system it writes. A batch of a chunked
+    // bulk load (`defer_closure`, e.g. SNOMED RF2 chunks) only rebuilds systems
+    // that had no concepts before it: rebuilding an existing system after every
+    // batch is O(n²) for SNOMED CT (~640K concepts, ~1 280 batches = hours), so
+    // the bulk importer's caller rebuilds once via `finalize_after_bootstrap`.
     // Probed with EXISTS rather than COUNT(*): the answer only distinguishes
     // empty from non-empty, and a COUNT over an ever-growing concept set would
     // make each batch of a chunked bulk load (SNOMED RF2, LOINC) scan all
     // previously imported rows.
-    let systems_needing_closure: Vec<String> = parsed
+    let systems_needing_closure: Vec<(String, Option<String>)> = parsed
         .code_systems
         .iter()
-        .filter_map(|cs| {
-            let has_concepts: bool = conn
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM concepts c
-                         JOIN code_systems s ON c.system_id = s.id
-                         WHERE s.url = ?1
-                     )",
-                    rusqlite::params![cs.url],
-                    |r| r.get(0),
-                )
-                .unwrap_or(false);
-            if has_concepts {
-                None
-            } else {
-                Some(cs.url.clone())
-            }
+        .filter(|cs| {
+            !parsed.defer_closure
+                || !conn
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM concepts c
+                             JOIN code_systems s ON c.system_id = s.id
+                             WHERE s.url = ?1
+                         )",
+                        rusqlite::params![cs.url],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false)
         })
+        .map(|cs| (cs.url.clone(), cs.version.clone()))
         .collect();
 
     // Wrap the whole bundle in a single transaction so that the thousands of
@@ -99,33 +99,47 @@ pub(crate) fn import_parsed_sync(
     tx.commit()
         .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
 
-    // Rebuild concept closure for newly imported (previously empty) code systems.
-    // Skipped for batch imports of existing systems (see comment above).
-    for url in &systems_needing_closure {
-        let system_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1",
-                rusqlite::params![url],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(sid) = system_id {
-            let has_hierarchy: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = ?1 LIMIT 1)",
-                    rusqlite::params![sid],
-                    |r| r.get(0),
-                )
-                .unwrap_or(false);
-            if has_hierarchy {
-                if let Err(e) = schema::build_concept_closure(&conn, &sid) {
-                    tracing::warn!(system_id = %sid, error = %e, "Failed to build concept closure after import");
-                }
-            }
-        }
+    // Rebuild the closure of exactly the (url, version) rows this bundle wrote,
+    // not every row sharing the URL: a small stub sharing a canonical with a
+    // large loaded system (e.g. `http://snomed.info/sct`) must not trigger a
+    // rebuild of the large one.
+    for (url, version) in &systems_needing_closure {
+        rebuild_closure_for(&conn, url, version.as_deref());
     }
 
     Ok(stats)
+}
+
+/// Rebuild `concept_closure` for the `code_systems` row at (`url`, `version`)
+/// when it has hierarchy edges. Must run outside any open transaction:
+/// [`schema::build_concept_closure`] opens its own `BEGIN IMMEDIATE`.
+///
+/// Failures are logged, not returned: the import itself has committed, and
+/// `migrate_concept_closure` at the next startup retries any system that is
+/// left without closure rows.
+#[cfg(feature = "sqlite")]
+fn rebuild_closure_for(conn: &Connection, url: &str, version: Option<&str>) {
+    let system_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM code_systems
+             WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
+            rusqlite::params![url, version],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(sid) = system_id else { return };
+    let has_hierarchy: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM concept_hierarchy WHERE system_id = ?1 LIMIT 1)",
+            rusqlite::params![sid],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if has_hierarchy {
+        if let Err(e) = schema::build_concept_closure(conn, &sid) {
+            tracing::warn!(system_id = %sid, error = %e, "Failed to build concept closure after import");
+        }
+    }
 }
 
 /// Write a [`ParsedBundle`] into the SQLite normalized tables.
@@ -177,7 +191,13 @@ pub(crate) fn import_code_system(
     if let Some(parsed) = bundle_parser::parse_code_system_value(cs_json) {
         // CRUD single-resource path: the target may already hold concepts, so
         // always replace (never skip the child delete).
-        write_code_system(conn, &parsed, stats, false)
+        write_code_system(conn, &parsed, stats, false)?;
+        // `write_code_system` dropped this system's closure; rebuild it so
+        // `$subsumes` / `is-a` see the new hierarchy now rather than after the
+        // next restart (#2128). The CRUD caller runs on an autocommit
+        // connection, so the rebuild's own transaction is safe to open here.
+        rebuild_closure_for(conn, &parsed.url, parsed.version.as_deref());
+        Ok(())
     } else {
         Err(HtsError::InvalidRequest(
             "CodeSystem.url is required".into(),
@@ -339,6 +359,11 @@ fn write_code_system(
          (concept_id, language, use_system, use_code, value)
          VALUES (?1, ?2, ?3, ?4, ?5)";
 
+    // Codes whose old parent edges this write has already cleared. A bundle
+    // can list the same code more than once, and the second occurrence must
+    // not wipe the edges the first one just inserted.
+    let mut edges_cleared: HashSet<&str> = HashSet::new();
+
     for concept in &cs.concepts {
         let concept_id: i64 = conn
             .prepare_cached(UPSERT_CONCEPT_SQL)
@@ -349,6 +374,20 @@ fn write_code_system(
                 )
             })
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+        // Replace this concept's parent edges rather than adding to them, so
+        // a re-import that moves a concept to a new parent (or reverses an
+        // edge) does not leave the old edge behind, which can form a cycle
+        // (#2129). Safe across chunked loads for the same reason as the
+        // property delete below: a concept and all its parents arrive in one
+        // batch. Skipped on a fresh load (nothing to delete).
+        if !skip_child_delete && edges_cleared.insert(concept.code.as_str()) {
+            conn.prepare_cached(
+                "DELETE FROM concept_hierarchy WHERE system_id = ?1 AND child_code = ?2",
+            )
+            .and_then(|mut s| s.execute(rusqlite::params![system_id, concept.code]))
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        }
 
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {
@@ -1287,5 +1326,229 @@ mod tests {
             0,
             "stale property must be removed on re-import"
         );
+    }
+
+    /// A CodeSystem with an `is-a` hierarchy `A > A.0`, as posted to `/import`.
+    fn hierarchical_cs_bundle() -> String {
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [{ "resource": hierarchical_cs() }]
+        })
+        .to_string()
+    }
+
+    fn hierarchical_cs() -> serde_json::Value {
+        serde_json::json!({
+            "resourceType": "CodeSystem",
+            "id": "s3",
+            "url": "http://ex.org/s3",
+            "status": "active",
+            "content": "complete",
+            "hierarchyMeaning": "is-a",
+            "concept": [{
+                "code": "A",
+                "concept": [{ "code": "A.0" }]
+            }]
+        })
+    }
+
+    async fn subsumes_a_a0(b: &SqliteTerminologyBackend) -> crate::types::SubsumptionOutcome {
+        b.subsumes(
+            &ctx(),
+            crate::types::SubsumesRequest {
+                system: "http://ex.org/s3".into(),
+                version: None,
+                code_a: "A".into(),
+                code_b: "A.0".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .outcome
+    }
+
+    /// Re-posting an existing CodeSystem to `/import` must leave its closure
+    /// usable. It used to delete the closure and defer the rebuild to the next
+    /// startup, so `$subsumes` answered `not-subsumed` in between (#2128).
+    #[tokio::test]
+    async fn reimport_keeps_closure_current() {
+        use crate::types::SubsumptionOutcome;
+        let b = backend();
+        let bundle = hierarchical_cs_bundle();
+
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+        assert_eq!(subsumes_a_a0(&b).await, SubsumptionOutcome::Subsumes);
+
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+        assert_eq!(
+            subsumes_a_a0(&b).await,
+            SubsumptionOutcome::Subsumes,
+            "re-import must rebuild the closure it deletes"
+        );
+    }
+
+    /// A deferred batch of an existing system leaves the rebuild to
+    /// `finalize_after_bootstrap`, which the chunked CLI / bootstrap loads run
+    /// once at the end.
+    #[tokio::test]
+    async fn deferred_reimport_rebuilds_on_finalize() {
+        use crate::types::SubsumptionOutcome;
+        let b = backend();
+        let bundle = hierarchical_cs_bundle();
+
+        b.import_bundle(&ctx(), bundle.as_bytes()).await.unwrap();
+        b.import_bundle_deferred(&ctx(), bundle.as_bytes())
+            .await
+            .unwrap();
+        let closure_rows: i64 = b
+            .pool()
+            .get()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM concept_closure", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(closure_rows, 0, "a deferred batch must not rebuild");
+
+        b.finalize_after_bootstrap().unwrap();
+        assert_eq!(subsumes_a_a0(&b).await, SubsumptionOutcome::Subsumes);
+    }
+
+    /// The SQLite CRUD path writes through `import_code_system` rather than
+    /// `import_bundle`; it must build the closure too.
+    #[tokio::test]
+    async fn crud_import_code_system_builds_closure() {
+        use crate::types::SubsumptionOutcome;
+        let b = backend();
+        {
+            let conn = b.pool().get().unwrap();
+            let mut stats = crate::import::ImportStats::default();
+            super::import_code_system(&conn, &hierarchical_cs(), &mut stats).unwrap();
+            // A second write is the CRUD update shape: the old closure is
+            // deleted and must come back.
+            super::import_code_system(&conn, &hierarchical_cs(), &mut stats).unwrap();
+        }
+        crate::traits::TerminologyCaches::invalidate_caches(&b);
+        assert_eq!(subsumes_a_a0(&b).await, SubsumptionOutcome::Subsumes);
+    }
+
+    /// A bundle for `http://example.org/cs/moves` whose concepts are given as
+    /// `(code, parents)` pairs, with parents expressed as `parent` properties.
+    fn cs_with_parents(concepts: &[(&str, &[&str])]) -> String {
+        let concepts: Vec<serde_json::Value> = concepts
+            .iter()
+            .map(|(code, parents)| {
+                let props: Vec<serde_json::Value> = parents
+                    .iter()
+                    .map(|p| serde_json::json!({"code": "parent", "valueCode": p}))
+                    .collect();
+                serde_json::json!({"code": code, "display": code, "property": props})
+            })
+            .collect();
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [{"resource": {
+                "resourceType": "CodeSystem",
+                "url": "http://example.org/cs/moves",
+                "version": "1.0",
+                "status": "active",
+                "content": "complete",
+                "property": [{"code": "parent", "type": "code"}],
+                "concept": concepts
+            }}]
+        })
+        .to_string()
+    }
+
+    fn hierarchy_edges(b: &SqliteTerminologyBackend) -> Vec<(String, String)> {
+        let conn = b.pool().get().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT h.parent_code, h.child_code FROM concept_hierarchy h \
+                 JOIN code_systems s ON s.id = h.system_id \
+                 WHERE s.url = 'http://example.org/cs/moves' \
+                 ORDER BY h.parent_code, h.child_code",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn edges(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(p, c)| (p.to_string(), c.to_string()))
+            .collect()
+    }
+
+    /// Re-importing a CodeSystem with a reversed edge must replace the old
+    /// edge, not add the new one beside it and form a cycle (#2129).
+    #[tokio::test]
+    async fn reimport_replaces_reversed_hierarchy_edge() {
+        let b = backend();
+        let ctx = ctx();
+
+        b.import_bundle(
+            &ctx,
+            cs_with_parents(&[("P", &[]), ("C", &["P"])]).as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hierarchy_edges(&b), edges(&[("P", "C")]));
+
+        b.import_bundle(
+            &ctx,
+            cs_with_parents(&[("P", &["C"]), ("C", &[])]).as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hierarchy_edges(&b),
+            edges(&[("C", "P")]),
+            "the stale P>C edge must be gone, or P and C are each other's parent"
+        );
+    }
+
+    /// A concept that moves to a different parent loses the old edge, and a
+    /// concept with several parents keeps all of them.
+    #[tokio::test]
+    async fn reimport_replaces_moved_parent_and_keeps_polyhierarchy() {
+        let b = backend();
+        let ctx = ctx();
+
+        let first = cs_with_parents(&[("A", &[]), ("B", &[]), ("X", &["A"]), ("Y", &["A", "B"])]);
+        b.import_bundle(&ctx, first.as_bytes()).await.unwrap();
+        assert_eq!(
+            hierarchy_edges(&b),
+            edges(&[("A", "X"), ("A", "Y"), ("B", "Y")])
+        );
+
+        let second = cs_with_parents(&[("A", &[]), ("B", &[]), ("X", &["B"]), ("Y", &["A", "B"])]);
+        b.import_bundle(&ctx, second.as_bytes()).await.unwrap();
+        assert_eq!(
+            hierarchy_edges(&b),
+            edges(&[("A", "Y"), ("B", "X"), ("B", "Y")])
+        );
+    }
+
+    /// Chunked loads send each concept in exactly one batch, so a later batch
+    /// must not remove edges written by an earlier one.
+    #[tokio::test]
+    async fn later_batch_keeps_earlier_batch_edges() {
+        let b = backend();
+        let ctx = ctx();
+
+        b.import_bundle(
+            &ctx,
+            cs_with_parents(&[("A", &[]), ("B", &["A"])]).as_bytes(),
+        )
+        .await
+        .unwrap();
+        b.import_bundle(&ctx, cs_with_parents(&[("C", &["B"])]).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(hierarchy_edges(&b), edges(&[("A", "B"), ("B", "C")]));
     }
 }

@@ -156,7 +156,7 @@ pub async fn import_icd9_cm(
         ..Default::default()
     };
     let seed = build_code_system_bundle(&meta, std::slice::from_ref(&root));
-    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -174,7 +174,7 @@ pub async fn import_icd9_cm(
             })
             .collect();
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
         stats.errors.extend(chunk.errors);
 
         eprintln!(
@@ -219,7 +219,10 @@ fn read_zip_contents(path: &Path) -> Result<Icd9ZipContents, HtsError> {
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
-        let name = entry.name().to_ascii_lowercase();
+        let name = entry
+            .name()
+            .map(|n| n.to_ascii_lowercase())
+            .unwrap_or_default();
         if !name.ends_with(".txt") {
             continue;
         }
@@ -554,8 +557,11 @@ E800  Railway accidents\n";
             let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-                zip.start_file("CMS32_DESC_LONG_DX.txt", zip::write::FileOptions::default())
-                    .unwrap();
+                zip.start_file(
+                    "CMS32_DESC_LONG_DX.txt",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
                 zip.write_all(content.as_bytes()).unwrap();
                 zip.finish().unwrap();
             }
@@ -567,7 +573,7 @@ E800  Railway accidents\n";
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
                 for (name, content) in entries {
-                    zip.start_file(*name, zip::write::FileOptions::default())
+                    zip.start_file(*name, zip::write::SimpleFileOptions::default())
                         .unwrap();
                     zip.write_all(content.as_bytes()).unwrap();
                 }

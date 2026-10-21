@@ -24,9 +24,9 @@ xml = ["helios-serde-support/xml"]
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 clap = { version = "4.0", features = ["derive"] }
-helios-fhir-macro = { path = "../fhir-macro", version = "0.2.4" }
-helios-serde-support = { path = "../serde-support", version = "0.2.4" }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.4" }
+helios-fhir-macro = { path = "../fhir-macro", version = "0.2.5" }
+helios-serde-support = { path = "../serde-support", version = "0.2.5" }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.5" }
 time = "0.3"
 chrono = { workspace = true }
 # Re-add serde-with-arbitrary-precision, keep macros
@@ -41,7 +41,7 @@ rust_decimal_macros = "1.0"
 
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking"] }
-zip = "0.6"
+zip = "9"
 
 [package.metadata.docs.rs]
 all-features = true

@@ -1,9 +1,12 @@
+import { chooseFixed, fixedControl, fixedTrigger } from "../pages/fixed-select";
+import { SearchBuilder } from "../pages/search-builder";
 import { holdSearches, searchLifecycleTests } from "../pages/search-lifecycle";
 import { test, expect } from "../pages/fixtures";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
 import { createResource, waitSearchable, deleteResources } from "../pages/api";
 import { seedSavedQuery } from "../pages/saved-search";
+import type { Route } from "@playwright/test";
 
 function catalogHtml(
   params: Array<{ code: string; type: string; targets?: string[] }>,
@@ -768,7 +771,7 @@ test.describe("query builder", () => {
       await search.builder.setUrl("Patient?name=ge1980");
       const row = search.builder.conditionRows.first();
       if (activationPath === "select") {
-        await row.locator(".builder-row__modifier").selectOption("exact");
+        await chooseFixed(row.locator(".builder-row__modifier"), "exact");
       } else {
         await row.locator("[data-toggle-mods]").click();
         await row.locator("[data-mod-chip=exact]").click();
@@ -786,7 +789,7 @@ test.describe("query builder", () => {
       await expect(row).toHaveAttribute("data-mod-type", "string");
       await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
       await expect(row.locator(".builder-row__comparator")).toHaveValue("");
-      await expect(row.locator(".builder-row__comparator")).toBeHidden();
+      await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
       await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
       await expect(search.builder.url).toHaveValue("GET /Patient?name:exact=ge1980");
       await expect(page.locator("#query-plain-text")).toContainText(
@@ -820,7 +823,7 @@ test.describe("query builder", () => {
       await search.builder.setUrl("Patient?birthdate=ge1980-01-01");
       let row = search.builder.conditionRows.first();
       if (activationPath === "select") {
-        await row.locator(".builder-row__modifier").selectOption("missing");
+        await chooseFixed(row.locator(".builder-row__modifier"), "missing");
       } else {
         await row.locator("[data-toggle-mods]").click();
         await row.locator("[data-mod-chip=missing]").click();
@@ -850,7 +853,7 @@ test.describe("query builder", () => {
       row = search.builder.conditionRows.first();
       await expect(row).toHaveAttribute("data-mod-type", "date");
       if (activationPath === "select") {
-        await row.locator(".builder-row__modifier").selectOption("missing");
+        await chooseFixed(row.locator(".builder-row__modifier"), "missing");
       } else {
         await row.locator("[data-toggle-mods]").click();
         await row.locator("[data-mod-chip=missing]").click();
@@ -928,14 +931,14 @@ test.describe("query builder", () => {
         await search.builder.setUrl(source.query);
         const row = search.builder.conditionRows.first();
         if (activationPath === "select") {
-          await row.locator(".builder-row__modifier").selectOption(source.modifier);
+          await chooseFixed(row.locator(".builder-row__modifier"), source.modifier);
         } else {
           await row.locator("[data-toggle-mods]").click();
           await row.locator(`[data-mod-chip=${source.modifier}]`).click();
         }
         await expect(search.builder.runButton).toBeDisabled();
 
-        await row.locator(".builder-row__comparator").selectOption("le");
+        await chooseFixed(row.locator(".builder-row__comparator"), "le");
         await expect(row.locator(".builder-row__modifier")).toHaveValue("");
         await expect(row.locator(".builder-row__comparator")).toHaveValue("le");
         await expect(search.builder.url).toHaveValue(source.query);
@@ -961,9 +964,9 @@ test.describe("query builder", () => {
           source.narration,
         );
         if (source.comparatorHidden) {
-          await expect(row.locator(".builder-row__comparator")).toBeHidden();
+          await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
         } else {
-          await expect(row.locator(".builder-row__comparator")).toBeVisible();
+          await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeVisible();
         }
         await expect(search.builder.runButton).toBeEnabled();
         expect(patientRequests).toEqual([]);
@@ -994,7 +997,7 @@ test.describe("query builder", () => {
 
       await search.builder.setUrl(source.query);
       const row = search.builder.conditionRows.first();
-      await row.locator(".builder-row__comparator").selectOption("le");
+      await chooseFixed(row.locator(".builder-row__comparator"), "le");
 
       await expect(search.builder.url).toHaveValue(source.query);
       await search.builder.copyButton.click();
@@ -1051,7 +1054,7 @@ test.describe("query builder", () => {
     const stable = "GET /Patient?name=alpha,1980";
     await expect(search.builder.url).toHaveValue(stable);
 
-    await comparators.nth(1).selectOption("le");
+    await chooseFixed(comparators.nth(1), "le");
     await expect(search.builder.url).toHaveValue(stable);
     await search.builder.copyButton.click();
     await expect
@@ -1065,8 +1068,8 @@ test.describe("query builder", () => {
     await expect(row).toHaveAttribute("data-mod-type", "string");
     await expect(comparators.nth(0)).toHaveValue("");
     await expect(comparators.nth(1)).toHaveValue("");
-    await expect(comparators.nth(0)).toBeHidden();
-    await expect(comparators.nth(1)).toBeHidden();
+    await expect(fixedTrigger(comparators.nth(0))).toBeHidden();
+    await expect(fixedTrigger(comparators.nth(1))).toBeHidden();
     await expect(values.nth(0)).toHaveValue("alpha");
     await expect(values.nth(1)).toHaveValue("le1980");
     await expect(search.builder.url).toHaveValue(
@@ -1103,7 +1106,7 @@ test.describe("query builder", () => {
     await search.builder.setUrl(original);
     const row = search.builder.conditionRows.first();
     const comparator = row.locator(".builder-row__comparator");
-    await comparator.selectOption("le");
+    await chooseFixed(comparator, "le");
     await expect(search.builder.url).toHaveValue(original);
     await search.builder.copyButton.click();
     await expect
@@ -1111,7 +1114,7 @@ test.describe("query builder", () => {
       .toBe(original);
     await expect(search.builder.runButton).toBeDisabled();
 
-    await comparator.selectOption("");
+    await chooseFixed(comparator, "");
     await expect(search.builder.url).toHaveValue("GET /Patient?name=1980");
     await expect(search.builder.runButton).toBeEnabled();
     expect(patientRequests).toEqual([]);
@@ -1119,7 +1122,7 @@ test.describe("query builder", () => {
     releaseParams();
     await expect(row).toHaveAttribute("data-mod-type", "string");
     await expect(comparator).toHaveValue("");
-    await expect(comparator).toBeHidden();
+    await expect(fixedTrigger(comparator)).toBeHidden();
     await expect(row.locator(".builder-row__value")).toHaveValue("1980");
     await expect(search.builder.url).toHaveValue("GET /Patient?name=1980");
     await expect(page.locator("#query-plain-text")).toContainText(
@@ -1151,10 +1154,10 @@ test.describe("query builder", () => {
     await search.builder.setUrl(original);
     const row = search.builder.conditionRows.first();
     const modifier = row.locator(".builder-row__modifier");
-    await modifier.selectOption("exact");
-    await row.locator(".builder-row__comparator").selectOption("le");
-    await modifier.selectOption("exact");
-    await modifier.selectOption("");
+    await chooseFixed(modifier, "exact");
+    await chooseFixed(row.locator(".builder-row__comparator"), "le");
+    await chooseFixed(modifier, "exact");
+    await chooseFixed(modifier, "");
     await row.locator(".builder-row__key").fill("birthdate");
 
     await expect(search.builder.url).toHaveValue(original);
@@ -1193,9 +1196,13 @@ test.describe("query builder", () => {
 
     await search.builder.setUrl("Patient?name=ge1980");
     const row = search.builder.conditionRows.first();
-    await row.locator(".builder-row__modifier").selectOption("exact");
-    await row.locator(".builder-row__comparator").selectOption("le");
+    await chooseFixed(row.locator(".builder-row__modifier"), "exact");
+    await chooseFixed(row.locator(".builder-row__comparator"), "le");
     await expect(search.builder.runButton).toBeDisabled();
+
+    const removedRow = await row.elementHandle();
+    const removedModifier = await row.locator(".builder-row__modifier").elementHandle();
+    await expect(row).toHaveAttribute("data-type-resolution", /.+/);
 
     await row.locator("[data-remove-row]").click();
     await expect(search.builder.conditionRows).toHaveCount(0);
@@ -1204,6 +1211,8 @@ test.describe("query builder", () => {
     expect(patientRequests).toEqual([]);
 
     releaseParams();
+    await expect.poll(() => removedRow!.evaluate(el => el.hasAttribute("data-type-resolution"))).toBe(false);
+    expect(await removedModifier!.evaluate(el => el.hasAttribute("data-combobox-native"))).toBe(false);
     await expect(search.builder.conditionRows).toHaveCount(0);
     await expect(search.builder.url).toHaveValue("GET /Patient");
     await expect(search.builder.runButton).toBeEnabled();
@@ -1235,7 +1244,7 @@ test.describe("query builder", () => {
       await search.builder.setUrl(original);
       const row = search.builder.conditionRows.first();
       if (activationPath === "select") {
-        await row.locator(".builder-row__modifier").selectOption("exact");
+        await chooseFixed(row.locator(".builder-row__modifier"), "exact");
       } else {
         await row.locator("[data-toggle-mods]").click();
         await row.locator("[data-mod-chip=exact]").click();
@@ -1255,7 +1264,7 @@ test.describe("query builder", () => {
       await expect(row).toHaveAttribute("data-mod-type", "string");
       await expect(row.locator(".builder-row__modifier")).toHaveValue("exact");
       await expect(row.locator(".builder-row__comparator")).toHaveValue("");
-      await expect(row.locator(".builder-row__comparator")).toBeHidden();
+      await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
       await expect(row.locator(".builder-row__value")).toHaveValue("ge1981");
       await expect(search.builder.url).toHaveValue("GET /Patient?name:exact=ge1981");
       await expect(page.locator("#query-plain-text")).toContainText(
@@ -1297,8 +1306,8 @@ test.describe("query builder", () => {
       await expect(comparators).toHaveCount(2);
       await expect(comparators.nth(0)).toHaveValue(scenario.comparators[0]);
       await expect(comparators.nth(1)).toHaveValue(scenario.comparators[1]);
-      await expect(comparators.nth(0)).toBeVisible();
-      await expect(comparators.nth(1)).toBeVisible();
+      await expect(fixedTrigger(comparators.nth(0))).toBeVisible();
+      await expect(fixedTrigger(comparators.nth(1))).toBeVisible();
       await expect(values.nth(0)).toHaveValue(scenario.values[0]);
       await expect(values.nth(1)).toHaveValue(scenario.values[1]);
       await values.nth(0).fill(scenario.values[0]);
@@ -1315,7 +1324,7 @@ test.describe("query builder", () => {
     const comparators = row.locator(".builder-row__comparator");
     const values = row.locator(".builder-row__value");
 
-    await comparators.nth(1).selectOption("gt");
+    await chooseFixed(comparators.nth(1), "gt");
     await expect(comparators.nth(0)).toHaveValue("le");
     await expect(comparators.nth(1)).toHaveValue("gt");
     await expect(search.builder.url).toHaveValue(
@@ -1342,7 +1351,7 @@ test.describe("query builder", () => {
     const alternatives = row.locator(".builder-row__orvalue");
     await expect(alternatives).toHaveCount(2);
     await expect(alternatives.nth(1).locator(".builder-row__comparator")).toHaveValue("");
-    await alternatives.nth(1).locator(".builder-row__comparator").selectOption("ge");
+    await chooseFixed(alternatives.nth(1).locator(".builder-row__comparator"), "ge");
     await alternatives.nth(1).locator(".builder-row__value").fill("1980-01-02");
     await expect(search.builder.url).toHaveValue(
       "GET /Patient?birthdate=le1979-12-31,ge1980-01-02",
@@ -1377,8 +1386,8 @@ test.describe("query builder", () => {
     await expect(row).toHaveAttribute("data-mod-type", "string");
     await expect(row.locator(".builder-row__comparator").nth(0)).toHaveValue("");
     await expect(row.locator(".builder-row__comparator").nth(1)).toHaveValue("");
-    await expect(row.locator(".builder-row__comparator").nth(0)).toBeHidden();
-    await expect(row.locator(".builder-row__comparator").nth(1)).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator").nth(0))).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator").nth(1))).toBeHidden();
     await expect(row.locator(".builder-row__value").nth(0)).toHaveValue("1980-01-02");
     await expect(row.locator(".builder-row__value").nth(1)).toHaveValue("1990-12-31");
     await expect(search.builder.url).toHaveValue(
@@ -1408,7 +1417,7 @@ test.describe("query builder", () => {
     await expect(row).toHaveAttribute("data-mod-type", "string");
     await expect(row.locator(".builder-row__comparator").nth(0)).toHaveValue("");
     await expect(row.locator(".builder-row__comparator").nth(1)).toHaveValue("");
-    await expect(row.locator(".builder-row__comparator").nth(0)).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator").nth(0))).toBeHidden();
     await expect(row.locator(".builder-row__value").nth(0)).toHaveValue("ge1980");
     await expect(row.locator(".builder-row__value").nth(1)).toHaveValue("le1990");
     await expect(search.builder.url).toHaveValue("Patient?name=ge1980,le1990");
@@ -1420,14 +1429,14 @@ test.describe("query builder", () => {
     row = search.builder.conditionRows.first();
     await expect(row).toHaveAttribute("data-mod-type", "");
     await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
-    await expect(row.locator(".builder-row__comparator")).toBeVisible();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeVisible();
     await expect(row.locator(".builder-row__value")).toHaveValue("1980");
     await expect(search.builder.url).toHaveValue("Patient?unregistered=ge1980");
 
     await search.builder.setUrl("Patient?link:Patient.name=ge1980");
     row = search.builder.chainRows.first();
     await expect(row).toHaveAttribute("data-mod-type", "string");
-    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
     await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
     await expect(page.locator("#query-plain-text")).toContainText("name is “ge1980”");
     await expect(page.locator("#query-plain-text")).not.toContainText("on or after");
@@ -1435,7 +1444,7 @@ test.describe("query builder", () => {
     await search.builder.setUrl("Patient?_has:Observation:patient:code=ge1980");
     row = search.builder.hasRows.first();
     await expect(row).toHaveAttribute("data-mod-type", "token");
-    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
     await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
     await expect(page.locator("#query-plain-text")).toContainText("code is “ge1980”");
     await expect(page.locator("#query-plain-text")).not.toContainText("on or after");
@@ -1450,7 +1459,7 @@ test.describe("query builder", () => {
     await row.locator(".builder-row__cparam").fill("name");
     await expect(row).toHaveAttribute("data-mod-type", "string");
     await expect(row.locator(".builder-row__comparator")).toHaveValue("");
-    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
     await expect(search.builder.url).toHaveValue(
       "GET /Patient?link:Patient.name=1980-01-02",
     );
@@ -1463,7 +1472,7 @@ test.describe("query builder", () => {
     await row.locator(".builder-row__cparam").fill("code");
     await expect(row).toHaveAttribute("data-mod-type", "token");
     await expect(row.locator(".builder-row__comparator")).toHaveValue("");
-    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
     await expect(search.builder.url).toHaveValue(
       "GET /Patient?_has:Observation:patient:code=2020-01-01",
     );
@@ -1524,7 +1533,7 @@ test.describe("query builder", () => {
     releaseParams();
     await expect(row).toHaveAttribute("data-mod-type", "string");
     await expect(row.locator(".builder-row__comparator")).toHaveValue("");
-    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
     await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
     await expect(search.builder.url).toHaveValue("GET /Patient?family=ge1980");
     await expect(page.locator("#query-plain-text")).toContainText("family is “ge1980”");
@@ -1550,7 +1559,7 @@ test.describe("query builder", () => {
     await expect(search.builder.runButton).toBeDisabled();
     releasePatient();
     await expect(row).toHaveAttribute("data-mod-type", "string");
-    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
     await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
     await expect(search.builder.url).toHaveValue(
       "GET /Patient?link:Patient.family=ge1980",
@@ -1573,7 +1582,7 @@ test.describe("query builder", () => {
     await expect(search.builder.runButton).toBeDisabled();
     releaseObservation();
     await expect(row).toHaveAttribute("data-mod-type", "token");
-    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
     await expect(row.locator(".builder-row__value")).toHaveValue("ge1980");
     await expect(search.builder.url).toHaveValue(
       "GET /Patient?_has:Observation:patient:category=ge1980",
@@ -1587,9 +1596,9 @@ test.describe("query builder", () => {
     let row = search.builder.conditionRows.first();
     await expect(row).toHaveAttribute("data-mod-type", "number");
     await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
-    await expect(row.locator(".builder-row__comparator")).toBeVisible();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeVisible();
     await expect(row.locator(".builder-row__value")).toHaveValue("0.5");
-    await row.locator(".builder-row__comparator").selectOption("gt");
+    await chooseFixed(row.locator(".builder-row__comparator"), "gt");
     await expect(search.builder.url).toHaveValue(
       "GET /RiskAssessment?probability=gt0.5",
     );
@@ -1598,9 +1607,9 @@ test.describe("query builder", () => {
     row = search.builder.conditionRows.first();
     await expect(row).toHaveAttribute("data-mod-type", "quantity");
     await expect(row.locator(".builder-row__comparator")).toHaveValue("le");
-    await expect(row.locator(".builder-row__comparator")).toBeVisible();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeVisible();
     await expect(row.locator(".builder-row__value")).toHaveValue("5");
-    await row.locator(".builder-row__comparator").selectOption("ge");
+    await chooseFixed(row.locator(".builder-row__comparator"), "ge");
     await expect(search.builder.url).toHaveValue(
       "GET /Observation?value-quantity=ge5",
     );
@@ -1613,8 +1622,8 @@ test.describe("query builder", () => {
     const chain = search.builder.chainRows.first();
     const chainComparator = chain.locator(".builder-row__comparator");
     await expect(chain).toHaveAttribute("data-mod-type", "date");
-    await expect(chainComparator).toBeVisible();
-    await chainComparator.selectOption("ge");
+    await expect(fixedTrigger(chainComparator)).toBeVisible();
+    await chooseFixed(chainComparator, "ge");
     await expect(search.builder.url).toHaveValue(
       "GET /Patient?link:Patient.birthdate=ge1980-01-02",
     );
@@ -1623,8 +1632,8 @@ test.describe("query builder", () => {
     const reverseChain = search.builder.hasRows.first();
     const reverseComparator = reverseChain.locator(".builder-row__comparator");
     await expect(reverseChain).toHaveAttribute("data-mod-type", "date");
-    await expect(reverseComparator).toBeVisible();
-    await reverseComparator.selectOption("le");
+    await expect(fixedTrigger(reverseComparator)).toBeVisible();
+    await chooseFixed(reverseComparator, "le");
     await expect(search.builder.url).toHaveValue(
       "GET /Patient?_has:Observation:patient:date=le2020-01-01",
     );
@@ -1806,7 +1815,7 @@ test.describe("query builder", () => {
         `GET /Matrix?ordered-param=${prefix}1980`,
       );
       if (prefix === "eq") {
-        await row.locator(".builder-row__comparator").selectOption("le");
+        await chooseFixed(row.locator(".builder-row__comparator"), "le");
         await expect(search.builder.url).toHaveValue(
           "GET /Matrix?ordered-param=le1980",
         );
@@ -1829,7 +1838,7 @@ test.describe("query builder", () => {
     await expect(row.locator(".builder-row__comparator")).toHaveValue("ge");
     await row.locator(".builder-row__key").fill("gender");
     await expect(row.locator(".builder-row__comparator")).toHaveValue("");
-    await expect(row.locator(".builder-row__comparator")).toBeHidden();
+    await expect(fixedTrigger(row.locator(".builder-row__comparator"))).toBeHidden();
     await expect(search.builder.url).toHaveValue("GET /Patient?gender=1980-01-01");
   });
 
@@ -2007,7 +2016,7 @@ test.describe("query builder", () => {
 
     await missingChip.click();
     await expect(missingChip).toHaveAttribute("aria-pressed", "true");
-    await row.locator(".builder-row__comparator").selectOption("ge");
+    await chooseFixed(row.locator(".builder-row__comparator"), "ge");
 
     await expect(row.locator(".builder-row__modifier")).toHaveValue("");
     await expect(missingChip).toHaveAttribute("aria-pressed", "false");
@@ -2070,7 +2079,7 @@ test.describe("query builder", () => {
       }
 
       const primaryControls = row.locator(
-        ".builder-row__key, .builder-row__modifier, .builder-row__values, " +
+        ":scope > .builder-row__key, :scope > .combobox--inline, :scope > .builder-row__values, " +
           ".builder-row__or, .builder-row__adv, [data-remove-row]",
       );
       const primaryBounds = () =>
@@ -2111,13 +2120,13 @@ test.describe("query builder", () => {
         const panelClientRect = panel.getBoundingClientRect();
         const visibleLeaves = Array.from(
           element.querySelectorAll(
-            ".builder-row__key, .builder-row__modifier, .builder-row__comparator, " +
+            ".builder-row__key, [data-combobox-trigger], " +
               ".builder-row__value, " +
               ".builder-row__remove--or, .builder-row__or, .builder-row__adv, [data-remove-row]",
           ),
         ).filter((leaf) => {
           const style = getComputedStyle(leaf);
-          return style.display !== "none" && style.visibility !== "hidden";
+          return leaf.getClientRects().length > 0 && style.display !== "none" && style.visibility !== "hidden";
         });
         const leafBoxes = visibleLeaves.map((leaf) => relativeBox(leaf));
         const chips = Array.from(panel.querySelectorAll(".builder-row__modchip")).map((chip) =>
@@ -2212,7 +2221,7 @@ test.describe("query builder", () => {
     await expect(headers).toContainText(["id", "name", "gender", "birthDate"]);
 
     const sort = search.page.locator("#query-results-sort");
-    await sort.selectOption("-_lastUpdated");
+    await chooseFixed(sort, "-_lastUpdated");
     // Picking a sort rewrites the visible query and re-runs (#958).
     await expect(search.builder.url).toHaveValue(
       "GET /Patient?name=Sortable&_sort=-_lastUpdated",
@@ -2296,6 +2305,24 @@ test.describe("query builder", () => {
     await search.railItem("Patient").click();
     // /ui/resources/params fills #param-options for the picked type.
     await expect.poll(async () => search.builder.paramOptions.count()).toBeGreaterThan(0);
+  });
+
+  test("the rail filter narrows the Recently used group too (#1275)", async ({ search }) => {
+    await search.railItem("Patient").click();
+    await expect(search.recentGroup).toBeVisible();
+    await expect(search.recentItem("Patient")).toBeVisible();
+
+    await search.railFilter.fill("zzzznomatch");
+    await expect(search.railItem("Patient")).toBeHidden();
+    await expect(search.recentItem("Patient")).toBeHidden();
+    await expect(search.recentGroup).toBeHidden();
+
+    await search.railFilter.fill("patie");
+    await expect(search.recentGroup).toBeVisible();
+    await expect(search.recentItem("Patient")).toBeVisible();
+
+    await search.railFilter.fill("");
+    await expect(search.railItem("Patient")).toBeVisible();
   });
 
   // Picking a type updates the URL (and back navigates) without a full
@@ -2382,6 +2409,11 @@ test.describe("query builder", () => {
       await page.reload({ waitUntil: "networkidle" });
       await search.showBuilder();
       await search.builder.recentToggle.click();
+      // #1759: a SAVED row sits in the same .recent-item wrapper as a RECENT
+      // row, so both sections share padding, row height and hover.
+      await expect(
+        search.builder.recentPanel.locator(".recent-item > [data-saved-load]", { hasText: savedName }),
+      ).toHaveCount(1);
       await search.builder.recentPanel.locator("[data-saved-load]", { hasText: savedName }).click();
       await expect(search.builder.url).toHaveValue(expected);
       const values = search.builder.conditionRows.first().locator(".builder-row__value");
@@ -2475,7 +2507,7 @@ test.describe("query builder", () => {
       const url = new URL(request.url());
       return url.pathname === "/Location" && url.searchParams.has("_sort");
     });
-    await sort.selectOption("_lastUpdated");
+    await chooseFixed(sort, "_lastUpdated");
     const sortedUrl = new URL((await sortedRequest).url());
     expect(sortedUrl.searchParams.getAll("name")).toEqual([literal]);
     expect(sortedUrl.searchParams.get("_sort")).toBe("_lastUpdated");
@@ -3092,11 +3124,8 @@ test.describe("query builder unknown parameter", () => {
       await typeUnknown(search, "asdasd");
       await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
       await expect(search.builder.flaggedInputs).toHaveCount(1);
-      // The row's modifier <select> has no accessible name today (a gap that
-      // predates this state and is not part of it), so it is left out here.
       const { violations } = await new AxeBuilder({ page })
         .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
-        .exclude(".builder-row__modifier")
         .analyze();
       expect(violations, axeSummary(violations)).toEqual([]);
     });
@@ -3204,4 +3233,472 @@ test("issue1772 visual builder and parameter suggestions work when settings are 
   await search.builder.runButton.click();
   await search.results.waitShown();
   await expect(search.results.error).toBeHidden();
+});
+
+for (const path of ["/ui/resources", "/ui/search"]) {
+  test(`issue2080 themed builder updates parameter choices, OR and result controls on ${path}`, async ({ page }) => {
+    await page.route("**/ui/resources/params?type=Patient", route => route.fulfill({
+      contentType: "text/html", body: catalogHtml([
+        { code: "family", type: "string" }, { code: "birthdate", type: "date" },
+      ]),
+    }));
+    await page.goto(`${path}?type=Patient`, { waitUntil: "networkidle" });
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    const builder = new SearchBuilder(page);
+    await builder.setUrl("Patient?family=1980");
+    const row = builder.conditionRows.first();
+    await expect(row).toHaveAttribute("data-mod-type", "string");
+    const modifier = row.locator(".builder-row__modifier");
+    await expect(modifier).toBeHidden();
+    const trigger = fixedTrigger(modifier);
+    await trigger.focus();
+    await trigger.press("ArrowDown");
+    await trigger.press("ArrowDown");
+    await trigger.press("Enter");
+    await expect(builder.url).toHaveValue("GET /Patient?family:exact=1980");
+    await expect(trigger).toBeFocused();
+    await trigger.press("ArrowDown");
+    await trigger.press("Escape");
+    await expect(trigger).toHaveAttribute("aria-expanded", "false");
+    await expect(builder.url).toHaveValue("GET /Patient?family:exact=1980");
+
+    await row.locator(".builder-row__key").fill("birthdate");
+    await expect(row).toHaveAttribute("data-mod-type", "date");
+    await expect(trigger).toHaveAccessibleName("Modifiers is");
+    await trigger.click();
+    await expect(fixedControl(modifier).getByRole("option")).toHaveText(["is", ":missing"]);
+    await trigger.press("Escape");
+    const comparator = row.locator(".builder-row__comparator");
+    await chooseFixed(comparator, "ge");
+    await chooseFixed(modifier, "missing");
+    await expect(fixedTrigger(comparator)).toHaveAccessibleName("is is");
+    await chooseFixed(comparator, "le");
+    await expect(trigger).toHaveAccessibleName("Modifiers is");
+    await row.locator("[data-toggle-mods]").click();
+    await row.locator('[data-mod-chip="missing"]').click();
+    await expect(trigger).toHaveAccessibleName("Modifiers :missing");
+    await expect(fixedTrigger(comparator)).toHaveAccessibleName("is is");
+    await chooseFixed(comparator, "le");
+    await expect(trigger).toHaveAccessibleName("Modifiers is");
+    await row.locator("[data-add-or]").click();
+    await chooseFixed(row.locator(".builder-row__comparator").nth(1), "gt");
+    await row.locator(".builder-row__value").nth(1).fill("1990");
+    await builder.addButton("control").click();
+    const control = page.locator("#builder-controls .builder-row");
+    await chooseFixed(control.locator("select.builder-row__key"), "_sort");
+    await control.locator(".builder-row__value").fill("birthdate");
+    await expect(builder.url).toHaveValue("GET /Patient?birthdate=le1980,gt1990&_sort=birthdate");
+    await expect(page.locator("#builder-sections select:visible")).toHaveCount(0);
+  });
+
+  test(`issue2080 empty chain/include choices become themed registry options on ${path}`, async ({ page }) => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    await page.route("**/ui/resources/params?type=Observation", async route => {
+      await gate;
+      await route.fulfill({ contentType: "text/html", body: catalogHtml([
+        { code: "subject", type: "reference", targets: ["Patient", "Group"] },
+        { code: "device", type: "reference", targets: ["Device"] },
+      ]) });
+    });
+    for (const type of ["Patient", "Group"]) {
+      await page.route(`**/ui/resources/params?type=${type}`, route => route.fulfill({
+        contentType: "text/html", body: catalogHtml([{ code: "family", type: "string" }]),
+      }));
+    }
+    await page.goto(`${path}?type=Patient`, { waitUntil: "networkidle" });
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    const builder = new SearchBuilder(page);
+    await builder.setUrl("Observation?subject:Patient.family=Ann&_include=Observation:subject");
+    const qualifier = builder.chainRows.locator(".builder-row__ctype");
+    const target = page.locator(".builder-row__itarget");
+    await expect(fixedTrigger(qualifier)).toBeDisabled();
+    await expect(fixedTrigger(target)).toBeDisabled();
+    release();
+    await expect(fixedTrigger(qualifier)).toBeEnabled();
+    await expect(fixedTrigger(target)).toBeEnabled();
+    await chooseFixed(qualifier, "Group");
+    await chooseFixed(target, "Patient");
+    await expect(builder.url).toHaveValue("GET /Observation?subject:Group.family=Ann&_include=Observation:subject:Patient");
+    await page.locator(".builder-row__iparam").fill("device");
+    await expect(target.locator("option")).toHaveText(["any", "Device"]);
+    await chooseFixed(target, "Device");
+    await expect(builder.url).toHaveValue("GET /Observation?subject:Group.family=Ann&_include=Observation:device:Device");
+    await expect(page.locator("#builder-sections select:visible")).toHaveCount(0);
+  });
+
+  test(`issue2080 Sort reflects the candidate silently and locks during its one search on ${path}`, async ({ page }) => {
+    await page.route("**/ui/resources/params?type=Patient", route => route.fulfill({
+      contentType: "text/html", body: catalogHtml([{ code: "birthdate", type: "date" }]),
+    }));
+    await page.route("**/ui/resources/params?type=Observation", route => route.fulfill({
+      contentType: "text/html", body: catalogHtml([{ code: "date", type: "date" }]),
+    }));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const requests: string[] = [];
+    await page.route(/\/Patient\?/, async route => {
+      const url = new URL(route.request().url());
+      requests.push(url.search);
+      if (url.searchParams.get("_sort") === "birthdate") await gate;
+      await route.fulfill({ contentType: "application/fhir+json", body: JSON.stringify({
+        resourceType: "Bundle", type: "searchset", total: 0,
+      }) });
+    });
+    await page.goto(`${path}?type=Patient`, { waitUntil: "networkidle" });
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    const builder = new SearchBuilder(page);
+    await builder.run("Patient?_count=2");
+    await expect(builder.status).toBeHidden();
+    const before = requests.length;
+    await builder.setUrl("Patient?_count=2&_sort=-birthdate");
+    await expect(builder.sortTrigger).toHaveAccessibleName("Sort birthdate ↓");
+    expect(requests).toHaveLength(before);
+    await builder.chooseSort("birthdate");
+    await expect(builder.sortTrigger).toBeDisabled();
+    await expect(builder.url).toHaveValue("GET /Patient?_count=2&_sort=birthdate");
+    await expect.poll(() => requests.length).toBe(before + 1);
+    release();
+    await expect(builder.sortTrigger).toBeEnabled();
+    await builder.setUrl("Observation?date=2020");
+    await expect(builder.sortTrigger).toHaveAccessibleName("Sort Default");
+    await builder.sortTrigger.click();
+    await expect(fixedControl(builder.sort).locator('[role="option"][data-value="date"]')).toBeVisible();
+    await expect(fixedControl(builder.sort).locator('[role="option"][data-value="birthdate"]')).toHaveCount(0);
+    await builder.sortTrigger.press("Escape");
+  });
+}
+
+function previousResultsBundle(ids: string[], total = ids.length, link: Array<{ relation: string; url: string }> = []) {
+  return {
+    resourceType: "Bundle", type: "searchset", total, link,
+    entry: ids.map(id => ({ resource: { resourceType: "Patient", id, name: [{ family: id }] } })),
+  };
+}
+
+for (const workspace of ["Resources", "Search"] as const) {
+  test(`issue2078 ${workspace} labels retained results when Recent, Saved or edits change the candidate`, async ({ page, request, resources, search }) => {
+    const prefix = `Issue2078${workspace}${Date.now()}`;
+    const familyA = `${prefix}A`, familyB = `${prefix}B`;
+    const queryA = `/Patient?family=${familyA}&_summary=true`;
+    const queryB = `/Patient?family=${familyB}`;
+    const saved = await seedSavedQuery(request, "Patient", `Saved2078 ${prefix}`, `family=${familyB}`);
+    test.skip(!saved, "no per-user settings store on this backend");
+    let runs = 0;
+    await page.route("**/Patient?*", async route => {
+      const family = new URL(route.request().url()).searchParams.get("family");
+      if (family !== familyA && family !== familyB) return route.continue();
+      runs++;
+      const ids = family === familyA ? [`${prefix}-a1`, `${prefix}-a2`, `${prefix}-a3`] : [`${prefix}-b`];
+      await route.fulfill({ contentType: "application/fhir+json", body: JSON.stringify(previousResultsBundle(ids)) });
+    });
+    const active = workspace === "Resources" ? resources : search;
+    async function waitRecent(query: string) {
+      await expect.poll(async () => {
+        const document = await (await request.get("/_user/settings")).json();
+        return document.recentSearches?.some((entry: { query: string }) => entry.query === query);
+      }).toBe(true);
+    }
+    async function loadRecent(query: string) {
+      await active.builder.recentToggle.click();
+      await active.builder.recentPanel.getByRole("button", { name: `GET ${query}`, exact: true }).click();
+      await expect(active.builder.url).toHaveValue(`GET ${query}`);
+    }
+    try {
+      if (workspace === "Resources") await resources.goto("Patient");
+      else await search.gotoBuilder("Patient");
+      const mode = page.locator("[data-mode-btn=builder]");
+      if (await mode.count()) await mode.click();
+      for (const [query, count] of [[queryA, 3], [queryB, 1]] as const) {
+        await active.builder.run(query);
+        await active.results.waitDone();
+        await expect(active.results.rows).toHaveCount(count);
+        await waitRecent(query);
+      }
+      await expect(active.results.meta).toHaveText(/^1 results/);
+      await expect(active.results.previous).toBeHidden();
+      const retainedB = await active.results.visibleState();
+
+      // Loading the query already represented by the table is still load-only.
+      await loadRecent(queryB);
+      await expect(active.results.previous).toBeHidden();
+      expect(runs).toBe(2);
+      await loadRecent(queryA);
+      expect(await active.results.visibleState()).toEqual(retainedB);
+      expect(runs, "Recent waits for an explicit Run").toBe(2);
+      await expect.soft(active.results.previous).toBeVisible();
+
+      await active.builder.runButton.click();
+      await active.results.waitDone();
+      await expect(active.results.rows).toHaveCount(3);
+      await expect(active.results.meta).toHaveText(/^3 results/);
+      await expect(active.results.previous).toBeHidden();
+      expect(runs).toBe(3);
+      await waitRecent(queryA);
+      const retainedA = await active.results.visibleState();
+
+      await active.builder.recentToggle.click();
+      await active.builder.recentPanel.getByRole("button", { name: saved!.entry.name, exact: true }).click();
+      await expect(active.builder.url).toHaveValue(`GET ${queryB}`);
+      await expect.soft(active.results.previous).toBeVisible();
+      await active.builder.setUrl(queryA);
+      await expect(active.results.previous).toBeHidden();
+      // Typing changes the candidate before blur or row hydration.
+      await active.builder.url.fill(queryB);
+      await expect.soft(active.results.previous).toBeVisible();
+      await active.builder.setUrl(queryA);
+      const value = active.builder.conditionRows.first().locator(".builder-row__value");
+      await value.fill(familyB);
+      await expect.soft(active.results.previous).toBeVisible();
+      await value.fill(familyA);
+      await expect(active.results.previous).toBeHidden();
+      expect(await active.results.visibleState()).toEqual(retainedA);
+      expect(runs, "Saved and editing preserve load-only behavior").toBe(3);
+    } finally {
+      await saved?.remove();
+    }
+  });
+
+  test(`issue2078 ${workspace} labels a successful response when its candidate was edited while waiting`, async ({ page, resources, search }) => {
+    let held: Route | undefined;
+    await page.route("**/Patient?*", route => {
+      if (new URL(route.request().url()).searchParams.get("family") !== "Issue2078Held") return route.continue();
+      held = route;
+    });
+    const active = workspace === "Resources" ? resources : search;
+    if (workspace === "Resources") await resources.goto("Patient");
+    else await search.gotoBuilder("Patient");
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    await active.builder.run("Patient?family=Issue2078Held");
+    await expect.poll(() => !!held).toBe(true);
+    await active.builder.setUrl("Patient?family=Issue2078Candidate");
+    await held!.fulfill({ contentType: "application/fhir+json", body: JSON.stringify(previousResultsBundle(["issue2078-held"])) });
+    await active.results.waitDone();
+    await expect(active.results.rows).toContainText(["issue2078-held"]);
+    await expect.soft(active.results.previous).toBeVisible();
+    await active.builder.setUrl("GET /Patient?family=Issue2078Held");
+    await expect(active.results.previous).toBeHidden();
+  });
+
+  test(`issue2078 ${workspace} keeps failed rerun results labeled after delayed Recent persistence`, async ({ page, request, resources, search }) => {
+    const settings = await request.get("/_user/settings");
+    test.skip(settings.status() === 501, "no per-user settings store on this backend");
+    const family = `Issue2078Failed${workspace}${Date.now()}`;
+    const query = `/Patient?family=${family}`;
+    const diagnostic = "Same-query rerun failed";
+    let runs = 0, delaySettings = false;
+    let heldSettings: Route | undefined;
+    await page.route("**/_user/settings", route => {
+      const request = route.request();
+      if (!delaySettings || request.method() !== "PATCH" || !request.postDataJSON().recentSearches?.some((entry: { query: string }) => entry.query === query)) return route.continue();
+      heldSettings = route;
+    });
+    await page.route("**/Patient?*", route => {
+      if (new URL(route.request().url()).searchParams.get("family") !== family) return route.continue();
+      runs++;
+      const body = runs === 1 ? previousResultsBundle(["issue2078-retained"]) : { resourceType: "OperationOutcome", issue: [{ severity: "error", code: "exception", diagnostics: diagnostic }] };
+      return route.fulfill({ status: runs === 1 ? 200 : 502, contentType: "application/fhir+json", body: JSON.stringify(body) });
+    });
+    const active = workspace === "Resources" ? resources : search;
+    if (workspace === "Resources") await resources.goto("Patient");
+    else await search.gotoBuilder("Patient");
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    await active.builder.run(query);
+    await active.results.waitDone();
+    await expect(active.results.rows).toContainText(["issue2078-retained"]);
+    await expect(active.results.previous).toBeHidden();
+    const recent = active.builder.recentPanel.getByText(`GET ${query}`, { exact: true });
+    await expect(recent).toHaveCount(1);
+    const previousRecent = await recent.elementHandle();
+    const retained = await active.results.visibleState();
+
+    delaySettings = true;
+    await active.builder.runButton.click();
+    await active.results.waitDone();
+    await expect.poll(() => !!heldSettings).toBe(true);
+    await expect(active.results.error).toHaveText(diagnostic);
+    await expect(active.results.previous).toBeVisible();
+    await heldSettings!.continue();
+    // The old Recent button detaches when the delayed settings callback
+    // renders, so the following checks run after that refresh, not before it.
+    await page.waitForFunction(button => !button!.isConnected, previousRecent);
+    await expect.soft(active.results.previous).toBeVisible();
+    await expect(active.results.error).toBeVisible();
+    await expect(active.results.error).toHaveText(diagnostic);
+    expect(await active.results.visibleState()).toEqual(retained);
+    expect(runs).toBe(2);
+  });
+
+  test(`issue2078 ${workspace} compares an opaque page and its refresh with the logical query`, async ({ page, resources, search }) => {
+    const query = "/Patient?family=Issue2078Paging&_count=1";
+    const opaque = "/_paging/issue2078?cursor=opaque%2Fpage";
+    let pageRequests = 0;
+    await page.route("**/*", async route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === "/Patient" && url.searchParams.get("family") === "Issue2078Paging") {
+        await route.fulfill({ contentType: "application/fhir+json", body: JSON.stringify(previousResultsBundle(["issue2078-page-one"], 2, [{ relation: "next", url: opaque }])) });
+      } else if (url.pathname === "/_paging/issue2078") {
+        pageRequests++;
+        await route.fulfill({ contentType: "application/fhir+json", body: JSON.stringify(previousResultsBundle(["issue2078-page-two"], 2)) });
+      } else await route.continue();
+    });
+    const active = workspace === "Resources" ? resources : search;
+    if (workspace === "Resources") await resources.goto("Patient");
+    else await search.gotoBuilder("Patient");
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    await active.builder.run(query);
+    await active.results.waitDone();
+    await expect(active.results.previous).toBeHidden();
+    await active.results.next.click();
+    await active.results.waitDone();
+    await expect(active.results.rows).toContainText(["issue2078-page-two"]);
+    await expect(active.results.previous).toBeHidden();
+    // The GET prefix and wire-only _total do not change the logical query
+    // represented by the opaque page.
+    await active.builder.setUrl(`GET ${query}`);
+    await expect(active.results.previous).toBeHidden();
+    await active.builder.setUrl("Patient?family=Issue2078Different&_count=1");
+    await expect.soft(active.results.previous).toBeVisible();
+    await page.evaluate(() => document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: "Patient" } })));
+    await expect.poll(() => pageRequests).toBe(2);
+    await active.results.waitDone();
+    await expect(active.results.rows).toContainText(["issue2078-page-two"]);
+    await expect.soft(active.results.previous).toBeVisible();
+    await active.builder.setUrl(query);
+    await expect(active.results.previous).toBeHidden();
+  });
+}
+
+for (const workspace of ["Resources", "Search"] as const) {
+  test(`issue2079 ${workspace} summarizes Observation components as text`, async ({ page, request, resources, search }) => {
+    const systolic = {
+      code: { coding: [{ system: "http://loinc.org", code: "8480-6", display: "Systolic blood pressure" }] },
+      valueQuantity: { value: 120, unit: "mmHg", system: "http://unitsofmeasure.org", code: "mm[Hg]" },
+    };
+    const fixtures = [
+      {
+        component: [systolic],
+        effectivePeriod: { start: "2026-10-15" },
+        expected: "Systolic blood pressure",
+        period: '{"start":"2026-10-15"}',
+      },
+      {
+        component: [systolic, {
+          code: { coding: [{ system: "http://loinc.org", code: "8462-4", display: "Diastolic blood pressure" }] },
+          valueQuantity: { value: 80, unit: "mmHg", system: "http://unitsofmeasure.org", code: "mm[Hg]" },
+        }],
+        expected: "Systolic blood pressure +1",
+      },
+      {
+        component: [{ ...systolic, code: { ...systolic.code, text: "Systolic reading" } }],
+        effectivePeriod: { start: "2026-10-15T09:00:00Z", end: "2026-10-15T09:01:00Z" },
+        expected: "Systolic reading",
+        // Postgres JSONB returns object keys shortest-first, so the
+        // backend decides whether start or end comes first.
+        period: /^\{("start":"2026-10-15T09:00:00Z","end":"2026-10-15T09:01:00Z"|"end":"2026-10-15T09:01:00Z","start":"2026-10-15T09:00:00Z")…$/,
+      },
+      {
+        component: [{ ...systolic, code: { coding: [{ system: "http://loinc.org", code: "8480-6" }] } }],
+        expected: "8480-6",
+      },
+    ];
+    const ids: string[] = [];
+    try {
+      for (const { component, effectivePeriod } of fixtures) {
+        ids.push(await createResource(request, "Observation", {
+          status: "final",
+          code: { coding: [{ system: "http://loinc.org", code: "85354-9", display: "Blood pressure panel" }] },
+          component,
+          ...(effectivePeriod ? { effectivePeriod } : {}),
+        }));
+      }
+      for (const id of ids) await waitSearchable(request, "Observation", id);
+      const active = workspace === "Resources" ? resources : search;
+      if (workspace === "Resources") await resources.goto("Observation");
+      else await search.gotoBuilder("Observation");
+      const mode = page.locator("[data-mode-btn=builder]");
+      if (await mode.count()) await mode.click();
+
+      for (const projection of ["", "&_elements=id,code,component,effectivePeriod"]) {
+        await active.builder.run(`Observation?_id=${ids.join(",")}&_count=5${projection}`);
+        await active.results.waitDone();
+        await expect(active.results.rows).toHaveCount(fixtures.length);
+        const headers = await page.locator("#query-results-head th").allTextContents();
+        const componentIndex = headers.indexOf("component");
+        const periodIndex = headers.indexOf("effectivePeriod");
+        expect(componentIndex).toBeGreaterThan(0);
+        expect(periodIndex).toBeGreaterThan(0);
+        for (const [i, { expected, period }] of fixtures.entries()) {
+          const row = active.results.rows.filter({ has: page.locator(`[data-resource-id="${ids[i]}"]`) });
+          const componentCell = row.locator("td").nth(componentIndex);
+          await expect(componentCell).toBeVisible();
+          await expect(componentCell).toHaveText(expected);
+          await expect(componentCell).toHaveAttribute("data-full-name", expected);
+          if (period) {
+            const periodCell = row.locator("td").nth(periodIndex);
+            await expect(periodCell).toHaveText(period);
+            await expect(periodCell).toHaveAttribute("data-full-name", period);
+          }
+        }
+        await expect(active.results.card).not.toContainText("[object Object]");
+        await expect(active.results.error).toBeHidden();
+      }
+    } finally {
+      await deleteResources(request, "Observation", ids);
+    }
+  });
+}
+
+// #1759: SAVED rows share the RECENT rows' wrapper, so they align, are as tall
+// and highlight on hover the same way.
+test("issue1759 Saved rows match Recent rows in alignment, height and hover", async ({ page, request, resources }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "Saved1759Match" }] });
+  let saved: Awaited<ReturnType<typeof seedSavedQuery>> = null;
+  try {
+    saved = await seedSavedQuery(request, "Patient", `Saved1759 ${id}`, `_id=${id}`);
+    test.skip(!saved, "no per-user settings store on this backend");
+    await resources.goto("Patient");
+    const mode = page.locator("[data-mode-btn=builder]");
+    if (await mode.count()) await mode.click();
+    await resources.builder.recentToggle.click();
+    await resources.builder.recentPanel.locator("[data-saved-load]", { hasText: saved!.entry.name }).click();
+    await resources.builder.runButton.click();
+    await resources.results.waitShown();
+    await expect.poll(async () => {
+      const document = await (await request.get("/_user/settings")).json();
+      return document.recentSearches?.some((entry: { query: string }) => entry.query === `/Patient?_id=${id}`);
+    }).toBe(true);
+
+    await page.reload({ waitUntil: "networkidle" });
+    if (await mode.count()) await mode.click();
+    await resources.builder.recentToggle.click();
+    const panel = resources.builder.recentPanel;
+    const savedRow = panel.locator(".recent-item", { has: page.locator("[data-saved-load]") }).first();
+    const recentRow = panel.locator(".recent-item", { has: page.locator("[data-recent-load]") }).first();
+    await expect(savedRow).toBeVisible();
+    await expect(recentRow).toBeVisible();
+
+    const savedBox = await savedRow.boundingBox();
+    const recentBox = await recentRow.boundingBox();
+    if (!savedBox || !recentBox) throw new Error("recent rows have no layout box");
+    expect(savedBox.x).toBe(recentBox.x);
+    expect(savedBox.height).toBe(recentBox.height);
+
+    const background = (row: typeof savedRow) => row.evaluate((el) => getComputedStyle(el).backgroundColor);
+    const idle = await background(savedRow);
+    await savedRow.hover();
+    const hovered = await background(savedRow);
+    expect(hovered).not.toBe(idle);
+    await recentRow.hover();
+    expect(await background(recentRow)).toBe(hovered);
+  } finally {
+    await saved?.remove();
+    await request.delete(`/Patient/${id}`);
+  }
 });

@@ -15,6 +15,7 @@
 
 #![cfg(feature = "elasticsearch")]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,8 +23,13 @@ use std::time::Duration;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
-use helios_persistence::composite::{HealthCheckResult, HealthMonitor};
-use helios_persistence::core::{PurgableStorage, ResourceStorage};
+use helios_persistence::composite::{
+    CompositeConfig, CompositeStorage, DynStorage, HealthCheckResult, HealthMonitor, SyncMode,
+};
+use helios_persistence::core::{
+    BackendKind, BundleEntry, BundleMethod, BundleProvider, PurgableStorage, ResourceStorage,
+    VersionedStorage,
+};
 use helios_persistence::error::{BackendError, ResourceError, StorageError};
 use helios_persistence::search::{ReindexTarget, SearchParameterLoader, TenantSearchRegistries};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -368,6 +374,189 @@ async fn create_indexes_the_instant_it_returns_as_last_modified() {
         json!(created.last_modified().to_rfc3339()),
         "the indexed instant is the one the caller is told"
     );
+}
+
+fn patient_from_primary(id: &str, version: &str, last_updated: &str) -> Value {
+    json!({
+        "resourceType": "Patient",
+        "id": id,
+        "name": [{ "family": "Stub" }],
+        "meta": { "versionId": version, "lastUpdated": last_updated }
+    })
+}
+
+const PRIMARY_INSTANT: &str = "2026-09-28T19:39:53.005Z";
+const PRIMARY_INSTANT_INDEXED: &str = "2026-09-28T19:39:53.005+00:00";
+
+/// create_or_update with the primary's meta skips the existence GET and
+/// indexes that version and lastUpdated.
+#[tokio::test]
+async fn create_or_update_indexes_the_primarys_version_and_last_updated() {
+    let server = MockServer::start().await;
+    indices_exist(&server).await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+
+    let es = backend(&server);
+    let (stored, is_new) = es
+        .create_or_update(
+            &tenant(),
+            "Patient",
+            "p1",
+            patient_from_primary("p1", "4", PRIMARY_INSTANT),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the stub accepts the write");
+
+    assert_eq!(stored.version_id(), "4");
+    assert!(!is_new, "the primary's version 4 is an update");
+    assert_eq!(stored.last_modified().to_rfc3339(), PRIMARY_INSTANT_INDEXED);
+    let body = &indexed_bodies(&server).await[0];
+    assert_eq!(body["version_id"], json!("4"));
+    assert_eq!(body["last_updated"], json!(PRIMARY_INSTANT_INDEXED));
+    let (_, is_new) = es
+        .create_or_update(
+            &tenant(),
+            "Patient",
+            "p1",
+            patient_from_primary("p1", "1", PRIMARY_INSTANT),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the stub accepts the write");
+    assert!(is_new, "the primary's version 1 is a create");
+    assert_eq!(
+        requests_to(&server, "GET", DOC_PATH).await,
+        0,
+        "primary metadata makes the existence GET unnecessary"
+    );
+}
+
+/// The single-document path a resource falls back to when its batch fails.
+#[tokio::test]
+async fn create_indexes_the_primarys_version_and_last_updated() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+
+    let stored = backend(&server)
+        .create(
+            &tenant(),
+            "Patient",
+            patient_from_primary("p1", "3", PRIMARY_INSTANT),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the stub accepts the write");
+
+    assert_eq!(stored.version_id(), "3");
+    let body = &indexed_bodies(&server).await[0];
+    assert_eq!(body["version_id"], json!("3"));
+    assert_eq!(body["last_updated"], json!(PRIMARY_INSTANT_INDEXED));
+}
+
+/// The batch a transaction bundle's results sync through.
+#[tokio::test]
+async fn write_search_entries_page_indexes_each_resources_primary_version() {
+    let server = MockServer::start().await;
+    indices_exist(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(|request: &Request| {
+            let n = String::from_utf8_lossy(&request.body).lines().count() / 2;
+            let items: Vec<Value> = (0..n)
+                .map(|_| json!({"index": {"status": 200, "result": "updated"}}))
+                .collect();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"took": 1, "errors": false, "items": items}))
+        })
+        .mount(&server)
+        .await;
+
+    let first = StoredResource::from_storage(
+        "Patient",
+        "p1",
+        "3",
+        TenantId::new(TENANT),
+        patient_from_primary("p1", "3", PRIMARY_INSTANT),
+        chrono::DateTime::parse_from_rfc3339(PRIMARY_INSTANT)
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        chrono::DateTime::parse_from_rfc3339(PRIMARY_INSTANT)
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        None,
+        FhirVersion::default(),
+    );
+    let later = chrono::DateTime::parse_from_rfc3339("2026-09-28T20:00:00.000Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let second = StoredResource::from_storage(
+        "Patient",
+        "p2",
+        "6",
+        TenantId::new(TENANT),
+        patient_from_primary("p2", "6", "2026-09-28T20:00:00.000Z"),
+        later,
+        later,
+        None,
+        FhirVersion::default(),
+    );
+    let results = backend(&server)
+        .write_search_entries_page(&tenant(), &[first, second])
+        .await;
+
+    assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+    let request = server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .into_iter()
+        .find(|r| r.url.path() == "/_bulk")
+        .expect("one _bulk request");
+    let indexed: Vec<Value> = String::from_utf8_lossy(&request.body)
+        .lines()
+        .skip(1)
+        .step_by(2)
+        .map(|line| serde_json::from_str::<Value>(line).expect("a document line"))
+        .collect();
+    assert_eq!(
+        indexed
+            .iter()
+            .map(|doc| doc["version_id"].clone())
+            .collect::<Vec<_>>(),
+        [json!("3"), json!("6")]
+    );
+    assert_eq!(indexed[0]["last_updated"], json!(PRIMARY_INSTANT_INDEXED));
+    assert_eq!(
+        indexed[1]["last_updated"],
+        json!("2026-09-28T20:00:00+00:00")
+    );
+}
+
+/// A search-index write with an empty primary version is refused.
+#[tokio::test]
+async fn write_search_entries_rejects_a_missing_primary_version() {
+    let server = MockServer::start().await;
+    let now = chrono::Utc::now();
+    let resource = StoredResource::from_storage(
+        "Patient",
+        "p1",
+        "",
+        TenantId::new(TENANT),
+        plain_patient(),
+        now,
+        now,
+        None,
+        FhirVersion::default(),
+    );
+    let error = backend(&server)
+        .write_search_entries(&tenant(), &resource)
+        .await
+        .expect_err("a missing primary version must not be indexed as 1");
+    assert!(error.to_string().contains("versionId"), "{error}");
+    assert_eq!(requests_to(&server, "POST", DOC_PATH).await, 0);
 }
 
 /// The issue's case (2): a single write that meets a `503` (then a `429`) is
@@ -1040,5 +1229,156 @@ async fn a_failed_health_probe_reads_as_unhealthy() {
         error.matches("Elasticsearch unreachable after").count(),
         1,
         "{error}"
+    );
+}
+
+/// SQLite primary + Elasticsearch search secondary: a transaction that
+/// updates the same Patient several times indexes the primary's version and
+/// lastUpdated. The hit's version is one `If-Match` accepts.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_es_transaction_indexes_primary_version_and_accepts_if_match() {
+    use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::error::ConcurrencyError;
+    let server = MockServer::start().await;
+    indices_exist(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(|request: &Request| {
+            let n = String::from_utf8_lossy(&request.body).lines().count() / 2;
+            let items: Vec<Value> = (0..n)
+                .map(|_| json!({"index": {"status": 200, "result": "updated"}}))
+                .collect();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"took": 1, "errors": false, "items": items}))
+        })
+        .mount(&server)
+        .await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+
+    let sqlite = Arc::new(SqliteBackend::in_memory().expect("sqlite"));
+    sqlite.init_schema().expect("schema");
+    let es = Arc::new(backend(&server));
+    let config = CompositeConfig::builder()
+        .primary("sqlite", BackendKind::Sqlite)
+        .search_backend("es", BackendKind::Elasticsearch)
+        .sync_mode(SyncMode::Synchronous)
+        .build()
+        .expect("composite config");
+    let mut backends: HashMap<String, DynStorage> = HashMap::new();
+    backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+    backends.insert("es".to_string(), es.clone() as DynStorage);
+    let composite = CompositeStorage::new(config, backends)
+        .expect("composite")
+        .with_full_primary(sqlite);
+
+    composite
+        .create(
+            &tenant(),
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "p1",
+                "name": [{ "family": "One" }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+
+    let result = composite
+        .process_transaction(
+            &tenant(),
+            vec![BundleEntry {
+                method: BundleMethod::Put,
+                url: "Patient/p1".to_string(),
+                resource: Some(json!({
+                    "resourceType": "Patient",
+                    "id": "p1",
+                    "name": [{ "family": "Two" }]
+                })),
+                ..Default::default()
+            }],
+            FhirVersion::default(),
+        )
+        .await
+        .expect("transaction");
+    assert!(result.entries.iter().all(|e| e.status < 300), "{result:?}");
+
+    let stored = composite
+        .read(&tenant(), "Patient", "p1")
+        .await
+        .expect("read")
+        .expect("present");
+    assert_eq!(stored.version_id(), "2");
+
+    let bulk = server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .into_iter()
+        .find(|r| r.url.path() == "/_bulk")
+        .expect("bundle sync is one _bulk page");
+    let docs: Vec<Value> = String::from_utf8_lossy(&bulk.body)
+        .lines()
+        .skip(1)
+        .step_by(2)
+        .map(|line| serde_json::from_str::<Value>(line).expect("document line"))
+        .collect();
+    let last = docs
+        .iter()
+        .rev()
+        .find(|doc| doc["resource_id"] == json!("p1"))
+        .expect("Patient/p1 was indexed");
+    assert_eq!(last["version_id"], json!("2"));
+    let indexed_at = chrono::DateTime::parse_from_rfc3339(
+        last["last_updated"]
+            .as_str()
+            .expect("last_updated is a string"),
+    )
+    .expect("indexed last_updated is RFC3339")
+    .with_timezone(&chrono::Utc);
+    assert_eq!(
+        indexed_at.timestamp_millis(),
+        stored.last_modified().timestamp_millis(),
+        "search last_updated is the primary's last_modified, not the sync clock"
+    );
+
+    composite
+        .update_with_match(
+            &tenant(),
+            "Patient",
+            "p1",
+            "2",
+            json!({
+                "resourceType": "Patient",
+                "id": "p1",
+                "name": [{ "family": "Four" }]
+            }),
+        )
+        .await
+        .expect("If-Match of the indexed version succeeds");
+
+    let conflict = composite
+        .update_with_match(
+            &tenant(),
+            "Patient",
+            "p1",
+            "1",
+            json!({
+                "resourceType": "Patient",
+                "id": "p1",
+                "name": [{ "family": "Stale" }]
+            }),
+        )
+        .await
+        .expect_err("a stale search-hit version must 412");
+    assert!(
+        matches!(
+            conflict,
+            StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+        ),
+        "{conflict:?}"
     );
 }

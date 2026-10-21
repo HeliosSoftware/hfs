@@ -122,9 +122,13 @@
       </doseForm>
       <ingredient>
         <item>
-          <reference>
-            <reference value="#metoprololTartrate25Substance"/>
-          </reference>
+          <concept>
+            <coding>
+              <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
+              <code value="6918"/>
+            </coding>
+            <text value="Metoprolol"/>
+          </concept>
         </item>
         <strengthRatio>
           <numerator>
@@ -138,21 +142,6 @@
         </strengthRatio>
       </ingredient>
     </Medication>
-  </contained>
-  <contained>
-    <Substance>
-      <id value="metoprololTartrate25Substance"/>
-      <!-- <instance value="false"/> -->
-      <code>
-        <concept>
-          <coding>
-            <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
-            <code value="6918"/>
-          </coding>
-          <text value="Metoprolol"/>
-        </concept>
-      </code>
-    </Substance>
   </contained>
   <contained>
     <ActivityDefinition>
@@ -225,9 +214,13 @@
       </doseForm>
       <ingredient>
         <item>
-          <reference>
-            <reference value="#metoprololTartrate50Substance"/>
-          </reference>
+          <concept>
+            <coding>
+              <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
+              <code value="6918"/>
+            </coding>
+            <text value="Metoprolol"/>
+          </concept>
         </item>
         <strengthRatio>
           <numerator>
@@ -241,21 +234,6 @@
         </strengthRatio>
       </ingredient>
     </Medication>
-  </contained>
-  <contained>
-    <Substance>
-      <id value="metoprololTartrate50Substance"/>
-      <!-- <instance value="false"/> -->
-      <code>
-        <concept>
-          <coding>
-            <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
-            <code value="6918"/>
-          </coding>
-          <text value="Metoprolol"/>
-        </concept>
-      </code>
-    </Substance>
   </contained>
   <contained>
     <ActivityDefinition>
@@ -328,9 +306,13 @@
       </doseForm>
       <ingredient>
         <item>
-          <reference>
-            <reference value="#amlodipineSubstance"/>
-          </reference>
+          <concept>
+            <coding>
+              <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
+              <code value="17767"/>
+            </coding>
+            <text value="amLODIPine"/>
+          </concept>
         </item>
         <strengthRatio>
           <numerator>
@@ -344,21 +326,6 @@
         </strengthRatio>
       </ingredient>
     </Medication>
-  </contained>
-  <contained>
-    <Substance>
-      <!-- <instance value="false"/> -->
-      <id value="amlodipineSubstance"/>
-      <code>
-        <concept>
-          <coding>
-            <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
-            <code value="17767"/>
-          </coding>
-          <text value="amLODIPine"/>
-        </concept>
-      </code>
-    </Substance>
   </contained>
   <contained>
     <ActivityDefinition>
@@ -440,9 +407,13 @@
       </doseForm>
       <ingredient>
         <item>
-          <reference>
-            <reference value="#nitroglycerinSubstance"/>
-          </reference>
+          <concept>
+            <coding>
+              <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
+              <code value="4917"/>
+            </coding>
+            <text value="Nitroglycerin"/>
+          </concept>
         </item>
         <strengthRatio>
           <numerator>
@@ -456,21 +427,6 @@
         </strengthRatio>
       </ingredient>
     </Medication>
-  </contained>
-  <contained>
-    <Substance>
-      <id value="nitroglycerinSubstance"/>
-      <!-- <instance value="false"/> -->
-      <code>
-        <concept>
-          <coding>
-            <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
-            <code value="4917"/>
-          </coding>
-          <text value="Nitroglycerin"/>
-        </concept>
-      </code>
-    </Substance>
   </contained>
   <!-- <compose>
         <include>

@@ -523,9 +523,12 @@ impl<'a> EsQueryBuilder<'a> {
                     });
                     // `search_params.date.end` exists only in indices at schema
                     // version 2 (#1391). An index that has not been reconciled
-                    // yet (the mapping is brought up to date on the first write
-                    // to it) lacks the field, and Elasticsearch refuses to sort
-                    // on an unmapped one with a 400 unless told its type.
+                    // yet lacks the field (the startup pass may have failed or
+                    // missed it, e.g. Elasticsearch was down at boot or an older
+                    // instance created the index during a rolling upgrade; the
+                    // first write then reconciles it), and Elasticsearch
+                    // refuses to sort on an unmapped one with a 400 unless told
+                    // its type.
                     if field == "search_params.date.end" {
                         clause["unmapped_type"] = json!("date");
                     }
@@ -573,6 +576,11 @@ impl<'a> EsQueryBuilder<'a> {
 /// sets — `sort`, `size`, `from`, `search_after`, `track_total_hits`,
 /// `track_scores` — is a `parsing_exception` there, which surfaced as a 500
 /// on every `_total=accurate` search served by Elasticsearch.
+///
+/// Known limitation: unlike `search()`, this builder is not given
+/// `with_max_terms_count`, so a very large resolved id set (for example a `_has`
+/// over a big reverse chain) is not chunked here and can exceed the cluster's
+/// `index.max_terms_count` on `_total=accurate`.
 pub fn build_count_query(tenant_id: &str, resource_type: &str, query: &SearchQuery) -> Value {
     let builder = EsQueryBuilder::new(tenant_id, resource_type, String::new());
     let mut es_query = builder.build(query);

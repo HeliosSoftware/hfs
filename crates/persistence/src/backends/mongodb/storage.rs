@@ -28,7 +28,7 @@ use crate::core::{
 };
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
-    StorageResult, TransactionError,
+    StorageResult, TooLargeForCacheCause, TransactionError,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
@@ -42,7 +42,12 @@ use crate::types::{
 };
 
 use super::MongoBackend;
-use super::retry::{BUNDLE_TRANSACTION_RETRY, jitter_fraction};
+use super::bundle_creates::{PendingCreates, StagedCreate};
+use super::deferred_index::{
+    BundleDeferral, DeferredCommit, DeferredIndexSet, SEARCH_INDEX_PENDING_COLLECTION,
+    SEARCH_ROWS_PENDING_FIELD, inline_index_types, ledger_documents,
+};
+use super::retry::{BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, jitter_fraction};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
 pub(super) fn internal_error(message: String) -> StorageError {
@@ -80,11 +85,62 @@ enum PendingSearchParameterChange {
     Delete,
 }
 
-/// Request context shared by every entry in one MongoDB Bundle transaction.
+/// What one attempt at a Bundle transaction has staged: the SearchParameter
+/// changes for after its commit, for a Bundle that defers its search rows
+/// (#1975) the resources it left without them, and the creates not yet sent to
+/// the server (#1977). Every attempt starts with its own, so an aborted attempt
+/// leaves nothing behind.
+struct BundleWrites {
+    search_parameter_changes: Vec<PendingSearchParameterChange>,
+    deferred: Option<DeferredIndexSet>,
+    /// The creates staged but not yet sent, #1977. The attempt's loop sends them
+    /// ([`MongoBackend::send_staged_creates`]).
+    creates: PendingCreates,
+}
+
+impl BundleWrites {
+    fn new(deferral: Option<&BundleDeferral>) -> Self {
+        Self {
+            search_parameter_changes: Vec::new(),
+            deferred: deferral.map(DeferredIndexSet::new),
+            creates: PendingCreates::default(),
+        }
+    }
+
+    /// The marker to stamp on a `resources` document written in this attempt,
+    /// when its search rows are deferred: the id of the Bundle.
+    fn pending_marker(&self, resource_type: &str) -> Option<String> {
+        self.deferred
+            .as_ref()
+            .filter(|deferred| deferred.defers(resource_type))
+            .map(|deferred| deferred.bundle_id().to_string())
+    }
+}
+
+/// What a committed attempt at a Bundle transaction hands back: the entry
+/// results, the staged SearchParameter changes, and, for a Bundle that deferred
+/// its search rows, the ledger it committed with (#1975).
+struct CommittedAttempt {
+    results: Vec<BundleEntryResult>,
+    search_parameter_changes: Vec<PendingSearchParameterChange>,
+    deferred: Option<DeferredCommit>,
+}
+
+/// Request context for one entry of a MongoDB Bundle transaction; everything
+/// but `index` is shared by every entry.
 struct BundleEntryContext<'a> {
+    /// The entry's position in the Bundle; a staged create is charged to it.
+    index: usize,
     tenant: &'a TenantContext,
     fhir_version: helios_fhir::FhirVersion,
     patch_validator: Option<&'a dyn PatchCandidateValidator>,
+}
+
+/// Whether the entry's create is only staged (#1977), so that processing the
+/// entry reads nothing: a POST without `ifNoneExist`. Every other entry may
+/// read what an earlier entry wrote, so the staged creates are sent before it.
+fn stages_its_create(entry: &BundleEntry) -> bool {
+    entry.method == BundleMethod::Post && entry.if_none_exist.is_none()
 }
 
 /// Commit retries after a commit whose outcome is unknown
@@ -164,7 +220,9 @@ const EVICTION_ROLLBACK_REASON: &str = "rolled back for eviction";
 /// WiredTiger `-31800`). Sent with no `TransientTransactionError` label. mongod
 /// sends it instead of 365/112 only when the transaction holds more than
 /// `transactionTooLargeForCacheThreshold` (0.75) of the cache's dirty bytes. A
-/// replay cannot help: the same writes meet the same cache (#1837).
+/// replay cannot help: the same writes meet the same cache (#1837). It can
+/// arrive on `commitTransaction` too: the commit writes the transaction's oplog
+/// entry, which can push a write set just under the ceiling over it (#1991).
 const TRANSACTION_TOO_LARGE_FOR_CACHE_CODE: i32 = 388;
 
 /// Pause before the single retry of an unconditional delete that hit a write
@@ -172,24 +230,147 @@ const TRANSACTION_TOO_LARGE_FOR_CACHE_CODE: i32 = 388;
 /// does not just collide with it again.
 const WRITE_CONFLICT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// Persisted metadata from a successful attempt. The caller retains the payload
+/// across retries and moves it into the returned resource only after commit.
+struct ResourceWriteOutcome {
+    id: String,
+    version_id: String,
+    created_at: DateTime<Utc>,
+    last_updated: DateTime<Utc>,
+    fhir_version: FhirVersion,
+}
+
+impl ResourceWriteOutcome {
+    fn into_resource(
+        self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+    ) -> StoredResource {
+        StoredResource::from_storage(
+            resource_type,
+            &self.id,
+            self.version_id,
+            tenant.tenant_id().clone(),
+            resource,
+            self.created_at,
+            self.last_updated,
+            None,
+            self.fhir_version,
+        )
+    }
+}
+
 /// Why one attempt at a versioned write failed.
 enum WriteAttemptError {
     /// The server refused the write because a concurrent writer got there
-    /// first ([`is_write_conflict`]); nothing was written.
+    /// first (`WriteConflict`, code 112); nothing was written.
     Conflict(MongoError),
     /// Anything else, already in its final form.
     Storage(StorageError),
 }
 
 impl WriteAttemptError {
-    /// Classifies a driver error raised inside the attempt's session.
+    /// Classifies a driver error raised inside the attempt's session. Only the
+    /// `WriteConflict` code says another writer got to the document, and not
+    /// when its message names a rollback for eviction ([`is_eviction_rollback`]):
+    /// that one is cache pressure, with nobody having won. A transaction the
+    /// server aborted for any other reason keeps its driver error so
+    /// [`replay_aborted_writes`] can decide what to do with it.
     fn driver(context: &str, err: MongoError) -> Self {
-        if is_write_conflict(&err) {
+        if has_server_code(&err, WRITE_CONFLICT_CODE) && !is_eviction_rollback(&err) {
             Self::Conflict(err)
         } else {
-            Self::Storage(internal_error(format!("{}: {}", context, err)))
+            Self::Storage(internal_driver_error(context, err))
         }
     }
+}
+
+/// The driver error behind `err` when the server aborted the write's
+/// transaction for a reason other than a conflicting writer: labelled
+/// `TransientTransactionError` without the `WriteConflict` code. A chunk
+/// migration holding the critical section of one of the write's collections
+/// (`StaleConfig`) is the common case. The aborted attempt committed nothing;
+/// another attempt must still check the original version precondition. An
+/// eviction rollback is not one: see [`rolled_back_for_eviction`].
+fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError> {
+    kept_driver_error(err).filter(|driver| {
+        driver.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
+            && !driver.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
+            && !has_server_code(driver, WRITE_CONFLICT_CODE)
+            && !is_eviction_rollback(driver)
+    })
+}
+
+/// The driver error behind `err` when WiredTiger rolled the write's
+/// transaction back under cache pressure ([`is_eviction_rollback`]): a labelled
+/// 112 naming the eviction, or a 365. Nothing committed and no writer won, so
+/// it is not a `VersionConflict`; it is not run again either, because the same
+/// write meets the same cache, the reason a lone Bundle's eviction is not
+/// replayed (#1895). It ends as `Unavailable`, a retryable 503.
+fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
+    kept_driver_error(err).filter(|driver| is_eviction_rollback(driver))
+}
+
+/// Runs one single-resource write again, up to [`WRITE_ABORT_RETRY`], while
+/// the server aborts its transaction without a conflicting writer
+/// ([`aborted_without_conflicting_writer`]). Every attempt starts its own
+/// session, so it begins from its first read. A write that keeps being
+/// aborted ends as `Unavailable`, which the REST layer answers with a
+/// retryable 503, as does an eviction rollback ([`rolled_back_for_eviction`])
+/// without a second attempt. Any other error ends the write at once.
+///
+/// The client-facing message names the write and nothing else; the driver
+/// error goes to the log only.
+async fn replay_aborted_writes<T, F, Fut>(what: &str, mut attempt: F) -> StorageResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = StorageResult<T>>,
+{
+    let mut attempts = 1;
+    loop {
+        let err = match attempt().await {
+            Err(err) if aborted_without_conflicting_writer(&err).is_some() => err,
+            Err(err) if rolled_back_for_eviction(&err).is_some() => {
+                tracing::warn!(
+                    error_code = rolled_back_for_eviction(&err).and_then(driver_error_code),
+                    "mongodb rolled the {what} transaction back for eviction under cache pressure; not running it again: {err}"
+                );
+                return Err(write_unavailable(format!(
+                    "The {what} was rolled back by the database under cache pressure; retry the request"
+                )));
+            }
+            outcome => return outcome,
+        };
+        if attempts >= WRITE_ABORT_RETRY.max_attempts {
+            tracing::warn!(
+                attempts,
+                error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
+                "mongodb aborted the {what} transaction {attempts} times without a conflicting writer; giving up: {err}"
+            );
+            return Err(write_unavailable(format!(
+                "The {what} was aborted by the database {attempts} times without a conflicting writer; retry the request"
+            )));
+        }
+        let backoff = WRITE_ABORT_RETRY.backoff(attempts);
+        tracing::warn!(
+            attempt = attempts,
+            error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
+            backoff_ms = backoff.as_millis() as u64,
+            "mongodb aborted the {what} transaction without a conflicting writer; running it again: {err}"
+        );
+        tokio::time::sleep(backoff).await;
+        attempts += 1;
+    }
+}
+
+/// `Unavailable` (a retryable 503) for a single-resource write that did not
+/// commit; see [`replay_aborted_writes`].
+fn write_unavailable(message: String) -> StorageError {
+    StorageError::Backend(BackendError::Unavailable {
+        backend_name: "mongodb".to_string(),
+        message,
+    })
 }
 
 impl<E: Into<StorageError>> From<E> for WriteAttemptError {
@@ -205,8 +386,11 @@ impl<E: Into<StorageError>> From<E> for WriteAttemptError {
 /// conflicting writer the way PostgreSQL queues behind a row lock: the loser's
 /// write fails at once with `WriteConflict` (112), labelled
 /// `TransientTransactionError`, and its transaction is aborted. The label on
-/// its own means the same thing for our purposes — the transaction did not and
-/// will not commit, and running it again is safe — so both are classified.
+/// its own means the transaction did not and will not commit and running it
+/// again is safe, which is what the bundle replay needs, so both are
+/// classified here. It does not by itself mean another writer won: a chunk
+/// migration's `StaleConfig` carries the label too, and the single-resource
+/// writes decide a lost race by the code alone ([`WriteAttemptError::driver`]).
 /// `UnknownTransactionCommitResult` is deliberately not: there the write may
 /// have landed.
 ///
@@ -232,7 +416,8 @@ fn has_server_code(err: &MongoError, code: i32) -> bool {
 }
 
 /// The server's message when `err` is a server failure with `code`, as a failed
-/// command or as a per-write error.
+/// command, a per-write error, or the first matching per-document error of an
+/// `insert_many`.
 fn server_error_message(err: &MongoError, code: i32) -> Option<&str> {
     match err.kind.as_ref() {
         MongoErrorKind::Command(command) if command.code == code => Some(&command.message),
@@ -241,6 +426,12 @@ fn server_error_message(err: &MongoError, code: i32) -> Option<&str> {
         {
             Some(&write.message)
         }
+        MongoErrorKind::InsertMany(insert) => insert
+            .write_errors
+            .as_ref()?
+            .iter()
+            .find(|error| error.code == code)
+            .map(|error| error.message.as_str()),
         _ => None,
     }
 }
@@ -259,18 +450,12 @@ fn is_eviction_rollback(err: &MongoError) -> bool {
             .is_some_and(|message| message.contains(EVICTION_ROLLBACK_REASON))
 }
 
-/// True when `err` is `TransactionTooLargeForCache` (388): as a failed command,
-/// a per-write error, or any per-document error of an `insert_many`, the shape
+/// True when `err` is `TransactionTooLargeForCache` (388): as a failed command
+/// (an entry's write, or `commitTransaction` itself, #1991), a per-write error,
+/// or any per-document error of an `insert_many`, the shape
 /// the search-index insert reports it in (#1837). Decided by the code, never by
 /// the message text.
 fn is_too_large_for_cache(err: &MongoError) -> bool {
-    if let MongoErrorKind::InsertMany(insert_many) = err.kind.as_ref() {
-        return insert_many.write_errors.as_ref().is_some_and(|errors| {
-            errors
-                .iter()
-                .any(|error| error.code == TRANSACTION_TOO_LARGE_FOR_CACHE_CODE)
-        });
-    }
     has_server_code(err, TRANSACTION_TOO_LARGE_FOR_CACHE_CODE)
 }
 
@@ -357,6 +542,29 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
     None
 }
 
+/// The [`TransactionError::TooLargeForCache`] for a `TransactionTooLargeForCache`
+/// (388), wherever the Bundle met it: an entry's write ([`entry_attempt_error`]),
+/// the deferred-search-index ledger ([`ledger_attempt_error`], #1975) or the
+/// commit ([`CommitAttempts::after_failure`], #1991). They are one cause: the
+/// Bundle's own write set does not fit WiredTiger's cache, so neither a replay
+/// nor a re-sent commit can help (#1837). A lone Bundle's eviction rollback is
+/// another cause and is built in [`lone_eviction_failure`] (#1895).
+///
+/// `entries` is the Bundle's entry count. `reason` is the raw driver detail
+/// behind a prefix that says where it happened (`Entry N processing failed: `
+/// or `Commit failed: `). It is for the log only.
+///
+/// It carries [`TooLargeForCacheCause::WriteSetTooLarge`];
+/// [`lone_eviction_failure`] carries [`TooLargeForCacheCause::LoneEviction`]
+/// (#1993).
+fn write_set_too_large_for_cache(entries: usize, reason: String) -> TransactionError {
+    TransactionError::TooLargeForCache {
+        cause: TooLargeForCacheCause::WriteSetTooLarge,
+        entries,
+        reason,
+    }
+}
+
 /// Why a bundle attempt failed, given the error entry `index` raised in a
 /// transaction of `entries` entries (#1586, #1837).
 ///
@@ -370,10 +578,10 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
 /// - Anything else is a [`TransactionError::BundleError`] at the entry.
 fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> BundleAttemptError {
     if kept_driver_error(err).is_some_and(is_too_large_for_cache) {
-        return BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+        return BundleAttemptError::Failed(write_set_too_large_for_cache(
             entries,
-            reason: format!("Entry {index} processing failed: {err}"),
-        });
+            format!("Entry {index} processing failed: {err}"),
+        ));
     }
     if let Some(abort) = transient_entry_abort(err) {
         return BundleAttemptError::TransientAbort {
@@ -389,15 +597,50 @@ fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> Bund
     })
 }
 
+/// Why a bundle attempt failed when its deferred-search-index ledger could not
+/// be written, given a transaction of `entries` entries (#1975).
+///
+/// The ledger belongs to no entry, so no entry is blamed for it. A cache
+/// failure (388) is [`TransactionError::TooLargeForCache`] and a transient abort
+/// is handed back as [`entry_attempt_error`] does, with no entry named, so the
+/// bundle loop's rules for a replay and for a lone eviction (#1895) apply to it
+/// unchanged. Anything else rolled the Bundle back on the server's side, a
+/// [`TransactionError::RolledBack`] (HTTP 500). A [`TransactionError::BundleError`]
+/// would answer 400 about an entry the client never sent.
+fn ledger_attempt_error(entries: usize, err: &StorageError) -> BundleAttemptError {
+    match entry_attempt_error(entries, entries, err) {
+        BundleAttemptError::TransientAbort {
+            code,
+            eviction,
+            reason,
+            ..
+        } => BundleAttemptError::TransientAbort {
+            entry: None,
+            code,
+            eviction,
+            reason,
+        },
+        too_large @ BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. }) => {
+            too_large
+        }
+        BundleAttemptError::Failed(_) => BundleAttemptError::Failed(TransactionError::RolledBack {
+            reason: format!("Failed to write the deferred search index ledger: {err}"),
+        }),
+    }
+}
+
 /// #1895: the error a transient abort ends the Bundle with instead of a replay,
 /// or `None` to replay.
 ///
 /// A Bundle that held the whole admission room ran alone: no other Bundle of
-/// this backend was open. Its cache-pressure rollback is its own write set
+/// this backend was open. Its cache-pressure rollback is mostly its own write set
 /// meeting the cache, and a replay is rolled back again at about the same entry
 /// (benchmark: 49 of 50 such replays failed again while holding the whole
-/// room). So it ends as the outcome 388 already has (#1837). A Bundle that
-/// shared the room, or a plain `WriteConflict`, is replayed as before.
+/// room). So it ends as the outcome 388 already has (#1837), with
+/// [`TooLargeForCacheCause::LoneEviction`]: the room bounds only this backend's
+/// transaction Bundles and other writes share the cache, so the client is not
+/// told that a resubmit must fail (#1993). A Bundle that shared the room, or a
+/// plain `WriteConflict`, is replayed as before.
 fn lone_eviction_failure(
     holds_whole_room: bool,
     eviction: bool,
@@ -406,6 +649,7 @@ fn lone_eviction_failure(
     reason: &str,
 ) -> Option<TransactionError> {
     (holds_whole_room && eviction).then(|| TransactionError::TooLargeForCache {
+        cause: TooLargeForCacheCause::LoneEviction,
         entries,
         reason: match entry {
             Some(index) => format!(
@@ -435,6 +679,11 @@ enum CommitFailure {
     StillUnknown,
     /// The commit failed in a way that leaves nothing applied.
     RolledBack,
+    /// The server refused the commit with `TransactionTooLargeForCache` (388):
+    /// WiredTiger rolled the transaction back because its own write set, with
+    /// the oplog entry the commit writes, does not fit the cache. Nothing
+    /// committed, and neither a replay nor a re-sent commit can fit it (#1991).
+    TooLargeForCache,
 }
 
 /// The decision behind [`classify_commit_failure`], taken on the facts it reads
@@ -479,10 +728,38 @@ fn classify_commit_signals(
     }
 }
 
+/// The verdict for a commit refused with `TransactionTooLargeForCache` (388),
+/// given the one [`classify_commit_signals`] reached on its other signals
+/// (#1991).
+///
+/// 388 decides only a verdict that already says nothing was applied: a plain
+/// [`CommitFailure::RolledBack`], or a [`CommitFailure::TransientAbort`] when a
+/// `TransientTransactionError` label rides on it. Both become
+/// [`CommitFailure::TooLargeForCache`], as 388 outranks that label on an entry
+/// write ([`entry_attempt_error`]). It never overrides a verdict that says the
+/// commit may have applied: with a write-concern error or an
+/// `UnknownTransactionCommitResult` label the commit is re-sent as before, and
+/// after an earlier unknown commit the outcome stays unknown. The driver adds
+/// that label only to network and server-selection errors, retryable-write
+/// errors and codes 50, 64 and 91, never to 388, so the server's own 388
+/// always takes the first branch.
+fn too_large_for_cache_at_commit(verdict: CommitFailure) -> CommitFailure {
+    match verdict {
+        CommitFailure::RolledBack
+        | CommitFailure::TransientAbort
+        | CommitFailure::TooLargeForCache => CommitFailure::TooLargeForCache,
+        CommitFailure::UnknownResult | CommitFailure::StillUnknown => verdict,
+    }
+}
+
 /// Classifies a failed commit; `earlier_unknown` says a previous commit of the
 /// same transaction already failed with an unknown result.
+///
+/// A commit refused with 388 is settled by [`too_large_for_cache_at_commit`]
+/// (#1991). The commit's error is the driver's own, so [`is_too_large_for_cache`]
+/// reads it directly, with no [`kept_driver_error`] walk.
 fn classify_commit_failure(err: &MongoError, earlier_unknown: bool) -> CommitFailure {
-    classify_commit_signals(
+    let verdict = classify_commit_signals(
         err.contains_label(TRANSIENT_TRANSACTION_ERROR),
         err.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT),
         is_temporarily_unavailable(err),
@@ -491,7 +768,12 @@ fn classify_commit_failure(err: &MongoError, earlier_unknown: bool) -> CommitFai
             MongoErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(_))
         ),
         earlier_unknown,
-    )
+    );
+    if is_too_large_for_cache(err) {
+        too_large_for_cache_at_commit(verdict)
+    } else {
+        verdict
+    }
 }
 
 /// What to do after a commit failed.
@@ -508,13 +790,16 @@ struct CommitAttempts {
     sent: u32,
     /// True once any commit failed with an unknown result.
     outcome_unknown: bool,
+    /// The Bundle's entry count, which a commit refused with 388 reports (#1991).
+    entries: usize,
 }
 
 impl CommitAttempts {
-    fn new() -> Self {
+    fn new(entries: usize) -> Self {
         Self {
             sent: 1,
             outcome_unknown: false,
+            entries,
         }
     }
 
@@ -526,6 +811,12 @@ impl CommitAttempts {
     /// [`TransactionError::CommitOutcomeUnknown`]: not a replay of the entries,
     /// and not `RolledBack`, which would tell the client nothing was applied
     /// when the earlier commit may have applied it.
+    ///
+    /// A commit refused with `TransactionTooLargeForCache` (388) stops at once as
+    /// [`TransactionError::TooLargeForCache`] with the Bundle's entry count: the
+    /// commit is not re-sent and, being `Failed`, the Bundle is not replayed
+    /// (#1991). This holds only while nothing says the commit may have applied
+    /// ([`too_large_for_cache_at_commit`]).
     fn after_failure(&mut self, err: &MongoError) -> CommitStep {
         match classify_commit_failure(err, self.outcome_unknown) {
             CommitFailure::TransientAbort => CommitStep::Stop(BundleAttemptError::TransientAbort {
@@ -566,6 +857,9 @@ impl CommitAttempts {
                     reason: format!("Commit failed: {err}"),
                 }))
             }
+            CommitFailure::TooLargeForCache => CommitStep::Stop(BundleAttemptError::Failed(
+                write_set_too_large_for_cache(self.entries, format!("Commit failed: {err}")),
+            )),
         }
     }
 }
@@ -1037,6 +1331,7 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
             .database(&self.config.database_name)
             .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
             .find(filter)
+            .batch_size(self.config.sof_cursor_batch_size)
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
@@ -1195,10 +1490,10 @@ async fn commit_best_effort_multi_write_session(
     try_commit_best_effort_multi_write_session(session, transaction_active)
         .await
         .map_err(|e| {
-            internal_error(format!(
-                "Failed to commit MongoDB transaction after {}: {}",
-                operation, e
-            ))
+            internal_driver_error(
+                &format!("Failed to commit MongoDB transaction after {operation}"),
+                e,
+            )
         })
 }
 
@@ -1234,7 +1529,8 @@ impl ResourceStorage for MongoBackend {
                 backend_name: "mongodb".to_string(),
                 message: format!("Unable to check the required query indexes: {error}"),
             })?;
-        super::schema::check_required_query_indexes(&database).await
+        super::schema::check_required_query_indexes(&database, self.missing_params_index_ready())
+            .await
     }
 
     fn bulk_write_concurrency(&self) -> usize {
@@ -1276,172 +1572,18 @@ impl ResourceStorage for MongoBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
-        tenant.check_permission(Operation::Create, resource_type)?;
-
-        let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Extract or generate ID
+        let mut resource = resource;
         let id = resource
             .get("id")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .map(String::from)
             .unwrap_or_else(crate::types::new_resource_id);
-
-        // Check if resource already exists (including deleted resources).
-        let identity_filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": &id,
-        };
-
-        let existing = if let Some(active_session) = session.as_mut() {
-            resources
-                .find_one(identity_filter.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to check existence (session): {}", e))
-                })?
-        } else {
-            resources
-                .find_one(identity_filter)
-                .await
-                .map_err(|e| internal_error(format!("Failed to check existence: {}", e)))?
-        };
-
-        if existing.is_some() {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id,
-            }));
-        }
-
-        let mut resource = resource;
         ensure_resource_identity(resource_type, &id, &mut resource);
-
-        let search_documents =
-            self.search_index_documents(tenant_id, resource_type, &id, &resource);
-        let payload = value_to_document(&resource)?;
-
-        let now = Utc::now();
-        let now_bson = chrono_to_bson(now);
-        let version_id = "1".to_string();
-        let fhir_version_str = fhir_version.as_mime_param().to_string();
-
-        let resource_doc = search_documents.resource_document(doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": &id,
-            "version_id": &version_id,
-            "data": Bson::Document(payload.clone()),
-            "created_at": now_bson,
-            "last_updated": now_bson,
-            "is_deleted": false,
-            "deleted_at": Bson::Null,
-            "fhir_version": &fhir_version_str,
-        });
-
-        if let Some(active_session) = session.as_mut() {
-            resources
-                .insert_one(resource_doc.clone())
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    if is_duplicate_key_error(&e) {
-                        StorageError::Resource(ResourceError::AlreadyExists {
-                            resource_type: resource_type.to_string(),
-                            id: id.clone(),
-                        })
-                    } else {
-                        internal_error(format!("Failed to insert resource (session): {}", e))
-                    }
-                })?;
-        } else {
-            resources.insert_one(resource_doc).await.map_err(|e| {
-                if is_duplicate_key_error(&e) {
-                    StorageError::Resource(ResourceError::AlreadyExists {
-                        resource_type: resource_type.to_string(),
-                        id: id.clone(),
-                    })
-                } else {
-                    internal_error(format!("Failed to insert resource: {}", e))
-                }
-            })?;
-        }
-
-        let history_doc = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "id": &id,
-            "version_id": &version_id,
-            "data": Bson::Document(payload),
-            "created_at": now_bson,
-            "last_updated": now_bson,
-            "is_deleted": false,
-            "deleted_at": Bson::Null,
-            "fhir_version": fhir_version_str,
-        };
-
-        if let Some(active_session) = session.as_mut() {
-            history
-                .insert_one(history_doc)
-                .session(active_session)
-                .await
-                .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to insert resource history (session): {}",
-                        e
-                    ))
-                })?;
-        } else {
-            history
-                .insert_one(history_doc)
-                .await
-                .map_err(|e| internal_error(format!("Failed to insert resource history: {}", e)))?;
-        }
-
-        self.index_resource(
-            &db,
-            tenant_id,
-            resource_type,
-            &id,
-            search_documents,
-            &mut session,
-        )
+        let outcome = replay_aborted_writes("create", || {
+            self.create_attempt(tenant, resource_type, &id, &resource, fhir_version)
+        })
         .await?;
-
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
-
-        // An overlay-affecting SearchParameter write: refresh the stored-param
-        // cache (which the per-tenant loader reads) and drop the cached
-        // registries. This must run after the commit above: the reload
-        // reads the `resources` collection without the session, so while the
-        // transaction is still open the write above is invisible to it. Seeded
-        // spec copies never affect the overlay (see `create_affects_overlay`),
-        // which keeps bulk seeding from triggering an O(n²) reload storm.
-        if resource_type == "SearchParameter"
-            && self.tenant_registries().create_affects_overlay(&resource)
-        {
-            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
-            }
-        }
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            &id,
-            version_id,
-            tenant.tenant_id().clone(),
-            resource,
-            now,
-            now,
-            None,
-            fhir_version,
-        ))
+        Ok(outcome.into_resource(tenant, resource_type, resource))
     }
 
     async fn create_or_update(
@@ -1452,34 +1594,60 @@ impl ResourceStorage for MongoBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
-                let mut resource = resource;
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+        // Every branch is a check-then-act on the `read`, and every write is
+        // a compare-and-swap, so a race with another writer (on this or
+        // another instance) surfaces as a typed error that is never a
+        // legitimate answer from *this* method — it decides existence itself.
+        // Re-read and retry a bounded number of times; see the Postgres
+        // backend's `create_or_update` for the full reasoning.
+        const MAX_CAS_RETRIES: usize = 3;
+        let mut attempts = 0;
+        let mut resource = resource;
+        loop {
+            let body = if attempts < MAX_CAS_RETRIES {
+                resource.clone()
+            } else {
+                std::mem::take(&mut resource)
+            };
+
+            let result = match self.read(tenant, resource_type, id).await {
+                // Update existing (preserves original FHIR version)
+                Ok(Some(current)) => self
+                    .update(tenant, &current, body)
+                    .await
+                    .map(|updated| (updated, false)),
+                // Create new with specific ID
+                Ok(None) => {
+                    let mut body = body;
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(id.to_string()));
+                    }
+                    self.create(tenant, resource_type, body, fhir_version)
+                        .await
+                        .map(|created| (created, true))
                 }
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok((created, true))
+                // A deleted resource is brought back to life by a subsequent
+                // update (FHIR http.html#delete), continuing the existing
+                // version chain rather than being rejected with `Gone`.
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => self
+                    .restore_deleted(tenant, resource_type, id, body)
+                    .await
+                    .map(|restored| (restored, true)),
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+                    | StorageError::Resource(
+                        ResourceError::NotFound { .. } | ResourceError::AlreadyExists { .. },
+                    ),
+                ) if attempts < MAX_CAS_RETRIES => {
+                    attempts += 1;
+                    continue;
+                }
+                other => return other,
             }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
-                let restored = self
-                    .restore_deleted(tenant, resource_type, id, resource)
-                    .await?;
-                Ok((restored, true))
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -1549,23 +1717,31 @@ impl ResourceStorage for MongoBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        // No retry: `update` always carries a precondition (`current`'s
-        // version), and a writer that beat us to the document has, or is about
-        // to have, moved it on. The honest answer is the one PostgreSQL gives
-        // for the same race — `VersionConflict` -> 409 — not a second attempt.
-        match self.update_attempt(tenant, current, resource).await {
-            Ok(stored) => Ok(stored),
-            Err(WriteAttemptError::Storage(e)) => Err(e),
-            Err(WriteAttemptError::Conflict(e)) => Err(self
-                .lost_race(
-                    tenant,
-                    current.resource_type(),
-                    current.id(),
-                    current.version_id(),
-                    &e,
-                )
-                .await),
-        }
+        // A lost race is not run again: `update` always carries a precondition
+        // (`current`'s version), and a writer that beat us to the document
+        // has, or is about to have, moved it on. The honest answer is the one
+        // PostgreSQL gives for the same race — `VersionConflict` -> 409 — not
+        // a second attempt. A transaction the server aborted for any other
+        // reason is run again, checking the original version each time.
+        let mut resource = resource;
+        ensure_resource_identity(current.resource_type(), current.id(), &mut resource);
+        let outcome = replay_aborted_writes("update", || async {
+            match self.update_attempt(tenant, current, &resource).await {
+                Ok(stored) => Ok(stored),
+                Err(WriteAttemptError::Storage(e)) => Err(e),
+                Err(WriteAttemptError::Conflict(e)) => Err(self
+                    .lost_race(
+                        tenant,
+                        current.resource_type(),
+                        current.id(),
+                        current.version_id(),
+                        &e,
+                    )
+                    .await),
+            }
+        })
+        .await?;
+        Ok(outcome.into_resource(tenant, current.resource_type(), resource))
     }
 
     async fn delete(
@@ -2212,6 +2388,7 @@ impl ResourceStorage for MongoBackend {
             MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
             MongoBackend::RESOURCE_HISTORY_COLLECTION,
             MongoBackend::RESOURCES_COLLECTION,
+            super::deferred_index::SEARCH_INDEX_PENDING_COLLECTION,
         ] {
             db.collection::<Document>(collection)
                 .delete_many(doc! { "tenant_id": id })
@@ -2356,6 +2533,166 @@ pub(super) fn with_missing_metadata_update(
 }
 
 impl MongoBackend {
+    /// One attempt at [`ResourceStorage::create`]: the existence check, the
+    /// resource, its history row and the search index, in one transaction
+    /// where the deployment has them. Driver errors raised in the session
+    /// keep their source so [`replay_aborted_writes`] can see an abort.
+    async fn create_attempt(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: &Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<ResourceWriteOutcome> {
+        tenant.check_permission(Operation::Create, resource_type)?;
+
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Check if resource already exists (including deleted resources).
+        let identity_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+        };
+
+        let existing = if let Some(active_session) = session.as_mut() {
+            resources
+                .find_one(identity_filter.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| internal_driver_error("Failed to check existence (session)", e))?
+        } else {
+            resources
+                .find_one(identity_filter)
+                .await
+                .map_err(|e| internal_error(format!("Failed to check existence: {}", e)))?
+        };
+
+        if existing.is_some() {
+            return Err(StorageError::Resource(ResourceError::AlreadyExists {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, resource);
+        let payload = value_to_document(resource)?;
+
+        let now = Utc::now();
+        let now_bson = chrono_to_bson(now);
+        let version_id = "1".to_string();
+        let fhir_version_str = fhir_version.as_mime_param().to_string();
+
+        let resource_doc = search_documents.resource_document(doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &version_id,
+            "data": Bson::Document(payload.clone()),
+            "created_at": now_bson,
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        });
+
+        if let Some(active_session) = session.as_mut() {
+            resources
+                .insert_one(resource_doc.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    if is_duplicate_key_error(&e) {
+                        StorageError::Resource(ResourceError::AlreadyExists {
+                            resource_type: resource_type.to_string(),
+                            id: id.to_string(),
+                        })
+                    } else {
+                        internal_driver_error("Failed to insert resource (session)", e)
+                    }
+                })?;
+        } else {
+            resources.insert_one(resource_doc).await.map_err(|e| {
+                if is_duplicate_key_error(&e) {
+                    StorageError::Resource(ResourceError::AlreadyExists {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                    })
+                } else {
+                    internal_error(format!("Failed to insert resource: {}", e))
+                }
+            })?;
+        }
+
+        let history_doc = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &version_id,
+            "data": Bson::Document(payload),
+            "created_at": now_bson,
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": fhir_version_str,
+        };
+
+        if let Some(active_session) = session.as_mut() {
+            history
+                .insert_one(history_doc)
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    internal_driver_error("Failed to insert resource history (session)", e)
+                })?;
+        } else {
+            history
+                .insert_one(history_doc)
+                .await
+                .map_err(|e| internal_error(format!("Failed to insert resource history: {}", e)))?;
+        }
+
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            id,
+            search_documents,
+            &mut session,
+        )
+        .await?;
+
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
+
+        // An overlay-affecting SearchParameter write: refresh the stored-param
+        // cache (which the per-tenant loader reads) and drop the cached
+        // registries. This must run after the commit above: the reload
+        // reads the `resources` collection without the session, so while the
+        // transaction is still open the write above is invisible to it. Seeded
+        // spec copies never affect the overlay (see `create_affects_overlay`),
+        // which keeps bulk seeding from triggering an O(n²) reload storm.
+        if resource_type == "SearchParameter"
+            && self.tenant_registries().create_affects_overlay(resource)
+        {
+            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
+        Ok(ResourceWriteOutcome {
+            id: id.to_string(),
+            version_id,
+            created_at: now,
+            last_updated: now,
+            fhir_version,
+        })
+    }
+
     /// One attempt at [`ResourceStorage::update`]: the compare-and-swap on
     /// `current`'s version, the history row and the search index, in one
     /// transaction where the deployment has them. A write the server refused
@@ -2365,8 +2702,8 @@ impl MongoBackend {
         &self,
         tenant: &TenantContext,
         current: &StoredResource,
-        resource: Value,
-    ) -> Result<StoredResource, WriteAttemptError> {
+        resource: &Value,
+    ) -> Result<ResourceWriteOutcome, WriteAttemptError> {
         let resource_type = current.resource_type();
         tenant.check_permission(Operation::Update, resource_type)?;
 
@@ -2426,10 +2763,8 @@ impl MongoBackend {
 
         let new_version = next_version(current.version_id())?;
 
-        let mut resource = resource;
-        ensure_resource_identity(resource_type, id, &mut resource);
-        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
-        let payload = value_to_document(&resource)?;
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, resource);
+        let payload = value_to_document(resource)?;
 
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
@@ -2552,17 +2887,13 @@ impl MongoBackend {
             }
         }
 
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version,
-            tenant.tenant_id().clone(),
-            resource,
+        Ok(ResourceWriteOutcome {
+            id: id.to_string(),
+            version_id: new_version,
             created_at,
-            now,
-            None,
+            last_updated: now,
             fhir_version,
-        ))
+        })
     }
 
     /// The version of the live (not deleted) resource, read outside any
@@ -2596,6 +2927,13 @@ impl MongoBackend {
     /// the document that filter is then built from: a `DELETE` with `If-Match`
     /// used to be evaluated above this layer against an earlier read and then
     /// deleted whatever version was current by the time it got here (#1404).
+    ///
+    /// Two retries nest here. [`replay_aborted_writes`] runs the whole thing
+    /// again when the server aborts it without a conflicting writer, and inside
+    /// each of those runs an unconditional delete that lost a race gets its one
+    /// extra attempt. So an unconditional delete makes at most
+    /// `2 * WRITE_ABORT_RETRY.max_attempts` attempts, which needs a lost race
+    /// and an abort on every run.
     async fn soft_delete(
         &self,
         tenant: &TenantContext,
@@ -2603,45 +2941,49 @@ impl MongoBackend {
         id: &str,
         expected_version: Option<&str>,
     ) -> StorageResult<()> {
-        let mut retried = false;
-        loop {
-            let conflict = match self
-                .soft_delete_attempt(tenant, resource_type, id, expected_version)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(WriteAttemptError::Storage(e)) => return Err(e),
-                Err(WriteAttemptError::Conflict(e)) => e,
-            };
+        replay_aborted_writes("delete", move || async move {
+            let mut retried = false;
+            loop {
+                let conflict = match self
+                    .soft_delete_attempt(tenant, resource_type, id, expected_version)
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(WriteAttemptError::Storage(e)) => return Err(e),
+                    Err(WriteAttemptError::Conflict(e)) => e,
+                };
 
-            // ONE more attempt, and only for a delete with no precondition:
-            // "delete whatever is current" means the same thing after the
-            // other writer commits, which is the driver's recommended handling
-            // of a transient transaction error. A delete that names a version
-            // is never run again — the writer it lost to has moved the resource
-            // on, and the client must see that (`VersionConflict` -> 409).
-            if expected_version.is_none() && !retried {
-                retried = true;
-                tracing::debug!(
-                    resource_type,
-                    id,
-                    error = %conflict,
-                    "MongoDB write conflict on an unconditional delete; retrying once"
-                );
-                tokio::time::sleep(WRITE_CONFLICT_RETRY_DELAY).await;
-                continue;
+                // ONE more attempt, and only for a delete with no precondition:
+                // "delete whatever is current" means the same thing after the
+                // other writer commits, which is the driver's recommended
+                // handling of a lost race. A delete that names a version is
+                // never run again — the writer it lost to has moved the
+                // resource on, and the client must see that
+                // (`VersionConflict` -> 409).
+                if expected_version.is_none() && !retried {
+                    retried = true;
+                    tracing::debug!(
+                        resource_type,
+                        id,
+                        error = %conflict,
+                        "MongoDB write conflict on an unconditional delete; retrying once"
+                    );
+                    tokio::time::sleep(WRITE_CONFLICT_RETRY_DELAY).await;
+                    continue;
+                }
+
+                return Err(self
+                    .lost_race(
+                        tenant,
+                        resource_type,
+                        id,
+                        expected_version.unwrap_or("unknown"),
+                        &conflict,
+                    )
+                    .await);
             }
-
-            return Err(self
-                .lost_race(
-                    tenant,
-                    resource_type,
-                    id,
-                    expected_version.unwrap_or("unknown"),
-                    &conflict,
-                )
-                .await);
-        }
+        })
+        .await
     }
 
     /// Reports a write the server refused with `WriteConflict` as the
@@ -2894,9 +3236,14 @@ impl MongoBackend {
     /// record keeps its version, the restore gets the next one) and keeps the
     /// FHIR version the resource was originally stored under.
     ///
-    /// Returns `NotFound` if no deleted document is present — the caller has
-    /// already established one exists, so that only happens under a concurrent
-    /// write.
+    /// The write is a compare-and-swap on the tombstone's version, so a lost
+    /// race reports `VersionConflict` (with the version actually stored) and
+    /// `create_or_update` retries from a fresh read. Returns `NotFound` only
+    /// if no document is present at all — the caller has already established
+    /// a tombstone exists, so either only happens under a concurrent write.
+    ///
+    /// The attempt is run again when the server aborts it without a
+    /// conflicting writer ([`replay_aborted_writes`]).
     async fn restore_deleted(
         &self,
         tenant: &TenantContext,
@@ -2904,6 +3251,26 @@ impl MongoBackend {
         id: &str,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        let mut resource = resource;
+        ensure_resource_identity(resource_type, id, &mut resource);
+        let outcome = replay_aborted_writes("restore", || {
+            self.restore_attempt(tenant, resource_type, id, &resource)
+        })
+        .await?;
+        Ok(outcome.into_resource(tenant, resource_type, resource))
+    }
+
+    /// One attempt at [`Self::restore_deleted`]; see [`Self::create_attempt`].
+    /// Returns `NotFound` if no deleted document is present — the caller has
+    /// already established one exists, so that only happens under a concurrent
+    /// write.
+    async fn restore_attempt(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: &Value,
+    ) -> StorageResult<ResourceWriteOutcome> {
         tenant.check_permission(Operation::Update, resource_type)?;
 
         let db = self.get_database().await?;
@@ -2925,7 +3292,7 @@ impl MongoBackend {
                 .session(active_session)
                 .await
                 .map_err(|e| {
-                    internal_error(format!("Failed to read deleted resource (session): {}", e))
+                    internal_driver_error("Failed to read deleted resource (session)", e)
                 })?
         } else {
             resources
@@ -2955,10 +3322,8 @@ impl MongoBackend {
         let fhir_version = FhirVersion::from_storage(&fhir_version_str)
             .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
-        let mut resource = resource;
-        ensure_resource_identity(resource_type, id, &mut resource);
-        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
-        let payload = value_to_document(&resource)?;
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, resource);
+        let payload = value_to_document(resource)?;
 
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
@@ -2982,13 +3347,51 @@ impl MongoBackend {
         });
 
         let update_result = if let Some(active_session) = session.as_mut() {
-            resources
+            match resources
                 .update_one(restore_filter.clone(), restore_doc.clone())
                 .session(active_session)
                 .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to restore resource (session): {}", e))
-                })?
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    match WriteAttemptError::driver("Failed to restore resource (session)", e) {
+                        // Inside a transaction a racing restore does not queue
+                        // behind the winner: it fails at once with `WriteConflict`.
+                        // That is the same lost CAS as a zero-match below, so give
+                        // the winner a moment to commit and report it the same way
+                        // — `create_or_update` retries it from a fresh read —
+                        // instead of as a 500.
+                        WriteAttemptError::Conflict(conflict) => {
+                            tracing::debug!(
+                                resource_type,
+                                id,
+                                error = %conflict,
+                                "MongoDB write conflict on restore: a concurrent writer won"
+                            );
+                            drop(session);
+                            tokio::time::sleep(WRITE_CONFLICT_RETRY_DELAY).await;
+                            let actual = resources
+                                .find_one(doc! {
+                                    "tenant_id": tenant_id,
+                                    "resource_type": resource_type,
+                                    "id": id,
+                                })
+                                .await
+                                .map_err(|e| {
+                                    internal_error(format!("Failed to get current version: {}", e))
+                                })?;
+                            return Err(crate::core::restore_cas_miss(
+                                resource_type,
+                                id,
+                                deleted_version,
+                                actual
+                                    .map(|doc| doc.get_str("version_id").unwrap_or("").to_string()),
+                            ));
+                        }
+                        WriteAttemptError::Storage(e) => return Err(e),
+                    }
+                }
+            }
         } else {
             resources
                 .update_one(restore_filter, restore_doc)
@@ -2997,10 +3400,33 @@ impl MongoBackend {
         };
 
         if update_result.matched_count == 0 {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
+            // The tombstone the read observed is gone. A concurrent PUT
+            // restored it (a live document now) or restored and re-deleted it
+            // (a newer tombstone) — the same fact for the caller, so the
+            // re-read does not filter on `is_deleted`: any document is a
+            // conflict `create_or_update` retries from a fresh read; none at
+            // all is a hard delete.
+            let current_filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "id": id,
+            };
+            let actual = if let Some(active_session) = session.as_mut() {
+                resources
+                    .find_one(current_filter)
+                    .session(active_session)
+                    .await
+            } else {
+                resources.find_one(current_filter).await
+            }
+            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+
+            return Err(crate::core::restore_cas_miss(
+                resource_type,
+                id,
+                deleted_version,
+                actual.map(|doc| doc.get_str("version_id").unwrap_or("").to_string()),
+            ));
         }
 
         let history_doc = doc! {
@@ -3022,10 +3448,7 @@ impl MongoBackend {
                 .session(active_session)
                 .await
                 .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to insert restore history row (session): {}",
-                        e
-                    ))
+                    internal_driver_error("Failed to insert restore history row (session)", e)
                 })?;
         } else {
             history.insert_one(history_doc).await.map_err(|e| {
@@ -3058,17 +3481,13 @@ impl MongoBackend {
             }
         }
 
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version,
-            tenant.tenant_id().clone(),
-            resource,
+        Ok(ResourceWriteOutcome {
+            id: id.to_string(),
+            version_id: new_version,
             created_at,
-            now,
-            None,
+            last_updated: now,
             fhir_version,
-        ))
+        })
     }
 
     /// The `search_index`/`search_index_contained` documents one resource
@@ -3107,8 +3526,8 @@ impl MongoBackend {
             .tenant_extractor(tenant_id)
             .extract_with_missing(resource, resource_type)
         {
-            Ok(extraction) => (
-                extraction
+            Ok(extraction) => {
+                let own = extraction
                     .values
                     .iter()
                     .filter_map(|value| {
@@ -3119,16 +3538,31 @@ impl MongoBackend {
                             value,
                         )
                     })
-                    .collect::<Vec<_>>(),
-                Some(
-                    extraction
-                        .missing
-                        .into_iter()
-                        .map(|parameter| parameter.name)
-                        .collect::<Vec<_>>(),
-                ),
-                (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
-            ),
+                    .collect::<Vec<_>>();
+                // A parameter whose values all failed to build a row (an
+                // unparseable date, a Period end that is not a date) is as
+                // absent as one that extracted nothing: without this it would
+                // match neither `:missing=true` nor `:missing=false` (#2000).
+                let missing = extraction
+                    .missing
+                    .into_iter()
+                    .map(|parameter| parameter.name)
+                    .chain(
+                        extraction
+                            .present
+                            .into_iter()
+                            .filter(|parameter| {
+                                !own.iter().any(|row| row_marks_present(row, parameter))
+                            })
+                            .map(|parameter| parameter.name),
+                    )
+                    .collect::<Vec<_>>();
+                (
+                    own,
+                    Some(missing),
+                    (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
+                )
+            }
             Err(e) => {
                 tracing::warn!(
                     "Search extraction failed for {}/{}: {}. Using minimal fallback index values.",
@@ -3547,6 +3981,18 @@ impl MongoBackend {
 
         docs
     }
+}
+
+/// Whether `row` satisfies `parameter`'s `:missing=false` presence check —
+/// the same `{param_name, value_field: {$ne: null}}` test
+/// [`super::search_impl::missing_presence_filter`] runs.
+fn row_marks_present(
+    row: &Document,
+    parameter: &crate::search::extractor::PresentParameter,
+) -> bool {
+    row.get_str("param_name") == Ok(parameter.name.as_str())
+        && super::search_impl::value_field_for(parameter.param_type)
+            .is_none_or(|field| row.get(field).is_some_and(|value| *value != Bson::Null))
 }
 
 #[async_trait]
@@ -4043,8 +4489,9 @@ impl BundleProvider for MongoBackend {
     /// losing ends as [`TransactionError::Transient`] (a retryable 503), not as
     /// a `BundleError` blaming the entry it happened to be on. A Bundle whose own
     /// write set does not fit WiredTiger's cache (`TransactionTooLargeForCache`,
-    /// 388) is not run again: it ends at once as
-    /// [`TransactionError::TooLargeForCache`] (#1837). A Bundle that held the
+    /// 388), whether on an entry's write or on the commit, is not run again and
+    /// its commit is not re-sent: it ends at once as
+    /// [`TransactionError::TooLargeForCache`] (#1837, #1991). A Bundle that held the
     /// whole admission room ran alone, and when WiredTiger rolls it back for
     /// cache pressure (112 "rolled back for eviction", or 365) it is not run
     /// again either; it ends at once as `TooLargeForCache` (#1895).
@@ -4067,6 +4514,24 @@ impl BundleProvider for MongoBackend {
     /// is taken before the session starts, so a queued Bundle holds no session
     /// and no transaction, and it is kept across replays until the commit.
     /// Dropping a queued request gives up its place.
+    ///
+    /// Search rows (#1975): a Bundle of at least
+    /// [`Self::deferred_search_index_min_entries`] entries commits without its
+    /// `search_index` rows, writes a bounded ledger of the resources owed rows
+    /// in the same transaction, keeps its admission through the commit and
+    /// writes the rows after it. Smaller Bundles write their rows in the
+    /// transaction, as before.
+    ///
+    /// Creates (#1977): a Bundle's creates are staged and sent in chunks of up
+    /// to 100 entries, 16 MiB of payload or 5,000 search rows, and a create does
+    /// no existence read: a reused id is refused by the unique
+    /// `idx_resources_identity` and reported as `AlreadyExists` at its entry, as
+    /// before. The documents and index keys written are the same, so the
+    /// transaction's cache footprint, and with it the ceiling on a Bundle's
+    /// size, are not expected to change (inferred, not measured); a chunk
+    /// shortens the time the Bundle holds its room. `failed_entry`, and the
+    /// entry named by a failed write, is the first entry of the chunk being sent
+    /// unless the driver error names a document ([`super::bundle_creates`]).
     ///
     /// Dropping this future — the request timed out, the client went away —
     /// drops the session, which aborts the transaction server-side. The slot
@@ -4092,6 +4557,28 @@ impl BundleProvider for MongoBackend {
         // past either (#1641, #1806). It also holds the room until the drop
         // after the commit.
         let gate = self.transaction_bundle_gate();
+
+        // A Bundle of at least `deferred_search_index_min_entries()` entries
+        // commits without its search rows and writes them after the commit
+        // (#1975). Decided once: every attempt of the Bundle shares it.
+        let deferral = self
+            .deferred_search_index_min_entries()
+            .filter(|min| entries.len() >= *min)
+            .map(|min| {
+                let deferral = BundleDeferral {
+                    bundle_id: uuid::Uuid::new_v4().to_string(),
+                    inline_types: inline_index_types(&entries),
+                };
+                tracing::debug!(
+                    entries = entries.len(),
+                    min_entries = min,
+                    bundle_id = %deferral.bundle_id,
+                    inline_types = ?deferral.inline_types,
+                    "transaction bundle defers its search rows until after the commit"
+                );
+                deferral
+            });
+
         let admission = gate.admit(entries.len()).await;
         let queued = admission.queued();
         if let Some(limit) = gate.limit() {
@@ -4109,7 +4596,7 @@ impl BundleProvider for MongoBackend {
         let mut session = begin_required_bundle_transaction_session(&db).await?;
 
         let mut attempts: u32 = 1;
-        let (results, pending_search_parameter_changes) = loop {
+        let committed = loop {
             let attempt_started = std::time::Instant::now();
             let attempt = self
                 .bundle_transaction_attempt(
@@ -4119,6 +4606,7 @@ impl BundleProvider for MongoBackend {
                     fhir_version,
                     validator,
                     &entries,
+                    deferral.as_ref(),
                 )
                 .await;
             let attempt_duration = attempt_started.elapsed();
@@ -4197,18 +4685,43 @@ impl BundleProvider for MongoBackend {
             );
         }
 
-        drop(admission);
+        let CommittedAttempt {
+            results,
+            search_parameter_changes,
+            deferred,
+        } = committed;
 
-        // Any SearchParameter change in this transaction alters a tenant's
-        // overlay — refresh the stored-param cache and drop the cached
-        // registries so the next access reflects the committed writes. Once,
-        // after the commit that counted, never after an aborted attempt.
-        if !pending_search_parameter_changes.is_empty() {
-            if let Err(e) = self
-                .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
-                .await
-            {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
+        match deferred {
+            None => {
+                drop(admission);
+                self.reload_after_search_parameter_changes(tenant, &search_parameter_changes)
+                    .await;
+            }
+            // The room is kept through the post-commit rows, so the next large
+            // Bundle does not compete with their inserts for cache (#1975).
+            Some(deferred) => {
+                // The rows are built with the committed registry.
+                self.reload_after_search_parameter_changes(tenant, &search_parameter_changes)
+                    .await;
+                // The rows stop being started at the Bundle's own deadline, so
+                // a committed Bundle is answered rather than timed out and
+                // resubmitted; the repair finishes what is left (#1975).
+                let stop_at = self.config().bundle_transaction_deadline.map(|deadline| {
+                    tokio::time::Instant::now()
+                        + deadline.saturating_sub(admission.elapsed().since_call)
+                });
+                // On the Bundle's own session, which is causally consistent: the
+                // first batch reads at or after the commit above.
+                self.write_deferred_search_rows(
+                    &db,
+                    &mut session,
+                    tenant.tenant_id().as_str(),
+                    &deferred,
+                    entries.len(),
+                    stop_at,
+                )
+                .await;
+                drop(admission);
             }
         }
 
@@ -4220,16 +4733,52 @@ impl BundleProvider for MongoBackend {
 }
 
 impl MongoBackend {
+    /// Any SearchParameter change in a Bundle transaction alters a tenant's
+    /// overlay — refresh the stored-param cache and drop the cached registries
+    /// so the next access reflects the committed writes. Once, after the commit
+    /// that counted, never after an aborted attempt.
+    async fn reload_after_search_parameter_changes(
+        &self,
+        tenant: &TenantContext,
+        changes: &[PendingSearchParameterChange],
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
+            .await
+        {
+            tracing::warn!("SearchParameter cache reload failed: {e}");
+        }
+    }
+
     /// One attempt at a bundle transaction: every entry in order, then commit.
     ///
-    /// Returns the entry results and the staged SearchParameter changes when
-    /// the transaction committed. Otherwise it returns why it did not, with the
-    /// server-side transaction already aborted (or failed at commit), so the
-    /// caller may begin another on the same session.
+    /// Returns the entry results, the staged SearchParameter changes and the
+    /// deferred-rows ledger (if any) when the transaction committed. Otherwise
+    /// it returns why it did not, with the server-side transaction already
+    /// aborted (or failed at commit), so the caller may begin another on the
+    /// same session.
     ///
     /// Each attempt clones the original entries before pinning references.
     /// Pins and payload rewrites stay in that attempt: a replay resolves its
     /// own targets and cannot retain identities from an aborted transaction.
+    ///
+    /// An attempt of a Bundle that defers its search rows (`deferral`, #1975)
+    /// writes its ledger last, inside the transaction, so the ledger commits or
+    /// aborts with the Bundle and an aborted attempt leaves no trace of it.
+    ///
+    /// Creates (#1977) are staged in [`BundleWrites`] and sent by
+    /// [`Self::send_staged_creates`] at four points, and only there:
+    ///
+    /// - before any entry that is not a plain POST ([`stages_its_create`]),
+    ///   since it may read what the staged creates wrote;
+    /// - after an entry that leaves the buffer full;
+    /// - before an entry failure is reported, so that a refused create is the
+    ///   failure the client sees, in the order the Bundle ran;
+    /// - after the last entry, before the ledger and the commit.
+    #[allow(clippy::too_many_arguments)]
     async fn bundle_transaction_attempt(
         &self,
         db: &mongodb::Database,
@@ -4238,8 +4787,8 @@ impl MongoBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
         entries: &[BundleEntry],
-    ) -> Result<(Vec<BundleEntryResult>, Vec<PendingSearchParameterChange>), BundleAttemptError>
-    {
+        deferral: Option<&BundleDeferral>,
+    ) -> Result<CommittedAttempt, BundleAttemptError> {
         let mut entries = entries.to_vec();
         // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
         // resolve against the transaction's starting view before any entry is
@@ -4279,10 +4828,17 @@ impl MongoBackend {
             }
         };
         let mut bundle_state = BundleTransactionState::new(references);
-        let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
+        let mut writes = BundleWrites::new(deferral);
 
         let entry_count = entries.len();
+        let tenant_id = tenant.tenant_id().as_str();
         for (idx, entry) in entries.iter_mut().enumerate() {
+            // Anything but a plain POST reads what earlier entries wrote, so the
+            // staged creates go first (#1977).
+            if !stages_its_create(entry) {
+                self.send_staged_creates(db, session, tenant_id, entry_count, &mut writes)
+                    .await?;
+            }
             let mut resource = entry.resource.take();
             let used_references = resource
                 .as_mut()
@@ -4306,13 +4862,14 @@ impl MongoBackend {
                     db,
                     session,
                     BundleEntryContext {
+                        index: idx,
                         tenant,
                         fhir_version,
                         patch_validator: validator,
                     },
                     entry,
                     resource,
-                    &mut pending_search_parameter_changes,
+                    &mut writes,
                     targets.get(&idx),
                 )
                 .await;
@@ -4342,13 +4899,38 @@ impl MongoBackend {
                     }
 
                     results.push(entry_result);
+
+                    // A full buffer goes out now, so the next chunk starts empty
+                    // and an attempt never holds more than one (#1977).
+                    if writes.creates.is_full() {
+                        self.send_staged_creates(db, session, tenant_id, entry_count, &mut writes)
+                            .await?;
+                    } else if stages_its_create(entry) {
+                        // Staging a create does no I/O, so without this the
+                        // search extraction of a whole chunk (up to 100 entries)
+                        // would run without giving the worker back; each create
+                        // used to yield on its own writes (#1977).
+                        tokio::task::yield_now().await;
+                    }
                 }
                 Err(e) => {
+                    // The creates staged before this entry went first in the
+                    // order the Bundle ran them, so a refused one is reported
+                    // instead of this entry's error (#1977).
+                    self.send_staged_creates(db, session, tenant_id, entry_count, &mut writes)
+                        .await?;
                     let _ = session.abort_transaction().await;
                     return Err(entry_attempt_error(idx, entry_count, &e));
                 }
             }
         }
+
+        // The creates still staged are sent before the Bundle reports a failed
+        // entry, before the ledger and before the commit: a create the server
+        // refuses is the failure the client sees, as when each create was sent
+        // as its entry ran (#1977).
+        self.send_staged_creates(db, session, tenant_id, entry_count, &mut writes)
+            .await?;
 
         if let Some((index, message)) = error_info {
             let _ = session.abort_transaction().await;
@@ -4357,13 +4939,49 @@ impl MongoBackend {
             ));
         }
 
+        // The ledger goes in after the last entry and before the commit: the
+        // Bundle's writes and the record of the rows still owed commit together
+        // or not at all (#1975). A failure here is classified by `ledger_attempt_error`.
+        let mut deferred = None;
+        if let Some(set) = writes.deferred.as_ref().filter(|set| !set.is_empty()) {
+            let (documents, chunks) = ledger_documents(
+                tenant.tenant_id().as_str(),
+                set.bundle_id(),
+                entry_count,
+                set.refs(),
+                Utc::now(),
+            );
+            if let Err(e) = db
+                .collection::<Document>(SEARCH_INDEX_PENDING_COLLECTION)
+                .insert_many(documents)
+                .session(&mut *session)
+                .await
+            {
+                let _ = session.abort_transaction().await;
+                return Err(ledger_attempt_error(
+                    entry_count,
+                    &internal_driver_error(
+                        "Failed to write the deferred search index ledger in transaction",
+                        e,
+                    ),
+                ));
+            }
+            deferred = Some(DeferredCommit {
+                bundle_id: set.bundle_id().to_string(),
+                chunks,
+                resources: set.refs().len(),
+            });
+        }
+
         // A commit whose outcome is unknown may have applied. Sending the
         // commit again is safe (the driver's own documented recovery);
         // re-running the entries is not, since every POST would be stored a
         // second time under a new id. `CommitAttempts` keeps the verdicts
         // straight: once any commit has been unknown, no later failure may
-        // read as "rolled back" or as grounds for a replay.
-        let mut commit = CommitAttempts::new();
+        // read as "rolled back" or as grounds for a replay. A commit refused
+        // with 388 ends the attempt as `TooLargeForCache` at once: no re-sent
+        // commit and no replay (#1991).
+        let mut commit = CommitAttempts::new(entry_count);
         while let Err(e) = session.commit_transaction().await {
             match commit.after_failure(&e) {
                 CommitStep::RetryCommit => continue,
@@ -4371,7 +4989,37 @@ impl MongoBackend {
             }
         }
 
-        Ok((results, pending_search_parameter_changes))
+        Ok(CommittedAttempt {
+            results,
+            search_parameter_changes: writes.search_parameter_changes,
+            deferred,
+        })
+    }
+
+    /// Sends the creates the attempt has staged (#1977), or does nothing when it
+    /// has none. A create the server refuses aborts the transaction and ends the
+    /// attempt, classified as the entry write that would have failed: the entry
+    /// is the one of the refused document, or the first of the chunk
+    /// ([`MongoBackend::flush_bundle_creates`]).
+    async fn send_staged_creates(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant_id: &str,
+        entry_count: usize,
+        writes: &mut BundleWrites,
+    ) -> Result<(), BundleAttemptError> {
+        if writes.creates.is_empty() {
+            return Ok(());
+        }
+        if let Err((at, err)) = self
+            .flush_bundle_creates(db, session, tenant_id, &mut writes.creates)
+            .await
+        {
+            let _ = session.abort_transaction().await;
+            return Err(entry_attempt_error(at, entry_count, &err));
+        }
+        Ok(())
     }
 
     /// Resolves every URL-borne conditional entry inside the session, before
@@ -4442,10 +5090,11 @@ impl MongoBackend {
         context: BundleEntryContext<'_>,
         entry: &BundleEntry,
         resource: Option<Value>,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
         target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
         let BundleEntryContext {
+            index,
             tenant,
             fhir_version,
             patch_validator: validator,
@@ -4505,17 +5154,14 @@ impl MongoBackend {
                     }
                 }
 
-                let created = self
-                    .create_resource_in_bundle_transaction(
-                        db,
-                        session,
-                        tenant,
-                        &resource_type,
-                        resource,
-                        fhir_version,
-                        pending_search_parameter_changes,
-                    )
-                    .await?;
+                let created = self.create_resource_in_bundle_transaction(
+                    index,
+                    tenant,
+                    &resource_type,
+                    resource,
+                    fhir_version,
+                    writes,
+                )?;
                 Ok(BundleEntryResult::created(created))
             }
             BundleMethod::Put => {
@@ -4529,27 +5175,20 @@ impl MongoBackend {
                     return Ok(match &target.resolved {
                         Some(existing) => crate::core::conditional_update_entry(
                             self.update_resource_in_bundle_transaction(
-                                db,
-                                session,
-                                tenant,
-                                existing,
-                                resource,
-                                pending_search_parameter_changes,
+                                db, session, tenant, existing, resource, writes,
                             )
                             .await?,
                         ),
-                        None => BundleEntryResult::created(
-                            self.create_resource_in_bundle_transaction(
-                                db,
-                                session,
+                        None => {
+                            BundleEntryResult::created(self.create_resource_in_bundle_transaction(
+                                index,
                                 tenant,
                                 &target.resource_type,
                                 resource,
                                 fhir_version,
-                                pending_search_parameter_changes,
-                            )
-                            .await?,
-                        ),
+                                writes,
+                            )?)
+                        }
                     });
                 }
 
@@ -4573,12 +5212,7 @@ impl MongoBackend {
 
                         let updated = self
                             .update_resource_in_bundle_transaction(
-                                db,
-                                session,
-                                tenant,
-                                &existing,
-                                resource,
-                                pending_search_parameter_changes,
+                                db, session, tenant, &existing, resource, writes,
                             )
                             .await?;
                         Ok(BundleEntryResult::updated(updated))
@@ -4595,17 +5229,14 @@ impl MongoBackend {
                         let mut resource_with_id = resource;
                         resource_with_id["id"] = serde_json::json!(id);
 
-                        let created = self
-                            .create_resource_in_bundle_transaction(
-                                db,
-                                session,
-                                tenant,
-                                &resource_type,
-                                resource_with_id,
-                                fhir_version,
-                                pending_search_parameter_changes,
-                            )
-                            .await?;
+                        let created = self.create_resource_in_bundle_transaction(
+                            index,
+                            tenant,
+                            &resource_type,
+                            resource_with_id,
+                            fhir_version,
+                            writes,
+                        )?;
                         Ok(BundleEntryResult::created(created))
                     }
                 }
@@ -4620,7 +5251,7 @@ impl MongoBackend {
                                 tenant,
                                 &target.resource_type,
                                 existing.id(),
-                                pending_search_parameter_changes,
+                                writes,
                             )
                             .await?;
                             crate::core::conditional_delete_entry(existing)
@@ -4640,7 +5271,7 @@ impl MongoBackend {
                             &resource_type,
                             &id,
                             if_match,
-                            pending_search_parameter_changes,
+                            writes,
                         )
                         .await
                     {
@@ -4664,7 +5295,7 @@ impl MongoBackend {
                             tenant,
                             &resource_type,
                             &id,
-                            pending_search_parameter_changes,
+                            writes,
                         )
                         .await
                     {
@@ -4742,12 +5373,7 @@ impl MongoBackend {
                 };
                 let update_result = self
                     .update_resource_in_bundle_transaction(
-                        db,
-                        session,
-                        tenant,
-                        &existing,
-                        candidate,
-                        pending_search_parameter_changes,
+                        db, session, tenant, &existing, candidate, writes,
                     )
                     .await;
                 crate::core::transaction::patch_update_result(update_result)
@@ -4755,19 +5381,27 @@ impl MongoBackend {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn create_resource_in_bundle_transaction(
+    /// Stages one create of the Bundle (#1977); the attempt's loop sends it
+    /// ([`Self::send_staged_creates`]). It reads and writes nothing, so it
+    /// takes no session.
+    ///
+    /// There is no existence read: `idx_resources_identity` is unique and not
+    /// partial, and a soft-deleted resource keeps its document, so a reused id
+    /// (live or deleted) is refused at the send and reported as
+    /// [`ResourceError::AlreadyExists`] at this entry
+    /// ([`super::bundle_creates::resource_insert_failure`]). The result is
+    /// returned now, as before; it is the stored resource only once the staged
+    /// create has been sent, which the loop does before it reports a failure
+    /// and before the commit.
+    fn create_resource_in_bundle_transaction(
         &self,
-        db: &mongodb::Database,
-        session: &mut ClientSession,
+        index: usize,
         tenant: &TenantContext,
         resource_type: &str,
         resource: Value,
         fhir_version: helios_fhir::FhirVersion,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<StoredResource> {
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
 
         let id = resource
@@ -4776,91 +5410,67 @@ impl MongoBackend {
             .map(str::to_string)
             .unwrap_or_else(crate::types::new_resource_id);
 
-        let existing = resources
-            .find_one(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": &id,
-            })
-            .session(&mut *session)
-            .await
-            .map_err(|e| {
-                internal_driver_error("Failed to check resource existence in transaction", e)
-            })?;
-
-        if existing.is_some() {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id,
-            }));
-        }
-
         let mut resource = resource;
         ensure_resource_identity(resource_type, &id, &mut resource);
         let search_documents =
             self.search_index_documents(tenant_id, resource_type, &id, &resource);
         let payload = value_to_document(&resource)?;
+        let payload_bytes = bson::RawDocumentBuf::from_document(&payload)
+            .map_err(|e| serialization_error(format!("Failed to serialize resource: {e}")))?
+            .as_bytes()
+            .len();
 
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
         let version_id = "1".to_string();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
-        resources
-            .insert_one(search_documents.resource_document(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": &id,
-                "version_id": &version_id,
-                "data": Bson::Document(payload.clone()),
-                "created_at": now_bson,
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            }))
-            .session(&mut *session)
-            .await
-            .map_err(|e| {
-                if is_duplicate_key_error(&e) {
-                    StorageError::Resource(ResourceError::AlreadyExists {
-                        resource_type: resource_type.to_string(),
-                        id: id.clone(),
-                    })
-                } else {
-                    internal_driver_error("Failed to insert resource in transaction", e)
-                }
-            })?;
+        let mut current = search_documents.resource_document(doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": &id,
+            "version_id": &version_id,
+            "data": Bson::Document(payload.clone()),
+            "created_at": now_bson,
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        });
+        // A Bundle that defers its search rows marks the resource until they
+        // are written (#1975). The history document carries no marker.
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            current.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
 
-        history
-            .insert_one(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": &id,
-                "version_id": &version_id,
-                "data": Bson::Document(payload),
-                "created_at": now_bson,
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            })
-            .session(&mut *session)
-            .await
-            .map_err(|e| internal_driver_error("Failed to insert history in transaction", e))?;
+        let history = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": &id,
+            "version_id": &version_id,
+            "data": Bson::Document(payload),
+            "created_at": now_bson,
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        };
 
-        self.index_resource_in_bundle_transaction(
-            db,
-            session,
-            tenant_id,
-            resource_type,
-            &id,
-            search_documents,
-        )
-        .await?;
+        let rows = self.search_rows_in_transaction(writes, resource_type, &id, search_documents);
+        writes.creates.push(StagedCreate {
+            entry: index,
+            resource_type: resource_type.to_string(),
+            id: id.clone(),
+            resource: current,
+            history,
+            payload_bytes,
+            rows,
+        });
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Create);
+            writes
+                .search_parameter_changes
+                .push(PendingSearchParameterChange::Create);
         }
 
         Ok(StoredResource::from_storage(
@@ -4883,7 +5493,7 @@ impl MongoBackend {
         tenant: &TenantContext,
         current: &StoredResource,
         resource: Value,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<StoredResource> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -4937,6 +5547,18 @@ impl MongoBackend {
         let fhir_version = current.fhir_version();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
+        let mut set = doc! {
+            "version_id": &new_version,
+            "data": Bson::Document(payload.clone()),
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        };
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            set.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
+
         let update_result = resources
             .update_one(
                 doc! {
@@ -4946,16 +5568,7 @@ impl MongoBackend {
                     "version_id": current.version_id(),
                     "is_deleted": false,
                 },
-                search_documents.resource_update(doc! {
-                    "$set": {
-                        "version_id": &new_version,
-                        "data": Bson::Document(payload.clone()),
-                        "last_updated": now_bson,
-                        "is_deleted": false,
-                        "deleted_at": Bson::Null,
-                        "fhir_version": &fhir_version_str,
-                    }
-                }),
+                search_documents.resource_update(doc! { "$set": set }),
             )
             .session(&mut *session)
             .await
@@ -4998,11 +5611,14 @@ impl MongoBackend {
             resource_type,
             id,
             search_documents,
+            writes,
         )
         .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Update);
+            writes
+                .search_parameter_changes
+                .push(PendingSearchParameterChange::Update);
         }
 
         Ok(StoredResource::from_storage(
@@ -5025,7 +5641,7 @@ impl MongoBackend {
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -5079,6 +5695,17 @@ impl MongoBackend {
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
 
+        let mut set = doc! {
+            "version_id": &new_version,
+            "is_deleted": true,
+            "missing_params": Bson::Array(Vec::new()),
+            "deleted_at": now_bson,
+            "last_updated": now_bson,
+        };
+        if let Some(marker) = writes.pending_marker(resource_type) {
+            set.insert(SEARCH_ROWS_PENDING_FIELD, marker);
+        }
+
         let update_result = resources
             .update_one(
                 doc! {
@@ -5088,15 +5715,7 @@ impl MongoBackend {
                     "version_id": &current_version,
                     "is_deleted": false,
                 },
-                doc! {
-                    "$set": {
-                        "version_id": &new_version,
-                        "is_deleted": true,
-                        "missing_params": Bson::Array(Vec::new()),
-                        "deleted_at": now_bson,
-                        "last_updated": now_bson,
-                    }
-                },
+                doc! { "$set": set },
             )
             .session(&mut *session)
             .await
@@ -5130,11 +5749,20 @@ impl MongoBackend {
                 internal_driver_error("Failed to insert delete history in transaction", e)
             })?;
 
-        self.delete_search_index_in_bundle_transaction(db, session, tenant_id, resource_type, id)
-            .await?;
+        self.delete_search_index_in_bundle_transaction(
+            db,
+            session,
+            tenant_id,
+            resource_type,
+            id,
+            writes,
+        )
+        .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Delete);
+            writes
+                .search_parameter_changes
+                .push(PendingSearchParameterChange::Delete);
         }
 
         Ok(())
@@ -5149,7 +5777,7 @@ impl MongoBackend {
         resource_type: &str,
         id: &str,
         expected_version: &str,
-        pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         let existing = self
             .read_resource_in_bundle_transaction(db, session, tenant, resource_type, id)
@@ -5173,15 +5801,8 @@ impl MongoBackend {
             ));
         }
 
-        self.delete_resource_in_bundle_transaction(
-            db,
-            session,
-            tenant,
-            resource_type,
-            id,
-            pending_search_parameter_changes,
-        )
-        .await
+        self.delete_resource_in_bundle_transaction(db, session, tenant, resource_type, id, writes)
+            .await
     }
 
     async fn read_resource_in_bundle_transaction(
@@ -5752,6 +6373,46 @@ impl MongoBackend {
         Ok(())
     }
 
+    /// Decides where a resource's search rows are written: `Some(docs)` when
+    /// they go into the Bundle's transaction, `None` when they do not.
+    ///
+    /// Nothing is written in the transaction while search is offloaded, and
+    /// nothing when the Bundle defers the type (#1975), in which case the
+    /// resource is only noted for the post-commit step.
+    ///
+    /// The rows come from `docs`, which the caller built from the same
+    /// extraction as the resource's `missing_params`. A deferred type drops
+    /// `docs`: its `missing_params` are already on the resource document and
+    /// its rows are rebuilt after commit.
+    fn search_rows_in_transaction(
+        &self,
+        writes: &mut BundleWrites,
+        resource_type: &str,
+        resource_id: &str,
+        docs: SearchIndexDocuments,
+    ) -> Option<SearchIndexDocuments> {
+        if self.is_search_offloaded() {
+            return None;
+        }
+
+        if let Some(deferred) = writes
+            .deferred
+            .as_mut()
+            .filter(|deferred| deferred.defers(resource_type))
+        {
+            deferred.record(resource_type, resource_id);
+            return None;
+        }
+
+        Some(docs)
+    }
+
+    /// Writes a resource's search rows inside the Bundle's transaction, or, when
+    /// the Bundle defers them for this type (#1975), only notes the resource for
+    /// the post-commit step: neither the two deletes nor the inserts run. See
+    /// [`Self::search_rows_in_transaction`]. A create stages its rows with its
+    /// document instead (#1977).
+    #[allow(clippy::too_many_arguments)]
     async fn index_resource_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
@@ -5760,17 +6421,19 @@ impl MongoBackend {
         resource_type: &str,
         resource_id: &str,
         docs: SearchIndexDocuments,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
-        if self.is_search_offloaded() {
+        let Some(docs) = self.search_rows_in_transaction(writes, resource_type, resource_id, docs)
+        else {
             return Ok(());
-        }
+        };
 
-        self.delete_search_index_in_bundle_transaction(
+        self.delete_search_index_rows_for(
             db,
-            session,
             tenant_id,
             resource_type,
-            resource_id,
+            Bson::String(resource_id.to_string()),
+            Some(&mut *session),
         )
         .await?;
 
@@ -5778,6 +6441,9 @@ impl MongoBackend {
             .await
     }
 
+    /// Deletes a resource's search rows inside the Bundle's transaction, or,
+    /// when the Bundle defers them for this type (#1975), only notes the
+    /// resource: the post-commit step finds it deleted and leaves it no rows.
     async fn delete_search_index_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
@@ -5785,8 +6451,18 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        writes: &mut BundleWrites,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
+            return Ok(());
+        }
+
+        if let Some(deferred) = writes
+            .deferred
+            .as_mut()
+            .filter(|deferred| deferred.defers(resource_type))
+        {
+            deferred.record(resource_type, resource_id);
             return Ok(());
         }
 
@@ -6955,11 +7631,7 @@ impl ReindexTarget for MongoBackend {
         let db = match self.get_database().await {
             Ok(db) => db,
             Err(e) => {
-                let msg = e.to_string();
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
+                return super::reindex_pipeline::PageFailure::storage(e).fan_out(resources.len());
             }
         };
         let tenant_id = tenant.tenant_id().as_str();
@@ -6970,13 +7642,14 @@ impl ReindexTarget for MongoBackend {
         if resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST {
             self.log_reindex_mode_once(multi_thread, overlapped);
         }
-        if overlapped {
+        let outcome = if overlapped {
             self.write_page_overlapped(&db, tenant_id, resources, stats)
                 .await
         } else {
             self.write_page_serial(&db, tenant_id, resources, stats, multi_thread)
                 .await
-        }
+        };
+        outcome.unwrap_or_else(|failure| failure.fan_out(resources.len()))
     }
 
     /// Delegates to [`Self::write_search_entries_page_timed`] with a
@@ -6997,7 +7670,9 @@ impl ReindexTarget for MongoBackend {
 /// insert. Mirrors `bulk_ingest.rs`'s `INSERT_DOCS_PER_COMMAND` (same value,
 /// same rationale: bound how much the driver serializes per command) without
 /// depending on that module, since a sub-batch's `search_index` documents
-/// are built the same way a batch's are.
+/// are built the same way a batch's are. It also caps the search rows that one
+/// chunk of a transaction Bundle's staged creates holds (`bundle_creates`,
+/// #1977).
 pub(super) const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 
 /// Chunked, unordered `insert_many` of `docs` into `collection`, attributing
@@ -7021,7 +7696,7 @@ pub(super) async fn insert_search_entries_chunk(
     docs: &[Document],
     error_context: &str,
     stats: &mut ReindexPageStats,
-) -> Result<HashMap<usize, String>, String> {
+) -> Result<HashMap<usize, String>, super::reindex_pipeline::PageFailure> {
     let mut insert_failures: HashMap<usize, String> = HashMap::new();
     let mut offset = 0usize;
     for chunk in docs.chunks(SEARCH_INDEX_INSERT_CHUNK) {
@@ -7031,17 +7706,27 @@ pub(super) async fn insert_search_entries_chunk(
             Ok(_) => {}
             Err(e) => match e.kind.as_ref() {
                 MongoErrorKind::InsertMany(insert_many) => {
-                    let Some(write_errors) = insert_many.write_errors.as_ref() else {
-                        return Err(format!("{error_context}: {e}"));
-                    };
-                    for write_error in write_errors {
+                    for write_error in insert_many.write_errors.iter().flatten() {
                         let owner = owners[offset + write_error.index];
                         insert_failures
                             .entry(owner)
                             .or_insert_with(|| format!("{error_context}: {}", write_error.message));
                     }
+                    if insert_many.write_concern_error.is_some()
+                        || insert_many.write_errors.as_ref().is_none_or(Vec::is_empty)
+                    {
+                        return Err(
+                            super::reindex_pipeline::PageFailure::driver(error_context, e)
+                                .with_permanent(insert_failures),
+                        );
+                    }
                 }
-                _ => return Err(format!("{error_context}: {e}")),
+                _ => {
+                    return Err(
+                        super::reindex_pipeline::PageFailure::driver(error_context, e)
+                            .with_permanent(insert_failures),
+                    );
+                }
             },
         }
         offset += chunk.len();
@@ -8536,6 +9221,97 @@ mod transient_abort_tests {
         assert!(abort.reason.contains("Entry processing failed"));
     }
 
+    #[test]
+    fn a_write_attempt_loses_a_race_only_on_the_write_conflict_code() {
+        assert!(matches!(
+            WriteAttemptError::driver(
+                "Failed to update resource (session)",
+                command_error(WRITE_CONFLICT_CODE, "WriteConflict")
+            ),
+            WriteAttemptError::Conflict(_)
+        ));
+        let WriteAttemptError::Storage(stale) = WriteAttemptError::driver(
+            "Failed to update resource (session)",
+            command_error(13388, "StaleConfig"),
+        ) else {
+            panic!("a StaleConfig abort is not a lost race");
+        };
+        assert!(
+            stale
+                .to_string()
+                .contains("Failed to update resource (session)")
+        );
+        assert_eq!(
+            kept_driver_error(&stale).and_then(driver_error_code),
+            Some(13388),
+            "the driver error is kept for the replay decision"
+        );
+        // The replay decision needs the server's label, which a constructed
+        // command error cannot carry: the code alone is not a transient abort.
+        assert!(aborted_without_conflicting_writer(&stale).is_none());
+    }
+
+    #[test]
+    fn insert_many_conflicts_are_not_classified_as_other_aborts() {
+        let conflict = insert_many_write_error(WRITE_CONFLICT_CODE);
+        assert!(has_server_code(&conflict, WRITE_CONFLICT_CODE));
+        assert!(matches!(
+            WriteAttemptError::driver("Failed to insert index rows", conflict),
+            WriteAttemptError::Conflict(_)
+        ));
+        let other = insert_many_write_error(13388);
+        assert!(!has_server_code(&other, WRITE_CONFLICT_CODE));
+    }
+
+    #[test]
+    fn an_eviction_rollback_is_neither_a_lost_race_nor_replayed() {
+        for driver in [
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+            write_conflict_write_error(EVICTION_112),
+            command_error(365, "TemporarilyUnavailable"),
+        ] {
+            let WriteAttemptError::Storage(err) =
+                WriteAttemptError::driver("Failed to update resource (session)", driver)
+            else {
+                panic!("an eviction rollback is not a lost race");
+            };
+            assert!(rolled_back_for_eviction(&err).is_some(), "{err}");
+            assert!(aborted_without_conflicting_writer(&err).is_none(), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_insert_many_write_conflict_names_its_eviction() {
+        let insert_many: mongodb::error::InsertManyError = bson::from_document(doc! {
+            "writeErrors": [{ "index": 0, "code": WRITE_CONFLICT_CODE, "errmsg": EVICTION_112 }],
+        })
+        .expect("an InsertManyError deserializes from a server reply");
+        let driver = MongoError::from(MongoErrorKind::InsertMany(insert_many));
+        assert!(is_eviction_rollback(&driver));
+        assert!(matches!(
+            WriteAttemptError::driver("Failed to insert index rows", driver),
+            WriteAttemptError::Storage(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_eviction_rollback_ends_the_write_as_unavailable_at_once() {
+        let mut attempts = 0;
+        let result: StorageResult<()> = replay_aborted_writes("update", || {
+            attempts += 1;
+            std::future::ready(Err(internal_driver_error(
+                "Failed to insert search index entries",
+                command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+            )))
+        })
+        .await;
+        assert_eq!(attempts, 1);
+        let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = result else {
+            panic!("expected Unavailable, got {result:?}");
+        };
+        assert!(!message.contains("WiredTiger"), "{message}");
+    }
+
     /// A `TemporarilyUnavailable` (365) the way a write inside the transaction
     /// reports it: as a per-write error rather than a failed command.
     fn temporarily_unavailable_write_error() -> MongoError {
@@ -8608,9 +9384,11 @@ mod transient_abort_tests {
             match entry_attempt_error(6959, 7412, &err) {
                 BundleAttemptError::Failed(TransactionError::TooLargeForCache {
                     entries,
+                    cause,
                     reason,
                 }) => {
                     assert_eq!(entries, 7412);
+                    assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
                     assert!(reason.contains("388"), "{reason}");
                     assert!(reason.contains("6959"), "{reason}");
                 }
@@ -8621,8 +9399,108 @@ mod transient_abort_tests {
         let err = StorageError::from(command_error(388, "TransactionTooLargeForCache"));
         assert!(matches!(
             entry_attempt_error(0, 2, &err),
-            BundleAttemptError::Failed(TransactionError::TooLargeForCache { entries: 2, .. })
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                entries: 2,
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
+                ..
+            })
         ));
+    }
+
+    /// An `insert_many` failure on document `index`, as the driver builds it
+    /// from a reply with `writeErrors` for an ordered insert.
+    fn insert_many_write_error_at(index: usize, code: i32, errmsg: &str) -> MongoError {
+        let insert_many: mongodb::error::InsertManyError = bson::from_document(doc! {
+            "writeErrors": [{ "index": index as i32, "code": code, "errmsg": errmsg }],
+        })
+        .expect("an InsertManyError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::InsertMany(insert_many))
+    }
+
+    /// The entries and `Type/id`s of a chunk of three staged creates, entries
+    /// 20 to 22 of a Bundle of 30.
+    fn staged_chunk() -> (Vec<usize>, Vec<(String, String)>) {
+        (
+            vec![20, 21, 22],
+            (0..3)
+                .map(|n| ("Patient".to_string(), format!("p{n}")))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_duplicate_id_in_a_create_chunk_is_a_bundle_error_at_that_entry_never_a_transient_abort() {
+        let (entries, identities) = staged_chunk();
+        let duplicate = insert_many_write_error_at(
+            1,
+            11000,
+            "E11000 duplicate key error collection: hfs.resources index: idx_resources_identity",
+        );
+        let (at, err) =
+            super::super::bundle_creates::resource_insert_failure(&entries, &identities, duplicate);
+        assert_eq!(at, 21, "the entry of the refused create, not of the chunk");
+        assert!(
+            transient_entry_abort(&err).is_none(),
+            "a reused id is not transient"
+        );
+        match entry_attempt_error(at, 30, &err) {
+            BundleAttemptError::Failed(TransactionError::BundleError { index, message }) => {
+                assert_eq!(index, 21);
+                assert_eq!(
+                    message,
+                    "Entry processing failed: resource already exists: Patient/p1"
+                );
+            }
+            other => panic!("expected a BundleError at entry 21, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_create_chunk_refused_with_388_is_too_large_for_cache() {
+        let (entries, identities) = staged_chunk();
+        let (at, err) = super::super::bundle_creates::resource_insert_failure(
+            &entries,
+            &identities,
+            insert_many_write_error(388),
+        );
+        assert_eq!(at, 20);
+        match entry_attempt_error(at, 30, &err) {
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                entries,
+                cause,
+                reason,
+            }) => {
+                assert_eq!(entries, 30);
+                assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
+                assert!(reason.contains("388"), "{reason}");
+            }
+            other => panic!("expected TooLargeForCache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_eviction_on_a_create_chunk_is_charged_to_its_first_entry() {
+        let (entries, identities) = staged_chunk();
+        // A failed command names no document: the chunk's first entry is charged.
+        let (at, err) = super::super::bundle_creates::resource_insert_failure(
+            &entries,
+            &identities,
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+        );
+        assert_eq!(at, 20);
+        match entry_attempt_error(at, 30, &err) {
+            BundleAttemptError::TransientAbort {
+                entry,
+                code,
+                eviction,
+                ..
+            } => {
+                assert_eq!(entry, Some(20));
+                assert_eq!(code, Some(WRITE_CONFLICT_CODE));
+                assert!(eviction);
+            }
+            other => panic!("expected a TransientAbort, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8733,7 +9611,10 @@ mod transient_abort_tests {
         );
         assert!(matches!(
             entry_attempt_error(3, 10, &err),
-            BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. })
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::WriteSetTooLarge,
+                ..
+            })
         ));
     }
 
@@ -8746,9 +9627,11 @@ mod transient_abort_tests {
         match lone_eviction_failure(true, true, 7412, Some(6959), &reason) {
             Some(TransactionError::TooLargeForCache {
                 entries,
+                cause,
                 reason: actual,
             }) => {
                 assert_eq!(entries, 7412);
+                assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
                 assert_eq!(
                     actual,
                     format!(
@@ -8761,8 +9644,13 @@ mod transient_abort_tests {
         }
         // At commit there is no failing entry to name.
         match lone_eviction_failure(true, true, 7412, None, "Commit failed: boom") {
-            Some(TransactionError::TooLargeForCache { entries, reason }) => {
+            Some(TransactionError::TooLargeForCache {
+                entries,
+                cause,
+                reason,
+            }) => {
                 assert_eq!(entries, 7412);
+                assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
                 assert_eq!(
                     reason,
                     "Commit rolled back for eviction while the Bundle ran alone; \
@@ -8835,6 +9723,84 @@ mod transient_abort_tests {
             entry_attempt_error(3, 10, &classified_io_error()),
             BundleAttemptError::TransientAbort { .. }
         ));
+    }
+
+    #[test]
+    fn a_ledger_write_that_overflows_the_cache_is_too_large_for_cache() {
+        for driver in [
+            command_error(388, "TransactionTooLargeForCache"),
+            insert_many_write_error(388),
+        ] {
+            let err = internal_driver_error(
+                "Failed to write the deferred search index ledger in transaction",
+                driver,
+            );
+            match ledger_attempt_error(7412, &err) {
+                BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                    entries,
+                    cause,
+                    ..
+                }) => {
+                    assert_eq!(entries, 7412);
+                    assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
+                }
+                other => panic!("expected TooLargeForCache, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_ledger_write_aborted_transiently_is_a_transient_abort_with_no_entry() {
+        let eviction = internal_driver_error(
+            "Failed to write the deferred search index ledger in transaction",
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+        );
+        match ledger_attempt_error(7412, &eviction) {
+            BundleAttemptError::TransientAbort {
+                entry: None,
+                code: Some(WRITE_CONFLICT_CODE),
+                eviction: true,
+                ..
+            } => {}
+            other => panic!("expected a transient abort, got {other:?}"),
+        }
+        let plain = internal_driver_error(
+            "Failed to write the deferred search index ledger in transaction",
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+        );
+        assert!(matches!(
+            ledger_attempt_error(7412, &plain),
+            BundleAttemptError::TransientAbort {
+                entry: None,
+                eviction: false,
+                ..
+            }
+        ));
+        // A dropped connection reaches the loop as `Unavailable`.
+        assert!(matches!(
+            ledger_attempt_error(7412, &classified_io_error()),
+            BundleAttemptError::TransientAbort { entry: None, .. }
+        ));
+    }
+
+    #[test]
+    fn any_other_ledger_write_failure_is_a_server_side_rollback_not_an_entry_error() {
+        for driver in [
+            command_error(2, "BadValue"),
+            command_error(121, "DocumentValidationFailure"),
+            insert_many_write_error(11000),
+        ] {
+            let err = internal_driver_error(
+                "Failed to write the deferred search index ledger in transaction",
+                driver,
+            );
+            match ledger_attempt_error(7412, &err) {
+                BundleAttemptError::Failed(TransactionError::RolledBack { reason }) => {
+                    assert!(reason.contains("deferred search index ledger"), "{reason}");
+                }
+                other => panic!("expected RolledBack, got {other:?}"),
+            }
+        }
     }
 
     /// A commit that failed with a write-concern error of `code`, as the driver
@@ -8967,6 +9933,20 @@ mod transient_abort_tests {
         err
     }
 
+    /// #1991: the commit failure of the issue's log, `Error code 388
+    /// (TransactionTooLargeForCache) ... labels: {}`: code 388 with no label.
+    /// The literal is deliberate; it pins the number the server sends.
+    fn commit_too_large_for_cache() -> MongoError {
+        let err = command_error_with_message(
+            388,
+            "TransactionTooLargeForCache",
+            "WiredTigerRecordStore::insertRecord -31800: transaction is too large and will \
+             not fit in the storage engine cache",
+        );
+        assert!(err.labels().is_empty(), "the server sent no label");
+        err
+    }
+
     #[test]
     fn an_unlabelled_commit_failure_with_code_365_is_a_transient_abort() {
         let err = temporarily_unavailable();
@@ -9011,10 +9991,122 @@ mod transient_abort_tests {
         }
     }
 
+    #[test]
+    fn an_unlabelled_code_388_commit_failure_is_too_large_for_cache_while_no_commit_is_unknown() {
+        assert_eq!(
+            classify_commit_failure(&commit_too_large_for_cache(), false),
+            CommitFailure::TooLargeForCache
+        );
+        // An earlier commit may have applied, so the outcome stays unknown
+        // rather than reading as a rollback.
+        assert_eq!(
+            classify_commit_failure(&commit_too_large_for_cache(), true),
+            CommitFailure::StillUnknown
+        );
+        // A write-concern error is reported after the commit applied, whatever
+        // its code.
+        let applied = write_concern_error(388, "TransactionTooLargeForCache");
+        for earlier in [false, true] {
+            assert_eq!(
+                classify_commit_failure(&applied, earlier),
+                CommitFailure::UnknownResult
+            );
+        }
+    }
+
+    #[test]
+    fn code_388_at_commit_decides_only_verdicts_that_say_nothing_was_applied() {
+        use CommitFailure::*;
+        // (transient label, unknown-result label, write concern, earlier unknown)
+        let table = [
+            ((false, false, false, false), TooLargeForCache),
+            ((true, false, false, false), TooLargeForCache),
+            ((true, true, false, false), TooLargeForCache),
+            ((false, true, false, false), UnknownResult),
+            ((false, true, false, true), UnknownResult),
+            ((false, false, false, true), StillUnknown),
+            ((true, false, false, true), StillUnknown),
+            ((true, true, false, true), StillUnknown),
+        ];
+        for ((t, u, wc, e), expected) in table {
+            assert_eq!(
+                too_large_for_cache_at_commit(classify_commit_signals(t, u, false, wc, e)),
+                expected,
+                "transient={t} unknown={u} write_concern={wc} earlier={e}"
+            );
+        }
+        for t in [false, true] {
+            for u in [false, true] {
+                for e in [false, true] {
+                    assert_eq!(
+                        too_large_for_cache_at_commit(classify_commit_signals(
+                            t, u, false, true, e
+                        )),
+                        UnknownResult,
+                        "a write-concern error is unknown: transient={t} unknown={u} earlier={e}"
+                    );
+                }
+            }
+        }
+        assert_eq!(too_large_for_cache_at_commit(RolledBack), TooLargeForCache);
+        assert_eq!(
+            too_large_for_cache_at_commit(TransientAbort),
+            TooLargeForCache
+        );
+        assert_eq!(too_large_for_cache_at_commit(UnknownResult), UnknownResult);
+        assert_eq!(too_large_for_cache_at_commit(StillUnknown), StillUnknown);
+    }
+
+    #[test]
+    fn the_commit_loop_ends_a_code_388_commit_failure_at_once_as_too_large_for_cache() {
+        let steps = drive_commit(vec![
+            commit_too_large_for_cache(),
+            commit_too_large_for_cache(),
+            commit_too_large_for_cache(),
+        ]);
+        assert_eq!(steps.len(), 1, "the commit is not re-sent");
+        match stopped_with(&steps[0]) {
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                cause,
+                entries,
+                reason,
+            }) => {
+                assert_eq!(
+                    *cause,
+                    TooLargeForCacheCause::WriteSetTooLarge,
+                    "a commit-time 388 is the write-set cause"
+                );
+                assert_eq!(*entries, DRIVEN_BUNDLE_ENTRIES);
+                assert!(reason.starts_with("Commit failed: "), "{reason}");
+                assert!(reason.contains("388"), "{reason}");
+                assert!(reason.contains("TransactionTooLargeForCache"), "{reason}");
+            }
+            other => panic!("expected TooLargeForCache, got {other:?}"),
+        }
+
+        // After an earlier unknown commit the 388 does not read as a rollback.
+        let steps = drive_commit(vec![
+            write_concern_error(79, "UnknownReplWriteConcern"),
+            commit_too_large_for_cache(),
+        ]);
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(steps[0], CommitStep::RetryCommit));
+        match stopped_with(&steps[1]) {
+            BundleAttemptError::Failed(TransactionError::CommitOutcomeUnknown { reason }) => {
+                assert!(reason.contains("unknown"), "{reason}");
+            }
+            other => panic!("expected CommitOutcomeUnknown, got {other:?}"),
+        }
+    }
+
+    /// The entry count [`drive_commit`] runs its commits for: the 6,135-entry
+    /// Synthea Bundle of #1991.
+    const DRIVEN_BUNDLE_ENTRIES: usize = 6135;
+
     /// Runs `failures` through a fresh [`CommitAttempts`], as the commit loop
     /// does, and returns what it decided at each one.
     fn drive_commit(failures: Vec<MongoError>) -> Vec<CommitStep> {
-        let mut attempts = CommitAttempts::new();
+        let mut attempts = CommitAttempts::new(DRIVEN_BUNDLE_ENTRIES);
         let mut steps = Vec::new();
         for failure in failures {
             let step = attempts.after_failure(&failure);

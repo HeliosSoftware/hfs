@@ -237,7 +237,7 @@ AWS_REGION=us-east-1 \
 | `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |
 | `HFS_DATA_DIR` | `./data` | Directory containing FHIR data files (search parameters) |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` | FHIR version (R4, R4B, R5, R6) |
+| `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | FHIR version (R4, R4B, R5, R6) |
 | `HFS_LOG_LEVEL` | `info` | Log level (error, warn, info, debug, trace) |
 | `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. Set `false` for headless deployments; `/ui` then returns `404` + OperationOutcome. Has no effect on a binary built without the `ui` feature. |
 | `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes against storage (CLI `--dashboard-reconcile-interval-secs`). Whole seconds, must be `> 0`; `0` or a non-numeric value is a startup error. A tenant's full recount is additionally spaced to at most every max(interval, 10 × its last recount duration); also how soon a failed background seed is retried. |
@@ -300,7 +300,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | ES index name prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | *(none)* | ES basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | ES basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | ES request timeout in milliseconds, including `_bulk`. A `_bulk` request that times out is split in half and resent |
@@ -334,15 +334,19 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_URL` / `HFS_MONGODB_URI` | *(none)* | MongoDB connection string |
 | `HFS_MONGODB_DATABASE` | `helios` | Database name |
 | `HFS_MONGODB_MAX_CONNECTIONS` | `10` | Connection pool size |
-| `HFS_MONGODB_PROBE_TIMEOUT_MS` | `10` | Server execution budget for optional cardinality and ordered-page probes (ms), from 1 through 2147483647. Unset or blank preserves the default. Probe timeouts fall back to normal matching; this is not an exact-total or network deadline. |
+| `HFS_MONGODB_SEARCH_TIMEOUT_MS` | *(unset)* | Soft MongoDB search/count budget (ms), 1–2147483647, shared by admission, planning, pages, totals and inline includes. Unset or blank preserves existing behavior. Checks occur before commands and matching batches, never per ID. Completed search results are returned even if late; unfinished planning, retries and additional batches can still time out. Active commands/cursor reads may overrun; detected expiry returns an error without partial results. New commands receive the remaining maxTimeMS; implicit getMore retains its cursor budget. The HTTP timeout is separate. |
+| `HFS_MONGODB_PROBE_TIMEOUT_MS` | `10` | Server execution budget for optional cardinality and ordered-page probes (ms), from 1 through 2147483647. Unset or blank preserves the default. A probe’s own timeout falls back to normal matching; the optional whole-search deadline still applies. |
 | `HFS_MONGODB_ADAPTIVE_OFFSET_PAGING` | `true` | Samples eligible no-total offsets and caches their execution strategy. `false` disables adaptive offset selection; other search plans are unchanged. |
 | `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | TCP handshake timeout (ms) |
 | `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` | *(unset: no limit)* | How many potentially broad standard searches run at once per process; others wait for a slot. Reads and narrow searches (`_id`, a reference or uri, a date with `eq`/`ap`, `identifier=system\|code`) bypass this admission limit. A value at or above the pool size is accepted with a startup warning; `0` fails startup. |
 | `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` | `25000` | Server execution budget (`maxTimeMS`) for the cross-tenant resource count behind the Tenants UI, `GET /admin/tenants`, the existence check of `DELETE /admin/tenants/{id}` and the console tenant metrics. No other query carries it. Past it the server stops the count and the call fails with a timeout error, never a zero count. A caller outside the HTTP request timeout, such as the Tenants UI, sees that error directly and shows its error state instead of counts. The REST endpoints answer `504` only when this budget is below `HFS_REQUEST_TIMEOUT`, as the defaults are (25 s against 30 s). The request timeout starts when the request arrives, before the count, so with a budget at or above it the request timeout answers `408` first; the budget still stops the count on the server a moment later. Keep it below `HFS_REQUEST_TIMEOUT` when raising either. It bounds server execution only, not server selection, waiting for a pooled connection or network time. Must be 1 to 2147483647; anything else fails startup. The 25 s default is policy (five seconds under the default request timeout), not a large-store measurement. The count is a covered scan of the `idx_resources_live_tenant` index, which boot creates; for its build cost on an existing store see `docs/mongodb/tenant-count-index.md`. |
+| `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` | `512` | Documents per cursor batch of a SQL-on-FHIR scan (`1` to `100000`; anything else fails startup). Lower = lower first-row latency on selective views (the first row waits for one full batch); higher = fewer round trips against a remote MongoDB (about 3,500 `getMore` per 1.8M rows at `512`, about 7,000 at `256`). Memory is bounded by this many documents per reply. |
 | `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | `15000` | How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
 | `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` | `4` | How many standard-size transaction Bundles (see `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES`) run at once; the rest wait their turn within the request timeout. Each Bundle is one MongoDB transaction held in WiredTiger's cache until commit, so this bounds cache pressure (see `crates/persistence/README.md`). `0` removes the limit. |
 | `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` | `1000` | The entry count of one standard Bundle. Bundles are admitted while their entries fit in limit × this, each counting at least 1 entry and at most the whole room, so small Bundles share a slot and a large one takes several. `0` counts every Bundle as one slot (the #1776 behaviour). The limit counts standard Bundles of this many entries, not Bundles, so with the default weight many small transaction Bundles can be open at once, each with its own session and transaction, bounded by the entry room and the connection pool rather than by the limit. For a hard cap on concurrent Bundles (for example limit `1` to serialise them), set this to `0`. |
-| `HFS_MONGODB_INDEX_BUILD` | `background` | When the generation-2 `search_index` indexes are built: `background` serves immediately and builds after boot, `inline` waits for the build before serving, `off` only warns so an operator can pre-build (see `docs/mongodb/search-indexes.md`). |
+| `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` | `auto` (the admission room, `4000`) | Transaction Bundles with at least this many entries commit their resources and history without their search rows, which are written right after the commit, before the response; other clients may see search lag for those resources. `off` or `0` writes every Bundle's rows inside its transaction. Ignored on mongodb-elasticsearch. See `crates/persistence/README.md` (Deferred search indexing). |
+| `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` | `60` | Seconds between passes of the task that finishes the search rows a large Bundle left unwritten after its commit (crash, cancelled request, failure); it also runs once at startup. A pass takes only Bundles whose ledger is older than the larger of 60 s and the Bundle deadline (`HFS_REQUEST_TIMEOUT` less 2 s). `0` turns the task off. |
+| `HFS_MONGODB_INDEX_BUILD` | `background` | When the generation-2 `search_index` indexes and `resources.idx_resources_missing_params` are built: `background` serves immediately and builds after boot, `inline` waits for the build before serving, `off` only warns so an operator can pre-build (see `docs/mongodb/search-indexes.md`). |
 | `HFS_MONGODB_REINDEX_OVERLAP` | `true` | Overlap search-parameter extraction with `search_index` inserts inside a `$reindex` page; `false` restores the serial writer. |
 | `HFS_MONGODB_REINDEX_PREPARE_THREADS` | `0` | Extraction threads for `$reindex` pages: `0` = cores − 1 (1–4), `1` = none beyond the page's own thread. |
 | `HFS_MONGODB_REINDEX_PREFETCH` | `true` | Fetch the next id-order `$reindex` page while the current one is written, on standalone MongoDB and on `mongo-es` (#1250); the MongoDB-specific switch under `HFS_REINDEX_PREFETCH`, which covers every backend. |
@@ -361,6 +365,10 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing (required by MinIO and most S3-compatible providers) |
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure `http://` endpoint URLs (only relevant when `HFS_S3_ENDPOINT` is set) |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
+
+**S3 keyspace layout (`HFS_S3_KEYSPACE_LAYOUT`).** Each tenant has one layout, `v1` or `v2`, recorded in a marker object `history/_keyspace.json` (`{"layout":2}`). The variable only decides the layout of a tenant that has no marker and no data yet; a tenant that already holds objects without a marker is always `v1`, and a stamped marker always wins, so changing the variable never moves existing data. `v2` stores `resources/{type}/{h2}/{id}/…` and `history/type/{type}/{h2}/…` with `h2 = hex(sha256(id))[0..2]` (256 sub-prefixes) and drops the tenant-wide `history/system/` index (system history is served from `history/type/`), so each write does 3 PUTs instead of 4. The layout of a tenant is immutable: there is no migration, and `purge_tenant_data` keeps the marker. To change it, stop every instance and delete the tenant's prefix by hand. `v2` requires every instance that writes the bucket to run a build that reads the marker and to use the same setting; an older binary ignores the marker and would write `v1` keys into a `v2` tenant, leaving them unreachable. Opt-in: the default is `v1`.
 
 **SQL-on-FHIR async export**
 
@@ -375,8 +383,12 @@ for the full `HFS_EXPORT_*` table.
 | `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized in full before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. Narrow it with a ViewDefinition `where`, or raise this limit |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's); does not cover materializing a dependency |
-| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3` |
+| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. Any other value fails startup; `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` export sink |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket for the `s3` sink; required when `HFS_EXPORT_SINK=s3` |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | Region override for the `s3` sink; defaults to `us-east-1` when `HFS_EXPORT_S3_ENDPOINT` is set |
+| `HFS_EXPORT_S3_ENDPOINT` | *(AWS)* | Custom S3 endpoint URL for the `s3` sink (e.g. MinIO); forces path-style addressing |
+| `HFS_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for the `s3` sink; forced on when `HFS_EXPORT_S3_ENDPOINT` is set |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output and bookkeeping; the cleanup reaper deletes shards and drops the job afterward |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval (seconds; clamped to ≥ 1) |
 
@@ -524,7 +536,7 @@ Storage backend abstraction supporting multiple database technologies optimized 
 - ✅ **FHIR R4** (4.0.1) - Default
 - ✅ **FHIR R4B** (4.3.0)
 - ✅ **FHIR R5** (5.0.0)
-- ✅ **FHIR R6** (6.0.0-ballot2)
+- ✅ **FHIR R6** (6.0.0-snapshot1)
 
 ## FHIRPath Expression Language
 - Complete implementation of [FHIRPath 3.0.0-ballot specification](https://hl7.org/fhirpath/2025Jan/)

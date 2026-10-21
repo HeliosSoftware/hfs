@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use helios_persistence::ResourceStorage;
@@ -245,7 +246,26 @@ pub struct AppState<B: TerminologyBackend> {
     /// [`AppState::clear_expand_cache`] — a newly-imported supplement
     /// might define a previously-unknown code.
     pub lookup_not_found_cache: NotFoundCache,
+
+    /// Serialises concept-closure rebuilds started by `POST /import?finalize=true`.
+    ///
+    /// The rebuild runs as a detached task, so two finalize requests can
+    /// overlap. On PostgreSQL both would see the same system as missing its
+    /// closure and race on `concept_closure`'s primary key. Holding this lock
+    /// means the second caller finds nothing left to rebuild.
+    pub closure_rebuild_lock: Arc<tokio::sync::Mutex<()>>,
+
+    /// How long `POST /import?finalize=true` waits for the closure rebuild
+    /// before answering `202 Accepted` and letting it finish in the background.
+    /// Must stay below the router's 30 s request timeout. See
+    /// [`DEFAULT_IMPORT_FINALIZE_WAIT`].
+    pub import_finalize_wait: Duration,
 }
+
+/// Default for [`AppState::import_finalize_wait`]: comfortably inside the
+/// 30 s `TimeoutLayer` in `server::create_app`, so a slow rebuild is reported
+/// as pending instead of being cut off with a 408.
+pub const DEFAULT_IMPORT_FINALIZE_WAIT: Duration = Duration::from_secs(20);
 
 impl<B: TerminologyBackend> AppState<B> {
     /// Wrap `backend` in an `Arc` and return a ready-to-use state.
@@ -268,6 +288,8 @@ impl<B: TerminologyBackend> AppState<B> {
             inline_compose_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_not_found_cache: Arc::new(RwLock::new(HashSet::new())),
+            closure_rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
+            import_finalize_wait: DEFAULT_IMPORT_FINALIZE_WAIT,
         }
     }
 
@@ -314,6 +336,12 @@ impl<B: TerminologyBackend> AppState<B> {
     /// Override the maximum expansion size (default: 10 000).
     pub fn with_max_expansion_size(mut self, limit: u32) -> Self {
         self.max_expansion_size = limit;
+        self
+    }
+
+    /// Override [`Self::import_finalize_wait`].
+    pub fn with_import_finalize_wait(mut self, wait: Duration) -> Self {
+        self.import_finalize_wait = wait;
         self
     }
 

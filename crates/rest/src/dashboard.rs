@@ -89,10 +89,15 @@
 //!   ([`ResourceStorage::latest_write_marker`]) is read around every totals
 //!   read, and probed once per pass for a tenant that is not due: a change
 //!   this process did not record (a sibling instance, a direct database edit)
-//!   labels the figures approximate and makes the totals due at once. The
+//!   labels the figures approximate and makes the totals due at once. Due
+//!   totals that are still exact, with the marker where their count left it,
+//!   are not re-read (up to [`UNCHANGED_TOTALS_MAX_AGE`]): the count would
+//!   only confirm them. The
 //!   history rings of its charted types that are no longer exact are re-seeded
 //!   when the tenant is quiet, or once their history is older than
-//!   [`RESEED_MAX_AGE_FACTOR`] intervals even under continuous writes.
+//!   [`RESEED_MAX_AGE_FACTOR`] intervals even under continuous writes — each
+//!   window's under the same duty-cycle bound as the totals, so a slow
+//!   30-day history read is not repeated every few passes (#2107).
 //! - **Ring seeds.** A page load that charts a ring without storage history
 //!   queues it and wakes the loop, which loads it after a short debounce —
 //!   deferred while a bulk submit is active for the tenant. The queued rings of
@@ -197,7 +202,22 @@ const SLOW_RECONCILE_LOG: StdDuration = StdDuration::from_secs(5);
 /// tenant with no figures, or stale ones after a purge, is read right away),
 /// but they do record their read in it. A change the storage write marker
 /// detects makes the totals due at once.
+///
+/// The same bound applies to the re-seed of a tenant's history rings, per
+/// window (#2107): after a grouped history read of one window took `t`, the
+/// tenant's already loaded rings of that window are not re-read for
+/// `t × RECONCILE_DUTY_FACTOR` when that is longer than the interval. A 30-day window that takes ten seconds over a
+/// bulk-imported history is reloaded at most every 100 seconds, while the
+/// one-hour window, a few milliseconds, still follows every write. A ring
+/// that was never loaded (or was invalidated by a purge) is not held back.
 const RECONCILE_DUTY_FACTOR: u32 = 10;
+
+/// Longest a seeded tenant's totals go without a `count_all_types` while its
+/// write marker stays where the last exact count left it (#2107). An exact
+/// tenant whose marker has not moved has nothing to correct, so a due
+/// reconcile is skipped then; this backstop still recounts now and then, for
+/// changes the marker cannot see.
+const UNCHANGED_TOTALS_MAX_AGE: Duration = Duration::hours(1);
 
 /// How far before the previous totals reconcile began the write marker counts
 /// recent writes. Covers writes committed with an earlier timestamp than the
@@ -744,6 +764,10 @@ pub(crate) struct ReconcileReport {
     pub(crate) skipped_active_import: Vec<String>,
     /// Seeded tenants whose totals reconcile is not due yet (duty cycle).
     pub(crate) not_due: Vec<String>,
+    /// Seeded tenants whose totals were due but not re-read: exact, and the
+    /// storage write marker unchanged since they were counted (see
+    /// [`UNCHANGED_TOTALS_MAX_AGE`]).
+    pub(crate) totals_unchanged: Vec<String>,
     /// Seeded tenants whose storage write marker showed a change this process
     /// did not record; their totals were made due at once.
     pub(crate) external_changes: Vec<String>,
@@ -757,6 +781,23 @@ pub(crate) struct ReconcileReport {
     pub(crate) job_counts_refreshed: Vec<String>,
     /// History rings loaded from storage during the pass.
     pub(crate) rings_seeded: usize,
+    /// Inexact history rings whose re-seed waits for their window's duty
+    /// cycle (see [`RECONCILE_DUTY_FACTOR`]).
+    pub(crate) rings_not_due: usize,
+}
+
+impl ReconcileReport {
+    /// Whether the pass ran a totals or history query against storage —
+    /// including one that failed — rather than only reading the counters.
+    /// Those are the multi-second aggregates on a large database, and the
+    /// heap they free is what the loop hands back to the OS afterwards
+    /// (#2106).
+    pub(crate) fn read_storage(&self) -> bool {
+        !self.seeded.is_empty()
+            || !self.seed_failed.is_empty()
+            || !self.reconciled.is_empty()
+            || self.rings_seeded > 0
+    }
 }
 
 /// The reconcile loop's own per-tenant bookkeeping: when each tenant's totals
@@ -766,6 +807,9 @@ pub(crate) struct ReconcileReport {
 pub(crate) struct ReconcileSchedule {
     interval: StdDuration,
     next_due: HashMap<String, Instant>,
+    /// When each tenant's loaded rings of a window may next be re-seeded (see
+    /// [`RECONCILE_DUTY_FACTOR`]).
+    ring_due: HashMap<(String, DashboardWindow), Instant>,
     /// When each tenant's last totals reconcile began.
     last_begin: HashMap<String, DateTime<Utc>>,
     /// The `recent_since` bound the counters' current marker for the tenant
@@ -788,6 +832,7 @@ impl ReconcileSchedule {
         Self {
             interval,
             next_due: HashMap::new(),
+            ring_due: HashMap::new(),
             last_begin: HashMap::new(),
             marker_bound: HashMap::new(),
             carried_over: Vec::new(),
@@ -815,6 +860,27 @@ impl ReconcileSchedule {
             .max(elapsed.saturating_mul(RECONCILE_DUTY_FACTOR));
         self.next_due
             .insert(tenant.to_string(), Instant::now() + pause);
+    }
+
+    /// Whether `tenant`'s loaded rings of `window` may be re-seeded now.
+    fn rings_due(&self, tenant: &str, window: DashboardWindow) -> bool {
+        self.ring_due
+            .get(&(tenant.to_string(), window))
+            .is_none_or(|due| Instant::now() >= *due)
+    }
+
+    /// Records a grouped history read of `window` for `tenant` that took
+    /// `elapsed`, holding that window's re-seeds back for
+    /// `elapsed × RECONCILE_DUTY_FACTOR`. A pause shorter than the interval
+    /// holds nothing back: passes are that far apart anyway.
+    fn record_rings(&mut self, tenant: &str, window: DashboardWindow, elapsed: StdDuration) {
+        let key = (tenant.to_string(), window);
+        let pause = elapsed.saturating_mul(RECONCILE_DUTY_FACTOR);
+        if pause < self.interval {
+            self.ring_due.remove(&key);
+        } else {
+            self.ring_due.insert(key, Instant::now() + pause);
+        }
     }
 
     /// The bound a between-reconcile marker probe of `tenant` uses: the one
@@ -905,6 +971,7 @@ impl ReconcileSchedule {
     /// Drops everything kept for `tenant`.
     fn forget(&mut self, tenant: &str) {
         self.next_due.remove(tenant);
+        self.ring_due.retain(|(t, _), _| t != tenant);
         self.last_begin.remove(tenant);
         self.marker_bound.remove(tenant);
         self.carried_over.retain(|t| t != tenant);
@@ -913,6 +980,7 @@ impl ReconcileSchedule {
     fn tenants(&self) -> impl Iterator<Item = &String> {
         self.next_due
             .keys()
+            .chain(self.ring_due.keys().map(|(tenant, _)| tenant))
             .chain(self.last_begin.keys())
             .chain(self.marker_bound.keys())
             .chain(self.carried_over.iter())
@@ -1641,6 +1709,7 @@ where
         tenant: &str,
         window: DashboardWindow,
         types: &[String],
+        schedule: &mut ReconcileSchedule,
     ) -> Option<usize> {
         if types.is_empty() {
             return Some(0);
@@ -1666,6 +1735,7 @@ where
             )
             .await;
         let elapsed = started.elapsed();
+        schedule.record_rings(tenant, window, elapsed);
         dashboard_metrics::record_storage_query(StorageQuery::History, elapsed, result.is_ok());
         debug!(
             tenant = %tenant,
@@ -1706,11 +1776,16 @@ where
     /// [`seed_window_rings`](Self::seed_window_rings) query per window for all
     /// of that window's types. Returns how many rings were seeded; a window
     /// whose query failed seeds none.
-    async fn seed_rings(&self, tenant: &str, rings: Vec<(String, DashboardWindow)>) -> usize {
+    async fn seed_rings(
+        &self,
+        tenant: &str,
+        rings: Vec<(String, DashboardWindow)>,
+        schedule: &mut ReconcileSchedule,
+    ) -> usize {
         let mut seeded = 0usize;
         for (window, types) in rings_by_window(rings) {
             seeded += self
-                .seed_window_rings(tenant, window, &types)
+                .seed_window_rings(tenant, window, &types, schedule)
                 .await
                 .unwrap_or(0);
         }
@@ -1742,7 +1817,7 @@ where
             }
         }
         let rings_seeded = self
-            .seed_rings(tenant, self.inexact_charted_rings(tenant))
+            .seed_rings(tenant, self.inexact_charted_rings(tenant), schedule)
             .await;
         debug!(
             tenant = %tenant,
@@ -1943,7 +2018,10 @@ where
                 continue;
             }
             for (window, types) in rings_by_window(rings) {
-                let Some(n) = self.seed_window_rings(&tenant, window, &types).await else {
+                let Some(n) = self
+                    .seed_window_rings(&tenant, window, &types, schedule)
+                    .await
+                else {
                     // Still queued: the next drain retries the window.
                     continue;
                 };
@@ -1981,15 +2059,20 @@ where
     ///      write marker is probed once; a change this process did not record
     ///      makes them due now.
     ///    - **Totals.** When due (see [`RECONCILE_DUTY_FACTOR`]),
-    ///      `count_all_types` is re-read as a counters reconcile. An error logs
-    ///      and keeps the previous counters.
+    ///      `count_all_types` is re-read as a counters reconcile, unless the
+    ///      totals are exact and the write marker, probed first, is the one
+    ///      their count stored (within [`UNCHANGED_TOTALS_MAX_AGE`]): nothing
+    ///      changed, so nothing is read. An error logs and keeps the previous
+    ///      counters.
     ///    - **Rings.** When the tenant is quiet — its totals exact — each
     ///      recently charted ring that is not exact is re-seeded (one grouped
     ///      history query per window), which is what lets the snapshot become
     ///      exact after an import. Under continuous writes the rings
     ///      [`DashboardCounters::rings_to_reseed`] names are re-seeded instead:
     ///      those whose history is older than [`RESEED_MAX_AGE_FACTOR`]
-    ///      intervals, or that only an external change made inexact.
+    ///      intervals, or that only an external change made inexact. Either
+    ///      way a ring already loaded waits for its window's duty cycle
+    ///      ([`RECONCILE_DUTY_FACTOR`]).
     /// 5. **Ring seeds.** The queued ring seeds are drained.
     ///
     /// Only the job counts are refreshed when the backend cannot count.
@@ -2036,19 +2119,39 @@ where
             }
 
             let mut due = schedule.is_due(&tenant);
-            if !due
+            // Exact totals counted recently enough to be vouched for by an
+            // unchanged marker (#2107).
+            let vouchable = self.counters.totals_view(&tenant).is_some_and(|totals| {
+                totals.exact
+                    && Utc::now().signed_duration_since(totals.reconciled_at)
+                        < UNCHANGED_TOTALS_MAX_AGE
+            });
+            if (!due || vouchable)
                 && let Some(marker) = self
                     .read_marker(&tenant, schedule.probe_bound(&tenant))
                     .await
-                && self.counters.note_marker(&tenant, marker)
             {
-                debug!(
-                    tenant = %tenant,
-                    "dashboard reconcile: storage changed outside this process; totals due now"
-                );
-                schedule.force_due(&tenant);
-                report.external_changes.push(tenant.clone());
-                due = true;
+                if self.counters.note_marker(&tenant, marker) {
+                    debug!(
+                        tenant = %tenant,
+                        "dashboard reconcile: storage changed outside this process; totals due now"
+                    );
+                    schedule.force_due(&tenant);
+                    report.external_changes.push(tenant.clone());
+                    due = true;
+                } else if due
+                    && vouchable
+                    && self.counters.matches_reconciled_marker(&tenant, marker)
+                {
+                    // No write recorded, none detected: a count would read
+                    // back exactly the figures on show.
+                    debug!(
+                        tenant = %tenant,
+                        "dashboard reconcile: write marker unchanged; totals still exact"
+                    );
+                    report.totals_unchanged.push(tenant.clone());
+                    due = false;
+                }
             }
             if due {
                 match self.reconcile_totals(&tenant, schedule).await {
@@ -2062,7 +2165,7 @@ where
                         "dashboard reconcile: count_all_types failed; keeping the previous counters"
                     ),
                 }
-            } else {
+            } else if !report.totals_unchanged.contains(&tenant) {
                 debug!(
                     tenant = %tenant,
                     "dashboard reconcile: totals reconcile not due yet (duty-cycle back-off)"
@@ -2074,7 +2177,7 @@ where
                 .counters
                 .totals_view(&tenant)
                 .is_some_and(|totals| totals.exact);
-            let rings = if quiet {
+            let mut rings = if quiet {
                 self.inexact_charted_rings(&tenant)
             } else {
                 self.counters.rings_to_reseed(
@@ -2084,8 +2187,20 @@ where
                     Utc::now(),
                 )
             };
+            // A loaded ring waits for its window's duty cycle; one without
+            // storage history is loaded at once.
+            rings.retain(|(resource_type, window)| {
+                let due = schedule.rings_due(&tenant, *window)
+                    || !self
+                        .ring_view(&tenant, resource_type, *window)
+                        .is_some_and(|view| view.history_seeded);
+                if !due {
+                    report.rings_not_due += 1;
+                }
+                due
+            });
             if !rings.is_empty() {
-                report.rings_seeded += self.seed_rings(&tenant, rings).await;
+                report.rings_seeded += self.seed_rings(&tenant, rings, schedule).await;
             }
         }
 
@@ -2102,11 +2217,13 @@ where
             reconciled = report.reconciled.len(),
             skipped_active_import = report.skipped_active_import.len(),
             not_due = report.not_due.len(),
+            totals_unchanged = report.totals_unchanged.len(),
             external_changes = report.external_changes.len(),
             budget_skipped = report.budget_skipped.len(),
             dropped = report.dropped.len(),
             job_counts_refreshed = report.job_counts_refreshed.len(),
             rings_seeded = report.rings_seeded,
+            rings_not_due = report.rings_not_due,
             elapsed_ms = elapsed.as_millis() as u64,
             "dashboard reconcile: pass completed"
         );
@@ -2185,6 +2302,7 @@ where
 /// [module documentation](self) for what it does.
 ///
 /// Called from [`crate::build_app`] right after the provider is registered.
+/// When the UI is disabled, starts no task and publishes no reconcile metrics.
 /// The task is supervised (see [`supervise_reconcile_loop`]) and owned by the
 /// provider, which aborts it when dropped; the loop itself holds only a
 /// [`Weak`] reference, so once the provider is no longer registered (a later
@@ -2194,10 +2312,13 @@ where
 /// no job store is wired. Does nothing outside a Tokio runtime (`build_app` is
 /// synchronous and may be called from non-async contexts); nothing seeds the
 /// counters then, so every snapshot of that provider stays pending.
-pub(crate) fn spawn_reconcile_loop<S>(provider: &Arc<StorageDashboardProvider<S>>)
+pub(crate) fn spawn_reconcile_loop<S>(provider: &Arc<StorageDashboardProvider<S>>, enabled: bool)
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    if !enabled {
+        return;
+    }
     let interval = provider.reconcile_interval;
     // The supervisor's handle is only for tests: the provider owns the task.
     drop(spawn_reconcile_loop_every(provider, interval));
@@ -2328,7 +2449,8 @@ async fn run_reconcile_loop<S>(
             return;
         }
         Some(provider) => {
-            provider.seed_default_tenant(&mut schedule).await;
+            let report = provider.seed_default_tenant(&mut schedule).await;
+            release_memory_after(&report);
         }
         None => return,
     }
@@ -2346,12 +2468,26 @@ async fn run_reconcile_loop<S>(
             debug!("dashboard reconcile: provider no longer registered; stopping");
             return;
         };
-        if woken {
-            provider.drain_pending_seeds(&mut schedule).await;
+        let report = if woken {
+            provider.drain_pending_seeds(&mut schedule).await
         } else {
-            provider.reconcile_pass(&mut schedule).await;
+            let report = provider.reconcile_pass(&mut schedule).await;
             next_pass = tokio::time::Instant::now() + interval;
-        }
+            report
+        };
+        release_memory_after(&report);
+    }
+}
+
+/// Returns the heap a pass's storage queries freed to the OS (#2106). On a
+/// large SQLite database the totals and history aggregates run for seconds
+/// on Tokio's blocking pool, and each pooled connection can grow a 64 MiB
+/// page cache. glibc keeps what they free in per-thread arenas, so without a
+/// trim a process that only serves the dashboard climbed to its 12 GB limit.
+/// A pass that read nothing from storage skips the trim.
+fn release_memory_after(report: &ReconcileReport) {
+    if report.read_storage() {
+        crate::memory_trim::release_free_memory();
     }
 }
 
@@ -2364,6 +2500,18 @@ mod tests {
     use helios_persistence::backends::sqlite::SqliteBackend;
     use helios_persistence::core::WriteEvent;
     use helios_persistence::core::WriteObserver;
+    use helios_persistence::core::{
+        BulkEntryOutcome, BulkEntryResult, BulkExportStorage, BulkProcessingOptions,
+        BulkSubmitProvider, BulkSubmitRollbackProvider, EntryCountSummary, EntryResultContinuation,
+        EntryResultPage, ExpiredExportRef, ExportClaimStrategy, ExportFileMetadata, ExportJobId,
+        ExportJobLease, ExportJobMetadata, ExportProgress, ExportWorkerStorage, FinalizedPart,
+        LeaseError, ManifestFetchParams, ManifestLease, ManifestPhase, ManifestPublicationResult,
+        ManifestPublicationStatus, ManifestWorkerView, NdjsonEntry, PollTokenTarget,
+        RawExportManifest, StartExportInput, StreamProcessingResult, StreamingBulkSubmitProvider,
+        SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+        SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+        TypeExportProgress, UnindexedEntry, WorkerId, WorkerJobView,
+    };
     use helios_persistence::error::{BackendError, StorageError};
     use helios_persistence::types::StoredResource;
     use serde_json::Value;
@@ -2560,6 +2708,43 @@ mod tests {
         ReconcileSchedule::new(StdDuration::from_secs(30))
     }
 
+    #[test]
+    fn only_a_pass_that_queried_storage_asks_for_a_trim() {
+        let quiet = ReconcileReport {
+            not_due: vec!["default".to_string()],
+            skipped_active_import: vec!["a".to_string()],
+            seed_deferred: vec!["b".to_string()],
+            budget_skipped: vec!["c".to_string()],
+            dropped: vec!["d".to_string()],
+            job_counts_refreshed: vec!["e".to_string()],
+            ..ReconcileReport::default()
+        };
+        assert!(!ReconcileReport::default().read_storage());
+        assert!(!quiet.read_storage());
+
+        let queried = [
+            ReconcileReport {
+                seeded: vec!["default".to_string()],
+                ..ReconcileReport::default()
+            },
+            ReconcileReport {
+                seed_failed: vec!["default".to_string()],
+                ..ReconcileReport::default()
+            },
+            ReconcileReport {
+                reconciled: vec!["default".to_string()],
+                ..ReconcileReport::default()
+            },
+            ReconcileReport {
+                rings_seeded: 1,
+                ..ReconcileReport::default()
+            },
+        ];
+        for report in queried {
+            assert!(report.read_storage(), "{report:?}");
+        }
+    }
+
     /// The tenants waiting for a background seed, sorted.
     fn queued_tenants<S>(provider: &StorageDashboardProvider<S>) -> Vec<String> {
         let mut tenants: Vec<String> = lock(&provider.seeds.tenants).iter().cloned().collect();
@@ -2599,6 +2784,10 @@ mod tests {
     struct InstrumentedStorage {
         inner: Arc<SqliteBackend>,
         aggregate_calls: AtomicUsize,
+        totals_calls: AtomicUsize,
+        marker_calls: AtomicUsize,
+        export_job_calls: AtomicUsize,
+        submit_job_calls: AtomicUsize,
         /// Per-type `count_deltas_by_bucket` calls (also in `aggregate_calls`).
         per_type_history_calls: AtomicUsize,
         /// Grouped `count_deltas_by_type_and_bucket` calls (also in
@@ -2622,6 +2811,10 @@ mod tests {
             Arc::new(Self {
                 inner,
                 aggregate_calls: AtomicUsize::new(0),
+                totals_calls: AtomicUsize::new(0),
+                marker_calls: AtomicUsize::new(0),
+                export_job_calls: AtomicUsize::new(0),
+                submit_job_calls: AtomicUsize::new(0),
                 per_type_history_calls: AtomicUsize::new(0),
                 grouped_history_calls: AtomicUsize::new(0),
                 delay_ms: AtomicU64::new(0),
@@ -2649,6 +2842,18 @@ mod tests {
 
         fn grouped_history_calls(&self) -> usize {
             self.grouped_history_calls.load(Ordering::SeqCst)
+        }
+
+        fn dashboard_reads(&self) -> [usize; 7] {
+            [
+                self.aggregate_calls(),
+                self.totals_calls.load(Ordering::SeqCst),
+                self.per_type_history_calls(),
+                self.grouped_history_calls(),
+                self.marker_calls.load(Ordering::SeqCst),
+                self.export_job_calls.load(Ordering::SeqCst),
+                self.submit_job_calls.load(Ordering::SeqCst),
+            ]
         }
 
         /// A history read: counted as an aggregate, then failed if
@@ -2823,6 +3028,7 @@ mod tests {
             &self,
             tenant: &TenantContext,
         ) -> StorageResult<Vec<(String, u64)>> {
+            self.totals_calls.fetch_add(1, Ordering::SeqCst);
             if self.panic_once.swap(false, Ordering::SeqCst) {
                 panic!("injected count_all_types panic");
             }
@@ -2835,6 +3041,7 @@ mod tests {
             tenant: &TenantContext,
             recent_since: Option<DateTime<Utc>>,
         ) -> StorageResult<Option<WriteMarker>> {
+            self.marker_calls.fetch_add(1, Ordering::SeqCst);
             let marker = *lock(&self.marker);
             match marker {
                 Some(marker) => Ok(marker),
@@ -2843,6 +3050,340 @@ mod tests {
                         .await
                 }
             }
+        }
+    }
+
+    // Job-store marker traits require worker/lifecycle surfaces that the
+    // dashboard never calls. Forward those to the same SQLite fixture and
+    // count the dashboard's two job-query methods independently.
+    macro_rules! forward_job_store {
+        ($store_trait:ident {
+            $(async fn $method:ident($($argument:ident: $argument_type:ty),* $(,)?)
+                -> $result:ty $(, count = $counter:ident)?;)+
+        }) => {
+            #[async_trait]
+            impl $store_trait for InstrumentedStorage {
+                $(
+                    async fn $method(&self, $($argument: $argument_type),*) -> $result {
+                        $(self.$counter.fetch_add(1, Ordering::SeqCst);)?
+                        <SqliteBackend as $store_trait>::$method(
+                            self.inner.as_ref(), $($argument),*
+                        ).await
+                    }
+                )+
+            }
+        };
+    }
+
+    forward_job_store! {
+        BulkExportStorage {
+            async fn start_export(
+                tenant: &TenantContext,
+                input: StartExportInput,
+            ) -> StorageResult<ExportJobId>;
+            async fn get_export_status(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> StorageResult<ExportProgress>;
+            async fn cancel_export(tenant: &TenantContext, job_id: &ExportJobId) -> StorageResult<()>;
+            async fn delete_export(tenant: &TenantContext, job_id: &ExportJobId) -> StorageResult<()>;
+            async fn get_export_manifest(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> StorageResult<RawExportManifest>;
+            async fn list_exports(
+                tenant: &TenantContext,
+                include_completed: bool,
+            ) -> StorageResult<Vec<ExportProgress>>;
+            async fn get_export_job_metadata(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> StorageResult<ExportJobMetadata>;
+            async fn get_export_file_metadata(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+                part: &str,
+            ) -> StorageResult<ExportFileMetadata>;
+            async fn count_active_exports(tenant: &TenantContext) -> StorageResult<u64>;
+            async fn count_exports_by_status(
+                tenant: &TenantContext,
+                status: ExportStatus,
+            ) -> StorageResult<u64>, count = export_job_calls;
+            async fn list_expired_exports(
+                now: DateTime<Utc>,
+                output_ttl: StdDuration,
+                limit: u32,
+            ) -> StorageResult<Vec<ExpiredExportRef>>;
+        }
+    }
+
+    forward_job_store! {
+        ExportWorkerStorage {
+            async fn get_export_job_for_worker(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+                worker_id: &WorkerId,
+                fencing_token: u64,
+            ) -> Result<WorkerJobView, LeaseError>;
+            async fn mark_export_in_progress(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+                worker_id: &WorkerId,
+                fencing_token: u64,
+            ) -> Result<(), LeaseError>;
+            async fn update_export_type_progress(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+                worker_id: &WorkerId,
+                fencing_token: u64,
+                progress: &TypeExportProgress,
+            ) -> Result<(), LeaseError>;
+            async fn set_export_current_type(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+                worker_id: &WorkerId,
+                fencing_token: u64,
+                current_type: Option<&str>,
+                types_done: u32,
+                types_total: u32,
+            ) -> Result<(), LeaseError>;
+            async fn record_export_file(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+                worker_id: &WorkerId,
+                fencing_token: u64,
+                part: &FinalizedPart,
+                file_type: &str,
+            ) -> Result<(), LeaseError>;
+            async fn finish_export_job(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+                worker_id: &WorkerId,
+                fencing_token: u64,
+            ) -> Result<(), LeaseError>;
+            async fn fail_export_job(
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+                worker_id: &WorkerId,
+                fencing_token: u64,
+                error_message: &str,
+            ) -> Result<(), LeaseError>;
+        }
+    }
+
+    forward_job_store! {
+        ExportClaimStrategy {
+            async fn claim_next(
+                worker_id: &WorkerId,
+                lease_duration: StdDuration,
+                max_attempts: u32,
+            ) -> StorageResult<Option<ExportJobLease>>;
+            async fn heartbeat(lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError>;
+            async fn release(lease: ExportJobLease) -> StorageResult<bool>;
+        }
+    }
+
+    forward_job_store! {
+        BulkSubmitProvider {
+            async fn create_submission(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+                metadata: Option<Value>,
+            ) -> StorageResult<SubmissionSummary>;
+            async fn get_submission(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+            ) -> StorageResult<Option<SubmissionSummary>>;
+            async fn list_submissions(
+                tenant: &TenantContext,
+                submitter: Option<&str>,
+                status: Option<SubmissionStatus>,
+                limit: u32,
+                offset: u32,
+            ) -> StorageResult<Vec<SubmissionSummary>>;
+            async fn complete_submission(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+            ) -> StorageResult<()>;
+            async fn abort_submission(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+                reason: &str,
+            ) -> StorageResult<u64>;
+            async fn add_manifest(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                manifest_url: Option<&str>,
+                replaces_manifest_url: Option<&str>,
+            ) -> StorageResult<SubmissionManifest>;
+            async fn get_manifest(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                manifest_id: &str,
+            ) -> StorageResult<Option<SubmissionManifest>>;
+            async fn list_manifests(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+            ) -> StorageResult<Vec<SubmissionManifest>>;
+            async fn process_entries(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                manifest_id: &str,
+                entries: Vec<NdjsonEntry>,
+                options: &BulkProcessingOptions,
+            ) -> StorageResult<Vec<BulkEntryResult>>;
+            async fn get_entry_results_page(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                manifest_id: &str,
+                outcome_filter: Option<BulkEntryOutcome>,
+                limit: u32,
+                continuation: Option<&EntryResultContinuation>,
+            ) -> StorageResult<EntryResultPage>;
+            async fn get_entry_counts(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                manifest_id: &str,
+            ) -> StorageResult<EntryCountSummary>;
+            async fn mark_entries_unindexed(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                manifest_id: &str,
+                entries: &[UnindexedEntry],
+            ) -> StorageResult<u64>;
+        }
+    }
+
+    forward_job_store! {
+        StreamingBulkSubmitProvider {
+            async fn process_ndjson_stream(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                manifest_id: &str,
+                resource_type: &str,
+                reader: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+                options: &BulkProcessingOptions,
+            ) -> StorageResult<StreamProcessingResult>;
+        }
+    }
+
+    forward_job_store! {
+        BulkSubmitRollbackProvider {
+            async fn record_change(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                change: &SubmissionChange,
+            ) -> StorageResult<()>;
+            async fn list_changes(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                limit: u32,
+                offset: u32,
+            ) -> StorageResult<Vec<SubmissionChange>>;
+            async fn rollback_change(
+                tenant: &TenantContext,
+                submission_id: &SubmissionId,
+                change: &SubmissionChange,
+            ) -> StorageResult<bool>;
+        }
+    }
+
+    forward_job_store! {
+        SubmitWorkerStorage {
+            async fn get_manifest_for_worker(
+                lease: &ManifestLease,
+            ) -> Result<ManifestWorkerView, LeaseError>;
+            async fn mark_manifest_processing(lease: &ManifestLease) -> Result<(), LeaseError>;
+            async fn add_manifest_progress(
+                lease: &ManifestLease,
+                processed_delta: u64,
+                failed_delta: u64,
+                lines_delta: u64,
+            ) -> Result<(), LeaseError>;
+            async fn update_manifest_bytes(
+                lease: &ManifestLease,
+                bytes_processed: u64,
+                bytes_total: u64,
+            ) -> Result<(), LeaseError>;
+            async fn update_manifest_phase(
+                lease: &ManifestLease,
+                phase: ManifestPhase,
+                files_done: u64,
+                files_total: u64,
+            ) -> Result<(), LeaseError>;
+            async fn record_output_file_done(
+                lease: &ManifestLease,
+                file_url: &str,
+            ) -> Result<(), LeaseError>;
+            async fn record_submit_file(
+                lease: &ManifestLease,
+                file: &SubmitFileRecord,
+            ) -> Result<(), LeaseError>;
+            async fn publish_manifest_artifacts(
+                lease: &ManifestLease,
+                files: &[SubmitFileRecord],
+                terminal: ManifestPublicationStatus,
+            ) -> Result<ManifestPublicationResult, LeaseError>;
+            async fn finish_manifest(lease: &ManifestLease) -> Result<(), LeaseError>;
+            async fn fail_manifest(
+                lease: &ManifestLease,
+                error_message: &str,
+            ) -> Result<(), LeaseError>;
+            async fn set_manifest_fetch_params(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+                manifest_id: &str,
+                params: ManifestFetchParams<'_>,
+            ) -> StorageResult<()>;
+            async fn replace_manifest_by_url(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+                manifest_url: &str,
+            ) -> StorageResult<Vec<String>>;
+            async fn set_submission_kickoff_meta(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+                owner_subject: Option<&str>,
+                request_url: &str,
+                requires_access_token: bool,
+            ) -> StorageResult<()>;
+            async fn ensure_poll_token(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+            ) -> StorageResult<String>;
+            async fn resolve_poll_token(token: &str) -> StorageResult<Option<PollTokenTarget>>;
+            async fn clear_poll_token(tenant: &TenantContext, id: &SubmissionId) -> StorageResult<()>;
+            async fn list_submit_files(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+            ) -> StorageResult<Vec<SubmitFileRow>>;
+            async fn delete_submission_artifacts(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+            ) -> StorageResult<()>;
+            async fn count_active_submissions(
+                tenant: &TenantContext,
+            ) -> StorageResult<u64>, count = submit_job_calls;
+            async fn list_expired_submissions(
+                now: DateTime<Utc>,
+                ttl: StdDuration,
+                limit: u32,
+            ) -> StorageResult<Vec<(TenantContext, SubmissionId)>>;
+            async fn ensure_transaction_time(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+            ) -> StorageResult<DateTime<Utc>>;
+        }
+    }
+
+    forward_job_store! {
+        SubmitClaimStrategy {
+            async fn claim_next_manifest(
+                worker_id: &WorkerId,
+                lease_duration: StdDuration,
+            ) -> StorageResult<Option<ManifestLease>>;
+            async fn heartbeat(lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError>;
+            async fn release(lease: ManifestLease) -> StorageResult<bool>;
         }
     }
 
@@ -4505,6 +5046,136 @@ mod tests {
         }
     }
 
+    /// Disabling the UI starts no dashboard storage work, even if a caller
+    /// queues tenant/ring/job refreshes and several reconcile intervals pass.
+    #[tokio::test(start_paused = true)]
+    async fn disabled_ui_starts_no_dashboard_storage_work() {
+        let storage = InstrumentedStorage::over(sqlite());
+        populate(storage.as_ref(), &[("Patient", 1)]).await;
+        let counters = isolated_counters();
+        let config = ServerConfig {
+            ui_enabled: false,
+            dashboard_reconcile_interval_secs: 1,
+            ..test_config()
+        };
+        let provider = Arc::new(
+            StorageDashboardProvider::new(Arc::clone(&storage), &config)
+                .with_counters(Arc::clone(&counters))
+                .with_job_stores(
+                    Some(Arc::clone(&storage) as Arc<dyn BulkExportJobStore>),
+                    Some(Arc::clone(&storage) as Arc<dyn BulkSubmitJobStore>),
+                ),
+        );
+
+        spawn_reconcile_loop(&provider, config.ui_enabled);
+        assert!(provider.reconcile_task.get().is_none());
+        assert_eq!(storage.dashboard_reads(), [0; 7], "no startup reads");
+
+        let snapshot = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert_eq!(snapshot.figures, Figures::Pending);
+        assert_eq!(queued_tenants(&provider), vec!["default".to_string()]);
+        provider.enqueue_ring_seed("default", "Patient", DashboardWindow::LastHour);
+        assert!(!lock(&provider.seeds.rings).is_empty());
+        assert!(!lock(&provider.seeds.job_counts).is_empty());
+
+        for _ in 0..3 {
+            tokio::time::advance(StdDuration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                storage.dashboard_reads(),
+                [0; 7],
+                "no totals, history, marker or job probes after an interval"
+            );
+        }
+        assert!(!counters.is_seeded("default"));
+        assert!(provider.reconcile_task.get().is_none());
+    }
+
+    /// The production startup entry still seeds the default tenant, refreshes
+    /// wired job stores after a snapshot and keeps reconciling with UI enabled.
+    #[tokio::test]
+    async fn enabled_ui_seeds_and_reconciles_dashboard_storage() {
+        let storage = InstrumentedStorage::over(sqlite());
+        populate(storage.as_ref(), &[("Patient", 1)]).await;
+        let counters = isolated_counters();
+        let config = ServerConfig {
+            dashboard_reconcile_interval_secs: 1,
+            ..test_config()
+        };
+        assert!(config.ui_enabled);
+        let provider = Arc::new(
+            StorageDashboardProvider::new(Arc::clone(&storage), &config)
+                .with_counters(Arc::clone(&counters))
+                .with_job_stores(
+                    Some(Arc::clone(&storage) as Arc<dyn BulkExportJobStore>),
+                    Some(Arc::clone(&storage) as Arc<dyn BulkSubmitJobStore>),
+                ),
+        );
+
+        spawn_reconcile_loop(&provider, config.ui_enabled);
+        assert!(provider.reconcile_task.get().is_some());
+        assert!(
+            eventually(|| {
+                counters.is_seeded("default") && all_rings_exact(&counters, &["Patient"])
+            })
+            .await,
+            "the production entry seeds totals and every history window"
+        );
+        assert!(storage.totals_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(storage.grouped_history_calls(), DashboardWindow::ALL.len());
+        assert_eq!(storage.per_type_history_calls(), 0);
+        assert!(storage.marker_calls.load(Ordering::SeqCst) >= 2);
+
+        let snapshot = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert_eq!(snapshot.total_resources, 1);
+        assert!(snapshot.figures.is_known());
+        assert!(
+            eventually(|| {
+                storage.export_job_calls.load(Ordering::SeqCst) >= 2
+                    && storage.submit_job_calls.load(Ordering::SeqCst) >= 1
+                    && lock(&provider.job_counts)
+                        .get("default")
+                        .is_some_and(|entry| entry.export.is_some() && entry.import == Some(0))
+            })
+            .await,
+            "the background loop refreshes both wired job stores"
+        );
+        // Later real intervals probe the write marker, but an exact tenant
+        // whose marker has not moved is not recounted (#2107)…
+        let totals = storage.totals_calls.load(Ordering::SeqCst);
+        let markers = storage.marker_calls.load(Ordering::SeqCst);
+        assert!(
+            eventually(|| storage.marker_calls.load(Ordering::SeqCst) > markers).await,
+            "a later real interval probes the write marker"
+        );
+        assert_eq!(
+            storage.totals_calls.load(Ordering::SeqCst),
+            totals,
+            "an unchanged marker needs no recount"
+        );
+        // …until storage changes behind the counters.
+        create_in(storage.inner.as_ref(), "Patient").await;
+        assert!(
+            eventually(|| storage.totals_calls.load(Ordering::SeqCst) > totals).await,
+            "a later real interval recounts the changed tenant"
+        );
+        let snapshot = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert_eq!(snapshot.import_jobs_active, Some(0));
+        assert_eq!(
+            snapshot.export_jobs,
+            Some(ExportJobCounts {
+                running: 0,
+                queued: 0,
+            })
+        );
+    }
+
     /// The reconcile loop seeds the default tenant at startup, loads a ring a
     /// page load queued promptly (woken, not at its next tick), and stops once
     /// its provider is gone — so repeated `build_app` calls never leave loops
@@ -5015,6 +5686,107 @@ mod tests {
         );
     }
 
+    /// #2107: a due totals reconcile of an exact tenant whose write marker has
+    /// not moved since its count reads nothing — the count would only confirm
+    /// the figures. A recorded write or a moved marker still re-reads them.
+    #[tokio::test]
+    async fn exact_totals_with_an_unchanged_marker_are_not_recounted() {
+        let storage = InstrumentedStorage::over(sqlite());
+        create_in(storage.as_ref(), "Patient").await;
+        let marker = |millis: i64| {
+            Some(WriteMarker {
+                latest: DateTime::from_timestamp_millis(millis),
+                recent_writes: None,
+            })
+        };
+        storage.set_marker(marker(1_000));
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(Arc::clone(&counters));
+        let mut schedule = schedule();
+        provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        provider.drain_pending_seeds(&mut schedule).await;
+        let totals = || storage.totals_calls.load(Ordering::SeqCst);
+        assert_eq!(totals(), 1);
+
+        // Due, exact, marker unchanged: probed, not counted.
+        schedule.force_due("default");
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.totals_unchanged, strings(&["default"]));
+        assert!(report.reconciled.is_empty() && report.not_due.is_empty());
+        assert_eq!(totals(), 1);
+        assert_eq!(report.rings_seeded, 0);
+
+        // A write this process recorded: the totals are re-read.
+        counters.record("default", "Patient", 1, Utc::now());
+        create_in(storage.inner.as_ref(), "Patient").await;
+        schedule.force_due("default");
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.reconciled, strings(&["default"]));
+        assert_eq!(totals(), 2);
+
+        // Exact again; a marker moved by another instance is re-read too.
+        create_in(storage.inner.as_ref(), "Patient").await;
+        storage.set_marker(marker(2_000));
+        schedule.force_due("default");
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.external_changes, strings(&["default"]));
+        assert_eq!(report.reconciled, strings(&["default"]));
+        assert_eq!(totals(), 3);
+        let snapshot = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert_eq!(snapshot.total_resources, 3);
+    }
+
+    /// #2107: a window whose grouped history read is slow is not re-read for
+    /// [`RECONCILE_DUTY_FACTOR`] times its duration, even when its rings are
+    /// inexact; once that pause has passed it is.
+    #[tokio::test]
+    async fn slow_history_windows_are_reseeded_on_their_duty_cycle() {
+        let storage = InstrumentedStorage::over(sqlite());
+        create_in(storage.as_ref(), "Patient").await;
+        let marker = |millis: i64| {
+            Some(WriteMarker {
+                latest: DateTime::from_timestamp_millis(millis),
+                recent_writes: None,
+            })
+        };
+        storage.set_marker(marker(1_000));
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(Arc::clone(&counters));
+        // Every read takes 50 ms, so a window is held back for 500 ms: longer
+        // than the 100 ms interval.
+        storage.delay_ms.store(50, Ordering::SeqCst);
+        let mut schedule = ReconcileSchedule::new(StdDuration::from_millis(100));
+        provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        let report = provider.drain_pending_seeds(&mut schedule).await;
+        assert_eq!(report.rings_seeded, DashboardWindow::ALL.len());
+        let history = storage.grouped_history_calls();
+
+        // Another instance writes: the totals are re-read at once, but the
+        // inexact rings wait for their windows' duty cycle.
+        create_in(storage.inner.as_ref(), "Patient").await;
+        storage.set_marker(marker(2_000));
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.reconciled, strings(&["default"]));
+        assert_eq!(report.rings_seeded, 0);
+        assert_eq!(report.rings_not_due, DashboardWindow::ALL.len());
+        assert_eq!(storage.grouped_history_calls(), history);
+        assert!(!all_rings_exact(&counters, &["Patient"]));
+
+        tokio::time::sleep(StdDuration::from_millis(600)).await;
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.rings_seeded, DashboardWindow::ALL.len());
+        assert_eq!(report.rings_not_due, 0);
+        assert!(all_rings_exact(&counters, &["Patient"]));
+    }
+
     /// #1078 decision (e): a pass visits at most its budget of tenants, most
     /// recently viewed first, and the tenants it skipped go first next pass.
     /// Even with the budget spent, the first seed of a tenant someone just
@@ -5042,6 +5814,11 @@ mod tests {
             provider
                 .snapshot(DashboardWindow::LastHour, tenant, &[], false)
                 .await;
+        }
+        // A recorded write each, so every due tenant's totals are re-read
+        // (an exact one with an unchanged marker would not be, #2107).
+        for tenant in ["a", "b", "c"] {
+            counters.record(tenant, "Patient", 1, Utc::now());
         }
         let mut schedule = schedule();
         schedule.max_tenants_per_pass = 2;

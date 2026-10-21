@@ -1093,7 +1093,14 @@ falls through to the normal REST surface.
   write. Tenant-derived keys live under a reserved `byTenant` map so a tenant
   purge can reach them. The server renders the "Recently used" group from
   `recent` on every rail but Compartments — its 4-5 definitions make a group
-  noise, so it remembers only `last`; with no settings store configured, there
+  noise, so it remembers only `last`. The rail's filter box narrows that group
+  together with the list below it (a term matching nothing hides the group);
+  the SQL rails and Search Parameters filter as you type (htmx, 300 ms
+  debounce; the term is trimmed server-side; on the SQL rails typing never
+  prompts over an unsaved draft and never records a selection) and Enter
+  still applies it
+  without JavaScript. With no settings
+  store configured, there
   is nothing to render and every rail opens on its page default instead. The
   async export workspaces' job lists live there too —
   `byTenant.<tenant>.bulkExport.jobs` and `byTenant.<tenant>.sqlExport.jobs` —
@@ -1155,7 +1162,11 @@ falls through to the normal REST surface.
   `sql_export.rs`), so the detail page's Output files table survives the
   reaper and a server restart the same way the list does — the one exception
   being the download links themselves, which expire with whatever the storage
-  backend's presigned-URL TTL is. Only a job still `in-progress` triggers a
+  backend's presigned-URL TTL is. Locations under the server's own
+  `HFS_BASE_URL` are stored as same-origin paths, so they survive a reverse
+  proxy or a different port (#833); any other location, such as an S3
+  pre-signed URL under `HFS_EXPORT_SINK=s3`, is stored and linked verbatim
+  (#2050). Only a job still `in-progress` triggers a
   poll: one when the page (or its htmx fragment) renders, exactly like the
   list. An id belonging to another user or tenant is a `404` rendered by the
   shared `pages/not-found.html`/`render_not_found` helper (`crates/ui/src/
@@ -1170,7 +1181,8 @@ forms' Since presets (#1836). Pass parallel value and localized-label arrays.
 The native select remains enabled and named as the sole successful form control,
 including an empty value; the unnamed `type="button"` trigger and popup are only
 an enhancement. Labels and live selectedness come from the select, and choosing
-an option emits its bubbling native `change` event, preserving page validation.
+an option emits bubbling native `input` then `change` events once, preserving
+builder updates and page validation.
 The trigger's accessible name includes the field label and current choice.
 
 The selected marker is independent of keyboard navigation. Arrow keys, Home/End
@@ -1181,6 +1193,41 @@ visible value. Mounting is idempotent for live elements and remounts cloned HTMX
 fragments. The select is hidden only after setup succeeds; partial setup rolls
 back its listeners and popup so the native fallback stays usable. Fixed mode
 uses the shared popup and theme tokens without changing lookup/chip behavior.
+
+Existing or dynamically created single SELECTs opt in through
+`HfsCombobox.adopt(select, { available? })`, or a `data-combobox-select` attribute
+followed by `HfsCombobox.install(scope)`. Adoption preserves the SELECT's id,
+business classes, name, form association and labels. The visible button carries
+`data-combobox-trigger`; do not copy business selector classes onto it. The
+returned handle has `root`, `trigger`, `focus()`, `refresh(options?)` and
+`destroy()`; adoption is idempotent and returns `null` if setup fails, retaining
+the native fallback. An initially empty SELECT mounts safely with its trigger
+disabled until options arrive.
+
+After changing options, `.value` or `.disabled` programmatically, call
+`HfsCombobox.refresh(select, { available? })`. It adopts an unmounted SELECT,
+otherwise updates its existing handle, closes stale options and emits no business
+events. `available` controls the entire composition and is retained when omitted;
+it is separate from the SELECT's technical `hidden` state after enhancement.
+Pass applicability through this argument instead of writing `select.hidden` once
+adopted. A disabled source is checked again before opening or selecting, including
+while a popup is already open. Reset and page restoration keep their existing
+native `change` notifications for Since's dependent Custom field.
+
+Fixed popups stay inside their DOM owner and use viewport positioning to escape
+scrollable editor clipping while retaining modal ownership. They flip above when
+needed, cap height/width to available room, scroll their own options and close on
+an external scroll that moves the anchor, or on resize. A queued scroll whose
+anchor already settled before opening does not dismiss the list. Open-popup
+Escape is consumed before an enclosing
+Add Element picker or Resources modal handles the next Escape. Call
+`HfsCombobox.destroy(scopeOrSelect)` before manual subtree replacement/removal,
+and `install()` after inserting server markup; HTMX cleanup/swaps do these steps
+automatically. Destruction removes fixed listeners, cancels pending reset work
+and restores the fallback, unwrapping generated compositions. Lookup/chip
+comboboxes retain their separate transport and selection lifecycle. Adopted
+compositions accept the shared CSS variables `--combobox-width`,
+`--combobox-height` and `--combobox-font-size` for compact contexts.
 
 ### Internationalization
 

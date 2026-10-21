@@ -579,6 +579,61 @@ async fn subsumes_subsumed_by_returns_correct_outcome() {
     assert_eq!(resp.outcome, SubsumptionOutcome::SubsumedBy);
 }
 
+/// Re-importing an existing CodeSystem must leave its closure populated: the
+/// write deletes the closure, and it used to be rebuilt only at the next
+/// startup, so closure-backed `is-a` expansion found nothing in between
+/// (#2128). (PostgreSQL `$subsumes` walks `concept_hierarchy` directly, so it
+/// cannot observe this; count the rows instead.)
+#[tokio::test]
+async fn closure_survives_reimport() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("closure-reimport");
+    let system = format!("{base}cs");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem",
+            "id": format!("cs-{uid}"),
+            "url": system,
+            "name": "HierCS",
+            "status": "active",
+            "content": "complete",
+            "hierarchyMeaning": "is-a",
+            "concept": [{
+                "code": "A", "display": "A",
+                "concept": [{"code": "A.0", "display": "A.0"}]
+            }]
+        }}]
+    });
+    let bytes = serde_json::to_vec(&bundle).unwrap();
+    let closure_rows = || async {
+        let client = backend.pool().get().await.unwrap();
+        client
+            .query_one(
+                "SELECT COUNT(*) FROM concept_closure cc
+                 JOIN code_systems s ON s.id = cc.system_id
+                 WHERE s.url = $1",
+                &[&system],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+    };
+
+    // (A, A), (A.0, A.0), (A, A.0)
+    backend.import_bundle(&ctx(), &bytes).await.unwrap();
+    assert_eq!(closure_rows().await, 3);
+
+    backend.import_bundle(&ctx(), &bytes).await.unwrap();
+    assert_eq!(
+        closure_rows().await,
+        3,
+        "re-import must rebuild the closure it deletes"
+    );
+}
+
 #[tokio::test]
 async fn subsumes_not_subsumed_returns_correct_outcome() {
     let backend = fresh_backend().await;
@@ -1043,6 +1098,149 @@ async fn expand_hierarchical_returns_nested_tree() {
     assert_eq!(b.code, "B");
     assert!(!b.contains.is_empty(), "B should have children");
     assert_eq!(b.contains[0].code, "C");
+}
+
+/// `concept_hierarchy` is not acyclic (SNOMED RF2 leaves mutual parent/child
+/// pairs behind). Tree-mode `$expand` used to recurse across such a pair until
+/// the stack overflowed, aborting the process. Mirrors the SQLite unit tests in
+/// `backends::hierarchy`; this one proves the shared builder is actually wired
+/// into the PostgreSQL path.
+#[tokio::test]
+async fn expand_hierarchical_terminates_on_cyclic_hierarchy() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("exp-cycle");
+
+    // root → a, plus the mutual pair a ⇄ b, expressed with `parent` properties
+    // because nested `concept` cannot describe a cycle.
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
+                "url": format!("{base}cs"), "name": "CycleCS",
+                "status": "active", "content": "complete",
+                "hierarchyMeaning": "is-a",
+                "property": [{"code": "parent",
+                    "uri": "http://hl7.org/fhir/concept-properties#parent",
+                    "type": "code"}],
+                "concept": [
+                    {"code": "root", "display": "root"},
+                    {"code": "a", "display": "a", "property": [
+                        {"code": "parent", "valueCode": "root"},
+                        {"code": "parent", "valueCode": "b"}]},
+                    {"code": "b", "display": "b", "property": [
+                        {"code": "parent", "valueCode": "a"}]}
+                ]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": format!("vs-{uid}"),
+                "url": format!("{base}vs"), "name": "CycleVS",
+                "status": "active",
+                "compose": {"include": [{"system": format!("{base}cs")}]}
+            }}
+        ]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                hierarchical: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // root → a → b; b's edge back to a closes the cycle and is dropped.
+    assert_eq!(resp.contains.len(), 1, "{:?}", resp.contains);
+    let root = &resp.contains[0];
+    assert_eq!(root.code, "root");
+    assert_eq!(root.contains.len(), 1);
+    assert_eq!(root.contains[0].code, "a");
+    assert_eq!(root.contains[0].contains.len(), 1);
+    assert_eq!(root.contains[0].contains[0].code, "b");
+    assert!(root.contains[0].contains[0].contains.is_empty());
+}
+
+/// Re-importing a CodeSystem that reverses an edge must replace the old edge
+/// instead of keeping both, which would make the pair each other's parent
+/// (#2129).
+#[tokio::test]
+async fn reimport_replaces_reversed_hierarchy_edge() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("reimport-edge");
+
+    // `(code, parent)` pairs → bundle with the CodeSystem and an all-codes VS.
+    let bundle = |concepts: &[(&str, Option<&str>)]| {
+        let concepts: Vec<serde_json::Value> = concepts
+            .iter()
+            .map(|(code, parent)| match parent {
+                Some(p) => serde_json::json!({"code": code, "display": code,
+                    "property": [{"code": "parent", "valueCode": p}]}),
+                None => serde_json::json!({"code": code, "display": code}),
+            })
+            .collect();
+        serde_json::json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
+                    "url": format!("{base}cs"), "name": "ReimportCS",
+                    "status": "active", "content": "complete",
+                    "hierarchyMeaning": "is-a",
+                    "property": [{"code": "parent",
+                        "uri": "http://hl7.org/fhir/concept-properties#parent",
+                        "type": "code"}],
+                    "concept": concepts
+                }},
+                {"resource": {
+                    "resourceType": "ValueSet", "id": format!("vs-{uid}"),
+                    "url": format!("{base}vs"), "name": "ReimportVS",
+                    "status": "active",
+                    "compose": {"include": [{"system": format!("{base}cs")}]}
+                }}
+            ]
+        })
+    };
+
+    // root → P → C, then re-imported as root → C → P.
+    for concepts in [
+        [("root", None), ("P", Some("root")), ("C", Some("P"))],
+        [("root", None), ("C", Some("root")), ("P", Some("C"))],
+    ] {
+        backend
+            .import_bundle(&ctx(), &serde_json::to_vec(&bundle(&concepts)).unwrap())
+            .await
+            .unwrap();
+    }
+
+    let resp = backend
+        .expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(format!("{base}vs")),
+                hierarchical: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // With the stale root>P and P>C edges left behind, root would have both
+    // C and P as children.
+    assert_eq!(resp.contains.len(), 1, "{:?}", resp.contains);
+    let root = &resp.contains[0];
+    assert_eq!(root.code, "root");
+    assert_eq!(root.contains.len(), 1, "{:?}", root.contains);
+    assert_eq!(root.contains[0].code, "C");
+    assert_eq!(root.contains[0].contains.len(), 1);
+    assert_eq!(root.contains[0].contains[0].code, "P");
 }
 
 #[tokio::test]
@@ -2032,7 +2230,7 @@ LP7786-3.LP10156-0.718-7,3,LP10156-0,718-7,Hemoglobin\r\n";
     let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
     {
         let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-        let opts = zip::write::FileOptions::default();
+        let opts = zip::write::SimpleFileOptions::default();
         zip.start_file("LoincTable.csv", opts).unwrap();
         zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
         zip.start_file("MultiAxialHierarchy.csv", opts).unwrap();
@@ -2485,4 +2683,163 @@ async fn compose_ops_enumerated_include_with_whole_system_exclude_and_count() {
     )
     .await;
     assert_eq!(filtered, vec!["B"]);
+}
+
+// ── is-a / descendent-of / is-not-a / generalizes on dotted codes (#2114) ────
+// Parity with the SQLite unit tests: ICD-10-CM style codes such as `E11.6` are
+// not valid ECL concept ids. PG resolves these filters with closure-table SQL,
+// never the ECL parser, so this pins that it keeps working for dotted codes.
+// The `with_prior_filter` cases also exercise `concept in`, which PG used to
+// treat as a lookup of a property literally named `concept`.
+
+async fn dotted_setup(backend: &PostgresTerminologyBackend, base: &str, uid: &str) -> String {
+    let cs = format!("{base}cs-dotted");
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem", "id": format!("cs-dotted-{uid}"),
+            "url": cs, "status": "active", "content": "complete",
+            "concept": [
+                {"code": "E11", "display": "Type 2 diabetes mellitus", "concept": [
+                    {"code": "E11.6", "display": "With other specified complications", "concept": [
+                        {"code": "E11.65", "display": "With hyperglycemia"},
+                        {"code": "E11.69", "display": "With other specified complication"}
+                    ]},
+                    {"code": "E11.9", "display": "Without complications"}
+                ]},
+                {"code": "E10", "display": "Type 1 diabetes mellitus"}
+            ]
+        }}]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+    cs
+}
+
+async fn dotted_expand(filters: serde_json::Value) -> Vec<String> {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("dotted");
+    let cs = dotted_setup(&backend, &base, &uid).await;
+    compose_ops_expand(
+        &backend,
+        serde_json::json!({"include": [{"system": cs, "filter": filters}]}),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn dotted_code_is_a_without_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "is-a", "value": "E11.6"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E11.6", "E11.65", "E11.69"]);
+}
+
+#[tokio::test]
+async fn dotted_code_descendent_of_without_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "descendent-of", "value": "E11.6"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E11.65", "E11.69"]);
+}
+
+#[tokio::test]
+async fn dotted_code_is_not_a_without_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "is-not-a", "value": "E11.6"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E10", "E11", "E11.9"]);
+}
+
+#[tokio::test]
+async fn dotted_code_generalizes_without_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "generalizes", "value": "E11.65"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
+}
+
+#[tokio::test]
+async fn dotted_code_is_a_with_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+        {"property": "concept", "op": "is-a", "value": "E11.6"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E11.6", "E11.65"]);
+}
+
+#[tokio::test]
+async fn dotted_code_descendent_of_with_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+        {"property": "concept", "op": "descendent-of", "value": "E11.6"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E11.65"]);
+}
+
+#[tokio::test]
+async fn dotted_code_is_not_a_with_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+        {"property": "concept", "op": "is-not-a", "value": "E11.6"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E10", "E11"]);
+}
+
+#[tokio::test]
+async fn dotted_code_generalizes_with_prior_filter() {
+    let codes = dotted_expand(serde_json::json!([
+        {"property": "concept", "op": "in", "value": "E11,E11.6,E11.65,E10"},
+        {"property": "concept", "op": "generalizes", "value": "E11.65"}
+    ]))
+    .await;
+    assert_eq!(codes, vec!["E11", "E11.6", "E11.65"]);
+}
+
+#[tokio::test]
+async fn compose_ops_in_on_concept_matches_codes() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-in");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    for (property, value, expected) in [
+        ("concept", "A1,B", vec!["A1", "B"]),
+        ("code", "A1,B", vec!["A1", "B"]),
+        ("concept", "A", vec!["A"]),
+    ] {
+        let codes = compose_ops_expand(
+            &backend,
+            serde_json::json!({"include": [{"system": cs,
+                "filter": [{"property": property, "op": "in", "value": value}]}]}),
+            None,
+        )
+        .await;
+        assert_eq!(codes, expected, "{property} in {value}");
+    }
+}
+
+#[tokio::test]
+async fn compose_ops_not_in_on_concept_excludes_codes() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cops-notin");
+    let cs = compose_ops_setup(&backend, &base, &uid).await;
+    for (value, expected) in [("A,A1", vec!["B", "ROOT"]), ("B", vec!["A", "A1", "ROOT"])] {
+        let codes = compose_ops_expand(
+            &backend,
+            serde_json::json!({"include": [{"system": cs,
+                "filter": [{"property": "concept", "op": "not-in", "value": value}]}]}),
+            None,
+        )
+        .await;
+        assert_eq!(codes, expected, "concept not-in {value}");
+    }
 }

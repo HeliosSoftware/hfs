@@ -291,11 +291,18 @@ where
             helios_observability::middleware::track,
         ))
         .layer(cors)
+        // `POST /import?finalize=true` stops waiting on its closure rebuild
+        // after `AppState::import_finalize_wait` (20 s) and answers 202, so
+        // keep that below this limit if either changes.
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
         ))
-        .layer(TraceLayer::new_for_http())
+        // Method and path only: the default span logs the query string (#2149).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(helios_observability::middleware::request_span),
+        )
 }
 
 /// Recursively size a directory in bytes. Small utility used at HTS-UI

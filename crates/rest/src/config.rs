@@ -26,7 +26,7 @@
 //! | `HFS_NL_SEARCH_RATE_WINDOW_SECS` | 60 | Rate-limit window size (seconds) |
 //! | `HFS_NL_SEARCH_DAILY_LIMIT` | 200 | NL search requests per key per UTC day (slow-drip backstop) |
 //! | `HFS_NL_SEARCH_MAX_CHARS` | 500 | Maximum accepted input length (characters) |
-//! | `HFS_DEFAULT_FHIR_VERSION` | R4 | Default FHIR version (R4, R4B, R5, R6) |
+//! | `HFS_DEFAULT_FHIR_VERSION` | R4 (a build without R4 uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version (R4, R4B, R5, R6) |
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
@@ -63,9 +63,11 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use helios_fhir::FhirVersion;
+use helios_observability::redact::redact_url;
 use helios_persistence::BackendKind;
+use helios_persistence::core::database_url::redact_database_url;
 
 /// Storage backend mode.
 ///
@@ -607,7 +609,8 @@ impl ValidationConfig {
 /// HFS acts as the Data Consumer: it accepts submissions, fetches the referenced
 /// manifests/files, ingests them, and serves a status manifest whose
 /// `output`/`outcome`/`deleted` artifacts are written to the output store below.
-#[derive(Debug, Clone)]
+// `Debug` is hand-written below: it redacts the private and decryption keys.
+#[derive(Clone)]
 pub struct BulkSubmitConfig {
     /// Master switch — when `false`, the `$bulk-submit` endpoints return `501`.
     pub enabled: bool,
@@ -774,6 +777,90 @@ pub struct BulkSubmitConfig {
     pub poll_rate_limit: u32,
     /// Sliding window for [`Self::poll_rate_limit`], in seconds.
     pub poll_rate_window_secs: u64,
+}
+
+/// Prints the keys as `[redacted]` (#2149). Destructures every field, so a
+/// new field fails to compile until it is listed here.
+impl fmt::Debug for BulkSubmitConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            enabled,
+            output_backend,
+            output_dir,
+            s3_bucket,
+            requires_access_token,
+            file_url_ttl_secs,
+            output_ttl_secs,
+            worker_concurrency,
+            file_concurrency,
+            defer_indexing,
+            bulk_index_rebuild,
+            disable_local_worker,
+            max_concurrent_per_tenant,
+            batch_size,
+            fetch_read_timeout_secs,
+            skip_unchanged,
+            index_queue,
+            index_concurrency,
+            index_coalesce,
+            index_max_wait_secs,
+            index_page_bytes,
+            lease_duration_secs,
+            heartbeat_interval_secs,
+            cleanup_interval_secs,
+            block_concurrent_submission,
+            client_id,
+            private_key,
+            signing_alg,
+            decryption_key,
+            outbound_scope,
+            retry_after_secs,
+            pre_ingest_retry_after_secs,
+            manifest_page_size,
+            poll_rate_limit,
+            poll_rate_window_secs,
+        } = self;
+        f.debug_struct("BulkSubmitConfig")
+            .field("enabled", enabled)
+            .field("output_backend", output_backend)
+            .field("output_dir", output_dir)
+            .field("s3_bucket", s3_bucket)
+            .field("requires_access_token", requires_access_token)
+            .field("file_url_ttl_secs", file_url_ttl_secs)
+            .field("output_ttl_secs", output_ttl_secs)
+            .field("worker_concurrency", worker_concurrency)
+            .field("file_concurrency", file_concurrency)
+            .field("defer_indexing", defer_indexing)
+            .field("bulk_index_rebuild", bulk_index_rebuild)
+            .field("disable_local_worker", disable_local_worker)
+            .field("max_concurrent_per_tenant", max_concurrent_per_tenant)
+            .field("batch_size", batch_size)
+            .field("fetch_read_timeout_secs", fetch_read_timeout_secs)
+            .field("skip_unchanged", skip_unchanged)
+            .field("index_queue", index_queue)
+            .field("index_concurrency", index_concurrency)
+            .field("index_coalesce", index_coalesce)
+            .field("index_max_wait_secs", index_max_wait_secs)
+            .field("index_page_bytes", index_page_bytes)
+            .field("lease_duration_secs", lease_duration_secs)
+            .field("heartbeat_interval_secs", heartbeat_interval_secs)
+            .field("cleanup_interval_secs", cleanup_interval_secs)
+            .field("block_concurrent_submission", block_concurrent_submission)
+            .field("client_id", client_id)
+            .field("private_key", &private_key.as_ref().map(|_| "[redacted]"))
+            .field("signing_alg", signing_alg)
+            .field(
+                "decryption_key",
+                &decryption_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("outbound_scope", outbound_scope)
+            .field("retry_after_secs", retry_after_secs)
+            .field("pre_ingest_retry_after_secs", pre_ingest_retry_after_secs)
+            .field("manifest_page_size", manifest_page_size)
+            .field("poll_rate_limit", poll_rate_limit)
+            .field("poll_rate_window_secs", poll_rate_window_secs)
+            .finish()
+    }
 }
 
 impl Default for BulkSubmitConfig {
@@ -1075,7 +1162,8 @@ impl BulkSubmitConfig {
 ///
 /// This struct can be constructed from environment variables using [`ServerConfig::from_env`],
 /// from command line arguments using [`ServerConfig::parse`], or programmatically.
-#[derive(Debug, Clone, Parser)]
+// `Debug` is hand-written below: it redacts credentials (#2149).
+#[derive(Clone, Parser)]
 // `long_about = None` keeps `--help` on the one-line `about`: clap would
 // otherwise print this struct's Rust doc comment (a note about constructors
 // that means nothing to an operator) at the top of the help text.
@@ -1176,7 +1264,7 @@ pub struct ServerConfig {
     pub base_url: String,
 
     /// Database connection string.
-    #[arg(long, env = "HFS_DATABASE_URL")]
+    #[arg(long, env = "HFS_DATABASE_URL", hide_env_values = true)]
     pub database_url: Option<String>,
 
     /// Enable request ID tracking.
@@ -1201,11 +1289,19 @@ pub struct ServerConfig {
 
     /// Default FHIR version for operations that need it before request parsing
     /// (e.g., tenant resolution, resource type detection).
+    ///
+    /// Defaults to R4. A build without the `R4` feature has no R4 to fall back
+    /// to: with a single enabled version that version is the default
+    /// (`FhirVersion::default_enabled()`; a literal "R4" default failed to
+    /// parse in such builds, #2064), and with several there is no default, so
+    /// `hfs` refuses to start unless this is set
+    /// ([`ServerConfig::implicit_default_fhir_version_error`]). R5/R6 builds
+    /// always include R4B, so they must set it.
     #[arg(
         long,
         env = "HFS_DEFAULT_FHIR_VERSION",
         value_enum,
-        default_value = "R4"
+        default_value_t = FhirVersion::default_enabled()
     )]
     pub default_fhir_version: FhirVersion,
 
@@ -1247,7 +1343,8 @@ pub struct ServerConfig {
     #[arg(
         long,
         env = "HFS_ELASTICSEARCH_NODES",
-        default_value = "http://localhost:9200"
+        default_value = "http://localhost:9200",
+        hide_env_values = true
     )]
     pub elasticsearch_nodes: String,
 
@@ -1260,12 +1357,14 @@ pub struct ServerConfig {
     pub elasticsearch_username: Option<String>,
 
     /// Elasticsearch basic auth password (optional).
-    #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
+    #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD", hide_env_values = true)]
     pub elasticsearch_password: Option<String>,
 
     /// Elasticsearch index refresh interval (e.g. "1s", "200ms", "-1" to disable
     /// periodic refresh). Controls how quickly indexed documents become
-    /// searchable when no per-write refresh is requested.
+    /// searchable when no per-write refresh is requested. Set on new indices
+    /// when they are created and applied to existing indices at startup. With
+    /// `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` it is the wait of every write.
     #[arg(long, env = "HFS_ELASTICSEARCH_REFRESH_INTERVAL", default_value = "1s")]
     pub elasticsearch_refresh_interval: String,
 
@@ -1392,23 +1491,25 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
 
-    /// Mount the web UI at `/ui`.
+    /// Mount the web UI at `/ui` and run its dashboard's background work.
     ///
     /// On by default. Headless deployments (behind an API gateway, or anywhere
     /// an HTML surface should not listen at all) opt out with
     /// `HFS_UI_ENABLED=false`; `/ui` and everything under it then answer
     /// `404` + OperationOutcome rather than falling through to the FHIR
-    /// router. This replaces the former `headless` *build* feature, which was
-    /// a negative Cargo feature and so was tripped accidentally by
-    /// `--all-features` (see issue #975).
+    /// router, and the Home dashboard performs no startup seed or background
+    /// reconcile storage reads. This replaces the former `headless` *build*
+    /// feature, which was a negative Cargo feature and so was tripped
+    /// accidentally by `--all-features` (see issue #975).
     ///
-    /// Has no effect on a binary built without the `ui` feature — there the UI
-    /// is not compiled in at all and `/ui` always answers `404`.
+    /// A `hfs` binary built without the `ui` feature normalizes this flag to
+    /// `false`: `/ui` always answers `404`, and dashboard background work is
+    /// skipped. The shared REST configuration's default remains `true`.
     #[arg(long, env = "HFS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
 
     /// Seconds between the web UI dashboard's background reconcile passes
-    /// (#1078).
+    /// (#1078). Used only when the web UI is served.
     ///
     /// Each pass re-reads the per-type totals of the tenants that are due and
     /// re-seeds their charted history, so the dashboard's in-memory counters
@@ -1447,7 +1548,7 @@ pub struct ServerConfig {
     /// LLM provider API key for natural-language search. Present makes the
     /// feature functional; absent (with the switch on) leaves the UI in an
     /// advertise/setup state and the endpoint non-functional.
-    #[arg(long, env = "HFS_NL_SEARCH_API_KEY")]
+    #[arg(long, env = "HFS_NL_SEARCH_API_KEY", hide_env_values = true)]
     pub nl_search_api_key: Option<String>,
 
     /// LLM model id used for query translation.
@@ -1458,7 +1559,8 @@ pub struct ServerConfig {
     #[arg(
         long,
         env = "HFS_NL_SEARCH_BASE_URL",
-        default_value = "https://api.anthropic.com"
+        default_value = "https://api.anthropic.com",
+        hide_env_values = true
     )]
     pub nl_search_base_url: String,
 
@@ -1501,6 +1603,14 @@ pub struct ServerConfig {
     /// S3 region for S3 export sink (defaults to AWS credential-chain region).
     #[arg(long, env = "HFS_EXPORT_S3_REGION")]
     pub export_s3_region: Option<String>,
+
+    /// Custom S3 endpoint URL for the S3 export sink (e.g. MinIO).
+    #[arg(long, env = "HFS_EXPORT_S3_ENDPOINT", hide_env_values = true)]
+    pub export_s3_endpoint: Option<String>,
+
+    /// Use path-style S3 addressing; forced on when an endpoint is set.
+    #[arg(long, env = "HFS_EXPORT_S3_FORCE_PATH_STYLE", default_value = "false")]
+    pub export_s3_force_path_style: bool,
 
     /// Pre-signed URL TTL (seconds) for S3 export sink.
     ///
@@ -1603,7 +1713,7 @@ pub struct ServerConfig {
     ///
     /// Leave unset (default: none) to disable terminology integration.
     /// Example: `http://localhost:8090`
-    #[arg(long, env = "HFS_TERMINOLOGY_SERVER")]
+    #[arg(long, env = "HFS_TERMINOLOGY_SERVER", hide_env_values = true)]
     pub terminology_server: Option<String>,
 
     /// Multitenancy configuration (loaded from environment variables).
@@ -1623,6 +1733,239 @@ pub struct ServerConfig {
     pub validation: ValidationConfig,
 }
 
+/// Prints secrets as `[redacted]` and configured URLs without their
+/// credentials, query or fragment (#2149). Destructures every field, so a new
+/// field fails to compile until it is listed here.
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            port,
+            host,
+            log_level,
+            max_body_size,
+            request_timeout,
+            batch_max_concurrency,
+            enable_cors,
+            cors_origins,
+            cors_methods,
+            cors_headers,
+            default_tenant,
+            base_url,
+            database_url,
+            enable_request_id,
+            return_gone,
+            enable_versioning,
+            require_if_match,
+            default_fhir_version,
+            data_dir,
+            search_param_cache_ttl,
+            default_page_size,
+            max_page_size,
+            everything_max_unpaged,
+            storage_backend,
+            elasticsearch_nodes,
+            elasticsearch_index_prefix,
+            elasticsearch_username,
+            elasticsearch_password,
+            elasticsearch_refresh_interval,
+            elasticsearch_write_refresh,
+            elasticsearch_nested_objects_limit,
+            elasticsearch_max_terms_count,
+            elasticsearch_request_timeout_ms,
+            elasticsearch_bulk_max_bytes,
+            elasticsearch_bulk_concurrency,
+            elasticsearch_reindex_refresh,
+            elasticsearch_reindex_prepare_threads,
+            reindex_batch_size,
+            reindex_batch_bytes,
+            reindex_prefetch,
+            sof_enabled,
+            ui_enabled,
+            dashboard_reconcile_interval_secs,
+            dashboard_refresh_secs,
+            dashboard_idle_refresh_secs,
+            nl_search_enabled,
+            nl_search_api_key,
+            nl_search_model,
+            nl_search_base_url,
+            nl_search_rate_limit,
+            nl_search_rate_window_secs,
+            nl_search_daily_limit,
+            nl_search_max_chars,
+            seed_conformance,
+            export_sink,
+            export_dir,
+            export_s3_bucket,
+            export_s3_region,
+            export_s3_endpoint,
+            export_s3_force_path_style,
+            export_presign_ttl_secs,
+            export_max_concurrency,
+            export_max_jobs_per_tenant,
+            export_shard_rows,
+            export_controller,
+            export_output_ttl_secs,
+            export_cleanup_interval_secs,
+            sof_sqlquery_max_rows,
+            sof_sqlquery_max_source_rows_per_vd,
+            sof_sqlquery_max_vds,
+            sof_sqlquery_timeout_secs,
+            sof_runner_header,
+            terminology_server,
+            multitenancy,
+            bulk_export,
+            bulk_submit,
+            validation,
+        } = self;
+        f.debug_struct("ServerConfig")
+            .field("port", port)
+            .field("host", host)
+            .field("log_level", log_level)
+            .field("max_body_size", max_body_size)
+            .field("request_timeout", request_timeout)
+            .field("batch_max_concurrency", batch_max_concurrency)
+            .field("enable_cors", enable_cors)
+            .field("cors_origins", cors_origins)
+            .field("cors_methods", cors_methods)
+            .field("cors_headers", cors_headers)
+            .field("default_tenant", default_tenant)
+            .field("base_url", base_url)
+            .field(
+                "database_url",
+                &database_url
+                    .as_deref()
+                    .map(|url| debug_database_url(url, storage_backend)),
+            )
+            .field("enable_request_id", enable_request_id)
+            .field("return_gone", return_gone)
+            .field("enable_versioning", enable_versioning)
+            .field("require_if_match", require_if_match)
+            .field("default_fhir_version", default_fhir_version)
+            .field("data_dir", data_dir)
+            .field("search_param_cache_ttl", search_param_cache_ttl)
+            .field("default_page_size", default_page_size)
+            .field("max_page_size", max_page_size)
+            .field("everything_max_unpaged", everything_max_unpaged)
+            .field("storage_backend", storage_backend)
+            .field("elasticsearch_nodes", &redact_url_list(elasticsearch_nodes))
+            .field("elasticsearch_index_prefix", elasticsearch_index_prefix)
+            .field("elasticsearch_username", elasticsearch_username)
+            .field(
+                "elasticsearch_password",
+                &elasticsearch_password.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "elasticsearch_refresh_interval",
+                elasticsearch_refresh_interval,
+            )
+            .field("elasticsearch_write_refresh", elasticsearch_write_refresh)
+            .field(
+                "elasticsearch_nested_objects_limit",
+                elasticsearch_nested_objects_limit,
+            )
+            .field(
+                "elasticsearch_max_terms_count",
+                elasticsearch_max_terms_count,
+            )
+            .field(
+                "elasticsearch_request_timeout_ms",
+                elasticsearch_request_timeout_ms,
+            )
+            .field("elasticsearch_bulk_max_bytes", elasticsearch_bulk_max_bytes)
+            .field(
+                "elasticsearch_bulk_concurrency",
+                elasticsearch_bulk_concurrency,
+            )
+            .field(
+                "elasticsearch_reindex_refresh",
+                elasticsearch_reindex_refresh,
+            )
+            .field(
+                "elasticsearch_reindex_prepare_threads",
+                elasticsearch_reindex_prepare_threads,
+            )
+            .field("reindex_batch_size", reindex_batch_size)
+            .field("reindex_batch_bytes", reindex_batch_bytes)
+            .field("reindex_prefetch", reindex_prefetch)
+            .field("sof_enabled", sof_enabled)
+            .field("ui_enabled", ui_enabled)
+            .field(
+                "dashboard_reconcile_interval_secs",
+                dashboard_reconcile_interval_secs,
+            )
+            .field("dashboard_refresh_secs", dashboard_refresh_secs)
+            .field("dashboard_idle_refresh_secs", dashboard_idle_refresh_secs)
+            .field("nl_search_enabled", nl_search_enabled)
+            .field(
+                "nl_search_api_key",
+                &nl_search_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("nl_search_model", nl_search_model)
+            .field("nl_search_base_url", &redact_url(nl_search_base_url))
+            .field("nl_search_rate_limit", nl_search_rate_limit)
+            .field("nl_search_rate_window_secs", nl_search_rate_window_secs)
+            .field("nl_search_daily_limit", nl_search_daily_limit)
+            .field("nl_search_max_chars", nl_search_max_chars)
+            .field("seed_conformance", seed_conformance)
+            .field("export_sink", export_sink)
+            .field("export_dir", export_dir)
+            .field("export_s3_bucket", export_s3_bucket)
+            .field("export_s3_region", export_s3_region)
+            .field(
+                "export_s3_endpoint",
+                &export_s3_endpoint.as_deref().map(redact_url),
+            )
+            .field("export_s3_force_path_style", export_s3_force_path_style)
+            .field("export_presign_ttl_secs", export_presign_ttl_secs)
+            .field("export_max_concurrency", export_max_concurrency)
+            .field("export_max_jobs_per_tenant", export_max_jobs_per_tenant)
+            .field("export_shard_rows", export_shard_rows)
+            .field("export_controller", export_controller)
+            .field("export_output_ttl_secs", export_output_ttl_secs)
+            .field("export_cleanup_interval_secs", export_cleanup_interval_secs)
+            .field("sof_sqlquery_max_rows", sof_sqlquery_max_rows)
+            .field(
+                "sof_sqlquery_max_source_rows_per_vd",
+                sof_sqlquery_max_source_rows_per_vd,
+            )
+            .field("sof_sqlquery_max_vds", sof_sqlquery_max_vds)
+            .field("sof_sqlquery_timeout_secs", sof_sqlquery_timeout_secs)
+            .field("sof_runner_header", sof_runner_header)
+            .field(
+                "terminology_server",
+                &terminology_server.as_deref().map(redact_url),
+            )
+            .field("multitenancy", multitenancy)
+            .field("bulk_export", bulk_export)
+            .field("bulk_submit", bulk_submit)
+            .field("validation", validation)
+            .finish()
+    }
+}
+
+/// `url` for `Debug` output: the location the primary backend of
+/// `storage_backend` would read from it, credentials and options removed.
+fn debug_database_url(url: &str, storage_backend: &str) -> String {
+    let backend = match storage_backend
+        .parse::<StorageBackendMode>()
+        .map(StorageBackendMode::primary_backend_kind)
+    {
+        Ok(BackendKind::Sqlite) => "sqlite",
+        Ok(BackendKind::Postgres) => "postgres",
+        Ok(BackendKind::MongoDB) => "mongodb",
+        _ => "",
+    };
+    redact_database_url(url, backend)
+}
+
+/// A comma-separated URL list, each entry passed through [`redact_url`].
+fn redact_url_list(urls: &str) -> String {
+    urls.split(',')
+        .map(|url| redact_url(url.trim()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn parse_public_base_url_arg(value: &str) -> Result<String, String> {
     crate::public_url::PublicUrl::parse(value).map(|url| url.as_str().to_string())
 }
@@ -1631,7 +1974,31 @@ impl ServerConfig {
     /// Loads configuration for the HFS binary and reports command-line,
     /// environment, and validation errors to the caller.
     pub fn try_from_env() -> Result<Self, clap::Error> {
-        Self::finish_parsed(Self::try_parse()?)
+        Self::try_from_env_with_provenance().map(|(config, _)| config)
+    }
+
+    /// Like [`ServerConfig::try_from_env`], and also reports whether
+    /// `default_fhir_version` came from its built-in default (`true`) rather
+    /// than from `--default-fhir-version` or `HFS_DEFAULT_FHIR_VERSION`.
+    ///
+    /// Pass the flag to [`ServerConfig::implicit_default_fhir_version_error`].
+    pub fn try_from_env_with_provenance() -> Result<(Self, bool), clap::Error> {
+        Self::try_parse_from_with_provenance(std::env::args_os())
+    }
+
+    /// [`ServerConfig::try_from_env_with_provenance`] over an explicit
+    /// argument list, whose first item is the program name.
+    pub fn try_parse_from_with_provenance<I, T>(args: I) -> Result<(Self, bool), clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut matches = Self::command().try_get_matches_from(args)?;
+        let version_is_implicit = matches.value_source("default_fhir_version")
+            == Some(clap::parser::ValueSource::DefaultValue);
+        let parsed = Self::from_arg_matches_mut(&mut matches)
+            .map_err(|error| error.format(&mut Self::command()))?;
+        Ok((Self::finish_parsed(parsed)?, version_is_implicit))
     }
 
     fn finish_parsed(mut config: Self) -> Result<Self, clap::Error> {
@@ -1715,6 +2082,8 @@ impl Default for ServerConfig {
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
             export_s3_region: None,
+            export_s3_endpoint: None,
+            export_s3_force_path_style: false,
             export_presign_ttl_secs: 86_400,
             export_max_concurrency: 4,
             export_max_jobs_per_tenant: 8,
@@ -1761,6 +2130,26 @@ impl ServerConfig {
             .as_str()
             .to_string();
         Ok(())
+    }
+
+    /// Returns a startup error when `default_fhir_version` was not chosen by
+    /// the operator and this build has no R4 to default to.
+    ///
+    /// `version_is_implicit` is the flag from
+    /// [`ServerConfig::try_from_env_with_provenance`]. Without the `R4` feature
+    /// the built-in default is the first enabled version. Every R5 or R6 build
+    /// also enables R4B (helios-audit turns it on), so that first version would
+    /// be R4B, and a server left on it would parse, store and advertise R4B
+    /// (4.3.0) for requests that name no version. That is hard to undo once
+    /// data is written (#2064), so the operator has to choose. A build with a
+    /// single enabled version (for example R4B only) has nothing to choose
+    /// between, and a build with R4 defaults to R4; neither returns an error.
+    pub fn implicit_default_fhir_version_error(&self, version_is_implicit: bool) -> Option<String> {
+        let enabled: Vec<&str> = FhirVersion::enabled_versions()
+            .iter()
+            .map(|version| version.as_str())
+            .collect();
+        implicit_default_fhir_version_error_for(&enabled, version_is_implicit)
     }
 
     /// Returns why a loopback public base is unsafe for the configured listener.
@@ -1908,6 +2297,55 @@ impl ServerConfig {
             ));
         }
 
+        // The export sink is only wired when SQL-on-FHIR is, so a leftover
+        // `HFS_EXPORT_*` setting on a server with SoF off is not an error.
+        if self.sof_enabled {
+            match self.export_sink.trim().to_lowercase().as_str() {
+                "fs" => {}
+                "s3" => {
+                    if !cfg!(feature = "s3") {
+                        errors.push(
+                            "HFS_EXPORT_SINK=s3 requires the 's3' feature. \
+                             Build with: cargo build -p helios-hfs --features s3"
+                                .to_string(),
+                        );
+                    }
+                    if self
+                        .export_s3_bucket
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty())
+                        .is_none()
+                    {
+                        errors.push(
+                            "HFS_EXPORT_S3_BUCKET is required when HFS_EXPORT_SINK=s3".to_string(),
+                        );
+                    }
+                    if let Some(endpoint) = self
+                        .export_s3_endpoint
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|e| !e.is_empty())
+                    {
+                        let valid = url::Url::parse(endpoint).is_ok_and(|u| {
+                            matches!(u.scheme(), "http" | "https") && u.host_str().is_some()
+                        });
+                        if !valid {
+                            errors.push(format!(
+                                "HFS_EXPORT_S3_ENDPOINT must be an http(s) URL with a host, \
+                                 e.g. http://localhost:9000; got '{endpoint}'"
+                            ));
+                        }
+                    }
+                }
+                other => {
+                    errors.push(format!(
+                        "HFS_EXPORT_SINK must be 'fs' or 's3', got '{other}'"
+                    ));
+                }
+            }
+        }
+
         if let Err(mut bulk_errors) = self.bulk_export.validate() {
             errors.append(&mut bulk_errors);
         }
@@ -1998,6 +2436,8 @@ impl ServerConfig {
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
             export_s3_region: None,
+            export_s3_endpoint: None,
+            export_s3_force_path_style: false,
             export_presign_ttl_secs: 86_400,
             export_max_concurrency: 4,
             export_max_jobs_per_tenant: 8,
@@ -2022,6 +2462,30 @@ impl ServerConfig {
     pub fn multitenancy(&self) -> &MultitenancyConfig {
         &self.multitenancy
     }
+}
+
+/// Decides whether an implicit default FHIR version is a startup error, given
+/// the names of the versions this build enables.
+///
+/// Takes plain names rather than reading [`FhirVersion::enabled_versions`] so
+/// the decision and its message can be unit-tested in any build, including the
+/// default R4 build where the error never fires.
+fn implicit_default_fhir_version_error_for(
+    enabled: &[&str],
+    version_is_implicit: bool,
+) -> Option<String> {
+    let has_r4 = enabled.contains(&"R4");
+    if !version_is_implicit || has_r4 || enabled.len() < 2 {
+        return None;
+    }
+
+    let enabled_list = enabled.join(", ");
+    Some(format!(
+        "HFS_DEFAULT_FHIR_VERSION is not set and this build does not include R4, so there is \
+         no default FHIR version to fall back to. This build enables: {enabled_list}. R4B is \
+         always enabled alongside R5 and R6 because helios-audit requires it. Set \
+         HFS_DEFAULT_FHIR_VERSION (or --default-fhir-version) to one of the enabled versions"
+    ))
 }
 
 #[cfg(test)]
@@ -2118,6 +2582,116 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.contains("HFS_EXPORT_MAX_JOBS_PER_TENANT")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_unrecognised_export_sink() {
+        let config = ServerConfig {
+            export_sink: "aws".to_string(),
+            ..Default::default()
+        };
+        let errors = config
+            .validate()
+            .expect_err("an unrecognised export sink must fail startup validation");
+        assert!(
+            errors.iter().any(|e| e.contains("HFS_EXPORT_SINK")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_export_sink_s3_requires_bucket() {
+        for bucket in [None, Some("".to_string()), Some("   ".to_string())] {
+            let config = ServerConfig {
+                export_sink: "s3".to_string(),
+                export_s3_bucket: bucket.clone(),
+                ..Default::default()
+            };
+            let errors = config
+                .validate()
+                .expect_err("s3 sink without a bucket must fail startup validation");
+            assert!(
+                errors.iter().any(|e| e.contains("HFS_EXPORT_S3_BUCKET")),
+                "bucket {bucket:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_ignores_export_sink_when_sof_disabled() {
+        let config = ServerConfig {
+            sof_enabled: false,
+            export_sink: "s3".to_string(),
+            export_s3_bucket: None,
+            export_s3_endpoint: Some("not a url".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn test_validate_export_s3_endpoint_must_be_http_url() {
+        for endpoint in ["localhost:9000", "ftp://minio:9000", "http://", "not a url"] {
+            let config = ServerConfig {
+                export_sink: "s3".to_string(),
+                export_s3_bucket: Some("hfs-sql-export".to_string()),
+                export_s3_endpoint: Some(endpoint.to_string()),
+                ..Default::default()
+            };
+            let errors = config
+                .validate()
+                .expect_err("a malformed endpoint must fail startup validation");
+            assert!(
+                errors.iter().any(|e| e.contains("HFS_EXPORT_S3_ENDPOINT")),
+                "endpoint {endpoint:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn test_validate_export_s3_endpoint_accepts_http_url_or_blank() {
+        for endpoint in [" http://localhost:9000 ", "https://s3.example.com", "  "] {
+            let config = ServerConfig {
+                export_sink: "s3".to_string(),
+                export_s3_bucket: Some("hfs-sql-export".to_string()),
+                export_s3_endpoint: Some(endpoint.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "endpoint {endpoint:?}: {:?}",
+                config.validate()
+            );
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn test_validate_export_sink_s3_with_bucket_and_whitespace_ok() {
+        let config = ServerConfig {
+            export_sink: " S3 ".to_string(),
+            export_s3_bucket: Some("hfs-sql-export".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[test]
+    fn test_validate_export_sink_s3_rejected_without_feature() {
+        let config = ServerConfig {
+            export_sink: "s3".to_string(),
+            export_s3_bucket: Some("hfs-sql-export".to_string()),
+            ..Default::default()
+        };
+        let errors = config
+            .validate()
+            .expect_err("s3 sink without the s3 feature must fail startup validation");
+        assert!(
+            errors.iter().any(|e| e.contains("'s3' feature")),
             "{errors:?}"
         );
     }
@@ -2847,6 +3421,86 @@ mod tests {
         assert!(public.loopback_public_base_warning().is_none());
     }
 
+    #[test]
+    fn test_default_fhir_version_provenance() {
+        // The CLI value wins over the built-in default, whatever the build enables.
+        let version = FhirVersion::default_enabled();
+        let (config, implicit) = ServerConfig::try_parse_from_with_provenance([
+            "rest-server",
+            "--default-fhir-version",
+            version.as_str(),
+        ])
+        .unwrap();
+        assert_eq!(config.default_fhir_version, version);
+        assert!(
+            !implicit,
+            "an explicit --default-fhir-version is not implicit"
+        );
+
+        // With nothing on the command line the value is the built-in default,
+        // unless the environment sets it (then it is not implicit either).
+        let (config, implicit) =
+            ServerConfig::try_parse_from_with_provenance(["rest-server"]).unwrap();
+        if std::env::var_os("HFS_DEFAULT_FHIR_VERSION").is_none() {
+            assert!(implicit, "no flag and no env var is the built-in default");
+            assert_eq!(config.default_fhir_version, FhirVersion::default_enabled());
+        } else {
+            assert!(!implicit, "HFS_DEFAULT_FHIR_VERSION is an explicit choice");
+        }
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error() {
+        let config = ServerConfig::default();
+        // Only an implicit default can be an error, in every build.
+        assert!(config.implicit_default_fhir_version_error(false).is_none());
+        // This unit-test module needs `R4`, and a build with R4 never errors
+        // (the build without R4 is covered by tests/fhir_version_coverage.rs).
+        assert!(config.implicit_default_fhir_version_error(true).is_none());
+    }
+
+    // The decision helper takes plain version names, so these run in every
+    // build, including the default R4 build where the error never fires.
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4b_r5() {
+        let error = implicit_default_fhir_version_error_for(&["R4B", "R5"], true)
+            .expect("an implicit default without R4 is an error");
+        assert!(
+            error.contains("This build enables: R4B, R5."),
+            "message must list the enabled versions: {error}"
+        );
+        assert!(
+            error.contains("HFS_DEFAULT_FHIR_VERSION"),
+            "message must name the setting to choose: {error}"
+        );
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4b_r5_r6() {
+        let error = implicit_default_fhir_version_error_for(&["R4B", "R5", "R6"], true)
+            .expect("an implicit default without R4 is an error");
+        assert!(
+            error.contains("This build enables: R4B, R5, R6."),
+            "message must list every enabled version: {error}"
+        );
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_explicit_choice() {
+        assert!(implicit_default_fhir_version_error_for(&["R4B", "R5"], false).is_none());
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_r4_present() {
+        assert!(implicit_default_fhir_version_error_for(&["R4", "R5"], true).is_none());
+    }
+
+    #[test]
+    fn test_implicit_default_fhir_version_error_for_single_version() {
+        assert!(implicit_default_fhir_version_error_for(&["R4B"], true).is_none());
+    }
+
     // ── multitenancy() accessor ───────────────────────────────────
 
     #[test]
@@ -3343,5 +3997,80 @@ mod tests {
     #[test]
     fn bulk_submit_file_concurrency_default_is_one() {
         assert_eq!(BulkSubmitConfig::default().file_concurrency, 1);
+    }
+
+    // ── Secrets stay out of `--help` and `Debug` (#2149) ─────────────
+
+    /// Every argument whose environment value can carry a credential.
+    const SECRET_ENV_ARGS: &[&str] = &[
+        "HFS_DATABASE_URL",
+        "HFS_ELASTICSEARCH_NODES",
+        "HFS_ELASTICSEARCH_PASSWORD",
+        "HFS_NL_SEARCH_API_KEY",
+        "HFS_NL_SEARCH_BASE_URL",
+        "HFS_EXPORT_S3_ENDPOINT",
+        "HFS_TERMINOLOGY_SERVER",
+    ];
+
+    #[test]
+    fn help_hides_the_values_of_secret_environment_variables() {
+        let command = ServerConfig::command();
+        for name in SECRET_ENV_ARGS {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_env().is_some_and(|env| env == *name))
+                .unwrap_or_else(|| panic!("no argument reads {name}"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "`hfs --help` would print the value of {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_redacts_server_config_secrets() {
+        let config = ServerConfig {
+            storage_backend: "postgres".to_string(),
+            database_url: Some("postgres://hfs:DB-SECRET@db.internal:5432/hfs".to_string()),
+            elasticsearch_nodes: "https://elastic:NODE-SECRET@es1:9200, https://es2:9200"
+                .to_string(),
+            elasticsearch_username: Some("elastic".to_string()),
+            elasticsearch_password: Some("ES-PASSWORD-SECRET".to_string()),
+            nl_search_api_key: Some("sk-NL-KEY-SECRET".to_string()),
+            nl_search_base_url: "https://llm-proxy.internal?key=NL-URL-SECRET".to_string(),
+            export_s3_endpoint: Some("http://minio:9000?X-Amz-Signature=S3-SECRET".to_string()),
+            terminology_server: Some("https://u:TX-SECRET@hts.internal:8090".to_string()),
+            bulk_submit: BulkSubmitConfig {
+                client_id: Some("hfs-client".to_string()),
+                private_key: Some("-----BEGIN PRIVATE KEY----- PRIVATE-SECRET".to_string()),
+                decryption_key: Some("{\"d\":\"DECRYPTION-SECRET\"}".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for debug in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!debug.contains("SECRET"), "secret in Debug output: {debug}");
+            for kept in [
+                "es1:9200",
+                "es2:9200",
+                "elastic",
+                "llm-proxy.internal",
+                "minio:9000",
+                "hts.internal:8090",
+                "hfs-client",
+                "[redacted]",
+            ] {
+                assert!(debug.contains(kept), "`{kept}` missing from {debug}");
+            }
+        }
+    }
+
+    #[test]
+    fn debug_shows_a_sqlite_database_path() {
+        let config = ServerConfig {
+            database_url: Some("./data/fhir.db".to_string()),
+            ..Default::default()
+        };
+        assert!(format!("{config:?}").contains("./data/fhir.db"));
     }
 }

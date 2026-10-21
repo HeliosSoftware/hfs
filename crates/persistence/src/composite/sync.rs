@@ -20,10 +20,7 @@
 //!
 //! // Sync a create event to secondaries
 //! manager.sync(&SyncEvent::Create {
-//!     resource_type: "Patient".to_string(),
-//!     resource_id: "123".to_string(),
-//!     content: patient_json,
-//!     tenant_id: tenant.tenant_id().clone(),
+//!     resource: stored_patient,
 //! }, &secondaries).await?;
 //! ```
 
@@ -31,9 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
-use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::{debug, warn};
@@ -49,34 +44,19 @@ use super::sync_failures::{SyncFailureKey, SyncFailureRecorder, SyncOperation};
 /// A synchronization event to propagate to secondary backends.
 #[derive(Debug, Clone)]
 pub enum SyncEvent {
-    /// Resource was created.
+    /// Resource was created. Carries the primary's [`StoredResource`] so a
+    /// search secondary can index `version_id` and `last_modified` without
+    /// recovering them from the JSON body.
     Create {
-        /// Resource type.
-        resource_type: String,
-        /// Resource ID.
-        resource_id: String,
-        /// Resource content.
-        content: Value,
-        /// Tenant ID.
-        tenant_id: TenantId,
-        /// FHIR version.
-        fhir_version: FhirVersion,
+        /// The resource the primary stored.
+        resource: StoredResource,
     },
 
-    /// Resource was updated.
+    /// Resource was updated. Same payload as [`Self::Create`]: the search
+    /// secondary overwrites its document from this snapshot.
     Update {
-        /// Resource type.
-        resource_type: String,
-        /// Resource ID.
-        resource_id: String,
-        /// New resource content.
-        content: Value,
-        /// Tenant ID.
-        tenant_id: TenantId,
-        /// New version.
-        version: String,
-        /// FHIR version.
-        fhir_version: FhirVersion,
+        /// The resource the primary stored.
+        resource: StoredResource,
     },
 
     /// Resource was deleted.
@@ -99,11 +79,22 @@ pub enum SyncEvent {
 }
 
 impl SyncEvent {
+    /// A create of `resource` on every secondary.
+    pub fn created(resource: StoredResource) -> Self {
+        Self::Create { resource }
+    }
+
+    /// An update of `resource` on every secondary.
+    pub fn updated(resource: StoredResource) -> Self {
+        Self::Update { resource }
+    }
+
     /// Returns the resource type for this event.
     pub fn resource_type(&self) -> &str {
         match self {
-            SyncEvent::Create { resource_type, .. } => resource_type,
-            SyncEvent::Update { resource_type, .. } => resource_type,
+            SyncEvent::Create { resource } | SyncEvent::Update { resource } => {
+                resource.resource_type()
+            }
             SyncEvent::Delete { resource_type, .. } => resource_type,
             SyncEvent::BulkSync { .. } => "bulk",
         }
@@ -112,8 +103,7 @@ impl SyncEvent {
     /// Returns the resource ID for this event (if applicable).
     pub fn resource_id(&self) -> Option<&str> {
         match self {
-            SyncEvent::Create { resource_id, .. } => Some(resource_id),
-            SyncEvent::Update { resource_id, .. } => Some(resource_id),
+            SyncEvent::Create { resource } | SyncEvent::Update { resource } => Some(resource.id()),
             SyncEvent::Delete { resource_id, .. } => Some(resource_id),
             SyncEvent::BulkSync { .. } => None,
         }
@@ -122,8 +112,7 @@ impl SyncEvent {
     /// Returns the tenant ID for this event.
     pub fn tenant_id(&self) -> &TenantId {
         match self {
-            SyncEvent::Create { tenant_id, .. } => tenant_id,
-            SyncEvent::Update { tenant_id, .. } => tenant_id,
+            SyncEvent::Create { resource } | SyncEvent::Update { resource } => resource.tenant_id(),
             SyncEvent::Delete { tenant_id, .. } => tenant_id,
             SyncEvent::BulkSync { tenant_id, .. } => tenant_id,
         }
@@ -216,6 +205,78 @@ fn sync_queue_unavailable(message: impl Into<String>) -> StorageError {
         backend_name: "sync".to_string(),
         message: message.into(),
     })
+}
+
+/// Writes the primary's snapshot to one secondary.
+///
+/// Elasticsearch (a search document store) goes through
+/// [`ReindexTarget::write_search_entries`], which already indexes
+/// `version_id` and `last_modified` from the [`StoredResource`]. A replica
+/// that stores the resource itself uses `create` or `create_or_update`.
+async fn write_primary_resource(
+    backend: &dyn ResourceStorage,
+    tenant: &TenantContext,
+    resource: &StoredResource,
+    as_create: bool,
+) -> StorageResult<()> {
+    if let Some(index) = backend.as_search_index() {
+        index
+            .write_search_entries(tenant, resource)
+            .await
+            .map(|_| ())
+    } else if as_create {
+        backend
+            .create(
+                tenant,
+                resource.resource_type(),
+                resource.content_with_meta(),
+                resource.fhir_version(),
+            )
+            .await
+            .map(|_| ())
+    } else {
+        backend
+            .create_or_update(
+                tenant,
+                resource.resource_type(),
+                resource.id(),
+                resource.content_with_meta(),
+                resource.fhir_version(),
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Writes a same-type batch the primary already stored.
+async fn write_primary_resources(
+    backend: &dyn ResourceStorage,
+    tenant: &TenantContext,
+    resource_type: &str,
+    resources: &[StoredResource],
+) -> Vec<StorageResult<()>> {
+    if let Some(index) = backend.as_search_index() {
+        return index
+            .write_synced_entries_page(tenant, resources)
+            .await
+            .into_iter()
+            .map(|result| result.map(|_| ()))
+            .collect();
+    }
+    let fhir_version = resources
+        .first()
+        .map(StoredResource::fhir_version)
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+    let contents = resources
+        .iter()
+        .map(StoredResource::content_with_meta)
+        .collect();
+    backend
+        .create_many(tenant, resource_type, contents, fhir_version)
+        .await
+        .into_iter()
+        .map(|result| result.map(|_| ()))
+        .collect()
 }
 
 impl SyncManager {
@@ -382,7 +443,9 @@ impl SyncManager {
     /// the secondary backends as a batch.
     ///
     /// In the synchronous modes every backend receives the whole batch
-    /// through [`ResourceStorage::create_many`], so a secondary with a native
+    /// through [`write_primary_resources`]: Elasticsearch writes the page
+    /// with [`ReindexTarget::write_synced_entries_page`], and a replica
+    /// uses [`ResourceStorage::create_many`]. A secondary with a native
     /// batch write (Elasticsearch `_bulk`) pays one round trip and, under
     /// `refresh=wait_for`, one refresh wait rather than one per resource.
     /// Items the batch rejects are retried one at a time through the same
@@ -394,17 +457,10 @@ impl SyncManager {
         &self,
         tenant_id: &TenantId,
         resource_type: &str,
-        fhir_version: FhirVersion,
-        resources: Vec<(String, Value)>,
+        resources: Vec<StoredResource>,
         backends: &HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
     ) -> StorageResult<Vec<SyncStatus>> {
-        let create_event = |(id, content): &(String, Value)| SyncEvent::Create {
-            resource_type: resource_type.to_string(),
-            resource_id: id.clone(),
-            content: content.clone(),
-            tenant_id: tenant_id.clone(),
-            fhir_version,
-        };
+        let create_event = |resource: &StoredResource| SyncEvent::created(resource.clone());
         let synchronous = match self.config.mode {
             SyncMode::Synchronous => true,
             SyncMode::Asynchronous => false,
@@ -448,24 +504,45 @@ impl SyncManager {
                     resource_id: resource_id.to_string(),
                     backend_id: backend_id.clone(),
                 };
-                let contents = resources
-                    .iter()
-                    .map(|(_, content)| content.clone())
-                    .collect();
-                let results = backend
-                    .create_many(&tenant, &resource_type, contents, fhir_version)
-                    .await;
+                let results =
+                    write_primary_resources(backend.as_ref(), &tenant, &resource_type, &resources)
+                        .await;
 
                 let mut synced = 0;
                 let mut errors = 0;
                 let mut last_error = None;
                 let mut failed_resource_ids = Vec::new();
-                for ((resource_id, content), result) in resources.iter().zip(results) {
+                // Set once a resource retried on its own failed because the
+                // backend is unavailable. A cluster that stopped answering
+                // makes every further retry wait out the request timeout
+                // `max_retries + 1` times, serially: a batch of N would block
+                // for N x (max_retries + 1) timeouts. The rest of the batch is
+                // recorded as failed instead, for the repair task to re-sync
+                // (#1749).
+                let mut backend_unavailable = false;
+                for (resource, result) in resources.iter().zip(results) {
+                    let resource_id = resource.id();
                     let Err(batch_error) = result else {
                         synced += 1;
                         recorder.resource_sync_succeeded(key(resource_id)).await;
                         continue;
                     };
+                    if backend_unavailable {
+                        errors += 1;
+                        recorder
+                            .resource_sync_failed(
+                                key(resource_id),
+                                SyncOperation::Create,
+                                Some(resource.version_id()),
+                                &batch_error,
+                                // Only the batch attempt: no single retry was made.
+                                1,
+                            )
+                            .await;
+                        last_error = Some(batch_error.to_string());
+                        failed_resource_ids.push(resource_id.to_string());
+                        continue;
+                    }
                     warn!(
                         backend_id = %backend_id,
                         resource_type = %resource_type,
@@ -473,13 +550,7 @@ impl SyncManager {
                         error = %batch_error,
                         "Batch sync rejected a resource; retrying it individually"
                     );
-                    let event = SyncEvent::Create {
-                        resource_type: resource_type.clone(),
-                        resource_id: resource_id.clone(),
-                        content: content.clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                        fhir_version,
-                    };
+                    let event = SyncEvent::created(resource.clone());
                     match Self::sync_event_to_backend(&event, backend.as_ref(), &retry_config).await
                     {
                         Ok(()) => {
@@ -487,19 +558,30 @@ impl SyncManager {
                             recorder.resource_sync_succeeded(key(resource_id)).await;
                         }
                         Err(e) => {
+                            if matches!(
+                                e,
+                                StorageError::Backend(BackendError::Unavailable { .. })
+                            ) {
+                                warn!(
+                                    backend_id = %backend_id,
+                                    resource_type = %resource_type,
+                                    "Backend unavailable; not retrying the rest of the batch one by one"
+                                );
+                                backend_unavailable = true;
+                            }
                             errors += 1;
                             recorder
                                 .resource_sync_failed(
                                     key(resource_id),
                                     SyncOperation::Create,
-                                    content.pointer("/meta/versionId").and_then(|v| v.as_str()),
+                                    Some(resource.version_id()),
                                     &e,
                                     // The batch attempt, then the retried single sync.
                                     retry_config.max_retries + 2,
                                 )
                                 .await;
                             last_error = Some(e.to_string());
-                            failed_resource_ids.push(resource_id.clone());
+                            failed_resource_ids.push(resource_id.to_string());
                         }
                     }
                 }
@@ -691,43 +773,19 @@ impl SyncManager {
             attempts += 1;
 
             let result = match event {
-                SyncEvent::Create {
-                    resource_type,
-                    content,
-                    tenant_id,
-                    fhir_version,
-                    ..
-                } => {
-                    let tenant =
-                        TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
-                    backend
-                        .create(&tenant, resource_type, content.clone(), *fhir_version)
-                        .await
-                        .map(|_| ())
+                SyncEvent::Create { resource } => {
+                    let tenant = TenantContext::new(
+                        resource.tenant_id().clone(),
+                        TenantPermissions::full_access(),
+                    );
+                    write_primary_resource(backend, &tenant, resource, true).await
                 }
-                SyncEvent::Update {
-                    resource_type,
-                    resource_id,
-                    content,
-                    tenant_id,
-                    fhir_version,
-                    ..
-                } => {
-                    let tenant =
-                        TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
-
-                    // For secondary backends, we do a create_or_update
-                    // since we don't track versions in secondaries
-                    backend
-                        .create_or_update(
-                            &tenant,
-                            resource_type,
-                            resource_id,
-                            content.clone(),
-                            *fhir_version,
-                        )
-                        .await
-                        .map(|_| ())
+                SyncEvent::Update { resource } => {
+                    let tenant = TenantContext::new(
+                        resource.tenant_id().clone(),
+                        TenantPermissions::full_access(),
+                    );
+                    write_primary_resource(backend, &tenant, resource, false).await
                 }
                 SyncEvent::Delete {
                     resource_type,
@@ -753,17 +811,14 @@ impl SyncManager {
                 } => {
                     let tenant =
                         TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
-
-                    for resource in resources {
-                        backend
-                            .create_or_update(
-                                &tenant,
-                                resource.resource_type(),
-                                resource.id(),
-                                resource.content().clone(),
-                                resource.fhir_version(),
-                            )
-                            .await?;
+                    if let Some(index) = backend.as_search_index() {
+                        for result in index.write_synced_entries_page(&tenant, resources).await {
+                            result?;
+                        }
+                    } else {
+                        for resource in resources {
+                            write_primary_resource(backend, &tenant, resource, false).await?;
+                        }
                     }
                     Ok(())
                 }
@@ -952,16 +1007,17 @@ pub struct ReconciliationResult {
 mod tests {
     use super::*;
     use helios_fhir::FhirVersion;
+    use serde_json::Value;
 
     #[test]
     fn test_sync_event_accessors() {
-        let event = SyncEvent::Create {
-            resource_type: "Patient".to_string(),
-            resource_id: "123".to_string(),
-            content: serde_json::json!({}),
-            tenant_id: TenantId::new("test"),
-            fhir_version: FhirVersion::default(),
-        };
+        let event = SyncEvent::created(StoredResource::new(
+            "Patient",
+            "123",
+            TenantId::new("test"),
+            serde_json::json!({}),
+            FhirVersion::default(),
+        ));
 
         assert_eq!(event.resource_type(), "Patient");
         assert_eq!(event.resource_id(), Some("123"));
@@ -1147,25 +1203,22 @@ mod tests {
         map
     }
 
+    fn stored_patient(id: &str) -> StoredResource {
+        StoredResource::new(
+            "Patient",
+            id,
+            TenantId::new("t"),
+            serde_json::json!({"resourceType": "Patient", "id": id}),
+            FhirVersion::default(),
+        )
+    }
+
     fn create_event(id: &str) -> SyncEvent {
-        SyncEvent::Create {
-            resource_type: "Patient".to_string(),
-            resource_id: id.to_string(),
-            content: serde_json::json!({"resourceType": "Patient", "id": id}),
-            tenant_id: TenantId::new("t"),
-            fhir_version: FhirVersion::default(),
-        }
+        SyncEvent::created(stored_patient(id))
     }
 
     fn update_event(id: &str) -> SyncEvent {
-        SyncEvent::Update {
-            resource_type: "Patient".to_string(),
-            resource_id: id.to_string(),
-            content: serde_json::json!({"resourceType": "Patient", "id": id}),
-            tenant_id: TenantId::new("t"),
-            version: "2".to_string(),
-            fhir_version: FhirVersion::default(),
-        }
+        SyncEvent::updated(stored_patient(id))
     }
 
     fn delete_event(id: &str) -> SyncEvent {

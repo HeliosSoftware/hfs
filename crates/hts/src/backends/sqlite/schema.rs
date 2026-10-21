@@ -433,8 +433,13 @@ pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> ru
 /// correctly without rebuilding the existing closure.
 ///
 /// Called once at startup so that existing databases (imported before the
-/// closure table was introduced) are migrated automatically.
-pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+/// closure table was introduced) are migrated automatically, and again after a
+/// chunked `POST /import?finalize=true` — see
+/// [`BundleImportBackend::rebuild_missing_closures`](crate::import::BundleImportBackend::rebuild_missing_closures).
+///
+/// Returns the number of systems rebuilt, so callers can log whether any work
+/// happened rather than guessing.
+pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
     // Find every system that has hierarchy edges but no closure rows at all.
     let systems_needing_closure: Vec<String> = {
         let mut stmt = conn.prepare(
@@ -454,7 +459,7 @@ pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<
         build_concept_closure(conn, sid)?;
     }
 
-    Ok(())
+    Ok(systems_needing_closure.len())
 }
 
 /// Add search-related columns to the existing tables.

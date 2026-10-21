@@ -56,7 +56,7 @@ use crate::types::{ExpandRequest, ExpansionContains};
 use super::format::{ResponseFormat, json_to_fhir_xml, negotiate_format};
 use super::params::{
     collect_resource_params, extract_parameter_array, find_resource_param, find_str_param,
-    parse_query_string, query_params_to_fhir_params,
+    parse_query_string, parse_stored_coding, query_params_to_fhir_params,
 };
 
 /// Standards-status codes that warrant a `warning-<status>` expansion
@@ -160,7 +160,7 @@ fn vs_extension_statuses(resource: &Value) -> Vec<String> {
 fn serialize_expansion_contains(
     c: &ExpansionContains,
     multi_version_systems: &std::collections::HashSet<String>,
-) -> Value {
+) -> Result<Value, HtsError> {
     let mut item = serde_json::Map::new();
     // Concept-level extensions appear FIRST in the IG fixtures (the FHIR
     // canonical ordering puts `extension` ahead of `system` for any element).
@@ -232,9 +232,12 @@ fn serialize_expansion_contains(
                     "Decimal" => "valueDecimal",
                     "DateTime" => "valueDateTime",
                     "Code" => "valueCode",
+                    "Coding" => "valueCoding",
                     _ => "valueString",
                 };
-                let value: Value = if key == "valueBoolean" {
+                let value: Value = if key == "valueCoding" {
+                    parse_stored_coding(&p.value)?
+                } else if key == "valueBoolean" {
                     json!(p.value == "true")
                 } else if key == "valueInteger" {
                     json!(p.value.parse::<i64>().unwrap_or(0))
@@ -249,9 +252,9 @@ fn serialize_expansion_contains(
                 } else {
                     json!(p.value)
                 };
-                json!({ "code": p.code, key: value })
+                Ok(json!({ "code": p.code, key: value }))
             })
-            .collect();
+            .collect::<Result<_, HtsError>>()?;
         item.insert("property".into(), json!(props));
     }
     if !c.contains.is_empty() {
@@ -259,10 +262,10 @@ fn serialize_expansion_contains(
             .contains
             .iter()
             .map(|child| serialize_expansion_contains(child, multi_version_systems))
-            .collect();
+            .collect::<Result<_, _>>()?;
         item.insert("contains".into(), json!(nested));
     }
-    Value::Object(item)
+    Ok(Value::Object(item))
 }
 
 /// Resolve `is_abstract` / `inactive` flags on each expansion entry via a
@@ -399,7 +402,7 @@ fn populate_properties<'a, B: TerminologyBackend>(
     properties: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        use crate::types::ExpansionContainsProperty;
+        use crate::types::{ExpansionContainsProperty, PropertyValue};
         use std::collections::HashMap;
         let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
         for c in contains.iter() {
@@ -408,7 +411,7 @@ fn populate_properties<'a, B: TerminologyBackend>(
                 .or_default()
                 .push(c.code.clone());
         }
-        let mut map: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+        let mut map: HashMap<(String, String), Vec<PropertyValue>> = HashMap::new();
         // `prop_types_by_system` holds the (property_code → FHIR type) mapping
         // declared on each contributing CodeSystem (and any supplements that
         // share its URL). We consult it when serialising the property values
@@ -481,11 +484,12 @@ fn populate_properties<'a, B: TerminologyBackend>(
                 // `status` entry — an exact-pair dedupe collapses the versions
                 // while still allowing genuinely-distinct same-code properties
                 // (e.g. multiple `parent` values) through.
-                let mut seen: std::collections::HashSet<(String, String)> =
+                // A Coding object and a scalar containing its JSON text are distinct.
+                let mut seen: std::collections::HashSet<(String, String, bool)> =
                     std::collections::HashSet::new();
                 c.properties = list
                     .into_iter()
-                    .filter(|(code, value)| {
+                    .filter(|property| {
                         // The `status` property is auto-included in the
                         // population lookup so retired/deprecated/withdrawn
                         // concepts get a per-concept marker without the
@@ -494,10 +498,16 @@ fn populate_properties<'a, B: TerminologyBackend>(
                         // and `parameters/parameters-expand-supplement-good`
                         // fixtures all omit `status:active` from contains[].
                         // Only emit when the status is non-active.
-                        !(code == "status" && value == "active")
+                        !(property.code == "status" && property.value == "active")
                     })
-                    .filter(|pair| seen.insert(pair.clone()))
-                    .map(|(code, value)| {
+                    .filter(|property| {
+                        seen.insert((
+                            property.code.clone(),
+                            property.value.clone(),
+                            property.value_type == "Coding",
+                        ))
+                    })
+                    .map(|property| {
                         // Pick the FHIR `value[x]` shape from the property
                         // code:
                         //   - When the CS / supplement declares the property
@@ -507,15 +517,19 @@ fn populate_properties<'a, B: TerminologyBackend>(
                         //   - Everything else defaults to `Code` — concept
                         //     property values are most commonly Code and
                         //     tests have not flagged false positives.
-                        let value_type = match cs_types.and_then(|m| m.get(&code)) {
-                            Some(ty) => fhir_property_type_to_value_type(ty),
-                            None if code == "definition" => "string".to_string(),
-                            None => "Code".to_string(),
+                        let value_type = if property.value_type == "Coding" {
+                            "Coding".to_string()
+                        } else {
+                            match cs_types.and_then(|m| m.get(&property.code)) {
+                                Some(ty) => fhir_property_type_to_value_type(ty),
+                                None if property.code == "definition" => "string".to_string(),
+                                None => "Code".to_string(),
+                            }
                         };
                         ExpansionContainsProperty {
-                            code,
+                            code: property.code,
                             value_type,
-                            value,
+                            value: property.value,
                         }
                     })
                     .collect();
@@ -538,6 +552,7 @@ fn fhir_property_type_to_value_type(fhir_type: &str) -> String {
         "decimal" | "Decimal" => "Decimal".to_string(),
         "dateTime" | "DateTime" => "DateTime".to_string(),
         "code" | "Code" => "Code".to_string(),
+        // Coding is selected from the stored value type, never from a declaration.
         // string, Coding, and any unrecognised type fall back to a string
         // serialization so the FHIR `valueString` field carries the value.
         _ => "string".to_string(),
@@ -769,7 +784,7 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
     properties: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        use crate::types::ExpansionContainsProperty;
+        use crate::types::{ExpansionContainsProperty, PropertyValue};
         use std::collections::HashMap;
         if supplement_urls.is_empty() || properties.is_empty() {
             return;
@@ -784,7 +799,7 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
             .supplement_property_values(ctx, supplement_urls, &codes, properties)
             .await
             .unwrap_or_default();
-        let mut by_code: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut by_code: HashMap<String, Vec<PropertyValue>> = HashMap::new();
         for (code, list) in map {
             by_code.insert(code, list);
         }
@@ -825,15 +840,19 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
         }
         for c in contains.iter_mut() {
             if let Some(extra) = by_code.get(&c.code) {
-                for (prop, value) in extra {
-                    let value_type = match supp_prop_types.get(prop) {
-                        Some(ty) => fhir_property_type_to_value_type(ty),
-                        None => "Code".to_string(),
+                for property in extra {
+                    let value_type = if property.value_type == "Coding" {
+                        "Coding".to_string()
+                    } else {
+                        match supp_prop_types.get(&property.code) {
+                            Some(ty) => fhir_property_type_to_value_type(ty),
+                            None => "Code".to_string(),
+                        }
                     };
                     c.properties.push(ExpansionContainsProperty {
-                        code: prop.clone(),
+                        code: property.code.clone(),
                         value_type,
-                        value: value.clone(),
+                        value: property.value.clone(),
                     });
                 }
             }
@@ -2724,7 +2743,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
         .contains
         .iter()
         .map(|c| serialize_expansion_contains(c, &multi_version_systems))
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     // The IG validator (txTests) treats `expansion.identifier` and
     // `expansion.timestamp` as required (they appear in every fixture without
@@ -3465,7 +3484,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 .contains
                 .iter()
                 .map(|c| serialize_expansion_contains(c, &multi_version_systems))
-                .collect();
+                .collect::<Result<_, _>>()?;
             expansion["contains"] = json!(resorted);
             if merged {
                 expansion["total"] = json!(resp.contains.len());
@@ -5392,6 +5411,253 @@ mod tests {
             .find(|p| p["code"] == "prop")
             .expect("code1 has prop property");
         assert_eq!(prop["valueCode"], "old", "code1 prop should be 'old'");
+    }
+
+    #[tokio::test]
+    async fn expand_round_trips_imported_coding_property() {
+        use crate::import::BundleImportBackend;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let coding = json!({
+            "system": "http://example.org/target", "version": "2026",
+            "code": "TARGET", "display": "Target concept", "userSelected": true,
+            "extension": [{"url": "http://example.org/note", "valueString": "detail"}]
+        });
+        let bundle = json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": "coding-cs",
+                    "url": "http://example.org/coding-cs", "version": "1",
+                    "status": "active", "content": "complete",
+                    "property": [
+                        {"code": "maps-to", "type": "Coding"},
+                        {"code": "declared-coding", "type": "Coding"},
+                        {"code": "rank", "type": "integer"}
+                    ],
+                    "concept": [{"code": "SOURCE", "property": [
+                        {"code": "maps-to", "valueCoding": coding},
+                        {"code": "maps-to", "valueCoding": coding},
+                        {"code": "maps-to", "valueString": coding.to_string()},
+                        {"code": "declared-coding", "valueString": "Plain text"},
+                        {"code": "undeclared", "valueCoding": coding},
+                        {"code": "rank", "valueInteger": 0}
+                    ]}]
+                }},
+                {"resource": {
+                    "resourceType": "ValueSet", "id": "coding-vs",
+                    "url": "http://example.org/coding-vs", "status": "active",
+                    "compose": {"include": [{"system": "http://example.org/coding-cs"}]}
+                }}
+            ]
+        });
+        let imported = backend
+            .import_bundle(&TenantContext::system(), bundle.to_string().as_bytes())
+            .await
+            .unwrap();
+        assert!(imported.errors.is_empty());
+        let app = Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(AppState::new(backend));
+        let response = post_json(
+            app,
+            "/ValueSet/$expand",
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "url", "valueUri": "http://example.org/coding-vs"},
+                {"name": "property", "valueString": "maps-to"},
+                {"name": "property", "valueString": "declared-coding"},
+                {"name": "property", "valueString": "undeclared"},
+                {"name": "property", "valueString": "rank"}
+            ]}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let response = body_json(response).await;
+        let contains = response["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 1);
+        assert_eq!(contains[0]["code"], "SOURCE");
+        let properties = contains[0]["property"].as_array().unwrap();
+        let expected = [
+            json!({"code": "maps-to", "valueCoding": coding}),
+            json!({"code": "maps-to", "valueString": coding.to_string()}),
+            json!({"code": "declared-coding", "valueString": "Plain text"}),
+            json!({"code": "undeclared", "valueCoding": coding}),
+            json!({"code": "rank", "valueInteger": 0}),
+        ];
+        assert_eq!(properties.len(), expected.len());
+        for property in expected {
+            assert!(
+                properties.contains(&property),
+                "missing property: {property}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_expansion_rejects_invalid_stored_coding() {
+        for value in ["not json", "null", "[]", "42", "true", "\"A\""] {
+            let contains: ExpansionContains = serde_json::from_value(json!({
+                "system": "http://example.org/coding-cs", "code": "parent",
+                "contains": [{
+                    "system": "http://example.org/coding-cs", "code": "child",
+                    "properties": [{"code": "maps-to", "value_type": "Coding", "value": value}]
+                }]
+            }))
+            .unwrap();
+            assert!(matches!(
+                serialize_expansion_contains(&contains, &std::collections::HashSet::new()),
+                Err(HtsError::StorageError(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn supplement_coding_preserves_existing_scalar_output() {
+        use crate::import::BundleImportBackend;
+        use crate::operations::lookup::lookup_handler;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let coding = json!({
+            "system": "http://example.org/target", "version": "2026",
+            "code": "TARGET", "display": "Target concept"
+        });
+        let bundle = json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": "base",
+                    "url": "http://example.org/base", "status": "active",
+                    "content": "complete", "concept": [{"code": "SOURCE"}]
+                }},
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": "coding-supplement",
+                    "url": "http://example.org/coding-supplement", "status": "active",
+                    "content": "supplement", "supplements": "http://example.org/base",
+                    "property": [
+                        {"code": "annotation", "type": "Coding"},
+                        {"code": "rank", "type": "integer"}
+                    ],
+                    "concept": [{"code": "SOURCE", "property": [
+                        {"code": "annotation", "valueCoding": coding},
+                        {"code": "rank", "valueInteger": 7},
+                        {"code": "undeclared", "valueString": "Plain text"}
+                    ]}]
+                }},
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": "string-supplement",
+                    "url": "http://example.org/string-supplement", "status": "active",
+                    "content": "supplement", "supplements": "http://example.org/base",
+                    "property": [
+                        {"code": "annotation", "type": "string"},
+                        {"code": "label", "type": "string"}
+                    ],
+                    "concept": [{"code": "SOURCE", "property": [
+                        {"code": "annotation", "valueString": "Plain text"},
+                        {"code": "label", "valueCode": "LABEL"}
+                    ]}]
+                }},
+                {"resource": {
+                    "resourceType": "ValueSet", "id": "supplement-vs",
+                    "url": "http://example.org/supplement-vs", "status": "active",
+                    "compose": {"include": [{"system": "http://example.org/base"}]}
+                }}
+            ]
+        });
+        let imported = backend
+            .import_bundle(&TenantContext::system(), bundle.to_string().as_bytes())
+            .await
+            .unwrap();
+        assert!(imported.errors.is_empty());
+        let app = Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .route(
+                "/CodeSystem/$lookup",
+                post(lookup_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(AppState::new(backend));
+        let supplements = [
+            json!({"name": "useSupplement", "valueCanonical": "http://example.org/coding-supplement"}),
+            json!({"name": "useSupplement", "valueCanonical": "http://example.org/string-supplement"}),
+        ];
+        for lookup in [true, false] {
+            let mut parameters = supplements.to_vec();
+            for property in ["annotation", "rank", "label", "undeclared"] {
+                parameters.push(json!({"name": "property", "valueCode": property}));
+            }
+            let path = if lookup {
+                parameters.push(json!({"name": "system", "valueUri": "http://example.org/base"}));
+                parameters.push(json!({"name": "code", "valueCode": "SOURCE"}));
+                "/CodeSystem/$lookup"
+            } else {
+                parameters
+                    .push(json!({"name": "url", "valueUri": "http://example.org/supplement-vs"}));
+                "/ValueSet/$expand"
+            };
+            let response = post_json(
+                app.clone(),
+                path,
+                json!({"resourceType": "Parameters", "parameter": parameters}),
+            )
+            .await;
+            assert_eq!(response.status(), 200, "{path}");
+            let response = body_json(response).await;
+            if lookup {
+                let properties: Vec<_> = response["parameter"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|parameter| parameter["name"] == "property")
+                    .collect();
+                assert_eq!(properties.len(), 5);
+                for (code, value) in [
+                    (
+                        "annotation",
+                        json!({"name": "value", "valueCoding": coding}),
+                    ),
+                    (
+                        "annotation",
+                        json!({"name": "value", "valueString": "Plain text"}),
+                    ),
+                    ("rank", json!({"name": "value", "valueString": "7"})),
+                    ("label", json!({"name": "value", "valueString": "LABEL"})),
+                    (
+                        "undeclared",
+                        json!({"name": "value", "valueString": "Plain text"}),
+                    ),
+                ] {
+                    assert!(properties.iter().any(|property| {
+                        property["part"]
+                            == json!([
+                                {"name": "code", "valueCode": code}, value
+                            ])
+                    }));
+                }
+            } else {
+                let contains = response["expansion"]["contains"].as_array().unwrap();
+                assert_eq!(contains.len(), 1);
+                let properties = contains[0]["property"].as_array().unwrap();
+                let expected = [
+                    json!({"code": "annotation", "valueCoding": coding}),
+                    json!({"code": "annotation", "valueString": "Plain text"}),
+                    json!({"code": "rank", "valueInteger": 7}),
+                    json!({"code": "label", "valueString": "LABEL"}),
+                    json!({"code": "undeclared", "valueCode": "Plain text"}),
+                ];
+                assert_eq!(properties.len(), expected.len());
+                for property in expected {
+                    assert!(
+                        properties.contains(&property),
+                        "missing property: {property}"
+                    );
+                }
+            }
+        }
     }
 
     /// `downconvert_property_to_r4_extension` rewrites typed `property[]`

@@ -1193,7 +1193,12 @@ impl ResourceStorage for PostgresBackend {
             }
 
             let extractor = self
-                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .write_extractor(
+                    &transaction,
+                    tenant_id,
+                    !self.is_search_offloaded(),
+                    resource_type == "SearchParameter",
+                )
                 .await?;
             self.index_resource_guarded(
                 &transaction,
@@ -1261,34 +1266,69 @@ impl ResourceStorage for PostgresBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
-                let mut resource = resource;
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+        // Unconditional PUT is last-writer-wins at the API surface, but every
+        // branch below is a check-then-act on the `read`: the row can be
+        // created, bumped, deleted or restored by another writer (on this or
+        // another instance) between the read and the write. Each write is a
+        // compare-and-swap, so a lost race surfaces as a typed error rather
+        // than corrupting anything — and because *this* method decides
+        // existence itself, none of those errors is a legitimate answer from
+        // it: `VersionConflict` from `update`, `AlreadyExists` from `create`,
+        // and `NotFound` from `update` (the row was deleted underneath it) or
+        // `restore_deleted` (another PUT restored the tombstone first) all
+        // mean "re-read and go again". A
+        // bounded number of retries absorbs the race; the last attempt's
+        // error propagates so a pathological caller cannot spin forever.
+        const MAX_CAS_RETRIES: usize = 3;
+        let mut attempts = 0;
+        let mut resource = resource;
+        loop {
+            // Each attempt consumes a body; keep a copy only while a retry is
+            // still possible so the final attempt moves rather than clones.
+            let body = if attempts < MAX_CAS_RETRIES {
+                resource.clone()
+            } else {
+                std::mem::take(&mut resource)
+            };
+
+            let result = match self.read(tenant, resource_type, id).await {
+                // Update existing (preserves original FHIR version)
+                Ok(Some(current)) => self
+                    .update(tenant, &current, body)
+                    .await
+                    .map(|updated| (updated, false)),
+                // Create new with specific ID
+                Ok(None) => {
+                    let mut body = body;
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(id.to_string()));
+                    }
+                    self.create(tenant, resource_type, body, fhir_version)
+                        .await
+                        .map(|created| (created, true))
                 }
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok((created, true))
+                // A deleted resource is brought back to life by a subsequent
+                // update (FHIR http.html#delete), continuing the existing
+                // version chain rather than being rejected with `Gone`.
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => self
+                    .restore_deleted(tenant, resource_type, id, body)
+                    .await
+                    .map(|restored| (restored, true)),
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+                    | StorageError::Resource(
+                        ResourceError::NotFound { .. } | ResourceError::AlreadyExists { .. },
+                    ),
+                ) if attempts < MAX_CAS_RETRIES => {
+                    attempts += 1;
+                    continue;
+                }
+                other => return other,
             }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
-                let restored = self
-                    .restore_deleted(tenant, resource_type, id, resource)
-                    .await?;
-                Ok((restored, true))
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -1461,7 +1501,12 @@ impl ResourceStorage for PostgresBackend {
             // parameters. The `resource_fts` row stays either way:
             // `index_fts_content_guarded` upserts over it on the same connection.
             let extractor = self
-                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .write_extractor(
+                    &transaction,
+                    tenant_id,
+                    !self.is_search_offloaded(),
+                    resource_type == "SearchParameter",
+                )
                 .await?;
             self.index_resource_guarded(
                 &transaction,
@@ -2422,8 +2467,13 @@ impl PostgresBackend {
     /// record keeps its version, the restore gets the next one) and keeps the
     /// FHIR version the resource was originally stored under.
     ///
-    /// Returns `NotFound` if no deleted row is present — the caller has already
-    /// established one exists, so that only happens under a concurrent write.
+    /// The tombstone is re-read inside the transaction, under the same
+    /// per-resource advisory lock every other write path takes, so two PUTs
+    /// racing onto one tombstone serialize: the winner restores it, and the
+    /// loser finds no deleted row and reports `NotFound`, which
+    /// `create_or_update` turns into a fresh read-and-retry (landing on
+    /// `update`). Returns `NotFound` only under such a concurrent write — the
+    /// caller has already established a tombstone exists.
     async fn restore_deleted(
         &self,
         tenant: &TenantContext,
@@ -2490,7 +2540,12 @@ impl PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to insert restore history: {e}")))?;
             let extractor = self
-                .write_extractor(&transaction, tenant_id, !self.is_search_offloaded())
+                .write_extractor(
+                    &transaction,
+                    tenant_id,
+                    !self.is_search_offloaded(),
+                    resource_type == "SearchParameter",
+                )
                 .await?;
             self.index_resource_guarded(
                 &transaction,
@@ -5440,16 +5495,31 @@ impl ReindexSource for PostgresBackend {
     }
 
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
+        // The listing yields a few dozen types, but it has to read every live
+        // row of the tenant to find them, so its cost follows the tenant's
+        // size. A system-level `$reindex` lists first, and a failed listing
+        // fails the whole job before it counts or indexes anything (#2040).
+        // Lift the timeout for this one statement, as `count_resources` does;
+        // the session keeps it afterwards.
         let tenant_id = tenant.tenant_id().as_str();
-
-        let rows = client
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin resource type listing")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for resource type listing")?;
+        let rows = tx
             .query(
                 "SELECT DISTINCT resource_type FROM resources WHERE tenant_id = $1 AND is_deleted = FALSE",
                 &[&tenant_id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to query resource types: {}", e)))?;
+            .or_query_error("Failed to query resource types")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish resource type listing")?;
 
         let types: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
         Ok(types)

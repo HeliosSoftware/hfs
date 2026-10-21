@@ -40,6 +40,13 @@
   `hx-include` — alongside the rest of the document; the SQL Export builder
   passes nothing (its fields already live inside their own `<form>`), so
   this is the one caller whose behavior does not change.
+
+  The `{prefix}:{name}-error` span must stay unconditional: rendered hidden
+  even when there is no error, because `sql-export-form.js` finds it inside
+  the `.field` to show its "This value is required." message when a missing
+  value blocks the submit (#2049). The control's `aria-describedby` is
+  server-rendered only alongside an actual error, so the script cannot
+  reach the span through that attribute on a fresh page.
 -->
 {% macro fields(prefix, params, form="") %}
 <div class="param-grid">
@@ -48,9 +55,9 @@
     <span class="field__label"><code>:{{ p.name }}</code> · {{ p.type_code }}{% if let Some(default) = p.default %} · {{ i18n.t("sql-param-default") }} {{ default }}{% endif %}</span>
     {% match p.type_code.as_str() %}
     {% when "integer" | "positiveInt" | "unsignedInt" | "integer64" %}
-    <input class="field__input" type="number" step="1" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input field__input--number" type="number" step="1" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "decimal" %}
-    <input class="field__input" type="number" step="any" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input field__input--number" type="number" step="any" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "date" %}
     <input class="field__input" type="date" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "boolean" %}

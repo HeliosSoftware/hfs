@@ -499,10 +499,11 @@ pub enum TransactionError {
     /// The transaction's uncommitted writes did not fit in the backend's
     /// storage-engine cache, and the backend rolled it back (#1837). For MongoDB
     /// this is `TransactionTooLargeForCache` (388): WiredTiger's "transaction is
-    /// too large and will not fit in the storage engine cache". It is also a
-    /// cache-pressure rollback (112 "rolled back for eviction", or 365) of a
-    /// Bundle that held the whole admission room and so ran alone, which a
-    /// replay meets again (#1895).
+    /// too large and will not fit in the storage engine cache", on one of the
+    /// transaction's writes or on its commit, which also writes the
+    /// transaction's oplog entry (#1991). It is also a cache-pressure rollback
+    /// (112 "rolled back for eviction", or 365) of a Bundle that held the whole
+    /// admission room and so ran alone, which a replay meets again (#1895).
     ///
     /// Distinct from [`Transient`](Self::Transient): running it again meets the
     /// same cache, so the backend does not. Distinct from
@@ -511,14 +512,26 @@ pub enum TransactionError {
     /// should surface it as a `5xx` without `Retry-After`, naming the Bundle's
     /// size rather than the backend detail.
     ///
+    /// [`cause`](TooLargeForCacheCause) says which of the two ended it, because
+    /// they differ in what an unchanged resubmit can expect (#1993): 388 is the
+    /// backend's verdict on the write set itself, while a lone Bundle's eviction
+    /// rollback also depends on what else fills the cache. Tell a client that a
+    /// resubmit will fail only for
+    /// [`WriteSetTooLarge`](TooLargeForCacheCause::WriteSetTooLarge).
+    ///
     /// `reason` is raw backend detail: for logs, never for a client response.
-    #[error("transaction too large for the storage engine cache ({entries} entries): {reason}")]
+    #[error(
+        "transaction too large for the storage engine cache ({entries} entries, {cause}): {reason}"
+    )]
     TooLargeForCache {
+        /// Which signal ended the transaction; it decides what a client is
+        /// told about an unchanged resubmit (#1993). Shown in the log line.
+        cause: TooLargeForCacheCause,
         /// Entries the transaction ran, so an operator can size the cache from
         /// the log.
         entries: usize,
-        /// Raw backend detail of the failing write, with the entry being
-        /// written. Log-only.
+        /// Raw backend detail of the failure, after a prefix naming the entry
+        /// being written (`Entry N ...`) or the commit (`Commit ...`). Log-only.
         reason: String,
     },
 
@@ -595,6 +608,41 @@ pub enum TransactionError {
         /// Backend identifier (e.g., `s3`).
         backend_name: String,
     },
+}
+
+/// Why a transaction ended as [`TransactionError::TooLargeForCache`] (#1993).
+///
+/// The two causes differ in what an unchanged resubmit can expect, so a caller
+/// that answers a client words each on its own. Every constructor must name
+/// one. Deliberately not `#[non_exhaustive]`: a caller's `match` (the
+/// `too-costly` text in `helios-rest`) then has to word a new cause on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TooLargeForCacheCause {
+    /// The backend reported that the transaction's own write set does not fit
+    /// its cache. For MongoDB, `TransactionTooLargeForCache` (388), which
+    /// mongod sends only when the transaction holds more than
+    /// `transactionTooLargeForCacheThreshold` (0.75) of the cache's dirty
+    /// bytes. An unchanged resubmit brings the same write set to the same
+    /// cache and fails again.
+    WriteSetTooLarge,
+    /// The backend rolled the transaction back under cache pressure while it
+    /// ran alone: it held the whole admission room, so no other transaction
+    /// Bundle of this backend instance was open (#1895). For MongoDB, a
+    /// `WriteConflict` (112) "rolled back for eviction" or a
+    /// `TemporarilyUnavailable` (365). A replay usually fails again (49 of 50
+    /// in the benchmark) but not always: the room bounds only this backend
+    /// instance's transaction Bundles, and single-resource writes, batch
+    /// Bundles, other HFS instances and other clients share the same cache.
+    LoneEviction,
+}
+
+impl fmt::Display for TooLargeForCacheCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TooLargeForCacheCause::WriteSetTooLarge => write!(f, "write set too large"),
+            TooLargeForCacheCause::LoneEviction => write!(f, "lone eviction rollback"),
+        }
+    }
 }
 
 /// Errors originating from the database backend.
@@ -692,6 +740,34 @@ pub enum BackendError {
         /// Failure detail from the serializer.
         message: String,
     },
+}
+
+impl BackendError {
+    /// Whether this is a transient infrastructure failure (the backend is
+    /// down, unreachable or saturated) rather than a fault in the request or
+    /// the server: [`Self::Unavailable`], [`Self::ConnectionFailed`] and
+    /// [`Self::PoolExhausted`].
+    ///
+    /// This is the single definition of "transient" for the layers that answer
+    /// `503` rather than `500` for these errors, so adding a variant here
+    /// changes their status codes together (#2048).
+    /// [`Self::Timeout`] is deliberately not included: it is a `504`.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            BackendError::Unavailable { .. }
+                | BackendError::ConnectionFailed { .. }
+                | BackendError::PoolExhausted { .. }
+        )
+    }
+}
+
+impl StorageError {
+    /// Whether this error is a transient backend failure; see
+    /// [`BackendError::is_unavailable`].
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, StorageError::Backend(e) if e.is_unavailable())
+    }
 }
 
 /// Errors related to bulk export operations.
@@ -1105,12 +1181,12 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 /// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
 ///   message this helper's callers produced before.
 ///
-/// HFS sets `maxTimeMS` on one command only: the cross-tenant
-/// `count_by_tenant` aggregate (#1828,
-/// `MongoBackendConfig::count_by_tenant_max_time_ms`). Elsewhere the timeout
-/// arm fires only when the deadline comes from the server or a
-/// connection-string option. `maxTimeMS` bounds server execution at interrupt
-/// points; server selection, pool checkout and socket time are outside it.
+/// Search commands can set `maxTimeMS` from an optional whole-search deadline.
+/// Optional planner probes classify their own shorter timeouts before this helper.
+/// The cross-tenant `count_by_tenant` aggregate has a separate budget (#1828,
+/// `MongoBackendConfig::count_by_tenant_max_time_ms`). `maxTimeMS` bounds server
+/// execution at interrupt points; server selection, pool checkout and socket
+/// time are outside it.
 #[cfg(feature = "mongodb")]
 pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> BackendError {
     use mongodb::error::ErrorKind;
@@ -1566,6 +1642,54 @@ mod tests {
         assert!(matches!(storage_err, StorageError::BulkSubmit(_)));
     }
 
+    /// #2048: the one predicate the 503-vs-500 decisions share.
+    #[test]
+    fn is_unavailable_is_true_only_for_transient_backend_failures() {
+        let transient = [
+            BackendError::Unavailable {
+                backend_name: "s3".to_string(),
+                message: "slow down".to_string(),
+            },
+            BackendError::ConnectionFailed {
+                backend_name: "postgres".to_string(),
+                message: "refused".to_string(),
+            },
+            BackendError::PoolExhausted {
+                backend_name: "postgres".to_string(),
+            },
+        ];
+        for err in transient {
+            assert!(err.is_unavailable(), "{err:?}");
+            assert!(StorageError::Backend(err).is_unavailable());
+        }
+
+        let not_transient = [
+            BackendError::Timeout {
+                backend_name: "postgres".to_string(),
+                message: "statement_timeout".to_string(),
+            },
+            BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: "boom".to_string(),
+                source: None,
+            },
+            BackendError::QueryError {
+                message: "syntax".to_string(),
+            },
+        ];
+        for err in not_transient {
+            assert!(!err.is_unavailable(), "{err:?}");
+            assert!(!StorageError::Backend(err).is_unavailable());
+        }
+
+        let not_backend: StorageError = ResourceError::NotFound {
+            resource_type: "Patient".to_string(),
+            id: "1".to_string(),
+        }
+        .into();
+        assert!(!not_backend.is_unavailable());
+    }
+
     #[test]
     fn test_unavailable_display_includes_the_failure_reason() {
         let error = BackendError::Unavailable {
@@ -1576,5 +1700,28 @@ mod tests {
 
         assert_eq!(error.to_string(), expected);
         assert_eq!(StorageError::Backend(error).to_string(), expected);
+    }
+
+    /// #1993: the log line names the cause, keeping the prefix and the count.
+    #[test]
+    fn test_too_large_for_cache_display_names_the_cause() {
+        let err = TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::WriteSetTooLarge,
+            entries: 7412,
+            reason: "raw".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transaction too large for the storage engine cache (7412 entries, write set too large): raw"
+        );
+        let err = TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::LoneEviction,
+            entries: 1502,
+            reason: "raw".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transaction too large for the storage engine cache (1502 entries, lone eviction rollback): raw"
+        );
     }
 }

@@ -153,14 +153,25 @@ pub struct ReindexPageStats {
     pub sub_batches: u64,
     /// Of `sub_batches`, how many ran on the rayon pool rather than inline (#1403).
     pub pool_sub_batches: u64,
+    /// Inspecting leftover IDs, checking the written page and cleaning known
+    /// stale rows. Concurrent-writer conflicts are reported, not guessed away.
+    pub verify: Duration,
+    /// Rows identified for cleanup or reported as unresolved during verification.
+    /// Includes leftovers, superseded page rows and ambiguous concurrent rows.
+    pub stale_rows_found: u64,
+    /// Of `stale_rows_found`, rows left unresolved, including concurrent rows
+    /// that cleanup cannot safely delete. Their resources are reported as failed.
+    /// Missing expected IDs and changed versions are reported as errors, not rows.
+    pub stale_rows_remaining: u64,
 }
 
 impl ReindexPageStats {
     /// Time the page's thread waited on the database: the measured wait, or,
-    /// for a writer that does not measure it, its busy delete + insert time
-    /// (the serial case) (#1403).
+    /// for a writer that does not measure it, its busy delete + insert +
+    /// verify time (the serial case) (#1403).
     pub fn db_wait_or_busy(&self) -> Duration {
-        self.db_wait.unwrap_or(self.delete + self.insert)
+        self.db_wait
+            .unwrap_or(self.delete + self.insert + self.verify)
     }
 
     /// Adds every duration and count of `other` to this one.
@@ -177,6 +188,9 @@ impl ReindexPageStats {
         self.insert_commands += other.insert_commands;
         self.sub_batches += other.sub_batches;
         self.pool_sub_batches += other.pool_sub_batches;
+        self.verify += other.verify;
+        self.stale_rows_found += other.stale_rows_found;
+        self.stale_rows_remaining += other.stale_rows_remaining;
         self.db_wait = db_wait;
     }
 }
@@ -536,6 +550,20 @@ pub trait ReindexTarget: Send + Sync {
         stats: &mut ReindexPageStats,
     ) -> Vec<StorageResult<usize>> {
         let _ = stats;
+        self.write_search_entries_page(tenant, resources).await
+    }
+
+    /// Writes a page the primary just stored, for composite secondary sync
+    /// rather than a rebuild. The default delegates to
+    /// [`Self::write_search_entries_page`]. Elasticsearch overrides it so the
+    /// page goes out under the ordinary write refresh policy, not the
+    /// rebuild's: `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` must not cost a
+    /// transaction bundle its read-your-writes search.
+    async fn write_synced_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
         self.write_search_entries_page(tenant, resources).await
     }
 }
@@ -2533,7 +2561,8 @@ fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted) {
 /// elapsed_ms, entries, failed, pages, fetch_ms, write_ms, extract_ms,
 /// delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms, deleted,
 /// inserted, insert_commands, fetch_wait_ms, db_wait_ms, sub_batches,
-/// pool_sub_batches`. `outcome` is this type's own exit path — a type that
+/// pool_sub_batches, stale_found, stale_remaining`. `outcome` is this type's
+/// own exit path — a type that
 /// finished all its pages is always `completed`, even if a later type or the
 /// job as a whole fails or is cancelled. Every counter and phase field
 /// (`entries` through `pool_sub_batches`) is scoped to this type only, since
@@ -2584,6 +2613,8 @@ fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
         db_wait_ms = phases.db_wait_ms,
         sub_batches = s.counters.writer.sub_batches,
         pool_sub_batches = s.counters.writer.pool_sub_batches,
+        stale_found = s.counters.writer.stale_rows_found,
+        stale_remaining = s.counters.writer.stale_rows_remaining,
         "reindex type finished"
     );
 }
@@ -2596,8 +2627,9 @@ fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
 /// interval_resources, interval_resources_per_s, entries, failed, pages,
 /// fetch_ms, write_ms, extract_ms, delete_ms, insert_ms, writer_other_ms,
 /// yield_ms, other_ms, deleted, inserted, insert_commands, fetch_wait_ms,
-/// db_wait_ms`. L4 does **not** carry `sub_batches`/`pool_sub_batches`, to
-/// stay within the log line's field budget. **Scope is the open type, not
+/// db_wait_ms`. L4 does **not** carry `sub_batches`/`pool_sub_batches` or
+/// `stale_found`/`stale_remaining`, to stay within the log line's field
+/// budget. **Scope is the open type, not
 /// the whole job**: `type_resources`, `type_total`, `type_elapsed_ms`,
 /// `type_resources_per_s`, and every counter and phase field from `entries`
 /// through `db_wait_ms`, describe only the type open since its own `reindex
@@ -2660,7 +2692,8 @@ fn log_progress(tenant: &str, job_id: &str, s: &ProgressSnapshot) {
 /// elapsed_ms, resources_per_s, entries, failed, pages, fetch_ms, write_ms,
 /// extract_ms, delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms,
 /// deleted, inserted, insert_commands, fetch_wait_ms, db_wait_ms,
-/// sub_batches, pool_sub_batches`. `outcome` is the job's already-written
+/// sub_batches, pool_sub_batches, stale_found, stale_remaining`. `outcome`
+/// is the job's already-written
 /// terminal status if one exists, otherwise the exit path's outcome
 /// (`job_outcome`). `types_done` counts types whose L3 said `completed`.
 /// Every counter and phase field (`entries` through `pool_sub_batches`) is
@@ -2705,6 +2738,8 @@ fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
         db_wait_ms = phases.db_wait_ms,
         sub_batches = s.counters.writer.sub_batches,
         pool_sub_batches = s.counters.writer.pool_sub_batches,
+        stale_found = s.counters.writer.stale_rows_found,
+        stale_remaining = s.counters.writer.stale_rows_remaining,
         "reindex job finished"
     );
 }
@@ -2714,7 +2749,8 @@ fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
 /// or id batch. Field order: `tenant, job_id, resource_type, page, resources,
 /// type_elapsed_ms, entries, failed, fetch_ms, write_ms, extract_ms,
 /// delete_ms, insert_ms, deleted, inserted, insert_commands, fetch_wait_ms,
-/// db_wait_ms, sub_batches, pool_sub_batches`. Every counter and phase field
+/// db_wait_ms, sub_batches, pool_sub_batches, stale_found, stale_remaining`.
+/// Every counter and phase field
 /// describes only this one page — `page` is the 1-based page number within
 /// the open type, `resources` is this page's own count. L6 has no derived
 /// `other_ms`/`writer_other_ms` fields: `fetch_ms`/`write_ms` are the
@@ -2754,6 +2790,8 @@ fn log_page(
         db_wait_ms = millis(r.writer.db_wait_or_busy()),
         sub_batches = r.writer.sub_batches,
         pool_sub_batches = r.writer.pool_sub_batches,
+        stale_found = r.writer.stale_rows_found,
+        stale_remaining = r.writer.stale_rows_remaining,
         "reindex page"
     );
 }
@@ -6901,6 +6939,192 @@ mod tests {
         );
     }
 
+    /// Changes the source after the failed write has consumed its snapshot.
+    /// This checks the driver boundary, not atomicity with a MongoDB command
+    /// that may still be running after an uncertain write outcome.
+    async fn automatic_retry_after_source_change(delete: bool) {
+        struct ChangingBackend {
+            current: parking_lot::Mutex<Option<StoredResource>>,
+            delete: bool,
+            pages: std::sync::atomic::AtomicUsize,
+            fetched_ids: parking_lot::Mutex<Vec<Vec<String>>>,
+            written: parking_lot::Mutex<Vec<(String, serde_json::Value)>>,
+        }
+
+        #[async_trait]
+        impl ReindexSource for ChangingBackend {
+            async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+                Ok(vec!["Patient".to_string()])
+            }
+
+            async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+                Ok(u64::from(self.current.lock().is_some()))
+            }
+
+            async fn fetch_resources_page(
+                &self,
+                _: &TenantContext,
+                _: &str,
+                _: Option<&str>,
+                _: u32,
+            ) -> StorageResult<ResourcePage> {
+                self.pages.fetch_add(1, Ordering::SeqCst);
+                Ok(ResourcePage {
+                    resources: self.current.lock().iter().cloned().collect(),
+                    next_cursor: None,
+                    skipped: Vec::new(),
+                })
+            }
+
+            async fn fetch_resources_by_ids(
+                &self,
+                _: &TenantContext,
+                resource_type: &str,
+                ids: &[String],
+            ) -> StorageResult<Vec<StoredResource>> {
+                assert_eq!(resource_type, "Patient");
+                self.fetched_ids.lock().push(ids.to_vec());
+                Ok(self
+                    .current
+                    .lock()
+                    .iter()
+                    .filter(|resource| ids.iter().any(|id| id == resource.id()))
+                    .cloned()
+                    .collect())
+            }
+        }
+
+        #[async_trait]
+        impl ReindexTarget for ChangingBackend {
+            async fn delete_search_entries(
+                &self,
+                _: &TenantContext,
+                _: &str,
+                _: &str,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+
+            async fn write_search_entries(
+                &self,
+                _: &TenantContext,
+                resource: &StoredResource,
+            ) -> StorageResult<usize> {
+                let mut written = self.written.lock();
+                written.push((
+                    resource.version_id().to_string(),
+                    resource.content().clone(),
+                ));
+                if written.len() == 1 {
+                    *self.current.lock() = if self.delete {
+                        None
+                    } else {
+                        Some(resource.clone().new_version(
+                            serde_json::json!({"resourceType": "Patient", "id": "p1", "active": true}),
+                            crate::types::ResourceMethod::Put,
+                        ))
+                    };
+                    return Err(crate::error::BackendError::Unavailable {
+                        backend_name: "changing-source".into(),
+                        message: "injected transient page write failure".into(),
+                    }
+                    .into());
+                }
+                Ok(1)
+            }
+
+            async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+                panic!("a resource retry must not clear the tenant index")
+            }
+        }
+
+        let tenant = named_tenant(if delete {
+            "retry-deleted"
+        } else {
+            "retry-updated"
+        });
+        let original = serde_json::json!({"resourceType": "Patient", "id": "p1", "active": false});
+        let backend = Arc::new(ChangingBackend {
+            current: parking_lot::Mutex::new(Some(StoredResource::new(
+                "Patient",
+                "p1",
+                tenant.tenant_id().clone(),
+                original.clone(),
+                helios_fhir::FhirVersion::default(),
+            ))),
+            delete,
+            pages: std::sync::atomic::AtomicUsize::new(0),
+            fetched_ids: parking_lot::Mutex::new(Vec::new()),
+            written: parking_lot::Mutex::new(Vec::new()),
+        });
+        let op = Arc::new(ReindexOperation::with_parts(
+            backend.clone(),
+            vec![backend.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ));
+        ReindexOnFinish::new(op.clone())
+            .reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        await_automatic_idle(&op).await;
+
+        assert_eq!(backend.pages.load(Ordering::SeqCst), 1);
+        assert_eq!(*backend.fetched_ids.lock(), vec![vec!["p1".to_string()]]);
+        let written = backend.written.lock();
+        assert_eq!(written[0], ("1".to_string(), original));
+        if delete {
+            assert_eq!(
+                written.len(),
+                1,
+                "deleted resources must not replay a saved snapshot"
+            );
+        } else {
+            assert_eq!(written.len(), 2);
+            assert_eq!(written[1].0, "2");
+            assert_eq!(written[1].1["active"], true);
+        }
+
+        let jobs = op.list_jobs();
+        assert_eq!(jobs.len(), 2);
+        assert!(
+            jobs.iter()
+                .all(|job| job.status == ReindexStatus::Completed)
+        );
+        let first = jobs.iter().find(|job| !job.resource_scoped).unwrap();
+        assert_eq!(first.errors.len(), 1);
+        assert!(first.errors[0].retryable);
+        let serialized = serde_json::to_value(first).unwrap();
+        assert_eq!(serialized["errors"][0]["retryable"], true);
+        let parameters = first.to_parameters();
+        let error = parameters["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "error")
+            .unwrap();
+        assert!(
+            error["part"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|part| { part["name"] == "retryable" && part["valueBoolean"] == true })
+        );
+        let retry = jobs.iter().find(|job| job.resource_scoped).unwrap();
+        assert_eq!(retry.total_resources, 1);
+        assert_eq!(retry.processed_resources, 1);
+        assert!(retry.errors.is_empty());
+        assert_eq!(retry.entries_created, u64::from(!delete));
+    }
+
+    #[tokio::test]
+    async fn automatic_resource_retry_reads_the_updated_version() {
+        automatic_retry_after_source_change(false).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_resource_retry_skips_a_resource_deleted_after_failure() {
+        automatic_retry_after_source_change(true).await;
+    }
+
     #[tokio::test]
     async fn a_failed_resource_retry_is_not_retried_again() {
         let source = Arc::new(PagedSource::new(3));
@@ -7183,6 +7407,8 @@ mod tests {
         "db_wait_ms",
         "sub_batches",
         "pool_sub_batches",
+        "stale_found",
+        "stale_remaining",
     ];
     const PROGRESS_FIELDS: &[&str] = &[
         "tenant",
@@ -7244,6 +7470,8 @@ mod tests {
         "db_wait_ms",
         "sub_batches",
         "pool_sub_batches",
+        "stale_found",
+        "stale_remaining",
     ];
     const PAGE_FIELDS: &[&str] = &[
         "tenant",
@@ -7266,6 +7494,8 @@ mod tests {
         "db_wait_ms",
         "sub_batches",
         "pool_sub_batches",
+        "stale_found",
+        "stale_remaining",
     ];
 
     /// One captured `reindex ...` event: field names in printed (macro) order,
@@ -7381,41 +7611,33 @@ mod tests {
 
     #[test]
     fn field_lists_append_fetch_wait_and_db_wait() {
+        // Appended only: the writer-wait pair, then the sub-batch pair, then the
+        // stale-row pair from delete verification.
+        let appended = [
+            "fetch_wait_ms",
+            "db_wait_ms",
+            "sub_batches",
+            "pool_sub_batches",
+            "stale_found",
+            "stale_remaining",
+        ];
         assert_eq!(
-            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 4..],
-            [
-                "fetch_wait_ms",
-                "db_wait_ms",
-                "sub_batches",
-                "pool_sub_batches"
-            ]
+            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 6..],
+            appended
         );
         assert_eq!(
             &PROGRESS_FIELDS[PROGRESS_FIELDS.len() - 2..],
             ["fetch_wait_ms", "db_wait_ms"]
         );
         assert!(
-            !PROGRESS_FIELDS.contains(&"sub_batches"),
-            "L4 must not carry sub_batches or pool_sub_batches (#1403)"
+            !PROGRESS_FIELDS.contains(&"sub_batches") && !PROGRESS_FIELDS.contains(&"stale_found"),
+            "L4 must not carry sub_batches, pool_sub_batches or the stale-row pair (#1403)"
         );
         assert_eq!(
-            &JOB_FINISHED_FIELDS[JOB_FINISHED_FIELDS.len() - 4..],
-            [
-                "fetch_wait_ms",
-                "db_wait_ms",
-                "sub_batches",
-                "pool_sub_batches"
-            ]
+            &JOB_FINISHED_FIELDS[JOB_FINISHED_FIELDS.len() - 6..],
+            appended
         );
-        assert_eq!(
-            &PAGE_FIELDS[PAGE_FIELDS.len() - 4..],
-            [
-                "fetch_wait_ms",
-                "db_wait_ms",
-                "sub_batches",
-                "pool_sub_batches"
-            ]
-        );
+        assert_eq!(&PAGE_FIELDS[PAGE_FIELDS.len() - 6..], appended);
     }
 
     #[test]

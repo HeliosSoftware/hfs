@@ -721,6 +721,100 @@ async fn import_non_bundle_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// A chunked import into a running server with `?defer_closure=true` leaves
+/// `concept_closure` empty, and `?finalize=true` rebuilds it. Same scenario as the SQLite test in
+/// `operations::import_bundle`, but the symptom differs per backend: PostgreSQL
+/// answers `$subsumes` from a recursive CTE over `concept_hierarchy`, so it is
+/// unaffected there; what reads the closure on PostgreSQL is the `is-a`
+/// ValueSet path, so the implicit `?fhir_vs=isa/A` expansion is what goes
+/// empty. `$subsumes` is asserted alongside to document that difference.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
+    // Own database: any other test's `TestAppPg::new` would rebuild the
+    // closure this test drops on purpose, before `finalize=true` gets to it.
+    let app = TestAppPg::new_isolated().await;
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let sys = format!("http://chunked.{uid}/cs");
+    const DEFER: &str = "/import?defer_closure=true";
+
+    let chunk = |concepts: &str| {
+        format!(
+            r#"{{"resourceType":"Bundle","type":"collection","entry":[{{"resource":{{
+                 "resourceType":"CodeSystem","id":"chunked-{uid}","url":"{sys}",
+                 "version":"1.0","name":"ChunkedCS","status":"active",
+                 "content":"complete","hierarchyMeaning":"is-a",
+                 "property":[{{"code":"parent","uri":"http://hl7.org/fhir/concept-properties#parent","type":"code"}}],
+                 "concept":[{concepts}]
+               }}}}]}}"#
+        )
+    };
+    async fn subsumes(app: &TestAppPg, sys: &str, a: &str, b: &str) -> String {
+        let path = format!("/CodeSystem/$subsumes?system={sys}&codeA={a}&codeB={b}");
+        let (status, body) = app.get_fhir(&path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["parameter"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == "outcome"))
+            .and_then(|p| p["valueCode"].as_str())
+            .unwrap_or("<none>")
+            .to_string()
+    }
+    /// Codes in the implicit `<sys>?fhir_vs=isa/A` ValueSet, sorted.
+    async fn isa_members(app: &TestAppPg, sys: &str) -> Vec<String> {
+        let path = format!("/ValueSet/$expand?url={sys}%3Ffhir_vs%3Disa%2FA");
+        let (status, body) = app.get_fhir(&path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut codes: Vec<String> = body["expansion"]["contains"]
+            .as_array()
+            .map(|cs| {
+                cs.iter()
+                    .filter_map(|c| c["code"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        codes.sort();
+        codes
+    }
+
+    // Chunk 1: metadata only. Chunk 2: parent + child, builds the closure.
+    // Chunk 3: another child; the system is no longer empty, so the closure is
+    // deleted and not rebuilt.
+    let (status, body) = app.post_fhir(DEFER, chunk("")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app
+        .post_fhir(
+            DEFER,
+            chunk(
+                r#"{"code":"A","display":"A"},
+               {"code":"A.0","display":"A zero","property":[{"code":"parent","valueCode":"A"}]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app
+        .post_fhir(
+            DEFER,
+            chunk(
+            r#"{"code":"A.1","display":"A one","property":[{"code":"parent","valueCode":"A"}]}"#,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert!(
+        isa_members(&app, &sys).await.is_empty(),
+        "chunked import should have left the closure empty"
+    );
+    // Unaffected on PostgreSQL: walks concept_hierarchy, not the closure.
+    assert_eq!(subsumes(&app, &sys, "A", "A.0").await, "subsumes");
+
+    let (status, body) = app.post_fhir("/import?finalize=true", chunk("")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["closures_rebuilt"].as_u64(), Some(1), "{body}");
+
+    assert_eq!(isa_members(&app, &sys).await, ["A", "A.0", "A.1"]);
+    assert_eq!(subsumes(&app, &sys, "A", "A.1").await, "subsumes");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn import_bundle_with_malformed_cs_returns_207() {
     let app = TestAppPg::new().await;
@@ -1353,6 +1447,31 @@ mod vcl {
         let app = app().await;
         let codes = expand_codes(&app, &format!("({SYS})code/\"a.*\"")).await;
         assert_eq!(codes, ["arm"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_regex_on_concept() {
+        // #2115: `concept/"re"` names the concept code, same as `code/"re"`.
+        let app = app().await;
+        for prop in ["concept", "code"] {
+            assert_eq!(
+                expand_codes(&app, &format!("({SYS}){prop}/\"l.*\"")).await,
+                ["leg", "limb"],
+                "{prop}"
+            );
+            // After an earlier filter has built a candidate set.
+            assert_eq!(
+                expand_codes(&app, &format!("({SYS})(concept<<limb,{prop}/\"a.*\")")).await,
+                ["arm"],
+                "{prop}"
+            );
+            // With a text filter (FTS-first path on SQLite).
+            let expr = format!("({SYS}){prop}/\"l.*\"");
+            let (status, body) =
+                expand_with(&app, &expr, &[("filter", "valueString", "leg")]).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(codes_of(&body), ["leg"], "{prop}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

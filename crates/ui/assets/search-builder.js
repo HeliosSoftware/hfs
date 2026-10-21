@@ -418,6 +418,34 @@
     select.appendChild(el);
   }
 
+  /* The native select keeps the builder's value and events. Its themed
+   * projection is refreshed silently when the builder changes that state. */
+  function refreshSelect(select, available) {
+    if (!select) return;
+    // Mount after insertion, when form association is available. Late catalog
+    // completions on removed rows must not recreate document listeners.
+    if (!select.isConnected) {
+      if (typeof available === "boolean") select.hidden = !available;
+      return;
+    }
+    if (window.HfsCombobox) {
+      window.HfsCombobox.refresh(select,
+        typeof available === "boolean" ? { available: available } : undefined);
+    } else if (typeof available === "boolean") select.hidden = !available;
+  }
+
+  function enhanceRowSelects(row) {
+    if (!window.HfsCombobox || !row.isConnected) return;
+    row.querySelectorAll("select").forEach(function (select) {
+      window.HfsCombobox.adopt(select);
+    });
+  }
+
+  function releaseRowControls(row) {
+    releaseRowTypeaheads(row);
+    if (window.HfsCombobox) window.HfsCombobox.destroy(row);
+  }
+
   /* ---- chaining rows (#394) -------------------------------------------- */
 
   var chainListSeq = 0;
@@ -508,6 +536,7 @@
     rm.textContent = "×";
     wrap.appendChild(rm);
     host.appendChild(wrap);
+    refreshSelect(comparator, !comparator.hidden);
     return input;
   }
 
@@ -621,6 +650,7 @@
     }
     var copy = document.getElementById("query-copy");
     if (copy) copy.disabled = writeBlocked;
+    syncPreviousResults();
     if (runBlocked || writeBlocked || builderCompatibilityPending()) return;
     var ready = pendingBuilderConsumers;
     pendingBuilderConsumers = [];
@@ -646,6 +676,7 @@
 
   function noteBuilderUserEdit() {
     builderRevision += 1;
+    syncPreviousResults();
   }
 
   function beginTypeResolution(row, userTransition) {
@@ -736,6 +767,7 @@
     }
     var panel = row.querySelector(".builder-row__modpanel");
     if (panel) fillModPanel(panel, row, mods);
+    refreshSelect(modifier);
     return original !== selected;
   }
 
@@ -752,6 +784,7 @@
       input.dataset.fhirWire = comparator.value + input.dataset.fhirWire;
     }
     comparator.value = "";
+    refreshSelect(comparator);
   }
 
   function classifyHydratedComparators(row, sourceType, classifySelected) {
@@ -804,6 +837,7 @@
   function clearComparatorsForModifier(row) {
     row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
       comparator.value = "";
+      refreshSelect(comparator);
     });
   }
 
@@ -898,7 +932,7 @@
       if (!paramType && selected && prefixes.indexOf(selected) < 0) {
         option(comparator, selected, selected, true);
       }
-      comparator.hidden = prefixes.length === 0 && !selected;
+      refreshSelect(comparator, prefixes.length > 0 || !!selected);
     });
     return wireChanged;
   }
@@ -1142,6 +1176,7 @@
               if (chosen && targets.indexOf(chosen) < 0) {
                 option(typeSel, chosen, chosen, true);
               }
+              refreshSelect(typeSel);
             }
           });
         });
@@ -1219,6 +1254,7 @@
       });
 
       hopsHost.appendChild(seg);
+      enhanceRowSelects(seg);
       segRefill(k);
     }
 
@@ -1400,6 +1436,7 @@
           if (chosen && targets.indexOf(chosen) < 0) {
             option(target, chosen, chosen, true);
           }
+          refreshSelect(target);
         }
       });
     }
@@ -1817,12 +1854,14 @@
 
     var hosts = builderHosts();
     Object.keys(hosts).forEach(function (kind) {
-      releaseRowTypeaheads(hosts[kind]);
+      releaseRowControls(hosts[kind]);
       hosts[kind].textContent = "";
     });
     splitQuery(parsed.query).forEach(function (part) {
       var kind = bucketFor(part);
-      hosts[kind].appendChild(builderRow(kind, part));
+      var row = builderRow(kind, part);
+      hosts[kind].appendChild(row);
+      enhanceRowSelects(row);
     });
     refreshRunAvailability();
     refreshChainAffordances();
@@ -1956,6 +1995,7 @@
           var rowModifier = row.querySelector(".builder-row__modifier");
           if (rowModifier) {
             rowModifier.value = "";
+            refreshSelect(rowModifier);
             var rowPanel = row.querySelector(".builder-row__modpanel");
             if (rowPanel) {
               fillModPanel(rowPanel, row, applicableMods(row.dataset.modType || ""));
@@ -2021,6 +2061,7 @@
         var chipRow = modChip.closest(".builder-row");
         var sel = chipRow.querySelector(".builder-row__modifier");
         sel.value = sel.value === modChip.dataset.modChip ? "" : modChip.dataset.modChip;
+        refreshSelect(sel);
         var modifierDeferred = false;
         if (sel.value) {
           modifierDeferred = !enforceModifierComparatorExclusion(chipRow);
@@ -2051,6 +2092,7 @@
         var orWrap = removeOr.closest(".builder-row__orvalue");
         if (orWrap.parentElement.children.length > 1) {
           var removeOrRow = orWrap.closest(".builder-row");
+          releaseRowControls(orWrap);
           orWrap.remove();
           cancelComparatorClassification(removeOrRow);
           updateUrl();
@@ -2060,7 +2102,7 @@
       if (remove) {
         noteBuilderUserEdit();
         var removedRow = remove.closest(".builder-row");
-        releaseRowTypeaheads(removedRow);
+        releaseRowControls(removedRow);
         removedRow.remove();
         refreshRunAvailability();
         updateUrl();
@@ -2089,8 +2131,9 @@
           modifier: keptMod,
           value: keptValues.join(","),
         });
-        releaseRowTypeaheads(from);
+        releaseRowControls(from);
         from.replaceWith(chain);
+        enhanceRowSelects(chain);
         noteBuilderUserEdit();
         focusQuietly(chain.querySelector(".builder-row__cparam"));
         updateUrl();
@@ -2103,6 +2146,7 @@
             value: "",
           });
           builderHosts().include.appendChild(inc);
+          enhanceRowSelects(inc);
           noteBuilderUserEdit();
           inc.querySelector(kind === "include-rev" ? ".builder-row__itype" : ".builder-row__iparam").focus();
           return;
@@ -2117,6 +2161,7 @@
             value: "",
           });
           builderHosts().condition.appendChild(has);
+          enhanceRowSelects(has);
           noteBuilderUserEdit();
           has.querySelector(".builder-row__htype").focus();
           return;
@@ -2128,6 +2173,7 @@
         };
         var row = builderRow(kind, part);
         builderHosts()[kind].appendChild(row);
+        enhanceRowSelects(row);
         noteBuilderUserEdit();
         if (kind === "condition") refreshChainAffordances();
         focusQuietly(row.querySelector(kind === "condition" ? ".builder-row__key" : ".builder-row__value"));
@@ -2197,6 +2243,9 @@
         if (index >= railMaxRecent) item.remove();
       });
     railRecentGroup.hidden = false;
+    /* The clone inherits the source's `hidden`, and a live filter must
+     * still apply to the repainted group. */
+    applyRailFilter();
   }
 
   /* Serializes every `recordRailSelection` read-modify-write cycle behind
@@ -2316,16 +2365,30 @@
     if (document.getElementById("resources")) restoreLocationContext();
     else restoreRailMarkOnly();
   });
+  /* Applies the rail's filter box to every list in the rail: the full type
+   * list and the "Recently used" group above it (#1275). The group itself is
+   * hidden when it has no items left, so its divider (which CSS shows only
+   * after a non-hidden group) goes with it. */
+  function applyRailFilter() {
+    if (!railFilter) return;
+    var needle = railFilter.value.trim().toLowerCase();
+    function filterItems(host) {
+      var visible = 0;
+      host.querySelectorAll("a.filter-rail__item[data-type]").forEach(function (item) {
+        item.hidden =
+          !!needle && item.dataset.type.toLowerCase().indexOf(needle) < 0;
+        if (!item.hidden) visible += 1;
+      });
+      return visible;
+    }
+    if (railList) filterItems(railList);
+    if (railRecentGroup) {
+      railRecentGroup.hidden = filterItems(railRecentGroup) === 0;
+    }
+  }
+
   if (railFilter && railList) {
-    railFilter.addEventListener("input", function () {
-      var needle = railFilter.value.trim().toLowerCase();
-      railList
-        .querySelectorAll("a.filter-rail__item[data-type]")
-        .forEach(function (item) {
-          item.hidden =
-            !!needle && item.dataset.type.toLowerCase().indexOf(needle) < 0;
-        });
-    });
+    railFilter.addEventListener("input", applyRailFilter);
   }
 
 
@@ -2605,6 +2668,28 @@
     previous: document.getElementById("query-results-previous"),
   };
 
+  /* Retained rows belong to the last successful logical query, not its
+   * possibly opaque pager URL or the transport-only _total parameter.
+   * Pending or failed searches keep the existing previous-results cue;
+   * otherwise it follows what Run would request once the builder settles. */
+  function syncPreviousResults() {
+    if (!results || !results.previous) return;
+    if (!lastSearchContext) {
+      results.previous.hidden = true;
+      return;
+    }
+    var candidate = parseSearchUrl(urlInput && urlInput.value);
+    results.previous.hidden = !(
+      activeSearch ||
+      (results.error && !results.error.hidden) ||
+      !candidate ||
+      builderRunBlocked() ||
+      builderWriteBlocked() ||
+      builderHasPendingSerialization() ||
+      requestPath(candidate) !== requestPath(lastSearchContext)
+    );
+  }
+
   /* Compact display heuristics for common FHIR shapes (HumanName,
    * CodeableConcept, Reference, Quantity); everything else is truncated
    * JSON rather than a blank cell. */
@@ -2626,7 +2711,7 @@
     if (value.reference) return value.reference;
     if (value.value !== undefined && value.unit)
       return value.value + " " + value.unit;
-    if (value.code) return value.code;
+    if (value.code) return fmt(value.code);
     var json = JSON.stringify(value);
     return json.length > 60 ? json.slice(0, 60) + "…" : json;
   }
@@ -2939,7 +3024,6 @@
     results.body.replaceChildren(prepared.rows);
     results.meta.textContent = prepared.meta;
     results.note.textContent = prepared.note;
-    results.previous.hidden = true;
     var renderedRevision = builderRevision;
     syncCandidateSort();
     if (!PARAM_META[context.type])
@@ -2969,6 +3053,7 @@
     clearResultsError();
     lastSearchPath = path;
     lastSearchContext = context;
+    syncPreviousResults();
     return true;
   }
 
@@ -3053,6 +3138,7 @@
     });
     results.sort.value = value;
     if (results.sort.value !== value) results.sort.value = "";
+    refreshSelect(results.sort);
   }
 
   function setResultsBusy(busy) {
@@ -3061,7 +3147,10 @@
     var run = form.querySelector('[data-intent="run"]');
     if (run) run.setAttribute("aria-busy", busy ? "true" : "false");
     results.meta.hidden = busy;
-    if (results.sort) results.sort.disabled = busy;
+    if (results.sort) {
+      results.sort.disabled = busy;
+      refreshSelect(results.sort);
+    }
     searchCancel.hidden = !busy;
   }
 
@@ -3091,7 +3180,7 @@
     results.card.hidden = search.prior.hidden;
     results.error.textContent = search.prior.errorText;
     results.error.hidden = search.prior.errorHidden;
-    results.previous.hidden = !lastSearchPath;
+    syncPreviousResults();
     syncCandidateSort();
   }
 
@@ -3123,7 +3212,7 @@
     };
     activeSearch = search;
     clearResultsError();
-    results.previous.hidden = !lastSearchPath;
+    syncPreviousResults();
     setResultsBusy(true);
     function elapsed() {
       if (activeSearch !== search) return;
@@ -3311,7 +3400,12 @@
         btn.dataset.savedLoad = path;
         btn.textContent = row.name;
         btn.title = "GET " + path;
-        recentHost.appendChild(btn);
+        /* Same wrapper as the Recent rows, so both sections share padding,
+         * row height and the hover state. */
+        var wrap = document.createElement("div");
+        wrap.className = "recent-item";
+        wrap.appendChild(btn);
+        recentHost.appendChild(wrap);
       });
       var recentHeading = document.createElement("div");
       recentHeading.className = "recent-group";

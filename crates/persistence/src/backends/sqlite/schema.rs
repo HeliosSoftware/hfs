@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 38;
+pub const SCHEMA_VERSION: i32 = 41;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -24,7 +24,7 @@ pub const SCHEMA_VERSION: i32 = 38;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 16] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -39,7 +39,11 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
     ),
     (
         "idx_search_date_end",
-        "CREATE INDEX IF NOT EXISTS idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date) WHERE value_date_end IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date_start, resource_key) WHERE value_date_end IS NOT NULL",
+    ),
+    (
+        "idx_search_date_start",
+        "CREATE INDEX IF NOT EXISTS idx_search_date_start ON search_index(tenant_id, resource_type, param_name, value_date_start, value_date_end, resource_key) WHERE value_date_start IS NOT NULL",
     ),
     (
         "idx_search_number",
@@ -476,6 +480,9 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             35 => migrate_v35_to_v36(conn)?,
             36 => migrate_v36_to_v37(conn)?,
             37 => migrate_v37_to_v38(conn)?,
+            38 => migrate_v38_to_v39(conn)?,
+            39 => migrate_v39_to_v40(conn)?,
+            40 => migrate_v40_to_v41(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2003,6 +2010,170 @@ fn migrate_v37_to_v38(conn: &Connection) -> StorageResult<()> {
         }
     }
     Ok(())
+}
+
+/// v38 -> v39 (#1506): adds `search_index.value_date_start`, the start of every
+/// date row's range in the same fixed-width UTC text as `value_date_end`
+/// ([`super::search::writer::SQLITE_INSTANT_FORMAT`]). The range path compared
+/// the start through a `strftime` expression over the raw `value_date` on
+/// every row of the parameter, which made the prefixes that only bound the
+/// start (`lt`, `ge`, `le`, `ne`, `eb`, `ap`) slower than before #1391; it now
+/// compares this column as plain text.
+///
+/// The backfill runs in Rust, in rowid batches of one transaction each,
+/// through the writer's own start helper, so an old row gets exactly the start
+/// a new one would. Only rows still without a start are visited, and the
+/// indexes are built after it, once, over final data: a replay, or a restart
+/// after a crash, resumes where the last committed batch stopped.
+///
+/// `idx_search_date_end` carried `value_date` as its last column; it now
+/// carries `value_date_start` and `resource_key`, and the new
+/// `idx_search_date_start` carries `value_date_end` and `resource_key`, so both
+/// are covering for the date subquery. v35 still creates the old shape on a
+/// fresh database, so an index of another shape is dropped and rebuilt here.
+fn migrate_v38_to_v39(conn: &Connection) -> StorageResult<()> {
+    if !table_columns(conn, "search_index")?
+        .iter()
+        .any(|column| column == "value_date_start")
+    {
+        conn.execute(
+            "ALTER TABLE search_index ADD COLUMN value_date_start TEXT",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v39 add value_date_start: {e}")))?;
+    }
+
+    backfill_value_date_start(conn)?;
+
+    // Both indexes end in `resource_key`, so a date seek is answered from the
+    // index alone: without it every matching entry costs a random read of its
+    // `search_index` row just to fetch the key (#1506). An index of an earlier
+    // shape is replaced.
+    for name in ["idx_search_date_end", "idx_search_date_start"] {
+        let is_current: bool = conn
+            .query_row(
+                "SELECT sql LIKE '%resource_key)%' FROM sqlite_master
+                  WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !is_current {
+            conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                .map_err(|e| migration_err(format!("v39 drop {name}: {e}")))?;
+        }
+    }
+    for (name, sql) in SEARCH_VALUE_INDEXES {
+        if name == "idx_search_date_end" || name == "idx_search_date_start" {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("v39 create {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Fill `value_date_start` on every date row still without one. A row whose
+/// date cannot be read keeps NULL, as its end does, and matches no start
+/// comparison.
+fn backfill_value_date_start(conn: &Connection) -> StorageResult<()> {
+    const BATCH: i64 = 10_000;
+    let mut after = 0_i64;
+    loop {
+        // One transaction per batch: a crash loses at most the batch in
+        // flight, and the next start continues from the rows still NULL.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| migration_err(format!("v39 begin backfill batch: {e}")))?;
+        let rows: Vec<(i64, String)> = {
+            let mut select = tx
+                .prepare_cached(
+                    "SELECT rowid, value_date FROM search_index
+                      WHERE rowid > ?1 AND value_date IS NOT NULL AND value_date_start IS NULL
+                      ORDER BY rowid LIMIT ?2",
+                )
+                .map_err(|e| migration_err(format!("v39 read date rows: {e}")))?;
+            let rows = select
+                .query_map(rusqlite::params![after, BATCH], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|e| migration_err(format!("v39 read date rows: {e}")))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| migration_err(format!("v39 read date rows: {e}")))?
+        };
+        let Some(&(last, _)) = rows.last() else {
+            break;
+        };
+        after = last;
+        {
+            let mut update = tx
+                .prepare_cached("UPDATE search_index SET value_date_start = ?2 WHERE rowid = ?1")
+                .map_err(|e| migration_err(format!("v39 backfill value_date_start: {e}")))?;
+            for (rowid, value) in rows {
+                if let Some(start) = super::search::writer::stored_date_start(&value)
+                    .map(super::search::writer::sqlite_instant)
+                {
+                    update
+                        .execute(rusqlite::params![rowid, start])
+                        .map_err(|e| {
+                            migration_err(format!("v39 backfill value_date_start: {e}"))
+                        })?;
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| migration_err(format!("v39 commit backfill batch: {e}")))?;
+    }
+    Ok(())
+}
+
+/// The shape v40 gives `idx_history_updated`: the `(tenant_id, last_updated)`
+/// range every history-window read uses, plus each column the dashboard's
+/// bucketed history counts read (#2107).
+const HISTORY_UPDATED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated, resource_type, is_deleted, version_id)";
+
+/// v39 -> v40 (#2107): `idx_history_updated` carries `resource_type`,
+/// `is_deleted` and `version_id` after its `(tenant_id, last_updated)` key, so
+/// the dashboard's bucketed history counts (`count_deltas_by_bucket`,
+/// `count_deltas_by_type_and_bucket`) are answered from the index alone.
+/// Before, every history row in the charted window cost a read of its table
+/// row (the resource blob's page) just to test the type and the delta rule;
+/// after a bulk import that is nearly the whole history table, and on a 19M
+/// resource database the 30-day window took over ten seconds and churned the
+/// connection's page cache.
+///
+/// The index is widened rather than joined by a second one, so the write path
+/// still maintains one entry per history row, and every existing reader of the
+/// `(tenant_id, last_updated)` prefix (the write marker, the activity
+/// histogram, system history) keeps it. The v1 schema still creates the old
+/// shape on a fresh database, so an index of another shape is dropped and
+/// rebuilt here.
+fn migrate_v39_to_v40(conn: &Connection) -> StorageResult<()> {
+    let is_current: bool = conn
+        .query_row(
+            "SELECT sql LIKE '%is_deleted, version_id)%' FROM sqlite_master
+              WHERE type = 'index' AND name = 'idx_history_updated'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !is_current {
+        conn.execute("DROP INDEX IF EXISTS idx_history_updated", [])
+            .map_err(|e| migration_err(format!("v40 drop idx_history_updated: {e}")))?;
+    }
+    conn.execute(HISTORY_UPDATED_INDEX, [])
+        .map_err(|e| migration_err(format!("v40 create idx_history_updated: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 40 to version 41.
+///
+/// Adds the bookkeeping for SQL-on-FHIR terminology relations (#1824): the
+/// registry of per-(tenant, canonical) relation tables and the Library
+/// references that keep them alive. The relation tables themselves are created
+/// and dropped at runtime by the terminology store.
+fn migrate_v40_to_v41(conn: &Connection) -> StorageResult<()> {
+    super::sof_terminology::create_bookkeeping_tables(conn)
+        .map_err(|e| migration_err(format!("v41 terminology tables: {e}")))
 }
 
 fn migration_err(message: String) -> crate::error::StorageError {
@@ -4207,6 +4378,231 @@ mod tests {
         .unwrap();
         migrate_v34_to_v35(&conn).unwrap();
         assert_eq!(end("a").as_deref(), Some("kept"));
+    }
+
+    /// #2107: v40 widens a v39 database's `idx_history_updated` so the
+    /// dashboard's history counts are covered, and a replay leaves it as is.
+    #[test]
+    fn migrate_v39_to_v40_widens_the_history_updated_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_history_updated;
+             CREATE INDEX idx_history_updated ON resource_history(tenant_id, last_updated);",
+        )
+        .unwrap();
+        set_schema_version(&conn, 39).unwrap();
+        let shape = || -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_history_updated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(!shape().contains("version_id"));
+
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let widened = shape();
+        assert!(
+            widened.ends_with("(tenant_id, last_updated, resource_type, is_deleted, version_id)"),
+            "{widened}"
+        );
+        migrate_v39_to_v40(&conn).unwrap();
+        assert_eq!(shape(), widened, "a replay keeps the index");
+    }
+
+    /// A v38 database: the v39 column and both date-end indexes un-applied.
+    fn v38_database_with_date_rows(rows: &[(&str, Option<&str>)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP INDEX idx_search_date_start;
+             DROP INDEX idx_search_date_end;
+             ALTER TABLE search_index DROP COLUMN value_date_start;
+             CREATE INDEX idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date) WHERE value_date_end IS NOT NULL;",
+        )
+        .unwrap();
+        for (id, value) in rows {
+            conn.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_date, value_date_precision, value_date_end, value_string)
+                 VALUES ('t', 'Patient', ?1, 'date', ?2, 'day', '2030-01-01 00:00:00.000', ?3)",
+                rusqlite::params![id, value, value.is_none().then_some("x")],
+            )
+            .unwrap();
+        }
+        set_schema_version(&conn, 38).unwrap();
+        conn
+    }
+
+    fn start_of(conn: &Connection, id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT value_date_start FROM search_index WHERE resource_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// #1506: v39 backfills `value_date_start` as UTC millisecond text, leaves
+    /// unreadable rows NULL, swaps `idx_search_date_end` for the new shape,
+    /// and a replay resumes without rewriting a start already set.
+    #[test]
+    fn test_v39_backfills_value_date_start() {
+        let conn = v38_database_with_date_rows(&[
+            ("a", Some("2020-01-01T00:00:00")),
+            ("b", Some("2020-06-15T10:00:00+02:00")),
+            ("c", Some("2026-09-06T08:44:27.828123+00:00")),
+            ("d", Some("garbage")),
+            ("e", None),
+        ]);
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        assert_eq!(
+            start_of(&conn, "a").as_deref(),
+            Some("2020-01-01 00:00:00.000")
+        );
+        assert_eq!(
+            start_of(&conn, "b").as_deref(),
+            Some("2020-06-15 08:00:00.000")
+        );
+        assert_eq!(
+            start_of(&conn, "c").as_deref(),
+            Some("2026-09-06 08:44:27.828")
+        );
+        assert_eq!(start_of(&conn, "d"), None);
+        assert_eq!(start_of(&conn, "e"), None);
+
+        let sql = |name: &str| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            sql("idx_search_date_end").contains("value_date_end, value_date_start, resource_key)")
+        );
+        assert!(
+            sql("idx_search_date_start")
+                .contains("value_date_start, value_date_end, resource_key)")
+        );
+
+        conn.execute(
+            "UPDATE search_index SET value_date_start = 'kept' WHERE resource_id = 'a'",
+            [],
+        )
+        .unwrap();
+        migrate_v38_to_v39(&conn).unwrap();
+        assert_eq!(start_of(&conn, "a").as_deref(), Some("kept"));
+    }
+
+    /// A crash between two batches leaves some starts filled: the next start
+    /// fills the rest and lands on the same result as a single pass.
+    #[test]
+    fn test_v39_resumes_from_a_half_backfilled_table() {
+        let rows: Vec<(String, Option<String>)> = (1..=25)
+            .map(|i| (format!("r{i}"), Some(format!("2020-01-{i:02}T00:00:00"))))
+            .collect();
+        let rows: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|(i, v)| (i.as_str(), v.as_deref()))
+            .collect();
+        let whole = v38_database_with_date_rows(&rows);
+        initialize_schema(&whole).unwrap();
+
+        let half = v38_database_with_date_rows(&rows);
+        half.execute(
+            "ALTER TABLE search_index ADD COLUMN value_date_start TEXT",
+            [],
+        )
+        .unwrap();
+        half.execute(
+            "UPDATE search_index SET value_date_start = replace(value_date, 'T', ' ') || '.000'
+              WHERE rowid % 2 = 0",
+            [],
+        )
+        .unwrap();
+        initialize_schema(&half).unwrap();
+        for (id, _) in &rows {
+            assert_eq!(start_of(&half, id), start_of(&whole, id), "{id}");
+            assert!(start_of(&half, id).is_some(), "{id}");
+        }
+    }
+
+    /// The stored start is what the per-row `strftime` expression the range
+    /// path used to evaluate over `value_date` produced.
+    #[test]
+    fn test_value_date_start_matches_the_old_strftime_expression() {
+        use crate::backends::sqlite::search::writer::{sqlite_instant, stored_date_start};
+        let conn = Connection::open_in_memory().unwrap();
+        for value in [
+            "2020-01-01T00:00:00",
+            "2020-06-15T10:30:00",
+            "2020-06-15T10:30:00Z",
+            "2020-06-15T10:30:00+02:00",
+            "2020-06-15T10:30:00-05:30",
+            "2020-06-15T10:30:00.5Z",
+            "2020-06-15T10:30:00.123+01:00",
+            "2020-06-15T23:59:59.999Z",
+            "0001-01-01T00:00:00Z",
+            "9999-12-31T23:59:59Z",
+        ] {
+            let old: Option<String> = conn
+                .query_row("SELECT strftime('%Y-%m-%d %H:%M:%f', ?1)", [value], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let new = stored_date_start(value).map(sqlite_instant);
+            assert_eq!(new, old, "{value}");
+        }
+        // Past the millisecond the stored form is cut, as the old expression
+        // cut the fraction before reading it.
+        assert_eq!(
+            stored_date_start("2020-06-15T10:30:00.123987Z")
+                .map(sqlite_instant)
+                .as_deref(),
+            Some("2020-06-15 10:30:00.123")
+        );
+    }
+
+    /// `lt` seeks `idx_search_date_start` instead of scanning the parameter.
+    #[test]
+    fn test_start_bounded_date_condition_seeks_the_start_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let (cond, binds) =
+            crate::backends::sqlite::search::parameter_handlers::date::date_range_condition(
+                "value_date_start",
+                "value_date_end",
+                crate::types::SearchPrefix::Lt,
+                "1955",
+                1,
+            )
+            .unwrap();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT resource_key FROM search_index
+              WHERE tenant_id = 't' AND resource_type = 'Encounter' AND param_name = 'date'
+                AND {cond}"
+        );
+        let plan: Vec<String> = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("COVERING INDEX idx_search_date_start"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN search_index"), "{plan}");
     }
 
     /// #1391: a row with no `value_date_precision` (written before the column,

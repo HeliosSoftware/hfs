@@ -8,7 +8,7 @@
 //! # FHIR Version
 //!
 //! - **Version**: current
-//! - **Release Date**: September 17, 2026
+//! - **Release Date**: October 18, 2026
 //! - **Status**: draft
 //! - **Specification**: <http://build.fhir.org/>
 //!
@@ -417,7 +417,7 @@ pub struct Account {
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/account-billing-status
     #[fhir_serde(rename = "billingStatus")]
     pub billing_status: Option<CodeableConcept>,
-    /// E.g. patient, expense, depreciation
+    /// E.g. patient billing account, accounts receivable, cash
     ///
     /// Categorizes the account for reporting and searching purposes.
     ///
@@ -1114,7 +1114,7 @@ pub struct AccountDiagnosis {
     /// Used when: act-1
     #[fhir_serde(rename = "dateOfDiagnosis")]
     pub date_of_diagnosis: Option<DateTime>,
-    /// Type that this diagnosis has relevant to the account (e.g. admission, billing, discharge …)
+    /// Type that this diagnosis has relevant to the account (e.g. working, final …)
     ///
     /// Type that this diagnosis has relevant to the account (e.g. admission,
     /// billing, discharge …).
@@ -4782,7 +4782,7 @@ pub struct AdministrableProductDefinitionProperty {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(flatten)]
     pub value: Option<AdministrableProductDefinitionPropertyValue>,
-    /// The status of characteristic e.g. assigned or pending
+    /// The status of characteristic e.g. draft or active
     ///
     /// The status of characteristic e.g. assigned or pending.
     ///
@@ -5589,12 +5589,7 @@ pub struct AdverseEvent {
     /// ## Implementation Notes
     /// It would be unusual for a recorder of an adverse event to not know this
     /// value; unknown code is included to support legacy data and is strongly
-    /// discouraged. AllergyIntolerance should be used for the initial capture or
-    /// recording of the individual's propensity to an adverse reaction to a
-    /// substance. If an AllergyIntolerance does not exist, then an adverse reaction
-    /// should be recorded as an AllergyIntolerance. If an AllergyIntolerance does
-    /// exist and the substance was given, then an adverse reaction should be
-    /// recorded as an AdverseEvent due to the aberrant workflow.
+    /// discouraged.
     ///
     /// ## Cardinality: Required (1..1)
     ///
@@ -7223,8 +7218,8 @@ pub struct AllergyIntolerance {
     /// ## Constraints
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
-    #[fhir_serde(rename = "lastOccurrence")]
-    pub last_occurrence: Option<DateTime>,
+    #[fhir_serde(rename = "lastReactionOccurrence")]
+    pub last_reaction_occurrence: Option<DateTime>,
     /// Additional text not captured in other fields
     ///
     /// Additional narrative about the propensity for the Adverse Reaction, not
@@ -9672,6 +9667,18 @@ pub struct AppointmentResponse {
     pub recurrence_id: Option<PositiveInt>,
 }
 
+/// Choice of types for the versionAlgorithm\[x\] field in ArtifactAssessment
+#[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath)]
+#[fhir_choice_element(base_name = "versionAlgorithm")]
+pub enum ArtifactAssessmentVersionAlgorithm {
+    /// Variant accepting the String type.
+    #[fhir_serde(rename = "versionAlgorithmString")]
+    String(String),
+    /// Variant accepting the Coding type.
+    #[fhir_serde(rename = "versionAlgorithmCoding")]
+    Coding(Coding),
+}
+
 /// Choice of types for the artifact\[x\] field in ArtifactAssessment
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath)]
 #[fhir_choice_element(base_name = "artifact")]
@@ -9702,8 +9709,8 @@ pub enum ArtifactAssessmentArtifact {
 /// See: [ArtifactAssessment](http://hl7.org/fhir/StructureDefinition/ArtifactAssessment)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
-    choice_elements = "artifact",
-    summary_fields = "id,meta,implicit_rules,modifier_extension,identifier,title,artifact,date,last_review_date,workflow_status,disposition"
+    choice_elements = "versionAlgorithm,artifact",
+    summary_fields = "id,meta,implicit_rules,modifier_extension,url,identifier,version,version_algorithm,name,title,status,experimental,date,publisher,contact,use_context,jurisdiction,last_review_date,effective_period,artifact,workflow_status,disposition"
 )]
 pub struct ArtifactAssessment {
     /// Logical id of this artifact
@@ -9915,6 +9922,45 @@ pub struct ArtifactAssessment {
     /// extensions, user content
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
+    /// Canonical identifier for this ArtifactAssessment, represented as an absolute URI (globally unique)
+    ///
+    /// An absolute URI that is used to identify this ArtifactAssessment when it is
+    /// referenced in a specification, model, design or an instance; also called its
+    /// canonical identifier. This SHOULD be globally unique and SHOULD be a literal
+    /// address at which an authoritative instance of this ArtifactAssessment is (or
+    /// will be) published. This URL can be the target of a canonical reference. It
+    /// SHALL remain the same when the ArtifactAssessment is stored on different
+    /// servers.
+    ///
+    /// ## Requirements
+    /// Allows the ArtifactAssessment to be referenced by a single globally unique
+    /// identifier.
+    ///
+    /// ## Implementation Notes
+    /// Can be a urn:uuid: or a urn:oid: but real http: addresses are preferred.
+    /// Multiple instances may share the same URL if they have a distinct version.
+    ///
+    /// The determination of when to create a new version of a resource (same url,
+    /// new version) vs. defining a new artifact is up to the author. Considerations
+    /// for making this decision are found in [Technical and Business
+    /// Versions](resource.html#versions).
+    ///
+    /// In some cases, the resource can no longer be found at the stated url, but the
+    /// url itself cannot change. Implementations can use the
+    /// [meta.source](resource.html#meta) element to indicate where the current
+    /// master source of the resource can be found.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **cnl-1**: URL should not contain | or # - these characters make processing canonical references problematic (warning)
+    ///   Expression: `exists() implies matches('^[^|# ]+$')`
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub url: Option<Uri>,
     /// Additional identifier for the artifact assessment
     ///
     /// A formal identifier that is used to identify this artifact assessment when it
@@ -9939,6 +9985,88 @@ pub struct ArtifactAssessment {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub identifier: Option<Vec<Identifier>>,
+    /// Canonical version of the ArtifactAssessment
+    ///
+    /// The identifier that is used to identify this version of the
+    /// ArtifactAssessment when it is referenced in a specification, model, design or
+    /// instance. This is an arbitrary value managed by the ArtifactAssessment author
+    /// and is not expected to be globally unique. For example, it might be a SemVer
+    /// version, timestamp (e.g. yyyymmdd), or incrementing number. There is no
+    /// expectation that versions can be placed in a lexicographical sequence without
+    /// additional knowledge.
+    ///
+    /// ## Implementation Notes
+    /// There may be different ArtifactAssessments that have the same canonical url
+    /// but different versions. The version can be appended to the url in a reference
+    /// to allow a reference to a particular canonical version of the
+    /// ArtifactAssessment with the format [url]|[version]. Note that the canonical
+    /// version of a resource is not related to a server resource instance version
+    /// (`Resource.meta.versionId`). For more information, see [Version Matching for
+    /// Canonical Resources](references.html#matching). The version SHOULD NOT
+    /// contain a '#' - see [Business Version](resource.html#bv-format).
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub version: Option<String>,
+    /// How to compare versions
+    ///
+    /// Indicates the mechanism used to compare canonical versions to determine which
+    /// is more current.
+    ///
+    /// ## Implementation Notes
+    /// If set as a string, this is a FHIRPath expression that has two additional
+    /// context variables passed in - %version1 and %version2 and will return a
+    /// negative number if version1 is newer, a positive number if version2 and a 0
+    /// if the version ordering can't be successfully be determined. For more
+    /// information, see [Choosing the right Canonical
+    /// Reference](references.html#canonical-matching).
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Binding
+    /// - **Strength**: extensible
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/version-algorithm
+    #[fhir_serde(flatten)]
+    pub version_algorithm: Option<ArtifactAssessmentVersionAlgorithm>,
+    /// Name for this ArtifactAssessment (computer friendly)
+    ///
+    /// A natural language name identifying the ArtifactAssessment. This name should
+    /// be usable as an identifier for the resource by machine processing
+    /// applications such as code generation.
+    ///
+    /// ## Requirements
+    /// Supports code generation.
+    ///
+    /// ## Implementation Notes
+    /// The name is not expected to be globally unique. The name should be a simple
+    /// alphanumeric type no-whitespace name to ensure that it is machine-processing
+    /// friendly.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Conditions
+    /// Used when: cnl-0
+    pub name: Option<String>,
     /// A label for use in displaying and selecting the artifact assessment
     ///
     /// A label for use in displaying and selecting the artifact assessment.
@@ -9952,44 +10080,77 @@ pub struct ArtifactAssessment {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub title: Option<String>,
-    /// How to cite the comment or rating
+    /// draft | active | retired | unknown
     ///
-    /// Display of the bibliographic citation of the comment, classifier, or rating.
+    /// The current state of this ArtifactAssessment.
+    ///
+    /// ## Requirements
+    /// Enables tracking the life-cycle of the content and filtering of
+    /// ArtifactAssessments that are appropriate for use versus not.
+    ///
+    /// ## Implementation Notes
+    /// A nominal state-transition diagram can be found in the [Definition
+    /// pattern](definition.html#statemachine) documentation.
+    ///
+    /// Unknown does not represent 'other' - one of the defined statuses must apply.
+    /// Unknown is used when the authoring system is not sure what the current status
+    /// is.
+    ///
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// If a server wishes to reflect whether a given canonical resource is
+    /// 'supported' or 'enabled' on that server, this is NOT done with status.
+    /// Instead, expose support for the resource using a 'feature' in the server's
+    /// CapabilityStatement.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    #[fhir_serde(rename = "citeAs")]
-    pub cite_as: Option<Markdown>,
-    /// The artifact assessed, commented upon or rated
-    ///
-    /// A reference to a resource, canonical resource, or non-FHIR resource which the
-    /// comment or assessment is about.
-    ///
-    /// ## Cardinality: Required (1..1)
-    ///
     /// ## Special Semantics
+    /// - Modifier element - This is labeled as "Is Modifier" because applications should not use a retired ArtifactAssessment without due consideration
     /// - Included in summary
     ///
     /// ## Constraints
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
-    #[fhir_serde(flatten)]
-    pub artifact: Option<ArtifactAssessmentArtifact>,
-    /// Relationship to other Resources
     ///
-    /// Relationship that this ArtifactAssessment has with other FHIR or non-FHIR
-    /// resources that already exist.
+    /// ## Binding
+    /// - **Strength**: required
+    /// - **Description**: The lifecycle status of an artifact.
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
+    pub status: Option<Code>,
+    /// For testing only - never for real usage
     ///
-    /// ## Cardinality: Optional, Multiple (0..*)
+    /// A Boolean value to indicate that this ArtifactAssessment is authored for
+    /// testing purposes (or education/evaluation/marketing) and no version of this
+    /// resource will ever be intended for genuine usage.
+    ///
+    /// ## Requirements
+    /// Enables experimental content to be developed following the same lifecycle
+    /// that would be used for a production-level ArtifactAssessment.
+    ///
+    /// ## Implementation Notes
+    /// Allows filtering of ArtifactAssessments that are appropriate for use versus
+    /// not. Experimental resources might include example instances in implementation
+    /// guides, instances created solely for testing purposes, etc. If experimental
+    /// is 'true' for any version of a resource, it should be true for all versions
+    /// of the resource. (If experimental changes, then it is being misused or a
+    /// resource that was never intended for real-world use has unexpectedly changed
+    /// its purpose.).
+    ///
+    /// Experimental resources are not expected to be stable and may well have
+    /// breaking changes without a corresponding change to the 'version' element.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    /// - When missing: If absent, this resource is treated as though it is not experimental.
     ///
     /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children or both (error)
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
-    #[fhir_serde(rename = "relatesTo")]
-    pub relates_to: Option<Vec<ArtifactAssessmentRelatesTo>>,
+    pub experimental: Option<Boolean>,
     /// Date last changed
     ///
     /// The date (and optionally time) when the artifact assessment was published.
@@ -10017,6 +10178,141 @@ pub struct ArtifactAssessment {
     /// ## Aliases
     /// Revision Date
     pub date: Option<DateTime>,
+    /// Name of the publisher/steward (organization or individual)
+    ///
+    /// The name of the organization or individual responsible for the release and
+    /// ongoing maintenance of the ArtifactAssessment.
+    ///
+    /// ## Requirements
+    /// Helps establish the "authority/credibility" of the ArtifactAssessment. May
+    /// also allow for contact.
+    ///
+    /// ## Implementation Notes
+    /// Usually an organization but may be an individual. The publisher (or steward)
+    /// of the ArtifactAssessment is the organization or individual primarily
+    /// responsible for the maintenance and upkeep of the ArtifactAssessment. This is
+    /// not necessarily the same individual or organization that developed and
+    /// initially authored the content. The publisher is the primary point of contact
+    /// for questions or issues with the ArtifactAssessment. This item SHOULD be
+    /// populated unless the information is available from context. The publisher is
+    /// not necessarily an entity that is involved in developing the content of the
+    /// resource.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub publisher: Option<String>,
+    /// Contact details for the publisher
+    ///
+    /// Contact details to assist a user in finding and communicating with the
+    /// publisher.
+    ///
+    /// ## Implementation Notes
+    /// May be a web site, an email address, a telephone number, etc.
+    ///
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub contact: Option<Vec<ContactDetail>>,
+    /// Natural language description of the ArtifactAssessment
+    ///
+    /// A free text natural language description of the ArtifactAssessment from a
+    /// consumer's perspective.
+    ///
+    /// ## Implementation Notes
+    /// This description can be used to capture details such as comments about
+    /// misuse, instructions for clinical use and interpretation, literature
+    /// references, examples from the paper world, etc. It is not a rendering of the
+    /// ArtifactAssessment as conveyed in the 'text' field of the resource itself.
+    /// This item SHOULD be populated unless the information is available from
+    /// context.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub description: Option<Markdown>,
+    /// The context that the content is intended to support
+    ///
+    /// The content was developed with a focus and intent of supporting the contexts
+    /// that are listed. These contexts may be general categories (gender, age, ...)
+    /// or may be references to specific programs (insurance plans, studies, ...) and
+    /// may be used to assist with indexing and searching for appropriate
+    /// ArtifactAssessments.
+    ///
+    /// ## Requirements
+    /// Assist in searching for appropriate content.
+    ///
+    /// ## Implementation Notes
+    /// When multiple useContexts are specified, there is no expectation that all or
+    /// even any of the contexts apply.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(rename = "useContext")]
+    pub use_context: Option<Vec<UsageContext>>,
+    /// Jurisdiction of the authority that maintains the ArtifactAssessment (if applicable)
+    ///
+    /// A legal or geographic region in which the authority that maintains the
+    /// resource is operating. In general, the jurisdiction is also found in the
+    /// useContext. The useContext may reference additional jurisdictions because the
+    /// defining jurisdiction does not necessarily limit the jurisdictions of use.
+    ///
+    /// ## Implementation Notes
+    /// It may be possible for the ArtifactAssessment to be used in jurisdictions
+    /// other than those for which it was originally designed or intended.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Binding
+    /// - **Strength**: extensible
+    /// - **Description**: Countries and regions within which this artifact is targeted for use.
+    /// - **ValueSet**: http://terminology.hl7.org/ValueSet/jurisdiction
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    /// Why this ArtifactAssessment is defined
+    ///
+    /// Explanation of why this ArtifactAssessment is needed and why it has been
+    /// designed as it has.
+    ///
+    /// ## Implementation Notes
+    /// This element does not describe the usage of the ArtifactAssessment. Instead,
+    /// it provides traceability of "why" the resource is either needed or "why" it
+    /// is defined as it is. This may be used to point to source materials or
+    /// specifications that drove the structure of this ArtifactAssessment.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub purpose: Option<Markdown>,
     /// Notice about intellectual property ownership, can include restrictions on use
     ///
     /// A copyright statement relating to the artifact assessment and/or its
@@ -10037,6 +10333,40 @@ pub struct ArtifactAssessment {
     /// ## Aliases
     /// License, Restrictions
     pub copyright: Option<Markdown>,
+    /// Copyright holder and year(s)
+    ///
+    /// A short string (<50 characters), suitable for inclusion in a page footer that
+    /// identifies the copyright holder, effective period, and optionally whether
+    /// rights are restricted. (e.g. 'All rights reserved', 'Some rights reserved').
+    ///
+    /// ## Requirements
+    /// Defines the content expected to be rendered in all representations of the
+    /// artifact.
+    ///
+    /// ## Implementation Notes
+    /// The copyright symbol and the '(c)' textual representation SHOULD NOT be
+    /// included in this string. It will be added by software when rendering the
+    /// notation. Full details about licensing, restrictions, warrantees, etc. goes
+    /// in the more general 'copyright' element.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(rename = "copyrightLabel")]
+    pub copyright_label: Option<String>,
+    /// Describes the clinical usage of the ArtifactAssessment
+    ///
+    /// A detailed description of how the ArtifactAssessment is used from a
+    /// clinical/user perspective.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub usage: Option<Markdown>,
     /// When the artifact assessment was approved by publisher
     ///
     /// The date on which the resource content was approved by the publisher.
@@ -10075,6 +10405,129 @@ pub struct ArtifactAssessment {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "lastReviewDate")]
     pub last_review_date: Option<Date>,
+    /// When the ArtifactAssessment is expected to be used
+    ///
+    /// The period during which the ArtifactAssessment content was or is planned to
+    /// be in active use.
+    ///
+    /// ## Requirements
+    /// Allows establishing a transition before a resource comes into effect and also
+    /// allows for a sunsetting process when new versions of the ArtifactAssessment
+    /// are or are expected to be used instead.
+    ///
+    /// ## Implementation Notes
+    /// The effective period for a ArtifactAssessment determines when the content is
+    /// applicable for usage and is independent of publication and review dates. For
+    /// example, a measure intended to be used for the year 2016 might be published
+    /// in 2015.
+    ///
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(rename = "effectivePeriod")]
+    pub effective_period: Option<Period>,
+    /// Who authored the ArtifactAssessment
+    ///
+    /// An individual or organization primarily involved in the development of the
+    /// content in the ArtifactAssessment.
+    ///
+    /// ## Implementation Notes
+    /// An author does not necessarily have the authority to manage the actual
+    /// publication of releases of the resource.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub author: Option<Vec<ContactDetail>>,
+    /// Who edited the ArtifactAssessment
+    ///
+    /// An individual or organization primarily responsible for internal coherence of
+    /// the ArtifactAssessment.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub editor: Option<Vec<ContactDetail>>,
+    /// Who reviewed the ArtifactAssessment
+    ///
+    /// An individual or organization asserted by the publisher to be primarily
+    /// responsible for review of some aspect of the ArtifactAssessment.
+    ///
+    /// ## Implementation Notes
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub reviewer: Option<Vec<ContactDetail>>,
+    /// Who endorsed the ArtifactAssessment
+    ///
+    /// An individual or organization asserted by the publisher to be responsible for
+    /// officially endorsing the ArtifactAssessment for use in some setting.
+    ///
+    /// ## Implementation Notes
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub endorser: Option<Vec<ContactDetail>>,
+    /// Relationship to other Resources
+    ///
+    /// Relationship that this ArtifactAssessment has with other FHIR or non-FHIR
+    /// resources that already exist.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children or both (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(rename = "relatesTo")]
+    pub relates_to: Option<Vec<ArtifactAssessmentRelatesTo>>,
+    /// How to cite the comment or rating
+    ///
+    /// Display of the bibliographic citation of the comment, classifier, or rating.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(rename = "citeAs")]
+    pub cite_as: Option<Markdown>,
+    /// The artifact assessed, commented upon or rated
+    ///
+    /// A reference to a resource, canonical resource, or non-FHIR resource which the
+    /// comment or assessment is about.
+    ///
+    /// ## Cardinality: Required (1..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(flatten)]
+    pub artifact: Option<ArtifactAssessmentArtifact>,
     /// Comment, classifier, or rating content
     ///
     /// A component comment, classifier, or rating of the artifact.
@@ -13795,9 +14248,9 @@ pub struct BiologicallyDerivedProductCollection {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// Individual performing the collection
+    /// Who or what performed the collection
     ///
-    /// Healthcare professional who is performing the collection.
+    /// The practitioner or device that performed the collection.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -14038,7 +14491,7 @@ pub struct BiologicallyDerivedProductProperty {
 /// See: [BodyStructure](http://hl7.org/fhir/StructureDefinition/BodyStructure)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
-    summary_fields = "id,meta,implicit_rules,modifier_extension,identifier,active,description,patient"
+    summary_fields = "id,meta,implicit_rules,modifier_extension,identifier,active,morphology,description,patient"
 )]
 pub struct BodyStructure {
     /// Logical id of this artifact
@@ -14286,10 +14739,43 @@ pub struct BodyStructure {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub active: Option<Boolean>,
+    /// Morphology of the body structure
+    ///
+    /// A single morphologic entity that spans multiple anatomical entries in the
+    /// included structures.
+    ///
+    /// ## Implementation Notes
+    /// Use this element when a morphology applies to the overall body structure or
+    /// spans multiple structures and cannot be attributed to a single included
+    /// structure. Morphologies specific to an individual included or excluded
+    /// structure should be represented using
+    /// BodyStructure.includedStructure.morphology or
+    /// BodyStructure.excludedStructure.morphology.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Binding
+    /// - **Strength**: example
+    /// - **Description**: Codes describing anatomic morphology.
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/bodystructure-code
+    pub morphology: Option<CodeableConcept>,
     /// Included anatomic location(s)
     ///
     /// The anatomical location(s) or region(s) of the specimen, lesion, or body
     /// structure.
+    ///
+    /// ## Implementation Notes
+    /// An included structure should not describe the same fully specified anatomical
+    /// area as an excluded structure in the same BodyStructure. Consider all
+    /// details, including laterality and qualifiers, when determining whether the
+    /// areas are the same.
     ///
     /// ## Cardinality: Required, Multiple (1..*)
     ///
@@ -14301,7 +14787,13 @@ pub struct BodyStructure {
     /// Excluded anatomic locations(s)
     ///
     /// The anatomical location(s) or region(s) not occupied or represented by the
-    /// specimen, lesion, or body structure.
+    /// body structure, morphologic entity, or specimen.
+    ///
+    /// ## Implementation Notes
+    /// An excluded structure should identify an area omitted from an included
+    /// structure, not repeat the same fully specified area. The same structure code
+    /// may appear in both when other details, such as laterality or qualifiers,
+    /// distinguish the included and excluded areas.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -14356,6 +14848,12 @@ pub struct BodyStructure {
 ///
 /// The anatomical location(s) or region(s) of the specimen, lesion, or body
 /// structure.
+///
+/// ## Implementation Notes
+/// An included structure should not describe the same fully specified anatomical
+/// area as an excluded structure in the same BodyStructure. Consider all
+/// details, including laterality and qualifiers, when determining whether the
+/// areas are the same.
 ///
 /// ## Cardinality: Required, Multiple (1..*)
 ///
@@ -14463,7 +14961,12 @@ pub struct BodyStructureIncludedStructure {
     pub structure: CodeableConcept,
     /// Code that represents the included structure laterality
     ///
-    /// Code that represents the included structure laterality.
+    /// Code that distinguishes the side of a paired included structure.
+    ///
+    /// ## Implementation Notes
+    /// Use laterality to distinguish paired structures, such as the left or right
+    /// breast. Use qualifier to describe a part of a structure, including a left or
+    /// right region of a structure that is not itself paired.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -14512,7 +15015,12 @@ pub struct BodyStructureIncludedStructure {
     pub image: Option<Vec<Attachment>>,
     /// Code that represents the included structure qualifier
     ///
-    /// Code that represents the included structure qualifier.
+    /// Code that describes a part or region of the included structure.
+    ///
+    /// ## Implementation Notes
+    /// A left or right qualifier may describe a region of an unpaired structure;
+    /// laterality distinguishes between paired structures. Both elements may be used
+    /// when needed to describe different aspects of an included structure.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -14525,7 +15033,7 @@ pub struct BodyStructureIncludedStructure {
     /// - **Description**: Concepts modifying the anatomic location.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/bodystructure-relative-location
     pub qualifier: Option<Vec<CodeableConcept>>,
-    /// Kind of Structure
+    /// Structure morphology
     ///
     /// The morphology of the included anatomical or pathological structure. This can
     /// define both normal and abnormal morphologies.
@@ -33306,14 +33814,9 @@ pub struct CodeSystemProperty {
     pub code: Code,
     /// Formal identifier for the property
     ///
-    /// Reference to the formal meaning of the property. One possible source of
-    /// meaning is the [Concept Properties](codesystem-concept-properties.html) code
-    /// system.
-    ///
-    /// ## Implementation Notes
-    /// The URIs used here SHOULD be drawn from the [Concept
-    /// Properties](codesystem-concept-properties.html) code system, where the URI
-    /// string consists of \[code system URL]#\[code]
+    /// Reference to the formal meaning of the property. The URIs used here SHOULD be
+    /// drawn from the [Concept Properties](codesystem-concept-properties.html) code
+    /// system, where the URI string consists of \[code system URL]#\[code].
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -40610,13 +41113,13 @@ pub struct Condition {
     /// The data type is CodeableConcept because clinicalStatus has some clinical
     /// judgment involved, such that there might need to be more specificity than the
     /// required FHIR value set allows. For example, a SNOMED coding might allow for
-    /// additional specificity. clinicalStatus is required since it is a modifier
-    /// element. For conditions that are problems list items, the clinicalStatus
-    /// should not be unknown. For conditions that are not problem list items, the
-    /// clinicalStatus may be unknown. For example, conditions derived from a claim
-    /// are point in time, so those conditions may have a clinicalStatus of unknown
+    /// additional specificity. For conditions that are problem list items, the
+    /// clinicalStatus should not be unknown. For conditions that are not problem
+    /// list items, the clinicalStatus may be unknown. For example, conditions
+    /// derived from a claim are point in time, so those conditions may have a
+    /// clinicalStatus of unknown
     ///
-    /// ## Cardinality: Required (1..1)
+    /// ## Cardinality: Optional (0..1)
     ///
     /// ## Special Semantics
     /// - Modifier element - This element is labeled as a modifier because the status contains codes that mark the condition as no longer active.
@@ -40632,9 +41135,9 @@ pub struct Condition {
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-clinical|6.0.0-snapshot1
     ///
     /// ## Conditions
-    /// Used when: con-3
+    /// Used when: con-2, con-3
     #[fhir_serde(rename = "clinicalStatus")]
-    pub clinical_status: CodeableConcept,
+    pub clinical_status: Option<CodeableConcept>,
     /// unconfirmed | provisional | differential | confirmed | refuted | entered-in-error
     ///
     /// The verification status to support the clinical status of the condition. The
@@ -40661,6 +41164,9 @@ pub struct Condition {
     /// - **Strength**: required
     /// - **Description**: The verification status to support or decline the clinical status of the condition or diagnosis.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-ver-status|6.0.0-snapshot1
+    ///
+    /// ## Conditions
+    /// Used when: con-2
     #[fhir_serde(rename = "verificationStatus")]
     pub verification_status: Option<CodeableConcept>,
     /// Classification of type of condition
@@ -40678,9 +41184,12 @@ pub struct Condition {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     ///
     /// ## Binding
-    /// - **Strength**: example
+    /// - **Strength**: preferred
     /// - **Description**: A category assigned to the condition.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-category
+    ///
+    /// ## Conditions
+    /// Used when: con-2
     pub category: Option<Vec<CodeableConcept>>,
     /// Subjective severity of condition
     ///
@@ -41454,7 +41963,7 @@ pub struct Consent {
     pub period: Option<Period>,
     /// Who is granting rights according to the policy and rules
     ///
-    /// The entity responsible for granting the rights listed in a Consent Directive.
+    /// The agent responsible for granting the rights listed in a Consent Directive.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -41470,9 +41979,8 @@ pub struct Consent {
     pub grantor: Option<Vec<Reference>>,
     /// Who is agreeing to the policy and rules
     ///
-    /// The entity responsible for complying with the Consent Directive, including
-    /// any obligations or limitations on authorizations and enforcement of
-    /// prohibitions.
+    /// The agent responsible for complying with the Consent Directive, including any
+    /// obligations or limitations on authorizations and enforcement of prohibitions.
     ///
     /// ## Implementation Notes
     /// In a fully computable consent, both grantee and grantor will be listed as
@@ -41594,11 +42102,11 @@ pub struct Consent {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "policyText")]
     pub policy_text: Option<Vec<Reference>>,
-    /// Consent verified by patient (or another authorized person)
+    /// Consent verified by patient or another authorized agent
     ///
     /// Whether the consent instructions/rules (e.g. artificial respiration: yes or
     /// no) have been verified with the patient, his/her family, or another
-    /// authorized person.
+    /// authorized agent.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -42343,11 +42851,11 @@ pub struct ConsentProvisionData {
     pub reference: Reference,
 }
 
-/// Consent verified by patient (or another authorized person)
+/// Consent verified by patient or another authorized agent
 ///
 /// Whether the consent instructions/rules (e.g. artificial respiration: yes or
 /// no) have been verified with the patient, his/her family, or another
-/// authorized person.
+/// authorized agent.
 ///
 /// ## Cardinality: Optional, Multiple (0..*)
 ///
@@ -42440,7 +42948,7 @@ pub struct ConsentVerification {
     pub modifier_extension: Option<Vec<Extension>>,
     /// Has been verified
     ///
-    /// Has the instruction been verified.
+    /// Have the consent provisions been verified as correct and authentic.
     ///
     /// ## Cardinality: Required (1..1)
     ///
@@ -42473,9 +42981,11 @@ pub struct ConsentVerification {
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/consent-verification
     #[fhir_serde(rename = "type")]
     pub r#type: Option<CodeableConcept>,
-    /// Person conducting verification
+    /// Person or agent conducting verification
     ///
-    /// The person who conducted the verification/validation of the Grantor decision.
+    /// The person or agent who conducted the verification/validation of the Grantor
+    /// decision as listed in .verifiedWith. This agent will have interviewed or in
+    /// some other way captured the verification information.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -42486,7 +42996,8 @@ pub struct ConsentVerification {
     pub verified_by: Option<Reference>,
     /// Person who verified
     ///
-    /// Who verified the instruction (Patient, Relative or other Authorized Person).
+    /// Who verified the patient's provisions as correct and authentic. This may be a
+    /// Patient, Relative, or other Authorized agent.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -49803,7 +50314,7 @@ pub struct DeviceDeviceVersion {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// The type of the device version, e.g. manufacturer, approved, internal
+    /// The type of the device version, e.g. hardware, software, firmware revision
     ///
     /// The type of the device version, e.g. manufacturer, approved, internal.
     ///
@@ -53669,7 +54180,7 @@ pub struct DeviceDefinitionDeviceVersion {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// The type of the device version, e.g. manufacturer, approved, internal
+    /// The type of the device version, e.g. hardware, software, firmware revision
     ///
     /// The type of the device version, e.g. manufacturer, approved, internal.
     ///
@@ -57144,8 +57655,7 @@ pub struct DiagnosticReport {
     pub performer: Option<Vec<Reference>>,
     /// Who analyzed and reported the conclusions and interpretations
     ///
-    /// The practitioner or organization that is responsible for the report's
-    /// conclusions and interpretations.
+    /// The party responsible for the report's conclusions and interpretations.
     ///
     /// ## Requirements
     /// Need to know whom to contact if there are queries about the results. Also may
@@ -59658,9 +60168,9 @@ pub struct Dosage {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "doseAndRate")]
     pub dose_and_rate: Option<Vec<DosageDoseAndRate>>,
-    /// Safety Information about the this dosage instructions
+    /// Safety Information about these dosage instructions
     ///
-    /// Safety Information about the this dosage instructions.
+    /// Safety Information about these dosage instructions.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -60180,9 +60690,9 @@ pub struct DosageCondition {
     /// - **Description**: How the criteria value is tested.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/comparison-operation|6.0.0-snapshot1
     pub operation: Option<Code>,
-    /// The value for this critera
+    /// The value for this criteria
     ///
-    /// The value for this critera.
+    /// The value for this criteria.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -60222,7 +60732,9 @@ pub struct DosageCondition {
 ///
 /// See: [DosageDetails](http://hl7.org/fhir/StructureDefinition/DosageDetails)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
-#[fhir_resource(summary_fields = "modifier_extension,rendered_instruction,step,safety")]
+#[fhir_resource(
+    summary_fields = "modifier_extension,rendered_instruction,repeat_cycle,step,safety"
+)]
 pub struct DosageDetails {
     /// Unique id for inter-element referencing
     ///
@@ -60324,6 +60836,28 @@ pub struct DosageDetails {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "renderedInstruction")]
     pub rendered_instruction: Option<Markdown>,
+    /// Repeat the dosage course after this duration
+    ///
+    /// The duration after which the whole dosage course (all its steps) starts
+    /// again, measured from the start of the course. For example, 28 days for a
+    /// contraceptive taken daily for 21 days followed by 7 days without tablets.
+    ///
+    /// ## Implementation Notes
+    /// The whole dosage course repeats; the time between the end of the last step
+    /// and the end of the cycle is a period without doses. See [Repeating
+    /// cycles](dosage.html#repeatcycle) on the Dosage page for the limitations of
+    /// `repeatCycle`.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(rename = "repeatCycle")]
+    pub repeat_cycle: Option<Duration>,
     /// One step in a sequence of steps that comprise the dosage course
     ///
     /// One step in a sequence of steps that comprise the dosage course.
@@ -64340,7 +64874,7 @@ pub struct Encounter {
     /// - **Description**: Indicates the urgency of the encounter.
     /// - **ValueSet**: http://terminology.hl7.org/ValueSet/v3-ActPriority
     pub priority: Option<CodeableConcept>,
-    /// Specific type of encounter (e.g. e-mail consultation, surgical day-care, ...)
+    /// Specific type of encounter (e.g. annual diabetes screening, outpatient injection, ...)
     ///
     /// Specific type of encounter (e.g. e-mail consultation, surgical day-care,
     /// skilled nursing, rehabilitation).
@@ -64728,7 +65262,7 @@ pub struct Encounter {
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/encounter-diet
     #[fhir_serde(rename = "dietPreference")]
     pub diet_preference: Option<Vec<CodeableConcept>>,
-    /// Wheelchair, translator, stretcher, etc
+    /// Wheelchair, interpreter, attendant, etc
     ///
     /// Any special requests that have been made for this encounter, such as the
     /// provision of specific equipment or other things.
@@ -65262,7 +65796,7 @@ pub struct EncounterDiagnosis {
     /// ## Aliases
     /// Admission diagnosis, discharge diagnosis, indication
     pub condition: Option<Vec<CodeableReference>>,
-    /// Role that this diagnosis has within the encounter (e.g. admission, billing, discharge …)
+    /// Role that this diagnosis has within the encounter (e.g. working, final …)
     ///
     /// Role that this diagnosis has within the encounter (e.g. admission, billing,
     /// discharge …).
@@ -66729,7 +67263,7 @@ pub struct EpisodeOfCare {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "statusHistory")]
     pub status_history: Option<Vec<EpisodeOfCareStatusHistory>>,
-    /// Type/class  - e.g. specialist referral, disease management
+    /// Type/class  - e.g. post acute care, home and community care
     ///
     /// A classification of the type of episode of care; e.g. specialist referral,
     /// disease management, type of funded care.
@@ -67040,7 +67574,7 @@ pub struct EpisodeOfCareDiagnosis {
     /// - **Strength**: example
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-code
     pub condition: Option<Vec<CodeableReference>>,
-    /// Role that this diagnosis has within the episode of care (e.g. admission, billing, discharge …)
+    /// Role that this diagnosis has within the episode of care (e.g. working, final …)
     ///
     /// Role that this diagnosis has within the episode of care (e.g. admission,
     /// billing, discharge …).
@@ -70276,7 +70810,7 @@ pub struct EvidenceStatisticModelCharacteristicVariable {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "variableDefinition")]
     pub variable_definition: Reference,
-    /// boolean | continuous | dichotomous | ordinal | polychotomous | time-to-event | not-specified
+    /// Method of handling in statistical analysis (e.g. boolean, continuous, dichotomous, ordinal, polychotomous or time-to-event variable)
     ///
     /// How the variable is classified for use in adjusted analysis.
     ///
@@ -71570,7 +72104,7 @@ pub struct EvidenceVariable {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "definitionModifier")]
     pub definition_modifier: Option<Vec<EvidenceVariableDefinitionModifier>>,
-    /// boolean | continuous | dichotomous | ordinal | polychotomous | time-to-event | not-specified
+    /// Method of handling in statistical analysis (e.g. boolean, continuous, dichotomous, ordinal, polychotomous or time-to-event variable)
     ///
     /// The method of handling in statistical analysis.
     ///
@@ -82036,7 +82570,7 @@ pub struct Expression {
     /// ## Conditions
     /// Used when: exp-2
     pub name: Option<Code>,
-    /// text/cql | text/fhirpath | application/x-fhir-query | etc.
+    /// text/cql | text/fhirpath | text/x-fhir-query | etc.
     ///
     /// The media type of the language for the expression.
     ///
@@ -83146,6 +83680,9 @@ pub enum FamilyMemberHistoryConditionOnset {
     /// Variant accepting the String type.
     #[fhir_serde(rename = "onsetString")]
     String(String),
+    /// Variant accepting the DateTime type.
+    #[fhir_serde(rename = "onsetDateTime")]
+    DateTime(DateTime),
 }
 
 /// Condition that the related person had
@@ -83266,7 +83803,7 @@ pub struct FamilyMemberHistoryCondition {
     /// - **Description**: Identification of the Condition or diagnosis.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-code
     pub code: CodeableConcept,
-    /// deceased | permanent disability | etc
+    /// E.g. deceased, permanent disability
     ///
     /// Indicates what happened following the condition. If the condition resulted in
     /// death, deceased date is captured on the relation.
@@ -84269,7 +84806,7 @@ pub struct Goal {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "achievementStatusDate")]
     pub achievement_status_date: Option<Date>,
-    /// E.g. Treatment, dietary, behavioral, etc
+    /// E.g. dietary, behavioral, nursing, etc
     ///
     /// Indicates a category the goal falls within.
     ///
@@ -84319,8 +84856,8 @@ pub struct Goal {
     /// Used for sorting and presenting goals.
     ///
     /// ## Implementation Notes
-    /// Extensions are available to track priorities as established by each
-    /// participant (i.e. Priority from the patient's perspective, different
+    /// Goal.acceptance.priority is available to track priorities as established by
+    /// each participant (i.e. Priority from the patient's perspective, different
     /// practitioners' perspectives, family member's perspectives)
     ///
     /// The ordinal extension on Coding can be used to convey a numerically
@@ -84337,9 +84874,9 @@ pub struct Goal {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     ///
     /// ## Binding
-    /// - **Strength**: preferred
+    /// - **Strength**: example
     /// - **Description**: The level of importance associated with a goal.
-    /// - **ValueSet**: http://terminology.hl7.org/ValueSet/goal-priority
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/goal-priority
     pub priority: Option<CodeableConcept>,
     /// Code or text describing goal
     ///
@@ -84647,7 +85184,7 @@ pub struct GoalAcceptance {
     /// ## Binding
     /// - **Strength**: example
     /// - **Description**: Codes to identify the level of importance associated with reaching or sustaining a goal.
-    /// - **ValueSet**: http://terminology.hl7.org/ValueSet/goal-priority
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/goal-priority
     pub priority: Option<CodeableConcept>,
 }
 
@@ -88067,9 +88604,9 @@ pub struct Identifier {
 
 /// FHIR ImagingSelection type
 ///
-/// A selection of DICOM SOP instances within a single DICOM Study and Series.
-/// This might include additional specifics such as a set of frames or an image
-/// region, allowing linkage to an Observation Resource.
+/// A selection of DICOM SOP instances within a single DICOM Study and DICOM
+/// Series. This might include additional specifics such as a set of frames or an
+/// image region, allowing linkage to an Observation Resource.
 ///
 /// ## Type: Resource type
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
@@ -88303,11 +88840,12 @@ pub struct ImagingSelection {
     /// participating systems and in a way that remains consistent across servers.
     ///
     /// ## Implementation Notes
-    /// Note: This is a business identifier, not a resource identifier (see
-    /// [discussion](resource.html#identifiers)). It is best practice for the
-    /// identifier to only appear on a single resource instance, however business
-    /// practices MAY occasionally dictate that multiple resource instances with the
-    /// same identifier can exist - possibly even with different resource types. For
+    /// Note: This is a business identifier, not a resource identifier (see [general
+    /// discussion](resource.html#identifiers) and [event-specific
+    /// discussion](event.html#identifier)). It is best practice for the identifier
+    /// to only appear on a single resource instance, however business practices may
+    /// occasionally dictate that multiple resource instances with the same
+    /// identifier can exist - possibly even with different resource types. For
     /// example, multiple Patient and a Person resource instance might share the same
     /// social insurance number.
     ///
@@ -89056,15 +89594,21 @@ pub struct ImagingSelectionInstance {
     /// Used when: isl-10
     #[fhir_serde(rename = "frameNumber")]
     pub frame_number: Option<Vec<PositiveInt>>,
-    /// Selected content items
+    /// Selected content item
     ///
-    /// A list of Referenced Content Item Identifier values selected from a DICOM SR
-    /// or other structured document SOP Instance (See [DICOM PS3.3
+    /// A sequence of positive integers that identify a single Referenced Content
+    /// Item selected from a DICOM SR or other structured document SOP Instance (See
+    /// [DICOM PS3.3
     /// C.17.3.2.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.17.3.2.5.html)).
     ///
     /// ## Requirements
     /// Only allowed if the value of `instance.sopClass` corresponds to a DICOM SR or
     /// other structured document SOP Class.
+    ///
+    /// ## Implementation Notes
+    /// The Content Item Identifier is only reliable if the order of sequence items
+    /// in the referenced DICOM SOP Instance is consistent. Some applications may
+    /// re-order sequence items, invalidating this reference.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -90515,7 +91059,7 @@ pub struct ImagingStudySeriesInstance {
     /// ## Aliases
     /// InstanceNumber
     pub number: Option<UnsignedInt>,
-    /// The number of this instance in the series
+    /// The number of frames in the instance
     ///
     /// The number frames in a multiframe image.
     ///
@@ -103291,7 +103835,7 @@ pub struct MeasureReportGroupStratifierStratum {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// The stratum value, e.g. male
+    /// The stratum value, e.g. northwest
     ///
     /// The value for this stratum, expressed as a CodeableConcept. When defining
     /// stratifiers on complex values, the value must be rendered such that the value
@@ -103520,7 +104064,7 @@ pub struct MeasureReportGroupStratifierStratumComponent {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub description: Option<Markdown>,
-    /// The stratum component value, e.g. male
+    /// The stratum component value, e.g. northwest
     ///
     /// The stratum component value.
     ///
@@ -103745,6 +104289,18 @@ pub struct MeasureReportGroupStratifierStratumPopulation {
     pub subjects: Option<Reference>,
 }
 
+/// Choice of types for the versionAlgorithm\[x\] field in Medication
+#[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath)]
+#[fhir_choice_element(base_name = "versionAlgorithm")]
+pub enum MedicationVersionAlgorithm {
+    /// Variant accepting the String type.
+    #[fhir_serde(rename = "versionAlgorithmString")]
+    String(String),
+    /// Variant accepting the Coding type.
+    #[fhir_serde(rename = "versionAlgorithmCoding")]
+    Coding(Coding),
+}
+
 /// FHIR Medication type
 ///
 /// This resource is primarily used for the identification and definition of a
@@ -103761,7 +104317,8 @@ pub struct MeasureReportGroupStratifierStratumPopulation {
 /// See: [Medication](http://hl7.org/fhir/StructureDefinition/Medication)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
-    summary_fields = "id,meta,implicit_rules,modifier_extension,identifier,code,status,marketing_authorization_holder,package_size"
+    choice_elements = "versionAlgorithm",
+    summary_fields = "id,meta,implicit_rules,modifier_extension,url,identifier,version,version_algorithm,name,title,code,status,experimental,date,publisher,contact,use_context,jurisdiction,marketing_authorization_holder,package_size"
 )]
 pub struct Medication {
     /// Logical id of this artifact
@@ -103973,12 +104530,54 @@ pub struct Medication {
     /// extensions, user content
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
+    /// Canonical identifier for this Medication, represented as an absolute URI (globally unique)
+    ///
+    /// An absolute URI that is used to identify this Medication when it is
+    /// referenced in a specification, model, design or an instance; also called its
+    /// canonical identifier. This SHOULD be globally unique and SHOULD be a literal
+    /// address at which an authoritative instance of this Medication is (or will be)
+    /// published. This URL can be the target of a canonical reference. It SHALL
+    /// remain the same when the Medication is stored on different servers.
+    ///
+    /// ## Requirements
+    /// Allows the Medication to be referenced by a single globally unique
+    /// identifier.
+    ///
+    /// ## Implementation Notes
+    /// Can be a urn:uuid: or a urn:oid: but real http: addresses are preferred.
+    /// Multiple instances may share the same URL if they have a distinct version.
+    /// The determination of when to create a new version of a resource (same url,
+    /// new version) vs. defining a new artifact is up to the author. Considerations
+    /// for making this decision are found in [Technical and Business
+    /// Versions](resource.html#versions). In some cases, the resource can no longer
+    /// be found at the stated url, but the url itself cannot change. Implementations
+    /// can use the [meta.source](resource.html#meta) element to indicate where the
+    /// current master source of the resource can be found.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **cnl-1**: URL should not contain | or # - these characters make processing canonical references          problematic (warning)
+    ///   Expression: `exists() implies matches('^[^|# ]+$')`
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub url: Option<Uri>,
     /// Business identifier for this medication
     ///
     /// Business identifier for this medication.
     ///
     /// ## Implementation Notes
-    /// The serial number could be included as an identifier.
+    /// This is the business identifier of the Medication record. It is particularly
+    /// important when the Medication represents a kind of medication, including when
+    /// it is used as a canonical resource (with `url` and `version`), so that the
+    /// medication can be identified and referenced across systems. For a Medication
+    /// that represents a physical instance, the business identifier is less
+    /// relevant: the serial number of the item is conveyed in
+    /// `Medication.instance.identifier`, and the batch or lot number in
+    /// `Medication.instance.lotNumber`.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -103989,6 +104588,92 @@ pub struct Medication {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub identifier: Option<Vec<Identifier>>,
+    /// Business version of the Medication
+    ///
+    /// The identifier that is used to identify this version of the Medication when
+    /// it is referenced in a specification.
+    ///
+    /// ## Implementation Notes
+    /// There may be different Medications that have the same url but different
+    /// versions. The version can be appended to the url in a reference to allow a
+    /// reference to a particular business version of the Medication with the format
+    /// [url]|[version]. The version SHOULD NOT contain a '#' - see [Business
+    /// Version](resource.html#bv-format).
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub version: Option<String>,
+    /// How to compare versions
+    ///
+    /// Indicates the mechanism used to compare versions to determine which is more
+    /// current.
+    ///
+    /// ## Implementation Notes
+    /// If set as a string, this is a FHIRPath expression that has two additional
+    /// context variables passed in - %version1 and %version2 and will return a
+    /// negative number if version1 is newer, a positive number if version2 and a 0
+    /// if the version ordering can't be successfully be determined.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Binding
+    /// - **Strength**: extensible
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/version-algorithm
+    #[fhir_serde(flatten)]
+    pub version_algorithm: Option<MedicationVersionAlgorithm>,
+    /// Name for this Medication (computer friendly)
+    ///
+    /// A natural language name identifying the Medication. This name should be
+    /// usable as an identifier for the resource by machine processing applications
+    /// such as code generation.
+    ///
+    /// ## Requirements
+    /// Supports code generation.
+    ///
+    /// ## Implementation Notes
+    /// The name is not expected to be globally unique. The name should be a simple
+    /// alphanumeric type no-whitespace name to ensure that it is machine-processing
+    /// friendly.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub name: Option<String>,
+    /// Name for this Medication (human friendly)
+    ///
+    /// A short, descriptive, user-friendly title for the Medication.
+    ///
+    /// ## Implementation Notes
+    /// This name does not need to be machine-processing friendly and may contain
+    /// punctuation, white-space, etc.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub title: Option<String>,
     /// Codes that identify this medication
     ///
     /// A code (or set of codes) that specify this medication, or a textual
@@ -104023,25 +104708,24 @@ pub struct Medication {
     /// - **Description**: A coded concept that defines the type of a medication.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-codes
     pub code: Option<CodeableConcept>,
-    /// active | inactive | entered-in-error
+    /// draft | active | retired | unknown
     ///
-    /// A code to indicate if the medication is in active use.
+    /// The status of this Medication: whether the medication record is in use.
     ///
     /// ## Implementation Notes
-    /// This status is intended to identify if the medication in a local system is in
-    /// active use within a drug database or inventory. For example, a pharmacy
-    /// system may create a new drug file record for a compounded product "ABC
-    /// Hospital Special Cream" with an active status. At some point in the future,
-    /// it may be determined that the drug record was created with an error and the
-    /// status is changed to "entered in error". This status is not intended to
-    /// specify if a medication is part of a particular formulary. It is possible
-    /// that the drug record may be referenced by multiple formularies or catalogues
-    /// and each of those entries would have a separate status.
+    /// This status identifies whether the medication record, in a local system,
+    /// catalogue or published definition, is in use. For example, a pharmacy system
+    /// may create a record for a compounded product "ABC Hospital Special Cream"
+    /// with status `active`; when the product is no longer to be used, or the record
+    /// was created in error, its status is `retired`. This status is not intended to
+    /// specify whether a medication is part of a particular formulary; the
+    /// medication may be referenced by several formularies or catalogues, each with
+    /// their own status.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
     /// ## Special Semantics
-    /// - Modifier element - This element changes the interpretation of all descriptive attributes.
+    /// - Modifier element - This element changes the interpretation of all descriptive attributes: a retired Medication should not be used for new references.
     /// - Included in summary
     ///
     /// ## Constraints
@@ -104050,9 +104734,251 @@ pub struct Medication {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **Description**: A coded concept defining if the medication is in active use.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-status|6.0.0-snapshot1
+    /// - **Description**: The lifecycle status of an artifact.
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Option<Code>,
+    /// For testing only - never for real usage
+    ///
+    /// A Boolean value to indicate that this Medication is authored for testing
+    /// purposes (or education/evaluation/marketing) and no version of this resource
+    /// will ever be intended for genuine usage.
+    ///
+    /// ## Requirements
+    /// Enables experimental content to be developed following the same lifecycle
+    /// that would be used for a production-level Medication.
+    ///
+    /// ## Implementation Notes
+    /// Allows filtering of Medications that are appropriate for use versus not.
+    /// Experimental resources might include example instances in implementation
+    /// guides, instances created solely for testing purposes, etc. If experimental
+    /// is 'true' for any version of a resource, it should be true for all versions
+    /// of the resource. (If experimental changes, then it is being misused or a
+    /// resource that was never intended for real-world use has unexpectedly changed
+    /// its purpose.). Experimental resources are not expected to be stable and may
+    /// well have breaking changes without a corresponding change to the 'version'
+    /// element.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    /// - When missing: If absent, this resource is treated as though it is not experimental.
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub experimental: Option<Boolean>,
+    /// Date last changed
+    ///
+    /// The date (and optionally time) when the Medication was last significantly
+    /// changed. The date must change when the business version changes and it must
+    /// change if the status code changes. In addition, it should change when the
+    /// substantive content of the Medication changes.
+    ///
+    /// ## Implementation Notes
+    /// The date is often not tracked until the resource is published, but may be
+    /// present on draft content. Note that this is not the same as the resource
+    /// last-modified-date, since the resource may be a secondary representation of
+    /// the Medication. Additional specific dates may be added as extensions or be
+    /// found by consulting Provenances associated with past versions of the
+    /// resource. See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Aliases
+    /// Revision Date
+    pub date: Option<DateTime>,
+    /// Name of the publisher/steward (organization or individual)
+    ///
+    /// The name of the organization or individual responsible for the release and
+    /// ongoing maintenance of the Medication.
+    ///
+    /// ## Requirements
+    /// Helps establish the "authority/credibility" of the Medication. May also allow
+    /// for contact.
+    ///
+    /// ## Implementation Notes
+    /// Usually an organization but may be an individual. The publisher (or steward)
+    /// of the Medication is the organization or individual primarily responsible for
+    /// the maintenance and upkeep of the Medication. This is not necessarily the
+    /// same individual or organization that developed and initially authored the
+    /// content. The publisher is the primary point of contact for questions or
+    /// issues with the Medication. This item SHOULD be populated unless the
+    /// information is available from context.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub publisher: Option<String>,
+    /// Contact details for the publisher
+    ///
+    /// Contact details to assist a user in finding and communicating with the
+    /// publisher.
+    ///
+    /// ## Implementation Notes
+    /// May be a web site, an email address, a telephone number, etc. See guidance
+    /// around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub contact: Option<Vec<ContactDetail>>,
+    /// Natural language description of the Medication
+    ///
+    /// A free text natural language description of the Medication from a consumer's
+    /// perspective.
+    ///
+    /// ## Implementation Notes
+    /// This description can be used to capture details such as comments about
+    /// misuse, instructions for clinical use and interpretation, literature
+    /// references, examples from the paper world, etc. It is not a rendering of the
+    /// Medication as conveyed in the 'text' field of the resource itself. This item
+    /// SHOULD be populated unless the information is available from context.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub description: Option<Markdown>,
+    /// The context that the content is intended to support
+    ///
+    /// The content was developed with a focus and intent of supporting the contexts
+    /// that are listed. These contexts may be general categories (gender, age, ...)
+    /// or may be references to specific programs (insurance plans, studies, ...) and
+    /// may be used to assist with indexing and searching for appropriate
+    /// Medications.
+    ///
+    /// ## Requirements
+    /// Assist in searching for appropriate content.
+    ///
+    /// ## Implementation Notes
+    /// When multiple useContexts are specified, there is no expectation that all or
+    /// even any of the contexts apply.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(rename = "useContext")]
+    pub use_context: Option<Vec<UsageContext>>,
+    /// Jurisdiction of the authority that maintains the Medication (if applicable)
+    ///
+    /// A legal or geographic region in which the authority that maintains the
+    /// resource is operating. In general, the jurisdiction is also found in the
+    /// useContext. The useContext may reference additional jurisdictions because the
+    /// defining jurisdiction does not necessarily limit the jurisdictions of use.
+    ///
+    /// ## Implementation Notes
+    /// It may be possible for the Medication to be used in jurisdictions other than
+    /// those for which it was originally designed or intended. DEPRECATION NOTE: For
+    /// consistency, implementations are encouraged to migrate to using the new
+    /// 'jurisdiction' code in the useContext element. (I.e. useContext.code
+    /// indicating
+    /// http://terminology.hl7.org/CodeSystem/usage-context-type#jurisdiction and
+    /// useContext.valueCodeableConcept indicating the jurisdiction.)
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Binding
+    /// - **Strength**: extensible
+    /// - **Description**: Countries and regions within which this artifact is targeted for use.
+    /// - **ValueSet**: http://terminology.hl7.org/ValueSet/jurisdiction
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    /// Why this Medication is defined
+    ///
+    /// Explanation of why this Medication is needed and why it has been designed as
+    /// it has.
+    ///
+    /// ## Implementation Notes
+    /// This element does not describe the usage of the Medication. Instead, it
+    /// provides traceability of "why" the resource is either needed or "why" it is
+    /// defined as it is. This may be used to point to source materials or
+    /// specifications that drove the structure of this Medication.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub purpose: Option<Markdown>,
+    /// Notice about intellectual property ownership, can include restrictions on use
+    ///
+    /// A copyright statement relating to the Medication and/or its contents.
+    /// Copyright statements are notices of intellectual property ownership and can
+    /// include restrictions on the use and publishing of the Medication.
+    ///
+    /// ## Requirements
+    /// Consumers must be able to determine any legal restrictions on the use of the
+    /// Medication and/or its content.
+    ///
+    /// ## Implementation Notes
+    /// The short copyright declaration (e.g. (c) '2015+ xyz organization') should be
+    /// sent in the copyrightLabel element without the copyright prefix (i.e., do not
+    /// include '(c)' or the symbol).
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Aliases
+    /// License, Restrictions
+    pub copyright: Option<Markdown>,
+    /// Copyright holder and year(s)
+    ///
+    /// A short string (<50 characters), suitable for inclusion in a page footer that
+    /// identifies the copyright holder, effective period, and optionally whether
+    /// rights are restricted. (e.g. 'All rights reserved', 'Some rights reserved').
+    ///
+    /// ## Requirements
+    /// Defines the content expected to be rendered in all representations of the
+    /// artifact.
+    ///
+    /// ## Implementation Notes
+    /// The copyright symbol and the '(c)' textual representation SHOULD NOT be
+    /// included in this string. It will be added by software when rendering the
+    /// notation. Full details about licensing, restrictions, warrantees, etc. goes
+    /// in the more general 'copyright' element.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(rename = "copyrightLabel")]
+    pub copyright_label: Option<String>,
     /// Organization that has authorization to market medication
     ///
     /// The company or other legal entity that has authorization, from the
@@ -104071,7 +104997,7 @@ pub struct Medication {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "marketingAuthorizationHolder")]
     pub marketing_authorization_holder: Option<Reference>,
-    /// powder | tablets | capsule +
+    /// E.g. powder, tablets, capsule
     ///
     /// Describes the form of the item.  Powder; tablets; capsule.
     ///
@@ -104327,8 +105253,8 @@ pub struct MedicationIngredient {
     pub is_active: Option<Boolean>,
     /// A code that defines the type of ingredient, active, base, etc.
     ///
-    /// Indication of whether this ingredient affects the therapeutic action of the
-    /// drug.
+    /// The (typically coded) functional role of the ingredient - for example active,
+    /// excipient, adjuvant, solvent etc.
     ///
     /// ## Requirements
     /// This can be used in combination with the isActive element to provide further
@@ -104473,6 +105399,13 @@ pub struct MedicationInstance {
     /// Identifier for the physical instance, typically a serial number
     ///
     /// Identifier for the physical instance, typically a serial number.
+    ///
+    /// ## Implementation Notes
+    /// The unique identifier of the physical item, typically a serial number,
+    /// following the [Product pattern](product.html). This may differ from the
+    /// business identifier of the Medication record (`Medication.identifier`). It is
+    /// not used for batch or lot numbers, which are conveyed in
+    /// `Medication.instance.lotNumber`.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -105850,7 +106783,14 @@ pub struct MedicationDispense {
     /// ## Implementation Notes
     /// While both a procedure and a medication administration may have triggered the
     /// dispense, but it is not expected that multiple procedures and/or multiple
-    /// medication administrations would be triggers.
+    /// medication administrations would be triggers. A dispense can be part of a
+    /// medication administration when there is no separate, formal dispense, for
+    /// example when the medication is taken from ward stock or an emergency cart in
+    /// order to administer it. The MedicationDispense then records the supply, for
+    /// example for logistics and inventory, without adding that information to the
+    /// MedicationAdministration, and references the administration in `partOf`. This
+    /// does not create a circular reference: a given MedicationDispense and
+    /// MedicationAdministration are not each recorded as part of the other.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -105882,9 +106822,10 @@ pub struct MedicationDispense {
     /// - **Description**: Describes the lifecycle of the dispense.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationdispense-status|6.0.0-snapshot1
     pub status: Code,
-    /// Why a dispense was not performed
+    /// Reason for current status
     ///
-    /// Indicates the reason why a dispense was not performed.
+    /// Captures the reason for the current status of the dispense, for example why
+    /// it was not performed, put on hold, or resumed.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -105895,8 +106836,8 @@ pub struct MedicationDispense {
     /// ## Binding
     /// - **Strength**: example
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationdispense-status-reason
-    #[fhir_serde(rename = "notPerformedReason")]
-    pub not_performed_reason: Option<CodeableReference>,
+    #[fhir_serde(rename = "statusReason")]
+    pub status_reason: Option<CodeableReference>,
     /// When the status changed
     ///
     /// The date (and maybe time) when the status of the dispense record changed.
@@ -106806,6 +107747,13 @@ pub struct MedicationRequest {
     /// eg. a procedure that is being planned (ServiceRequest) and MedicationRequests
     /// are known to be needed, this element documents those requests.
     ///
+    /// ## Implementation Notes
+    /// A Request can be based on an authorization (e.g. an instance order being
+    /// based on an order, or an order based on a proposal) - in this case, `basedOn`
+    /// should be used; a request may also replace or follow a prior order, e.g. a
+    /// continuation or refill order being done one after the other - for that,
+    /// `priorPrescription` should be used.
+    ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
     /// ## Special Semantics
@@ -106820,6 +107768,13 @@ pub struct MedicationRequest {
     ///
     /// Reference to an order/prescription that is being replaced by this
     /// MedicationRequest.
+    ///
+    /// ## Implementation Notes
+    /// A Request can be based on an authorization (e.g. an instance order being
+    /// based on an order, or an order based on a proposal) - in this case, `basedOn`
+    /// should be used; a request may also replace or follow a prior order, e.g. a
+    /// continuation or refill order being done one after the other - for that,
+    /// `priorPrescription` should be used.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -106902,9 +107857,10 @@ pub struct MedicationRequest {
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationrequest-status-reason
     #[fhir_serde(rename = "statusReason")]
     pub status_reason: Option<CodeableConcept>,
-    /// When the status was changed
+    /// When the status was last changed
     ///
-    /// The date (and perhaps time) when the status was changed.
+    /// The date (and perhaps time) when the status of the MedicationRequest was last
+    /// changed.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -107085,15 +108041,15 @@ pub struct MedicationRequest {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub subject: Reference,
-    /// The person or organization who provided the information about this request, if the source is someone other than the requestor
+    /// The person, organization, or device who provided the information about this request, if the source is someone other than the requestor
     ///
-    /// The person or organization who provided the information about this request,
-    /// if the source is someone other than the requestor. The informationSource
-    /// element is generally used when details of a prescription are being reported
-    /// by someone who is not the requestor, e.g., I indicate that I received a
-    /// prescription for a med out of my jurisdiction and the details are recorded in
-    /// the system as a MedicationRequest. Normally when this element is populated,
-    /// the .isRecordOfRequest element would be set to "true".
+    /// The person, organization, or device who provided the information about this
+    /// request, if the source is someone other than the requestor. The
+    /// informationSource element is generally used when details of a prescription
+    /// are being reported by someone who is not the requestor, e.g., I indicate that
+    /// I received a prescription for a med out of my jurisdiction and the details
+    /// are recorded in the system as a MedicationRequest. Normally when this element
+    /// is populated, the .isRecordOfRequest element would be set to "true".
     ///
     /// ## Implementation Notes
     /// MedicationStatement is indeed intended to capture that the patient is on a
@@ -107102,7 +108058,8 @@ pub struct MedicationRequest {
     /// need for MedicationRequest.isRecordOfRequest and .informationSource to
     /// represent that an order exists, as reported by someone. The informationSource
     /// is therefore not the "original requester", but the reporter of that
-    /// MedicationRequest.
+    /// MedicationRequest. The informationSource can be a Device, for example an AI
+    /// system that reports or extracts the details of a prescription.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -107239,6 +108196,10 @@ pub struct MedicationRequest {
     ///
     /// The intended type of device that is to be used for the administration of the
     /// medication (for example, PCA Pump).
+    ///
+    /// ## Implementation Notes
+    /// Use of Device is intended primarily to support instance orders, where a
+    /// specific device instance may be intended.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -107960,7 +108921,7 @@ pub enum MedicationStatementEffective {
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
     choice_elements = "effective",
-    summary_fields = "id,meta,implicit_rules,modifier_extension,identifier,status,category,medication,subject,encounter,effective,date_asserted,author,adherence"
+    summary_fields = "id,meta,implicit_rules,modifier_extension,identifier,based_on,status,category,medication,subject,encounter,effective,date_asserted,author,adherence"
 )]
 pub struct MedicationStatement {
     /// Logical id of this artifact
@@ -108192,6 +109153,31 @@ pub struct MedicationStatement {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub identifier: Option<Vec<Identifier>>,
+    /// Fulfils plan, proposal or order
+    ///
+    /// A plan, proposal or order that is fulfilled in whole or in part by this
+    /// event.
+    ///
+    /// ## Requirements
+    /// Allows tracing of authorization for the event and tracking whether
+    /// proposals/recommendations were acted upon.
+    ///
+    /// ## Implementation Notes
+    /// Use basedOn to reference the order or plan that this statement fulfils, or
+    /// that authorized the medication to be given or taken. To reference information
+    /// from which the statement was inferred, or that is evidence for it, use
+    /// derivedFrom.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    #[fhir_serde(rename = "basedOn")]
+    pub based_on: Option<Vec<Reference>>,
     /// Part of referenced event
     ///
     /// A larger event of which this particular MedicationStatement is a component or
@@ -108367,8 +109353,18 @@ pub struct MedicationStatement {
     /// Person or organization that provided the information about the taking of this medication
     ///
     /// The person or organization that provided the information about the taking of
-    /// this medication. Note: Use derivedFrom when a MedicationStatement is derived
-    /// from other resources, e.g. Claim or MedicationRequest.
+    /// this medication, or the kind of person or organization when the specific
+    /// individual is not recorded. Note: Use derivedFrom when a MedicationStatement
+    /// is derived from other resources, e.g. Claim or MedicationRequest.
+    ///
+    /// ## Implementation Notes
+    /// When only the kind of source is known, such as the patient's spouse, a care
+    /// giver or the patient's pharmacy, reference a resource that carries that kind
+    /// without identifying an individual: a RelatedPerson with its relationship (for
+    /// example, spouse), a PractitionerRole with its code, or an Organization with
+    /// its type (for example, a community pharmacy). Information taken from records
+    /// or objects, such as a medication administration record from a transferring
+    /// facility or a medication container, is referenced in `derivedFrom`.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -108384,12 +109380,17 @@ pub struct MedicationStatement {
     /// MedicationStatement.
     ///
     /// ## Implementation Notes
-    /// Likely references would be to MedicationRequest, MedicationDispense, Claim,
-    /// Observation or QuestionnaireAnswers. The most common use cases for deriving a
+    /// Use derivedFrom to reference sources of information from which the
+    /// MedicationStatement was inferred, or that are evidence for it. To reference
+    /// the order that this statement fulfils, use basedOn. Likely references would
+    /// be to MedicationRequest, MedicationDispense, Claim, Observation or
+    /// QuestionnaireAnswers. The most common use cases for deriving a
     /// MedicationStatement comes from creating a MedicationStatement from a
     /// MedicationRequest or from a lab observation or a claim. it should be noted
     /// that the amount of information that is available varies from the type
-    /// resource that you derive the MedicationStatement from.
+    /// resource that you derive the MedicationStatement from. This includes records
+    /// used as a source of the statement, such as a medication administration record
+    /// received from a transferring facility (for example, as a DocumentReference).
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -108461,9 +109462,10 @@ pub struct MedicationStatement {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub dosage: Option<DosageDetails>,
-    /// Indicates whether the medication is or is not being consumed or administered
+    /// Indicates whether the medication is or is not being consumed or administered as directed
     ///
-    /// Indicates whether the medication is or is not being consumed or administered.
+    /// Indicates whether the medication is or is not being consumed or administered
+    /// as directed.
     ///
     /// ## Implementation Notes
     /// This element can be used to indicate whether a patient is following a course
@@ -108483,9 +109485,10 @@ pub struct MedicationStatement {
     pub adherence: Option<MedicationStatementAdherence>,
 }
 
-/// Indicates whether the medication is or is not being consumed or administered
+/// Indicates whether the medication is or is not being consumed or administered as directed
 ///
-/// Indicates whether the medication is or is not being consumed or administered.
+/// Indicates whether the medication is or is not being consumed or administered
+/// as directed.
 ///
 /// ## Implementation Notes
 /// This element can be used to indicate whether a patient is following a course
@@ -108600,14 +109603,9 @@ pub struct MedicationStatementAdherence {
     /// - **Strength**: example
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-statement-adherence
     pub code: CodeableConcept,
-    /// Details of the reason for the current use of the medication
+    /// The reason for the current adherence status
     ///
-    /// Captures the reason for the current use or adherence of a medication.
-    ///
-    /// ## Implementation Notes
-    /// This is generally only used for "exception" statuses such as
-    /// "entered-in-error". The reason for performing the event at all is captured in
-    /// reasonCode, not here.
+    /// The reason for the current adherence status.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -109895,7 +110893,7 @@ pub struct MedicinalProductDefinitionName {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "productName")]
     pub product_name: String,
-    /// Type of product name, such as rINN, BAN, Proprietary, Non-Proprietary
+    /// Type of product name, such as rINN, BAN, INN
     ///
     /// Type of product name, such as rINN, BAN, Proprietary, Non-Proprietary.
     ///
@@ -118599,6 +119597,9 @@ pub enum ObservationValue {
     /// Variant accepting the Attachment type.
     #[fhir_serde(rename = "valueAttachment")]
     Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[fhir_serde(rename = "valueReference")]
+    Reference(Reference),
 }
 
 /// FHIR Observation type
@@ -119635,6 +120636,9 @@ pub enum ObservationComponentValue {
     /// Variant accepting the Attachment type.
     #[fhir_serde(rename = "valueAttachment")]
     Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[fhir_serde(rename = "valueReference")]
+    Reference(Reference),
 }
 
 /// Component results
@@ -121139,10 +122143,10 @@ pub struct ObservationDefinition {
     ///
     /// ## Binding
     /// - **Strength**: example
-    /// - **Description**: Codes identifying names of simple observations.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-codes-observationorboth
+    /// - **Description**: LOINC codes identifying types of observations, including panels.
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-codes
     pub code: CodeableConcept,
-    /// Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period
+    /// Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period | Reference
     ///
     /// The data types allowed for the value element of the instance observations
     /// conforming to this ObservationDefinition.
@@ -121462,7 +122466,7 @@ pub struct ObservationDefinitionComponent {
     /// - **Description**: Codes identifying names of simple observations.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-codes-observationorboth
     pub code: CodeableConcept,
-    /// Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period
+    /// Quantity | CodeableConcept | string | boolean | integer | Range | Ratio | SampledData | time | dateTime | Period | Reference
     ///
     /// The data types allowed for the value element of the instance of these
     /// component observations.
@@ -133499,7 +134503,7 @@ pub struct PlanDefinitionGoal {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// E.g. Treatment, dietary, behavioral
+    /// E.g. dietary, behavioral, nursing
     ///
     /// Indicates a category the goal falls within.
     ///
@@ -141373,7 +142377,7 @@ pub struct RegulatedAuthorization {
     /// - **Description**: Jurisdiction codes
     /// - **ValueSet**: http://terminology.hl7.org/ValueSet/jurisdiction
     pub region: Option<Vec<CodeableConcept>>,
-    /// The status that is authorised e.g. approved. Intermediate states can be tracked with cases and applications
+    /// The status that is authorised e.g. active. Intermediate states can be tracked with cases and applications
     ///
     /// The status that is authorised e.g. approved. Intermediate states and actions
     /// can be tracked with cases and applications.
@@ -147048,18 +148052,14 @@ pub struct ResearchStudy {
     /// - **ele-1**: All FHIR elements must have a @value or children or both (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub recruitment: Option<ResearchStudyRecruitment>,
-    /// Defined path through the study for a subject
+    /// A cohort of study participants that is compared to another group
     ///
-    /// Describes an expected event or sequence of events for one of the subjects of
-    /// a study. E.g. for a living subject: exposure to drug A, wash-out, exposure to
-    /// drug B, wash-out, follow-up. E.g. for a stability study: {store sample from
-    /// lot A at 25 degrees for 1 month}, {store sample from lot A at 40 degrees for
-    /// 1 month}.
-    ///
-    /// ## Implementation Notes
-    /// In many clinical trials this is refered to as the ARM of the study, but such
-    /// a term is not used in other sorts of trials even when there is a comparison
-    /// between two or more groups.
+    /// Describes a group of subjects (participants) in a study that is compared to
+    /// another group. This group may be an arm of the study, such as controlled
+    /// trials that define groups for assignment into specific paths or protocols
+    /// involving different exposures. This group may also be defined for other types
+    /// of comparisons, such as descriptive or predictive studies characterizing
+    /// populations by their characteristics.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -147068,7 +148068,7 @@ pub struct ResearchStudy {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     ///
     /// ## Aliases
-    /// arm
+    /// arm, cohort
     #[fhir_serde(rename = "comparisonGroup")]
     pub comparison_group: Option<Vec<ResearchStudyComparisonGroup>>,
     /// A goal for the study
@@ -147268,18 +148268,14 @@ pub struct ResearchStudyAssociatedParty {
     pub party: Option<Reference>,
 }
 
-/// Defined path through the study for a subject
+/// A cohort of study participants that is compared to another group
 ///
-/// Describes an expected event or sequence of events for one of the subjects of
-/// a study. E.g. for a living subject: exposure to drug A, wash-out, exposure to
-/// drug B, wash-out, follow-up. E.g. for a stability study: {store sample from
-/// lot A at 25 degrees for 1 month}, {store sample from lot A at 40 degrees for
-/// 1 month}.
-///
-/// ## Implementation Notes
-/// In many clinical trials this is refered to as the ARM of the study, but such
-/// a term is not used in other sorts of trials even when there is a comparison
-/// between two or more groups.
+/// Describes a group of subjects (participants) in a study that is compared to
+/// another group. This group may be an arm of the study, such as controlled
+/// trials that define groups for assignment into specific paths or protocols
+/// involving different exposures. This group may also be defined for other types
+/// of comparisons, such as descriptive or predictive studies characterizing
+/// populations by their characteristics.
 ///
 /// ## Cardinality: Optional, Multiple (0..*)
 ///
@@ -147288,7 +148284,7 @@ pub struct ResearchStudyAssociatedParty {
 ///   Expression: `hasValue() or (children().count() > id.count())`
 ///
 /// ## Aliases
-/// arm
+/// arm, cohort
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 pub struct ResearchStudyComparisonGroup {
     /// Unique id for inter-element referencing
@@ -147530,7 +148526,7 @@ pub struct ResearchStudyLabel {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// primary | official | scientific | plain-language | subtitle | short-title | acronym | earlier-title | language | auto-translated | human-use | machine-use | duplicate-uid
+    /// primary | official | scientific | plain-language | subtitle | short-title | acronym | earlier-title | language | autotranslated | human-use | machine-use | duplicate-uid
     ///
     /// Kind of name.
     ///
@@ -147888,10 +148884,8 @@ pub struct ResearchStudyObjectiveOutcomeMeasure {
     /// Comparison group of interest.
     ///
     /// ## Implementation Notes
-    /// To re-use and reference a Group represented in
-    /// ResearchStudy.comparisonGroup.eligibility, one may include the Group Resource
-    /// in ResearchStudy.contained and then reference the same (internal) Group by
-    /// its id
+    /// The referenced Group Resource may be the same as a reference noted in
+    /// ResearchStudy.comparisonGroup.eligibility
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -147904,10 +148898,8 @@ pub struct ResearchStudyObjectiveOutcomeMeasure {
     /// Comparison group for comparison.
     ///
     /// ## Implementation Notes
-    /// To re-use and reference a Group represented in
-    /// ResearchStudy.comparisonGroup.eligibility, one may include the Group Resource
-    /// in ResearchStudy.contained and then reference the same (internal) Group by
-    /// its id
+    /// The referenced Group Resource may be the same as a reference noted in
+    /// ResearchStudy.comparisonGroup.eligibility
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -153852,7 +154844,7 @@ pub struct Specimen {
     /// - **ValueSet**: http://terminology.hl7.org/ValueSet/v2-0487
     #[fhir_serde(rename = "type")]
     pub r#type: Option<CodeableConcept>,
-    /// Who or what this specimen is from (subject of record)
+    /// Subject (who or what) of record this specimen is associated with
     ///
     /// The subject of record that the specimen is associated with. This subject may
     /// be a patient, group, location, device, or another entity. If the specimen is
@@ -154185,9 +155177,14 @@ pub struct SpecimenCollection {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// Who collected the specimen
+    /// Who or what collected the specimen
     ///
-    /// Person who collected the specimen.
+    /// The person, organization, or device that collected the specimen.
+    ///
+    /// ## Implementation Notes
+    /// If both Specimen.collection.collector and
+    /// Specimen.collection.procedure.performer are valued, they are expected to be
+    /// consistent.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -154197,9 +155194,6 @@ pub struct SpecimenCollection {
     /// ## Constraints
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
-    ///
-    /// ## Conditions
-    /// Used when: spm-1
     pub collector: Option<Reference>,
     /// Collection time
     ///
@@ -154275,14 +155269,16 @@ pub struct SpecimenCollection {
     /// The procedure event during which the specimen was collected (e.g. the surgery
     /// leading to the collection of a pathology sample).
     ///
+    /// ## Implementation Notes
+    /// If both Specimen.collection.collector and
+    /// Specimen.collection.procedure.performer are valued, they are expected to be
+    /// consistent.
+    ///
     /// ## Cardinality: Optional (0..1)
     ///
     /// ## Constraints
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
-    ///
-    /// ## Conditions
-    /// Used when: spm-1
     pub procedure: Option<Reference>,
     /// Anatomical collection site
     ///
@@ -161646,7 +162642,7 @@ pub struct Substance {
 /// See: [SubstanceDefinition](http://hl7.org/fhir/StructureDefinition/SubstanceDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
-    summary_fields = "id,meta,implicit_rules,modifier_extension,identifier,version,status,classification,domain,grade,glycosylation_type,description,note,manufacturer,supplier,moiety,characterization,property,molecular_weight,structure,code,name,relationship,source_material"
+    summary_fields = "id,meta,implicit_rules,modifier_extension,url,identifier,version,status,experimental,date,classification,domain,grade,glycosylation_type,description,note,manufacturer,supplier,moiety,characterization,property,molecular_weight,structure,code,name,relationship,source_material"
 )]
 pub struct SubstanceDefinition {
     /// Logical id of this artifact
@@ -161858,6 +162854,45 @@ pub struct SubstanceDefinition {
     /// extensions, user content
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
+    /// Canonical identifier for this substance definition, represented as an absolute URI (globally unique)
+    ///
+    /// An absolute URI that is used to identify this substance definition when it is
+    /// referenced in a specification, model, design or an instance; also called its
+    /// canonical identifier. This SHOULD be globally unique and SHOULD be a literal
+    /// address at which an authoritative instance of this substance definition is
+    /// (or will be) published. This URL can be the target of a canonical reference.
+    /// It SHALL remain the same when the substance definition is stored on different
+    /// servers.
+    ///
+    /// ## Requirements
+    /// Allows the substance definition to be referenced by a single globally unique
+    /// identifier.
+    ///
+    /// ## Implementation Notes
+    /// Can be a urn:uuid: or a urn:oid: but real http: addresses are preferred.
+    /// Multiple instances may share the same URL if they have a distinct version.
+    ///
+    /// The determination of when to create a new version of a resource (same url,
+    /// new version) vs. defining a new artifact is up to the author. Considerations
+    /// for making this decision are found in [Technical and Business
+    /// Versions](resource.html#versions).
+    ///
+    /// In some cases, the resource can no longer be found at the stated url, but the
+    /// url itself cannot change. Implementations can use the
+    /// [meta.source](resource.html#meta) element to indicate where the current
+    /// master source of the resource can be found.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **cnl-1**: URL should not contain | or # - these characters make processing canonical references problematic (warning)
+    ///   Expression: `exists() implies matches('^[^|# ]+$')`
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub url: Option<Uri>,
     /// Identifier by which this substance is known
     ///
     /// Identifier by which this substance is known.
@@ -161903,6 +162938,68 @@ pub struct SubstanceDefinition {
     /// - **Description**: The lifecycle status of an artifact.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status
     pub status: Option<CodeableConcept>,
+    /// For testing only - never for real usage
+    ///
+    /// A Boolean value to indicate that this substance definition is authored for
+    /// testing purposes (or education/evaluation/marketing) and no version of this
+    /// resource will ever be intended for genuine usage.
+    ///
+    /// ## Requirements
+    /// Enables experimental content to be developed following the same lifecycle
+    /// that would be used for a production-level substance definition.
+    ///
+    /// ## Implementation Notes
+    /// Allows filtering of substance definitions that are appropriate for use versus
+    /// not. Experimental resources might include example instances in implementation
+    /// guides, instances created solely for testing purposes, etc. If experimental
+    /// is 'true' for any version of a resource, it should be true for all versions
+    /// of the resource. (If experimental changes, then it is being misused or a
+    /// resource that was never intended for real-world use has unexpectedly changed
+    /// its purpose.).
+    ///
+    /// Experimental resources are not expected to be stable and may well have
+    /// breaking changes without a corresponding change to the 'version' element.
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    /// - When missing: If absent, this resource is treated as though it is not experimental.
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub experimental: Option<Boolean>,
+    /// Date last changed
+    ///
+    /// The date (and optionally time) when the substance definition was last
+    /// significantly changed. The date must change when the business version changes
+    /// and it must change if the status code changes. In addition, it should change
+    /// when the substantive content of the substance definition changes.
+    ///
+    /// ## Implementation Notes
+    /// The date is often not tracked until the resource is published, but may be
+    /// present on draft content. Note that this is not the same as the resource
+    /// last-modified-date, since the resource may be a secondary representation of
+    /// the substance definition. Additional specific dates may be added as
+    /// extensions or be found by consulting Provenances associated with past
+    /// versions of the resource.
+    ///
+    /// See guidance around (not) making local changes to elements
+    /// [here](canonicalresource.html#localization).
+    ///
+    /// ## Cardinality: Optional (0..1)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Aliases
+    /// Revision Date
+    pub date: Option<DateTime>,
     /// A categorization, high level e.g. polymer or nucleic acid, or food, chemical, biological, or lower e.g. polymer linear or branch chain, or type of impurity
     ///
     /// A high level categorization, e.g. polymer or nucleic acid, or food, chemical,
@@ -162452,7 +163549,7 @@ pub struct SubstanceDefinitionCode {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub code: Option<CodeableConcept>,
-    /// Status of the code assignment, for example 'provisional', 'approved'
+    /// Status of the code assignment, for example 'draft', 'active'
     ///
     /// Status of the code assignment, for example 'provisional', 'approved'.
     ///
@@ -163399,7 +164496,7 @@ pub struct SubstanceDefinitionNucleicAcid {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// The type of the sequence (e.g. DNA, RNA)
+    /// The type of the sequence (e.g. complete, partial)
     ///
     /// The type of the sequence (e.g. DNA, RNA).
     ///
@@ -164885,7 +165982,7 @@ pub struct SubstanceDefinitionPolymerRepeat {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "averageMolecularFormula")]
     pub average_molecular_formula: Option<String>,
-    /// How the quantitative amount of Structural Repeat Units is captured (e.g. Exact, Numeric, Average)
+    /// How the quantitative amount of Structural Repeat Units is captured (e.g. SRU/Polymer ratio, Monomer/Polymer ratio)
     ///
     /// How the quantitative amount of Structural Repeat Units is captured (e.g.
     /// Exact, Numeric, Average).
@@ -165184,7 +166281,7 @@ pub struct SubstanceDefinitionPolymerRepeatRepeatUnitDegreeOfPolymerisation {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// The type of degree of polymerisation, e.g. SRU/Polymer ratio
+    /// The type of degree of polymerisation, e.g. number average, weight average
     ///
     /// The type of degree of polymerisation, e.g. SRU/Polymer ratio.
     ///
@@ -166605,7 +167702,7 @@ pub struct SubstanceDefinitionStructureRepresentation {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// The kind of structural representation (e.g. full, partial)
+    /// The kind of structural representation (e.g. systematic, scientific, brand)
     ///
     /// The kind of structural representation (e.g. full, partial).
     ///
@@ -167009,11 +168106,13 @@ pub struct Task {
     pub status: Code,
     /// Reason for current status
     ///
-    /// An explanation as to why this task is held, failed, was refused, etc.
+    /// An explanation of the current status of the Task (depending on a combination
+    /// of Task.status, Task.businessStatus, Task.input, and Task.output).
     ///
     /// ## Implementation Notes
-    /// This applies to the current status. Look at the history of the task to see
-    /// reasons for past statuses.
+    /// This applies to the current state, which is dependent on a combination of
+    /// Task.status, Task.businessStatus, Task.input, and Task.output (when there are
+    /// values for the optional fields).
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -167363,7 +168462,7 @@ pub struct Task {
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/performer-role
     #[fhir_serde(rename = "requestedPerformer")]
     pub requested_performer: Option<Vec<CodeableReference>>,
-    /// Responsible individual
+    /// Responsible party
     ///
     /// Party responsible for managing task execution.
     ///
@@ -169769,8 +170868,8 @@ pub struct TerminologyCapabilitiesCodeSystemVersion {
     pub modifier_extension: Option<Vec<Extension>>,
     /// Code system business version
     ///
-    /// For version-less code systems, there should be a single version with no
-    /// identifier.
+    /// Code system business version. For version-less code systems, there should be
+    /// a single version with no identifier.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -176501,12 +177600,13 @@ pub struct VisionPrescription {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "effectiveEndDate")]
     pub effective_end_date: Option<DateTime>,
-    /// Who authorized the vision prescription
+    /// Who or what authorized the vision prescription
     ///
-    /// The healthcare professional responsible for authorizing the prescription.
+    /// The practitioner, practitioner role, or device responsible for authorizing
+    /// the prescription.
     ///
     /// ## Requirements
-    /// Need to record the authorizing practitioner.
+    /// Need to record the authorizing prescriber.
     ///
     /// ## Cardinality: Required (1..1)
     ///
@@ -178992,7 +180092,12 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("AllergyIntolerance", "identifier", "Identifier", true),
     ("AllergyIntolerance", "implicitRules", "uri", false),
     ("AllergyIntolerance", "language", "code", false),
-    ("AllergyIntolerance", "lastOccurrence", "dateTime", false),
+    (
+        "AllergyIntolerance",
+        "lastReactionOccurrence",
+        "dateTime",
+        false,
+    ),
     ("AllergyIntolerance", "meta", "Meta", false),
     ("AllergyIntolerance", "modifierExtension", "Extension", true),
     ("AllergyIntolerance", "note", "Annotation", true),
@@ -179353,7 +180458,9 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         false,
     ),
     ("ArtifactAssessment", "artifactUri", "uri", false),
+    ("ArtifactAssessment", "author", "ContactDetail", true),
     ("ArtifactAssessment", "citeAs", "markdown", false),
+    ("ArtifactAssessment", "contact", "ContactDetail", true),
     ("ArtifactAssessment", "contained", "Resource", true),
     (
         "ArtifactAssessment",
@@ -179362,24 +180469,63 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         true,
     ),
     ("ArtifactAssessment", "copyright", "markdown", false),
+    ("ArtifactAssessment", "copyrightLabel", "string", false),
     ("ArtifactAssessment", "date", "dateTime", false),
+    ("ArtifactAssessment", "description", "markdown", false),
     ("ArtifactAssessment", "disposition", "code", false),
+    ("ArtifactAssessment", "editor", "ContactDetail", true),
+    ("ArtifactAssessment", "effectivePeriod", "Period", false),
+    ("ArtifactAssessment", "endorser", "ContactDetail", true),
+    ("ArtifactAssessment", "experimental", "boolean", false),
     ("ArtifactAssessment", "extension", "Extension", true),
     ("ArtifactAssessment", "id", "String", false),
     ("ArtifactAssessment", "identifier", "Identifier", true),
     ("ArtifactAssessment", "implicitRules", "uri", false),
+    (
+        "ArtifactAssessment",
+        "jurisdiction",
+        "CodeableConcept",
+        true,
+    ),
     ("ArtifactAssessment", "language", "code", false),
     ("ArtifactAssessment", "lastReviewDate", "date", false),
     ("ArtifactAssessment", "meta", "Meta", false),
     ("ArtifactAssessment", "modifierExtension", "Extension", true),
+    ("ArtifactAssessment", "name", "string", false),
+    ("ArtifactAssessment", "publisher", "string", false),
+    ("ArtifactAssessment", "purpose", "markdown", false),
     (
         "ArtifactAssessment",
         "relatesTo",
         "ArtifactAssessmentRelatesTo",
         true,
     ),
+    ("ArtifactAssessment", "reviewer", "ContactDetail", true),
+    ("ArtifactAssessment", "status", "code", false),
     ("ArtifactAssessment", "text", "Narrative", false),
     ("ArtifactAssessment", "title", "string", false),
+    ("ArtifactAssessment", "url", "uri", false),
+    ("ArtifactAssessment", "usage", "markdown", false),
+    ("ArtifactAssessment", "useContext", "UsageContext", true),
+    ("ArtifactAssessment", "version", "string", false),
+    (
+        "ArtifactAssessment",
+        "versionAlgorithm",
+        "ArtifactAssessmentVersionAlgorithm",
+        false,
+    ),
+    (
+        "ArtifactAssessment",
+        "versionAlgorithmCoding",
+        "Coding",
+        false,
+    ),
+    (
+        "ArtifactAssessment",
+        "versionAlgorithmString",
+        "string",
+        false,
+    ),
     ("ArtifactAssessment", "workflowStatus", "code", false),
     ("ArtifactAssessmentContent", "author", "Reference", true),
     (
@@ -179892,6 +181038,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("BodyStructure", "language", "code", false),
     ("BodyStructure", "meta", "Meta", false),
     ("BodyStructure", "modifierExtension", "Extension", true),
+    ("BodyStructure", "morphology", "CodeableConcept", false),
     ("BodyStructure", "patient", "Reference", false),
     ("BodyStructure", "text", "Narrative", false),
     (
@@ -185824,6 +186971,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("DosageDetails", "id", "String", false),
     ("DosageDetails", "modifierExtension", "Extension", true),
     ("DosageDetails", "renderedInstruction", "markdown", false),
+    ("DosageDetails", "repeatCycle", "Duration", false),
     ("DosageDetails", "safety", "DosageSafety", false),
     ("DosageDetails", "step", "DosageDetailsStep", true),
     ("DosageDetailsStep", "component", "Dosage", true),
@@ -190302,6 +191450,12 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("FamilyMemberHistoryCondition", "onsetAge", "Age", false),
     (
         "FamilyMemberHistoryCondition",
+        "onsetDateTime",
+        "dateTime",
+        false,
+    ),
+    (
+        "FamilyMemberHistoryCondition",
         "onsetPeriod",
         "Period",
         false,
@@ -192843,15 +193997,22 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("MeasureTerm", "id", "String", false),
     ("MeasureTerm", "modifierExtension", "Extension", true),
     ("Medication", "code", "CodeableConcept", false),
+    ("Medication", "contact", "ContactDetail", true),
     ("Medication", "contained", "Resource", true),
+    ("Medication", "copyright", "markdown", false),
+    ("Medication", "copyrightLabel", "string", false),
+    ("Medication", "date", "dateTime", false),
     ("Medication", "definition", "Reference", false),
+    ("Medication", "description", "markdown", false),
     ("Medication", "doseForm", "CodeableConcept", false),
+    ("Medication", "experimental", "boolean", false),
     ("Medication", "extension", "Extension", true),
     ("Medication", "id", "String", false),
     ("Medication", "identifier", "Identifier", true),
     ("Medication", "implicitRules", "uri", false),
     ("Medication", "ingredient", "MedicationIngredient", true),
     ("Medication", "instance", "MedicationInstance", false),
+    ("Medication", "jurisdiction", "CodeableConcept", true),
     ("Medication", "language", "code", false),
     (
         "Medication",
@@ -192861,9 +194022,24 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ),
     ("Medication", "meta", "Meta", false),
     ("Medication", "modifierExtension", "Extension", true),
+    ("Medication", "name", "string", false),
     ("Medication", "packageSize", "MedicationPackageSize", false),
+    ("Medication", "publisher", "string", false),
+    ("Medication", "purpose", "markdown", false),
     ("Medication", "status", "code", false),
     ("Medication", "text", "Narrative", false),
+    ("Medication", "title", "string", false),
+    ("Medication", "url", "uri", false),
+    ("Medication", "useContext", "UsageContext", true),
+    ("Medication", "version", "string", false),
+    (
+        "Medication",
+        "versionAlgorithm",
+        "MedicationVersionAlgorithm",
+        false,
+    ),
+    ("Medication", "versionAlgorithmCoding", "Coding", false),
+    ("Medication", "versionAlgorithmString", "string", false),
     ("MedicationAdministration", "basedOn", "Reference", true),
     (
         "MedicationAdministration",
@@ -193087,12 +194263,6 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ),
     ("MedicationDispense", "meta", "Meta", false),
     ("MedicationDispense", "modifierExtension", "Extension", true),
-    (
-        "MedicationDispense",
-        "notPerformedReason",
-        "CodeableReference",
-        false,
-    ),
     ("MedicationDispense", "note", "Annotation", true),
     ("MedicationDispense", "partOf", "Reference", true),
     (
@@ -193106,6 +194276,12 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("MedicationDispense", "recorded", "dateTime", false),
     ("MedicationDispense", "status", "code", false),
     ("MedicationDispense", "statusChanged", "dateTime", false),
+    (
+        "MedicationDispense",
+        "statusReason",
+        "CodeableReference",
+        false,
+    ),
     ("MedicationDispense", "subject", "Reference", false),
     (
         "MedicationDispense",
@@ -193471,6 +194647,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         false,
     ),
     ("MedicationStatement", "author", "Reference", false),
+    ("MedicationStatement", "basedOn", "Reference", true),
     ("MedicationStatement", "category", "CodeableConcept", true),
     ("MedicationStatement", "contained", "Resource", true),
     ("MedicationStatement", "dateAsserted", "dateTime", false),
@@ -195117,6 +196294,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("Observation", "valueQuantity", "Quantity", false),
     ("Observation", "valueRange", "Range", false),
     ("Observation", "valueRatio", "Ratio", false),
+    ("Observation", "valueReference", "Reference", false),
     ("Observation", "valueSampledData", "SampledData", false),
     ("Observation", "valueString", "string", false),
     ("Observation", "valueTime", "time", false),
@@ -195172,6 +196350,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("ObservationComponent", "valueQuantity", "Quantity", false),
     ("ObservationComponent", "valueRange", "Range", false),
     ("ObservationComponent", "valueRatio", "Ratio", false),
+    ("ObservationComponent", "valueReference", "Reference", false),
     (
         "ObservationComponent",
         "valueSampledData",
@@ -200386,8 +201565,10 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         true,
     ),
     ("SubstanceDefinition", "contained", "Resource", true),
+    ("SubstanceDefinition", "date", "dateTime", false),
     ("SubstanceDefinition", "description", "markdown", false),
     ("SubstanceDefinition", "domain", "CodeableConcept", false),
+    ("SubstanceDefinition", "experimental", "boolean", false),
     ("SubstanceDefinition", "extension", "Extension", true),
     (
         "SubstanceDefinition",
@@ -200472,6 +201653,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ),
     ("SubstanceDefinition", "supplier", "Reference", true),
     ("SubstanceDefinition", "text", "Narrative", false),
+    ("SubstanceDefinition", "url", "uri", false),
     ("SubstanceDefinition", "version", "string", false),
     (
         "SubstanceDefinitionCharacterization",

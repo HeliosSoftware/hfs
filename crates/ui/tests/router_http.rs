@@ -2075,6 +2075,68 @@ fn form_pane_body(doc: &Value, extra: &[(&str, &str)]) -> String {
     serializer.finish()
 }
 
+#[tokio::test]
+async fn editor_choice_selects_keep_their_native_contract_in_both_response_shapes() {
+    for (document, name, arm) in [
+        (
+            serde_json::json!({"resourceType": "Patient"}),
+            "deceased",
+            "deceasedBoolean",
+        ),
+        (
+            serde_json::json!({"resourceType": "RiskAssessment", "status": "final", "subject": {"reference": "Patient/p1"}}),
+            "occurrence",
+            "occurrencePeriod",
+        ),
+        (
+            serde_json::json!({"resourceType": "ViewDefinition", "status": "draft", "resource": "Patient"}),
+            "versionAlgorithm",
+            "versionAlgorithmString",
+        ),
+        (
+            serde_json::json!({"resourceType": "Library", "status": "draft"}),
+            "subject",
+            "subjectReference",
+        ),
+    ] {
+        for pane in ["", "form"] {
+            let response = edit(&form_pane_body(&document, &[("pane", pane)])).await;
+            let dom = Dom::fragment(&response);
+            let selector = format!("select[data-choose=''][data-declarer='{name}']");
+            let select = dom.one(&selector);
+            assert!(select.has_attr("data-combobox-select"));
+            assert!(!select.has_attr("hidden"));
+            assert!(!select.has_attr("disabled"));
+            assert!(
+                select
+                    .attr("aria-label")
+                    .unwrap()
+                    .starts_with(&format!("{name}[x]"))
+            );
+            assert_eq!(select.one("option[value='']").text(), "Pick a type…");
+            assert_eq!(select.one(&format!("option[value='{arm}']")).text(), arm);
+
+            let changed = edit(&form_pane_body(
+                &document,
+                &[
+                    ("pane", pane),
+                    ("op", "choose"),
+                    ("path", ""),
+                    ("name", name),
+                    ("arm", arm),
+                ],
+            ))
+            .await;
+            let dom = Dom::fragment(&changed);
+            let returned: Value =
+                serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+            assert!(returned.get(arm).is_some());
+            assert_eq!(dom.one("#editor-form").attr("data-focus"), Some(arm));
+            assert_eq!(dom.count(&selector), 0);
+        }
+    }
+}
+
 /// Slices out one row's own markup — from its `<div class="editor-row...`
 /// opening tag, found by the unique `data-path="{path}"` attribute every row
 /// carries, up to the next row (or the end of the fragment). `data-path` is
@@ -2990,6 +3052,14 @@ async fn history_page_renders_the_shell() {
     assert!(html.contains(r#"data-tab="instance""#));
     assert!(html.contains(r#"id="history-versions""#));
     assert!(html.contains("history.js"));
+    // #1759: the operation labels each version row shows are translated
+    // server-side and handed to the script as data attributes.
+    for op in ["create", "update", "patch", "delete", "version"] {
+        assert!(
+            html.contains(&format!("data-msg-op-{op}=")),
+            "missing data-msg-op-{op}"
+        );
+    }
 }
 
 async fn diff(form: &str) -> String {
@@ -6856,6 +6926,48 @@ async fn sql_query_page_shows_the_parameters_card_with_form_associated_fields() 
     assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="ward:string""#));
 }
 
+#[tokio::test]
+async fn sql_query_numeric_fields_keep_native_steps_values_and_form_association() {
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "numeric", "name": "numeric", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+        "parameter": [
+            {"name": "amount", "use": "in", "type": "decimal", "defaultDecimal": -150.5},
+            {"name": "whole", "use": "in", "type": "integer", "defaultInteger": 30},
+            {"name": "big", "use": "in", "type": "integer64", "defaultInteger64": "9007199254740993"}
+        ]
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=numeric")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = Dom::page(&html);
+    for (name, step, value) in [
+        ("amount", "any", "-150.5"),
+        ("whole", "1", "30"),
+        ("big", "1", "9007199254740993"),
+    ] {
+        let field = dom.one(&format!("input[name='param:{name}']"));
+        assert!(field.has_class("field__input--number"));
+        assert_eq!(field.attr("type"), Some("number"));
+        assert_eq!(field.attr("step"), Some(step));
+        assert_eq!(field.attr("value"), Some(value));
+        assert_eq!(field.attr("form"), Some("lib-editor-form"));
+    }
+}
+
 /// #1276: Create New (`?lib=new`) renders `#lib-params` for a SQL Query too,
 /// so `/run`'s out-of-band card has an element to replace once the pasted
 /// JSON declares a parameter. The starter declares none, so its signature is
@@ -7428,6 +7540,142 @@ async fn sql_view_page_resolves_reads_from_and_lists_used_by() {
     assert!(html.contains("by_ward"), "{html}");
     assert!(html.contains(r#"href="/ui/sql/export/job-a""#), "{html}");
     assert!(html.contains("Nightly extract"), "{html}");
+}
+
+/// A loopback terminology server for #1824's *Reads from* rows: `POST
+/// ValueSet/$expand` expands only `http://example.org/ValueSet/cardio`
+/// (404 otherwise), and `GET ConceptMap?url=` holds only
+/// `http://example.org/ConceptMap/ids-to-icd`.
+async fn mock_terminology_tables() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/ValueSet/$expand",
+            axum::routing::post(|body: String| async move {
+                let params: Value = serde_json::from_str(&body).unwrap_or_default();
+                let url = params["parameter"][0]["valueUri"].as_str().unwrap_or("");
+                if url == "http://example.org/ValueSet/cardio" {
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "resourceType": "ValueSet", "url": url,
+                            "name": "Cardio", "title": "Cardiology codes",
+                            "expansion": {"total": 2}
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (StatusCode::NOT_FOUND, String::new())
+                }
+            }),
+        )
+        .route(
+            "/ConceptMap",
+            axum::routing::get(
+                |axum::extract::Query(query): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    let url = query.get("url").map(String::as_str).unwrap_or("");
+                    let entry = if url == "http://example.org/ConceptMap/ids-to-icd" {
+                        serde_json::json!([{"resource": {
+                            "resourceType": "ConceptMap", "url": url, "name": "IdsToIcd"
+                        }}])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    serde_json::json!({"resourceType": "Bundle", "entry": entry}).to_string()
+                },
+            ),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// #1824: a dependency storage has no ViewDefinition or Library for is
+/// resolved on the terminology server — a value set it expands and a
+/// concept map it holds each render as a resolved row with their own chip
+/// and name, never as *Not found*; a canonical it knows neither of still
+/// does.
+#[tokio::test]
+async fn reads_from_resolves_value_set_and_concept_map_dependencies_on_the_terminology_server() {
+    let library = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "cardio_patients", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+            {"type": "depends-on", "label": "cardio", "resource": "http://example.org/ValueSet/cardio"},
+            {"type": "depends-on", "label": "icd", "resource": "http://example.org/ConceptMap/ids-to-icd"},
+            {"type": "depends-on", "label": "missing", "resource": "http://example.org/ValueSet/nope"},
+        ],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with("Library", helios_fhir::FhirVersion::R4, vec![library]);
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        Some(mock_terminology_tables().await),
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let reads_from = text_between(&html, r#"id="lib-tables""#, r#"id="lib-tables-add-table""#);
+    let row = |alias: &str| {
+        let start = reads_from
+            .find(&format!(
+                r#"<code class="lib-tables__alias">{alias}</code>"#
+            ))
+            .unwrap_or_else(|| panic!("no row for {alias}: {reads_from}"));
+        let head = &reads_from[..start];
+        let row_start = head.rfind("<li").unwrap();
+        let row_end = start + reads_from[start..].find("</li>").unwrap();
+        reads_from[row_start..row_end].to_string()
+    };
+
+    let cardio = row("cardio");
+    assert!(
+        cardio.contains(r#"<span class="tag tag--type">ValueSet</span>"#),
+        "{cardio}"
+    );
+    assert!(cardio.contains("Cardiology codes"), "{cardio}");
+    assert!(!cardio.contains("row--alert"), "{cardio}");
+
+    let icd = row("icd");
+    assert!(
+        icd.contains(r#"<span class="tag tag--type">ConceptMap</span>"#),
+        "{icd}"
+    );
+    assert!(icd.contains("IdsToIcd"), "{icd}");
+    assert!(!icd.contains("row--alert"), "{icd}");
+
+    let missing = row("missing");
+    assert!(missing.contains("row--alert"), "{missing}");
+    assert!(missing.contains("Not found"), "{missing}");
+
+    assert!(!row("v").contains("row--alert"));
 }
 
 /// #1238: the Tables card's own add row — search, alias, *Add* — is
@@ -8280,8 +8528,7 @@ async fn sql_queries_page_saved_redirect_fills_the_columns_card() {
 /// with no nested `<div>` in between (the list holds only `<a>` items and,
 /// when empty, a `<p>`) — so a test can assert what the paginated/filtered
 /// list shows without also matching the "Recently used" group above it,
-/// which can legitimately render an id the list itself excludes — the
-/// group is never filtered.
+/// which can render an off-page id from its stored snapshot.
 fn rail_list_html<'a>(html: &'a str, list_id: &str) -> &'a str {
     let start = html
         .find(&format!(r#"id="{list_id}""#))
@@ -8369,6 +8616,12 @@ async fn view_definitions_rail_paginates_across_pages_of_fifty() {
         html.contains(r#"class="pagination""#)
             && html.contains(r#"href="/ui/sql/view-definitions""#),
         "a previous link back to the bare route (page 1)"
+    );
+    // With a link to show, the always-emitted nav is not `hidden` (#1275).
+    let nav = &html[html.find(r#"id="vd-rail-pagination""#).expect("nav id")..];
+    assert!(
+        !nav[..nav.find('>').unwrap()].contains("hidden"),
+        "the pagination nav is visible when prev/next exist"
     );
     assert!(!html.contains("page=3"), "no next link past the last page");
 }
@@ -8508,10 +8761,13 @@ async fn view_definitions_selection_survives_a_filter_that_excludes_it() {
     let list = rail_list_html(&html, "vd-rail-list");
     assert!(list.contains(r#"data-type="other""#));
     assert!(!list.contains(r#"data-type="keep""#));
-    // ...but the just-selected "keep" still surfaces through the "Recently
-    // used" group above it — the group is never itself filtered — from its
-    // snapshot, since the filter takes it off the list this render shows.
-    assert!(html.contains(r#"id="vd-rail-recent""#));
+    // ...and the "Recently used" group above it follows the same filter
+    // (#1275): it is always emitted (the live filter swaps it by id) and the
+    // excluded selection is not in it.
+    let group_start = html.find(r#"id="vd-rail-recent""#).expect("group emitted");
+    let group =
+        &html[group_start..html[group_start..].find("filter-rail__divider").unwrap() + group_start];
+    assert!(!group.contains(r#"data-type="keep""#));
     // ...and the editor still holds the selected view the filter excluded.
     assert!(html.contains(r#"name="json""#));
     assert!(html.contains("keep_me"));
@@ -10070,4 +10326,23 @@ async fn editor_render_publishes_empty_issue_list_when_valid() {
     let doc = serde_json::json!({ "resourceType": "Patient", "gender": "male" });
     let html = edit(&form_pane_body(&doc, &[("pane", "")])).await;
     assert!(html.contains(r#"data-issues="[]""#), "{html}");
+}
+
+/* #1759: the Resources modal's History tab builds the same operation labels
+ * as the History page, from data attributes on #resource-history. */
+#[tokio::test]
+async fn resources_page_hands_the_history_operation_labels_to_the_script() {
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    for op in ["create", "update", "patch", "delete", "version"] {
+        assert!(
+            html.contains(&format!("data-msg-op-{op}=")),
+            "missing data-msg-op-{op}"
+        );
+    }
 }

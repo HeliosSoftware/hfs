@@ -53,144 +53,44 @@
       "reason": "Contested"
     },
     {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityMonthLiteralToQuantity",
-      "reason": "Test is wrong"
-    },
-    {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityYearLiteralToQuantity",
-      "reason": "Test is wrong"
-    },
-    {
       "groupName": "testMiscellaneousAccessorTests",
       "testName": "testPatientHasBirthDate",
       "reason": "Unsure how the predicate=true capability works"
     },
     {
-      "groupName": "isSemanticChecks",
-      "testName": "isEffectOnLogic1Base",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent1",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
     },
     {
-      "groupName": "isSemanticChecks",
-      "testName": "isEffectOnLogic2",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent3",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
     },
     {
-      "groupName": "isSemanticChecks",
-      "testName": "isEffectOnLogic3",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent4",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
     },
     {
-      "groupName": "isSemanticChecks",
-      "testName": "isEffectOnLogic3Base",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent1",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
     },
     {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardAnd",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent2",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
     },
     {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardAndBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent4",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
     },
     {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardAs",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardFnImpliesBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardIifBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardIifElse",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardImpliesBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardNotImplies",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardNotImpliesBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOfType",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOr",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOr2",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOrBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOrBoth",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOrFnTypesImpliesBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOrInnerImplies",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOrInnerImpliesBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOrOtherImpliesBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOrOtherImpliesNoParensBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardOrTypesImpliesBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
-    },
-    {
-      "groupName": "isSemanticChecks",
-      "testName": "isGuardXorBad",
-      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent5",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
     }
   ]
 }

@@ -18,14 +18,19 @@
 use std::sync::Arc;
 
 use deadpool_postgres::Pool;
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use helios_fhir::FhirVersion;
+use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnKind, ColumnarBatchBuilder};
+use helios_sof::sqlquery::engine::{DeclaredColumn, declared_columns};
 use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace};
 
+use helios_sof::arrow::record_batch::RecordBatch;
+
 use crate::core::sof_runner::{
-    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+    BatchSender, BatchStream, RowBatchSender, RowBatcher, RowStream, SofError, SofRunner,
+    ViewFilters, ViewRow, row_batch_channel, row_stream, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
@@ -34,8 +39,8 @@ use super::decode::{ColumnDecode, decode_text};
 use super::compiler::SqlDialect;
 use super::runtime::{RuntimeParam, prepare_sql_export_page, prepare_sql_run};
 
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
+/// Channel buffer depth for the columnar path (batches, not rows).
+const BATCH_CHANNEL_BUFFER: usize = 2;
 
 /// Resources read per page by the export reader.
 const EXPORT_PAGE_RESOURCES: usize = 10_000;
@@ -146,7 +151,7 @@ impl SofRunner for PgInDbRunner {
             .map(PgParam::from_runtime)
             .collect();
         let pool = self.pool.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let (tx, rx) = row_batch_channel();
         let guard_tx = tx.clone();
         let page_size = self.export_page_size;
         let producer = tokio::spawn(async move {
@@ -179,7 +184,70 @@ impl SofRunner for PgInDbRunner {
             }
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        Ok(row_stream(rx))
+    }
+
+    /// Columnar sibling of [`run_view`](Self::run_view): every column is text
+    /// on the wire, so each cell is read as `&str` and appended straight to
+    /// its Arrow builder. Columns whose type is only known per value are
+    /// decoded to JSON as on the row path.
+    ///
+    /// Returns `Ok(None)` when two output columns share a name: the row path
+    /// folds those into one JSON key, positional builders would keep both.
+    async fn run_view_columnar(
+        &self,
+        tenant: &TenantContext,
+        view_definition: Value,
+        filters: ViewFilters,
+    ) -> Result<Option<BatchStream>, SofError> {
+        let tenant_id = tenant.tenant_id().to_string();
+        let group_pool = self.pool.clone();
+        let group_tenant = tenant_id.clone();
+        let Some(prepared) = prepare_sql_run(
+            &view_definition,
+            SqlDialect::Postgres,
+            self.fhir_version,
+            &tenant_id,
+            filters,
+            move |refs| async move { load_group_documents(&group_pool, &group_tenant, &refs).await },
+        ).await? else {
+            return Ok(Some(Box::pin(futures::stream::empty())));
+        };
+        let compiled = prepared.query;
+        let mut seen = std::collections::HashSet::new();
+        if !compiled.columns.iter().all(|c| seen.insert(c.as_str())) {
+            return Ok(None);
+        }
+        let declared = declared_columns(&view_definition);
+        debug!(runner = "postgres-indb", tenant = %tenant_id, "executing compiled ViewDefinition (columnar)");
+        trace!(
+            runner = "postgres-indb", sql = %compiled.sql, columns = ?compiled.columns,
+            constants = compiled.constants.len(), "compiled ViewDefinition SQL"
+        );
+        let params = prepared
+            .params
+            .into_iter()
+            .map(PgParam::from_runtime)
+            .collect();
+        let pool = self.pool.clone();
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<RecordBatch, SofError>>(BATCH_CHANNEL_BUFFER);
+        let guard_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            stream_pg_batches(
+                pool,
+                compiled.sql,
+                params,
+                compiled.columns,
+                compiled.column_decodes,
+                declared,
+                prepared.client_limit,
+                tx,
+            )
+            .await;
+        });
+        watch_row_producer(self.runner_name(), guard_tx, producer);
+        Ok(Some(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
@@ -280,10 +348,12 @@ async fn stream_pg_rows(
     columns: Vec<String>,
     decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
-    tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    tx: RowBatchSender,
 ) {
-    if let Err(e) = stream_pg_rows_inner(pool, sql, params, columns, decodes, limit, &tx).await {
-        let _ = tx.send(Err(e)).await;
+    let mut batcher = RowBatcher::new(tx);
+    match stream_pg_rows_inner(pool, sql, params, columns, decodes, limit, &mut batcher).await {
+        Ok(()) => batcher.finish().await,
+        Err(e) => batcher.error(e).await,
     }
 }
 
@@ -294,7 +364,7 @@ async fn stream_pg_rows_inner(
     columns: Vec<String>,
     decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
-    tx: &tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    batcher: &mut RowBatcher,
 ) -> Result<(), SofError> {
     let client = pool
         .get()
@@ -339,7 +409,19 @@ async fn stream_pg_rows_inner(
     futures::pin_mut!(raw);
 
     let mut count = 0usize;
-    while let Some(row_result) = raw.next().await {
+    loop {
+        // Deliver the pending rows before waiting on the database, so a
+        // slow or selective query still shows its first rows promptly.
+        let next = match raw.next().now_or_never() {
+            Some(next) => next,
+            None => {
+                if !batcher.try_flush() {
+                    break; // receiver dropped
+                }
+                raw.next().await
+            }
+        };
+        let Some(row_result) = next else { break };
         match row_result {
             Ok(pg_row) => {
                 if let Some(cap) = limit {
@@ -350,12 +432,12 @@ async fn stream_pg_rows_inner(
                 count += 1;
                 match row_to_json(&pg_row, &columns, &decodes) {
                     Ok(row) => {
-                        if tx.send(Ok(row)).await.is_err() {
+                        if !batcher.push(row).await {
                             break; // receiver dropped
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        batcher.error(e).await;
                         break;
                     }
                 }
@@ -364,11 +446,11 @@ async fn stream_pg_rows_inner(
                 if std::env::var("PG_SOF_DEBUG").is_ok() {
                     eprintln!("[PG_SOF_DEBUG] row error: {e}\n--- SQL ---\n{sql}\n---");
                 }
-                let _ = tx
-                    .send(Err(SofError::Backend(format!(
+                batcher
+                    .error(SofError::Backend(format!(
                         "row error: {}",
-                        pg_error_text(&e)
-                    ))))
+                        pg_row_error_text(&e, &columns, &decodes)
+                    )))
                     .await;
                 break;
             }
@@ -426,6 +508,43 @@ fn pg_error_text(e: &tokio_postgres::Error) -> String {
     }
 }
 
+/// [`pg_error_text`] for a failure while reading rows. The declared column
+/// type is applied by a SQL cast, so a declared `integer` / `decimal` column
+/// over a value that is not a number fails the whole query with a message that
+/// quotes the value but not the column (`invalid input syntax for type
+/// bigint: "Garcia"`). PostgreSQL does not say which expression failed, so for
+/// those data-exception errors the declared numeric columns are listed.
+fn pg_row_error_text(
+    e: &tokio_postgres::Error,
+    columns: &[String],
+    decodes: &[ColumnDecode],
+) -> String {
+    let text = pg_error_text(e);
+    let is_cast_failure = e.as_db_error().is_some_and(|db| {
+        matches!(
+            db.code().code(),
+            "22P02" /* invalid_text_representation */ | "22003" /* numeric_value_out_of_range */
+        )
+    });
+    if !is_cast_failure {
+        return text;
+    }
+    let numeric: Vec<&str> = columns
+        .iter()
+        .zip(decodes)
+        .filter(|(_, d)| matches!(d, ColumnDecode::Integer | ColumnDecode::Decimal))
+        .map(|(c, _)| c.as_str())
+        .collect();
+    if numeric.is_empty() {
+        text
+    } else {
+        format!(
+            "{text} (a declared integer/decimal column received a value that is not a number or is out of range; declared numeric columns: {})",
+            numeric.join(", ")
+        )
+    }
+}
+
 // ============================================================================
 // Keyset-paged fetch loop (export)
 // ============================================================================
@@ -447,12 +566,23 @@ async fn stream_pg_pages(
     decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     page_size: usize,
-    tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    tx: RowBatchSender,
 ) {
-    if let Err(e) =
-        stream_pg_pages_inner(pool, sql, params, columns, decodes, limit, page_size, &tx).await
+    let mut batcher = RowBatcher::new(tx);
+    match stream_pg_pages_inner(
+        pool,
+        sql,
+        params,
+        columns,
+        decodes,
+        limit,
+        page_size,
+        &mut batcher,
+    )
+    .await
     {
-        let _ = tx.send(Err(e)).await;
+        Ok(()) => batcher.finish().await,
+        Err(e) => batcher.error(e).await,
     }
 }
 
@@ -470,7 +600,7 @@ async fn stream_pg_pages_inner(
     decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     page_size: usize,
-    tx: &tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    batcher: &mut RowBatcher,
 ) -> Result<(), SofError> {
     // `$1`/`$2` are tenant and resource type; the range slots are the last two.
     let (Some(PgParam::Text(tenant)), Some(PgParam::Text(resource_type))) =
@@ -507,14 +637,14 @@ async fn stream_pg_pages_inner(
     let mut count = 0usize;
     let mut pages = 0usize;
     loop {
-        if tx.is_closed() {
+        if batcher.is_closed() {
             return Ok(());
         }
         let bound_params: [&(dyn tokio_postgres::types::ToSql + Sync); 4] =
             [&tenant, &resource_type, &after, &page_limit];
         let bound = tokio::select! {
             r = client.query_opt(&bound_stmt, &bound_params) => r,
-            _ = tx.closed() => return Ok(()),
+            _ = batcher.closed() => return Ok(()),
         }
         .map_err(|e| SofError::Backend(format!("page bound error: {}", pg_error_text(&e))))?;
         let Some(bound) = bound else { break };
@@ -531,13 +661,16 @@ async fn stream_pg_pages_inner(
             .collect();
         let rows = tokio::select! {
             r = client.query(&page_stmt, &param_refs) => r,
-            _ = tx.closed() => return Ok(()),
+            _ = batcher.closed() => return Ok(()),
         }
         .map_err(|e| {
             if std::env::var("PG_SOF_DEBUG").is_ok() {
                 eprintln!("[PG_SOF_DEBUG] page error: {e}\n--- SQL ---\n{sql}\n---");
             }
-            SofError::Backend(format!("row error: {}", pg_error_text(&e)))
+            SofError::Backend(format!(
+                "row error: {}",
+                pg_row_error_text(&e, &columns, &decodes)
+            ))
         })?;
         drop(param_refs);
         drop(boxed);
@@ -549,9 +682,13 @@ async fn stream_pg_pages_inner(
             }
             count += 1;
             let row = row_to_json(pg_row, &columns, &decodes)?;
-            if tx.send(Ok(row)).await.is_err() {
+            if !batcher.push(row).await {
                 return Ok(()); // receiver dropped
             }
+        }
+        // The next page starts a new statement; do not hold these rows for it.
+        if !batcher.flush().await {
+            return Ok(());
         }
         if limit.is_some_and(|cap| count >= cap) {
             break;
@@ -565,6 +702,168 @@ async fn stream_pg_pages_inner(
         pages,
         "in-DB paged view run complete"
     );
+    Ok(())
+}
+
+// ============================================================================
+// Columnar fetch loop
+// ============================================================================
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_pg_batches(
+    pool: Pool,
+    sql: String,
+    params: Vec<PgParam>,
+    columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
+    declared: Vec<DeclaredColumn>,
+    limit: Option<usize>,
+    tx: BatchSender,
+) {
+    if let Err(e) =
+        stream_pg_batches_inner(pool, sql, params, columns, decodes, &declared, limit, &tx).await
+    {
+        let _ = tx.send(Err(e)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_pg_batches_inner(
+    pool: Pool,
+    sql: String,
+    params: Vec<PgParam>,
+    columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
+    declared: &[DeclaredColumn],
+    limit: Option<usize>,
+    tx: &BatchSender,
+) -> Result<(), SofError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| SofError::Storage(format!("failed to acquire Postgres connection: {e}")))?;
+    let stmt = client
+        .prepare(&sql)
+        .await
+        .map_err(|e| SofError::Backend(format!("failed to prepare SQL: {e}")))?;
+    let boxed = box_params(params);
+    let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = boxed
+        .iter()
+        .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
+    let raw = client
+        .query_raw(&stmt, param_refs.iter().copied())
+        .await
+        .map_err(|e| SofError::Backend(format!("query execution failed: {e}")))?;
+    drop(param_refs);
+    drop(boxed);
+    futures::pin_mut!(raw);
+
+    let kinds = (0..columns.len())
+        .map(|i| decodes.get(i).copied().unwrap_or_default().column_kind())
+        .collect();
+    let mut builder = ColumnarBatchBuilder::new(columns.clone(), kinds, COLUMNAR_BATCH_ROWS)
+        .map_err(|e| SofError::Backend(format!("columnar builder: {e}")))?;
+    builder
+        .pin_declared_types(declared)
+        .map_err(|e| SofError::Backend(format!("columnar builder: {e}")))?;
+
+    let mut count = 0usize;
+    // False once the stream ended on an error or a closed receiver: the
+    // partial batch is then dropped instead of flushed.
+    let mut completed = true;
+    while let Some(row_result) = raw.next().await {
+        let pg_row = match row_result {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx
+                    .send(Err(SofError::Backend(format!(
+                        "row error: {}",
+                        pg_row_error_text(&e, &columns, &decodes)
+                    ))))
+                    .await;
+                completed = false;
+                break;
+            }
+        };
+        if let Some(cap) = limit {
+            if count >= cap {
+                break;
+            }
+        }
+        count += 1;
+        if let Err(e) = append_pg_row(&mut builder, &pg_row, &columns, &decodes) {
+            let _ = tx.send(Err(e)).await;
+            completed = false;
+            break;
+        }
+        if builder.end_row() {
+            match builder.flush() {
+                Ok(Some(batch)) => {
+                    if tx.send(Ok(batch)).await.is_err() {
+                        completed = false;
+                        break; // receiver dropped
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(SofError::Backend(format!("columnar flush: {e}"))))
+                        .await;
+                    completed = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    if completed {
+        match builder.flush() {
+            Ok(Some(batch)) => {
+                let _ = tx.send(Ok(batch)).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = tx
+                    .send(Err(SofError::Backend(format!("columnar flush: {e}"))))
+                    .await;
+            }
+        }
+    }
+    debug!(
+        runner = "postgres-indb",
+        rows = count,
+        "in-DB columnar view run complete"
+    );
+    Ok(())
+}
+
+/// Appends one `tokio_postgres::Row` to the builder.
+///
+/// Every projected column is text, so each cell is borrowed as `&str`. Typed
+/// columns parse it in the builder; `Deferred` ones decode it to JSON exactly
+/// as [`row_to_json`] does.
+fn append_pg_row(
+    builder: &mut ColumnarBatchBuilder,
+    pg_row: &tokio_postgres::Row,
+    columns: &[String],
+    decodes: &[ColumnDecode],
+) -> Result<(), SofError> {
+    for (i, name) in columns.iter().enumerate() {
+        let val: Option<&str> = pg_row
+            .try_get(i)
+            .map_err(|e| SofError::Backend(format!("failed to read column '{name}': {e}")))?;
+        let decode = decodes.get(i).copied().unwrap_or_default();
+        match val {
+            None => builder.append_null(i),
+            Some(s) => match decode.column_kind() {
+                ColumnKind::Deferred => {
+                    builder.append_deferred(i, decode_text(decode, s.to_owned()))
+                }
+                _ => builder.append_str(i, s),
+            },
+        }
+    }
     Ok(())
 }
 

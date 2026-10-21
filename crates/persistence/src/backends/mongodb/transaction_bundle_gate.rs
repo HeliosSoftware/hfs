@@ -113,6 +113,18 @@ impl TransactionBundleGate {
         self.capacity
     }
 
+    /// The room in entries when the gate is on and entry-weighted, or `None`
+    /// when it is off or counts Bundles (`weight_entries == 0`), where the
+    /// capacity is a number of Bundles, not entries. The default size from
+    /// which a Bundle writes its search rows after the commit (#1975).
+    pub(super) fn entry_capacity(&self) -> Option<usize> {
+        if self.weight_entries > 0 {
+            self.capacity
+        } else {
+            None
+        }
+    }
+
     /// The permits a Bundle of `entries` entries takes: 1 when the weight is
     /// `0` (every Bundle is one slot), otherwise its entry count, at least 1
     /// and at most the whole capacity so that it can always be admitted.
@@ -508,6 +520,19 @@ mod tests {
         assert_eq!(gate.capacity(), Some(4000));
         assert_eq!(gate.weight(801), 801);
         assert_eq!(gate.weight(5000), 4000);
+    }
+
+    #[test]
+    fn entry_capacity_is_the_room_only_for_an_entry_weighted_gate() {
+        assert_eq!(
+            TransactionBundleGate::new(4, 1000).entry_capacity(),
+            Some(4000)
+        );
+        assert_eq!(TransactionBundleGate::new(1, 2).entry_capacity(), Some(2));
+        // Off: no room at all.
+        assert_eq!(TransactionBundleGate::new(0, 1000).entry_capacity(), None);
+        // Counting Bundles: the capacity is a number of Bundles, not entries.
+        assert_eq!(TransactionBundleGate::new(4, 0).entry_capacity(), None);
     }
 
     #[test]

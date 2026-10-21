@@ -39,18 +39,19 @@
 //! see the `#[cfg(test)]` module below.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::Stream;
 use helios_persistence::core::search::SearchProvider;
-use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
+use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
     BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
-    TableSchema,
+    TableSchema, TerminologyKind, TerminologyRelation,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -124,6 +125,18 @@ pub(crate) enum PlanNode {
         /// names this node. Not used for resolution.
         name: String,
     },
+    /// A `ValueSet` or `ConceptMap` dependency (#1824): a leaf whose rows were
+    /// read in Phase 1 (from the persisted table, or from the terminology
+    /// server), so Phase 2 — including the `$sql-export` worker, which has no
+    /// storage access — only copies them into the engine.
+    Terminology {
+        /// Canonical internal table name this node's rows are stored under.
+        internal_name: String,
+        /// The flattened relation.
+        relation: TerminologyRelation,
+        /// The dependency's canonical URL, for error messages.
+        name: String,
+    },
 }
 
 /// The output of Phase 1: a topologically-ordered (leaves first) dependency
@@ -191,6 +204,17 @@ pub(crate) trait ArtifactFetcher: Send + Sync {
     /// aborts resolution immediately rather than being aggregated with
     /// structural errors.
     async fn fetch(&self, url: &str) -> Result<Value, RestError>;
+
+    /// Resolves `url` as a terminology dependency (a `ValueSet` or
+    /// `ConceptMap`, #1824) once [`Self::fetch`] and the inline `context`
+    /// found no ViewDefinition or Library there. `Ok(None)` means it is not
+    /// terminology either.
+    async fn fetch_terminology(
+        &self,
+        _url: &str,
+    ) -> Result<Option<TerminologyRelation>, RestError> {
+        Ok(None)
+    }
 }
 
 /// Storage-backed [`ArtifactFetcher`] used by the real HTTP handlers.
@@ -228,6 +252,10 @@ where
             }
             Err(other) => Err(other),
         }
+    }
+
+    async fn fetch_terminology(&self, url: &str) -> Result<Option<TerminologyRelation>, RestError> {
+        super::terminology::resolve_relation(self.state, self.tenant, url).await
     }
 }
 
@@ -485,11 +513,45 @@ pub(crate) async fn build_plan(
         let artifact = match fetch_dependency(fetcher, inline, &dep.url).await {
             Ok(v) => v,
             Err(RestError::NotFound { .. }) => {
-                errors.push(RestError::NotFound {
-                    resource_type: "ViewDefinition or Library".to_string(),
-                    id: dep.url.clone(),
-                });
-                failed.insert(dep.url.clone());
+                // Not a ViewDefinition or Library: a ValueSet or ConceptMap
+                // is a terminology leaf (#1824).
+                match fetcher.fetch_terminology(&dep.url).await {
+                    Ok(Some(relation)) => {
+                        if let Some(err) = count_node(&mut resolved_nodes, max_nodes) {
+                            errors.push(err);
+                            return Err(errors);
+                        }
+                        let internal_name = next_internal_name(&mut next_internal_id);
+                        finished.insert(dep.url.clone(), internal_name.clone());
+                        nodes.push(PlanNode::Terminology {
+                            internal_name: internal_name.clone(),
+                            relation,
+                            name: dep.url.clone(),
+                        });
+                        if let Some(err) =
+                            register_label(&mut label_registry, &dep.label, &internal_name)
+                        {
+                            errors.push(err);
+                        } else {
+                            let top = stack.last_mut().expect("checked above");
+                            top.resolved_edges.push(Edge {
+                                label: dep.label.clone(),
+                                target_internal_name: internal_name,
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        errors.push(RestError::NotFound {
+                            resource_type: "ViewDefinition or Library".to_string(),
+                            id: dep.url.clone(),
+                        });
+                        failed.insert(dep.url.clone());
+                    }
+                    Err(e) => {
+                        errors.push(e);
+                        failed.insert(dep.url.clone());
+                    }
+                }
                 continue;
             }
             Err(other) => return Err(vec![other]),
@@ -702,9 +764,41 @@ pub(crate) struct ExecLimits {
 /// error, a backend statement timeout, or a lost connection while streaming
 /// a leaf ViewDefinition's rows — never that the Library or its
 /// ViewDefinitions were malformed; callers must not treat it as a client
-/// error.
+/// error. When the store reports itself unavailable ([`SofError::Unavailable`],
+/// from `run_view` or from a row), the error is instead
+/// [`SqlQueryError::SourceUnavailable`], which the REST layer answers with
+/// `503` (#2048).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan(
+    engine: InMemorySqlEngine,
+    runner: &Arc<dyn SofRunner>,
+    tenant: &TenantContext,
+    filters: &ViewFilters,
+    plan: &GraphPlan,
+    subject_sql: &str,
+    subject_bindings: &[BoundParam],
+    limits: ExecLimits,
+) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+    let materialized = AtomicUsize::new(0);
+    execute_plan_counting(
+        engine,
+        runner,
+        tenant,
+        filters,
+        plan,
+        subject_sql,
+        subject_bindings,
+        limits,
+        &materialized,
+    )
+    .await
+}
+
+/// [`execute_plan`], additionally adding to `materialized` the rows of every
+/// dependency node as it is loaded, so a caller can tell afterwards (also
+/// when the run fails) how much memory the engine held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_plan_counting(
     mut engine: InMemorySqlEngine,
     runner: &Arc<dyn SofRunner>,
     tenant: &TenantContext,
@@ -713,6 +807,7 @@ pub(crate) async fn execute_plan(
     subject_sql: &str,
     subject_bindings: &[BoundParam],
     limits: ExecLimits,
+    materialized: &AtomicUsize,
 ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
     let labels_by_target = labels_by_target(plan);
     let mut leaf_schemas: Vec<TableSchema> = Vec::new();
@@ -723,13 +818,29 @@ pub(crate) async fn execute_plan(
                 internal_name,
                 view,
             } => {
-                let schema = TableSchema::from_view_definition(view);
+                // An invalid `ansi/type` tag is a client error: name the view
+                // and column instead of silently dropping the tag.
+                let schema = TableSchema::try_from_view_definition(view).map_err(|e| {
+                    SqlQueryError::MalformedLibrary(format!(
+                        "dependency view '{}': {e}",
+                        artifact_display_name(view, internal_name)
+                    ))
+                })?;
                 engine.create_table(internal_name, &schema)?;
                 let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();
                 let row_stream = match runner.run_view(tenant, view.clone(), filters.clone()).await
                 {
                     Ok(s) => s,
+                    Err(SofError::Unavailable(message)) => {
+                        warn!(
+                            table = %internal_name,
+                            view = %view_label,
+                            error = %message,
+                            "SQL query dependency unavailable"
+                        );
+                        return Err(SqlQueryError::SourceUnavailable(message));
+                    }
                     Err(e) => {
                         warn!(
                             table = %internal_name,
@@ -742,7 +853,11 @@ pub(crate) async fn execute_plan(
                         )));
                     }
                 };
-                let row_stream = adapt_row_stream(row_stream);
+                // The engine sees row errors as bare strings; this keeps the
+                // first one the store reported as unavailable, so the engine's
+                // `SourceStream` can be turned back into a 503 below (#2048).
+                let unavailable = Arc::new(OnceLock::new());
+                let row_stream = adapt_row_stream(row_stream, Arc::clone(&unavailable));
                 let (returned_engine, inserted) = match engine
                     .insert_rows(
                         internal_name,
@@ -758,6 +873,9 @@ pub(crate) async fn execute_plan(
                         // dependency nor the setting; name both (#1473).
                         let e = match e {
                             SqlQueryError::RowCapExceeded { max } => {
+                                // The engine held `max` rows when it gave up;
+                                // count them, so a failed run is trimmed too.
+                                materialized.fetch_add(max, Ordering::Relaxed);
                                 SqlQueryError::DependencyRowCapExceeded {
                                     label: dependency_label(
                                         &labels_by_target,
@@ -770,6 +888,12 @@ pub(crate) async fn execute_plan(
                                     max,
                                 }
                             }
+                            // The row stream stopped on a store that reported
+                            // itself unavailable: transient, not a server bug.
+                            SqlQueryError::SourceStream(text) => match unavailable.get() {
+                                Some(message) => SqlQueryError::SourceUnavailable(message.clone()),
+                                None => SqlQueryError::SourceStream(text),
+                            },
                             other => other,
                         };
                         warn!(
@@ -782,6 +906,7 @@ pub(crate) async fn execute_plan(
                     }
                 };
                 engine = returned_engine;
+                materialized.fetch_add(inserted, Ordering::Relaxed);
                 let elapsed_ms = start.elapsed().as_millis();
                 debug!(
                     table = %internal_name,
@@ -810,6 +935,7 @@ pub(crate) async fn execute_plan(
                 .await?;
                 engine = returned_engine;
                 if result.rows.len() > limits.max_source_rows_per_vd {
+                    materialized.fetch_add(result.rows.len(), Ordering::Relaxed);
                     return Err(SqlQueryError::DependencyRowCapExceeded {
                         label: dependency_label(&labels_by_target, internal_name, name).to_string(),
                         kind: DependencyKind::SqlView,
@@ -818,7 +944,8 @@ pub(crate) async fn execute_plan(
                     });
                 }
                 let rows = result.rows.len();
-                engine = materialize_query_result(engine, internal_name, &result).await?;
+                materialized.fetch_add(rows, Ordering::Relaxed);
+                engine = materialize_query_result(engine, internal_name, result).await?;
                 let elapsed_ms = start.elapsed().as_millis();
                 debug!(
                     table = %internal_name,
@@ -826,6 +953,50 @@ pub(crate) async fn execute_plan(
                     elapsed_ms,
                     "materialized SQL view node"
                 );
+                engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
+            }
+            PlanNode::Terminology {
+                internal_name,
+                relation,
+                name,
+            } => {
+                let schema = relation.kind.table_schema();
+                engine.create_table(internal_name, &schema)?;
+                let rows: Vec<Result<Value, String>> =
+                    relation.rows.iter().cloned().map(Ok).collect();
+                let (returned_engine, inserted) = engine
+                    .insert_rows(
+                        internal_name,
+                        &schema,
+                        Box::pin(futures::stream::iter(rows)),
+                        limits.max_source_rows_per_vd,
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        SqlQueryError::RowCapExceeded { max } => {
+                            materialized.fetch_add(max, Ordering::Relaxed);
+                            SqlQueryError::DependencyRowCapExceeded {
+                                label: dependency_label(&labels_by_target, internal_name, name)
+                                    .to_string(),
+                                kind: match relation.kind {
+                                    TerminologyKind::ValueSet => DependencyKind::ValueSet,
+                                    TerminologyKind::ConceptMap => DependencyKind::ConceptMap,
+                                },
+                                view: name.clone(),
+                                max,
+                            }
+                        }
+                        other => other,
+                    })?;
+                engine = returned_engine;
+                materialized.fetch_add(inserted, Ordering::Relaxed);
+                debug!(
+                    table = %internal_name,
+                    dependency = %name,
+                    rows = inserted,
+                    "materialized SQL query terminology dependency"
+                );
+                leaf_schemas.push(schema);
                 engine = materialize_labels(engine, internal_name, &labels_by_target).await?;
             }
         }
@@ -943,6 +1114,7 @@ fn schema_from_query_result(result: &QueryResult) -> TableSchema {
             .map(|(name, ty)| ColumnSchema {
                 name: name.clone(),
                 fhir_type: ty.clone(),
+                ansi: None,
             })
             .collect(),
     }
@@ -950,29 +1122,36 @@ fn schema_from_query_result(result: &QueryResult) -> TableSchema {
 
 /// Materializes a [`QueryResult`] into a fresh physical table named
 /// `table_name`.
+///
+/// Takes the result by value and feeds `insert_rows` a lazy stream that moves
+/// each cell out of its row, so a second full copy of the result (one JSON
+/// object per row) never exists at once: each object is built on the insert
+/// thread just before its INSERT and dropped right after, and the source row
+/// is freed as it is consumed.
 async fn materialize_query_result(
     engine: InMemorySqlEngine,
     table_name: &str,
-    result: &QueryResult,
+    result: QueryResult,
 ) -> Result<InMemorySqlEngine, SqlQueryError> {
-    let schema = schema_from_query_result(result);
+    let schema = schema_from_query_result(&result);
     engine.create_table(table_name, &schema)?;
-    let rows: Vec<Result<Value, String>> = result
-        .rows
-        .iter()
-        .map(|row| {
-            let mut obj = serde_json::Map::new();
-            for (i, col) in result.columns.iter().enumerate() {
-                let v = row.get(i).cloned().flatten().unwrap_or(Value::Null);
-                obj.insert(col.clone(), v);
-            }
-            Ok(Value::Object(obj))
-        })
-        .collect();
     let cap = result.rows.len();
-    let stream = futures::stream::iter(rows);
+    let columns = result.columns;
+    let rows = result.rows.into_iter().map(move |row| {
+        let mut cells = row.into_iter();
+        let mut obj = serde_json::Map::with_capacity(columns.len());
+        for col in &columns {
+            obj.insert(col.clone(), cells.next().flatten().unwrap_or(Value::Null));
+        }
+        Ok(Value::Object(obj))
+    });
     let (returned_engine, _inserted) = engine
-        .insert_rows(table_name, &schema, Box::pin(stream), cap)
+        .insert_rows(
+            table_name,
+            &schema,
+            Box::pin(futures::stream::iter(rows)),
+            cap,
+        )
         .await?;
     Ok(returned_engine)
 }
@@ -1012,9 +1191,26 @@ async fn run_select_with_timeout(
 /// Converts a `RowStream<Result<Value, SofError>>` into a
 /// `Stream<Item = Result<Value, String>>` for the engine (it doesn't know the
 /// persistence crate's error type).
-fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, String>> + Send {
+///
+/// The conversion loses the error's kind, so the first [`SofError::Unavailable`]
+/// the stream yields is also recorded in `unavailable`: the caller reads it
+/// after the engine fails with `SourceStream`, to tell a store outage from a
+/// server fault (#2048). The engine stops at the first row error, so that
+/// error is the one it reports.
+fn adapt_row_stream(
+    stream: RowStream,
+    unavailable: Arc<OnceLock<String>>,
+) -> impl Stream<Item = Result<Value, String>> + Send {
     use futures::StreamExt;
-    stream.map(|r| r.map_err(|e| e.to_string()))
+    stream.map(move |r| {
+        r.map_err(|e| {
+            if let SofError::Unavailable(message) = &e {
+                // Only the first is kept: a later `set` finds the slot full.
+                let _ = unavailable.set(message.clone());
+            }
+            e.to_string()
+        })
+    })
 }
 
 // ============================================================================
@@ -1023,7 +1219,6 @@ fn adapt_row_stream(stream: RowStream) -> impl Stream<Item = Result<Value, Strin
 
 #[cfg(test)]
 mod tests {
-    use helios_persistence::core::sof_runner::SofError;
     use helios_persistence::tenant::{TenantId, TenantPermissions};
 
     use super::*;
@@ -1704,7 +1899,7 @@ mod tests {
             .iter()
             .filter_map(|n| match n {
                 PlanNode::SqlView { name, .. } => Some(name.as_str()),
-                PlanNode::Leaf { .. } => None,
+                _ => None,
             })
             .collect();
         assert_eq!(names, vec!["female_patients", unnamed_url]);
@@ -1789,6 +1984,75 @@ mod tests {
         }
     }
 
+    async fn run_plan_counting(
+        runner_rows: usize,
+        limits: ExecLimits,
+        plan: &GraphPlan,
+        subject_sql: &str,
+        materialized: &AtomicUsize,
+    ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+        let runner: Arc<dyn SofRunner> = Arc::new(RowsRunner { rows: runner_rows });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        execute_plan_counting(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            plan,
+            subject_sql,
+            &[],
+            limits,
+            materialized,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_run_that_fails_on_the_row_cap_still_counts_its_rows_for_the_trim() {
+        use crate::memory_trim::{TRIM_AFTER_ROWS, should_trim_after_rows};
+        // ViewDefinition dependency: the cap is hit with `cap` rows loaded.
+        let cap = TRIM_AFTER_ROWS;
+        let counted = AtomicUsize::new(0);
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        run_plan_counting(
+            cap + 10,
+            limits(cap, 1000),
+            &plan,
+            "SELECT * FROM obs",
+            &counted,
+        )
+        .await
+        .err()
+        .expect("the dependency exceeds its cap");
+        let n = counted.load(Ordering::Relaxed);
+        assert_eq!(n, cap);
+        assert!(should_trim_after_rows(n));
+
+        // SQLView: the over-cap result is counted before the error returns.
+        let plan = GraphPlan {
+            nodes: vec![
+                PlanNode::Leaf {
+                    internal_name: "__sof_node_0".to_string(),
+                    view: named_view_definition("patients"),
+                },
+                PlanNode::SqlView {
+                    internal_name: "__sof_node_1".to_string(),
+                    sql: "SELECT a.id FROM base a, base b".to_string(),
+                    edges: vec![edge("base", "__sof_node_0")],
+                    name: "pairs".to_string(),
+                },
+            ],
+            subject_edges: vec![edge("pairs_t", "__sof_node_1")],
+        };
+        let counted = AtomicUsize::new(0);
+        run_plan_counting(3, limits(5, 1000), &plan, "SELECT * FROM pairs_t", &counted)
+            .await
+            .err()
+            .expect("the 9-row SQLView exceeds the cap");
+        // 3 leaf rows, then the cap + 1 rows the SQLView query was allowed.
+        assert_eq!(counted.load(Ordering::Relaxed), 3 + 6);
+    }
+
     #[tokio::test]
     async fn leaf_dependency_over_the_cap_names_label_view_cap_and_setting() {
         let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
@@ -1829,6 +2093,229 @@ mod tests {
             .await
             .expect("a dependency of exactly the cap must run");
         assert_eq!(result.rows.len(), 3);
+    }
+
+    /// A [`MapFetcher`] that also answers terminology dependencies (#1824).
+    struct TerminologyFetcher {
+        artifacts: MapFetcher,
+        terminology: HashMap<String, TerminologyRelation>,
+    }
+
+    #[async_trait]
+    impl ArtifactFetcher for TerminologyFetcher {
+        async fn fetch(&self, url: &str) -> Result<Value, RestError> {
+            self.artifacts.fetch(url).await
+        }
+
+        async fn fetch_terminology(
+            &self,
+            url: &str,
+        ) -> Result<Option<TerminologyRelation>, RestError> {
+            Ok(self.terminology.get(url).cloned())
+        }
+    }
+
+    fn value_set_relation(codes: &[&str]) -> TerminologyRelation {
+        TerminologyRelation {
+            kind: TerminologyKind::ValueSet,
+            rows: codes
+                .iter()
+                .map(|c| {
+                    json!({"system": "http://s", "version": null, "code": c,
+                           "display": null, "inactive": null})
+                })
+                .collect(),
+        }
+    }
+
+    /// A ValueSet dependency is a leaf whose label joins like any table: the
+    /// spec's semi-join example shape.
+    #[tokio::test]
+    async fn value_set_dependency_is_joinable_by_label() {
+        let vd_url = "http://example.org/patients";
+        let vs_url = "http://example.org/vs";
+        let fetcher = TerminologyFetcher {
+            artifacts: MapFetcher(HashMap::from([(
+                vd_url.to_string(),
+                view_definition(vd_url),
+            )])),
+            terminology: HashMap::from([(vs_url.to_string(), value_set_relation(&["p1", "p3"]))]),
+        };
+        let deps = vec![depends_on("pts", vd_url), depends_on("cardio", vs_url)];
+        let plan = build_plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect("plan should resolve");
+        assert!(
+            plan.nodes
+                .iter()
+                .any(|n| matches!(n, PlanNode::Terminology { name, .. } if name == vs_url))
+        );
+
+        let (result, _) = run_plan(
+            5,
+            limits(100, 100),
+            &plan,
+            "SELECT p.id FROM pts p WHERE EXISTS \
+             (SELECT 1 FROM cardio c WHERE c.code = p.id) ORDER BY p.id",
+        )
+        .await
+        .expect("query should run");
+        assert_eq!(
+            result.rows,
+            vec![vec![Some(json!("p1"))], vec![Some(json!("p3"))]]
+        );
+    }
+
+    /// A dependency that is neither a view nor terminology is still a 404.
+    #[tokio::test]
+    async fn unknown_dependency_is_still_not_found() {
+        let fetcher = TerminologyFetcher {
+            artifacts: MapFetcher(HashMap::new()),
+            terminology: HashMap::new(),
+        };
+        let deps = vec![depends_on("x", "http://example.org/nothing")];
+        let errors = build_plan(&fetcher, &[], subject_node(&deps))
+            .await
+            .expect_err("unresolvable");
+        assert!(matches!(errors.as_slice(), [RestError::NotFound { .. }]));
+    }
+
+    #[tokio::test]
+    async fn terminology_dependency_over_the_cap_names_its_kind() {
+        let plan = GraphPlan {
+            nodes: vec![PlanNode::Terminology {
+                internal_name: "__sof_node_0".to_string(),
+                relation: value_set_relation(&["a", "b", "c"]),
+                name: "http://example.org/vs".to_string(),
+            }],
+            subject_edges: vec![edge("vs", "__sof_node_0")],
+        };
+        let err = run_plan(0, limits(2, 100), &plan, "SELECT * FROM vs")
+            .await
+            .err()
+            .expect("3 rows exceed a cap of 2");
+        assert!(matches!(
+            err,
+            SqlQueryError::DependencyRowCapExceeded {
+                kind: DependencyKind::ValueSet,
+                ..
+            }
+        ));
+    }
+
+    /// How a [`FailingStoreRunner`]'s store fails.
+    #[derive(Clone, Copy)]
+    enum StoreFailure {
+        /// `run_view` itself returns `SofError::Unavailable`.
+        UnavailableAtStart,
+        /// One good row, then an `Unavailable` row error.
+        UnavailableMidStream,
+        /// One good row, then a `Storage` row error (a server fault).
+        StorageMidStream,
+        /// `run_view` itself returns `SofError::Backend` (a server fault).
+        BackendAtStart,
+    }
+
+    /// A `SofRunner` whose store fails the way `failure` says.
+    struct FailingStoreRunner {
+        failure: StoreFailure,
+    }
+
+    const UNAVAILABLE_TEXT: &str = "failed to read object body after 3 attempts: connection reset";
+
+    #[async_trait]
+    impl SofRunner for FailingStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let rows = match self.failure {
+                StoreFailure::UnavailableAtStart => {
+                    return Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string()));
+                }
+                StoreFailure::BackendAtStart => {
+                    return Err(SofError::Backend("connection refused".to_string()));
+                }
+                StoreFailure::UnavailableMidStream => vec![
+                    Ok(json!({"id": "p0"})),
+                    Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string())),
+                ],
+                StoreFailure::StorageMidStream => vec![
+                    Ok(json!({"id": "p0"})),
+                    Err(SofError::Storage("bucket unreachable".to_string())),
+                ],
+            };
+            Ok(Box::pin(futures::stream::iter(rows)))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "failing-store-test-runner"
+        }
+    }
+
+    async fn run_plan_over_failing_store(failure: StoreFailure) -> SqlQueryError {
+        let runner: Arc<dyn SofRunner> = Arc::new(FailingStoreRunner { failure });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            &plan,
+            "SELECT * FROM obs",
+            &[],
+            limits(1000, 1000),
+        )
+        .await
+        .err()
+        .expect("a failing store must fail the plan")
+    }
+
+    /// #2048: a store that is unavailable keeps that fact through the plan, so
+    /// a SQL Query run answers 503 like a ViewDefinition run, whether the store
+    /// fails when the dependency starts or partway through its rows.
+    #[tokio::test]
+    async fn an_unavailable_store_is_a_503() {
+        for failure in [
+            StoreFailure::UnavailableAtStart,
+            StoreFailure::UnavailableMidStream,
+        ] {
+            let err = run_plan_over_failing_store(failure).await;
+            let SqlQueryError::SourceUnavailable(message) = &err else {
+                panic!("expected SourceUnavailable, got {err:?}");
+            };
+            assert_eq!(message, UNAVAILABLE_TEXT);
+
+            let rest = sqlquery_err_to_rest(err);
+            assert!(
+                matches!(rest, RestError::ServiceUnavailable { .. }),
+                "got {rest:?}"
+            );
+            assert_eq!(
+                rest.client_response().0,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
+
+    /// Only an unavailable store is a 503: any other source failure is still a
+    /// server fault (500), at the start of the dependency or partway through.
+    #[tokio::test]
+    async fn other_store_failures_stay_source_stream() {
+        for failure in [StoreFailure::StorageMidStream, StoreFailure::BackendAtStart] {
+            let err = run_plan_over_failing_store(failure).await;
+            assert!(
+                matches!(err, SqlQueryError::SourceStream(_)),
+                "expected SourceStream, got {err:?}"
+            );
+            assert_eq!(
+                sqlquery_err_to_rest(err).client_response().0,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
     }
 
     /// A node reached under two labels is named by the alphabetically first,
@@ -1896,6 +2383,52 @@ mod tests {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
         assert!(!text.contains("(ViewDefinition pairs)"), "{text}");
+    }
+
+    /// The SQLView node table is fed by moving the result's cells, so the
+    /// values and their SQLite storage classes must match the result's:
+    /// a column whose first value is NULL and a column mixing integers and
+    /// text keep the same `typeof()` per row, and no row is lost.
+    #[tokio::test]
+    async fn sqlview_node_keeps_cell_values_and_storage_classes() {
+        let plan = GraphPlan {
+            nodes: vec![
+                PlanNode::Leaf {
+                    internal_name: "__sof_node_0".to_string(),
+                    view: named_view_definition("patients"),
+                },
+                PlanNode::SqlView {
+                    internal_name: "__sof_node_1".to_string(),
+                    sql: "SELECT CASE WHEN id = 'p0' THEN NULL ELSE 7 END AS n, \
+                          CASE WHEN id IN ('p0', 'p1') THEN 1 ELSE 'x' END AS m, \
+                          id FROM base"
+                        .to_string(),
+                    edges: vec![edge("base", "__sof_node_0")],
+                    name: "mixed".to_string(),
+                },
+            ],
+            subject_edges: vec![edge("mixed_t", "__sof_node_1")],
+        };
+        let (result, _) = run_plan(
+            6,
+            limits(100, 100),
+            &plan,
+            "SELECT typeof(n), typeof(m), COUNT(*) FROM mixed_t GROUP BY 1, 2 ORDER BY 1, 2",
+        )
+        .await
+        .expect("the SQLView node must materialize");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Some(json!("integer")),
+                    Some(json!("integer")),
+                    Some(json!(1))
+                ],
+                vec![Some(json!("integer")), Some(json!("text")), Some(json!(4))],
+                vec![Some(json!("null")), Some(json!("integer")), Some(json!(1))],
+            ]
+        );
     }
 
     /// The subject's own result is not a dependency: it is silently

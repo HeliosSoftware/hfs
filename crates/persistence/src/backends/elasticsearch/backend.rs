@@ -72,7 +72,10 @@ impl std::fmt::Display for WriteRefreshPolicy {
 }
 
 /// Authentication configuration for Elasticsearch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the password and token never reach a log line
+/// (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub enum ElasticsearchAuth {
     /// Basic username/password authentication.
     Basic {
@@ -89,7 +92,11 @@ pub enum ElasticsearchAuth {
 }
 
 /// Configuration for the Elasticsearch backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written: node URLs are printed without userinfo, query or
+/// fragment, and `auth` through [`ElasticsearchAuth`]'s redacting `Debug`
+/// (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ElasticsearchConfig {
     /// Elasticsearch node URLs (e.g., `["http://localhost:9200"]`).
     /// Currently uses the first node (single-node connection pool).
@@ -245,6 +252,77 @@ fn default_bulk_concurrency() -> usize {
     DEFAULT_BULK_CONCURRENCY
 }
 
+impl Debug for ElasticsearchAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ElasticsearchAuth::Basic {
+                username,
+                password: _,
+            } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"[redacted]")
+                .finish(),
+            ElasticsearchAuth::Bearer { token: _ } => f
+                .debug_struct("Bearer")
+                .field("token", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
+impl Debug for ElasticsearchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            nodes,
+            index_prefix,
+            number_of_shards,
+            number_of_replicas,
+            refresh_interval,
+            write_refresh,
+            max_result_window,
+            max_terms_count,
+            nested_objects_limit,
+            request_timeout_ms,
+            bulk_max_bytes,
+            bulk_concurrency,
+            reindex_refresh,
+            reindex_prepare_threads,
+            auth,
+            disable_certificate_validation,
+            fhir_version,
+        } = self;
+        let nodes: Vec<String> = nodes
+            .iter()
+            .map(|node| crate::core::backend::redact_connection_string(node))
+            .collect();
+        f.debug_struct("ElasticsearchConfig")
+            .field("nodes", &nodes)
+            .field("index_prefix", index_prefix)
+            .field("number_of_shards", number_of_shards)
+            .field("number_of_replicas", number_of_replicas)
+            .field("refresh_interval", refresh_interval)
+            .field("write_refresh", write_refresh)
+            .field("max_result_window", max_result_window)
+            .field("max_terms_count", max_terms_count)
+            .field("nested_objects_limit", nested_objects_limit)
+            .field("request_timeout_ms", request_timeout_ms)
+            .field("bulk_max_bytes", bulk_max_bytes)
+            .field("bulk_concurrency", bulk_concurrency)
+            .field("reindex_refresh", reindex_refresh)
+            .field("reindex_prepare_threads", reindex_prepare_threads)
+            .field("auth", auth)
+            .field(
+                "disable_certificate_validation",
+                disable_certificate_validation,
+            )
+            .field("fhir_version", fhir_version)
+            .finish()
+    }
+}
+
 impl Default for ElasticsearchConfig {
     fn default() -> Self {
         Self {
@@ -266,6 +344,53 @@ impl Default for ElasticsearchConfig {
             disable_certificate_validation: false,
             fhir_version: FhirVersion::default_enabled(),
         }
+    }
+}
+
+/// An Elasticsearch `index.refresh_interval`, once read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshInterval {
+    /// `-1`: no periodic refresh. A `wait_for` write then blocks until
+    /// something else refreshes the index.
+    Disabled,
+    /// Refresh every so often.
+    Every(std::time::Duration),
+}
+
+/// Reads an Elasticsearch time value such as `1s`, `500ms` or `-1`.
+///
+/// Accepts `-1` (disabled), `0`, and a whole number followed by one of
+/// `nanos`, `micros`, `ms`, `s`, `m`, `h` or `d`. Anything else, including a
+/// fractional number, is `None`. This does not validate the setting:
+/// Elasticsearch still rejects an invalid value when it is applied.
+pub fn parse_refresh_interval(value: &str) -> Option<RefreshInterval> {
+    let value = value.trim();
+    match value {
+        "-1" => return Some(RefreshInterval::Disabled),
+        "0" => return Some(RefreshInterval::Every(std::time::Duration::ZERO)),
+        _ => {}
+    }
+    let split = value.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, unit) = value.split_at(split);
+    let amount: u64 = digits.parse().ok()?;
+    let duration = match unit {
+        "nanos" => std::time::Duration::from_nanos(amount),
+        "micros" => std::time::Duration::from_micros(amount),
+        "ms" => std::time::Duration::from_millis(amount),
+        "s" => std::time::Duration::from_secs(amount),
+        "m" => std::time::Duration::from_secs(amount.checked_mul(60)?),
+        "h" => std::time::Duration::from_secs(amount.checked_mul(3_600)?),
+        "d" => std::time::Duration::from_secs(amount.checked_mul(86_400)?),
+        _ => return None,
+    };
+    Some(RefreshInterval::Every(duration))
+}
+
+impl ElasticsearchConfig {
+    /// [`Self::refresh_interval`] as a [`RefreshInterval`], or `None` when it
+    /// is not a time value this crate understands.
+    pub fn refresh_interval_parsed(&self) -> Option<RefreshInterval> {
+        parse_refresh_interval(&self.refresh_interval)
     }
 }
 
@@ -415,6 +540,37 @@ impl ElasticsearchBackend {
         })
     }
 
+    /// Builds the backend like [`Self::with_shared_registry`] and runs its
+    /// startup initialization (index template, nested-object limit, mapping
+    /// reconcile) once, so existing indices are current before the first
+    /// request and the reindex warning is logged once per pass, not once per
+    /// index.
+    ///
+    /// Initialization never fails the start. A step that fails on a cluster
+    /// that answers is logged on its own and the other steps still run (see
+    /// [`Backend::initialize`]). A cluster that does not answer at all is
+    /// logged once, after at most one request timeout
+    /// ([`ElasticsearchConfig::request_timeout_ms`]; a refused connection
+    /// fails at once), and the server starts anyway: each index is then
+    /// reconciled on its first write (`ensure_index`), with the reindex
+    /// warning per index, and the nested-object limit of existing indices is
+    /// raised at the next start.
+    pub async fn start_with_shared_registry(
+        config: ElasticsearchConfig,
+        registries: Arc<TenantSearchRegistries>,
+    ) -> StorageResult<Self> {
+        let backend = Self::with_shared_registry(config, registries)?;
+        if let Err(e) = Backend::initialize(&backend).await {
+            tracing::warn!(
+                error = %e,
+                "Elasticsearch startup initialization failed; index mappings will be \
+                 reconciled lazily on first write, and the nested-object limit of \
+                 existing indices is raised at the next start"
+            );
+        }
+        Ok(backend)
+    }
+
     /// Builds the Elasticsearch client from configuration.
     fn build_client(config: &ElasticsearchConfig) -> StorageResult<Elasticsearch> {
         let url = config
@@ -502,6 +658,18 @@ impl ElasticsearchBackend {
             0 => usize::MAX,
             bytes => bytes,
         }
+    }
+
+    /// Sets the configured `refresh_interval` on every existing index under
+    /// the index prefix that has a different one, and returns how many
+    /// indices changed.
+    ///
+    /// The interval is part of the settings each index is created with, so an
+    /// index created under an earlier value keeps it until this runs. It
+    /// overwrites a value an operator set by hand on any index matching
+    /// `{index_prefix}_*`.
+    pub async fn apply_refresh_interval(&self) -> crate::error::StorageResult<usize> {
+        super::schema::apply_refresh_interval(self).await
     }
 
     /// The client's per-request timeout, as configured.
@@ -728,15 +896,50 @@ impl Backend for ElasticsearchBackend {
         Ok(())
     }
 
+    /// Writes the index template, raises the nested-object limit of existing
+    /// indices, and reconciles their mappings with `SCHEMA_VERSION`.
+    ///
+    /// Fails only when the cluster does not answer at all; then nothing else
+    /// is attempted. Otherwise each step is attempted even when another fails,
+    /// and each failure is logged where it happens.
     async fn initialize(&self) -> Result<(), BackendError> {
-        // Create index template for automatic index creation
-        super::schema::create_index_template(self)
+        // The steps below are independent, so each is tried even when the one
+        // before it failed. On a cluster that never answers, that would wait
+        // out the request timeout once per step, so whether it answers is
+        // asked once, first. Any HTTP status is an answer (a `401`, a `403`, a
+        // proxy's `404`); only a transport failure — refused, unreachable,
+        // timed out — stops here.
+        self.client
+            .ping()
+            .send()
             .await
-            .map_err(|e| BackendError::Internal {
+            .map_err(|e| BackendError::Unavailable {
                 backend_name: "elasticsearch".to_string(),
-                message: format!("Failed to create index template: {}", e),
-                source: None,
+                message: if e.is_timeout() {
+                    format!(
+                        "the cluster did not answer within the {} ms request timeout: {e}",
+                        self.config.request_timeout_ms
+                    )
+                } else {
+                    format!("the cluster did not answer: {e}")
+                },
             })?;
+
+        // The template matters only for indices created from now on, and only
+        // as a net: HFS creates its own indices with the full mapping
+        // (`ensure_index`). The two steps after it act on indices that already
+        // exist, so a template the cluster refuses (an HFS user without the
+        // `manage_index_templates` cluster privilege, say) is logged and does
+        // not skip them. It used to, and the existing indices then kept their
+        // old mapping and nested-object limit for the life of the process.
+        if let Err(e) = super::schema::create_index_template(self).await {
+            tracing::warn!(
+                error = %e,
+                "could not create the Elasticsearch index template; carrying on with the \
+                 existing indices. HFS creates its own indices with the current mapping, so \
+                 only an index Elasticsearch auto-creates misses it"
+            );
+        }
 
         // The template only reaches indices created from now on. Indices that
         // already exist keep Elasticsearch's 10000 nested-object limit until
@@ -756,6 +959,26 @@ impl Backend for ElasticsearchBackend {
                 limit,
                 "could not raise the Elasticsearch nested-object limit on existing indices; \
                  resources with more nested values than an index's current limit stay unsearchable"
+            ),
+        }
+
+        // `refresh_interval` is dynamic and, like the limit above, set only at
+        // creation (#1749): an index made under another value keeps it, and
+        // with `wait_for` writes that value is what every write waits out.
+        // Not fatal either.
+        let interval = self.config().refresh_interval.as_str();
+        match self.apply_refresh_interval().await {
+            Ok(0) => {}
+            Ok(changed) => tracing::info!(
+                indices = changed,
+                refresh_interval = interval,
+                "set the Elasticsearch refresh interval on existing indices"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                refresh_interval = interval,
+                "could not set the Elasticsearch refresh interval on existing indices; \
+                 they keep the one they were created with"
             ),
         }
 
@@ -926,7 +1149,248 @@ impl ElasticsearchBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_debug_redacts_password_and_token() {
+        let basic = ElasticsearchAuth::Basic {
+            username: "elastic".to_string(),
+            password: "es-s3cret-pw".to_string(),
+        };
+        let out = format!("{basic:?}");
+        assert!(!out.contains("es-s3cret-pw"), "password leaked: {out}");
+        assert!(out.contains("elastic"), "{out}");
+
+        let bearer = ElasticsearchAuth::Bearer {
+            token: "es-bearer-tok".to_string(),
+        };
+        let out = format!("{bearer:?}");
+        assert!(!out.contains("es-bearer-tok"), "token leaked: {out}");
+        assert!(out.contains("Bearer"), "{out}");
+    }
+
+    #[test]
+    fn config_debug_redacts_node_userinfo_and_auth() {
+        let config = ElasticsearchConfig {
+            nodes: vec!["https://user:node-s3cret@es.internal:9200/?token=q-s3cret".to_string()],
+            auth: Some(ElasticsearchAuth::Bearer {
+                token: "es-bearer-tok".to_string(),
+            }),
+            ..Default::default()
+        };
+        let out = format!("{config:?}");
+        for secret in ["node-s3cret", "q-s3cret", "es-bearer-tok"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("es.internal"), "{out}");
+        assert!(out.contains("index_prefix"), "{out}");
+    }
     use serde_json::json;
+
+    /// An unreachable cluster must not stop the server from starting.
+    #[tokio::test]
+    async fn startup_constructor_survives_an_unreachable_cluster() {
+        let config = ElasticsearchConfig {
+            nodes: vec!["http://127.0.0.1:1".to_string()],
+            request_timeout_ms: 500,
+            ..Default::default()
+        };
+        let started = ElasticsearchBackend::start_with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .await;
+        assert!(started.is_ok());
+    }
+
+    /// A node that accepts connections and never answers (hung, or behind a
+    /// proxy that holds the request) costs the start one request timeout, not
+    /// one per initialization step: the reachability check is the only request
+    /// it is sent (#1506).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn an_unresponsive_cluster_costs_one_request_timeout_not_one_per_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let holder = tokio::spawn(async move {
+            // Held open and never answered.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{address}")],
+            request_timeout_ms: 300,
+            ..Default::default()
+        };
+        let started = ElasticsearchBackend::start_with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .await;
+        holder.abort();
+
+        assert!(
+            started.is_ok(),
+            "an unresponsive cluster must not fail the start"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "one request timed out, not one per initialization step"
+        );
+        logs_assert(|lines: &[&str]| {
+            let failed: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("WARN") && l.contains("startup initialization failed"))
+                .collect();
+            assert_eq!(failed.len(), 1, "{lines:?}");
+            assert!(
+                failed[0].contains("did not answer within the 300 ms request timeout"),
+                "{}",
+                failed[0]
+            );
+            Ok(())
+        });
+    }
+
+    /// A template the cluster refuses (a `403` for an HFS user without the
+    /// `manage_index_templates` cluster privilege) is logged, and the
+    /// nested-object limit and the mapping reconcile of the existing indices
+    /// still run, with the one reindex warning of the pass (#1506). It used to
+    /// end initialization, leaving every existing index on its old mapping and
+    /// limit until each was reconciled on its first write, with a warning each.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_refused_template_does_not_skip_the_nested_limit_or_the_reconcile() {
+        use crate::backends::elasticsearch::SCHEMA_VERSION_META_KEY;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let acknowledged =
+            || ResponseTemplate::new(200).set_body_json(json!({ "acknowledged": true }));
+        let stub = |http_method: &'static str, url_path: &'static str, answer: ResponseTemplate| {
+            Mock::given(method(http_method))
+                .and(path(url_path))
+                .respond_with(answer)
+        };
+        // `HEAD /` is not stubbed: wiremock's `404` is an answer like any other.
+        stub(
+            "PUT",
+            "/_template/hfs_template",
+            ResponseTemplate::new(403).set_body_json(json!({
+                "error": {
+                    "type": "security_exception",
+                    "reason": "action [indices:admin/template/put] is unauthorized"
+                },
+                "status": 403
+            })),
+        )
+        .mount(&server)
+        .await;
+        stub(
+            "GET",
+            "/hfs_*/_settings/index.mapping.nested_objects.limit",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "hfs_t_patient": {
+                    "settings": {},
+                    "defaults": { "index.mapping.nested_objects.limit": "10000" }
+                }
+            })),
+        )
+        .mount(&server)
+        .await;
+        stub("PUT", "/hfs_t_patient/_settings", acknowledged())
+            .mount(&server)
+            .await;
+        stub(
+            "GET",
+            "/hfs_*/_mapping",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "hfs_t_patient": { "mappings": {
+                    "_meta": { SCHEMA_VERSION_META_KEY: 1 },
+                    "properties": { "resource_type": { "type": "keyword" } }
+                } }
+            })),
+        )
+        .mount(&server)
+        .await;
+        stub("PUT", "/hfs_t_patient/_mapping", acknowledged())
+            .mount(&server)
+            .await;
+        stub(
+            "GET",
+            "/hfs_t_patient/_stats/docs",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "indices": { "hfs_t_patient": { "primaries": { "docs": { "count": 3 } } } }
+            })),
+        )
+        .mount(&server)
+        .await;
+
+        let config = ElasticsearchConfig {
+            nodes: vec![server.uri()],
+            request_timeout_ms: 2_000,
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::start_with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .await
+        .expect("a refused template must not fail the start");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is on");
+        let sent = |http_method: &str, url_path: &str| {
+            requests
+                .iter()
+                .filter(|r| r.method.as_str() == http_method && r.url.path() == url_path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sent("PUT", "/_template/hfs_template").len(), 1);
+        let raised = sent("PUT", "/hfs_t_patient/_settings");
+        assert_eq!(raised.len(), 1, "the nested-object limit is still raised");
+        let body: Value = serde_json::from_slice(&raised[0].body).expect("settings body");
+        assert_eq!(body["index.mapping.nested_objects.limit"], json!(50_000));
+        assert_eq!(
+            sent("PUT", "/hfs_t_patient/_mapping").len(),
+            1,
+            "the mapping is still reconciled"
+        );
+        assert!(
+            backend.is_schema_checked("hfs_t_patient"),
+            "the write path must not reconcile, nor warn about, the index again"
+        );
+
+        logs_assert(|lines: &[&str]| {
+            let warnings = |needle: &str| {
+                lines
+                    .iter()
+                    .filter(|l| l.contains("WARN") && l.contains(needle))
+                    .count()
+            };
+            assert_eq!(
+                warnings("could not create the Elasticsearch index template"),
+                1,
+                "{lines:?}"
+            );
+            assert_eq!(warnings("before #1391"), 1, "one per pass: {lines:?}");
+            assert_eq!(warnings("startup initialization failed"), 0, "{lines:?}");
+            Ok(())
+        });
+    }
 
     #[test]
     fn missing_is_not_advertised_for_composite_or_special_parameters() {
@@ -947,6 +1411,78 @@ mod tests {
         assert_eq!(config.request_timeout_ms, 30_000);
         assert_eq!(config.bulk_max_bytes, DEFAULT_BULK_MAX_BYTES);
         assert_eq!(config.reindex_refresh, None);
+        assert_eq!(config.refresh_interval, "1s");
+    }
+
+    /// Elasticsearch time values, as the `refresh_interval` setting takes them.
+    #[test]
+    fn parse_refresh_interval_reads_elasticsearch_time_values() {
+        use std::time::Duration;
+        let every = |d| Some(RefreshInterval::Every(d));
+        assert_eq!(
+            parse_refresh_interval("-1"),
+            Some(RefreshInterval::Disabled)
+        );
+        assert_eq!(parse_refresh_interval("0"), every(Duration::ZERO));
+        assert_eq!(parse_refresh_interval("1s"), every(Duration::from_secs(1)));
+        assert_eq!(
+            parse_refresh_interval(" 30s "),
+            every(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_refresh_interval("200ms"),
+            every(Duration::from_millis(200))
+        );
+        assert_eq!(
+            parse_refresh_interval("1000ms"),
+            parse_refresh_interval("1s")
+        );
+        assert_eq!(
+            parse_refresh_interval("500micros"),
+            every(Duration::from_micros(500))
+        );
+        assert_eq!(
+            parse_refresh_interval("7nanos"),
+            every(Duration::from_nanos(7))
+        );
+        assert_eq!(
+            parse_refresh_interval("2m"),
+            every(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_refresh_interval("1h"),
+            every(Duration::from_secs(3_600))
+        );
+        assert_eq!(
+            parse_refresh_interval("1d"),
+            every(Duration::from_secs(86_400))
+        );
+
+        for bad in ["", "s", "1", "1x", "1.5s", "-2", "-1s", "1 s", "abc", "30S"] {
+            assert_eq!(parse_refresh_interval(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            parse_refresh_interval(&format!("{}d", u64::MAX)),
+            None,
+            "an overflowing amount is not a value"
+        );
+    }
+
+    #[test]
+    fn config_exposes_its_parsed_refresh_interval() {
+        let config = ElasticsearchConfig {
+            refresh_interval: "30s".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.refresh_interval_parsed(),
+            Some(RefreshInterval::Every(std::time::Duration::from_secs(30)))
+        );
+        let config = ElasticsearchConfig {
+            refresh_interval: "soon".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.refresh_interval_parsed(), None);
     }
 
     /// A rebuild follows the ordinary write policy unless it is given its
@@ -1060,7 +1596,9 @@ mod tests {
         assert!(backend.supports(BackendCapability::Sorting));
         assert!(!backend.supports(BackendCapability::Transactions));
         // Chained/`_has` search resolves via the backend-agnostic resolver over
-        // ES's `search()` (which honours `_id`), so ES declares it.
+        // ES's `search()` (which honours `_id`), so ES declares it. A `_has`
+        // hop reads its reference values in one aggregation
+        // (`search_reference_values`) instead of paging every source document.
         assert!(backend.supports(BackendCapability::ChainedSearch));
         assert!(backend.supports(BackendCapability::ReverseChaining));
         // No history/versioning on ES, and never a tenancy topology beyond

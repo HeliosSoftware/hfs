@@ -12,6 +12,7 @@ use std::fmt;
 use std::path::Path;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use helios_persistence::core::database_url::redact_database_url;
 
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
 
@@ -41,7 +42,8 @@ pub enum Command {
 // ── Server config ─────────────────────────────────────────────────────────────
 
 /// Configuration for the Helios Terminology Server HTTP server.
-#[derive(Parser, Debug, Clone)]
+// `Debug` is hand-written below: it redacts `database_url` (#2149).
+#[derive(Parser, Clone)]
 pub struct HtsConfig {
     /// Server port
     #[arg(long, env = "HTS_SERVER_PORT", default_value = "8090")]
@@ -56,7 +58,12 @@ pub struct HtsConfig {
     pub log_level: String,
 
     /// Database URL (SQLite file path or PostgreSQL connection string)
-    #[arg(long, env = "HTS_DATABASE_URL", default_value = "./data/hts.db")]
+    #[arg(
+        long,
+        env = "HTS_DATABASE_URL",
+        default_value = "./data/hts.db",
+        hide_env_values = true
+    )]
     pub database_url: String,
 
     /// Storage backend (sqlite | postgres)
@@ -122,6 +129,47 @@ pub struct HtsConfig {
     /// convenience, not part of the FHIR contract.
     #[arg(long, env = "HTS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
+}
+
+/// Prints `database_url` without credentials or connection options (#2149).
+/// Destructures every field, so a new field fails to compile until it is
+/// listed here.
+impl fmt::Debug for HtsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            port,
+            host,
+            log_level,
+            database_url,
+            storage_backend,
+            enable_cors,
+            cors_origins,
+            max_body_size,
+            max_expansion_size,
+            bootstrap_dir,
+            bootstrap_batch_size,
+            import_languages,
+            ui_enabled,
+        } = self;
+        f.debug_struct("HtsConfig")
+            .field("port", port)
+            .field("host", host)
+            .field("log_level", log_level)
+            .field(
+                "database_url",
+                &redact_database_url(database_url, storage_backend),
+            )
+            .field("storage_backend", storage_backend)
+            .field("enable_cors", enable_cors)
+            .field("cors_origins", cors_origins)
+            .field("max_body_size", max_body_size)
+            .field("max_expansion_size", max_expansion_size)
+            .field("bootstrap_dir", bootstrap_dir)
+            .field("bootstrap_batch_size", bootstrap_batch_size)
+            .field("import_languages", import_languages)
+            .field("ui_enabled", ui_enabled)
+            .finish()
+    }
 }
 
 impl HtsConfig {
@@ -297,7 +345,7 @@ fn detect_zip_format(path: &Path) -> Option<ImportFormat> {
         let Ok(entry) = zip.by_index(i) else {
             continue; // skip unreadable entries (zip64, encoding issues, etc.)
         };
-        let entry_name = entry.name().to_lowercase();
+        let entry_name = entry.name().map(|n| n.to_lowercase()).unwrap_or_default();
         if entry_name.contains("concept_full") || entry_name.contains("description_full") {
             return Some(ImportFormat::SnomedRf2);
         }
@@ -378,7 +426,8 @@ fn detect_json_format(path: &Path) -> Option<ImportFormat> {
 // ── Import args ───────────────────────────────────────────────────────────────
 
 /// Arguments for `hts import`.
-#[derive(Parser, Debug)]
+// `Debug` is hand-written below: it redacts `database_url` (#2149).
+#[derive(Parser)]
 pub struct ImportArgs {
     /// Path to the terminology package file or directory
     pub path: std::path::PathBuf,
@@ -389,7 +438,12 @@ pub struct ImportArgs {
     pub format: Option<ImportFormat>,
 
     /// Database URL (SQLite file path or PostgreSQL connection string)
-    #[arg(long, env = "HTS_DATABASE_URL", default_value = "./data/hts.db")]
+    #[arg(
+        long,
+        env = "HTS_DATABASE_URL",
+        default_value = "./data/hts.db",
+        hide_env_values = true
+    )]
     pub database_url: String,
 
     /// Storage backend to import into (`sqlite` or `postgres`)
@@ -419,6 +473,39 @@ pub struct ImportArgs {
     /// Emit per-batch progress details to stderr during import
     #[arg(long)]
     pub verbose: bool,
+}
+
+/// Prints `database_url` without credentials or connection options (#2149).
+/// Destructures every field, so a new field fails to compile until it is
+/// listed here.
+impl fmt::Debug for ImportArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            path,
+            format,
+            database_url,
+            storage_backend,
+            log_level,
+            batch_size,
+            languages,
+            dry_run,
+            verbose,
+        } = self;
+        f.debug_struct("ImportArgs")
+            .field("path", path)
+            .field("format", format)
+            .field(
+                "database_url",
+                &redact_database_url(database_url, storage_backend),
+            )
+            .field("storage_backend", storage_backend)
+            .field("log_level", log_level)
+            .field("batch_size", batch_size)
+            .field("languages", languages)
+            .field("dry_run", dry_run)
+            .field("verbose", verbose)
+            .finish()
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -493,7 +580,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file(
                 "SnomedCT/Snapshot/Terminology/Concept_Full_INT_20240101.txt",
                 opts,
@@ -511,7 +598,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("LoincTable.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -527,7 +614,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("Loinc_2.80/Loinc.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -542,7 +629,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("Loinc_2.77/LoincTable.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -556,7 +643,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("readme.txt", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -570,7 +657,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("rrf/RXNCONSO.RRF", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -584,7 +671,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("icd10cm_tabular_2025.xml", opts).unwrap();
             zip.write_all(b"<ICD10CM.tabular/>").unwrap();
             zip.finish().unwrap();
@@ -666,7 +753,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("ucum-essence.xml", opts).unwrap();
             zip.write_all(b"<root/>").unwrap();
             zip.finish().unwrap();
@@ -680,7 +767,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("Thesaurus.txt", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -694,7 +781,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             // File is nested inside a subdirectory — tests the starts_with fix
             zip.start_file("mesh2026/desc2026.xml", opts).unwrap();
             zip.write_all(b"<MeshHeadingList/>").unwrap();
@@ -709,7 +796,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("dicom_codes.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -723,7 +810,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("nucc_taxonomy_250.csv", opts).unwrap();
             zip.write_all(b"dummy").unwrap();
             zip.finish().unwrap();
@@ -737,7 +824,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("CMS32_DESC_LONG_DX.txt", opts).unwrap();
             zip.write_all(b"001|Cholera\n").unwrap();
             zip.finish().unwrap();
@@ -751,11 +838,68 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
         {
             let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("CMS32_DESC_SHORT_DX.txt", opts).unwrap();
             zip.write_all(b"001|Cholera\n").unwrap();
             zip.finish().unwrap();
         }
         assert_eq!(detect_format(tmp.path()), Some(ImportFormat::Icd9Cm));
+    }
+
+    // ── Secrets stay out of `--help` and `Debug` (#2149) ─────────────
+
+    #[test]
+    fn help_hides_the_database_url_value() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        for subcommand in ["run", "import"] {
+            let arg = cli
+                .find_subcommand(subcommand)
+                .unwrap_or_else(|| panic!("no `{subcommand}` subcommand"))
+                .get_arguments()
+                .find(|arg| arg.get_env().is_some_and(|env| env == "HTS_DATABASE_URL"))
+                .unwrap_or_else(|| panic!("`{subcommand}` does not read HTS_DATABASE_URL"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "`hts {subcommand} --help` would print HTS_DATABASE_URL"
+            );
+        }
+    }
+
+    const PG_URL: &str = "postgres://hts:DB-SECRET@db.internal:5432/hts?sslpassword=OPT-SECRET";
+
+    #[test]
+    fn debug_redacts_the_database_url() {
+        let config = HtsConfig {
+            database_url: PG_URL.to_string(),
+            storage_backend: "postgres".to_string(),
+            ..Default::default()
+        };
+        let args = ImportArgs {
+            path: "snomed.zip".into(),
+            format: None,
+            database_url: PG_URL.to_string(),
+            storage_backend: "postgres".to_string(),
+            log_level: "info".to_string(),
+            batch_size: 500,
+            languages: String::new(),
+            dry_run: false,
+            verbose: false,
+        };
+        for debug in [
+            format!("{config:?}"),
+            format!("{config:#?}"),
+            format!("{args:?}"),
+            format!("{:?}", Command::Run(config.clone())),
+        ] {
+            assert!(!debug.contains("SECRET"), "secret in Debug output: {debug}");
+            assert!(debug.contains("database_url"), "{debug}");
+        }
+    }
+
+    #[test]
+    fn debug_shows_a_sqlite_database_path() {
+        let config = HtsConfig::default();
+        assert!(format!("{config:?}").contains("./data/hts.db"));
     }
 }

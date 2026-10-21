@@ -2,7 +2,7 @@
 // its SQL decodes into the editor pane, and the results region runs it over
 // its depends-on ViewDefinition through $sql-run on arrival — no Run button
 // (#839, generalizing #752's View Definitions playground here).
-import { acceptConfirm, dismissConfirm, expect, test } from "../pages/fixtures";
+import { acceptConfirm, dialogsSeen, dismissConfirm, expect, test } from "../pages/fixtures";
 import { createResource, createSqlQueryLibrary, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { Editor } from "../pages/editor";
@@ -283,7 +283,7 @@ test("Tab in the SQL editor moves focus to Cancel and does not change the SQL", 
 });
 
 /** A minimal savable sql-query Library, named for the rail. */
-function starterLibrary(name: string) {
+function starterLibrary(name: string, code = "sql-query") {
   return {
     name,
     status: "active",
@@ -291,7 +291,7 @@ function starterLibrary(name: string) {
       coding: [
         {
           system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
-          code: "sql-query",
+          code,
         },
       ],
     },
@@ -325,6 +325,74 @@ test("restores the stored last selection on plain arrival; a deep link with ?lib
     "true",
   );
 });
+
+for (const [route, code] of [
+  ["/ui/sql/queries", "sql-query"],
+  ["/ui/sql/views", "sql-view"],
+] as const) {
+  test(`typing in the ${route} rail filter narrows the list and the recent group without Enter (#1275)`, async ({
+    page,
+    request,
+  }) => {
+    const stamp = Date.now().toString(36);
+    const libA = await createResource(request, "Library", starterLibrary(`zlive_${stamp}_a_keep`, code));
+    const libB = await createResource(request, "Library", starterLibrary(`zlive_${stamp}_b_other`, code));
+    try {
+      await Promise.all([libA, libB].map((id) => waitSearchable(request, "Library", id)));
+      await page.goto(`${route}?lib=${libA}`);
+      await page.goto(`${route}?lib=${libB}`);
+      const recent = page.locator("#lib-rail-recent");
+      await expect(recent.locator(`[data-type='${libA}']`)).toBeVisible();
+      await expect(recent.locator(`[data-type='${libB}']`)).toBeVisible();
+
+      const filter = page.locator("form.filter-rail__search input[name='filter']");
+      const historyLength = await page.evaluate(() => history.length);
+      await filter.fill(`${stamp}_a_keep`);
+      await expect(page.locator(`#lib-rail-list [data-type='${libB}']`)).toHaveCount(0);
+      await expect(page.locator(`#lib-rail-list [data-type='${libA}']`)).toHaveCount(1);
+      await expect(recent.locator(`[data-type='${libB}']`)).toHaveCount(0);
+      await expect(recent.locator(`[data-type='${libA}']`)).toBeVisible();
+      await expect.poll(() => new URL(page.url()).searchParams.get("filter")).toBe(`${stamp}_a_keep`);
+      expect(await page.evaluate(() => history.length)).toBe(historyLength);
+      await expect(filter).toBeFocused();
+
+      await filter.fill(`zzzznomatch_${stamp}`);
+      await expect(page.locator("#lib-rail-list .filter-rail__item")).toHaveCount(0);
+      await expect(recent).toBeHidden();
+
+      await filter.fill("");
+      await expect(recent).toBeVisible();
+      await expect(recent.locator(`[data-type='${libB}']`)).toBeVisible();
+    } finally {
+      await deleteResources(request, "Library", [libA, libB]);
+    }
+  });
+}
+
+for (const route of ["/ui/sql/queries", "/ui/sql/views"] as const) {
+  test(`typing in the ${route} rail filter with a dirty editor asks nothing and keeps the draft (#1275)`, async ({
+    page,
+  }) => {
+    await page.goto(`${route}?lib=new&lang=en`, { waitUntil: "networkidle" });
+    const sql = page.locator(".sql-editor .cm-content[role='textbox']");
+    await sql.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT 1 AS dirty_marker");
+    await expect(page.locator(".tag--unsaved").first()).toBeVisible();
+
+    dialogsSeen(page);
+    const filter = page.locator("form.filter-rail__search input[name='filter']");
+    const swapped = page.waitForResponse(
+      (r) => r.request().method() === "GET" && new URL(r.url()).searchParams.get("filter") === "zzdirty",
+    );
+    await filter.fill("zzdirty");
+    await swapped;
+
+    expect(dialogsSeen(page)).toEqual([]);
+    await expect(page.locator(".confirm-dialog")).toHaveCount(0);
+    await expect(sql).toContainText("dirty_marker");
+  });
+}
 
 // Editor-first layout (#839): the results card follows the SQL editor's
 // *current* text, live, on both SQL Queries and SQL Views — the same
@@ -1534,7 +1602,7 @@ test.describe("Tables panel", () => {
     await expect(row.locator("code")).toHaveText("v");
     await expect(row.locator(".tag--failed")).toHaveText("Not found");
     await expect(row).toContainText(
-      "No ViewDefinition or SQL View answers to http://example.org/ViewDefinition/change-me. Fix the canonical in Details or remove the row.",
+      "No ViewDefinition, SQL View, ValueSet or ConceptMap answers to http://example.org/ViewDefinition/change-me. Fix the canonical in Details or remove the row.",
     );
 
     // #842/04: the starter's own SQL ("SELECT * FROM v") still reads `v` —

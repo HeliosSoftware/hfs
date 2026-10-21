@@ -806,7 +806,7 @@ issues a `PUT` and the ids are known in advance.
 | 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. |
 | 4.12 | **_revinclude / _sort / paging** | `GET /Patient?_id=PID&_revinclude=Condition:patient` · `GET /Observation?patient=PID&_sort=-date&_count=5` · `GET /Patient?_count=20&_total=accurate` | **1 result · 15 included** · **165 results**, 5 rows, `effective` dates descending (also try the **Sort** dropdown: *Most recent*/*Oldest* re-run with `_sort` swapped) · **11,705 results**, 20 rows, **Next** appears; click it — the total stays 11,705 and **Previous** appears |
 | 4.13 | **_content** (full text) | `GET /Patient?_content=Everett` | ≥ 83 results (83 patients live in Everett); on composites check the log to confirm Elasticsearch served it. **N/A on `mongodb`** (standalone MongoDB has no full-text search; the server answers 501 `full-text search not available`) |
-| 4.14 | **visual builder + existing saved query** | On **Resources** (`/ui/resources`) choose **Patient** and builder mode, then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). The **Recent** disclosure records the query. When user settings already contain a named query, its **Saved** entry loads the editable URL without executing it; an explicit **Run** performs the search. Repeat Saved/Recent loading on **Search** in builder mode. |
+| 4.14 | **visual builder + existing saved query** | On **Resources** (`/ui/resources`) choose **Patient** and builder mode, then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. Then run `GET /Patient?_summary=true`, run `GET /Patient?family=Parker433`, and load the broad query from **Recent** without Run. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). The **Recent** disclosure records the query. Loading the broad query retains the Parker433 table and count with **Previous results** visible; **Run** updates the table and count for the broad query and clears the label. Loading the query already represented by the results keeps the label hidden. When user settings already contain a named query, its **Saved** entry loads the editable URL without executing it; an explicit **Run** performs the search. Repeat Saved/Recent loading on **Search** in builder mode. |
 
 ### 8.3 Searches over the data loaded by Batch / Transaction (T2)
 
@@ -1138,9 +1138,9 @@ kind is exported in every format.
 | # | Name | Subjects | Format | Expect |
 |---|---|---|---|---|
 | 7.m | `vd-csv` | `patient_demographics` | **CSV**, header on | header `id,gender,birth_date,family,city` plus **11,705** data lines; `PID`'s line reads `…,female,2015-12-29,Parker433,Everett` |
-| 7.n | `vd-parquet` | `patient_demographics` | **Parquet** | schema `id, gender, birth_date, family, city`; **11,705** rows; `birth_date` is a **string** column, which is correct — the SQL on FHIR 3.0.0-ballot default mapping (see #569) renders FHIR `date`, `dateTime` and `time` as `CHARACTER VARYING` |
+| 7.n | `vd-parquet` | `patient_demographics` | **Parquet** | schema `id, gender, birth_date, family, city`; **11,705** rows; `birth_date` is a **string** column, which is correct — the SQL on FHIR 3.0.0-ballot default mapping (see #569) renders FHIR `date`, `dateTime` and `time` as `CHARACTER VARYING` (UTF8 in Parquet); an `ansi/type: DATE` tag on the column would make it a native date |
 | 7.o | `query-ndjson` | `tall_female_patients`, `min_height` = `150` | **NDJSON** | one JSON object per line with `id`, `city`, `height`; line count equals the data-line count of 7.b |
-| 7.p | `query-parquet` | `tall_female_patients`, `min_height` = `150` | **Parquet** | schema `id, city, height` with `height` numeric; row count equals 7.o |
+| 7.p | `query-parquet` | `tall_female_patients`, `min_height` = `150` | **Parquet** | schema `id, city, height`; `height` is a computed column, so its type is inferred from the values (integer values `INT32`, a fractional value `UTF8`, since FHIRPath `Decimal` maps to `CHARACTER VARYING`); row count equals 7.o |
 | 7.q | `view-ndjson` | `female_patients` | **NDJSON** | **5,814** lines, each with `id`, `birth_date`, `city` and no `gender` key |
 
 Coverage after 7.a–7.q:
@@ -1198,9 +1198,11 @@ Subjects table controls (on `/ui/sql/export/new`):
 ### 11.7 Optional S3 sink (`sqlite`/`postgres` rows)
 
 Restart with `HFS_EXPORT_SINK=s3 HFS_EXPORT_S3_BUCKET=hfs-sql-export
-HFS_EXPORT_S3_REGION=us-east-1` (MinIO credentials and
-`AWS_ENDPOINT_URL=http://localhost:9000`) and repeat 7.a; the pills must be
-pre-signed URLs that download.
+HFS_EXPORT_S3_ENDPOINT=http://localhost:9000` plus the MinIO credentials from
+section 5 (the endpoint forces path-style addressing and a `us-east-1` region) and
+repeat 7.a; the pills must be pre-signed MinIO URLs that download. The server needs
+an `s3` build: without the feature, or without `HFS_EXPORT_S3_BUCKET`, it must
+refuse to start.
 
 Pass criteria: every kick-off in 7.a–7.d, 7.g–7.k, and 7.m–7.q produces a card that
 reaches **Complete**; the files parse in their declared format with the stated contents and

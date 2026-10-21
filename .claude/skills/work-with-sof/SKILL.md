@@ -42,6 +42,8 @@ All rows, where clauses, forEach/repeat items and streamed chunks of one view ru
 
 On the HFS server, `patient`/`group`/`_since` also apply to every dependency view of a Library (SQLQuery/SQLView) subject, and `_limit` caps only the final rows.
 
+A Library `depends-on` may name a `ValueSet` or `ConceptMap` (#1824, SQLite backend only); its label then selects the spec's fixed-column relation. On `POST`/`PUT` of the Library, the terminology server (`HFS_TERMINOLOGY_SERVER`) expands the value set (paged `$expand`) or returns the map (`GET /ConceptMap?url=`), and the rows go into a `sof_term_<id>` table in the primary DB, one per tenant and canonical, shared by Libraries and dropped with its last reference (Library `DELETE`, or a `PUT` without the dependency). A terminology dependency that cannot be materialized is a `422` on the write. `$sql-run`/`$sql-export` copy the stored rows into the request's in-memory engine, so the terminology server is not on the query path; an inline (never-written) Library is expanded for that request only. Code: `crates/rest/src/handlers/sof/terminology.rs`, `crates/sof/src/sqlquery/terminology.rs`, `crates/persistence/src/backends/sqlite/sof_terminology.rs`.
+
 When changing HFS stored-data SQL row order, collection cells or preview
 limits, read the
 [stored-data ordering contract](../../../book/src/ch06-sql-on-fhir.md#hfs-stored-data-ordering).
@@ -104,17 +106,21 @@ curl -X POST http://localhost:8080/\$sql-run \
   -d '{"_format": "parquet", "subjectResource": {...}, "resource": [...]}'
 ```
 
-Parquet type mapping follows Pathling conventions:
+Parquet / Arrow types follow the SQL-on-FHIR 3.0.0-ballot default mappings (shared resolver: `crates/sof/src/column_types.rs`):
 
 | SOF type | Parquet type |
 |---|---|
 | boolean | BOOLEAN |
-| string, code, uri | UTF8 |
-| integer | INT32 |
-| decimal | FLOAT64 |
-| dateTime, date | UTF8 |
+| integer, positiveInt, unsignedInt | INT32 |
+| integer64 | INT64 |
+| decimal | UTF8 (digits preserved, trailing zeros stripped) |
+| instant | TIMESTAMP (µs, UTC) |
+| base64Binary | BINARY |
+| date, dateTime, time, string, code, uri, other | UTF8 |
 
-Arrays map to Arrow List types. All fields are OPTIONAL. Snappy compression is the default.
+A column `tag` named `ansi/type` (element `tag`, singular; the spec prose's `tags` is a typo and is not read) overrides the default; an unknown or incompatible value is rejected (error names the column). Columns without a `type` are inferred from values. JSON/NDJSON/CSV keep their shape (decimal stays a JSON number, deliberately). The per-emitter comparison is in `crates/sof/README.md` → "Column Type Mapping". Collection columns map to Arrow List of the element type. All fields are OPTIONAL. Snappy compression is the default.
+
+Parquet/Arrow are encoded incrementally (`helios_sof::columnar_stream`): schema fixed up front, 8,192-row batches, row groups cut by encoded bytes (`row_group_size_mb`), and the `$sql-run` response streams with an aborted body on a mid-stream error. File splitting by size is per batch, so a file can overshoot by one batch plus the footer. Streamed responses have no `Content-Length` (chunked), the timeout layer does not cover the body, Arrow stays compressible, and a client disconnect stops the encoder and drops the `RowStream` (test: `streaming_columnar_client_disconnect_drops_the_row_stream`). `$sql-run` with a ViewDefinition subject also streams `json`, `csv` and `fhir` (`RowStreamEncoder`, `streaming_rows_response`) once a result has more than 100 rows (test: `streaming_rows_client_disconnect_drops_the_row_stream`); SQLQuery (Library) subjects still buffer, a row error after the first 100 rows aborts the body, and `HFS_REQUEST_TIMEOUT` no longer bounds a streamed run after that point. A value that does not fit a declared type is an error naming the column (an out-of-range integer is not nulled or wrapped); the Postgres runner's text cells are parsed by the builders (unit-tested, not run against a live Postgres). Peak-memory evidence: `docs/sof-parquet-streaming-benchmark.md` (`cargo run -p helios-sof --example parquet_peak_memory`). Row groups are cut at `row_group_size_mb` encoded bytes (REST/CLI minimum 64 MB), so per-request peak memory is about 3x that (~190 MB at the minimum). The first split file keeps the plain name and later files are `_002`, `_003` (no `_001`).
 
 ## Async Export in the HFS Server
 
@@ -135,14 +141,16 @@ in-process fallback.
 | `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized in full before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. Narrow it with a ViewDefinition `where`, or raise this limit |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's); does not cover materializing a dependency |
-| `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3` |
+| `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3`. Any other value fails startup; `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink |
-| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3` |
-| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`; startup fails without it |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink; defaults to `us-east-1` when `HFS_EXPORT_S3_ENDPOINT` is set |
+| `HFS_EXPORT_S3_ENDPOINT` | *(AWS)* | Custom S3 endpoint URL for the `s3` sink (e.g. MinIO); must be an `http(s)` URL with a host. Setting it forces path-style addressing |
+| `HFS_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Use path-style S3 addressing for the `s3` sink; forced on when `HFS_EXPORT_S3_ENDPOINT` is set |
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for `s3`, seconds (spec requires ≥ 24h) |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs |
 | `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum queued + running export jobs per tenant; beyond it `$sql-export` returns `429` with `Retry-After: 5` |
-| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger results split across files |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger results split across files; `0` = a single shard held fully in memory |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory` in-process; `kafka`/`sqs` reserved) |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`) |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval, seconds (clamped to ≥ 1) |
@@ -167,3 +175,15 @@ inputs have fixed limits, each a `400` naming the limit: 64 `subject` entries,
 - Integration tests live in `tests/`.
 - ViewDefinition examples are embedded in test files.
 - For version-independent logic, use enum wrappers such as `SofViewDefinition` and traits such as `ViewDefinitionTrait`, `BundleTrait`, and `ResourceTrait`.
+
+## Columnar fast path (#1813)
+
+`SofRunner::run_view_columnar` (default `Ok(None)` = unsupported) lets the SQLite and PostgreSQL
+in-DB runners emit Arrow `RecordBatch`es directly via `helios_sof::columnar::ColumnarBatchBuilder`,
+used by `$viewdefinition-run` for Parquet/Arrow IPC: the handler streams the batches through the
+same blocking encoder as the row path (`columnar_stream::{ParquetStreamWriter, ArrowIpcStreamWriter}::write_batch`).
+Column kinds come from `ColumnDecode::column_kind`; `pin_declared_types` then gives declared columns
+the row path's Arrow type (`integer64` → Int64, `collection` → `List<Utf8>`), and the remaining
+`Json`/`Auto` columns stay `Deferred` (inferred at first flush).
+Profile with `crates/persistence/tests/sof_columnar_profile.rs` (`--ignored --nocapture`,
+`HFS_TEST_COLUMNAR_PROFILE_ROWS`).

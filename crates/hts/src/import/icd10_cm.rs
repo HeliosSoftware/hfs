@@ -89,7 +89,7 @@ pub async fn import_icd10_cm(
 
     // Seed with an empty CodeSystem to register metadata.
     let seed_bytes = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+    let seed_stats = backend.import_bundle_deferred(ctx, &seed_bytes).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -108,7 +108,7 @@ pub async fn import_icd10_cm(
             })
             .collect();
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
         stats.errors.extend(chunk.errors);
 
         eprintln!(
@@ -146,7 +146,7 @@ fn read_xml_bytes(path: &Path) -> Result<Vec<u8>, HtsError> {
                     .by_index(i)
                     .ok()
                     .map(|e| {
-                        let n = e.name().to_ascii_lowercase();
+                        let n = e.name().map(|n| n.to_ascii_lowercase()).unwrap_or_default();
                         n.ends_with(".xml") && n.contains("tabular")
                     })
                     .unwrap_or(false)
@@ -588,7 +588,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zip.start_file("icd10cm_tabular_2025.xml", opts).unwrap();
             zip.write_all(TABULAR_XML.as_bytes()).unwrap();
             zip.finish().unwrap();

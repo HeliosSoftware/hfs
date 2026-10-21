@@ -123,12 +123,12 @@ sof-cli -v view-definition.json -b data.ndjson -f ndjson --skip-invalid
     --since <SINCE>            Filter resources modified at or after this time (RFC3339 format)
     --limit <LIMIT>            Limit the number of results (1-10000)
     --fhir-version <VERSION>   FHIR version to use [default: R4]
-    --parquet-row-group-size <MB> Row group size for Parquet (64-1024MB) [default: 256]
+    --parquet-row-group-size <MB> Encoded MB at which a Parquet row group is cut (64-1024MB) [default: 256]
     --parquet-page-size <KB>   Page size for Parquet (64-8192KB) [default: 1024]
     --parquet-compression <ALG> Compression for Parquet [default: snappy]
                               Options: none, snappy, gzip, lz4, brotli, zstd
     --max-file-size <MB>       Maximum file size for Parquet output (10-10000MB) [default: 1000]
-                              When exceeded, creates numbered files (e.g., output_001.parquet)
+                              When exceeded, the first file keeps the plain name and later files are numbered (output.parquet, output_002.parquet, ...)
     --chunk-size <N>           Number of resources per chunk for streaming NDJSON [default: 1000]
     --skip-invalid             Skip invalid JSON lines in NDJSON files instead of failing
     --terminology-server <URL> Terminology server URL for FHIRPath functions
@@ -321,9 +321,9 @@ The CLI supports multiple output formats via the `-f/--format` parameter:
   
 - **parquet** - Apache Parquet columnar format
   - Efficient binary format for analytics workloads
-  - Automatic schema inference from data
+  - Schema fixed before the first row from the declared column `type`; untyped columns are inferred from the first 100 rows
   - Configurable compression (snappy, gzip, lz4, brotli, zstd, none)
-  - Optimized for large datasets with automatic chunking
+  - Encoded incrementally with bounded memory, so large datasets do not need to fit in RAM
   - Configurable row group and page sizes for performance tuning
 
 ### `sof-server` - HTTP Server
@@ -620,8 +620,8 @@ Parameter table:
 |------|------|-----|-------|-----|-----|---------------|
 | _format | code | in | system | 0 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/vnd.apache.parquet` (aliases: `application/parquet`, `application/octet-stream`), `application/fhir+json` (`fhir`). Defaults to `application/x-ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
 | header | boolean | in | system | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
-| maxFileSize | integer | in | system | 0 | 1 | Maximum Parquet file size in MB (10-10000). When exceeded, generates multiple files in a ZIP archive. |
-| rowGroupSize | integer | in | system | 0 | 1 | Parquet row group size in MB (64-1024, default: 256) |
+| maxFileSize | integer | in | system | 0 | 1 | Maximum Parquet file size in MB (10-10000). When exceeded, generates multiple files in a ZIP archive. Checked after each batch, so a file can overshoot by one batch plus the footer. |
+| rowGroupSize | integer | in | system | 0 | 1 | Encoded MB at which a Parquet row group is cut (64-1024, default: 256; REST minimum 64). Peak memory per request is about 3x this value. |
 | pageSize | integer | in | system | 0 | 1 | Parquet page size in KB (64-8192, default: 1024) |
 | compression | code | in | system | 0 | 1 | Parquet compression: none, snappy (default), gzip, lz4, brotli, zstd |
 | subjectCanonical | canonical | in | system | 0 | 1 | Canonical URL of the subject. Not supported here: sof-server is stateless and has nothing to resolve it against. |
@@ -695,12 +695,12 @@ The server automatically sets appropriate response headers based on the output f
   - `application/fhir+json` for `_format=fhir` output and `Binary`-envelope responses
 
 **Streaming Response Headers (for large files):**
-- `Transfer-Encoding: chunked` - Automatically set for files > 10MB
+- `Transfer-Encoding: chunked` - Set for streamed Parquet and Arrow IPC responses
 - `Content-Disposition: attachment; filename="..."` - Suggests filename for downloads
   - Single Parquet: `filename="data.parquet"`
   - Multiple Parquet (ZIP): `filename="data.zip"`
 
-**Note:** The `Transfer-Encoding: chunked` header is automatically managed by the server. Clients don't need to set any special headers to receive chunked responses - they will automatically receive data in chunks if the response is large.
+**Note:** The `Transfer-Encoding: chunked` header is automatically managed by the server. Clients don't need to set any special headers to receive chunked responses - they will automatically receive data in chunks for streamed responses.
 
 ##### Error Responses
 
@@ -1001,18 +1001,22 @@ let parquet = run_view_definition(view, bundle, ContentType::Parquet)?;
 
 The SOF implementation supports Apache Parquet format for efficient columnar data storage and analytics:
 
-- **Automatic Schema Inference**: Column types are automatically determined from the data
-- **FHIR Type Mapping**:
-  - `boolean` → BOOLEAN
-  - `string`/`code`/`uri` → UTF8
-  - `integer` → INT32
-  - `decimal` → FLOAT64
-  - `dateTime`/`date` → UTF8
-  - Arrays → List types with nullable elements
+- **Declared-Type Schema**: Column types follow the `type` (and optional `ansi/type` tag) declared in the ViewDefinition, using the SQL-on-FHIR 3.0.0-ballot default mappings (see [Column Type Mapping](#column-type-mapping)). Columns that declare no `type` fall back to inference from the data
+- **Type Mapping**: see the tables below; `collection: true` columns become `List<element type>`
+- **In-database runners (`$viewdefinition-run` on HFS)**: for Parquet and Arrow IPC output
+  the SQLite and PostgreSQL runners append database values straight to typed Arrow builders
+  (`helios_sof::columnar`), skipping the JSON row step, and the batches are streamed through the
+  same encoder as the row path. Column types follow the declared mapping above (including the `ansi/type` tag), so an `integer`
+  column that is entirely null is `Int32` (not `Utf8`); an integer value outside the 32-bit range
+  of an `Int32` column is an error naming the column, not null. Undeclared columns are inferred from the first batch. Runners
+  without a columnar path fall back to the row path.
 - **Optimized for Large Datasets**:
-  - Automatic chunking into optimal batch sizes (100K-500K rows)
-  - Memory-efficient streaming for datasets > 1GB
-  - Configurable row group size (default: 256MB, range: 64-1024MB)
+  - Incremental encoding in batches of 8,192 rows; the schema is fixed before the first row
+  - Row groups are cut by encoded size, so memory stays bounded by about one row group (see `docs/sof-parquet-streaming-benchmark.md`)
+  - For a ViewDefinition subject, `$sql-run` also streams `json`, `csv` and `fhir` once a result has more than 100 rows (SQL Query (Library) subjects still buffer); a row error after the first 100 rows aborts the body, and the request timeout no longer bounds a streamed run after that point
+  - The `$sql-run` HTTP response is streamed as row groups are written; an error after the first bytes aborts the body instead of returning a truncated file with a clean `200`
+  - Configurable row group size (default: 256MB, range: 64-1024MB), measured in encoded bytes
+  - File splitting (`--max-file-size`) has the granularity of one batch: a file can overshoot the limit by one batch plus the footer
   - Configurable page size (default: 1MB, range: 64KB-8MB)
 - **Compression Options**:
   - `snappy` (default): Fast compression with good ratios
@@ -1077,29 +1081,96 @@ curl -X POST "http://localhost:8080/$sql-run?_format=application/parquet&compres
 
 #### Performance Guidelines
 
-- **Row Group Size**: Larger row groups (256-512MB) improve compression and columnar efficiency but require more memory during processing
+- **Row Group Size**: The value is the number of encoded MB at which a row group is cut, and peak memory is about 3x it (about 190 MB per request at the 64 MB minimum). Larger row groups (256-512MB) improve compression and columnar efficiency at the cost of memory
 - **Page Size**: Smaller pages (64-512KB) enable fine-grained reads and better predicate pushdown; larger pages (1-8MB) reduce metadata overhead
 - **Compression**:
   - Use `snappy` or `lz4` for real-time processing
   - Use `zstd` for balanced storage and query performance
   - Use `brotli` or `gzip` for long-term storage where space is critical
-- **Large Datasets**: The implementation automatically chunks data to prevent memory issues, processing in batches optimized for the configured row group size
+- **Large Datasets**: Rows are encoded incrementally in fixed 8,192-row batches, and a row group is written each time its encoded size reaches the configured row group size, so memory does not grow with the result size. Arrow IPC output is streamed the same way
 - **File Splitting**: When `--max-file-size` or `maxFileSize` is specified:
   - Files are split when they exceed the specified size in MB
   - Each file contains complete row groups and is independently queryable
   - CLI: Files are named with sequential numbering: `base.parquet`, `base_002.parquet`, `base_003.parquet`, etc.
-  - Server: Multiple files are automatically packaged into a ZIP archive for convenient download
+  - Server: Multiple files are automatically packaged into a ZIP archive for convenient download; `sof-server` builds a split multi-file ZIP in memory before sending it
   - Ideal for distributed processing systems that parallelize across files
 - **Streaming Response** (Server only):
-  - Files larger than 10MB are automatically streamed using chunked transfer encoding
+  - `$sql-run` Parquet and Arrow IPC responses are always sent with chunked transfer encoding and no `Content-Length`; a row error after the first bytes aborts the body
   - Reduces memory usage on both server and client
-  - Multiple Parquet files are streamed as a ZIP archive with proper content disposition headers
+  - Multiple Parquet files are returned as a ZIP archive with proper content disposition headers
   - Enables processing of gigabyte-scale datasets without memory constraints
   - Response headers for streaming:
     - `Transfer-Encoding: chunked` - Automatically set by the server for streaming responses
     - `Content-Type: application/vnd.apache.parquet` or `application/zip` - Based on single or multi-file output
     - `Content-Disposition: attachment; filename="data.parquet"` or `filename="data.zip"` - For convenient file downloads
   - Chunked responses use 64KB chunks for optimal network efficiency
+
+### Column Type Mapping
+
+SQL-on-FHIR 3.0.0-ballot defines default mappings from FHIR and FHIRPath types to ISO/IEC 9075 SQL types (`viewdef-6`, `viewdef-7`), and an `ansi/type` column tag to override them. Where a path has both a FHIR type and a FHIRPath type, the FHIR type wins. The resolver lives in `column_types` (`helios_sof::resolve_columns`) and is shared by every emitter, so they all agree on what a column's SQL type is; each emitter then maps that SQL type to the closest equivalent in its output format, as the specification asks for implementations without native SQL types.
+
+**FHIR type → SQL type (defaults)**
+
+| FHIR type | ISO/IEC 9075 type |
+|---|---|
+| `boolean` | `BOOLEAN` |
+| `integer`, `positiveInt`, `unsignedInt` | `INT` |
+| `integer64` | `BIGINT` |
+| `decimal` | `CHARACTER VARYING` (not a float; the digits are preserved, trailing zeros are not: `1.50` becomes `1.5`) |
+| `instant` | `TIMESTAMP WITH TIME ZONE` |
+| `base64Binary` | `BINARY` |
+| `date`, `dateTime`, `time` | `CHARACTER VARYING` |
+| every other type (`string`, `code`, `uri`, ...) | `CHARACTER VARYING` |
+
+FHIRPath types (columns without a declared `type`): `Boolean` → `BOOLEAN`, `Integer` → `INT`, `String`/`Decimal`/`Date`/`Time`/`DateTime` → `CHARACTER VARYING`.
+
+**Comparison with each emitter**
+
+"Status" is *conforms*, *fixed* (diverged before this change, now follows the table) or *deliberate* (diverges on purpose, reason given).
+
+| Emitter | `decimal` | `instant` | `integer64` | `base64Binary` | `integer*` / `boolean` | Status |
+|---|---|---|---|---|---|---|
+| Parquet / Arrow IPC (`sof-cli`, `sof-server`, pysof, `$sql-run`, `$sql-export`) | `Utf8` (was `Float64`) | `Timestamp(µs, UTC)`, offsets normalised (was `Utf8`) | `Int64` (was truncated to `Int32`) | `Binary` (was `Utf8`) | `Int32` with a checked conversion / `Boolean` | fixed |
+| JSON / NDJSON / CSV | JSON number, exact decimal digits, trailing zeros stripped | string as evaluated | JSON number (was the Rust debug string `Integer64(5, None, None)`) | string | number / boolean | `integer64` fixed; `decimal` **deliberate** |
+| `$sqlquery-run` / `$sql-run` in-memory SQLite (`sqlquery`) | `REAL` | `TEXT` | `INTEGER` (64-bit) | `TEXT` | `INTEGER` | `decimal` and `base64Binary` **deliberate** |
+| In-DB compilers (SQLite, PostgreSQL) | PostgreSQL `numeric`; SQLite `REAL` | text | `integer64` now decoded as a number (was text) | text | `bigint` / `INTEGER`; boolean | `integer64` fixed; `decimal`, `instant`, `base64Binary` **deliberate** |
+| In-DB MongoDB compiler | declared types are not applied (BSON is dynamically typed) | same | same | same | same | **deliberate** (limitation); an invalid `ansi/type` is still rejected |
+| `_format=fhir` (`value[x]`) | `valueDecimal` | `valueInstant` | `valueInteger64` | `valueBase64Binary` | `valueInteger` / `valueBoolean` | conforms (the FHIR type picks the `value[x]` part) |
+
+Reasons for the deliberate choices:
+
+- **`decimal` as a JSON number (JSON, NDJSON, CSV).** The upstream conformance suite's `expect` rows compare decimals as JSON numbers. The digits are exact (no `f64` round trip), but trailing zeros are stripped (`1.50` is emitted as `1.5`), because evaluation artefacts such as `3 / 2` or boundary functions would otherwise not compare equal. Parquet and Arrow carry the same digits as a string, which satisfies `viewdef-23`.
+- **`decimal` as `REAL` in SQLite.** With `TEXT` affinity `WHERE dec > 5` would compare as text and return wrong rows. SQLite has no exact decimal type either. Use `ansi/type: CHARACTER VARYING` if you want text. PostgreSQL keeps `numeric`.
+- **`instant` and `base64Binary` as text in SQLite and the in-DB runners.** The values travel as JSON text; only Parquet and Arrow have native timestamp and binary types.
+- **Columns without a `type`** are inferred from the values, passed through the FHIRPath table (a number with a fractional part is a `Decimal` and so `Utf8`; integers are `Int32`, widened to `Int64` if a value does not fit). An undeclared `instant` therefore stays `Utf8`; declare `type: instant` to get a timestamp.
+
+**`ansi/type` tag**
+
+A column may carry a `tag` with `name` `ansi/type` and a `value` naming the desired ISO/IEC 9075 type:
+
+```json
+{ "name": "birth_date", "path": "birthDate", "type": "date",
+  "tag": [{ "name": "ansi/type", "value": "DATE" }] }
+```
+
+The value is case-insensitive. Accepted values, the FHIR types each may be applied to, and the resulting Parquet / Arrow type:
+
+| `ansi/type` value (aliases) | Applies to FHIR type | Parquet / Arrow type |
+|---|---|---|
+| `CHARACTER VARYING` (`VARCHAR`, `CHAR VARYING`) | any | `Utf8` |
+| `BOOLEAN` | `boolean` | `Boolean` |
+| `INT` (`INTEGER`) | `integer`, `positiveInt`, `unsignedInt` | `Int32` |
+| `BIGINT` | the `INT` types, `integer64` | `Int64` |
+| `DOUBLE PRECISION` (`DOUBLE`) | `decimal`, the `INT` types, `integer64` | `Float64` |
+| `DATE` | `date` | `Date32` |
+| `TIME` | `time` | `Time64(µs)` |
+| `TIMESTAMP` (`TIMESTAMP WITHOUT TIME ZONE`) | `dateTime`, `instant` | `Timestamp(µs)` |
+| `TIMESTAMP WITH TIME ZONE` (`TIMESTAMPTZ`) | `dateTime`, `instant` | `Timestamp(µs, UTC)` |
+| `BINARY` (`VARBINARY`, `BINARY VARYING`) | `base64Binary` | `Binary` |
+
+A column with no declared `type` accepts any value and is checked per value. The specification leaves an unknown or incompatible value undefined; **we reject it** with an invalid-ViewDefinition error naming the column, in every emitter, rather than silently producing a column different from the one requested. This includes a tag whose `value` is not a string (for example `42`): the raw JSON is checked before the typed ViewDefinition is built, so the error names the column instead of being a generic deserialization failure. Likewise, a value that does not fit the requested type (a partial date such as `1980` with `DATE`, invalid base64, an integer outside the `INT` range) is an error naming the column, never `NULL`. Only the Parquet / Arrow and `sqlquery` SQLite emitters change the stored type; JSON, NDJSON and CSV keep their shape.
+
+**Breaking change (Parquet / Arrow IPC).** `decimal` columns change from `FLOAT64` to `UTF8`, `instant` from `UTF8` to `TIMESTAMP(µs, UTC)`, `integer64` from a truncated `INT32` to `INT64` and `base64Binary` from `UTF8` to `BINARY`. Collection columns of non-string types previously declared one type and built another. To keep a numeric decimal column, add `"tag": [{ "name": "ansi/type", "value": "DOUBLE PRECISION" }]`.
 
 ## Performance
 

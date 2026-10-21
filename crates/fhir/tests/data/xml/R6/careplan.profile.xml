@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="CarePlan"/>
   <meta>
-    <lastUpdated value="2026-09-14T16:43:45.341+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -433,7 +433,8 @@
             <a href="references.html#CodeableReference">CodeableReference</a>(
             <a href="condition.html">Condition</a> | 
             <a href="procedure.html">Procedure</a> | 
-            <a href="medicationadministration.html">MedicationAdministration</a>)
+            <a href="medicationadministration.html">MedicationAdministration</a> | 
+            <a href="observation.html">Observation</a>)
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Health issues this plan addresses
             <br/>Binding: 
@@ -622,7 +623,7 @@
   <name value="CarePlan"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-09-14T16:43:45+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Patient Care"/>
   <contact>
     <telecom>
@@ -1633,6 +1634,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Condition"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Procedure"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/MedicationAdministration"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Observation"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -2497,6 +2499,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Condition"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Procedure"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/MedicationAdministration"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Observation"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>

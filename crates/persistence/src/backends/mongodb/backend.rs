@@ -13,6 +13,7 @@ use tokio::sync::OnceCell;
 
 use helios_fhir::FhirVersion;
 
+use super::missing_index_builder::MissingIndexBuilder;
 use super::search_index_builder::{BuildOutcome, IndexBuildMode, SearchIndexBuilder};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageError, StorageResult};
@@ -101,6 +102,13 @@ pub struct MongoBackend {
     /// `&self`; never held across an `.await`.
     search_index_tx:
         Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<Option<BuildOutcome>>>>>,
+    /// Publishes the post-boot `idx_resources_missing_params` build's outcome
+    /// (#2001), from its own task so a long `resources` build never delays
+    /// the `search_index` outcome. `None` until that task finishes.
+    missing_index_rx: tokio::sync::watch::Receiver<Option<BuildOutcome>>,
+    /// The sending half, taken by `init_schema` alongside `search_index_tx`.
+    missing_index_tx:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<Option<BuildOutcome>>>>>,
     /// Rayon pool for `$reindex` sub-batch extraction; built lazily and only
     /// on a multi-thread runtime (#1403). `Err` remembers a failed build so
     /// the one warning fires once.
@@ -116,6 +124,11 @@ pub struct MongoBackend {
     reindex_mode_logged: std::sync::atomic::AtomicBool,
     /// Bounds how many transaction Bundles run at once (#1776).
     transaction_bundle_gate: super::transaction_bundle_gate::TransactionBundleGate,
+    /// The resolved [`MongoBackendConfig::transaction_bundle_deferred_index_entries`]:
+    /// a Bundle of at least this many entries writes its search rows after the
+    /// commit; `None` never defers (#1975). Read through
+    /// [`MongoBackend::deferred_search_index_min_entries`].
+    deferred_index_min_entries: Option<usize>,
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
     reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
@@ -189,7 +202,10 @@ impl MongoBackend {
 }
 
 /// Configuration for the MongoDB backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the connection string's credentials and options
+/// never reach a log line (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MongoBackendConfig {
     /// Samples eligible no-total offsets and caches their execution strategy.
     /// `false` disables adaptive offset selection; other search plans are unchanged.
@@ -200,6 +216,11 @@ pub struct MongoBackendConfig {
     /// Does not bound network latency or resource/count execution.
     #[serde(default = "default_probe_timeout_ms")]
     pub probe_timeout_ms: u64,
+
+    /// Soft MongoDB search budget, checked at command and matching-batch boundaries.
+    /// Unset preserves unbounded backend execution. The HTTP timeout is separate.
+    #[serde(default)]
+    pub search_timeout_ms: Option<u64>,
 
     /// MongoDB connection string.
     #[serde(default = "default_connection_string")]
@@ -364,12 +385,36 @@ pub struct MongoBackendConfig {
     /// entry and at most the whole room, so a Bundle larger than the room is
     /// admitted alone. `0` counts every Bundle as one slot (the #1776
     /// behaviour). A Bundle that takes the whole room runs alone and is not
-    /// replayed after an eviction rollback; it answers like
-    /// `TransactionTooLargeForCache` (388) does (#1895).
+    /// replayed after an eviction rollback; it ends as `TooLargeForCache` like
+    /// `TransactionTooLargeForCache` (388) does (#1895), with a text that does not
+    /// promise a resubmit fails (#1993).
     ///
     /// Default 1000.
     #[serde(default = "default_transaction_bundle_weight_entries")]
     pub transaction_bundle_weight_entries: usize,
+
+    /// Bundles with at least this many entries write their `search_index` /
+    /// `search_index_contained` rows after the commit instead of inside the
+    /// transaction (#1975;
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES`).
+    ///
+    /// The rows are about 18.6 per entry and dominate what a Bundle holds in
+    /// the WiredTiger cache until it commits, so writing them afterwards lifts
+    /// the size at which the server rolls the Bundle back for eviction. The
+    /// transaction records the affected resources in a durable ledger instead,
+    /// and a repair pass finishes any Bundle whose post-commit write did not.
+    ///
+    /// An embedder other than `hfs` must call
+    /// [`MongoBackend::repair_deferred_search_index`] periodically (`hfs` does
+    /// so at startup and every interval), or set this to `Some(0)`. Otherwise
+    /// the rows a crash or a deadline cut left unwritten are never written.
+    ///
+    /// `None` (default) follows the admission room
+    /// (`max_concurrent_transaction_bundles` × `transaction_bundle_weight_entries`,
+    /// 4,000 by default), or 4,000 when the gate is off or counts Bundles.
+    /// `Some(0)` never defers. Ignored while search is offloaded.
+    #[serde(default)]
+    pub transaction_bundle_deferred_index_entries: Option<usize>,
 
     /// Server execution budget, in milliseconds, sent as `maxTimeMS` on the
     /// cross-tenant `count_by_tenant` aggregate and on no other command (#1828;
@@ -407,6 +452,58 @@ pub struct MongoBackendConfig {
     /// rejects anything else.
     #[serde(default = "default_count_by_tenant_max_time_ms")]
     pub count_by_tenant_max_time_ms: u64,
+
+    /// Documents per cursor batch of a SQL-on-FHIR scan (#2161;
+    /// `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE`).
+    ///
+    /// Without a `batch_size` the server answers the first request with 101
+    /// documents and every `getMore` with up to 16 MiB, and the driver holds
+    /// each reply in memory until the consumer has drained it. A scan streams
+    /// its rows at the consumer's pace, so that window is pure buffering. This
+    /// bounds it to `batch size` documents per reply.
+    ///
+    /// The value is a trade-off. Lower means lower first-row latency on a
+    /// selective view: the driver applies one `batch_size` to the first batch
+    /// and every `getMore`, so the first row waits until the server has
+    /// matched a full batch (about 1.15 s at 512 on the 1.8M-row test, against
+    /// 0.24 s with no `batch_size`). Higher means fewer round trips, which
+    /// matters against a remote MongoDB (about 3,500 `getMore` per 1.8M rows at
+    /// 512, about 7,000 at 256).
+    ///
+    /// Memory: "well under 1 MiB" holds only for the projected view rows of
+    /// the in-database aggregate. The patient/group fallback `find` returns
+    /// full stored resources, so its buffer is bounded by this many resources
+    /// (still capped by the server's 16 MiB reply).
+    ///
+    /// Default 512. Must be between 1 and 100 000; [`MongoBackend::new`]
+    /// rejects anything else.
+    #[serde(default = "default_sof_cursor_batch_size")]
+    pub sof_cursor_batch_size: u32,
+}
+
+/// Environment variable that sets
+/// [`MongoBackendConfig::sof_cursor_batch_size`] (#2161).
+pub(crate) const SOF_CURSOR_BATCH_SIZE_ENV: &str = "HFS_MONGODB_SOF_CURSOR_BATCH_SIZE";
+
+/// Default [`MongoBackendConfig::sof_cursor_batch_size`]. Measured on a 1.8M-row
+/// collection on localhost: flat 37-40 MB peak RSS at every size tried, first
+/// row of a selective view 0.59 s at 256, 1.15 s at 512, 2.27 s at 1024.
+pub(crate) const DEFAULT_SOF_CURSOR_BATCH_SIZE: u32 = 512;
+
+/// Largest accepted [`MongoBackendConfig::sof_cursor_batch_size`].
+const MAX_SOF_CURSOR_BATCH_SIZE: u32 = 100_000;
+
+fn check_sof_cursor_batch_size(size: u32) -> Result<u32, String> {
+    if size == 0 || size > MAX_SOF_CURSOR_BATCH_SIZE {
+        return Err(format!(
+            "{SOF_CURSOR_BATCH_SIZE_ENV} must be between 1 and {MAX_SOF_CURSOR_BATCH_SIZE}; got {size}"
+        ));
+    }
+    Ok(size)
+}
+
+fn default_sof_cursor_batch_size() -> u32 {
+    DEFAULT_SOF_CURSOR_BATCH_SIZE
 }
 
 /// Environment variable that sets
@@ -431,11 +528,14 @@ fn check_count_by_tenant_max_time_ms(ms: u64) -> Result<Duration, String> {
 }
 
 impl MongoBackendConfig {
-    /// Applies `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (#1776) and
-    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (#1806) from `env`. Each
-    /// value is trimmed; an unset variable, or one empty after trimming, leaves
-    /// its field unchanged; anything but a non-negative integer is an `Err`
-    /// naming the variable.
+    /// Applies `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (#1776),
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (#1806) and
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (#1975) from
+    /// `env`. Each value is trimmed; an unset variable, or one empty after
+    /// trimming, leaves its field unchanged; anything but a non-negative
+    /// integer is an `Err` naming the variable. The deferred-index variable
+    /// also takes `off` (any case, the same as `0`: never defer) and `auto`
+    /// (follow the admission room).
     pub fn apply_transaction_bundle_env(
         &mut self,
         env: impl Fn(&str) -> Option<String>,
@@ -460,11 +560,27 @@ impl MongoBackendConfig {
                 })?;
             }
         }
+        if let Some(raw) = env("HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES") {
+            let raw = raw.trim();
+            if raw.eq_ignore_ascii_case("off") {
+                self.transaction_bundle_deferred_index_entries = Some(0);
+            } else if raw.eq_ignore_ascii_case("auto") {
+                self.transaction_bundle_deferred_index_entries = None;
+            } else if !raw.is_empty() {
+                self.transaction_bundle_deferred_index_entries =
+                    Some(raw.parse::<usize>().map_err(|_| {
+                        format!(
+                            "HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES must be a non-negative integer, \"auto\" or \"off\"; got {raw:?}"
+                        )
+                    })?);
+            }
+        }
         Ok(())
     }
 
-    /// Applies `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` from `env` (#1748). The
-    /// value is trimmed; an unset variable, or one empty after trimming,
+    /// Applies `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (#1748) and
+    /// `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` (1 to 100 000; #2161) from `env`.
+    /// Each value is trimmed; an unset variable, or one empty after trimming,
     /// leaves the field unchanged. Anything but a positive integer is an `Err`
     /// naming the variable.
     pub fn apply_search_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<(), String> {
@@ -482,11 +598,25 @@ impl MongoBackendConfig {
                 self.probe_timeout_ms = raw
                     .parse::<u64>()
                     .ok()
-                    .filter(|value| valid_probe_timeout_ms(*value))
+                    .filter(|value| valid_mongodb_timeout_ms(*value))
                     .ok_or_else(|| {
                         "HFS_MONGODB_PROBE_TIMEOUT_MS must be an integer from 1 to 2147483647"
                             .to_owned()
                     })?;
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_SEARCH_TIMEOUT_MS") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.search_timeout_ms = Some(
+                    raw.parse::<u64>()
+                        .ok()
+                        .filter(|value| valid_mongodb_timeout_ms(*value))
+                        .ok_or_else(|| {
+                            "HFS_MONGODB_SEARCH_TIMEOUT_MS must be an integer from 1 to 2147483647"
+                                .to_owned()
+                        })?,
+                );
             }
         }
         use super::search_admission::BROAD_SEARCH_CONCURRENCY_ENV;
@@ -503,6 +633,15 @@ impl MongoBackendConfig {
                         )
                     })?;
                 self.broad_search_concurrency = Some(limit);
+            }
+        }
+        if let Some(raw) = env(SOF_CURSOR_BATCH_SIZE_ENV) {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                let size = raw.parse::<u32>().map_err(|_| {
+                    format!("{SOF_CURSOR_BATCH_SIZE_ENV} must be a positive integer; got {raw:?}")
+                })?;
+                self.sof_cursor_batch_size = check_sof_cursor_batch_size(size)?;
             }
         }
         Ok(())
@@ -617,7 +756,7 @@ fn default_probe_timeout_ms() -> u64 {
     super::search_impl::DEFAULT_PROBE_TIMEOUT_MS
 }
 
-fn valid_probe_timeout_ms(value: u64) -> bool {
+fn valid_mongodb_timeout_ms(value: u64) -> bool {
     (1..=i32::MAX as u64).contains(&value)
 }
 
@@ -641,11 +780,87 @@ fn default_count_by_tenant_max_time_ms() -> u64 {
     DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS
 }
 
+impl Debug for MongoBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            adaptive_offset_paging,
+            probe_timeout_ms,
+            search_timeout_ms,
+            connection_string,
+            database_name,
+            max_connections,
+            connect_timeout_ms,
+            server_selection_timeout_ms,
+            fhir_version,
+            data_dir,
+            search_offloaded,
+            max_included_resources,
+            app_name,
+            index_build,
+            reindex_catch_up_margin_ms,
+            reindex_overlap,
+            reindex_prepare_threads,
+            reindex_prefetch,
+            bundle_transaction_budget,
+            bundle_transaction_deadline,
+            max_concurrent_transaction_bundles,
+            broad_search_concurrency,
+            transaction_bundle_weight_entries,
+            transaction_bundle_deferred_index_entries,
+            count_by_tenant_max_time_ms,
+            sof_cursor_batch_size,
+        } = self;
+        f.debug_struct("MongoBackendConfig")
+            .field("adaptive_offset_paging", adaptive_offset_paging)
+            .field("probe_timeout_ms", probe_timeout_ms)
+            .field("search_timeout_ms", search_timeout_ms)
+            .field(
+                "connection_string",
+                &crate::core::database_url::redact_database_url(connection_string, "mongodb"),
+            )
+            .field("database_name", database_name)
+            .field("max_connections", max_connections)
+            .field("connect_timeout_ms", connect_timeout_ms)
+            .field("server_selection_timeout_ms", server_selection_timeout_ms)
+            .field("fhir_version", fhir_version)
+            .field("data_dir", data_dir)
+            .field("search_offloaded", search_offloaded)
+            .field("max_included_resources", max_included_resources)
+            .field("app_name", app_name)
+            .field("index_build", index_build)
+            .field("reindex_catch_up_margin_ms", reindex_catch_up_margin_ms)
+            .field("reindex_overlap", reindex_overlap)
+            .field("reindex_prepare_threads", reindex_prepare_threads)
+            .field("reindex_prefetch", reindex_prefetch)
+            .field("bundle_transaction_budget", bundle_transaction_budget)
+            .field("bundle_transaction_deadline", bundle_transaction_deadline)
+            .field(
+                "max_concurrent_transaction_bundles",
+                max_concurrent_transaction_bundles,
+            )
+            .field("broad_search_concurrency", broad_search_concurrency)
+            .field(
+                "transaction_bundle_weight_entries",
+                transaction_bundle_weight_entries,
+            )
+            .field(
+                "transaction_bundle_deferred_index_entries",
+                transaction_bundle_deferred_index_entries,
+            )
+            .field("count_by_tenant_max_time_ms", count_by_tenant_max_time_ms)
+            .field("sof_cursor_batch_size", sof_cursor_batch_size)
+            .finish()
+    }
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
             adaptive_offset_paging: default_adaptive_offset_paging(),
             probe_timeout_ms: default_probe_timeout_ms(),
+            search_timeout_ms: None,
             connection_string: default_connection_string(),
             database_name: default_database_name(),
             max_connections: default_max_connections(),
@@ -666,7 +881,9 @@ impl Default for MongoBackendConfig {
             max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
             broad_search_concurrency: None,
             transaction_bundle_weight_entries: default_transaction_bundle_weight_entries(),
+            transaction_bundle_deferred_index_entries: None,
             count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
+            sof_cursor_batch_size: default_sof_cursor_batch_size(),
         }
     }
 }
@@ -727,13 +944,30 @@ impl MongoBackend {
     /// Creates a new MongoDB backend from the provided configuration.
     pub fn new(config: MongoBackendConfig) -> StorageResult<Self> {
         Self::validate_connection_string(&config.connection_string)?;
-        if !valid_probe_timeout_ms(config.probe_timeout_ms) {
+        if !valid_mongodb_timeout_ms(config.probe_timeout_ms) {
             return Err(StorageError::Backend(BackendError::Internal {
                 backend_name: "mongodb".to_owned(),
                 message: "probe_timeout_ms must be an integer from 1 to 2147483647".to_owned(),
                 source: None,
             }));
         }
+        if config
+            .search_timeout_ms
+            .is_some_and(|value| !valid_mongodb_timeout_ms(value))
+        {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_owned(),
+                message: "search_timeout_ms must be an integer from 1 to 2147483647".to_owned(),
+                source: None,
+            }));
+        }
+        check_sof_cursor_batch_size(config.sof_cursor_batch_size).map_err(|message| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message,
+                source: None,
+            })
+        })?;
         check_count_by_tenant_max_time_ms(config.count_by_tenant_max_time_ms).map_err(
             |message| {
                 StorageError::Backend(BackendError::Internal {
@@ -788,10 +1022,16 @@ impl MongoBackend {
         };
 
         let (search_index_tx, search_index_rx) = tokio::sync::watch::channel(None::<BuildOutcome>);
+        let (missing_index_tx, missing_index_rx) =
+            tokio::sync::watch::channel(None::<BuildOutcome>);
 
         let transaction_bundle_gate = super::transaction_bundle_gate::TransactionBundleGate::new(
             config.max_concurrent_transaction_bundles,
             config.transaction_bundle_weight_entries,
+        );
+        let deferred_index_min_entries = super::deferred_index::resolve_deferred_index_min_entries(
+            config.transaction_bundle_deferred_index_entries,
+            transaction_bundle_gate.entry_capacity(),
         );
 
         Ok(Self {
@@ -802,9 +1042,12 @@ impl MongoBackend {
             stored_by_tenant,
             search_index_rx,
             search_index_tx: Arc::new(tokio::sync::Mutex::new(Some(search_index_tx))),
+            missing_index_rx,
+            missing_index_tx: Arc::new(tokio::sync::Mutex::new(Some(missing_index_tx))),
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
             transaction_bundle_gate,
+            deferred_index_min_entries,
             broad_search_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -835,8 +1078,12 @@ impl MongoBackend {
     /// - `HFS_MONGODB_REINDEX_PREPARE_THREADS` (default: `0` = cores − 1, 1–4)
     /// - `HFS_MONGODB_REINDEX_PREFETCH` (default: `true`)
     /// - `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (default: 4; 0 = no limit)
+    /// - `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (default: auto = the
+    ///   admission room, 4000; off/0 = never). A caller other than `hfs` that leaves
+    ///   this on must call `MongoBackend::repair_deferred_search_index` periodically.
     /// - `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (default: unset, no limit)
     /// - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` (default: `25000`)
+    /// - `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` (default: `512`; 1 to 100000)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -915,8 +1162,8 @@ impl MongoBackend {
         }
 
         if !Self::looks_like_mongodb_uri(uri) {
+            // Malformed connection strings may contain credentials (#2139).
             tracing::warn!(
-                uri = %uri,
                 "MongoDB connection string does not start with mongodb:// or mongodb+srv://"
             );
         }
@@ -1031,10 +1278,20 @@ impl MongoBackend {
     /// which moves any contained rows out of `search_index` first, in every
     /// mode (#1160): spawned and left running in `background` mode, awaited
     /// in `inline` mode, and only inspected in `off` mode (see
-    /// `IndexBuildMode`).
+    /// `IndexBuildMode`). `idx_resources_missing_params` follows the same
+    /// mode from its own task, `MissingIndexBuilder` (#2001).
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
         schema::initialize_schema_async(&db).await?;
+
+        let missing_tx = self.missing_index_tx.lock().await.take();
+        let missing_handle = missing_tx.map(|tx| {
+            let builder = MissingIndexBuilder::new(db.clone(), self.config.index_build);
+            tokio::spawn(async move {
+                let outcome = builder.run().await;
+                let _ = tx.send(Some(outcome));
+            })
+        });
 
         // Taken once: `init_schema` runs once per backend instance (boot). A
         // second call finds `None` here and skips spawning another build —
@@ -1066,6 +1323,25 @@ impl MongoBackend {
             }
         }
 
+        if let Some(handle) = missing_handle
+            && self.config.index_build == IndexBuildMode::Inline
+        {
+            handle.await.map_err(|e| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message: format!("missing_params index build task panicked: {e}"),
+                    source: None,
+                })
+            })?;
+            if let Some(BuildOutcome::Failed { message }) = self.missing_index_rx.borrow().clone() {
+                return Err(StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message,
+                    source: None,
+                }));
+            }
+        }
+
         // Populate the per-tenant stored-param cache so the registries can build
         // each tenant's overlay lazily.
         self.reload_stored_cache().await?;
@@ -1080,6 +1356,37 @@ impl MongoBackend {
             self.search_index_rx.borrow().as_ref(),
             Some(BuildOutcome::UpToDate | BuildOutcome::Built { .. })
         )
+    }
+
+    /// `:missing=true` may use `missing_params` metadata, and hint
+    /// `idx_resources_missing_params`, only once `MissingIndexBuilder` has
+    /// confirmed the index is built and visible (#2001). Until then it takes
+    /// the value-index route, which returns the same results.
+    pub(super) fn missing_params_index_ready(&self) -> bool {
+        matches!(
+            self.missing_index_rx.borrow().as_ref(),
+            Some(BuildOutcome::UpToDate | BuildOutcome::Built { .. })
+        )
+    }
+
+    /// Waits for the post-boot `idx_resources_missing_params` build started
+    /// by `init_schema` and returns its outcome; `None` if `init_schema` has
+    /// not run. Same contract as [`Self::wait_for_search_index_build`].
+    pub async fn wait_for_missing_index_build(&self) -> Option<BuildOutcome> {
+        if self.missing_index_tx.lock().await.is_some() {
+            return None;
+        }
+        let mut rx = self.missing_index_rx.clone();
+        loop {
+            if let Some(outcome) = rx.borrow().clone() {
+                return Some(outcome);
+            }
+            if rx.changed().await.is_err() {
+                return Some(BuildOutcome::Failed {
+                    message: "missing_params index build task ended without reporting".to_string(),
+                });
+            }
+        }
     }
 
     /// Waits for the post-boot `search_index` build started by `init_schema`
@@ -1335,6 +1642,21 @@ impl MongoBackend {
     /// Sets the search-offloaded flag.
     pub fn set_search_offloaded(&mut self, offloaded: bool) {
         self.config.search_offloaded = offloaded;
+    }
+
+    /// The entry count from which a transaction Bundle writes its search rows
+    /// after the commit (#1975), or `None` when no Bundle does.
+    ///
+    /// Resolved once from
+    /// [`MongoBackendConfig::transaction_bundle_deferred_index_entries`] and
+    /// the admission room. `None` while search is offloaded, because the
+    /// offloaded backend writes no rows in the transaction to defer; that is
+    /// checked on every call, as the composite sets the flag after construction.
+    pub fn deferred_search_index_min_entries(&self) -> Option<usize> {
+        if self.is_search_offloaded() {
+            return None;
+        }
+        self.deferred_index_min_entries
     }
 }
 
@@ -1809,6 +2131,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn config_debug_redacts_connection_string_credentials() {
+        let config = MongoBackendConfig {
+            connection_string:
+                "mongodb://admin:m0ngo-s3cret@mongo.internal:27017/fhir?authSource=x-opt-tok"
+                    .to_string(),
+            database_name: "fhir_db".to_string(),
+            ..Default::default()
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("m0ngo-s3cret"), "password leaked: {out}");
+        assert!(!out.contains("admin"), "user leaked: {out}");
+        assert!(!out.contains("x-opt-tok"), "options leaked: {out}");
+        assert!(out.contains("mongo.internal"), "{out}");
+        assert!(out.contains("fhir_db"), "{out}");
+    }
+
+    #[test]
     fn app_name_defaults_to_the_historical_constant() {
         assert_eq!(MongoBackendConfig::default().app_name, "helios-persistence");
     }
@@ -2009,6 +2348,93 @@ mod tests {
     }
 
     #[test]
+    fn search_deadline_configuration_is_optional_and_validated() {
+        assert_eq!(MongoBackendConfig::default().search_timeout_ms, None);
+        for initial in [None, Some(2500)] {
+            for value in [None, Some(""), Some("  ")] {
+                let mut config = MongoBackendConfig {
+                    search_timeout_ms: initial,
+                    ..Default::default()
+                };
+                config
+                    .apply_search_env(|name| {
+                        (name == "HFS_MONGODB_SEARCH_TIMEOUT_MS")
+                            .then_some(value)
+                            .flatten()
+                            .map(str::to_owned)
+                    })
+                    .unwrap();
+                assert_eq!(config.search_timeout_ms, initial);
+            }
+        }
+        for (value, expected) in [("1", 1), (" 2500 ", 2500), ("2147483647", i32::MAX as u64)] {
+            let mut config = MongoBackendConfig::default();
+            config
+                .apply_search_env(|name| {
+                    (name == "HFS_MONGODB_SEARCH_TIMEOUT_MS").then(|| value.to_owned())
+                })
+                .unwrap();
+            assert_eq!(config.search_timeout_ms, Some(expected));
+            assert!(MongoBackend::new(config).is_ok());
+        }
+        for value in [
+            "0",
+            "-1",
+            "1.5",
+            "false",
+            "2147483648",
+            "18446744073709551616",
+        ] {
+            assert!(
+                MongoBackendConfig::default()
+                    .apply_search_env(
+                        |name| (name == "HFS_MONGODB_SEARCH_TIMEOUT_MS").then(|| value.to_owned())
+                    )
+                    .is_err()
+            );
+        }
+        for value in [0, i32::MAX as u64 + 1, u64::MAX] {
+            assert!(
+                MongoBackend::new(MongoBackendConfig {
+                    search_timeout_ms: Some(value),
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_deadline_expires_in_admission_without_database_work() {
+        use crate::core::SearchProvider;
+        let backend = MongoBackend::new(MongoBackendConfig {
+            search_timeout_ms: Some(20),
+            broad_search_concurrency: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let gate = backend.broad_search_gate().unwrap();
+        let held = gate.acquire().await.unwrap();
+        let tenant = crate::tenant::TenantContext::new(
+            crate::tenant::TenantId::new("deadline"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let query = crate::types::SearchQuery::new("Patient");
+        let result = backend.search_count(&tenant, &query).await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::Timeout { .. }))
+        ));
+        assert!(
+            backend.client.get().is_none(),
+            "admission expiry must not initialize MongoDB"
+        );
+        drop(held);
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[test]
     fn probe_timeout_configuration_preserves_defaults_and_validates_values() {
         assert_eq!(MongoBackendConfig::default().probe_timeout_ms, 10);
         for raw in [None, Some(""), Some("  ")] {
@@ -2160,6 +2586,52 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serializes");
         let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.count_by_tenant_max_time_ms, 1_500);
+    }
+
+    #[test]
+    fn sof_cursor_batch_size_defaults_parses_and_rejects() {
+        let default = MongoBackendConfig::default();
+        assert_eq!(default.sof_cursor_batch_size, 512);
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(from_empty.sof_cursor_batch_size, 512);
+
+        let mut config = MongoBackendConfig::default();
+        config
+            .apply_search_env(|name| (name == SOF_CURSOR_BATCH_SIZE_ENV).then(|| " 1024 ".into()))
+            .expect("valid value");
+        assert_eq!(config.sof_cursor_batch_size, 1024);
+        for edge in ["1", "100000"] {
+            config
+                .apply_search_env(|name| (name == SOF_CURSOR_BATCH_SIZE_ENV).then(|| edge.into()))
+                .expect("range edge");
+            assert_eq!(config.sof_cursor_batch_size.to_string(), edge);
+        }
+
+        let mut config = MongoBackendConfig {
+            sof_cursor_batch_size: 64,
+            ..Default::default()
+        };
+        config
+            .apply_search_env(|name| (name == SOF_CURSOR_BATCH_SIZE_ENV).then(|| "  ".into()))
+            .expect("blank is ignored");
+        config.apply_search_env(|_| None).expect("unset is ignored");
+        assert_eq!(config.sof_cursor_batch_size, 64);
+
+        for invalid in ["0", "-1", "many", "1.5", "100001", "4294967296"] {
+            let err = MongoBackendConfig::default()
+                .apply_search_env(|name| {
+                    (name == SOF_CURSOR_BATCH_SIZE_ENV).then(|| invalid.into())
+                })
+                .expect_err("invalid value");
+            assert!(err.contains(SOF_CURSOR_BATCH_SIZE_ENV), "{invalid}: {err}");
+        }
+
+        let rejected = MongoBackend::new(MongoBackendConfig {
+            sof_cursor_batch_size: 0,
+            ..Default::default()
+        });
+        assert!(rejected.is_err(), "zero batch size must be refused");
     }
 
     #[test]
@@ -2571,5 +3043,126 @@ mod tests {
                 .expect_err("a non-negative integer is required");
             assert!(err.contains(VAR), "{err}");
         }
+    }
+
+    #[test]
+    fn config_transaction_bundle_deferred_index_entries_defaults_to_auto_and_round_trips() {
+        assert_eq!(
+            MongoBackendConfig::default().transaction_bundle_deferred_index_entries,
+            None
+        );
+        let from_empty: MongoBackendConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty.transaction_bundle_deferred_index_entries, None);
+
+        let set = MongoBackendConfig {
+            transaction_bundle_deferred_index_entries: Some(5),
+            ..Default::default()
+        };
+        let back: MongoBackendConfig =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.transaction_bundle_deferred_index_entries, Some(5));
+    }
+
+    #[test]
+    fn apply_transaction_bundle_env_reads_the_deferred_index_entries() {
+        const VAR: &str = "HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES";
+        let with = |value: &'static str| move |name: &str| (name == VAR).then(|| value.to_string());
+
+        let mut config = MongoBackendConfig {
+            transaction_bundle_deferred_index_entries: Some(7),
+            ..Default::default()
+        };
+        config.apply_transaction_bundle_env(|_| None).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(7));
+        config.apply_transaction_bundle_env(with("  ")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(7));
+
+        // `auto` goes back to following the admission room.
+        config.apply_transaction_bundle_env(with("auto")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, None);
+
+        // `off` and `0` both mean never defer.
+        config.apply_transaction_bundle_env(with("off")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(0));
+        config.transaction_bundle_deferred_index_entries = None;
+        config.apply_transaction_bundle_env(with("OFF")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(0));
+        config.transaction_bundle_deferred_index_entries = None;
+        config.apply_transaction_bundle_env(with("0")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(0));
+
+        config.apply_transaction_bundle_env(with(" 5000 ")).unwrap();
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(5000));
+
+        let err = config
+            .apply_transaction_bundle_env(with("many"))
+            .expect_err("a non-integer must be rejected");
+        assert!(err.contains(VAR), "{err}");
+        // A rejected value leaves the field as it was.
+        assert_eq!(config.transaction_bundle_deferred_index_entries, Some(5000));
+
+        // The other two variables are not touched by it.
+        assert_eq!(config.max_concurrent_transaction_bundles, 4);
+        assert_eq!(config.transaction_bundle_weight_entries, 1000);
+    }
+
+    #[test]
+    fn deferred_search_index_min_entries_follows_the_room_and_offload() {
+        let min_entries = |config: MongoBackendConfig| {
+            MongoBackend::new(config)
+                .expect("a lazy backend needs no connection")
+                .deferred_search_index_min_entries()
+        };
+
+        // Default gate: 4 x 1,000.
+        assert_eq!(min_entries(MongoBackendConfig::default()), Some(4000));
+        // Follows the room of a small entry-weighted gate.
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                max_concurrent_transaction_bundles: 1,
+                transaction_bundle_weight_entries: 2,
+                ..Default::default()
+            }),
+            Some(2)
+        );
+        // A gate that is off or counts Bundles has no entry room: the default.
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                max_concurrent_transaction_bundles: 0,
+                ..Default::default()
+            }),
+            Some(4000)
+        );
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                transaction_bundle_weight_entries: 0,
+                ..Default::default()
+            }),
+            Some(4000)
+        );
+        // `Some(0)` never defers; any other value is taken as is.
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                transaction_bundle_deferred_index_entries: Some(0),
+                ..Default::default()
+            }),
+            None
+        );
+        assert_eq!(
+            min_entries(MongoBackendConfig {
+                transaction_bundle_deferred_index_entries: Some(9),
+                ..Default::default()
+            }),
+            Some(9)
+        );
+
+        // Offloaded search writes no rows in the transaction to defer; the
+        // composite sets the flag after construction, so it is read live.
+        let mut backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        assert_eq!(backend.deferred_search_index_min_entries(), Some(4000));
+        backend.set_search_offloaded(true);
+        assert_eq!(backend.deferred_search_index_min_entries(), None);
+        backend.set_search_offloaded(false);
+        assert_eq!(backend.deferred_search_index_min_entries(), Some(4000));
     }
 }

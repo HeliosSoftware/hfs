@@ -256,12 +256,14 @@ exactly as `Patient/<id>/$everything` does: a missing patient is 404, a deleted
 one 410, and next links stay on the type-level URL. Without the claim, or with a
 value of any other form (ignored, logged at debug), every patient the caller can
 see is walked. Narrowing applies whatever the token's scope context; the
-instance-level operation is unchanged. This narrowing is not an authorization
-boundary: a patient-context token can still read other patients through the
-instance-level operation or search until #1618, and an unusable `patient` value
-falls back to walking every patient rather than rejecting the request.
-`patient/` scope and compartment enforcement for search, read and `$export` is
-tracked in [#1618](https://github.com/HeliosSoftware/hfs/issues/1618).
+instance-level operation is unchanged.
+
+The authorization boundary is the scope context (#1618): when the token's
+grant rests on a `patient/` scope, `Patient/{id}/$everything` for any other
+patient is `403`, and a token whose `patient` claim is missing or unusable is
+refused rather than widened. A `user/` or `system/` grant is not confined, and
+for it an unusable `patient` value still falls back to walking every patient.
+See [Patient scopes in the auth README](../auth/README.md#patient-scopes).
 
 Supported on every backend that supports search (SQLite, PostgreSQL,
 MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
@@ -276,7 +278,7 @@ The server is configured via environment variables:
 | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `HFS_LOG_LEVEL` | info | Log level |
 | `HFS_MAX_BODY_SIZE` | 134217728 | Max request body (bytes; applies to the decompressed body for compressed requests). 128 MiB covers the largest per-patient Synthea Bundle (#1662); lower it on small hosts. Large bundles take minutes to process, so raise `HFS_REQUEST_TIMEOUT` too |
-| `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
+| `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds). It bounds the handler, not a streamed body: a `$sql-run` (ViewDefinition subject) that streams parquet, arrow, json, csv or fhir is no longer bounded after the first 100 rows |
 | `HFS_DASHBOARD_RECONCILE_SECS` | 30 | Seconds between dashboard count reconcile passes (whole seconds, > 0; `0` or non-numeric fails startup) |
 | `HFS_DASHBOARD_REFRESH_SECS` | 5 | Seconds between refreshes of a Home dashboard whose figures are moving (whole seconds, > 0, <= `HFS_DASHBOARD_IDLE_REFRESH_SECS`) |
 | `HFS_DASHBOARD_IDLE_REFRESH_SECS` | 10 | Seconds between watch ticks of a Home dashboard whose figures are settled (whole seconds, > 0, >= `HFS_DASHBOARD_REFRESH_SECS`) |
@@ -348,7 +350,7 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 | `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local-FS output root. |
 | `HFS_BULK_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
 | `HFS_BULK_EXPORT_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO). |
-| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers. |
+| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers. Forced on when `HFS_BULK_EXPORT_S3_ENDPOINT` is set. |
 | `HFS_BULK_EXPORT_S3_REGION` | *(falls back to `HFS_S3_REGION`, then AWS chain)* | AWS region override for export output. |
 | `HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`** (no pre-signed URLs). |
 | `HFS_BULK_EXPORT_FILE_URL_TTL` | `3600` | Pre-signed download-URL lifetime, seconds. |
@@ -366,6 +368,12 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 
 A runnable multi-instance stack (HFS + PostgreSQL + MinIO + Keycloak) is provided
 as a compose example in [`docker/bulk-export/`](../../docker/bulk-export/README.md).
+
+Under a `patient/` scope (#1618) only `Patient/$export` is available, pinned to
+the token's launch patient: a `patient` parameter naming anyone else is `403`,
+as are system-level `/$export`, `Group/{id}/$export` and a `_type` outside the
+Patient compartment. See [Patient scopes in the auth
+README](../auth/README.md#patient-scopes).
 
 ### Bulk Data Submit
 
@@ -436,6 +444,9 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Status-artifact store: `local-fs` or `s3`. |
 | `HFS_BULK_SUBMIT_OUTPUT_DIR` | `${HFS_DATA_DIR}/submit` | Local-FS artifact root. |
 | `HFS_BULK_SUBMIT_S3_BUCKET` | *(none)* | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
+| `HFS_BULK_SUBMIT_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO). Blank is treated as unset. |
+| `HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers; forced on when `HFS_BULK_SUBMIT_S3_ENDPOINT` is set. |
+| `HFS_BULK_SUBMIT_S3_REGION` | *(falls back to `HFS_S3_REGION`, then AWS chain)* | AWS region override for submit artifacts. |
 | `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`.** |
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact-URL lifetime, seconds. |
 | `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention after completion, seconds. |
@@ -471,7 +482,6 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 
 ```bash
 HFS_BULK_SUBMIT_DEFER_INDEXING=false       # index each committed batch during ingest
-HFS_ELASTICSEARCH_REFRESH_INTERVAL=30s     # the biggest lever: at 1s Elasticsearch spends its CPU refreshing
 HFS_ELASTICSEARCH_REINDEX_REFRESH=false
 HFS_ELASTICSEARCH_BULK_CONCURRENCY=4
 HFS_BULK_SUBMIT_BATCH_SIZE=1000
@@ -481,7 +491,7 @@ HFS_BULK_SUBMIT_INDEX_QUEUE=16             # bounds HFS memory
 HFS_PG_MAX_CONNECTIONS=32
 ```
 
-Leave `HFS_BULK_SUBMIT_INDEX_COALESCE`, `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` and `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` at their defaults. Plan for ~15 GB of HFS memory while a file of large resources (~100 KB each) is ingested. Resources the index rejects under load are marked unindexed and rebuilt one by one when the manifest completes. They are stored, so the completion manifest lists them in its `outcome` file as `warning`s (`incomplete`, "HFS starts a reindex that rebuilds its search index entries once the manifest completes; no manual $reindex is needed"), not as errors, and they are not counted in `failed_entries`; only a server without an automatic reindex reports them as `error`s asking for `POST /{type}/$reindex` (#1666). The warning points at `GET /$reindex-status/{job_id}` to follow that repair; the job id is in the `deferred reindex generation started` log line. Only if no such job started is a manual `POST /{type}/$reindex` needed. The log says `rebuilding search index entries for the resources the index rejected during ingest`, or `indexed every resource during ingest; no deferred reindex needed` when there were none.
+Leave `HFS_ELASTICSEARCH_REFRESH_INTERVAL` at its `1s` default. An earlier version of this block set it to `30s`, but the 1 h 45 min figure above came from a run that also carried other import fixes, so it was never isolated. Measured in isolation (#1749; `pg-es`, PostgreSQL 16, Elasticsearch 8.15.0, 8 CPU / 23 GB, 919,752 resources, 3 runs per value), the interval does not change the import time: `1s` 223 s, `5s` 220 s, `30s` 220 s on average (under 2 % apart, which is within run-to-run noise). It only lowers Elasticsearch's CPU (about 95 % at `1s`, about 40 % at `30s`). A long interval has a cost: with `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` every interactive write waits for the next refresh, and the server itself takes about 200 s to start on an empty cluster at `30s`, against 10 s at `1s`, because seeding the search parameters waits for refreshes too. `-1` together with `wait_for` never became ready in 10 minutes (three runs). The measurement at the full 18.96 M-resource scale is still open on #1749. Leave `HFS_BULK_SUBMIT_INDEX_COALESCE`, `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` and `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` at their defaults. Plan for ~15 GB of HFS memory while a file of large resources (~100 KB each) is ingested. Resources the index rejects under load are marked unindexed and rebuilt one by one when the manifest completes. They are stored, so the completion manifest lists them in its `outcome` file as `warning`s (`incomplete`, "HFS starts a reindex that rebuilds its search index entries once the manifest completes; no manual $reindex is needed"), not as errors, and they are not counted in `failed_entries`; only a server without an automatic reindex reports them as `error`s asking for `POST /{type}/$reindex` (#1666). The warning points at `GET /$reindex-status/{job_id}` to follow that repair; the job id is in the `deferred reindex generation started` log line. Only if no such job started is a manual `POST /{type}/$reindex` needed. The log says `rebuilding search index entries for the resources the index rejected during ingest`, or `indexed every resource during ingest; no deferred reindex needed` when there were none.
 
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
@@ -580,14 +590,16 @@ which subject failed without parsing the message.
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. Resolution stops with a `422` at the first node past this limit, before any further dependency is fetched. A Library may also declare at most 4 × this many `depends-on` entries (64 by default). |
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs (the subject's SQL and each SQL View's SQL). It does not cover materializing a dependency. |
 | `HFS_SOF_RUNNER_HEADER` | `false` | Add an `X-HFS-Runner` response header naming the runner that served a `$sql-run` ViewDefinition request (`sqlite-indb`, `postgres-indb`, `in-process`). Off by default: it discloses the storage backend; turn it on for debugging. |
-| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
+| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. Any other value fails startup, and `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false`. |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. Job directories and output files are created owner-only (`0700` / `0600`) on Unix. |
-| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
-| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`; startup fails without it. |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. Defaults to `us-east-1` when `HFS_EXPORT_S3_ENDPOINT` is set. |
+| `HFS_EXPORT_S3_ENDPOINT` | *(AWS)* | Custom S3 endpoint URL for the `s3` sink (e.g. MinIO). Must be an `http(s)` URL with a host, or startup fails. Setting it forces path-style addressing. |
+| `HFS_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Use path-style S3 addressing for the `s3` sink. Forced on when `HFS_EXPORT_S3_ENDPOINT` is set. |
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). Each URL is capped at the job's remaining `HFS_EXPORT_OUTPUT_TTL` retention (never below 60 s), so a late poll does not hand out a URL that outlives the object. |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
 | `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum export jobs one tenant may have queued or running at once (must be ≥ 1). A job counts from kick-off until its worker ends, so a job cancelled while it waits for an `HFS_EXPORT_MAX_CONCURRENCY` slot counts until its turn comes. Beyond it `$sql-export` answers `429 Too Many Requests` with `Retry-After: 5`. |
-| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. A ViewDefinition subject's rows are written as each shard fills, so it holds at most one shard in memory. A running view job keeps its row stream, and the storage connection or cursor behind it, open while it writes each shard, so keep `HFS_EXPORT_MAX_CONCURRENCY` below the storage connection pool size. |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. A ViewDefinition subject's rows are encoded as they arrive and written as each shard fills, so it holds at most one encoded shard in memory (the buffer can briefly reach about twice that while it grows by doubling). With `0` the whole output is one shard and stays in memory. A running view job keeps its row stream, and the storage connection or cursor behind it, open while it writes each shard, so keep `HFS_EXPORT_MAX_CONCURRENCY` below the storage connection pool size. |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`; a failed delete is retried on the next sweep. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
@@ -705,7 +717,7 @@ helios-rest = { version = "0.1", features = ["R4", "sqlite"] }
 - `R4` (default) - FHIR R4 (4.0.1)
 - `R4B` - FHIR R4B (4.3.0)
 - `R5` - FHIR R5 (5.0.0)
-- `R6` - FHIR R6 (6.0.0-ballot)
+- `R6` - FHIR R6 (6.0.0-snapshot1)
 
 ### Backends
 - `sqlite` (default) - SQLite (great for development)

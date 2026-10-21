@@ -353,6 +353,7 @@ mod tests {
                     left_join: false,
                     on_filter: None,
                     flat_index: Some(0),
+                    array_source: false,
                 }),
             }),
         };
@@ -381,6 +382,7 @@ mod tests {
             left_join: false,
             on_filter: None,
             flat_index: None,
+            array_source: false,
         };
         assert_eq!(
             OutputLimitStrategy::for_plan(&plan),
@@ -449,7 +451,8 @@ mod tests {
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["id"]);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.id') AS \"id\""),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.id') AS \"id\""),
             "{}",
             q.sql
         );
@@ -475,19 +478,20 @@ mod tests {
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["id", "gender", "dob"]);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.id') AS \"id\""),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.id') AS \"id\""),
             "{}",
             q.sql
         );
         assert!(
             q.sql
-                .contains("json_extract(r.data, '$.gender') AS \"gender\""),
+                .contains("json_extract(CAST(r.data AS TEXT), '$.gender') AS \"gender\""),
             "{}",
             q.sql
         );
         assert!(
             q.sql
-                .contains("json_extract(r.data, '$.birthDate') AS \"dob\""),
+                .contains("json_extract(CAST(r.data AS TEXT), '$.birthDate') AS \"dob\""),
             "{}",
             q.sql
         );
@@ -524,9 +528,10 @@ mod tests {
         });
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["family", "use"]);
-        // Type-guarded so a singleton object is not iterated member-wise.
+        // `Patient.name` repeats, so it is iterated in place.
         assert!(
-            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -551,8 +556,8 @@ mod tests {
         });
         let q = compile(view).unwrap();
         assert!(
-            q.sql.contains("LEFT JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')")
-                && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
+            q.sql
+                .contains("LEFT JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -572,7 +577,8 @@ mod tests {
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["id", "family"]);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.id') AS \"id\""),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.id') AS \"id\""),
             "{}",
             q.sql
         );
@@ -582,9 +588,10 @@ mod tests {
             "{}",
             q.sql
         );
-        // Type-guarded so a singleton object is not iterated member-wise.
+        // `Patient.name` repeats, so it is iterated in place.
         assert!(
-            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -657,12 +664,14 @@ mod tests {
         assert_eq!(q.columns, vec!["family", "city"]);
         // First unnest keeps the `fe` alias (legacy), second uses `fe2`.
         assert!(
-            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("END) fe ON"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON"),
             "{}",
             q.sql
         );
         assert!(
-            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.address') = 'array' THEN json_extract(r.data, '$.address')") && q.sql.contains("END) fe2 ON"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.address') fe2 ON"),
             "{}",
             q.sql
         );
@@ -682,10 +691,12 @@ mod tests {
         });
         let q = compile(view).unwrap();
         // SQLite truthy boundary doesn't use `IS TRUE` (which is strict-typed
-        // in some dialects) — it checks IS NOT NULL + non-zero / not 'false'.
-        assert!(q.sql.contains("IS NOT NULL"), "{}", q.sql);
+        // in some dialects) — it checks NOT IN (0, 'false'), which is NULL
+        // (filtered out) for a missing value.
+        assert!(q.sql.contains("NOT IN (0, 'false')"), "{}", q.sql);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.active')"),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.active')"),
             "{}",
             q.sql
         );
@@ -1359,7 +1370,7 @@ mod tests {
         let q = compile(view.clone()).unwrap();
         assert!(
             q.sql
-                .contains("(json_extract(r.data, '$.gender') = 'male')"),
+                .contains("(json_extract(CAST(r.data AS TEXT), '$.gender') = 'male')"),
             "{}",
             q.sql
         );
@@ -1511,6 +1522,51 @@ mod tests {
     }
 
     #[test]
+    fn test_integer64_decodes_as_integer() {
+        let d = decodes(condition_view(json!([
+            {"name": "a", "path": "id", "type": "integer64"},
+            {"name": "b", "path": "id", "type": "instant"},
+            {"name": "c", "path": "id", "type": "base64Binary"}
+        ])));
+        assert_eq!(
+            d,
+            vec![
+                ColumnDecode::Integer,
+                ColumnDecode::Text,
+                ColumnDecode::Text
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ansi_type_tag_is_validated_for_every_target() {
+        let view = |value: &str, ty: &str| {
+            json!({"resource": "Patient", "select": [{"column": [
+                {"name": "c", "path": "id", "type": ty,
+                 "tag": [{"name": "ansi/type", "value": value}]}
+            ]}]})
+        };
+        // Accepted tag: compiles for SQL and Mongo.
+        assert!(compile(view("VARCHAR", "integer")).is_ok());
+        #[cfg(feature = "mongodb")]
+        assert!(
+            compile_view_definition_mongo(&view("VARCHAR", "integer"), FhirVersion::R4).is_ok()
+        );
+        // Unknown and incompatible tags are rejected on both targets.
+        for bad in [view("NOPE", "string"), view("INT", "decimal")] {
+            assert!(matches!(
+                compile(bad.clone()),
+                Err(SofError::InvalidViewDefinition(_))
+            ));
+            #[cfg(feature = "mongodb")]
+            assert!(matches!(
+                compile_view_definition_mongo(&bad, FhirVersion::R4),
+                Err(SofError::InvalidViewDefinition(_))
+            ));
+        }
+    }
+
+    #[test]
     fn test_collection_column_is_json() {
         let d = decodes(condition_view(json!([
             {"name": "codes", "path": "code.coding.code", "type": "code", "collection": true}
@@ -1565,7 +1621,11 @@ mod tests {
                 ColumnDecode::Json
             ]
         );
-        assert!(q.sql.contains("(r.data -> '$.notAField')"), "{}", q.sql);
+        assert!(
+            q.sql.contains("(CAST(r.data AS TEXT) -> '$.notAField')"),
+            "{}",
+            q.sql
+        );
     }
 
     #[test]
@@ -1585,7 +1645,21 @@ mod tests {
                 ]}
             ]}]
         });
-        assert_eq!(decodes(view), vec![ColumnDecode::Text, ColumnDecode::Auto]);
+        let q = compile(view).unwrap();
+        // #1947: `b` differs between branches, so it is decoded as JSON and
+        // only the `string` branch needs wrapping to quote its value; the
+        // integer branch's text is already JSON.
+        assert_eq!(
+            q.column_decodes,
+            vec![ColumnDecode::Text, ColumnDecode::Json]
+        );
+        assert_eq!(
+            q.sql.matches("json_quote(CAST(\"b\" AS TEXT))").count(),
+            1,
+            "{}",
+            q.sql
+        );
+        assert_eq!(q.sql.matches(") AS _union_").count(), 1, "{}", q.sql);
     }
 
     #[test]

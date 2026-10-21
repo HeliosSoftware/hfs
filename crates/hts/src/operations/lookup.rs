@@ -37,12 +37,12 @@ use crate::state::{
     AppState, LOOKUP_HANDLER_CACHE_MAX, LookupHandlerCache, NOT_FOUND_CACHE_MAX, NotFoundCache,
 };
 use crate::traits::{SupplementInfo, TerminologyBackend};
-use crate::types::{DesignationValue, LookupRequest, PropertyValue};
+use crate::types::{DesignationValue, LookupRequest};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
     collect_str_params, extract_parameter_array, find_str_param, parse_query_string,
-    property_value_part, query_params_to_fhir_params,
+    property_value_part, query_params_to_fhir_params, split_versioned_canonical,
 };
 
 /// Build a canonical cache key for a `$lookup` request from its normalised
@@ -139,8 +139,11 @@ fn lookup_not_found_put(cache: &NotFoundCache, key: String) {
 /// not found, 501 when `expression` is supplied).
 async fn process_lookup<B: TerminologyBackend>(
     state: &AppState<B>,
-    params: Vec<Value>,
+    mut params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // `system=X|V` is looked up as `system=X` + `version=V` (#2122). Done
+    // before the cache key so both spellings share one entry.
+    split_versioned_canonical(&mut params, "system", "version");
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips supplement resolution, the backend `lookup` call, the
     // `code_system_language` lookup, and FHIR Parameters assembly when the
@@ -308,14 +311,13 @@ async fn process_lookup_inner<B: TerminologyBackend>(
             .await
             .unwrap_or_default();
         if let Some(list) = supp_props.get(&code) {
-            for (prop, value) in list {
-                resp.properties.push(PropertyValue {
-                    code: prop.clone(),
-                    value_type: "string".into(),
-                    value: value.clone(),
-                    description: None,
-                });
-            }
+            resp.properties
+                .extend(list.iter().cloned().map(|mut property| {
+                    if property.value_type != "Coding" {
+                        property.value_type = "string".into();
+                    }
+                    property
+                }));
         }
     }
 
@@ -349,7 +351,7 @@ async fn process_lookup_inner<B: TerminologyBackend>(
     }
 
     for prop in resp.properties {
-        let value_part = property_value_part(&prop.value_type, &prop.value);
+        let value_part = property_value_part(&prop.value_type, &prop.value)?;
         let mut parts = vec![json!({"name": "code", "valueCode": prop.code}), value_part];
         if let Some(desc) = prop.description {
             parts.push(json!({"name": "description", "valueString": desc}));
@@ -541,6 +543,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::backends::sqlite::SqliteTerminologyBackend;
+    use crate::import::BundleImportBackend;
     use crate::state::AppState;
 
     fn make_app() -> Router {
@@ -774,6 +777,117 @@ mod tests {
         let parts = prop_param["part"].as_array().unwrap();
         let code_part = parts.iter().find(|p| p["name"] == "code").unwrap();
         assert_eq!(code_part["valueCode"], "inactive");
+    }
+
+    #[tokio::test]
+    async fn lookup_round_trips_imported_coding_and_scalar_properties() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let coding = json!({
+            "system": "http://example.org/target", "version": "2026",
+            "code": "TARGET", "display": "Target concept", "userSelected": true,
+            "extension": [{"url": "http://example.org/note", "valueString": "detail"}]
+        });
+        let properties = json!([
+            {"code": "maps-to", "valueCoding": coding},
+            {"code": "status", "valueCode": "active"},
+            {"code": "inactive", "valueBoolean": false},
+            {"code": "rank", "valueInteger": 0},
+            {"code": "weight", "valueDecimal": 2.5},
+            {"code": "note", "valueString": "Example"},
+            {"code": "effective", "valueDateTime": "2026-01-01T00:00:00Z"},
+            {"code": "null-coding", "valueCoding": null},
+            {"code": "scalar-coding", "valueCoding": "TARGET"}
+        ]);
+        let bundle = json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [{"resource": {
+                "resourceType": "CodeSystem", "id": "property-round-trip",
+                "url": "http://example.org/property-round-trip", "version": "1",
+                "name": "PropertyRoundTrip", "status": "active", "content": "complete",
+                "property": [
+                    {"code": "maps-to", "type": "Coding"},
+                    {"code": "status", "type": "code"},
+                    {"code": "inactive", "type": "boolean"},
+                    {"code": "rank", "type": "integer"},
+                    {"code": "weight", "type": "decimal"},
+                    {"code": "note", "type": "string"},
+                    {"code": "effective", "type": "dateTime"},
+                    {"code": "null-coding", "type": "Coding"},
+                    {"code": "scalar-coding", "type": "Coding"}
+                ],
+                "concept": [{"code": "SOURCE", "display": "Source", "property": properties}]
+            }}]
+        });
+        let imported = backend
+            .import_bundle(&TenantContext::system(), bundle.to_string().as_bytes())
+            .await
+            .unwrap();
+        assert!(imported.errors.is_empty());
+        assert_eq!(imported.code_systems, 1);
+        assert_eq!(imported.concepts, 1);
+
+        let app = Router::new()
+            .route(
+                "/CodeSystem/$lookup",
+                post(lookup_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(AppState::new(backend));
+        let expected = [
+            ("maps-to", json!({"name": "value", "valueCoding": coding})),
+            ("status", json!({"name": "value", "valueCode": "active"})),
+            ("inactive", json!({"name": "value", "valueBoolean": false})),
+            ("rank", json!({"name": "value", "valueInteger": 0})),
+            ("weight", json!({"name": "value", "valueDecimal": 2.5})),
+            ("note", json!({"name": "value", "valueString": "Example"})),
+            (
+                "effective",
+                json!({"name": "value", "valueDateTime": "2026-01-01T00:00:00Z"}),
+            ),
+        ];
+        for filtered in [false, true] {
+            let mut parameters = vec![
+                json!({"name": "system", "valueUri": "http://example.org/property-round-trip"}),
+                json!({"name": "code", "valueCode": "SOURCE"}),
+            ];
+            if filtered {
+                parameters.push(json!({"name": "property", "valueCode": "maps-to"}));
+            }
+            let response = post_json(
+                app.clone(),
+                "/CodeSystem/$lookup",
+                json!({"resourceType": "Parameters", "parameter": parameters}),
+            )
+            .await;
+            assert_eq!(response.status(), 200);
+            let response = body_json(response).await;
+            let returned: Vec<_> = response["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|parameter| parameter["name"] == "property")
+                .collect();
+            assert_eq!(returned.len(), if filtered { 1 } else { expected.len() });
+            for (code, value) in &expected {
+                if filtered && *code != "maps-to" {
+                    continue;
+                }
+                let parts = returned
+                    .iter()
+                    .find_map(|property| {
+                        let parts = property["part"].as_array().unwrap();
+                        parts
+                            .iter()
+                            .any(|part| part["name"] == "code" && part["valueCode"] == *code)
+                            .then_some(parts)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    parts.iter().find(|part| part["name"] == "value").unwrap(),
+                    value,
+                    "property={code}, filtered={filtered}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
