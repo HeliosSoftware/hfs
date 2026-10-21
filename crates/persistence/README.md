@@ -663,6 +663,17 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_search_date_recent_end
   INCLUDE (value_date, value_date_end) WHERE value_date_end IS NOT NULL;
 ```
 
+The newest-first search fast path is only valid when no `search_index` row of the searched parameter
+has `last_updated IS NULL` (contained-resource memberships are written that way). Each fast-path
+statement used to re-run the whole search predicate in an `index_eligible` CTE to prove it. The
+backend now learns, per tenant, which `(resource type, parameter)` pairs have such rows with one
+`SELECT DISTINCT ... WHERE is_contained` and caches the answer for 30 s (plus a 10 s grace window
+served while one request refreshes it). A cached "NULL rows exist" answer, any probe failure, or a
+write by this process that creates contained rows keeps the original SQL, so the cache can only
+remove the probe, never add results. Writes by other processes are noticed after the TTL, so a
+deployment with several writers that create contained resources against one database can turn the
+cache off with `HFS_PG_ELIGIBLE_CACHE=0` (default on; `0`, `false`, `off` and `no` disable it).
+
 ### PostgreSQL + Elasticsearch
 
 PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarantees. Elasticsearch handles all search operations. Combines PostgreSQL's production-grade storage with Elasticsearch's search capabilities.

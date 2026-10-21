@@ -1012,6 +1012,20 @@ impl PostgresBackend {
             .unwrap_or(super::schema::IndexLayout::Legacy)
     }
 
+    /// Declares that `search_index` rows of `(tenant, resource_type, param)`
+    /// carry a NULL `last_updated`, exactly as a writer in this process does
+    /// through `note_null_rows` before it commits such rows.
+    ///
+    /// HFS only ever writes NULL `last_updated` for contained-resource
+    /// memberships (`is_contained`), which the eligibility cache learns from the
+    /// database. A test that fabricates NULLs by raw `UPDATE` on ordinary rows
+    /// plays an out-of-band writer the cache cannot see, so it declares them
+    /// here. `#[doc(hidden)] pub` only for the integration tests.
+    #[doc(hidden)]
+    pub fn declare_null_last_updated_rows(&self, tenant: &str, resource_type: &str, param: &str) {
+        super::null_timestamp_facts::note_null_rows(tenant, resource_type, param);
+    }
+
     /// The statement [`Self::reload_stored_cache`] runs to read every tenant's
     /// stored SearchParameters, at startup and on every refresh.
     ///

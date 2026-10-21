@@ -10958,6 +10958,15 @@ mod postgres_integration {
             .await
             .unwrap();
         drop(client);
+        // The raw UPDATE above plays an out-of-band writer: HFS itself writes
+        // NULL `last_updated` only on contained memberships, which the
+        // eligibility cache learns from the database. Declare the rows as an
+        // in-process writer would, so the cache cannot serve a stale "none".
+        backend.declare_null_last_updated_rows(
+            tenant.tenant_id().as_str(),
+            "Observation",
+            "patient",
+        );
 
         let default = postgres_2074_query();
         for query in [
