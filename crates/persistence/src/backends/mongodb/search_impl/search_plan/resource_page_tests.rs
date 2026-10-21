@@ -1243,8 +1243,12 @@ struct TimestampFixture {
 
 impl TimestampFixture {
     async fn new(label: &str) -> Option<Self> {
+        Self::with_count(label, 2048).await
+    }
+
+    async fn with_count(label: &str, count: usize) -> Option<Self> {
         // Late matches lie beyond the first 256 + 512 + 1,024 candidates.
-        let mut fixture = Fixture::new(label, 2048).await?;
+        let mut fixture = Fixture::new(label, count).await?;
         fixture.mark_deleted(1, 130).await;
         let resources = fixture.db.collection::<Document>("resources");
         let index = fixture.db.collection::<Document>("search_index");
@@ -1414,6 +1418,11 @@ async fn start_profiling(db: &mongodb::Database) {
     db.run_command(doc! { "profile": 0 }).await.unwrap();
     db.collection::<Document>("system.profile")
         .drop()
+        .await
+        .unwrap();
+    db.create_collection("system.profile")
+        .capped(true)
+        .size(32 * 1024 * 1024)
         .await
         .unwrap();
     db.run_command(doc! { "profile": 2 }).await.unwrap();
@@ -2497,27 +2506,29 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
     data.fixture.close().await;
 }
 
-/// A first batch with at most sixteen matches sends the page to the bounded
-/// id set instead of scanning the rest of the type; the page is the same.
+/// A sparse first batch does not abandon an ordered scan that can fill the
+/// page or exhaust a small resource type within the continuation budget.
 #[tokio::test]
-async fn sparse_first_batches_page_from_the_id_set() {
+async fn sparse_prefixes_finish_within_the_ordered_scan_budget() {
     let Some(data) = TimestampFixture::new("sparse-fallback").await else {
         return;
     };
     let db = &data.fixture.db;
     let first_batch = PAGE_CANDIDATE_BATCH_ROWS as i64;
     let live_rows = data.ordered.len() as i64;
-    // (conditions, candidates the stream may return, membership batches per
-    // predicate): a dense page fills in one batch, a medium one keeps
-    // scanning; sparse, late, empty and intersected pages stop after one
-    // batch and come from the id set.
+    // Dense pages retain their one-batch fast path. Sparse pages keep their
+    // ordered cursor until the page fills or this small fixture is exhausted.
     for (conditions, rows, batches) in [
         (vec!["frequent"], 1..=first_batch, 1..=1),
         (vec!["medium"], first_batch + 1..=live_rows, 2..=i64::MAX),
-        (vec!["sparse"], first_batch..=first_batch, 1..=1),
-        (vec!["late"], first_batch..=first_batch, 1..=1),
-        (vec!["empty"], first_batch..=first_batch, 1..=1),
-        (vec!["left", "right"], first_batch..=first_batch, 1..=1),
+        (
+            vec!["sparse"],
+            first_batch + 1..=live_rows - 1,
+            2..=i64::MAX,
+        ),
+        (vec!["late"], live_rows..=live_rows, 2..=i64::MAX),
+        (vec!["empty"], live_rows..=live_rows, 2..=i64::MAX),
+        (vec!["left", "right"], live_rows..=live_rows, 2..=i64::MAX),
     ] {
         let context = format!("search-{conditions:?}");
         let query = data.query(&conditions);
@@ -2546,8 +2557,9 @@ async fn sparse_first_batches_page_from_the_id_set() {
             batches.contains(&per_predicate),
             "{context}: {per_predicate} membership batches per predicate, expected {batches:?}"
         );
+        assert!(id_set_operations(db).await.is_empty(), "{context}");
         if expected.len() > 20 {
-            // A cursor page takes the same decision from the same first batch.
+            // Cursor pages retain the same bounded continuation rule.
             let next = data
                 .search_ids(
                     &query
@@ -2756,5 +2768,198 @@ async fn sampled_runs_classify_the_first_batch_and_resume() {
         live_rows
     );
     db.run_command(doc! { "profile": 0 }).await.unwrap();
+    data.fixture.close().await;
+}
+
+#[tokio::test]
+async fn bounded_ordered_continuation_preserves_offsets_and_resume_state() {
+    let Some(data) = TimestampFixture::new("bounded-page-resume").await else {
+        return;
+    };
+    let db = &data.fixture.db;
+    let plan = ResourceBatchPlan {
+        filters: vec![predicate("code", "base"), predicate("code", "sparse")],
+        exclusions: Vec::new(),
+        missing: Vec::new(),
+    };
+    let expected = data.expected(&["sparse"]);
+    for (budget, next_batch) in [(768, 1024), (1792, 2048)] {
+        for offset in [0, 10] {
+            let mut run = plan
+                .start_page(
+                    db,
+                    resource_filter(),
+                    None,
+                    doc! { "last_updated": -1, "id": -1 },
+                    offset,
+                    50,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                run.sample(db).await.unwrap(),
+                ResourcePageSample::Sparse { .. }
+            ));
+            assert!(
+                run.try_finish_page_with_budget(db, budget)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(run.scan.candidates_checked, budget);
+            assert_eq!(run.scan.batch_rows, next_batch);
+            if budget == 1792 {
+                assert!(run.scan.live_matches > SPARSE_SAMPLE_MAX_LIVE);
+            }
+            // An oversized fallback set must resume this exact state, including
+            // matches already skipped for the offset and IDs already retained.
+            assert_eq!(
+                run.finish(db).await.unwrap(),
+                expected
+                    .iter()
+                    .skip(offset as usize)
+                    .take(50)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    data.fixture.close().await;
+}
+
+#[tokio::test]
+async fn bounded_ordered_continuation_matches_a_carried_last_row_before_reading() {
+    let Some(data) = TimestampFixture::new("bounded-page-carried-row").await else {
+        return;
+    };
+    let db = &data.fixture.db;
+    let plan = ResourceBatchPlan {
+        filters: vec![predicate("code", "base")],
+        exclusions: Vec::new(),
+        missing: Vec::new(),
+    };
+    let mut run = plan
+        .start_page(db, resource_filter(), None, doc! { "id": -1 }, 0, 1)
+        .await
+        .unwrap();
+    let carried = data.ordered[0].clone();
+    // Reproduce the state after a byte-budget flush: one row is already in
+    // the next batch, and exactly one checked row remains in the total budget.
+    run.scan.candidates_checked = RESOURCE_PAGE_SCAN_BUDGET - 1;
+    run.scan.bytes = carried.len() + 16;
+    run.scan.batch.push(carried.clone());
+    let page = run.try_finish_sparse_page(db).await.unwrap().unwrap();
+    assert_eq!(page, [carried]);
+    assert_eq!(run.scan.candidates_checked, RESOURCE_PAGE_SCAN_BUDGET);
+    assert!(run.scan.batch.is_empty());
+    data.fixture.close().await;
+}
+
+#[tokio::test]
+async fn sparse_ordered_pages_cross_fifty_pages_without_collecting_the_full_id_set() {
+    let Some(mut data) = TimestampFixture::with_count("bounded-page-walk", 21_000).await else {
+        return;
+    };
+    let selected: Vec<_> = data.ordered.iter().skip(300).step_by(20).cloned().collect();
+    assert!(selected.len() > 1000);
+    let index = data.fixture.db.collection::<Document>("search_index");
+    for chunk in selected.chunks(500) {
+        index
+            .insert_many(
+                chunk
+                    .iter()
+                    .map(|id| index_row(id, "code", "walk"))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+    }
+    data.markers.insert("walk".into(), selected);
+    let db = &data.fixture.db;
+    let expected = data.expected(&["walk"]);
+    let query = data.query(&["walk"]);
+    data.force_broad_observations(&query);
+    start_profiling(db).await;
+    let mut request = query.clone();
+    let mut all_ids = Vec::new();
+    for page in 0..50 {
+        let result = data.search_ids(&request).await;
+        let actual = result_ids(&result);
+        assert_eq!(actual, expected[page * 20..(page + 1) * 20]);
+        assert_eq!(result.total, None);
+        all_ids.extend(actual);
+        request = query
+            .clone()
+            .with_cursor(result.resources.page_info.next_cursor.unwrap());
+    }
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
+    assert_eq!(all_ids, expected[..1000]);
+    assert!(
+        id_set_operations(db).await.is_empty(),
+        "every page must stay on the ordered path"
+    );
+    let operations = candidate_stream_operations(db).await;
+    assert_covered_index_order(&operations, "fifty sparse pages");
+    assert!(profile_sum(&operations, "nreturned") < 50 * 2048);
+
+    // The independent expected order also covers mixed timestamp/ID directions,
+    // ties, offsets, both total modes, previous links and a short final page.
+    for sort in [None, Some("-_lastUpdated"), Some("_lastUpdated")] {
+        let mut ordered = expected.clone();
+        if sort == Some("_lastUpdated") {
+            ordered.sort_by(|a, b| {
+                data.timestamps[a]
+                    .cmp(&data.timestamps[b])
+                    .then_with(|| b.cmp(a))
+            });
+        }
+        for mode in [TotalMode::None, TotalMode::Accurate] {
+            let mut query = data.query(&["walk"]);
+            query.total = Some(mode);
+            if let Some(sort) = sort {
+                query = query.with_sort(SortDirective::parse(sort));
+            }
+            let first = data.search_ids(&query).await;
+            assert_eq!(result_ids(&first), ordered[..20]);
+            assert_eq!(
+                first.total,
+                (mode == TotalMode::Accurate).then_some(ordered.len() as u64)
+            );
+            let next = data
+                .search_ids(
+                    &query
+                        .clone()
+                        .with_cursor(first.resources.page_info.next_cursor.unwrap()),
+                )
+                .await;
+            assert_eq!(result_ids(&next), ordered[20..40]);
+            let previous = data
+                .search_ids(
+                    &query
+                        .clone()
+                        .with_cursor(next.resources.page_info.previous_cursor.unwrap()),
+                )
+                .await;
+            assert_eq!(result_ids(&previous), ordered[..20]);
+            for offset in [7, ordered.len() - 7] {
+                let mut offset_query = query.clone();
+                offset_query.offset = Some(offset as u32);
+                let result = data.search_ids(&offset_query).await;
+                assert_eq!(
+                    result_ids(&result),
+                    ordered
+                        .iter()
+                        .skip(offset)
+                        .take(20)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    result.resources.page_info.has_next,
+                    offset + 20 < ordered.len()
+                );
+            }
+        }
+    }
     data.fixture.close().await;
 }
