@@ -19,22 +19,20 @@
 
 use std::sync::Arc;
 
+use futures::FutureExt as _;
 use mongodb::bson::{Bson, DateTime as BsonDateTime, Document, doc};
 use mongodb::{Client, Collection};
 use tokio::sync::OnceCell;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use crate::backends::mongodb::backend::{MongoBackend, MongoBackendConfig, connect_client};
 use crate::core::sof_runner::{
-    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+    RowBatcher, RowStream, SofError, SofRunner, ViewFilters, ViewRow, row_batch_channel,
+    row_stream, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
 use super::compiler::compile_view_definition_mongo;
-
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
 
 /// SQL-on-FHIR runner that compiles ViewDefinitions to MongoDB aggregation
 /// pipelines.
@@ -138,15 +136,16 @@ impl SofRunner for MongoInDbRunner {
         }
 
         let collection = self.resources().await?;
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let (tx, rx) = row_batch_channel();
         let guard_tx = tx.clone();
 
         let producer = tokio::spawn(async move {
+            let mut batcher = RowBatcher::new(tx);
             let mut cursor = match collection.aggregate(pipeline).await {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(SofError::Backend(format!("aggregate failed: {e}"))))
+                    batcher
+                        .error(SofError::Backend(format!("aggregate failed: {e}")))
                         .await;
                     return;
                 }
@@ -154,12 +153,31 @@ impl SofRunner for MongoInDbRunner {
 
             let mut count = 0usize;
             loop {
-                match cursor.advance().await {
+                // Poll the pinned `advance` future once; if it is waiting on a
+                // getMore, deliver the pending rows (without awaiting, so no
+                // pool connection is held while the consumer is slow), then
+                // keep polling the same future. It is never re-created after
+                // a partial poll, which would restart a half-started getMore.
+                // (Returning on a closed receiver drops it mid-poll; harmless
+                // because the cursor is dropped too.)
+                let advanced = {
+                    let mut advance = std::pin::pin!(cursor.advance());
+                    match (&mut advance).now_or_never() {
+                        Some(r) => r,
+                        None => {
+                            if !batcher.try_flush() {
+                                return; // receiver dropped
+                            }
+                            advance.await
+                        }
+                    }
+                };
+                match advanced {
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(SofError::Backend(format!("cursor advance: {e}"))))
+                        batcher
+                            .error(SofError::Backend(format!("cursor advance: {e}")))
                             .await;
                         return;
                     }
@@ -168,8 +186,8 @@ impl SofRunner for MongoInDbRunner {
                 let doc = match cursor.deserialize_current() {
                     Ok(d) => d,
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(SofError::Backend(format!("cursor deserialize: {e}"))))
+                        batcher
+                            .error(SofError::Backend(format!("cursor deserialize: {e}")))
                             .await;
                         return;
                     }
@@ -178,20 +196,21 @@ impl SofRunner for MongoInDbRunner {
                 let row = match mongodb::bson::from_bson::<ViewRow>(Bson::Document(doc)) {
                     Ok(v) => v,
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(SofError::Backend(format!("row decode: {e}"))))
+                        batcher
+                            .error(SofError::Backend(format!("row decode: {e}")))
                             .await;
                         return;
                     }
                 };
 
                 count += 1;
-                if tx.send(Ok(row)).await.is_err() {
+                if !batcher.push(row).await {
                     // Receiver dropped (client disconnected) — stop iterating.
                     return;
                 }
             }
 
+            batcher.finish().await;
             debug!(
                 runner = "mongo-indb",
                 rows = count,
@@ -200,6 +219,6 @@ impl SofRunner for MongoInDbRunner {
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        Ok(row_stream(rx))
     }
 }

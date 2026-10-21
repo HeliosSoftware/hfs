@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use deadpool_postgres::Pool;
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use helios_fhir::FhirVersion;
 use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnKind, ColumnarBatchBuilder};
 use helios_sof::sqlquery::engine::{DeclaredColumn, declared_columns};
@@ -29,8 +29,8 @@ use tracing::{debug, trace};
 use helios_sof::arrow::record_batch::RecordBatch;
 
 use crate::core::sof_runner::{
-    BatchSender, BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow,
-    watch_row_producer,
+    BatchSender, BatchStream, RowBatchSender, RowBatcher, RowStream, SofError, SofRunner,
+    ViewFilters, ViewRow, row_batch_channel, row_stream, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
@@ -38,9 +38,6 @@ use super::decode::{ColumnDecode, decode_text};
 
 use super::compiler::SqlDialect;
 use super::runtime::{RuntimeParam, prepare_sql_export_page, prepare_sql_run};
-
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
 
 /// Channel buffer depth for the columnar path (batches, not rows).
 const BATCH_CHANNEL_BUFFER: usize = 2;
@@ -154,7 +151,7 @@ impl SofRunner for PgInDbRunner {
             .map(PgParam::from_runtime)
             .collect();
         let pool = self.pool.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let (tx, rx) = row_batch_channel();
         let guard_tx = tx.clone();
         let page_size = self.export_page_size;
         let producer = tokio::spawn(async move {
@@ -187,7 +184,7 @@ impl SofRunner for PgInDbRunner {
             }
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        Ok(row_stream(rx))
     }
 
     /// Columnar sibling of [`run_view`](Self::run_view): every column is text
@@ -351,10 +348,12 @@ async fn stream_pg_rows(
     columns: Vec<String>,
     decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
-    tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    tx: RowBatchSender,
 ) {
-    if let Err(e) = stream_pg_rows_inner(pool, sql, params, columns, decodes, limit, &tx).await {
-        let _ = tx.send(Err(e)).await;
+    let mut batcher = RowBatcher::new(tx);
+    match stream_pg_rows_inner(pool, sql, params, columns, decodes, limit, &mut batcher).await {
+        Ok(()) => batcher.finish().await,
+        Err(e) => batcher.error(e).await,
     }
 }
 
@@ -365,7 +364,7 @@ async fn stream_pg_rows_inner(
     columns: Vec<String>,
     decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
-    tx: &tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    batcher: &mut RowBatcher,
 ) -> Result<(), SofError> {
     let client = pool
         .get()
@@ -410,7 +409,19 @@ async fn stream_pg_rows_inner(
     futures::pin_mut!(raw);
 
     let mut count = 0usize;
-    while let Some(row_result) = raw.next().await {
+    loop {
+        // Deliver the pending rows before waiting on the database, so a
+        // slow or selective query still shows its first rows promptly.
+        let next = match raw.next().now_or_never() {
+            Some(next) => next,
+            None => {
+                if !batcher.try_flush() {
+                    break; // receiver dropped
+                }
+                raw.next().await
+            }
+        };
+        let Some(row_result) = next else { break };
         match row_result {
             Ok(pg_row) => {
                 if let Some(cap) = limit {
@@ -421,12 +432,12 @@ async fn stream_pg_rows_inner(
                 count += 1;
                 match row_to_json(&pg_row, &columns, &decodes) {
                     Ok(row) => {
-                        if tx.send(Ok(row)).await.is_err() {
+                        if !batcher.push(row).await {
                             break; // receiver dropped
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        batcher.error(e).await;
                         break;
                     }
                 }
@@ -435,11 +446,11 @@ async fn stream_pg_rows_inner(
                 if std::env::var("PG_SOF_DEBUG").is_ok() {
                     eprintln!("[PG_SOF_DEBUG] row error: {e}\n--- SQL ---\n{sql}\n---");
                 }
-                let _ = tx
-                    .send(Err(SofError::Backend(format!(
+                batcher
+                    .error(SofError::Backend(format!(
                         "row error: {}",
                         pg_row_error_text(&e, &columns, &decodes)
-                    ))))
+                    )))
                     .await;
                 break;
             }
@@ -555,12 +566,23 @@ async fn stream_pg_pages(
     decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     page_size: usize,
-    tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    tx: RowBatchSender,
 ) {
-    if let Err(e) =
-        stream_pg_pages_inner(pool, sql, params, columns, decodes, limit, page_size, &tx).await
+    let mut batcher = RowBatcher::new(tx);
+    match stream_pg_pages_inner(
+        pool,
+        sql,
+        params,
+        columns,
+        decodes,
+        limit,
+        page_size,
+        &mut batcher,
+    )
+    .await
     {
-        let _ = tx.send(Err(e)).await;
+        Ok(()) => batcher.finish().await,
+        Err(e) => batcher.error(e).await,
     }
 }
 
@@ -578,7 +600,7 @@ async fn stream_pg_pages_inner(
     decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     page_size: usize,
-    tx: &tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    batcher: &mut RowBatcher,
 ) -> Result<(), SofError> {
     // `$1`/`$2` are tenant and resource type; the range slots are the last two.
     let (Some(PgParam::Text(tenant)), Some(PgParam::Text(resource_type))) =
@@ -615,14 +637,14 @@ async fn stream_pg_pages_inner(
     let mut count = 0usize;
     let mut pages = 0usize;
     loop {
-        if tx.is_closed() {
+        if batcher.is_closed() {
             return Ok(());
         }
         let bound_params: [&(dyn tokio_postgres::types::ToSql + Sync); 4] =
             [&tenant, &resource_type, &after, &page_limit];
         let bound = tokio::select! {
             r = client.query_opt(&bound_stmt, &bound_params) => r,
-            _ = tx.closed() => return Ok(()),
+            _ = batcher.closed() => return Ok(()),
         }
         .map_err(|e| SofError::Backend(format!("page bound error: {}", pg_error_text(&e))))?;
         let Some(bound) = bound else { break };
@@ -639,7 +661,7 @@ async fn stream_pg_pages_inner(
             .collect();
         let rows = tokio::select! {
             r = client.query(&page_stmt, &param_refs) => r,
-            _ = tx.closed() => return Ok(()),
+            _ = batcher.closed() => return Ok(()),
         }
         .map_err(|e| {
             if std::env::var("PG_SOF_DEBUG").is_ok() {
@@ -660,9 +682,13 @@ async fn stream_pg_pages_inner(
             }
             count += 1;
             let row = row_to_json(pg_row, &columns, &decodes)?;
-            if tx.send(Ok(row)).await.is_err() {
+            if !batcher.push(row).await {
                 return Ok(()); // receiver dropped
             }
+        }
+        // The next page starts a new statement; do not hold these rows for it.
+        if !batcher.flush().await {
+            return Ok(());
         }
         if limit.is_some_and(|cap| count >= cap) {
             break;
