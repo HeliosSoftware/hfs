@@ -20,14 +20,31 @@
 //! the session's `appName` and a `transaction` sub-document. Each test gives its
 //! backend a unique `appName`, because `$currentOp` is server-global and the
 //! suite's tests share one container and run in parallel.
+//!
+//! A POST-only Bundle stages its creates and sends them in chunks (#1977), so
+//! its server transaction opens at the first chunk and a small Bundle would be
+//! open for a few milliseconds, too short for the sampler below. Each test holds
+//! the Bundles' transactions open by construction instead: a `blockConnection`
+//! failpoint, scoped to the test's `appName`, delays every `insert` by
+//! [`INSERT_HOLD_MS`]. A Bundle sends at least three (`resources`,
+//! `resource_history`, its search rows), so its transaction is open for about
+//! three times that whatever the staging speed. The failpoint is server-global
+//! and the harness serialises its users with a suite-wide lock, so these tests
+//! also run one at a time with each other and with the other failpoint tests.
 
 use super::*;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Entries per bundle: enough that every bundle writes real search rows and
-/// stays open long enough for concurrent bundles to overlap.
+use crate::bulk_submit::FailPoint;
+
+/// Entries per bundle: enough that every bundle writes real search rows. How
+/// long its transaction stays open is not left to its size: see
+/// [`hold_inserts_open`].
 const BUNDLE_ENTRIES: usize = 60;
+
+/// How long the failpoint of [`hold_inserts_open`] delays each `insert`.
+const INSERT_HOLD_MS: i64 = 50;
 
 /// A backend with `limit` standard Bundles of `weight_entries` entries each as
 /// its admission room, under a unique `appName`. `None` when the shared Mongo
@@ -52,6 +69,24 @@ async fn backend_with_gate(
 
 fn unique_app(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Delays every `insert` of the connections under `app` by [`INSERT_HOLD_MS`],
+/// so each Bundle's transaction stays open across its inserts (see the module
+/// doc). `None`, after saying why, when the failpoint is unavailable, so the
+/// caller skips. The sampler's client has no `appName`, so it is not delayed.
+/// The test holds the guard until `run` returns and then calls `off`.
+async fn hold_inserts_open(app: &str) -> Option<FailPoint> {
+    FailPoint::enable(
+        app,
+        doc! {
+            "failCommands": ["insert"],
+            "blockConnection": true,
+            "blockTimeMS": INSERT_HOLD_MS,
+        },
+        doc! { "times": 1_000_000 },
+    )
+    .await
 }
 
 /// One Patient plus `n - 1` Observations that reference it by `urn:uuid`, each
@@ -186,8 +221,12 @@ async fn transaction_bundles_beyond_the_limit_wait_their_turn() {
         return;
     };
     let backend = Arc::new(backend);
+    let Some(hold) = hold_inserts_open(&app).await else {
+        return;
+    };
 
     let (max_open, results) = run(backend.clone(), tenant, BUNDLES, &app).await;
+    hold.off().await;
     if topology_lacks_transactions(&results) {
         return;
     }
@@ -223,8 +262,12 @@ async fn without_a_limit_the_same_bundles_overlap() {
     let Some(backend) = backend_with_gate("txn_gate_nolimit", &app, 0, weight).await else {
         return;
     };
+    let Some(hold) = hold_inserts_open(&app).await else {
+        return;
+    };
 
     let (max_open, results) = run(Arc::new(backend), tenant, BUNDLES, &app).await;
+    hold.off().await;
     if topology_lacks_transactions(&results) {
         return;
     }
@@ -256,8 +299,12 @@ async fn bundles_smaller_than_a_standard_one_share_its_room() {
     else {
         return;
     };
+    let Some(hold) = hold_inserts_open(&app).await else {
+        return;
+    };
 
     let (max_open, results) = run(Arc::new(backend), tenant, BUNDLES, &app).await;
+    hold.off().await;
     if topology_lacks_transactions(&results) {
         return;
     }
@@ -291,8 +338,12 @@ async fn a_bundle_larger_than_a_standard_one_takes_more_than_one_slot() {
         return;
     };
     let backend = Arc::new(backend);
+    let Some(hold) = hold_inserts_open(&app).await else {
+        return;
+    };
 
     let (max_open, results) = run(backend.clone(), tenant, BUNDLES, &app).await;
+    hold.off().await;
     if topology_lacks_transactions(&results) {
         return;
     }

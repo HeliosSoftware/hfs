@@ -250,6 +250,10 @@ pub trait Dialect: Send + Sync {
     /// out. The expression `expr` may be a text projection (PG `->>`), a JSON
     /// value (PG `->`), or a SQLite JSON1 extracted scalar; the dialect picks
     /// an appropriate form.
+    ///
+    /// Contract: the result may be NULL on SQLite (PostgreSQL never returns
+    /// NULL). Only consume it as an AND-joined WHERE term; never negate it,
+    /// use it as a value, or put it in CASE/HAVING.
     fn truthy_predicate(&self, expr: &str) -> String;
 
     /// Substring of `s` after the last `/` — used by `getReferenceKey()` to
@@ -401,14 +405,37 @@ impl Dialect for PgDialect {
     }
 
     fn last_path_segment(&self, s: &str) -> String {
-        // POSIX regexp on PG: strip everything up to and including the last `/`.
-        format!("regexp_replace({s}, '.*/', '')")
+        // Everything after the last `/` (the whole string when there is none).
+        // `split_part` with a negative position counts from the end (PG 14+,
+        // the minimum HFS supports) and is cheaper (no regex engine) than the
+        // equivalent `regexp_replace({s}, '.*/', '')`, which returns the same
+        // text for every input, NULL and the empty string included.
+        format!("split_part({s}, '/', -1)")
     }
 }
 
 // ============================================================================
 // SQLite
 // ============================================================================
+
+/// The root resource document in the generated SQL (`resources.data`).
+const SQLITE_ROOT_DATA: &str = "r.data";
+
+/// Wraps the root document as `CAST(r.data AS TEXT)` for SQLite's JSON
+/// functions, and passes any other base (`fe.value`, `rec_0.node`, ...)
+/// through unchanged.
+///
+/// `resources.data` is a BLOB holding JSON text, and SQLite's `json_*`
+/// functions only cache the parsed document for TEXT arguments. Handing them
+/// the BLOB re-parses the whole resource once per call (about nine times per
+/// row for a typical ViewDefinition); the cast lets one parse serve them all.
+pub(crate) fn sqlite_json_source(base: &str) -> std::borrow::Cow<'_, str> {
+    if base == SQLITE_ROOT_DATA {
+        "CAST(r.data AS TEXT)".into()
+    } else {
+        base.into()
+    }
+}
 
 /// SQLite JSON1 dialect.
 #[derive(Debug, Default, Clone, Copy)]
@@ -432,7 +459,11 @@ impl Dialect for SqliteDialect {
         // key is all digits (`json_path` would read that as an array index).
         let mut path = String::from("$");
         push_sqlite_member(&mut path, key);
-        format!("json_extract({base}, {})", sqlite_string_literal(&path))
+        format!(
+            "json_extract({}, {})",
+            sqlite_json_source(base),
+            sqlite_string_literal(&path)
+        )
     }
 
     fn json_field_text(&self, base: &str, key: &str) -> String {
@@ -447,7 +478,8 @@ impl Dialect for SqliteDialect {
         // object members. Numeric-only segments are array indices and must
         // not be preceded by a dot.
         format!(
-            "json_extract({base}, {})",
+            "json_extract({}, {})",
+            sqlite_json_source(base),
             sqlite_json_path_literal(segments)
         )
     }
@@ -459,7 +491,11 @@ impl Dialect for SqliteDialect {
     fn json_path_repr(&self, base: &str, segments: &[&str]) -> String {
         // The `->` operator (SQLite 3.38+) returns the JSON representation,
         // where `json_extract` would unquote strings.
-        format!("({base} -> {})", sqlite_json_path_literal(segments))
+        format!(
+            "({} -> {})",
+            sqlite_json_source(base),
+            sqlite_json_path_literal(segments)
+        )
     }
 
     fn unnest_array(&self, expr: &str) -> String {
@@ -525,11 +561,11 @@ impl Dialect for SqliteDialect {
     }
 
     fn truthy_predicate(&self, expr: &str) -> String {
-        // `json_extract` returns the JSON value's native SQLite type:
-        // JSON booleans → integer 1/0, numbers → integer/real, strings → text.
-        // Truthy is: non-NULL AND not zero/false. The explicit text-equality
-        // check covers literal `'true'`/`'false'` text values just in case.
-        format!("({expr}) IS NOT NULL AND ({expr}) != 0 AND ({expr}) != 'false'")
+        // `json_extract` yields native SQLite types (JSON booleans -> 1/0).
+        // `0` covers false/zero; `'false'` in the IN list covers literal text
+        // values. `NOT IN` evaluates `expr` once; NULL stays NULL (see the
+        // trait doc for the WHERE-only contract).
+        format!("({expr}) NOT IN (0, 'false')")
     }
 
     fn last_path_segment(&self, s: &str) -> String {
@@ -656,10 +692,33 @@ mod tests {
     }
 
     #[test]
+    fn pg_last_path_segment_uses_split_part() {
+        // `split_part(x, '/', -1)` equals `regexp_replace(x, '.*/', '')` for
+        // `Patient/1`, absolute URLs, `_history` tails, empty and NULL input
+        // (checked against PostgreSQL 16 when the form was chosen).
+        assert_eq!(
+            PgDialect.last_path_segment("r.data#>>'{subject,reference}'"),
+            "split_part(r.data#>>'{subject,reference}', '/', -1)"
+        );
+    }
+
+    #[test]
     fn sqlite_field() {
         assert_eq!(
             SqliteDialect.json_field("r.data", "id"),
-            "json_extract(r.data, '$.id')"
+            "json_extract(CAST(r.data AS TEXT), '$.id')"
+        );
+    }
+
+    #[test]
+    fn sqlite_json_source_casts_only_the_root_document() {
+        assert_eq!(sqlite_json_source("r.data"), "CAST(r.data AS TEXT)");
+        assert_eq!(sqlite_json_source("fe.value"), "fe.value");
+        assert_eq!(sqlite_json_source("rec_0.node"), "rec_0.node");
+        // Non-root bases keep their plain form through the dialect too.
+        assert_eq!(
+            SqliteDialect.json_path("fe.value", &["code"]),
+            "json_extract(fe.value, '$.code')"
         );
     }
 
@@ -667,7 +726,7 @@ mod tests {
     fn sqlite_path_dotted() {
         assert_eq!(
             SqliteDialect.json_path("r.data", &["subject", "reference"]),
-            "json_extract(r.data, '$.subject.reference')"
+            "json_extract(CAST(r.data AS TEXT), '$.subject.reference')"
         );
     }
 
@@ -744,26 +803,26 @@ mod tests {
     fn sqlite_field_is_quoted_and_escaped() {
         assert_eq!(
             SqliteDialect.json_field("r.data", "a'b"),
-            "json_extract(r.data, '$.\"a''b\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"a''b\"')"
         );
         assert_eq!(
             SqliteDialect.json_field("r.data", "x.y"),
-            "json_extract(r.data, '$.\"x.y\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"x.y\"')"
         );
         assert_eq!(
             SqliteDialect.json_field("r.data", "x') OR 1=1 --"),
-            "json_extract(r.data, '$.\"x'') OR 1=1 --\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"x'') OR 1=1 --\"')"
         );
         // An embedded double quote or backslash is backslash-escaped inside
         // the quoted label so it cannot close the label early.
         assert_eq!(
             SqliteDialect.json_field("r.data", "a\"b\\c"),
-            "json_extract(r.data, '$.\"a\\\"b\\\\c\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"a\\\"b\\\\c\"')"
         );
         // A field accessor never reads an all-digit key as an array index.
         assert_eq!(
             SqliteDialect.json_field("r.data", "0"),
-            "json_extract(r.data, '$.\"0\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"0\"')"
         );
     }
 
@@ -771,11 +830,11 @@ mod tests {
     fn sqlite_path_quotes_special_segments_and_keeps_indices() {
         assert_eq!(
             SqliteDialect.json_path("r.data", &["name", "0", "family"]),
-            "json_extract(r.data, '$.name[0].family')"
+            "json_extract(CAST(r.data AS TEXT), '$.name[0].family')"
         );
         assert_eq!(
             SqliteDialect.json_path("r.data", &["a b", "0", "c'd"]),
-            "json_extract(r.data, '$.\"a b\"[0].\"c''d\"')"
+            "json_extract(CAST(r.data AS TEXT), '$.\"a b\"[0].\"c''d\"')"
         );
     }
 
@@ -901,5 +960,59 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{sql}: {e}"));
             assert_eq!(got, *value, "{sql}");
         }
+    }
+
+    /// The single-evaluation truthy form must filter exactly like the old
+    /// three-term form (`IS NOT NULL AND != 0 AND != 'false'`) in a WHERE.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_truthy_predicate_filters_like_the_three_term_form() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let values = [
+            "0",
+            "0.0",
+            "-0.0",
+            "json_extract('{\"a\":false}', '$.a')",
+            "'false'",
+            "'0'",
+            "'False'",
+            "''",
+            "'[]'",
+            "'{}'",
+            "json_extract('{\"a\":true}', '$.a')",
+            "1",
+            "'true'",
+            "NULL",
+            "json_extract('{\"a\":null}', '$.a')",
+        ];
+        for v in values {
+            let old = format!("({v}) IS NOT NULL AND ({v}) != 0 AND ({v}) != 'false'");
+            let new = SqliteDialect.truthy_predicate(v);
+            let kept = |pred: &str| -> i64 {
+                conn.query_row(
+                    &format!("SELECT count(*) FROM (SELECT 1) WHERE {pred}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("{pred}: {e}"))
+            };
+            assert_eq!(kept(&old), kept(&new), "value {v}");
+        }
+
+        // The shape the EXISTS subqueries consume: a row set from json_each.
+        let rows = |pred: &str| -> Vec<String> {
+            let mut st = conn
+                .prepare(&format!(
+                    "SELECT value FROM json_each('[0,false,\"false\",null,1]') WHERE {pred}"
+                ))
+                .unwrap_or_else(|e| panic!("{pred}: {e}"));
+            st.query_map([], |r| r.get::<_, rusqlite::types::Value>(0))
+                .unwrap()
+                .map(|v| format!("{:?}", v.unwrap()))
+                .collect()
+        };
+        let old = "(value) IS NOT NULL AND (value) != 0 AND (value) != 'false'";
+        let new = SqliteDialect.truthy_predicate("value");
+        assert_eq!(rows(old), rows(&new), "json_each rows");
     }
 }
