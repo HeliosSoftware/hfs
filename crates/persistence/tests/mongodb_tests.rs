@@ -24095,6 +24095,10 @@ mongodb_bundle_identity_test!(
 #[path = "mongodb/missing_index.rs"]
 mod missing_index;
 
+/// #2006: write, storage and cache cost of `missing_params` metadata.
+#[path = "mongodb/missing_params_cost_bench.rs"]
+mod missing_params_cost_bench;
+
 #[path = "mongodb/reindex_failures.rs"]
 mod reindex_failures;
 

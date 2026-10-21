@@ -212,6 +212,14 @@ pub struct MongoBackendConfig {
     #[serde(default = "default_adaptive_offset_paging")]
     pub adaptive_offset_paging: bool,
 
+    /// Records each resource's absent search parameters in
+    /// `resources.missing_params` and builds `idx_resources_missing_params`
+    /// (#1984, #2006). `false` stops recording them (a write removes the
+    /// field), skips the index build and sends every `:missing=true` search
+    /// through the value-index route, which returns the same results.
+    #[serde(default = "default_missing_metadata")]
+    pub missing_metadata: bool,
+
     /// Server execution budget for optional planning probes, in milliseconds.
     /// Does not bound network latency or resource/count execution.
     #[serde(default = "default_probe_timeout_ms")]
@@ -592,6 +600,14 @@ impl MongoBackendConfig {
                 _ => return Err("HFS_MONGODB_ADAPTIVE_OFFSET_PAGING must be true or false".into()),
             }
         }
+        if let Some(raw) = env("HFS_MONGODB_MISSING_METADATA") {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "true" | "1" | "yes" | "on" => self.missing_metadata = true,
+                "false" | "0" | "no" | "off" => self.missing_metadata = false,
+                _ => return Err("HFS_MONGODB_MISSING_METADATA must be true or false".into()),
+            }
+        }
         if let Some(raw) = env("HFS_MONGODB_PROBE_TIMEOUT_MS") {
             let raw = raw.trim();
             if !raw.is_empty() {
@@ -764,6 +780,10 @@ fn default_adaptive_offset_paging() -> bool {
     true
 }
 
+fn default_missing_metadata() -> bool {
+    true
+}
+
 fn default_bundle_transaction_budget() -> Duration {
     super::retry::DEFAULT_BUNDLE_TRANSACTION_BUDGET
 }
@@ -786,6 +806,7 @@ impl Debug for MongoBackendConfig {
         // is classified as secret or not.
         let Self {
             adaptive_offset_paging,
+            missing_metadata,
             probe_timeout_ms,
             search_timeout_ms,
             connection_string,
@@ -814,6 +835,7 @@ impl Debug for MongoBackendConfig {
         } = self;
         f.debug_struct("MongoBackendConfig")
             .field("adaptive_offset_paging", adaptive_offset_paging)
+            .field("missing_metadata", missing_metadata)
             .field("probe_timeout_ms", probe_timeout_ms)
             .field("search_timeout_ms", search_timeout_ms)
             .field(
@@ -859,6 +881,7 @@ impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
             adaptive_offset_paging: default_adaptive_offset_paging(),
+            missing_metadata: default_missing_metadata(),
             probe_timeout_ms: default_probe_timeout_ms(),
             search_timeout_ms: None,
             connection_string: default_connection_string(),
@@ -1284,7 +1307,16 @@ impl MongoBackend {
         let db = self.get_database().await?;
         schema::initialize_schema_async(&db).await?;
 
-        let missing_tx = self.missing_index_tx.lock().await.take();
+        let mut missing_tx = self.missing_index_tx.lock().await.take();
+        if !self.config.missing_metadata
+            && let Some(tx) = missing_tx.take()
+        {
+            // Disabled (#2006): nothing reads or maintains the index, so it is
+            // neither built nor required. An existing one is left in place.
+            let _ = tx.send(Some(BuildOutcome::Skipped {
+                missing: Vec::new(),
+            }));
+        }
         let missing_handle = missing_tx.map(|tx| {
             let builder = MissingIndexBuilder::new(db.clone(), self.config.index_build);
             tokio::spawn(async move {
@@ -2291,6 +2323,43 @@ mod tests {
             MongoBackendConfig::default()
                 .apply_search_env(|name| (name == "HFS_MONGODB_ADAPTIVE_OFFSET_PAGING")
                     .then(|| "invalid".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_metadata_defaults_on_and_can_be_disabled() {
+        let default = MongoBackendConfig::default();
+        assert!(default.missing_metadata);
+        let mut serialized = serde_json::to_value(&default).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("missing_metadata");
+        assert!(
+            serde_json::from_value::<MongoBackendConfig>(serialized)
+                .unwrap()
+                .missing_metadata
+        );
+        for (raw, enabled) in [
+            ("on", true),
+            (" TRUE ", true),
+            ("off", false),
+            ("0", false),
+            ("", true),
+        ] {
+            let mut config = default.clone();
+            config
+                .apply_search_env(|name| {
+                    (name == "HFS_MONGODB_MISSING_METADATA").then(|| raw.to_string())
+                })
+                .unwrap();
+            assert_eq!(config.missing_metadata, enabled, "{raw:?}");
+        }
+        assert!(
+            MongoBackendConfig::default()
+                .apply_search_env(|name| (name == "HFS_MONGODB_MISSING_METADATA")
+                    .then(|| "sometimes".to_string()))
                 .is_err()
         );
     }
