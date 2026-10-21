@@ -784,6 +784,10 @@ pub(crate) enum FirstPagePlan {
 /// Any shape other than one plain parameter membership, and any probe error,
 /// is [`FirstPagePlan::Planner`]: the result of every plan is the same set in
 /// the same `ORDER BY last_updated DESC, id` order, so this only chooses cost.
+///
+/// Only the tests call it; the production path reaches the same plans through
+/// the probe's own keys.
+#[cfg(test)]
 fn choose_first_page_plan(
     conn: &rusqlite::Connection,
     tenant_id: &str,

@@ -5103,7 +5103,7 @@ mod tests {
         }
         let backend = create_test_backend();
         let tenant = create_test_tenant();
-        let mut conn = backend.get_connection().unwrap();
+        let conn = backend.get_connection().unwrap();
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
             Some(record),
