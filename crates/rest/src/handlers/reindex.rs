@@ -22,6 +22,8 @@
 //! |---|---|---|
 //! | `clearExisting` | `valueBoolean` | Clear the run's scope before rebuilding it |
 //! | `clearOnly` | `valueBoolean` | Clear the run's scope and do not rebuild it |
+//! | `metadataOnly` | `valueBoolean` | Recompute only per-resource search metadata (MongoDB's `missing_params`) and leave the search index untouched |
+//! | `skipExistingMetadata` | `valueBoolean` | With `metadataOnly`, leave alone resources that already carry metadata |
 //! | `batchSize` | `valueInteger` | Resources per page |
 //! | `idStart` | `valueString` | First id to reindex (included); `POST /{type}/$reindex` only |
 //! | `idEnd` | `valueString` | Id where the run stops (not included); `POST /{type}/$reindex` only |
@@ -30,7 +32,9 @@
 //! them `COLLATE "C"`, not in the database's collation), so ranges laid end to
 //! end (each `idEnd` the next `idStart`) cover a type exactly once. An invalid
 //! combination is `400` before a job starts; an id range on a backend without
-//! range support (S3, Elasticsearch as the source) is `501`.
+//! range support (S3, Elasticsearch as the source) is `501`, and so is
+//! `metadataOnly` on a deployment without per-resource search metadata (every
+//! backend but MongoDB, including MongoDB with search offloaded, #2008).
 //!
 //! On SQLite, ranges started together mostly queue on its single writer, and
 //! can see the busy → `503` path, rather than rebuild in parallel. They are
@@ -214,6 +218,17 @@ fn parse_reindex_request(
                     .get("valueBoolean")
                     .and_then(serde_json::Value::as_bool)
                     .ok_or_else(|| bad_request("clearOnly requires valueBoolean".to_string()))?;
+            }
+            Some(name @ ("metadataOnly" | "skipExistingMetadata")) => {
+                let on = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| bad_request(format!("{name} requires valueBoolean")))?;
+                if name == "metadataOnly" {
+                    request.metadata_only = on;
+                } else {
+                    request.skip_existing_metadata = on;
+                }
             }
             Some(name @ ("idStart" | "idEnd")) => {
                 let id = param
@@ -465,6 +480,59 @@ mod tests {
         let request = parse_reindex_request(patient(), None).unwrap();
         assert_eq!((request.id_start, request.id_end), (None, None));
         assert!(!request.clear_only);
+    }
+
+    #[test]
+    fn metadata_only_parameters_are_parsed() {
+        let body = parameters(json!([
+            { "name": "metadataOnly", "valueBoolean": true },
+            { "name": "skipExistingMetadata", "valueBoolean": true },
+            { "name": "idStart", "valueString": "4" }
+        ]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert!(request.metadata_only);
+        assert!(request.skip_existing_metadata);
+        assert_eq!(request.id_start.as_deref(), Some("4"));
+
+        let request = parse_reindex_request(None, None).unwrap();
+        assert!(!request.metadata_only);
+        assert!(!request.skip_existing_metadata);
+    }
+
+    #[test]
+    fn invalid_metadata_only_parameters_are_rejected() {
+        let cases = [
+            (
+                json!([{ "name": "skipExistingMetadata", "valueBoolean": true }]),
+                "skipExistingMetadata requires metadataOnly",
+            ),
+            (
+                json!([{ "name": "metadataOnly", "valueString": "true" }]),
+                "metadataOnly requires valueBoolean",
+            ),
+            (
+                json!([
+                    { "name": "metadataOnly", "valueBoolean": true },
+                    { "name": "clearExisting", "valueBoolean": true }
+                ]),
+                "metadataOnly cannot be combined with clearExisting",
+            ),
+            (
+                json!([
+                    { "name": "metadataOnly", "valueBoolean": true },
+                    { "name": "clearOnly", "valueBoolean": true }
+                ]),
+                "metadataOnly cannot be combined with clearOnly",
+            ),
+        ];
+        for (parameter, expected) in cases {
+            let body = parameters(parameter);
+            let error = parse_reindex_request(patient(), Some(&body)).unwrap_err();
+            assert!(
+                matches!(&error, RestError::BadRequest { message } if message.contains(expected)),
+                "{body}: {error:?}"
+            );
+        }
     }
 
     #[test]

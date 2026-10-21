@@ -1253,6 +1253,10 @@ mod reindex_fetch_by_ids;
 #[path = "mongodb/reindex_id_range.rs"]
 mod reindex_id_range;
 
+/// #2008: metadata-only `$reindex` backfills `missing_params`.
+#[path = "mongodb/reindex_metadata_only.rs"]
+mod reindex_metadata_only;
+
 /// #1586: a transaction bundle the server aborts with a
 /// `TransientTransactionError` is re-run instead of failing with a 400.
 #[path = "mongodb/transaction_retry.rs"]
