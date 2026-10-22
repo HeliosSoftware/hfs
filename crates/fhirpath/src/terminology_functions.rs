@@ -676,6 +676,34 @@ impl TerminologyFunctions {
     }
 }
 
+/// Whether a coded input is empty (`{}` or an empty collection). FHIRPath propagates an
+/// empty input as an empty result, so the terminology functions return `{}` for it without
+/// contacting, or requiring, a terminology server.
+pub(crate) fn is_empty_input(coded: &EvaluationResult) -> bool {
+    match coded {
+        EvaluationResult::Empty => true,
+        EvaluationResult::Collection { items, .. } => items.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether any coded argument of the `%terminologies` function `name` is empty, in which
+/// case the call evaluates to `{}`. `expand` takes no coded argument.
+pub(crate) fn terminologies_call_has_empty_coded_input(
+    name: &str,
+    args: &[EvaluationResult],
+) -> bool {
+    let coded: &[usize] = match name {
+        "lookup" => &[0],
+        "validateVS" | "validateCS" | "translate" => &[1],
+        "subsumes" => &[1, 2],
+        _ => &[],
+    };
+    coded
+        .iter()
+        .any(|&i| args.get(i).is_some_and(is_empty_input))
+}
+
 /// Extracts system and code from a Coding or CodeableConcept
 fn extract_coding(coded: &EvaluationResult) -> Result<(String, String), EvaluationError> {
     match coded {
@@ -859,6 +887,11 @@ pub fn member_of(
     value_set_url: &str,
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
+    // `{}.memberOf(url)` is `{}`; checked before a server is required.
+    if is_empty_input(coding) {
+        return Ok(EvaluationResult::Empty);
+    }
+
     let terminology = TerminologyFunctions::new(context)?;
 
     // Call validateVS and extract the result
@@ -1049,6 +1082,43 @@ mod tests {
             Ok(EvaluationResult::Boolean(true, ..))
         ));
         assert_eq!(request_count(&server).await, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_coded_input_is_empty_without_a_request() {
+        let server = terminology_stub().await;
+        let mut ctx = context_for(&server);
+        ctx.terminology_session = Arc::new(TerminologySession::with_max_calls(None));
+
+        let empty_collection = EvaluationResult::Collection {
+            items: vec![],
+            has_undefined_order: false,
+            type_info: None,
+        };
+        for empty in [&EvaluationResult::Empty, &empty_collection] {
+            assert!(matches!(
+                member_of(empty, VS, &ctx),
+                Ok(EvaluationResult::Empty)
+            ));
+        }
+        for expr in [
+            "{}.memberOf('http://example.org/fhir/ValueSet/test')",
+            "Patient.gender.memberOf('http://example.org/fhir/ValueSet/test')",
+            "%terminologies.validateVS('http://example.org/fhir/ValueSet/test', {})",
+            "%terminologies.validateCS('http://example.org/cs', {})",
+            "%terminologies.lookup({})",
+            "%terminologies.subsumes('http://example.org/cs', {}, 'a')",
+            "%terminologies.translate('http://example.org/cm', {})",
+        ] {
+            assert!(
+                matches!(
+                    crate::evaluate_expression(expr, &ctx),
+                    Ok(EvaluationResult::Empty)
+                ),
+                "{expr}"
+            );
+        }
+        assert_eq!(request_count(&server).await, 0);
     }
 
     #[test]
