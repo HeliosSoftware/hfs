@@ -7955,6 +7955,77 @@ mod postgres_integration_migrations {
         assert_eq!(advisory_locks, 0, "the migration lock must not be taken");
     }
 
+    /// #1283: v50 -> v51 adds the deferred-rebuild marker to `bulk_manifests`
+    /// even under a session `statement_timeout` shorter than the index build,
+    /// stamps its own marker, gives the session its timeout back, and is a
+    /// no-op on a restart that finds the columns and index but not the marker.
+    #[tokio::test]
+    async fn postgres_integration_v50_to_v51_adds_index_pending_under_a_short_timeout() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_v51_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize current schema fixture");
+        client
+            .batch_execute(
+                "DROP INDEX idx_bulk_manifests_index_pending;
+                 ALTER TABLE bulk_manifests
+                     DROP COLUMN index_pending, DROP COLUMN index_pending_types",
+            )
+            .await
+            .expect("remove the v51 marker from the fixture");
+        set_schema_version(&client, 50)
+            .await
+            .expect("mark fixture as v50");
+        client
+            .batch_execute(
+                "SET statement_timeout = '50ms';
+                 CREATE FUNCTION delay_v51_create_index() RETURNS event_trigger
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     PERFORM pg_sleep(0.2);
+                 END
+                 $$;
+                 CREATE EVENT TRIGGER delay_v51_create_index
+                 ON ddl_command_start WHEN TAG IN ('CREATE INDEX')
+                 EXECUTE FUNCTION delay_v51_create_index();",
+            )
+            .await
+            .expect("install delayed v51 CREATE INDEX injection");
+
+        initialize_schema(&mut client)
+            .await
+            .expect("migrate v50 to v51");
+        client
+            .batch_execute(
+                "DROP EVENT TRIGGER delay_v51_create_index;
+                 DROP FUNCTION delay_v51_create_index();",
+            )
+            .await
+            .expect("remove delayed v51 CREATE INDEX injection");
+        assert_eq!(get_schema_version(&client).await.unwrap(), 51);
+        assert_eq!(statement_timeout(&client).await, "50ms");
+        let definition = index_definition(&client, "idx_bulk_manifests_index_pending")
+            .await
+            .expect("v51 index must exist");
+        assert!(
+            definition.contains("(added_at)") && definition.contains("WHERE index_pending"),
+            "unexpected v51 index: {definition}"
+        );
+
+        // A restart that finds the columns and index but lost the marker.
+        set_schema_version(&client, 50).await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("re-run v51 over an applied schema");
+        assert_eq!(get_schema_version(&client).await.unwrap(), 51);
+    }
+
     /// Seeds live and soft-deleted rows for two tenants.
     async fn seed_live_and_deleted_resources(client: &deadpool_postgres::Client) {
         client
@@ -8018,7 +8089,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 50);
+        assert_eq!(SCHEMA_VERSION, 51);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)
