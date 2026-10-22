@@ -164,6 +164,10 @@ pub trait SecondarySyncObserver: Send + Sync {
 
     /// The number of outstanding "needs reindex" records changed.
     fn needs_reindex(&self, outstanding: u64);
+
+    /// The number of resources queued for asynchronous sync and not yet
+    /// written or recorded changed (#1545).
+    fn queue_depth(&self, _depth: u64) {}
 }
 
 /// The error as text. `BackendError::Unavailable` displays its reason, which
@@ -262,6 +266,13 @@ impl SyncFailureRecorder {
     /// Outstanding records, as far as this process knows.
     pub fn outstanding(&self) -> u64 {
         self.outstanding.load(Ordering::Relaxed)
+    }
+
+    /// Publishes the asynchronous sync queue's depth.
+    pub(crate) fn queue_depth(&self, depth: u64) {
+        if let Some(observer) = self.observer.read().clone() {
+            observer.queue_depth(depth);
+        }
     }
 
     fn publish_outstanding(&self) {
