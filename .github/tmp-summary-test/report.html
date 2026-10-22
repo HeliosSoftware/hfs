@@ -1,0 +1,691 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmark FHIR · 39657850695</title>
+<style>
+:root{
+  color-scheme: light;
+  --page:#f9f9f7; --surface:#fcfcfb; --surface-2:#f0efec;
+  --ink:#0b0b0b; --ink-2:#52514e; --muted:#6f6d68;
+  --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.12);
+  --pg:#2a78d6; --other:#9a988f; --pg-soft:#86b6ef; --pg-deep:#104281;
+  --ph1:#b7d3f6; --ph2:#3987e5; --ph3:#184f95;
+  --band-a:#f0efec; --band-b:#e7e6e0;
+  --good:#0a7d0a; --good-bg:#e5f3e5; --warn:#8a5a00; --warn-bg:#fdf1d6;
+  --bad:#b42323; --bad-bg:#fbe4e4; --na:#6f6d68; --na-bg:#efeee9;
+  --line:#0b0b0b; --cpu:#b42323;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --page:#0d0d0d; --surface:#1a1a19; --surface-2:#242422;
+    --ink:#f0efec; --ink-2:#c3c2b7; --muted:#9c9a93;
+    --grid:#2c2c2a; --axis:#4a4a46; --border:rgba(255,255,255,.12);
+    --pg:#3987e5; --other:#6b6a64; --pg-soft:#5598e7; --pg-deep:#cde2fb;
+    --ph1:#9ec5f4; --ph2:#3987e5; --ph3:#1c5cab;
+    --band-a:#222220; --band-b:#2b2b28;
+    --good:#4cc94c; --good-bg:#11301a; --warn:#f5b93a; --warn-bg:#36290b;
+    --bad:#ff7b7b; --bad-bg:#3a1515; --na:#9c9a93; --na-bg:#242422;
+    --line:#f0efec; --cpu:#ff7b7b;
+  }
+}
+:root[data-theme="dark"]{
+    color-scheme: dark;
+    --page:#0d0d0d; --surface:#1a1a19; --surface-2:#242422;
+    --ink:#f0efec; --ink-2:#c3c2b7; --muted:#9c9a93;
+    --grid:#2c2c2a; --axis:#4a4a46; --border:rgba(255,255,255,.12);
+    --pg:#3987e5; --other:#6b6a64; --pg-soft:#5598e7; --pg-deep:#cde2fb;
+    --ph1:#9ec5f4; --ph2:#3987e5; --ph3:#1c5cab;
+    --band-a:#222220; --band-b:#2b2b28;
+    --good:#4cc94c; --good-bg:#11301a; --warn:#f5b93a; --warn-bg:#36290b;
+    --bad:#ff7b7b; --bad-bg:#3a1515; --na:#9c9a93; --na-bg:#242422;
+    --line:#f0efec; --cpu:#ff7b7b;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--page);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-text-size-adjust:100%}
+.wrap{max-width:1100px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:1.5rem;line-height:1.25;margin:0 0 4px}
+h2{font-size:1.2rem;margin:40px 0 4px;padding-top:8px;border-top:1px solid var(--grid)}
+h2 .num{color:var(--muted);font-weight:500;margin-right:6px}
+h3{font-size:1rem;margin:22px 0 2px}
+p{margin:4px 0 10px}
+.lead{color:var(--ink-2);margin-bottom:14px}
+.meta{color:var(--ink-2);font-size:.9rem;display:flex;flex-wrap:wrap;gap:4px 16px}
+.meta b{color:var(--ink);font-weight:600}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em}
+nav.toc{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0 0}
+nav.toc a{color:var(--ink-2);text-decoration:none;border:1px solid var(--border);border-radius:999px;padding:2px 10px;font-size:.85rem}
+nav.toc a:hover{color:var(--ink);border-color:var(--axis)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px}
+.verdict{margin-top:16px;border-left:6px solid var(--warn);background:var(--surface)}
+.verdict .title{font-weight:700;font-size:1.05rem}
+.verdict ul{margin:6px 0 0;padding-left:20px}
+.note{font-size:.85rem;color:var(--ink-2)}
+.how{font-size:.85rem;color:var(--ink-2);margin:6px 0 2px}
+.how b{color:var(--ink)}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{border-collapse:collapse;width:100%;font-size:.86rem;font-variant-numeric:tabular-nums}
+th,td{padding:6px 8px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:top}
+th{font-weight:600;color:var(--ink-2);white-space:nowrap}
+td.n,th.n{text-align:right;white-space:nowrap}
+tr.pgrow td{background:color-mix(in srgb,var(--pg) 7%,transparent)}
+.st{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border-radius:6px;font-size:.82rem;white-space:nowrap;font-weight:500}
+.st i{font-style:normal;font-weight:800;width:1em;text-align:center}
+.st.ok{color:var(--good);background:var(--good-bg)}
+.st.warn{color:var(--warn);background:var(--warn-bg)}
+.st.bad{color:var(--bad);background:var(--bad-bg)}
+.st.na{color:var(--na);background:var(--na-bg)}
+.validity td{min-width:110px}
+.validity td:first-child{min-width:0;font-weight:600}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:10px}
+.kpi .lbl{font-size:.82rem;color:var(--ink-2)}
+.kpi .val{font-size:1.9rem;font-weight:700;line-height:1.15;margin:2px 0}
+.kpi .unit{font-size:.85rem;font-weight:500;color:var(--ink-2)}
+.kpi .sub{font-size:.82rem;color:var(--ink-2)}
+.kpi .delta{font-size:.82rem;margin-top:6px;padding-top:6px;border-top:1px dashed var(--grid);color:var(--ink-2)}
+.kpi .delta b{color:var(--ink)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+.grid2.wide{grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr))}
+.chart{min-height:40px}
+.chart svg{display:block;overflow:visible}
+.chart text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+.panel h4{margin:0 0 2px;font-size:.92rem}
+.panel .u{font-size:.8rem;color:var(--muted);margin-bottom:4px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:.82rem;color:var(--ink-2);margin:6px 0}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px}
+.seg{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.seg button{font:inherit;font-size:.84rem;padding:3px 10px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--ink-2);cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+.seg button:focus-visible,[data-tip]:focus-visible{outline:2px solid var(--pg);outline-offset:2px}
+#tip{position:fixed;z-index:10;pointer-events:none;background:var(--ink);color:var(--surface);font-size:.8rem;line-height:1.35;padding:6px 8px;border-radius:6px;max-width:280px;white-space:pre-line;opacity:0;transition:opacity .08s}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:after{content:" ↕";color:var(--muted);font-weight:400}
+th.sortable[aria-sort="ascending"]:after{content:" ↑";color:var(--ink)}
+th.sortable[aria-sort="descending"]:after{content:" ↓";color:var(--ink)}
+.gloss{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px 18px;font-size:.88rem}
+.gloss div b{display:block}
+.marks{font-size:.85rem;color:var(--ink-2)}
+.marks b{color:var(--ink)}
+footer{margin-top:40px;font-size:.8rem;color:var(--muted)}
+.mk{color:var(--bad);font-weight:700}
+@media (max-width:520px){
+  body{font-size:14px}
+  .kpi .val{font-size:1.6rem}
+  .grid2{grid-template-columns:1fr}
+}
+@media print{
+  :root{color-scheme:light}
+  body{background:#fff;font-size:11pt}
+  .wrap{max-width:none;padding:0}
+  nav.toc,.seg,#tip,.noprint{display:none!important}
+  h2{break-after:avoid;page-break-after:avoid}
+  .card,.panel,table,.kpi,figure{break-inside:avoid;page-break-inside:avoid}
+  .scroll{overflow:visible}
+  a{color:inherit}
+}
+figure{margin:0}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Benchmark de servidor FHIR <span class="mono" style="font-weight:500;color:var(--ink-2)">#39657850695</span></h1>
+  <div class="meta" id="meta"></div>
+  <nav class="toc" aria-label="Secciones">
+    <a href="#validez">1 · Validez</a><a href="#resultados">2 · Resultados</a><a href="#detalle">3 · Detalle</a><a href="#datos">4 · Datos</a><a href="#glosario">Glosario</a>
+  </nav>
+  <div class="card verdict" id="verdict" role="status"></div>
+</header>
+
+<section id="validez">
+  <h2><span class="num">1</span>¿Es válida esta corrida?</h2>
+  <p class="lead">Antes de mirar velocidades: cada leg debe haber cargado el corpus entero, sin errores y con sus contenedores vivos.</p>
+  <div class="card scroll"><table class="validity" id="validity"></table></div>
+  <p class="how"><b>Cómo leer esto:</b> <span class="st ok"><i>✓</i>ok</span> cumple · <span class="st warn"><i>!</i>aviso</span> usar con cuidado · <span class="st bad"><i>✗</i>falla</span> esos números no son comparables · <span class="st na"><i>–</i></span> no aplica.</p>
+  <p class="note">La carga se mide en el host Docker compartido (donde corren Postgres, Mongo y Elasticsearch), que tiene <b id="cpuN"></b> CPU; una carga mayor que ese número significa trabajo en cola.</p>
+</section>
+
+<section id="resultados">
+  <h2><span class="num">2</span>Resultados</h2>
+  <h3 id="headTitle"></h3>
+  <div class="kpis" id="kpis"></div>
+  <p class="how" id="prevNote"></p>
+
+  <h3>Rendimiento por suite, todas las legs</h3>
+  <p class="how"><b>Cómo leer esto:</b> barra más larga = más pedidos por segundo; cada panel tiene su propia escala, así que compara legs dentro de un panel, no entre paneles.</p>
+  <div class="legend"><span><span class="sw" style="background:var(--pg)"></span><span class="headName"></span></span><span><span class="sw" style="background:var(--other)"></span>otras legs (contexto)</span><span>† ‡ ⚠ marcas de validez (ver glosario)</span></div>
+  <div class="grid2" id="thr"></div>
+
+  <h3>Latencia por suite (escala logarítmica)</h3>
+  <p class="how"><b>Cómo leer esto:</b> el punto es la mediana (p50), la raya vertical el p95 y el final de la línea el p99; más a la izquierda es más rápido y cada marca del eje es 10 veces la anterior.</p>
+  <div class="legend"><span>● p50 (típico)</span><span>┃ p95 (1 de cada 20 más lento)</span><span>┤ p99 (1 de cada 100)</span></div>
+  <div class="grid2 wide" id="lat"></div>
+</section>
+
+<section id="detalle">
+  <h2><span class="num">3</span>Detalle</h2>
+
+  <h3>Línea de tiempo y carga del host</h3>
+  <p class="how"><b>Cómo leer esto:</b> las franjas son las fases de la leg; la línea es la carga del host Docker (media de 1 minuto) y la raya roja punteada marca sus <span class="cpuN2"></span> CPU: por encima, los procesos esperan turno.</p>
+  <div class="seg" role="group" aria-label="Leg" id="segTime"></div>
+  <figure class="card chart" id="timeline"></figure>
+  <p class="note">Solo hay una lectura al inicio y al final de cada fase; entre lecturas la línea es una interpolación. Cada franja cubre todo el paso de la suite (k6 más capturas de diagnóstico), no solo la carga.</p>
+
+  <h3>Bulk import (<span class="mono">$bulk-submit</span>) por fase</h3>
+  <p class="how"><b>Cómo leer esto:</b> cada barra es el tiempo hasta que los datos se pueden buscar; más corta es mejor. El cronómetro oficial suma ingesta e índice; la conversión previa a NDJSON se muestra aparte.</p>
+  <div class="legend"><span><span class="sw" style="background:var(--ph1)"></span>conversión (fuera del total)</span><span><span class="sw" style="background:var(--ph2)"></span>ingesta</span><span><span class="sw" style="background:var(--ph3)"></span>construcción del índice de búsqueda</span></div>
+  <figure class="card chart" id="bulk"></figure>
+
+  <h3>Búsqueda por forma de consulta</h3>
+  <p class="how"><b>Cómo leer esto:</b> el promedio de búsqueda esconde consultas lentas; aquí cada fila es un tipo de consulta, la parte oscura llega a la mediana y la clara al p95.</p>
+  <div class="seg" role="group" aria-label="Leg" id="segShape"></div>
+  <div class="legend"><span><span class="sw" style="background:var(--pg-deep)"></span>hasta p50</span><span><span class="sw" style="background:var(--pg-soft)"></span>p50 → p95</span></div>
+  <figure class="card chart" id="shapes"></figure>
+  <p class="note">Percentiles por índice sin interpolar, igual que <span class="mono">search_by_shape.py</span> del CI; por eso no coinciden exactamente con los de k6.</p>
+
+  <h3 id="trendTitle"></h3>
+  <p class="how"><b>Cómo leer esto:</b> un punto por corrida, más alto es mejor; con un solo dato por fecha y hosts distintos, la línea muestra contexto, no una tendencia demostrada.</p>
+  <div class="grid2" id="trend"></div>
+  <div class="card scroll" style="margin-top:10px"><table id="trendCtx"></table></div>
+</section>
+
+<section id="datos">
+  <h2><span class="num">4</span>Datos completos</h2>
+  <p class="lead">Todos los números de la corrida; toca un encabezado para ordenar.</p>
+  <div class="card scroll"><table id="full"></table></div>
+  <p class="marks" id="marksNote"></p>
+
+  <h3>Salud de cada leg</h3>
+  <div class="card scroll"><table id="health"></table></div>
+
+  <h3>Control de tamaño de resultados</h3>
+  <p class="how"><b>Cómo leer esto:</b> totales que devolvió cada leg para las mismas consultas; si difieren, las legs no buscaron sobre los mismos datos.</p>
+  <div class="card scroll"><table id="counts"></table></div>
+</section>
+
+<section id="glosario">
+  <h2>Glosario</h2>
+  <div class="gloss card">
+    <div><b>Leg</b>Una combinación de almacenamiento probada por separado (p. ej. postgres + Elasticsearch).</div>
+    <div><b>VU (usuario virtual)</b>Un cliente simulado con un solo pedido en curso; 300 VUs son 300 clientes a la vez, no 300 req/s.</div>
+    <div><b>req/s</b>Pedidos HTTP completados por segundo (más es mejor).</div>
+    <div><b>recursos/s</b>Recursos FHIR guardados por segundo; se usa en import y bulk import, donde un pedido lleva muchos recursos.</div>
+    <div><b>p50 / p95 / p99</b>Tiempo de respuesta que no supera el 50 %, 95 % o 99 % de los pedidos (menos es mejor).</div>
+    <div><b>Err%</b>Porcentaje de pedidos con error HTTP; no revisa si el contenido es correcto.</div>
+    <div><b>Checks ✓/✗</b>Verificaciones del script k6 que pasaron o fallaron (p. ej. «el Bundle se importó»).</div>
+    <div><b>Carga (load average)</b>Procesos que quieren CPU en promedio; por encima del número de CPU hay espera.</div>
+    <div><b>† ‡ ⚠</b><span id="glossMarks"></span></div>
+    <div><b>Suites y concurrencia</b><span id="glossSuites"></span></div>
+  </div>
+</section>
+
+<footer id="foot"></footer>
+</div>
+<div id="tip" role="tooltip"></div>
+
+<script>
+"use strict";
+const D = {"run":"39657850695","date":"2026-10-21T19:16:55Z","sha":"e0bd5cb35","ref":"main","docker_cpus":4,"docker_ram_gb":19,"headline":"postgres","order":["postgres","postgres-elasticsearch","sqlite","sqlite-elasticsearch","mongodb","mongodb-elasticsearch"],"missing":[],"legs":{"postgres":{"leg":"postgres","label":"postgres","runner":"github-agent6","cpus":"8","ram":"23G","sha":"e0bd5cb35","ref":"main","run":"39657850695","suites":{"prewarm":{"rps":1866.8,"reqs":56520,"p50":5.74,"p95":11.55,"p99":15.97,"max":64.2,"err":0,"ok":56520,"fail":0,"vus":10,"unit":"req/s"},"import":{"rps":4368.69,"reqs":2005,"p50":2673.33,"p95":26629.82,"p99":66378.21,"max":171504.46,"err":0,"ok":1000,"fail":0,"vus":20,"unit":"recursos/s"},"crud":{"rps":2175.48,"reqs":526680,"p50":122.67,"p95":290.0,"p99":415.73,"max":1672.49,"err":0,"ok":526680,"fail":0,"vus":300,"unit":"req/s"},"search":{"rps":2185.54,"reqs":262875,"p50":7.67,"p95":40.38,"p99":114.4,"max":26508.73,"err":0,"ok":262872,"fail":0,"vus":30,"unit":"req/s"},"insert":{"rps":1425.0,"reqs":171220,"p50":31.93,"p95":57.68,"p99":102.93,"max":637.64,"err":0,"ok":171220,"fail":0,"vus":50,"unit":"req/s"}},"ic":{"bundles_ok":1000,"entries":1627336,"scenario":372.5,"setup":19.7},"bulk":{"status":"complete","reason":"","phase":"done","convert":47.0,"ingest":510.3,"index":1053.9,"total":1564.2,"rps":1042.5,"ingest_rps":3195.5,"ok":1630685,"submitted":1630685,"failed":0,"index_status":"completed","searchable":true},"drain":null,"containers_known":true,"containers":["hfs-bench-pg-postgres-39657850695 OOMKilled=false Status=running"],"died":false,"host":[{"t":"20:17:15","suite":"prewarm","phase":"start","la1":1.07,"la5":3.0,"containers":24,"mem_mb":17669.0},{"t":"20:17:49","suite":"prewarm","phase":"end","la1":3.49,"la5":3.37,"containers":27,"mem_mb":16564.0},{"t":"20:17:51","suite":"import","phase":"start","la1":3.53,"la5":3.39,"containers":27,"mem_mb":16424.0},{"t":"20:24:28","suite":"import","phase":"end","la1":12.51,"la5":12.74,"containers":33,"mem_mb":12022.0},{"t":"20:24:34","suite":"crud","phase":"start","la1":11.99,"la5":12.63,"containers":33,"mem_mb":12039.0},{"t":"20:28:40","suite":"crud","phase":"end","la1":19.6,"la5":16.67,"containers":33,"mem_mb":11132.0},{"t":"20:28:43","suite":"search","phase":"start","la1":19.6,"la5":16.67,"containers":33,"mem_mb":11182.0},{"t":"20:36:49","suite":"search","phase":"end","la1":30.78,"la5":18.67,"containers":33,"mem_mb":8777.0},{"t":"20:36:56","suite":"insert","phase":"start","la1":28.96,"la5":18.49,"containers":33,"mem_mb":8756.0},{"t":"20:39:00","suite":"insert","phase":"end","la1":22.17,"la5":19.52,"containers":33,"mem_mb":8363.0},{"t":"20:39:04","suite":"bulk-import","phase":"start","la1":22.17,"la5":19.52,"containers":33,"mem_mb":8339.0},{"t":"21:06:30","suite":"bulk-import","phase":"end","la1":2.5,"la5":3.11,"containers":52,"mem_mb":7846.0}],"pg_ms":0.188,"counts":[{"q":"Patient?_summary=count","total":"1000","http":"200"},{"q":"Observation?_summary=count","total":"689080","http":"200"},{"q":"Encounter?_summary=count","total":"67692","http":"200"},{"q":"Patient?name:contains=an&_summary=count","total":"353","http":"200"},{"q":"Observation?date=ge2020-01-01&_summary=count","total":"327171","http":"200"},{"q":"Observation?date=sa2020-01-01&_summary=count","total":"326951","http":"200"},{"q":"Observation?code=8302-2,29463-7&_summary=count","total":"33473","http":"200"},{"q":"Observation?value-quantity=gt100&_summary=count","total":"101155","http":"200"},{"q":"Observation?value-quantity=sa100&_summary=count","total":"101155","http":"200"},{"q":"Observation?code-value-quantity=http://loinc.org%7C8867-4$gt100&_summary=count","total":"222","http":"200"},{"q":"Observation?combo-code-value-quantity=8480-6$gt140&_summary=count","total":"1009","http":"200"},{"q":"Encounter?class=AMB,EMER&_summary=count","total":"65900","http":"200"}],"residue":0,"indexing_suite":false,"start":"2026-10-21T20:17:15Z","markers":{"prewarm":"","import":"","crud":"","search":"","insert":"","bulk":""},"shapes":[{"type":"composite","q":"Observation?code-value-quantity","n":10953,"p50":18.2,"p95":174.59,"max":707.33},{"type":"composite","q":"Observation?component-code-value-quantity","n":10953,"p50":12.38,"p95":163.5,"max":1593.3},{"type":"string","q":"Patient?address","n":10953,"p50":11.47,"p95":59.03,"max":3661.84},{"type":"composite","q":"Observation?combo-code-value-quantity","n":10953,"p50":11.37,"p95":57.9,"max":369.43},{"type":"string","q":"Patient?name","n":10953,"p50":9.08,"p95":46.75,"max":494.19},{"type":"reference","q":"MedicationRequest?requester","n":10953,"p50":6.88,"p95":37.18,"max":1132.34},{"type":"quantity","q":"Observation?component-value-quantity","n":10953,"p50":10.54,"p95":36.68,"max":273.32},{"type":"quantity","q":"Observation?combo-value-quantity","n":10953,"p50":9.41,"p95":36.11,"max":375.15},{"type":"date","q":"Encounter?date","n":10953,"p50":6.24,"p95":35.02,"max":349.48},{"type":"reference","q":"Observation?subject","n":10953,"p50":8.04,"p95":34.1,"max":353.78},{"type":"quantity","q":"Observation?value-quantity","n":10953,"p50":8.86,"p95":34.03,"max":458.86},{"type":"date","q":"Observation?date","n":10953,"p50":7.07,"p95":32.92,"max":3952.76},{"type":"reference","q":"Encounter?participant","n":10953,"p50":7.09,"p95":28.37,"max":513.84},{"type":"token","q":"Observation?code","n":10953,"p50":6.85,"p95":28.09,"max":290.43},{"type":"token","q":"Observation?category","n":10953,"p50":7.24,"p95":27.06,"max":315.61},{"type":"token","q":"Encounter?class","n":10953,"p50":6.88,"p95":26.64,"max":26508.73},{"type":"date","q":"Patient?birthdate","n":10953,"p50":7.13,"p95":26.15,"max":293.29},{"type":"reference","q":"Encounter?subject","n":10953,"p50":6.78,"p95":25.61,"max":317.36},{"type":"token","q":"Encounter?status","n":10953,"p50":5.95,"p95":25.22,"max":316.48},{"type":"reference","q":"MedicationRequest?subject","n":10953,"p50":5.95,"p95":24.84,"max":307.99},{"type":"reference","q":"Observation?encounter","n":10953,"p50":6.29,"p95":24.04,"max":258.72},{"type":"string","q":"Organization?name","n":10953,"p50":5.5,"p95":23.68,"max":351.93},{"type":"reference","q":"MedicationRequest?encounter","n":10953,"p50":5.47,"p95":22.48,"max":317.02},{"type":"reference","q":"Observation?performer","n":10953,"p50":4.9,"p95":22.06,"max":338.9}],"shapes_src":"search-points.json","peak":30.78,"checks":{"corpus":["ok","1,000/1,000"],"err":["ok","0 %"],"cont":["ok","vivos"],"es":["na","—"],"load":["warn","pico 30.8 · pg 0.19 ms/llam."]}},"postgres-elasticsearch":{"leg":"postgres-elasticsearch","label":"postgres + ES","runner":"github-agent2","cpus":"8","ram":"23G","sha":"e0bd5cb35","ref":"main","run":"39657850695","suites":{"prewarm":{"rps":102.18,"reqs":3240,"p50":87.69,"p95":287.69,"p99":380.86,"max":841.25,"err":0,"ok":3240,"fail":0,"vus":10,"unit":"req/s"},"import":{"rps":6140.89,"reqs":2005,"p50":3486.41,"p95":10958.2,"p99":28386.96,"max":61126.96,"err":0,"ok":1000,"fail":0,"vus":20,"unit":"recursos/s"},"crud":{"rps":879.0,"reqs":216000,"p50":341.72,"p95":798.62,"p99":1036.21,"max":1885.58,"err":0,"ok":216000,"fail":0,"vus":300,"unit":"req/s"},"search":{"rps":868.76,"reqs":104619,"p50":30.47,"p95":73.03,"p99":107.96,"max":424.45,"err":0,"ok":104616,"fail":0,"vus":30,"unit":"req/s"},"insert":{"rps":262.93,"reqs":31765,"p50":204.68,"p95":247.12,"p99":263.19,"max":293.03,"err":0,"ok":31765,"fail":0,"vus":50,"unit":"req/s"}},"ic":{"bundles_ok":1000,"entries":1627336,"scenario":265.0,"setup":520.0},"bulk":{"status":"complete","reason":"","phase":"done","convert":44.4,"ingest":315.1,"index":320.7,"total":635.8,"rps":2564.8,"ingest_rps":5175.1,"ok":1630685,"submitted":1630685,"failed":0,"index_status":"completed","searchable":true},"drain":{"status":"drained","missing":"0","sync":"synchronous"},"containers_known":true,"containers":["hfs-bench-pg-postgres-elasticsearch-39657850695 OOMKilled=false Status=running","hfs-bench-es-postgres-elasticsearch-39657850695 OOMKilled=false Status=running"],"died":false,"host":[{"t":"22:56:17","suite":"prewarm","phase":"start","la1":1.64,"la5":2.93,"containers":23,"mem_mb":15431.0},{"t":"22:56:51","suite":"prewarm","phase":"end","la1":1.71,"la5":2.82,"containers":23,"mem_mb":15310.0},{"t":"22:56:55","suite":"import","phase":"start","la1":1.73,"la5":2.81,"containers":23,"mem_mb":15308.0},{"t":"23:10:03","suite":"import","phase":"end","la1":9.62,"la5":7.32,"containers":23,"mem_mb":12618.0},{"t":"23:10:07","suite":"crud","phase":"start","la1":8.85,"la5":7.2,"containers":23,"mem_mb":12617.0},{"t":"23:14:16","suite":"crud","phase":"end","la1":22.22,"la5":15.79,"containers":23,"mem_mb":12422.0},{"t":"23:14:31","suite":"search","phase":"start","la1":17.3,"la5":15.02,"containers":23,"mem_mb":12403.0},{"t":"23:16:34","suite":"search","phase":"end","la1":12.48,"la5":13.92,"containers":23,"mem_mb":12328.0},{"t":"23:16:38","suite":"insert","phase":"start","la1":11.48,"la5":13.69,"containers":23,"mem_mb":12329.0},{"t":"23:18:41","suite":"insert","phase":"end","la1":11.88,"la5":12.93,"containers":23,"mem_mb":12324.0},{"t":"23:18:45","suite":"bulk-import","phase":"start","la1":11.88,"la5":12.93,"containers":23,"mem_mb":12325.0},{"t":"23:30:28","suite":"bulk-import","phase":"end","la1":2.82,"la5":3.67,"containers":23,"mem_mb":12326.0}],"pg_ms":null,"counts":[{"q":"Patient?_summary=count","total":"1000","http":"200"},{"q":"Observation?_summary=count","total":"689080","http":"200"},{"q":"Encounter?_summary=count","total":"67692","http":"200"},{"q":"Patient?name:contains=an&_summary=count","total":"353","http":"200"},{"q":"Observation?date=ge2020-01-01&_summary=count","total":"327171","http":"200"},{"q":"Observation?date=sa2020-01-01&_summary=count","total":"326951","http":"200"},{"q":"Observation?code=8302-2,29463-7&_summary=count","total":"33473","http":"200"},{"q":"Observation?value-quantity=gt100&_summary=count","total":"101155","http":"200"},{"q":"Observation?value-quantity=sa100&_summary=count","total":"101155","http":"200"},{"q":"Observation?code-value-quantity=http://loinc.org%7C8867-4$gt100&_summary=count","total":"222","http":"200"},{"q":"Observation?combo-code-value-quantity=8480-6$gt140&_summary=count","total":"1009","http":"200"},{"q":"Encounter?class=AMB,EMER&_summary=count","total":"65900","http":"200"}],"residue":0,"indexing_suite":false,"start":"2026-10-21T22:56:17Z","markers":{"prewarm":"","import":"","crud":"","search":"","insert":"","bulk":""},"shapes":[{"type":"date","q":"Observation?date","n":4359,"p50":59.91,"p95":119.45,"max":419.79},{"type":"quantity","q":"Observation?combo-value-quantity","n":4359,"p50":52.84,"p95":109.21,"max":212.93},{"type":"quantity","q":"Observation?value-quantity","n":4359,"p50":50.44,"p95":104.83,"max":268.79},{"type":"token","q":"Observation?category","n":4359,"p50":42.9,"p95":86.06,"max":424.45},{"type":"quantity","q":"Observation?component-value-quantity","n":4359,"p50":46.35,"p95":79.64,"max":238.65},{"type":"token","q":"Observation?code","n":4359,"p50":33.2,"p95":61.7,"max":245.19},{"type":"date","q":"Encounter?date","n":4359,"p50":32.7,"p95":59.7,"max":306.22},{"type":"composite","q":"Observation?code-value-quantity","n":4359,"p50":30.85,"p95":57.33,"max":354.35},{"type":"composite","q":"Observation?combo-code-value-quantity","n":4359,"p50":30.14,"p95":55.14,"max":237.83},{"type":"composite","q":"Observation?component-code-value-quantity","n":4359,"p50":29.75,"p95":54.94,"max":354.64},{"type":"string","q":"Organization?name","n":4359,"p50":28.03,"p95":52.75,"max":289.65},{"type":"date","q":"Patient?birthdate","n":4359,"p50":28.13,"p95":52.74,"max":173.87},{"type":"token","q":"Encounter?class","n":4359,"p50":29.32,"p95":52.64,"max":309.12},{"type":"token","q":"Encounter?status","n":4359,"p50":28.21,"p95":51.83,"max":239.54},{"type":"reference","q":"Encounter?participant","n":4359,"p50":27.14,"p95":50.2,"max":219.58},{"type":"reference","q":"Encounter?subject","n":4359,"p50":27.2,"p95":49.83,"max":223.19},{"type":"reference","q":"Observation?subject","n":4359,"p50":26.78,"p95":49.44,"max":122.76},{"type":"string","q":"Patient?address","n":4359,"p50":27.12,"p95":49.39,"max":223.34},{"type":"reference","q":"MedicationRequest?subject","n":4359,"p50":25.88,"p95":48.82,"max":139.47},{"type":"reference","q":"Observation?encounter","n":4359,"p50":25.1,"p95":48.8,"max":189.44},{"type":"string","q":"Patient?name","n":4359,"p50":25.78,"p95":48.37,"max":129.94},{"type":"reference","q":"MedicationRequest?encounter","n":4359,"p50":25.31,"p95":48.01,"max":217.95},{"type":"reference","q":"MedicationRequest?requester","n":4359,"p50":25.88,"p95":47.78,"max":182.36},{"type":"reference","q":"Observation?performer","n":4359,"p50":23.72,"p95":47.76,"max":128.17}],"shapes_src":"search-points.json","peak":22.22,"checks":{"corpus":["ok","1,000/1,000"],"err":["ok","0 %"],"cont":["ok","vivos"],"es":["ok","drenado"],"load":["warn","pico 22.2"]}},"sqlite":{"leg":"sqlite","label":"sqlite","runner":"github-agent2","cpus":"8","ram":"23G","sha":"e0bd5cb35","ref":"main","run":"39657850695","suites":{"prewarm":{"rps":1475.41,"reqs":44496,"p50":1.97,"p95":20.61,"p99":93.25,"max":1731.64,"err":0,"ok":44496,"fail":0,"vus":10,"unit":"req/s"},"import":{"rps":1122.37,"reqs":2005,"p50":21619.67,"p95":60259.95,"p99":88429.54,"max":260003.48,"err":3.89,"ok":922,"fail":78,"vus":20,"unit":"recursos/s"},"crud":{"rps":1131.81,"reqs":279612,"p50":142.11,"p95":902.25,"p99":1606.29,"max":11321.22,"err":0,"ok":279612,"fail":0,"vus":300,"unit":"req/s"},"search":{"rps":3.69,"reqs":557,"p50":5625.73,"p95":17373.85,"p99":32468.82,"max":41078.0,"err":0,"ok":554,"fail":0,"vus":30,"unit":"req/s"},"insert":{"rps":826.95,"reqs":102415,"p50":45.44,"p95":113.3,"p99":374.33,"max":14584.66,"err":0,"ok":102415,"fail":0,"vus":50,"unit":"req/s"}},"ic":{"bundles_ok":922,"entries":1527543,"scenario":1361.0,"setup":4.6},"bulk":{"status":"complete","reason":"","phase":"done","convert":46.8,"ingest":355.2,"index":1098.7,"total":1453.9,"rps":1121.6,"ingest_rps":4590.9,"ok":1630685,"submitted":1630685,"failed":0,"index_status":"completed","searchable":true},"drain":null,"containers_known":true,"containers":[],"died":false,"host":[{"t":"19:16:55","suite":"prewarm","phase":"start","la1":7.6,"la5":6.32,"containers":16,"mem_mb":16158.0},{"t":"19:17:29","suite":"prewarm","phase":"end","la1":8.68,"la5":6.75,"containers":15,"mem_mb":16241.0},{"t":"19:17:31","suite":"import","phase":"start","la1":8.68,"la5":6.75,"containers":16,"mem_mb":16180.0},{"t":"19:40:19","suite":"import","phase":"end","la1":5.75,"la5":7.19,"containers":17,"mem_mb":14782.0},{"t":"19:40:21","suite":"crud","phase":"start","la1":5.75,"la5":7.19,"containers":17,"mem_mb":14773.0},{"t":"19:44:32","suite":"crud","phase":"end","la1":7.5,"la5":7.65,"containers":17,"mem_mb":14924.0},{"t":"19:44:34","suite":"search","phase":"start","la1":7.06,"la5":7.56,"containers":17,"mem_mb":14917.0},{"t":"19:47:10","suite":"search","phase":"end","la1":18.1,"la5":11.63,"containers":24,"mem_mb":13721.0},{"t":"19:47:52","suite":"insert","phase":"start","la1":12.72,"la5":11.27,"containers":16,"mem_mb":16823.0},{"t":"19:49:59","suite":"insert","phase":"end","la1":10.13,"la5":10.56,"containers":16,"mem_mb":16636.0},{"t":"19:50:01","suite":"bulk-import","phase":"start","la1":10.13,"la5":10.56,"containers":16,"mem_mb":16619.0},{"t":"20:15:25","suite":"bulk-import","phase":"end","la1":2.78,"la5":4.0,"containers":22,"mem_mb":18260.0}],"pg_ms":null,"counts":[{"q":"Patient?_summary=count","total":"922","http":"200"},{"q":"Observation?_summary=count","total":"657369","http":"200"},{"q":"Encounter?_summary=count","total":"63316","http":"200"},{"q":"Patient?name:contains=an&_summary=count","total":"330","http":"200"},{"q":"Observation?date=ge2020-01-01&_summary=count","total":"307405","http":"200"},{"q":"Observation?date=sa2020-01-01&_summary=count","total":"307197","http":"200"},{"q":"Observation?code=8302-2,29463-7&_summary=count","total":"31506","http":"200"},{"q":"Observation?value-quantity=gt100&_summary=count","total":"95724","http":"200"},{"q":"Observation?value-quantity=sa100&_summary=count","total":"95724","http":"200"},{"q":"Observation?code-value-quantity=http://loinc.org%7C8867-4$gt100&_summary=count","total":"217","http":"200"},{"q":"Observation?combo-code-value-quantity=8480-6$gt140&_summary=count","total":"922","http":"200"},{"q":"Encounter?class=AMB,EMER&_summary=count","total":"61602","http":"200"}],"residue":0,"indexing_suite":false,"start":"2026-10-21T19:16:55Z","markers":{"prewarm":"","import":"‡","crud":"†","search":"†","insert":"","bulk":""},"shapes":[{"type":"quantity","q":"Observation?value-quantity","n":22,"p50":16218.69,"p95":38339.73,"max":41078.0},{"type":"composite","q":"Observation?combo-code-value-quantity","n":25,"p50":16097.58,"p95":25915.43,"max":26475.59},{"type":"composite","q":"Observation?code-value-quantity","n":23,"p50":14611.63,"p95":25153.58,"max":25361.97},{"type":"quantity","q":"Observation?combo-value-quantity","n":27,"p50":4865.78,"p95":24136.76,"max":37865.26},{"type":"token","q":"Observation?category","n":19,"p50":9502.57,"p95":17937.4,"max":17937.4},{"type":"date","q":"Observation?date","n":26,"p50":6722.35,"p95":15677.41,"max":15813.0},{"type":"reference","q":"MedicationRequest?subject","n":20,"p50":4946.88,"p95":15629.68,"max":15629.68},{"type":"quantity","q":"Observation?component-value-quantity","n":27,"p50":5316.03,"p95":15497.83,"max":16700.81},{"type":"token","q":"Encounter?class","n":23,"p50":7019.45,"p95":15074.88,"max":15690.43},{"type":"token","q":"Encounter?status","n":23,"p50":6826.56,"p95":15064.41,"max":15971.23},{"type":"string","q":"Patient?address","n":28,"p50":5830.68,"p95":14506.24,"max":14530.54},{"type":"reference","q":"Encounter?subject","n":21,"p50":5865.81,"p95":14382.43,"max":14389.44},{"type":"reference","q":"Observation?subject","n":20,"p50":4398.33,"p95":14268.36,"max":14268.36},{"type":"reference","q":"Observation?encounter","n":20,"p50":4426.0,"p95":13014.84,"max":13014.84},{"type":"composite","q":"Observation?component-code-value-quantity","n":22,"p50":8996.38,"p95":12969.6,"max":14983.5},{"type":"reference","q":"Encounter?participant","n":22,"p50":4559.17,"p95":12335.78,"max":14918.45},{"type":"reference","q":"MedicationRequest?requester","n":21,"p50":3517.38,"p95":9462.35,"max":14230.32},{"type":"reference","q":"MedicationRequest?encounter","n":20,"p50":3999.92,"p95":9070.63,"max":9070.63},{"type":"date","q":"Patient?birthdate","n":26,"p50":4630.73,"p95":8723.41,"max":8898.07},{"type":"token","q":"Observation?code","n":17,"p50":4965.66,"p95":8592.56,"max":8592.56},{"type":"string","q":"Organization?name","n":28,"p50":2343.92,"p95":8039.12,"max":12210.49},{"type":"reference","q":"Observation?performer","n":20,"p50":5490.59,"p95":7603.25,"max":7603.25},{"type":"date","q":"Encounter?date","n":27,"p50":3654.63,"p95":6889.57,"max":9474.77},{"type":"string","q":"Patient?name","n":27,"p50":3868.67,"p95":6190.36,"max":8661.93}],"shapes_src":"search-points.json","peak":18.1,"checks":{"corpus":["bad","922/1,000"],"err":["bad","import 3.9 %"],"cont":["na","sin contenedor"],"es":["na","—"],"load":["warn","pico 18.1"]}},"sqlite-elasticsearch":{"leg":"sqlite-elasticsearch","label":"sqlite + ES","runner":"github-agent1","cpus":"8","ram":"23G","sha":"e0bd5cb35","ref":"main","run":"39657850695","suites":{"prewarm":{"rps":89.99,"reqs":2988,"p50":89.81,"p95":292.3,"p99":363.89,"max":871.78,"err":0,"ok":2988,"fail":0,"vus":10,"unit":"req/s"},"import":{"rps":6324.66,"reqs":2005,"p50":3523.21,"p95":10268.05,"p99":24381.41,"max":57285.4,"err":0,"ok":1000,"fail":0,"vus":20,"unit":"recursos/s"},"crud":{"rps":994.58,"reqs":248112,"p50":295.09,"p95":749.16,"p99":973.99,"max":1585.68,"err":0,"ok":248112,"fail":0,"vus":300,"unit":"req/s"},"search":{"rps":919.76,"reqs":110811,"p50":28.76,"p95":68.92,"p99":101.12,"max":484.19,"err":0,"ok":110808,"fail":0,"vus":30,"unit":"req/s"},"insert":{"rps":266.58,"reqs":32230,"p50":203.35,"p95":243.64,"p99":260.28,"max":315.5,"err":0,"ok":32230,"fail":0,"vus":50,"unit":"req/s"}},"ic":{"bundles_ok":1000,"entries":1627336,"scenario":257.3,"setup":426.9},"bulk":{"status":"complete","reason":"","phase":"done","convert":45.2,"ingest":220.1,"index":313.3,"total":533.4,"rps":3057.2,"ingest_rps":7408.8,"ok":1630685,"submitted":1630685,"failed":0,"index_status":"completed","searchable":true},"drain":{"status":"drained","missing":"0","sync":"synchronous"},"containers_known":true,"containers":["hfs-bench-es-sqlite-elasticsearch-39657850695 OOMKilled=false Status=running"],"died":false,"host":[{"t":"22:23:52","suite":"prewarm","phase":"start","la1":1.45,"la5":3.72,"containers":22,"mem_mb":15847.0},{"t":"22:24:28","suite":"prewarm","phase":"end","la1":2.64,"la5":3.82,"containers":22,"mem_mb":15768.0},{"t":"22:24:32","suite":"import","phase":"start","la1":2.43,"la5":3.75,"containers":22,"mem_mb":15764.0},{"t":"22:35:59","suite":"import","phase":"end","la1":7.4,"la5":5.87,"containers":22,"mem_mb":15266.0},{"t":"22:36:03","suite":"crud","phase":"start","la1":6.81,"la5":5.77,"containers":22,"mem_mb":15265.0},{"t":"22:40:15","suite":"crud","phase":"end","la1":16.62,"la5":13.59,"containers":22,"mem_mb":15225.0},{"t":"22:40:30","suite":"search","phase":"start","la1":13.09,"la5":12.95,"containers":22,"mem_mb":15217.0},{"t":"22:42:34","suite":"search","phase":"end","la1":12.92,"la5":12.72,"containers":22,"mem_mb":15208.0},{"t":"22:42:38","suite":"insert","phase":"start","la1":11.89,"la5":12.51,"containers":22,"mem_mb":15207.0},{"t":"22:44:41","suite":"insert","phase":"end","la1":4.05,"la5":9.27,"containers":22,"mem_mb":15199.0},{"t":"22:44:45","suite":"bulk-import","phase":"start","la1":3.81,"la5":9.13,"containers":22,"mem_mb":15197.0},{"t":"22:54:40","suite":"bulk-import","phase":"end","la1":2.79,"la5":3.61,"containers":22,"mem_mb":15200.0}],"pg_ms":null,"counts":[{"q":"Patient?_summary=count","total":"1000","http":"200"},{"q":"Observation?_summary=count","total":"689080","http":"200"},{"q":"Encounter?_summary=count","total":"67692","http":"200"},{"q":"Patient?name:contains=an&_summary=count","total":"353","http":"200"},{"q":"Observation?date=ge2020-01-01&_summary=count","total":"327171","http":"200"},{"q":"Observation?date=sa2020-01-01&_summary=count","total":"326951","http":"200"},{"q":"Observation?code=8302-2,29463-7&_summary=count","total":"33473","http":"200"},{"q":"Observation?value-quantity=gt100&_summary=count","total":"101155","http":"200"},{"q":"Observation?value-quantity=sa100&_summary=count","total":"101155","http":"200"},{"q":"Observation?code-value-quantity=http://loinc.org%7C8867-4$gt100&_summary=count","total":"222","http":"200"},{"q":"Observation?combo-code-value-quantity=8480-6$gt140&_summary=count","total":"1009","http":"200"},{"q":"Encounter?class=AMB,EMER&_summary=count","total":"65900","http":"200"}],"residue":0,"indexing_suite":false,"start":"2026-10-21T22:23:52Z","markers":{"prewarm":"","import":"","crud":"","search":"","insert":"","bulk":""},"shapes":[{"type":"date","q":"Observation?date","n":4617,"p50":58.58,"p95":113.11,"max":381.28},{"type":"quantity","q":"Observation?combo-value-quantity","n":4617,"p50":51.34,"p95":100.9,"max":342.43},{"type":"quantity","q":"Observation?value-quantity","n":4617,"p50":47.62,"p95":99.39,"max":201.01},{"type":"token","q":"Observation?category","n":4617,"p50":38.21,"p95":79.64,"max":484.19},{"type":"quantity","q":"Observation?component-value-quantity","n":4617,"p50":45.5,"p95":78.44,"max":298.24},{"type":"token","q":"Observation?code","n":4617,"p50":30.86,"p95":57.44,"max":167.08},{"type":"composite","q":"Observation?code-value-quantity","n":4617,"p50":29.92,"p95":55.88,"max":311.84},{"type":"date","q":"Encounter?date","n":4617,"p50":30.02,"p95":53.22,"max":334.85},{"type":"composite","q":"Observation?combo-code-value-quantity","n":4617,"p50":28.69,"p95":52.89,"max":218.22},{"type":"composite","q":"Observation?component-code-value-quantity","n":4617,"p50":28.27,"p95":52.21,"max":276.01},{"type":"string","q":"Organization?name","n":4617,"p50":26.65,"p95":50.13,"max":341.89},{"type":"date","q":"Patient?birthdate","n":4617,"p50":26.38,"p95":49.55,"max":105.64},{"type":"token","q":"Encounter?class","n":4617,"p50":26.54,"p95":49.55,"max":216.86},{"type":"token","q":"Encounter?status","n":4617,"p50":25.53,"p95":49.32,"max":222.53},{"type":"reference","q":"Encounter?subject","n":4617,"p50":25.28,"p95":48.18,"max":221.14},{"type":"string","q":"Patient?address","n":4617,"p50":25.69,"p95":48.14,"max":197.55},{"type":"reference","q":"Observation?subject","n":4617,"p50":25.13,"p95":47.82,"max":94.35},{"type":"reference","q":"Encounter?participant","n":4617,"p50":25.66,"p95":47.76,"max":202.05},{"type":"reference","q":"MedicationRequest?subject","n":4617,"p50":24.57,"p95":47.15,"max":182.81},{"type":"reference","q":"MedicationRequest?encounter","n":4617,"p50":24.38,"p95":46.54,"max":151.16},{"type":"reference","q":"MedicationRequest?requester","n":4617,"p50":24.46,"p95":46.26,"max":84.28},{"type":"string","q":"Patient?name","n":4617,"p50":24.06,"p95":46.13,"max":127.04},{"type":"reference","q":"Observation?encounter","n":4617,"p50":23.24,"p95":45.72,"max":111.54},{"type":"reference","q":"Observation?performer","n":4617,"p50":22.65,"p95":44.56,"max":103.77}],"shapes_src":"search-points.json","peak":16.62,"checks":{"corpus":["ok","1,000/1,000"],"err":["ok","0 %"],"cont":["ok","vivos"],"es":["ok","drenado"],"load":["warn","pico 16.6"]}},"mongodb":{"leg":"mongodb","label":"mongodb","runner":"github-agent3","cpus":"8","ram":"23G","sha":"e0bd5cb35","ref":"main","run":"39657850695","suites":{"prewarm":{"rps":1232.43,"reqs":37260,"p50":8.61,"p95":19.94,"p99":29.56,"max":56.41,"err":0,"ok":37260,"fail":0,"vus":10,"unit":"req/s"},"import":{"rps":1200.76,"reqs":2005,"p50":18455.12,"p95":49344.22,"p99":61241.92,"max":86344.86,"err":0.549,"ok":989,"fail":11,"vus":20,"unit":"recursos/s"},"crud":{"rps":1539.09,"reqs":377856,"p50":206.26,"p95":379.98,"p99":536.66,"max":1698.11,"err":0,"ok":377856,"fail":0,"vus":300,"unit":"req/s"},"search":{"rps":21.56,"reqs":3051,"p50":137.3,"p95":9387.27,"p99":13075.8,"max":117915.99,"err":0,"ok":3048,"fail":0,"vus":30,"unit":"req/s"},"insert":{"rps":1166.82,"reqs":140190,"p50":38.69,"p95":70.97,"p99":111.58,"max":668.72,"err":0,"ok":140190,"fail":0,"vus":50,"unit":"req/s"}},"ic":{"bundles_ok":989,"entries":1312554,"scenario":1093.1,"setup":21.8},"bulk":{"status":"complete","reason":"","phase":"done","convert":46.4,"ingest":930.5,"index":1697.8,"total":2628.3,"rps":620.4,"ingest_rps":1752.5,"ok":1630685,"submitted":1630685,"failed":0,"index_status":"completed","searchable":true},"drain":null,"containers_known":true,"containers":["hfs-bench-mongo-mongodb-39657850695 OOMKilled=false Status=running"],"died":false,"host":[{"t":"21:08:48","suite":"prewarm","phase":"start","la1":3.94,"la5":3.36,"containers":52,"mem_mb":10608.0},{"t":"21:09:21","suite":"prewarm","phase":"end","la1":4.9,"la5":3.64,"containers":52,"mem_mb":10031.0},{"t":"21:09:25","suite":"import","phase":"start","la1":4.51,"la5":3.58,"containers":52,"mem_mb":10032.0},{"t":"21:28:05","suite":"import","phase":"end","la1":5.73,"la5":4.31,"containers":53,"mem_mb":6339.0},{"t":"21:28:09","suite":"crud","phase":"start","la1":5.51,"la5":4.29,"containers":53,"mem_mb":6341.0},{"t":"21:32:18","suite":"crud","phase":"end","la1":25.29,"la5":15.76,"containers":53,"mem_mb":6056.0},{"t":"21:32:23","suite":"search","phase":"start","la1":23.67,"la5":15.58,"containers":54,"mem_mb":6198.0},{"t":"21:34:48","suite":"search","phase":"end","la1":29.96,"la5":21.78,"containers":54,"mem_mb":4927.0},{"t":"21:35:06","suite":"insert","phase":"start","la1":22.74,"la5":20.66,"containers":54,"mem_mb":4893.0},{"t":"21:37:11","suite":"insert","phase":"end","la1":25.99,"la5":22.53,"containers":54,"mem_mb":4618.0},{"t":"21:37:15","suite":"bulk-import","phase":"start","la1":24.15,"la5":22.2,"containers":54,"mem_mb":4590.0},{"t":"22:22:11","suite":"bulk-import","phase":"end","la1":2.82,"la5":4.83,"containers":22,"mem_mb":12219.0}],"pg_ms":null,"counts":[{"q":"Patient?_summary=count","total":"989","http":"200"},{"q":"Observation?_summary=count","total":"564051","http":"200"},{"q":"Encounter?_summary=count","total":"56497","http":"200"},{"q":"Patient?name:contains=an&_summary=count","total":"348","http":"200"},{"q":"Observation?date=ge2020-01-01&_summary=count","total":"269919","http":"200"},{"q":"Observation?date=sa2020-01-01&_summary=count","total":"269734","http":"200"},{"q":"Observation?code=8302-2,29463-7&_summary=count","total":"30291","http":"200"},{"q":"Observation?value-quantity=gt100&_summary=count","total":"83180","http":"200"},{"q":"Observation?value-quantity=sa100&_summary=count","total":"83180","http":"200"},{"q":"Observation?code-value-quantity=http://loinc.org%7C8867-4$gt100&_summary=count","total":"222","http":"200"},{"q":"Observation?combo-code-value-quantity=8480-6$gt140&_summary=count","total":"1003","http":"200"},{"q":"Encounter?class=AMB,EMER&_summary=count","total":"54762","http":"200"}],"residue":0,"indexing_suite":false,"start":"2026-10-21T21:08:48Z","markers":{"prewarm":"","import":"‡","crud":"†","search":"†","insert":"","bulk":""},"shapes":[{"type":"composite","q":"Observation?code-value-quantity","n":127,"p50":9284.37,"p95":15431.55,"max":16585.55},{"type":"composite","q":"Observation?component-code-value-quantity","n":127,"p50":8971.52,"p95":13584.21,"max":15366.59},{"type":"composite","q":"Observation?combo-code-value-quantity","n":127,"p50":8644.35,"p95":11794.09,"max":13305.57},{"type":"date","q":"Observation?date","n":127,"p50":150.82,"p95":3498.06,"max":7894.44},{"type":"quantity","q":"Observation?component-value-quantity","n":127,"p50":529.52,"p95":950.35,"max":1742.67},{"type":"quantity","q":"Observation?value-quantity","n":127,"p50":174.82,"p95":789.41,"max":966.19},{"type":"quantity","q":"Observation?combo-value-quantity","n":127,"p50":152.36,"p95":716.48,"max":1309.21},{"type":"token","q":"Observation?code","n":127,"p50":406.36,"p95":699.53,"max":1039.15},{"type":"token","q":"Observation?category","n":127,"p50":137.32,"p95":699.14,"max":869.93},{"type":"token","q":"Encounter?class","n":127,"p50":154.54,"p95":510.0,"max":683.86},{"type":"date","q":"Encounter?date","n":127,"p50":124.24,"p95":491.32,"max":14118.47},{"type":"string","q":"Patient?address","n":127,"p50":253.97,"p95":484.78,"max":899.61},{"type":"reference","q":"MedicationRequest?requester","n":127,"p50":100.15,"p95":392.75,"max":503.01},{"type":"reference","q":"Encounter?participant","n":127,"p50":118.4,"p95":391.22,"max":642.14},{"type":"date","q":"Patient?birthdate","n":127,"p50":122.81,"p95":364.33,"max":677.77},{"type":"string","q":"Patient?name","n":127,"p50":135.02,"p95":341.22,"max":538.84},{"type":"reference","q":"Observation?subject","n":127,"p50":122.13,"p95":244.23,"max":429.18},{"type":"token","q":"Encounter?status","n":127,"p50":95.5,"p95":236.19,"max":322.27},{"type":"string","q":"Organization?name","n":127,"p50":64.39,"p95":216.31,"max":774.28},{"type":"reference","q":"Observation?performer","n":127,"p50":75.62,"p95":196.48,"max":243.23},{"type":"reference","q":"Encounter?subject","n":127,"p50":72.76,"p95":194.44,"max":265.44},{"type":"reference","q":"Observation?encounter","n":127,"p50":60.97,"p95":179.49,"max":117915.99},{"type":"reference","q":"MedicationRequest?subject","n":127,"p50":80.96,"p95":169.67,"max":285.09},{"type":"reference","q":"MedicationRequest?encounter","n":127,"p50":59.16,"p95":168.5,"max":285.4}],"shapes_src":"search-points.json","peak":29.96,"checks":{"corpus":["bad","989/1,000"],"err":["warn","import 11 ✗ (<1 %)"],"cont":["ok","vivos"],"es":["na","—"],"load":["warn","pico 30.0"]}},"mongodb-elasticsearch":{"leg":"mongodb-elasticsearch","label":"mongodb + ES","runner":"github-agent7","cpus":"8","ram":"23G","sha":"e0bd5cb35","ref":"main","run":"39657850695","suites":{"prewarm":{"rps":97.49,"reqs":3240,"p50":90.0,"p95":304.32,"p99":388.86,"max":813.19,"err":0,"ok":3240,"fail":0,"vus":10,"unit":"req/s"},"import":{"rps":4971.8,"reqs":2005,"p50":4188.9,"p95":13450.41,"p99":24764.27,"max":37411.0,"err":0.2,"ok":996,"fail":4,"vus":20,"unit":"recursos/s"},"crud":{"rps":875.29,"reqs":216000,"p50":339.88,"p95":825.64,"p99":1042.03,"max":1817.41,"err":0,"ok":216000,"fail":0,"vus":300,"unit":"req/s"},"search":{"rps":1081.14,"reqs":130179,"p50":24.26,"p95":60.62,"p99":92.19,"max":521.45,"err":0,"ok":130176,"fail":0,"vus":30,"unit":"req/s"},"insert":{"rps":261.16,"reqs":31565,"p50":205.42,"p95":250.25,"p99":270.23,"max":360.55,"err":0,"ok":31565,"fail":0,"vus":50,"unit":"req/s"}},"ic":{"bundles_ok":996,"entries":1465188,"scenario":294.7,"setup":531.2},"bulk":{"status":"complete","reason":"","phase":"done","convert":45.2,"ingest":645.3,"index":350.2,"total":995.5,"rps":1638.1,"ingest_rps":2527.0,"ok":1630685,"submitted":1630685,"failed":0,"index_status":"completed","searchable":true},"drain":{"status":"drained","missing":"0","sync":"synchronous"},"containers_known":true,"containers":["hfs-bench-mongo-mongodb-elasticsearch-39657850695 OOMKilled=false Status=running","hfs-bench-es-mongodb-elasticsearch-39657850695 OOMKilled=false Status=running"],"died":false,"host":[{"t":"23:32:15","suite":"prewarm","phase":"start","la1":2.16,"la5":3.29,"containers":23,"mem_mb":15710.0},{"t":"23:32:51","suite":"prewarm","phase":"end","la1":2.21,"la5":3.16,"containers":23,"mem_mb":15592.0},{"t":"23:32:57","suite":"import","phase":"start","la1":1.95,"la5":3.07,"containers":23,"mem_mb":15584.0},{"t":"23:46:46","suite":"import","phase":"end","la1":4.56,"la5":3.23,"containers":23,"mem_mb":11314.0},{"t":"23:46:52","suite":"crud","phase":"start","la1":3.86,"la5":3.13,"containers":23,"mem_mb":11296.0},{"t":"23:51:01","suite":"crud","phase":"end","la1":19.05,"la5":12.37,"containers":23,"mem_mb":12029.0},{"t":"23:51:27","suite":"search","phase":"start","la1":11.75,"la5":11.23,"containers":23,"mem_mb":12080.0},{"t":"23:53:30","suite":"search","phase":"end","la1":9.3,"la5":10.49,"containers":23,"mem_mb":12065.0},{"t":"23:53:36","suite":"insert","phase":"start","la1":8.03,"la5":10.18,"containers":23,"mem_mb":12064.0},{"t":"23:55:40","suite":"insert","phase":"end","la1":7.49,"la5":9.22,"containers":23,"mem_mb":12050.0},{"t":"23:55:46","suite":"bulk-import","phase":"start","la1":6.66,"la5":8.98,"containers":23,"mem_mb":12050.0},{"t":"00:13:26","suite":"bulk-import","phase":"end","la1":1.24,"la5":1.81,"containers":23,"mem_mb":12045.0}],"pg_ms":null,"counts":[{"q":"Patient?_summary=count","total":"996","http":"200"},{"q":"Observation?_summary=count","total":"626637","http":"200"},{"q":"Encounter?_summary=count","total":"62962","http":"200"},{"q":"Patient?name:contains=an&_summary=count","total":"353","http":"200"},{"q":"Observation?date=ge2020-01-01&_summary=count","total":"296434","http":"200"},{"q":"Observation?date=sa2020-01-01&_summary=count","total":"296214","http":"200"},{"q":"Observation?code=8302-2,29463-7&_summary=count","total":"31961","http":"200"},{"q":"Observation?value-quantity=gt100&_summary=count","total":"91647","http":"200"},{"q":"Observation?value-quantity=sa100&_summary=count","total":"91647","http":"200"},{"q":"Observation?code-value-quantity=http://loinc.org%7C8867-4$gt100&_summary=count","total":"222","http":"200"},{"q":"Observation?combo-code-value-quantity=8480-6$gt140&_summary=count","total":"1003","http":"200"},{"q":"Encounter?class=AMB,EMER&_summary=count","total":"61208","http":"200"}],"residue":0,"indexing_suite":false,"start":"2026-10-21T23:32:15Z","markers":{"prewarm":"","import":"‡","crud":"†","search":"†","insert":"","bulk":""},"shapes":[{"type":"date","q":"Observation?date","n":5424,"p50":50.35,"p95":101.31,"max":443.82},{"type":"quantity","q":"Observation?combo-value-quantity","n":5424,"p50":43.81,"p95":92.96,"max":366.35},{"type":"quantity","q":"Observation?value-quantity","n":5424,"p50":38.7,"p95":88.67,"max":334.97},{"type":"token","q":"Observation?category","n":5424,"p50":33.59,"p95":72.0,"max":521.45},{"type":"quantity","q":"Observation?component-value-quantity","n":5424,"p50":38.39,"p95":66.47,"max":317.52},{"type":"date","q":"Encounter?date","n":5424,"p50":26.27,"p95":48.84,"max":336.19},{"type":"composite","q":"Observation?code-value-quantity","n":5424,"p50":25.37,"p95":48.01,"max":337.55},{"type":"token","q":"Observation?code","n":5424,"p50":25.54,"p95":47.99,"max":253.04},{"type":"composite","q":"Observation?component-code-value-quantity","n":5424,"p50":23.38,"p95":45.34,"max":337.26},{"type":"composite","q":"Observation?combo-code-value-quantity","n":5424,"p50":23.03,"p95":44.6,"max":260.62},{"type":"token","q":"Encounter?class","n":5424,"p50":22.82,"p95":44.15,"max":243.47},{"type":"string","q":"Organization?name","n":5424,"p50":23.21,"p95":44.01,"max":257.6},{"type":"date","q":"Patient?birthdate","n":5424,"p50":22.73,"p95":43.81,"max":255.77},{"type":"reference","q":"Encounter?subject","n":5424,"p50":22.17,"p95":43.37,"max":255.86},{"type":"token","q":"Encounter?status","n":5424,"p50":21.96,"p95":42.81,"max":254.35},{"type":"reference","q":"Observation?subject","n":5424,"p50":21.27,"p95":42.69,"max":140.72},{"type":"string","q":"Patient?address","n":5424,"p50":21.31,"p95":42.09,"max":152.61},{"type":"reference","q":"Encounter?participant","n":5424,"p50":21.09,"p95":41.7,"max":245.4},{"type":"reference","q":"MedicationRequest?encounter","n":5424,"p50":19.95,"p95":41.21,"max":195.35},{"type":"reference","q":"MedicationRequest?requester","n":5424,"p50":20.19,"p95":40.99,"max":255.49},{"type":"string","q":"Patient?name","n":5424,"p50":20.13,"p95":40.76,"max":207.15},{"type":"reference","q":"MedicationRequest?subject","n":5424,"p50":20.23,"p95":40.58,"max":179.48},{"type":"reference","q":"Observation?encounter","n":5424,"p50":19.15,"p95":40.02,"max":197.38},{"type":"reference","q":"Observation?performer","n":5424,"p50":18.22,"p95":39.39,"max":253.03}],"shapes_src":"search-points.json","peak":19.05,"checks":{"corpus":["bad","996/1,000"],"err":["warn","import 4 ✗ (<1 %)"],"cont":["ok","vivos"],"es":["ok","drenado"],"load":["warn","pico 19.1"]}}},"prev":{"run":"38564965562","date":"2026-10-14T12:50:26Z","sha":"4eff68803","branch":"main","runner":"github-agent1","suites":{"import":{"rps":4704.64,"p95":23584.93},"crud":{"rps":856.84,"p95":705.68},"search":{"rps":701.8,"p95":27.85},"insert":{"rps":493.41,"p95":144.08}},"bulk":{"rps":963.9,"total":1691.8},"bundles_ok":1000,"pg_ms":1.539,"crud_load":10.36,"indexing_suite":true,"markers":{"prewarm":"","import":"","crud":"","search":"","insert":"","bulk":""}},"trend":[{"run":"37986575337","date":"2026-10-10T12:51:35Z","sha":"2e31d2e70","branch":"main","runner":"github-agent8","suites":{"import":{"rps":4328.02,"p95":24630.42},"crud":{"rps":926.38,"p95":689.26},"search":{"rps":570.27,"p95":43.14},"insert":{"rps":383.09,"p95":292.99}},"bulk":{"rps":1191.6,"total":1368.5},"bundles_ok":1000,"pg_ms":1.309,"crud_load":10.19,"indexing_suite":true,"markers":{"prewarm":"","import":"","crud":"","search":"","insert":"","bulk":""}},{"run":"38447982496","date":"2026-10-13T20:00:36Z","sha":"9c87c8c2a","branch":"fix/1897-pg-searchparam-read-per-write","runner":"github-agent6","suites":{"crud":{"rps":2800.35,"p95":195.3},"insert":{"rps":1423.91,"p95":57.03}},"bulk":null,"bundles_ok":null,"pg_ms":0.127,"crud_load":8.63,"indexing_suite":false,"markers":{"prewarm":"","crud":"†","insert":""}},{"run":"38564965562","date":"2026-10-14T12:50:26Z","sha":"4eff68803","branch":"main","runner":"github-agent1","suites":{"import":{"rps":4704.64,"p95":23584.93},"crud":{"rps":856.84,"p95":705.68},"search":{"rps":701.8,"p95":27.85},"insert":{"rps":493.41,"p95":144.08}},"bulk":{"rps":963.9,"total":1691.8},"bundles_ok":1000,"pg_ms":1.539,"crud_load":10.36,"indexing_suite":true,"markers":{"prewarm":"","import":"","crud":"","search":"","insert":"","bulk":""}},{"run":"39657850695","date":"2026-10-21T20:17:15Z","sha":"e0bd5cb35","branch":"main","runner":"github-agent6","suites":{"import":{"rps":4368.69,"p95":26629.82},"crud":{"rps":2175.48,"p95":290.0},"search":{"rps":2185.54,"p95":40.38},"insert":{"rps":1425.0,"p95":57.68}},"bulk":{"rps":1042.5,"total":1564.2},"bundles_ok":1000,"pg_ms":0.188,"crud_load":11.99,"indexing_suite":false,"markers":{"prewarm":"","import":"","crud":"","search":"","insert":"","bulk":""}}],"verdict":{"title":"postgres es válido; 3 de 6 legs con alguna falla","items":[["ok","postgres: corpus 1,000/1,000, errores 0 %, contenedores vivos."],["bad","sqlite, mongodb, mongodb + ES: corpus incompleto (922/1,000, 989/1,000, 996/1,000); su crud y search corrieron sobre menos datos y no se comparan."],["bad","sqlite, mongodb, mongodb + ES: errores o checks fallidos (import 3.9 %, import 11 ✗ (<1 %), import 4 ✗ (<1 %)); revisar la tabla completa."],["warn","Host Docker por encima de sus 4 CPU en 6 de 6 legs (carga pico 16.6 a 30.8).","load"],["na","Es una sola corrida en un host compartido y las legs usaron 5 runners distintos: es una muestra, no una prueba."]],"sev":"warn"},"thresholds":{"import_target":1000,"err_pct_high":1.0,"pg_contended_ms":3.0}};
+const LEGS = D.order || [];
+const L = D.legs || {};
+const HEAD = D.headline;
+const H = L[HEAD] || null;
+const TH = D.thresholds;
+const SUITES = ["prewarm","import","crud","search","insert"];
+const NF = new Intl.NumberFormat("es-MX",{maximumFractionDigits:0});
+const NF1 = new Intl.NumberFormat("es-MX",{minimumFractionDigits:1,maximumFractionDigits:1});
+const NF2 = new Intl.NumberFormat("es-MX",{minimumFractionDigits:2,maximumFractionDigits:2});
+const ok = v => v!==null && v!==undefined && !Number.isNaN(v);
+const n0 = v => ok(v) ? NF.format(v) : "n/d";
+const n1 = v => ok(v) ? NF1.format(v) : "n/d";
+const thr = v => !ok(v) ? "n/d" : (v < 10 ? NF1.format(v) : NF.format(v));
+function ms(v){ if(!ok(v)) return "n/d"; if(v>=1000) return NF1.format(v/1000)+" s"; if(v<10) return NF1.format(v)+" ms"; return NF.format(v)+" ms"; }
+const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const $ = id => document.getElementById(id);
+const LBL = l => (L[l] && L[l].label) || l;
+const MESES = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"];
+function fdate(iso, withTime){
+  if(!iso) return "n/d";
+  const d = new Date(iso); if(isNaN(d)) return "n/d";
+  let s = d.getUTCDate()+"-"+MESES[d.getUTCMonth()]+"-"+d.getUTCFullYear();
+  if(withTime){
+    const p = x => String(x).padStart(2,"0"), bo = new Date(d.getTime()-4*3600e3);
+    s += " "+p(d.getUTCHours())+":"+p(d.getUTCMinutes())+" UTC ("+p(bo.getUTCHours())+":"+p(bo.getUTCMinutes())+" hora de Bolivia)";
+  }
+  return s;
+}
+const short = iso => { if(!iso) return "n/d"; const d=new Date(iso); return isNaN(d) ? "n/d" : d.getUTCDate()+"-"+MESES[d.getUTCMonth()]; };
+const MARK_TXT = {"†":"† corpus incompleto o ES sin drenar","‡":"‡ errores > "+TH.err_pct_high+" % o checks fallidos","⚠":"⚠ contenedor caído o Postgres contendido"};
+const markTip = m => m ? "\n"+[...m].map(c=>MARK_TXT[c]).join("\n") : "";
+const NODATA = '<p class="note">Sin datos.</p>';
+const suite = (l,s) => (L[l] && L[l].suites && L[l].suites[s]) || null;
+const mk = (l,s) => (L[l] && L[l].markers && L[l].markers[s]) || "";
+const ICON = {ok:"✓",warn:"!",bad:"✗",na:"–"};
+const WORD = {ok:"ok",warn:"aviso",bad:"falla",na:"no aplica"};
+const st = s => `<span class="st ${s}" title="${WORD[s]}"><i aria-hidden="true">${ICON[s]}</i></span>`;
+function peak(l){ const h = (L[l]&&L[l].host)||[]; return h.length ? Math.max(...h.map(p=>p.la1)) : null; }
+
+/* ---------- cabecera y veredicto ---------- */
+function renderHeader(){
+  const runners = [...new Set(LEGS.map(l=>L[l].runner).filter(Boolean))];
+  const any = LEGS.length ? L[LEGS[0]] : {};
+  $("meta").innerHTML = [
+    `<span><b>Inicio</b> ${fdate(D.date,true)}</span>`,
+    `<span><b>Commit</b> <span class="mono">${esc(D.sha||"n/d")}</span> (${esc(D.ref||"n/d")})</span>`,
+    `<span><b>Runners</b> ${esc(runners.join(", ")||"n/d")}${any.cpus?" · "+esc(any.cpus)+" CPU / "+esc(any.ram):""}</span>`,
+    `<span><b>Host Docker</b> ${D.docker_cpus?D.docker_cpus+" CPU":"CPU n/d"}${D.docker_ram_gb?" / "+D.docker_ram_gb+" GB":""}, compartido</span>`,
+    `<span><b>Legs</b> ${LEGS.length}${D.missing.length?" (faltan "+D.missing.length+")":""}</span>`
+  ].join("");
+  document.querySelector("h1 .mono").textContent = "#"+D.run;
+  document.title = "Benchmark FHIR · "+D.run;
+  $("cpuN").textContent = D.docker_cpus || "n/d";
+  document.querySelectorAll(".cpuN2").forEach(e=>e.textContent=D.docker_cpus||"n/d");
+  document.querySelectorAll(".headName").forEach(e=>e.textContent=LBL(HEAD));
+  $("headTitle").textContent = LBL(HEAD)+", el backend principal";
+  $("trendTitle").textContent = "Tendencia de "+LBL(HEAD)+" ("+D.trend.length+" corrida"+(D.trend.length===1?"":"s")+")";
+  const v = D.verdict, col = {ok:"var(--good)",warn:"var(--warn)",bad:"var(--bad)",na:"var(--muted)"}[v.sev];
+  $("verdict").innerHTML = `<div class="title">Veredicto: ${esc(v.title)}.</div><ul>`+
+    v.items.map(([s,t])=>`<li>${st(s)} ${esc(t)}</li>`).join("")+"</ul>";
+  $("verdict").style.borderLeftColor = col;
+  $("glossMarks").textContent = `† corpus incompleto (<${TH.import_target} Bundles) o ES sin drenar · ‡ más de ${TH.err_pct_high} % de errores o checks fallidos · ⚠ contenedor caído o Postgres contendido (>${TH.pg_contended_ms} ms/llamada en crud).`;
+  const src = H || (LEGS.length ? L[LEGS[0]] : null);
+  const vus = s => src && src.suites[s] && src.suites[s].vus ? src.suites[s].vus+" VUs" : "n/d";
+  $("glossSuites").textContent = `import ${vus("import")} · crud ${vus("crud")} · search ${vus("search")} · insert ${vus("insert")} · bulk import: un trabajo $bulk-submit, el reloj corre hasta que los datos se pueden buscar.`;
+}
+
+function renderValidity(){
+  const cols = [["corpus","Corpus importado"],["err","Errores"],["cont","Contenedores"],["es","ES drenado"],["load","Carga del host"]];
+  let h = "<thead><tr><th>Leg</th>"+cols.map(c=>`<th>${c[1]}</th>`).join("")+"</tr></thead><tbody>";
+  for(const l of LEGS){
+    const c = L[l].checks;
+    h += `<tr class="${l===HEAD?"pgrow":""}"><td>${esc(LBL(l))}</td>`+cols.map(([k])=>`<td>${st(c[k][0])} <span>${esc(c[k][1])}</span></td>`).join("")+"</tr>";
+  }
+  for(const l of D.missing) h += `<tr><td>${esc(l)}</td>`+cols.map(()=>`<td>${st("bad")} sin datos</td>`).join("")+"</tr>";
+  $("validity").innerHTML = h+"</tbody>";
+}
+
+/* ---------- KPIs ---------- */
+function renderKpis(){
+  const P = D.prev;
+  $("prevNote").innerHTML = P
+    ? `<b>Comparación indicativa</b> con la corrida anterior <span class="mono">${esc(P.run)}</span> (${fdate(P.date)}, <span class="mono">${esc(P.branch||"")}</span>): una sola corrida cada una, en otro momento y con otra carga del host; no prueba una mejora ni un empeoramiento.`
+    : "Sin corrida anterior para comparar.";
+  if(!H){ $("kpis").innerHTML = NODATA; return; }
+  const ps = s => P && P.suites[s] ? P.suites[s] : null;
+  const items = [["search","Búsqueda","req/s"],["crud","CRUD","req/s"],["insert","Insert","creaciones/s"],["import","Import","recursos/s"],["bulk","Bulk import","recursos/s"]];
+  $("kpis").innerHTML = items.map(([k,name,unit])=>{
+    let v, p95, pv, pp95, sub;
+    if(k==="bulk"){
+      const b = H.bulk; v = b && b.status==="complete" ? b.rps : null;
+      pv = P && P.bulk ? P.bulk.rps : null;
+      sub = b ? (b.status==="complete" ? "tiempo total "+n0(b.total)+" s"+(P&&P.bulk?" (antes "+n0(P.bulk.total)+" s)":"") : esc(b.status)+": "+esc(b.reason||b.phase||"")) : "";
+    } else {
+      const s = H.suites[k]; v = s ? s.rps : null; p95 = s ? s.p95 : null;
+      const q = ps(k); pv = q ? q.rps : null; pp95 = q ? q.p95 : null;
+      sub = s && s.vus ? s.vus+" VUs"+(k==="import"?" · p95 por Bundle":"") : "";
+    }
+    if(!ok(v)) return `<div class="card kpi"><div class="lbl">${name}</div><div class="val">—</div><div class="sub">sin datos ${sub?"· "+sub:""}</div></div>`;
+    let delta = "";
+    if(ok(pv) && pv){
+      const pct = (v-pv)/pv*100;
+      delta = `<div class="delta">${pct>=0?"▲ sube":"▼ baja"} <b>${pct>=0?"+":""}${NF.format(pct)} %</b> vs ${short(P.date)} (${thr(pv)})</div>`;
+    }
+    const lat = ok(p95) ? `p95 ${ms(p95)}${ok(pp95)?` <span class="note">(antes ${ms(pp95)})</span>`:""}<br>` : "";
+    return `<div class="card kpi"><div class="lbl">${name} <span class="mk">${mk(HEAD,k)}</span></div>
+      <div class="val">${thr(v)} <span class="unit">${unit}</span></div>
+      <div class="sub">${lat}${sub}</div>${delta}</div>`;
+  }).join("");
+}
+
+/* ---------- SVG helpers ---------- */
+const NS = "http://www.w3.org/2000/svg";
+const svg = (w,h,body,label) => `<svg xmlns="${NS}" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(label)}">${body}</svg>`;
+function txt(x,y,s,o={}){
+  return `<text x="${x}" y="${y}" text-anchor="${o.anchor||"start"}" font-size="${o.size||12}" font-weight="${o.weight||400}" fill="${o.fill||"var(--ink-2)"}">${esc(s)}</text>`;
+}
+function widthOf(el){ return Math.max(260, Math.floor(el.clientWidth || (el.parentElement && el.parentElement.clientWidth) || 600)); }
+const tipAttr = t => ` data-tip="${esc(t)}" tabindex="0"`;
+function roundRight(x,y,w,h,r,fill,extra=""){
+  if(!(w>0)) return "";
+  r = Math.min(r, w, h/2);
+  return `<path d="M${x},${y}h${w-r}a${r},${r} 0 0 1 ${r},${r}v${h-2*r}a${r},${r} 0 0 1 -${r},${r}h-${w-r}z" fill="${fill}"${extra}/>`;
+}
+function panels(hostId, prefix, P){
+  const host = $(hostId);
+  if(!host.dataset.built){
+    host.innerHTML = P.map(([k,t,u])=>`<div class="card panel"><h4>${t}</h4><div class="u">${u}</div><div class="chart" id="${prefix}-${k}"></div></div>`).join("");
+    host.dataset.built = 1;
+  }
+}
+
+/* ---------- rendimiento ---------- */
+function thrRows(s){
+  return LEGS.map(l=>{
+    if(s==="bulk"){
+      const b = L[l].bulk;
+      if(!b || b.status!=="complete") return {leg:l, v:null, why: b ? b.status : "sin datos"};
+      return {leg:l, v:b.rps, extra:"total "+n0(b.total)+" s · ingesta "+thr(b.ingest_rps)+" rec/s"};
+    }
+    const x = suite(l,s);
+    if(!x) return {leg:l, v:null, why:"sin datos"};
+    return {leg:l, v:x.rps, extra:"p95 "+ms(x.p95)+" · Err "+n1(x.err)+" %"+(x.fail?" · "+n0(x.fail)+" checks ✗":"")};
+  });
+}
+function barPanel(el, s, title, unit){
+  const rows = thrRows(s);
+  if(!rows.some(r=>ok(r.v))){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el), lw = Math.min(110, w*0.32), vw = 74, rh = 24, top = 4, pw = w-lw-vw-4;
+  const max = Math.max(...rows.map(r=>r.v||0));
+  let b = `<line x1="${lw}" y1="${top}" x2="${lw}" y2="${top+rows.length*rh}" stroke="var(--axis)"/>`;
+  rows.forEach((r,i)=>{
+    const y = top+i*rh, isH = r.leg===HEAD, m = mk(r.leg, s);
+    b += txt(lw-8, y+rh/2+4, LBL(r.leg), {anchor:"end", fill:isH?"var(--ink)":"var(--ink-2)", weight:isH?600:400});
+    if(!ok(r.v)){ b += txt(lw+6, y+rh/2+4, r.why, {size:11, fill:"var(--muted)"}); return; }
+    const bw = Math.max(2, r.v/max*pw);
+    b += roundRight(lw, y+4, bw, rh-8, 4, isH?"var(--pg)":"var(--other)", tipAttr(`${LBL(r.leg)} · ${title}\n${thr(r.v)} ${unit}\n${r.extra}${markTip(m)}`));
+    b += txt(lw+bw+6, y+rh/2+4, thr(r.v)+(m?" "+m:""), {fill:"var(--ink)", weight:isH?600:400});
+  });
+  el.innerHTML = svg(w, top+rows.length*rh+4, b, title+" por leg");
+}
+const THR_P = [["search","Búsqueda","req/s"],["crud","CRUD","req/s"],["insert","Insert","creaciones/s"],["import","Import","recursos/s"],["bulk","Bulk import","recursos/s (hasta poder buscar)"]];
+function renderThr(){ panels("thr","thr",THR_P); THR_P.forEach(([k,t,u])=>barPanel($("thr-"+k), k, t, u)); }
+
+/* ---------- latencia ---------- */
+function latPanel(el, s, title){
+  const rows = LEGS.map(l=>({leg:l, x:suite(l,s)}));
+  const have = rows.filter(r=>r.x && ok(r.x.p50) && ok(r.x.p99) && r.x.p50>0);
+  if(!have.length){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el), lw = Math.min(110, w*0.32), rw = 70, rh = 26, top = 4, axisH = 22, pw = w-lw-rw-8;
+  const lo = Math.pow(10, Math.floor(Math.log10(Math.min(...have.map(r=>r.x.p50)))));
+  let hi = Math.pow(10, Math.ceil(Math.log10(Math.max(...have.map(r=>r.x.p99)))));
+  if(hi<=lo) hi = lo*10;
+  const X = v => lw + (Math.log10(Math.max(v,lo))-Math.log10(lo))/(Math.log10(hi)-Math.log10(lo))*pw;
+  let b = "";
+  const dec = Math.round(Math.log10(hi/lo)), every = Math.max(1, Math.ceil(44/(pw/dec)));
+  const tl = t => t<1000 ? NF.format(t)+" ms" : NF.format(t/1000)+" s";
+  for(let k=0, t=lo; k<=dec; k++, t*=10){
+    const x = X(t);
+    b += `<line x1="${x}" y1="${top}" x2="${x}" y2="${top+rows.length*rh}" stroke="var(--grid)"/>`;
+    if(k%every===0) b += txt(x, top+rows.length*rh+15, tl(t), {anchor:"middle", size:11, fill:"var(--muted)"});
+  }
+  rows.forEach((r,i)=>{
+    const y = top+i*rh+rh/2, isH = r.leg===HEAD, m = mk(r.leg,s), col = isH?"var(--pg)":"var(--other)";
+    b += txt(lw-8, y+4, LBL(r.leg), {anchor:"end", fill:isH?"var(--ink)":"var(--ink-2)", weight:isH?600:400});
+    const x = r.x;
+    if(!x || !ok(x.p50) || !ok(x.p99)){ b += txt(lw+6, y+4, "sin datos", {size:11, fill:"var(--muted)"}); return; }
+    const x50 = X(x.p50), x95 = X(x.p95), x99 = X(x.p99);
+    b += `<g${tipAttr(`${LBL(r.leg)} · ${title}\np50 ${ms(x.p50)} · p95 ${ms(x.p95)} · p99 ${ms(x.p99)}\nmáx ${ms(x.max)}${markTip(m)}`)}>`+
+      `<rect x="${x50-6}" y="${y-10}" width="${x99-x50+12}" height="20" fill="transparent"/>`+
+      `<line x1="${x50}" y1="${y}" x2="${x99}" y2="${y}" stroke="${col}" stroke-width="2"/>`+
+      `<line x1="${x95}" y1="${y-8}" x2="${x95}" y2="${y+8}" stroke="${col}" stroke-width="3"/>`+
+      `<line x1="${x99}" y1="${y-4}" x2="${x99}" y2="${y+4}" stroke="${col}" stroke-width="2"/>`+
+      `<circle cx="${x50}" cy="${y}" r="5" fill="${col}" stroke="var(--surface)" stroke-width="2"/></g>`;
+    b += txt(w-2, y+4, "p95 "+ms(x.p95)+(m?" "+m:""), {anchor:"end", size:11, fill:"var(--ink)", weight:isH?600:400});
+  });
+  el.innerHTML = svg(w, top+rows.length*rh+axisH, b, title+": latencia por leg");
+}
+const LAT_P = [["search","Búsqueda","por pedido"],["crud","CRUD","por pedido"],["insert","Insert","por pedido"],["import","Import","por Bundle completo (descarga + POST)"]];
+function renderLat(){ panels("lat","lat",LAT_P); LAT_P.forEach(([k,t])=>latPanel($("lat-"+k), k, t)); }
+
+/* ---------- selectores ---------- */
+const sel = {time: L[HEAD]?HEAD:LEGS[0], shape: L[HEAD]?HEAD:LEGS[0]};
+function seg(id, key, render){
+  $(id).innerHTML = LEGS.map(l=>`<button type="button" data-leg="${esc(l)}" aria-pressed="${l===sel[key]}">${esc(LBL(l))}</button>`).join("");
+  $(id).addEventListener("click", e=>{
+    const b = e.target.closest("button"); if(!b) return;
+    sel[key] = b.dataset.leg;
+    $(id).querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed", x===b));
+    render();
+  });
+}
+
+/* ---------- linea de tiempo ---------- */
+function secs(t){ const [h,m,s] = t.split(":").map(Number); return h*3600+m*60+s; }
+function renderTimeline(){
+  const el = $("timeline"), leg = sel.time, pts = (L[leg]&&L[leg].host)||[];
+  if(pts.length<2){ el.innerHTML = NODATA; return; }
+  let prev = -1, add = 0;
+  const P = pts.map(p=>{ let s = secs(p.t)+add; if(s<prev){ add+=86400; s+=86400; } prev = s; return Object.assign({}, p, {s}); });
+  const t0 = P[0].s, t1 = Math.max(P[P.length-1].s, t0+60);
+  const w = widthOf(el)-28, ml = 34, mr = 8, mt = 30, ph = 190, mb = 34, pw = w-ml-mr;
+  const cpus = D.docker_cpus;
+  const ymax = Math.max(cpus?cpus*2:8, Math.ceil(Math.max(...P.map(p=>p.la1))/5)*5);
+  const X = s => ml+(s-t0)/(t1-t0)*pw, Y = v => mt+ph-v/ymax*ph;
+  let b = "";
+  const phases = [];
+  P.forEach(p=>{ if(p.phase==="start") phases.push({suite:p.suite, a:p.s}); else { const f = phases.find(x=>x.suite===p.suite && x.b==null); if(f) f.b = p.s; }});
+  phases.filter(f=>f.b!=null).forEach((f,i)=>{
+    const x = X(f.a), bw = Math.max(1, X(f.b)-x);
+    b += `<rect x="${x}" y="${mt}" width="${bw}" height="${ph}" fill="${i%2?"var(--band-b)":"var(--band-a)"}"${tipAttr(`${f.suite}: ${NF1.format((f.b-f.a)/60)} min`)}/>`;
+    const lab = f.suite==="bulk-import" ? "bulk" : f.suite;
+    b += bw > lab.length*6.5+4 ? txt(x+bw/2, mt-8, lab, {anchor:"middle", size:11}) : txt(x+bw/2, mt-8, lab.slice(0,2), {anchor:"middle", size:10, fill:"var(--muted)"});
+  });
+  const step = ymax>20?10:(ymax>10?5:2);
+  for(let v=0; v<=ymax; v+=step){
+    b += `<line x1="${ml}" y1="${Y(v)}" x2="${ml+pw}" y2="${Y(v)}" stroke="var(--grid)"${v?' stroke-dasharray="2 3"':""}/>`;
+    b += txt(ml-6, Y(v)+4, String(v), {anchor:"end", size:11, fill:"var(--muted)"});
+  }
+  if(cpus){
+    b += `<line x1="${ml}" y1="${Y(cpus)}" x2="${ml+pw}" y2="${Y(cpus)}" stroke="var(--cpu)" stroke-width="2" stroke-dasharray="6 4"/>`;
+    b += txt(ml+pw*0.5, Y(cpus)+15, cpus+" CPU del host", {anchor:"middle", size:11, fill:"var(--cpu)", weight:600});
+  }
+  const total = (t1-t0)/60, tstep = total>90?30:(total>60?15:(total>30?10:5));
+  for(let m=0; m<=total; m+=tstep) b += txt(X(t0+m*60), mt+ph+16, m+" min", {anchor:"middle", size:11, fill:"var(--muted)"});
+  b += txt(ml, mt+ph+31, "inicio "+P[0].t+" UTC", {size:10, fill:"var(--muted)"});
+  b += `<polyline points="${P.map(p=>X(p.s)+","+Y(p.la1)).join(" ")}" fill="none" stroke="var(--line)" stroke-width="2" stroke-linejoin="round"/>`;
+  P.forEach(p=>{
+    b += `<circle cx="${X(p.s)}" cy="${Y(p.la1)}" r="4" fill="var(--line)" stroke="var(--surface)" stroke-width="2"${tipAttr(`${p.t} UTC · ${p.suite} ${p.phase==="start"?"inicio":"fin"}\ncarga 1 min ${n1(p.la1)} (5 min ${n1(p.la5)})${ok(p.containers)?"\n"+p.containers+" contenedores":""}${ok(p.mem_mb)?" · "+n0(p.mem_mb)+" MB libres":""}`)}/>`;
+  });
+  const mx = P.reduce((a,p)=>p.la1>a.la1?p:a, P[0]);
+  b += txt(Math.min(Math.max(X(mx.s), ml+30), ml+pw-30), Y(mx.la1)-9, "pico "+n1(mx.la1), {anchor:"middle", size:11, fill:"var(--ink)", weight:600});
+  el.innerHTML = svg(w, mt+ph+mb+4, b, "Carga del host durante la leg "+LBL(leg));
+}
+
+/* ---------- bulk ---------- */
+function renderBulk(){
+  const el = $("bulk"), rows = LEGS.map(l=>({leg:l, b:L[l].bulk}));
+  const good = rows.filter(r=>r.b && r.b.status==="complete" && ok(r.b.total));
+  if(!good.length){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el)-28, lw = Math.min(110, w*0.3), rh = 44, top = 4, pw = w-lw-8;
+  const max = Math.max(...good.map(r=>(r.b.convert||0)+r.b.total));
+  const X = v => (v||0)/max*pw;
+  let b = "";
+  rows.forEach((r,i)=>{
+    const y = top+i*rh, isH = r.leg===HEAD, bk = r.b;
+    b += txt(lw-8, y+17, LBL(r.leg), {anchor:"end", fill:isH?"var(--ink)":"var(--ink-2)", weight:isH?600:400});
+    if(!bk || bk.status!=="complete"){ b += txt(lw, y+17, bk ? bk.status+": "+(bk.reason||bk.phase||"") : "sin datos", {size:11, fill:"var(--muted)"}); return; }
+    let x = lw;
+    [["convert","conversión","var(--ph1)","var(--ink)"],["ingest","ingesta","var(--ph2)","#fff"],["index","índice","var(--ph3)","#fff"]].forEach(([k,name,fill,tc])=>{
+      const sw = X(bk[k]);
+      if(sw>0) b += `<rect x="${x}" y="${y+4}" width="${Math.max(1,sw-2)}" height="20" rx="3" fill="${fill}"${tipAttr(`${LBL(r.leg)} · ${name}\n${n0(bk[k])} s`+(k==="convert"?" (no cuenta en el total)":""))}/>`;
+      if(sw > 46) b += txt(x+5, y+18, n0(bk[k])+" s", {size:11, fill:tc});
+      x += sw;
+    });
+    const m = mk(r.leg,"bulk");
+    b += txt(lw, y+38, `total ${n0(bk.total)} s · ${thr(bk.rps)} rec/s · búsqueda ${bk.searchable?"✓":"✗"}${m?" "+m:""}`, {size:11, fill:"var(--ink)", weight:isH?600:400});
+  });
+  el.innerHTML = svg(w, top+rows.length*rh, b, "Bulk import por fase");
+}
+
+/* ---------- formas de consulta ---------- */
+function renderShapes(){
+  const el = $("shapes"), leg = sel.shape, src = L[leg] && L[leg].shapes;
+  if(!src || !src.length){ el.innerHTML = '<p class="note">Sin datos por forma de consulta para '+esc(LBL(leg))+' (falta search-points.json).</p>'; return; }
+  const rows = src.slice().sort((a,b)=>b.p95-a.p95);
+  const w = widthOf(el)-28, rh = 36, top = 2, pw = w-130;
+  const max = Math.max(...rows.map(r=>r.p95)) || 1, X = v => v/max*pw;
+  let b = "";
+  rows.forEach((r,i)=>{
+    const y = top+i*rh;
+    b += `<text x="0" y="${y+12}" font-size="12" fill="var(--muted)">${esc(r.type)} <tspan fill="var(--ink)" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11.5">${esc(r.q)}</tspan></text>`;
+    b += `<g${tipAttr(`${r.type} ${r.q}\nn ${n0(r.n)} · p50 ${ms(r.p50)} · p95 ${ms(r.p95)} · máx ${ms(r.max)}`)}><rect x="0" y="${y+16}" width="${pw}" height="16" fill="transparent"/>`+
+         roundRight(0, y+18, Math.max(2,X(r.p95)), 12, 3, "var(--pg-soft)")+
+         `<rect x="0" y="${y+18}" width="${Math.max(2,X(r.p50))}" height="12" fill="var(--pg-deep)"/></g>`;
+    b += txt(w-2, y+29, `p50 ${ms(r.p50)} · p95 ${ms(r.p95)}`, {anchor:"end", size:11, fill:"var(--ink)"});
+  });
+  const m = mk(leg,"search");
+  el.innerHTML = `<div class="note" style="margin-bottom:6px">${esc(LBL(leg))}: ${rows.length} formas, ${n0(rows.reduce((a,r)=>a+r.n,0))} búsquedas medidas${m?" · "+esc(m)+markTip(m).replace(/\n/g," "):""}.</div>`+svg(w, top+rows.length*rh, b, "Latencia por forma de consulta, "+LBL(leg));
+}
+
+/* ---------- tendencia ---------- */
+function trendPanel(el, key, title, unit){
+  const T = D.trend;
+  const vals = T.map(t => key==="bulk" ? (t.bulk?t.bulk.rps:null) : (t.suites[key]?t.suites[key].rps:null));
+  if(!vals.some(ok)){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el), ml = 8, mr = 8, mt = 18, ph = 90, mb = 24, pw = w-ml-mr;
+  const max = Math.max(...vals.filter(ok))*1.15;
+  const X = i => T.length===1 ? ml+pw/2 : ml+30+i*(pw-60)/(T.length-1), Y = v => mt+ph-v/max*ph;
+  let b = `<line x1="${ml}" y1="${mt+ph}" x2="${ml+pw}" y2="${mt+ph}" stroke="var(--axis)"/>`;
+  for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--other)" stroke-width="2"/>`;
+  T.forEach((t,i)=>{
+    const cur = t.run===D.run, br = D.ref && t.branch!==D.ref;
+    b += txt(X(i), mt+ph+15, short(t.date)+(br?" *":""), {anchor:"middle", size:11, fill:cur?"var(--ink)":"var(--muted)", weight:cur?600:400});
+    if(!ok(vals[i])){ b += txt(X(i), mt+ph-6, "sin dato", {anchor:"middle", size:10, fill:"var(--muted)"}); return; }
+    const col = cur?"var(--pg)":"var(--other)";
+    const shape = br ? `<rect x="${X(i)-5}" y="${Y(vals[i])-5}" width="10" height="10" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
+                     : `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`;
+    const m = (t.markers||{})[key]||"";
+    b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}`)}>${shape}</g>`;
+    b += txt(X(i), Y(vals[i])-10, thr(vals[i])+(m?" "+m:""), {anchor:"middle", size:11, fill:"var(--ink)", weight:cur?600:400});
+  });
+  el.innerHTML = svg(w, mt+ph+mb, b, "Tendencia "+title);
+}
+function renderTrend(){
+  if(!D.trend.length){ $("trend").innerHTML = NODATA; return; }
+  const P = THR_P.map(([k,t,u])=>[k,t,u.split(" ")[0]+" · "+LBL(HEAD)]);
+  panels("trend","tr",P);
+  if(!$("trendCtx").dataset.built){
+    let h = `<thead><tr><th>Corrida</th><th>Inicio</th><th>Rama</th><th>Runner</th><th class="n">Carga al iniciar crud</th><th class="n">pg ms/llamada en crud</th><th>Notas</th></tr></thead><tbody>`;
+    D.trend.forEach(t=>{
+      const notes = [];
+      if(D.ref && t.branch!==D.ref) notes.push("* otra rama que esta corrida");
+      if(!t.suites.import) notes.push("sin import");
+      if(!t.suites.search) notes.push("sin search");
+      if(t.indexing_suite) notes.push("incluyó la suite opcional indexing");
+      if(t.run===D.run) notes.push("esta corrida");
+      h += `<tr class="${t.run===D.run?"pgrow":""}"><td class="mono">${esc(t.run)}</td><td>${fdate(t.date)}</td><td class="mono">${esc(t.branch||"n/d")}</td><td>${esc(t.runner||"n/d")}</td><td class="n">${n1(t.crud_load)}</td><td class="n">${ok(t.pg_ms)?NF2.format(t.pg_ms):"n/d"}</td><td>${notes.join("; ")}</td></tr>`;
+    });
+    $("trendCtx").innerHTML = h+"</tbody>"; $("trendCtx").dataset.built = 1;
+  }
+  P.forEach(([k,t,u])=>trendPanel($("tr-"+k), k, t, u.split(" ")[0]));
+}
+
+/* ---------- tablas ---------- */
+function sortable(table){
+  const ths = [...table.querySelectorAll("th.sortable")];
+  ths.forEach(th=>{
+    th.tabIndex = 0;
+    th.addEventListener("keydown",e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); th.click(); }});
+    th.addEventListener("click",()=>{
+      const idx = [...th.parentElement.children].indexOf(th);
+      const dir = th.getAttribute("aria-sort")==="ascending" ? "descending" : "ascending";
+      ths.forEach(x=>x.removeAttribute("aria-sort")); th.setAttribute("aria-sort",dir);
+      const tb = table.tBodies[0], rows = [...tb.rows];
+      rows.sort((a,b)=>{
+        const A = a.children[idx].dataset.v, B = b.children[idx].dataset.v;
+        const na = A===""?NaN:parseFloat(A), nb = B===""?NaN:parseFloat(B);
+        let c;
+        if(!isNaN(na)&&!isNaN(nb)) c = na-nb; else if(isNaN(na)&&isNaN(nb)) c = String(A).localeCompare(String(B)); else c = isNaN(na)?1:-1;
+        return dir==="ascending"?c:-c;
+      });
+      rows.forEach(r=>tb.appendChild(r));
+    });
+  });
+}
+const td = (v, shown, num=true) => `<td class="${num?"n":""}" data-v="${ok(v)||typeof v==="string"?esc(v):""}">${shown}</td>`;
+function renderFull(){
+  const cols = ["Leg","Suite","Rendimiento","Unidad","p50","p95","p99","Err %","Checks ✓","Checks ✗","VUs","Marcas"];
+  let h = "<thead><tr>"+cols.map((c,i)=>`<th class="sortable ${[2,4,5,6,7,8,9,10].includes(i)?"n":""}">${c}</th>`).join("")+"</tr></thead><tbody>";
+  LEGS.forEach((l,li)=>{
+    const d = L[l], cls = l===HEAD?"pgrow":"";
+    SUITES.forEach((s,si)=>{
+      const v = d.suites[s], m = mk(l,s);
+      const lead = `<tr class="${cls}"><td data-v="${li}">${esc(LBL(l))}</td><td data-v="${si}">${s}${s==="import"?" <span class='note'>(lat. por Bundle)</span>":""}</td>`;
+      if(!v){ h += lead+`<td class="n" data-v="">sin datos</td>`+"<td></td>".repeat(9)+"</tr>"; return; }
+      h += lead+td(v.rps, thr(v.rps))+td(v.unit, v.unit, false)+td(v.p50, ms(v.p50))+td(v.p95, ms(v.p95))+td(v.p99, ms(v.p99))+
+        td(v.err, n1(v.err))+td(v.ok, n0(v.ok))+td(v.fail, n0(v.fail))+td(v.vus, n0(v.vus))+td(m, `<span class="mk">${m}</span>`, false)+"</tr>";
+    });
+    const bk = d.bulk, m = mk(l,"bulk");
+    const lead = `<tr class="${cls}"><td data-v="${li}">${esc(LBL(l))}</td><td data-v="5">bulk import${bk&&ok(bk.total)?` <span class='note'>(${n0(bk.total)} s)</span>`:""}</td>`;
+    if(!bk || bk.status!=="complete"){ h += lead+`<td class="n" data-v="">${bk?esc(bk.status):"sin datos"}</td>`+"<td></td>".repeat(9)+"</tr>"; return; }
+    const e = bk.submitted ? bk.failed/bk.submitted*100 : null;
+    h += lead+td(bk.rps, thr(bk.rps))+td("recursos/s","recursos/s",false)+td(null,"—")+td(null,"—")+td(null,"—")+
+      td(e, n1(e))+td(bk.ok, n0(bk.ok))+td(bk.failed, n0(bk.failed))+td(null,"1 trabajo")+td(m, `<span class="mk">${m}</span>`, false)+"</tr>";
+  });
+  $("full").innerHTML = h+"</tbody>";
+  sortable($("full"));
+  const runners = new Set(LEGS.map(l=>L[l].runner+"|"+L[l].cpus+"|"+L[l].ram));
+  $("marksNote").innerHTML = `<b>Marcas:</b> † corpus incompleto (&lt;${TH.import_target} Bundles) o ES sin drenar · ‡ más de ${TH.err_pct_high} % de errores o algún check fallido · ⚠ contenedor caído o Postgres con más de ${TH.pg_contended_ms} ms por llamada en crud. Rendimiento en req/s, salvo import y bulk import (recursos/s). No se marca un «mejor» valor${runners.size>1?": las legs corrieron en hardware distinto":""}.`;
+}
+function renderHealth(){
+  let h = `<thead><tr><th>Leg</th><th>Runner</th><th class="n">Bundles</th><th class="n">Entradas importadas</th><th class="n">Escenario import</th><th>ES</th><th class="n">Carga inicio crud</th><th class="n">Carga pico</th><th class="n">Residuos crud</th><th>Contenedores</th></tr></thead><tbody>`;
+  LEGS.forEach(l=>{
+    const d = L[l], cs = d.host.find(p=>p.suite==="crud"&&p.phase==="start"), ic = d.ic;
+    const es = d.drain ? `${esc(d.drain.status)} · faltan ${esc(d.drain.missing)} · ${esc(d.drain.sync)}` : (l.endsWith("-elasticsearch")?"sin datos":"—");
+    h += `<tr class="${l===HEAD?"pgrow":""}"><td>${esc(LBL(l))}</td><td>${esc(d.runner||"n/d")}</td>`+
+      `<td class="n">${ic?n0(ic.bundles_ok)+"/"+n0(TH.import_target)+(ic.bundles_ok<TH.import_target?" †":""):"sin datos"}</td>`+
+      `<td class="n">${ic?n0(ic.entries):"n/d"}</td><td class="n">${ic?n0(ic.scenario)+" s + "+n0(ic.setup)+" s setup":"n/d"}</td><td>${es}</td>`+
+      `<td class="n">${cs?n1(cs.la1)+(ok(cs.containers)?" · "+cs.containers+" cont.":""):"n/d"}</td><td class="n">${n1(peak(l))}</td>`+
+      `<td class="n">${ok(d.residue)?d.residue:"n/d"}</td><td class="note">${d.containers.length?d.containers.map(c=>{ const p=c.split(" "), kind=(p[0].match(/^hfs-bench-([a-z]+)-/)||[,p[0]])[1], stt=((c.match(/Status=(\S+)/)||[,"?"])[1]), oom=/OOMKilled=true/.test(c); return `<span title="${esc(c)}">${esc(kind)}: ${esc(stt)}${oom?" (OOM)":""}</span>`; }).join("<br>"):(d.containers_known?"ninguno de backend":"sin datos")}</td></tr>`;
+  });
+  $("health").innerHTML = h+"</tbody>";
+}
+function renderCounts(){
+  const qs = [];
+  LEGS.forEach(l=>L[l].counts.forEach(c=>{ if(!qs.includes(c.q)) qs.push(c.q); }));
+  if(!qs.length){ $("counts").outerHTML = NODATA; return; }
+  const refLeg = L[HEAD] && L[HEAD].counts.length ? HEAD : LEGS.find(l=>L[l].counts.length);
+  let h = "<thead><tr><th>Consulta</th>"+LEGS.map(l=>`<th class="n">${esc(LBL(l))}</th>`).join("")+"</tr></thead><tbody>";
+  qs.forEach(q=>{
+    const r = L[refLeg].counts.find(c=>c.q===q), ref = r ? r.total : null;
+    h += `<tr><td class="mono" style="word-break:break-all;min-width:200px">${esc(q.replace("&_summary=count",""))}</td>`+LEGS.map(l=>{
+      const c = L[l].counts.find(x=>x.q===q);
+      if(!c) return `<td class="n">n/d</td>`;
+      const diff = ref!==null && c.total!==ref;
+      return `<td class="n">${diff?"<b>":""}${isNaN(+c.total)?esc(c.total):NF.format(+c.total)}${diff?"</b> ≠":""}${c.http!=="200"?" (HTTP "+esc(c.http)+")":""}</td>`;
+    }).join("")+"</tr>";
+  });
+  $("counts").innerHTML = h+"</tbody>";
+}
+
+/* ---------- tooltip ---------- */
+(function(){
+  const tip = $("tip");
+  function show(t, x, y){
+    tip.textContent = t; tip.style.opacity = 1;
+    const r = tip.getBoundingClientRect();
+    let left = x+14, top = y+14;
+    if(left+r.width > innerWidth-8) left = Math.max(8, x-r.width-14);
+    if(top+r.height > innerHeight-8) top = Math.max(8, y-r.height-14);
+    tip.style.left = left+"px"; tip.style.top = top+"px";
+  }
+  document.addEventListener("pointermove", e=>{
+    const el = e.target.closest && e.target.closest("[data-tip]");
+    if(el) show(el.dataset.tip, e.clientX, e.clientY); else tip.style.opacity = 0;
+  });
+  document.addEventListener("focusin", e=>{
+    const el = e.target.closest && e.target.closest("[data-tip]");
+    if(el){ const r = el.getBoundingClientRect(); show(el.dataset.tip, r.left+r.width/2, r.bottom); } else tip.style.opacity = 0;
+  });
+  document.addEventListener("scroll", ()=>{ tip.style.opacity = 0; }, {passive:true});
+})();
+
+/* ---------- arranque ---------- */
+function safe(f){ try{ f(); }catch(e){ console.error(e); } }
+function drawCharts(){ [renderThr, renderLat, renderTimeline, renderBulk, renderShapes, renderTrend].forEach(safe); }
+[renderHeader, renderValidity, renderKpis].forEach(safe);
+if(LEGS.length){ seg("segTime","time",renderTimeline); seg("segShape","shape",renderShapes); }
+drawCharts();
+[renderFull, renderHealth, renderCounts].forEach(safe);
+$("foot").innerHTML = `Generado por <span class="mono">build_report.py</span> desde los artefactos de la corrida <span class="mono">${esc(D.run)}</span> (k6 <span class="mono">--summary-export</span>, archivos <span class="mono">*.txt</span> de cada leg y, si existe, <span class="mono">search-points.json</span> leído en streaming). Números con coma de miles y punto decimal, como en el resumen de GitHub. Funciona sin conexión.`;
+let rt, lastW = innerWidth;
+addEventListener("resize", ()=>{ if(innerWidth===lastW) return; lastW = innerWidth; clearTimeout(rt); rt = setTimeout(drawCharts, 120); });
+addEventListener("beforeprint", drawCharts);
+addEventListener("afterprint", drawCharts);
+</script>
+</body>
+</html>
