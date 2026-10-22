@@ -401,32 +401,65 @@ impl ResourceStorage for SqliteBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
-                let mut resource = resource;
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+        // Every branch below is a check-then-act on the `read`: another writer
+        // can create, bump, delete or restore the row in between. Each write is
+        // a compare-and-swap, so a lost race surfaces as a typed error — and
+        // because this method decides existence itself, none of those errors is
+        // a legitimate answer from it: `VersionConflict` from `update`,
+        // `AlreadyExists` from `create`, and `NotFound` from `update` (deleted
+        // underneath it) or `restore_deleted` (another PUT restored the
+        // tombstone first) all mean "re-read and go again". The retries are
+        // bounded, the same as PostgreSQL's and MongoDB's, so the last attempt's
+        // error propagates rather than spinning forever.
+        const MAX_CAS_RETRIES: usize = 3;
+        let mut attempts = 0;
+        let mut resource = resource;
+        loop {
+            // Each attempt consumes a body; keep a copy only while a retry is
+            // still possible so the final attempt moves rather than clones.
+            let body = if attempts < MAX_CAS_RETRIES {
+                resource.clone()
+            } else {
+                std::mem::take(&mut resource)
+            };
+
+            let result = match self.read(tenant, resource_type, id).await {
+                // Update existing (preserves original FHIR version)
+                Ok(Some(current)) => self
+                    .update(tenant, &current, body)
+                    .await
+                    .map(|updated| (updated, false)),
+                // Create new with specific ID
+                Ok(None) => {
+                    let mut body = body;
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(id.to_string()));
+                    }
+                    self.create(tenant, resource_type, body, fhir_version)
+                        .await
+                        .map(|created| (created, true))
                 }
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok((created, true))
+                // A deleted resource is brought back to life by a subsequent
+                // update (FHIR http.html#delete), continuing the existing
+                // version chain rather than being rejected with `Gone`.
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => self
+                    .restore_deleted(tenant, resource_type, id, body)
+                    .map(|restored| (restored, true)),
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+                    | StorageError::Resource(
+                        ResourceError::NotFound { .. } | ResourceError::AlreadyExists { .. },
+                    ),
+                ) if attempts < MAX_CAS_RETRIES => {
+                    attempts += 1;
+                    continue;
+                }
+                other => return other,
             }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
-                let restored = self.restore_deleted(tenant, resource_type, id, resource)?;
-                Ok((restored, true))
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -1495,7 +1528,17 @@ impl SqliteBackend {
     /// FHIR version the resource was originally stored under.
     ///
     /// Returns `NotFound` if no deleted row is present — the caller has already
-    /// established one exists, so that only happens under a concurrent write.
+    /// established one exists, so that only happens under a concurrent write,
+    /// and `create_or_update` retries it from a fresh read.
+    ///
+    /// The tombstone read, the `UPDATE`, the history row and the search index
+    /// share one `IMMEDIATE` transaction. They used to be auto-committed
+    /// statements on a pooled connection: two PUTs onto the same tombstone both
+    /// read version N, the second `UPDATE` overwrote the first, and the second
+    /// history `INSERT` hit `PRIMARY KEY (…, version_id)` — a 500, with the live
+    /// row and history version N+1 holding different bodies (#2111). Under the
+    /// write lock the read is of the row the `UPDATE` then restores, so a racer
+    /// that loses finds no tombstone and leaves nothing behind.
     fn restore_deleted(
         &self,
         tenant: &TenantContext,
@@ -1505,10 +1548,32 @@ impl SqliteBackend {
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Update, resource_type)?;
 
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let row: Result<(String, String), _> = conn.query_row(
+        // Ensure the resource has correct type and id
+        let mut resource = resource;
+        if let Some(obj) = resource.as_object_mut() {
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+
+        let data = serde_json::to_vec(&resource)
+            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
+
+        // Extract the search values before taking the write lock: it is pure
+        // CPU, and SQLite has one writer.
+        let prepared = (!self.is_search_offloaded())
+            .then(|| self.prepare_index(tenant_id, resource_type, id, &resource));
+
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin restore: {}", e)))?;
+
+        let row: Result<(String, String), _> = tx.query_row(
             "SELECT version_id, fhir_version FROM resources
              WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 1",
             params![tenant_id, resource_type, id],
@@ -1534,23 +1599,10 @@ impl SqliteBackend {
         let new_version: u64 = deleted_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
-        // Ensure the resource has correct type and id
-        let mut resource = resource;
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-        }
-
-        let data = serde_json::to_vec(&resource)
-            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
-
         let now = Utc::now();
         let last_updated = now.to_rfc3339();
 
-        conn.execute(
+        tx.execute(
             "UPDATE resources
              SET version_id = ?1, data = ?2, last_updated = ?3, is_deleted = 0, deleted_at = NULL
              WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6",
@@ -1565,7 +1617,7 @@ impl SqliteBackend {
         )
         .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![tenant_id, resource_type, id, new_version_str, data, last_updated, fhir_version_str],
@@ -1574,8 +1626,13 @@ impl SqliteBackend {
 
         // The delete dropped the search index entries; rebuild them for the
         // resource that is live again.
-        self.delete_search_index(&conn, tenant_id, resource_type, id)?;
-        self.index_resource(&conn, tenant_id, resource_type, id, &resource)?;
+        if let Some(prepared) = prepared {
+            self.delete_search_index(&tx, tenant_id, resource_type, id)?;
+            self.write_prepared_index(&tx, tenant_id, resource_type, id, &resource, prepared)?;
+        }
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit restore: {}", e)))?;
 
         // A restored overlay-affecting SearchParameter re-enters this tenant's
         // overlay.
