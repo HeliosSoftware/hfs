@@ -514,7 +514,13 @@ async fn migrate_schema(
             }
             48 => migrate_v48_to_v49(client).await?,
             49 => migrate_v49_to_v50(client).await?,
-            50 => migrate_v50_to_v51(client).await?,
+            50 => {
+                // The helper writes the v51 marker inside its own transaction,
+                // like v48, so the common loop must not stamp it again.
+                migrate_v50_to_v51(client).await?;
+                version += 1;
+                continue;
+            }
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4852,17 +4858,30 @@ async fn migrate_v49_to_v50(client: &mut deadpool_postgres::Client) -> StorageRe
 /// `DISTINCT` over the manifest's `bulk_entry_results` (one row per ingested
 /// resource). The partial index keeps the startup lookup to the outstanding
 /// rows. Both columns have constant defaults, so the `ALTER` rewrites nothing.
-async fn migrate_v50_to_v51(client: &deadpool_postgres::Client) -> StorageResult<()> {
-    client
-        .batch_execute(
-            "ALTER TABLE bulk_manifests
-                 ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE,
-                 ADD COLUMN IF NOT EXISTS index_pending_types TEXT[] NOT NULL DEFAULT '{}';
-             CREATE INDEX IF NOT EXISTS idx_bulk_manifests_index_pending
-                 ON bulk_manifests (added_at) WHERE index_pending",
-        )
+/// Like v48 it runs in one transaction with `statement_timeout` disabled and
+/// stamps its own marker.
+async fn migrate_v50_to_v51(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
         .await
-        .map_err(|e| pg_error(format!("Migration v50->v51 failed: {e}")))?;
+        .map_err(|e| pg_error(format!("begin v51 migration: {e}")))?;
+    // The caller's session `statement_timeout` must not fail startup.
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v51 migration: {e}")))?;
+    tx.batch_execute(
+        "ALTER TABLE bulk_manifests
+             ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE,
+             ADD COLUMN IF NOT EXISTS index_pending_types TEXT[] NOT NULL DEFAULT '{}';
+         CREATE INDEX IF NOT EXISTS idx_bulk_manifests_index_pending
+             ON bulk_manifests (added_at) WHERE index_pending",
+    )
+    .await
+    .map_err(|e| pg_error(format!("Migration v50->v51 failed: {e}")))?;
+    set_schema_version(&tx, 51).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v51 migration: {e}")))?;
     Ok(())
 }
 
