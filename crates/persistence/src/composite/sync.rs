@@ -1955,14 +1955,16 @@ mod tests {
         }
     }
 
+    type Backends = HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>;
+
     fn recording() -> (
         Arc<RecordingBackend>,
-        HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
+        Backends,
         SyncManager,
         Arc<CountingObserver>,
     ) {
         let backend = Arc::new(RecordingBackend::default());
-        let mut map: HashMap<String, Arc<dyn ResourceStorage + Send + Sync>> = HashMap::new();
+        let mut map = Backends::new();
         map.insert("search".to_string(), backend.clone());
         let mut manager = SyncManager::new(async_config());
         let observer = Arc::new(CountingObserver::default());
