@@ -656,6 +656,20 @@ async fn sqlite_concurrent_update_and_plain_delete_stay_consistent() {
     .await;
 }
 
+/// #2111: unconditional PUTs racing onto one tombstone all succeed, and the
+/// history stays contiguous with the live body as its newest entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_puts_onto_a_tombstone_all_succeed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed(
+        backend,
+        "restore-race-2111",
+        40,
+    )
+    .await;
+}
+
 /// #1404: `delete_versioned` compares and deletes in one step.
 #[tokio::test]
 async fn sqlite_versioned_delete_is_a_compare_and_swap() {
