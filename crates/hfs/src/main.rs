@@ -3328,6 +3328,11 @@ fn spawn_submit_workers(
     let defer_indexing = cfg.defer_indexing;
     if defer_indexing {
         info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
+        if !jobs.records_index_pending() {
+            warn!(
+                "Bulk submit job store cannot record a pending search-index rebuild: if HFS stops before a deferred rebuild finishes, the manifest's resources stay unsearchable until POST /$reindex is run"
+            );
+        }
     }
     let batch_size = cfg.batch_size;
     let skip_unchanged = cfg.skip_unchanged;

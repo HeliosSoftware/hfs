@@ -1164,8 +1164,18 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
     // #1125's rebuild ledger lives on the primary's manifest rows. Without
     // these the trait's no-op defaults would apply: the marker would never be
     // written and a restart would find nothing to resume.
-    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
-        self.primary.mark_manifest_index_pending(lease).await
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        self.primary
+            .mark_manifest_index_pending(lease, resource_types)
+            .await
+    }
+
+    fn records_index_pending(&self) -> bool {
+        self.primary.records_index_pending()
     }
 
     async fn clear_manifest_index_pending(
@@ -2360,7 +2370,7 @@ mod tests {
                 .is_empty()
         );
 
-        jobs.mark_manifest_index_pending(&lease).await.unwrap();
+        jobs.mark_manifest_index_pending(&lease, &[]).await.unwrap();
         let pending = jobs.list_manifests_awaiting_reindex(10).await.unwrap();
         assert_eq!(
             pending.len(),

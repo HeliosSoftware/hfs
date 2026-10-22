@@ -58,8 +58,8 @@ use crate::core::bulk_submit_publication::{
 };
 use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
-    ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
-    SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex, PollTokenTarget,
+    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
 use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -1821,6 +1821,100 @@ impl SubmitClaimStrategy for MongoBackend {
 
 #[async_trait]
 impl SubmitWorkerStorage for MongoBackend {
+    /// #1125: the marker that says this manifest still owes a search-index
+    /// rebuild, with the types it covers (#1283). It lives on the manifest
+    /// document, so it survives a restart that loses the in-process job map.
+    /// The types are stored because deriving them again would read every
+    /// `bulk_entry_results` document of the manifest.
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        self.manifests()
+            .await?
+            .update_one(
+                manifest_filter(&lease.tenant, &lease.submission_id, &lease.manifest_id),
+                doc! { "$set": {
+                    "index_pending": true,
+                    "index_pending_types": resource_types,
+                }},
+            )
+            .await
+            .map_err(|e| internal_error(format!("mark index pending: {e}")))?;
+        Ok(())
+    }
+
+    fn records_index_pending(&self) -> bool {
+        true
+    }
+
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        self.manifests()
+            .await?
+            .update_many(
+                doc! {
+                    "tenant_id": tenant.tenant_id().as_str(),
+                    "manifest_id": manifest_id,
+                    "index_pending": true,
+                },
+                doc! { "$unset": { "index_pending": "", "index_pending_types": "" } },
+            )
+            .await
+            .map_err(|e| internal_error(format!("clear index pending: {e}")))?;
+        Ok(())
+    }
+
+    /// Served by the partial `idx_bulk_manifests_index_pending`, which holds
+    /// only the outstanding manifests.
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        let options = FindOptions::builder()
+            .sort(doc! { "added_at": 1_i32 })
+            .limit(Some(i64::from(limit)))
+            .build();
+        let cursor = self
+            .manifests()
+            .await?
+            .find(doc! { "index_pending": true })
+            .with_options(options)
+            .await
+            .map_err(|e| internal_error(format!("query pending reindex: {e}")))?;
+        Ok(collect(cursor)
+            .await?
+            .iter()
+            .filter_map(|d| {
+                let tenant_id = opt_str(d, "tenant_id")?;
+                let submitter = opt_str(d, "submitter")?;
+                let submission_id = opt_str(d, "submission_id")?;
+                let manifest_id = opt_str(d, "manifest_id")?;
+                let mut resource_types: Vec<String> = d
+                    .get_array("index_pending_types")
+                    .map(|types| {
+                        types
+                            .iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                resource_types.sort();
+                resource_types.dedup();
+                Some(PendingReindex {
+                    tenant: tenant_from_id(&tenant_id),
+                    submission: SubmissionId::new(submitter, submission_id),
+                    manifest_id,
+                    resource_types,
+                })
+            })
+            .collect())
+    }
+
     async fn get_manifest_for_worker(
         &self,
         lease: &ManifestLease,

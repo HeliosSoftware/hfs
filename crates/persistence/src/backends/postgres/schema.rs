@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 50;
+pub const SCHEMA_VERSION: i32 = 51;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -514,6 +514,7 @@ async fn migrate_schema(
             }
             48 => migrate_v48_to_v49(client).await?,
             49 => migrate_v49_to_v50(client).await?,
+            50 => migrate_v50_to_v51(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4840,6 +4841,28 @@ async fn migrate_v49_to_v50(client: &mut deadpool_postgres::Client) -> StorageRe
             "Migration v49->v50 failed: restore statement_timeout: {e}"
         ))
     })?;
+    Ok(())
+}
+
+/// v50 -> v51: the #1125 deferred-rebuild marker on `bulk_manifests` (#1283).
+///
+/// `index_pending` says the manifest was ingested with search indexing
+/// deferred and its rebuild has not finished; `index_pending_types` are the
+/// types that rebuild covers, so a restarted server re-fires it without a
+/// `DISTINCT` over the manifest's `bulk_entry_results` (one row per ingested
+/// resource). The partial index keeps the startup lookup to the outstanding
+/// rows. Both columns have constant defaults, so the `ALTER` rewrites nothing.
+async fn migrate_v50_to_v51(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "ALTER TABLE bulk_manifests
+                 ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE,
+                 ADD COLUMN IF NOT EXISTS index_pending_types TEXT[] NOT NULL DEFAULT '{}';
+             CREATE INDEX IF NOT EXISTS idx_bulk_manifests_index_pending
+                 ON bulk_manifests (added_at) WHERE index_pending",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v50->v51 failed: {e}")))?;
     Ok(())
 }
 
