@@ -8097,7 +8097,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 50);
+        assert_eq!(SCHEMA_VERSION, 51);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)
