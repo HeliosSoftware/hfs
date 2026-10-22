@@ -567,3 +567,35 @@ async fn deterministic_failure_is_not_resent_by_a_later_chunk() {
     assert_item_error(prepared.process_chunk(chunk_of(1)).unwrap_err(), "404");
     assert_eq!(request_count(&server).await, 1);
 }
+
+/// `use.memberOf(...)` on a name without `use` is `{}` (#1854): the cell is null, no request is
+/// sent, and no server needs to be configured for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_item_input_yields_null_without_a_request() {
+    let no_use = json!({
+        "resourceType": "Patient",
+        "id": "p1",
+        "name": [{"family": "Smith"}]
+    });
+
+    let server = terminology_stub().await;
+    {
+        let _env = TerminologyEnv::new(&server, None).await;
+        let output = run_view_definition(
+            foreach_use_view(),
+            bundle(std::slice::from_ref(&no_use)),
+            ContentType::Json,
+        )
+        .expect("view run succeeds");
+        let rows: Vec<Value> = serde_json::from_slice(&output).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["use_in_vs"], Value::Null, "row {}", rows[0]);
+        assert_eq!(request_count(&server).await, 0);
+    }
+
+    let _env = TerminologyEnv::with_server_url(None, None).await;
+    let output = run_view_definition(foreach_use_view(), bundle(&[no_use]), ContentType::Json)
+        .expect("view run succeeds without a terminology server");
+    let rows: Vec<Value> = serde_json::from_slice(&output).unwrap();
+    assert_eq!(rows[0]["use_in_vs"], Value::Null, "row {}", rows[0]);
+}
