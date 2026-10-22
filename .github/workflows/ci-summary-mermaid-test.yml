@@ -1,6 +1,7 @@
 # Throwaway experiment: publish a prototype benchmark report as the job summary
-# (Markdown + Mermaid) and as an unzipped HTML artifact, to check colours and dark
-# mode on the real Actions page. Lives only on tmp/ci-summary-mermaid-test; never merge.
+# (the unchanged CI text plus collapsed Mermaid charts) in two layouts, to check
+# colours, sizes, dark mode and Mermaid inside <details>/<td> on the real Actions
+# page. Lives only on tmp/ci-summary-mermaid-test; never merge.
 name: CI summary mermaid test
 
 on:
@@ -11,28 +12,52 @@ permissions:
   contents: read
 
 jobs:
-  render-test:
+  stacked:
+    name: layout-stacked
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - name: Upload the full HTML report without zipping
         id: up
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-report.html
+          name: benchmark-report-stacked.html
           path: .github/tmp-summary-test/report.html
           archive: false
           retention-days: 1
-
       - name: Write the job summary
         env:
           ARTIFACT_URL: ${{ steps.up.outputs.artifact-url }}
         run: |
           {
-            cat .github/tmp-summary-test/summary.md
+            cat .github/tmp-summary-test/stacked.md
             echo
-            echo "[Reporte completo (HTML)](${ARTIFACT_URL})"
+            echo "[Full report (HTML)](${ARTIFACT_URL})"
+          } >> "$GITHUB_STEP_SUMMARY"
+          wc -c "$GITHUB_STEP_SUMMARY"
+
+  sidebyside:
+    name: layout-side-by-side
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upload the full HTML report without zipping
+        id: up
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-report-sidebyside.html
+          path: .github/tmp-summary-test/report.html
+          archive: false
+          retention-days: 1
+      - name: Write the job summary
+        env:
+          ARTIFACT_URL: ${{ steps.up.outputs.artifact-url }}
+        run: |
+          {
+            cat .github/tmp-summary-test/sidebyside.md
+            echo
+            echo "[Full report (HTML)](${ARTIFACT_URL})"
           } >> "$GITHUB_STEP_SUMMARY"
           wc -c "$GITHUB_STEP_SUMMARY"
