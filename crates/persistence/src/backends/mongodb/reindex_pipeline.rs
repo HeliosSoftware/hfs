@@ -392,6 +392,17 @@ impl PageFailure {
             })
             .collect()
     }
+
+    /// [`Self::fan_out`] for a metadata-only page (#2008): every resource
+    /// fails and none had its metadata written.
+    pub(super) fn fan_out_metadata(&self, n: usize) -> (Vec<StorageResult<()>>, u64) {
+        let results = self
+            .fan_out(n)
+            .into_iter()
+            .map(|outcome| outcome.map(|_| ()))
+            .collect();
+        (results, 0)
+    }
 }
 
 impl From<String> for PageFailure {
@@ -2057,6 +2068,20 @@ mod tests {
             &outcomes[4],
             Err(StorageError::Backend(BackendError::Unavailable { .. }))
         ));
+    }
+
+    #[test]
+    fn metadata_fan_out_fails_every_resource_and_writes_none() {
+        let mut permanent = HashMap::new();
+        permanent.insert(1, "metadata rejected".to_string());
+        let failure =
+            PageFailure::driver("metadata page", command_error(2)).with_permanent(permanent);
+        let (results, written) = failure.fan_out_metadata(3);
+        assert_eq!(written, 0);
+        assert_eq!(results.len(), 3);
+        assert!(matches!(&results[0], Err(e) if e.to_string().contains("metadata page")));
+        assert!(matches!(&results[1], Err(e) if e.to_string().contains("metadata rejected")));
+        assert!(matches!(&results[2], Err(e) if e.to_string().contains("metadata page")));
     }
 
     #[test]

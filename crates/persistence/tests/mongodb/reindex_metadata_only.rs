@@ -216,6 +216,43 @@ async fn mongodb_metadata_only_reindex_backfills_without_touching_the_index() {
     );
 }
 
+/// A page large enough to extract on the reindex prepare pool, on a
+/// multi-thread runtime, stores the same metadata as the writes (#2008).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_metadata_only_reindex_extracts_a_large_page_on_the_pool() {
+    let Some(backend) = create_backend_with_full_registry("reindex_metadata_pool").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant = create_tenant("metadata-pool");
+    for n in 0..40 {
+        let mut patient = json!({"resourceType": "Patient", "id": format!("p{n:02}")});
+        if n % 3 == 0 {
+            patient["gender"] = json!("male");
+        }
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let written = metadata(&backend, &tenant).await;
+    unset_metadata(&backend, &tenant).await;
+    let rows = index_rows(&backend, &tenant).await;
+
+    let progress = run(
+        &backend,
+        &tenant,
+        ReindexRequest::for_types(["Patient"]).metadata_only(),
+    )
+    .await;
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+    assert!(progress.errors.is_empty(), "{progress:?}");
+    assert_eq!(progress.metadata_updated, 40);
+    assert_eq!(metadata(&backend, &tenant).await, written);
+    assert_eq!(index_rows(&backend, &tenant).await, rows);
+}
+
 /// `skipExistingMetadata` fills in only the resources without the field, and
 /// a type-scoped run only that type.
 #[tokio::test]

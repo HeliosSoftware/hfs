@@ -7681,21 +7681,14 @@ impl ReindexTarget for MongoBackend {
         if resources.is_empty() {
             return (Vec::new(), 0);
         }
-        let fan_out = |failure: super::reindex_pipeline::PageFailure| {
-            let results = failure
-                .fan_out(resources.len())
-                .into_iter()
-                .map(|outcome| outcome.map(|_| ()))
-                .collect();
-            (results, 0)
-        };
+        let n = resources.len();
         let db = match self.get_database().await {
             Ok(db) => db,
-            Err(e) => return fan_out(super::reindex_pipeline::PageFailure::storage(e)),
+            Err(e) => return super::reindex_pipeline::PageFailure::storage(e).fan_out_metadata(n),
         };
         self.write_metadata_page(&db, tenant.tenant_id().as_str(), resources, skip_existing)
             .await
-            .unwrap_or_else(fan_out)
+            .unwrap_or_else(|failure| failure.fan_out_metadata(n))
     }
 }
 
