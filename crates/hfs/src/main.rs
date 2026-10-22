@@ -488,8 +488,9 @@ fn composite_sync_mode_from_env() -> helios_persistence::composite::SyncMode {
 }
 
 /// Forwards composite secondary sync failures to the Prometheus exporter
-/// (#1334): `composite_secondary_sync_failures_total{backend,operation}` and
-/// the `composite_secondary_sync_needs_reindex` gauge.
+/// (#1334): `composite_secondary_sync_failures_total{backend,operation}`, the
+/// `composite_secondary_sync_needs_reindex` gauge and the
+/// `composite_secondary_sync_queue_depth` gauge (#1545).
 #[cfg(feature = "elasticsearch")]
 struct CompositeSyncMetrics;
 
@@ -508,6 +509,10 @@ impl helios_persistence::composite::SecondarySyncObserver for CompositeSyncMetri
 
     fn needs_reindex(&self, outstanding: u64) {
         helios_observability::composite_metrics::set_secondary_sync_needs_reindex(outstanding);
+    }
+
+    fn queue_depth(&self, depth: u64) {
+        helios_observability::composite_metrics::set_secondary_sync_queue_depth(depth);
     }
 }
 
