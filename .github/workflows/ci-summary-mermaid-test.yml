@@ -1,7 +1,15 @@
-# Throwaway experiment: publish a prototype benchmark report as the job summary
-# (the unchanged CI text plus collapsed Mermaid charts) in two layouts, to check
-# colours, sizes, dark mode and Mermaid inside <details>/<td> on the real Actions
-# page. Lives only on tmp/ci-summary-mermaid-test; never merge.
+# Throwaway experiment (branch tmp/ci-summary-mermaid-test only; never merge).
+# Reproduces the job-summary structure of a real "FHIR Server Benchmark" run
+# (run 39657850695): one "Benchmark (<leg>) summary" box per leg, in matrix order,
+# then the "Compare legs summary" box. Each box is the original CI text, unchanged,
+# followed by one trailing "### Charts" section of collapsed Mermaid charts.
+#
+# Files (copy v4/tmp-summary-test/ to .github/tmp-summary-test/):
+#   .github/tmp-summary-test/layout                  one word: stacked | sidebyside
+#   .github/tmp-summary-test/<layout>/leg-<leg>.md   one per leg
+#   .github/tmp-summary-test/<layout>/compare.md
+#   .github/tmp-summary-test/report.html             the full HTML report
+# Only compare.md differs between the two layouts (the cross-leg chart grid).
 name: CI summary mermaid test
 
 on:
@@ -12,33 +20,31 @@ permissions:
   contents: read
 
 jobs:
-  stacked:
-    name: layout-stacked
+  benchmark:
+    name: Benchmark (${{ matrix.leg }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        leg: [sqlite, postgres, mongodb, sqlite-elasticsearch, postgres-elasticsearch, mongodb-elasticsearch]
     steps:
       - uses: actions/checkout@v4
-      - name: Upload the full HTML report without zipping
-        id: up
-        uses: actions/upload-artifact@v7
-        with:
-          name: benchmark-report-stacked.html
-          path: .github/tmp-summary-test/report.html
-          archive: false
-          retention-days: 1
       - name: Write the job summary
         env:
-          ARTIFACT_URL: ${{ steps.up.outputs.artifact-url }}
+          LEG: ${{ matrix.leg }}
         run: |
-          {
-            cat .github/tmp-summary-test/stacked.md
-            echo
-            echo "[Full report (HTML)](${ARTIFACT_URL})"
-          } >> "$GITHUB_STEP_SUMMARY"
-          wc -c "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          LAYOUT=$(tr -d '[:space:]' < .github/tmp-summary-test/layout)
+          case "$LAYOUT" in stacked|sidebyside) ;; *) echo "::error::layout must be stacked or sidebyside, got '$LAYOUT'"; exit 1 ;; esac
+          F=".github/tmp-summary-test/$LAYOUT/leg-$LEG.md"
+          cat "$F" >> "$GITHUB_STEP_SUMMARY"
+          echo "layout=$LAYOUT file=$F bytes=$(wc -c < "$F")"
 
-  sidebyside:
-    name: layout-side-by-side
+  compare:
+    name: Compare legs
+    needs: benchmark
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -47,7 +53,6 @@ jobs:
         id: up
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-report-sidebyside.html
           path: .github/tmp-summary-test/report.html
           archive: false
           retention-days: 1
@@ -55,9 +60,15 @@ jobs:
         env:
           ARTIFACT_URL: ${{ steps.up.outputs.artifact-url }}
         run: |
+          set -euo pipefail
+          LAYOUT=$(tr -d '[:space:]' < .github/tmp-summary-test/layout)
+          case "$LAYOUT" in stacked|sidebyside) ;; *) echo "::error::layout must be stacked or sidebyside, got '$LAYOUT'"; exit 1 ;; esac
+          F=".github/tmp-summary-test/$LAYOUT/compare.md"
           {
-            cat .github/tmp-summary-test/sidebyside.md
+            cat "$F"
+            # compare.md ends with its "### Charts" section, so this lands at the
+            # end of that section and after every original line.
             echo
             echo "[Full report (HTML)](${ARTIFACT_URL})"
           } >> "$GITHUB_STEP_SUMMARY"
-          wc -c "$GITHUB_STEP_SUMMARY"
+          echo "layout=$LAYOUT file=$F bytes=$(wc -c < "$F")"
