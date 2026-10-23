@@ -8,13 +8,13 @@
 #     the real workflow; report.html is a 15th, additional artifact;
 #   - one summary box per leg and the Compare legs box: the original CI text, unchanged,
 #     followed by one trailing "### Charts" section of collapsed Mermaid charts. The text is the
-#     NEW import-row wording (Batch/Transaction Import and Bulk Import rows in each Results
+#     NEW import-row wording (worktree HEAD 566193c92) (Batch/Transaction Import and Bulk Import rows in each Results
 #     table, '20 concurrent clients' in the legends); the per-leg charts are two compact charts
 #     (k6 suites requests/s, Import resources/s) side by side or stacked, per `layout`.
 # Tuning-block cells the original reads live from its own containers are read live here
 # too, by running the repo's own scripts unchanged (see the Start ephemeral steps).
 #
-# Files (copy v7/tmp-summary-test/ to .github/tmp-summary-test/):
+# Files (copy v9/tmp-summary-test/ to .github/tmp-summary-test/):
 #   .github/tmp-summary-test/layout                  one word: stacked | sidebyside
 #   .github/tmp-summary-test/<layout>/leg-<leg>.md   one per leg (live cells as @@NAME@@)
 #   .github/tmp-summary-test/<layout>/compare.md

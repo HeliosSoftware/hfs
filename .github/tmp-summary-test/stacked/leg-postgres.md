@@ -98,7 +98,7 @@ _totals include 0 crud/prewarm leftovers (Patient: 0) and any Batch/Transaction 
 | prewarm | 1,867 | 5.7 | 11.6 | 16.0 | 0.0% | 56,520/0 |
 | search | 2,186 | 7.7 | 40.4 | 114.4 | 0.0% | 262,872/0 |
 
-_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Import** line above; k6 drives it with 20 concurrent clients); the Bulk Import row is resources/s end to end until searchable, with no per-request latency (see the **Bulk Import** line above)._
+_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Batch/Transaction Import** line above; k6 drives it with 20 concurrent clients); the Bulk Import row is resources/s end to end until searchable, with no per-request latency (see the **Bulk Import** line above)._
 
 **Environment:** crud Postgres cost **0.19 ms/call** (802 s over 4,258,777 statements, host loadavg 11.99 over 33 containers at crud start).
 

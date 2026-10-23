@@ -103,7 +103,7 @@ _totals include 0 crud/prewarm leftovers (Patient: 0) and any Batch/Transaction 
 | prewarm | 90 | 89.8 | 292.3 | 363.9 | 0.0% | 2,988/0 |
 | search | 920 | 28.8 | 68.9 | 101.1 | 0.0% | 110,808/0 |
 
-_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Import** line above; k6 drives it with 20 concurrent clients); the Bulk Import row is resources/s end to end until searchable, with no per-request latency (see the **Bulk Import** line above)._
+_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Batch/Transaction Import** line above; k6 drives it with 20 concurrent clients); the Bulk Import row is resources/s end to end until searchable, with no per-request latency (see the **Bulk Import** line above)._
 
 ### Charts
 
