@@ -85,6 +85,19 @@ enum PendingSearchParameterChange {
     Delete,
 }
 
+/// The version a Bundle writes over a stored document: an update over the live
+/// document, or a restore over a tombstone (`deleted`, #2145).
+/// See [`MongoBackend::write_next_version_in_bundle_transaction`].
+struct NextVersion<'a> {
+    resource_type: &'a str,
+    id: &'a str,
+    stored: &'a Document,
+    expected_version: &'a str,
+    deleted: bool,
+    fhir_version: helios_fhir::FhirVersion,
+    change: PendingSearchParameterChange,
+}
+
 /// What one attempt at a Bundle transaction has staged: the SearchParameter
 /// changes for after its commit, for a Bundle that defers its search rows
 /// (#1975) the resources it left without them, and the creates not yet sent to
@@ -5229,6 +5242,31 @@ impl MongoBackend {
                         let mut resource_with_id = resource;
                         resource_with_id["id"] = serde_json::json!(id);
 
+                        // A deleted id is restored, as the same PUT outside a
+                        // Bundle is; only an id never stored creates (#2145).
+                        if let Some(deleted) = self
+                            .read_deleted_in_bundle_transaction(
+                                db,
+                                session,
+                                tenant,
+                                &resource_type,
+                                &id,
+                            )
+                            .await?
+                        {
+                            let restored = self
+                                .restore_resource_in_bundle_transaction(
+                                    db,
+                                    session,
+                                    tenant,
+                                    &deleted,
+                                    resource_with_id,
+                                    writes,
+                                )
+                                .await?;
+                            return Ok(BundleEntryResult::created(restored));
+                        }
+
                         let created = self.create_resource_in_bundle_transaction(
                             index,
                             tenant,
@@ -5496,7 +5534,6 @@ impl MongoBackend {
         writes: &mut BundleWrites,
     ) -> StorageResult<StoredResource> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = current.resource_type();
         let id = current.id();
@@ -5536,7 +5573,124 @@ impl MongoBackend {
             ));
         }
 
-        let new_version = next_version(current.version_id())?;
+        self.write_next_version_in_bundle_transaction(
+            db,
+            session,
+            tenant,
+            NextVersion {
+                resource_type,
+                id,
+                stored: &existing_doc,
+                expected_version: current.version_id(),
+                deleted: false,
+                fhir_version: current.fhir_version(),
+                change: PendingSearchParameterChange::Update,
+            },
+            resource,
+            writes,
+        )
+        .await
+    }
+
+    /// The tombstone of a soft-deleted resource, read inside the Bundle's
+    /// session; `None` when the id is live or was never stored.
+    async fn read_deleted_in_bundle_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<Document>> {
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        resources
+            .find_one(doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": resource_type,
+                "id": id,
+                "is_deleted": true,
+            })
+            .session(&mut *session)
+            .await
+            .map_err(|e| internal_driver_error("Failed to read deleted resource in transaction", e))
+    }
+
+    /// A `PUT` to the id of a soft-deleted resource restores it inside the
+    /// Bundle's session and continues its version chain, as the same `PUT`
+    /// outside a Bundle does ([`Self::restore_attempt`], FHIR
+    /// http.html#delete; #2145). `deleted` is the tombstone
+    /// ([`Self::read_deleted_in_bundle_transaction`]).
+    ///
+    /// The tombstone keeps its document under the unique, non-partial
+    /// `idx_resources_identity`, so a create over it would be refused as
+    /// [`ResourceError::AlreadyExists`]; that refusal was the Bundle's answer
+    /// before this restore existed.
+    async fn restore_resource_in_bundle_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        deleted: &Document,
+        resource: Value,
+        writes: &mut BundleWrites,
+    ) -> StorageResult<StoredResource> {
+        let field = |name: &str| {
+            deleted.get_str(name).map_err(|e| {
+                internal_error(format!(
+                    "Missing {name} of deleted resource in transaction: {e}"
+                ))
+            })
+        };
+        // The restore keeps the FHIR version the resource was stored under.
+        let fhir_version =
+            FhirVersion::from_storage(deleted.get_str("fhir_version").unwrap_or("4.0"))
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+        self.write_next_version_in_bundle_transaction(
+            db,
+            session,
+            tenant,
+            NextVersion {
+                resource_type: field("resource_type")?,
+                id: field("id")?,
+                stored: deleted,
+                expected_version: field("version_id")?,
+                deleted: true,
+                fhir_version,
+                change: PendingSearchParameterChange::Create,
+            },
+            resource,
+            writes,
+        )
+        .await
+    }
+
+    /// Writes the version after `expected_version` over the stored document
+    /// (live, or a tombstone when `deleted`) inside the Bundle's session: the
+    /// compare-and-swap on the current document, its history row and its
+    /// search rows. A lost compare-and-swap is a `VersionConflict`.
+    async fn write_next_version_in_bundle_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        next: NextVersion<'_>,
+        resource: Value,
+        writes: &mut BundleWrites,
+    ) -> StorageResult<StoredResource> {
+        let NextVersion {
+            resource_type,
+            id,
+            stored: existing_doc,
+            expected_version,
+            deleted,
+            fhir_version,
+            change,
+        } = next;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let new_version = next_version(expected_version)?;
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
         let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
@@ -5544,7 +5698,6 @@ impl MongoBackend {
 
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
-        let fhir_version = current.fhir_version();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
         let mut set = doc! {
@@ -5565,8 +5718,8 @@ impl MongoBackend {
                     "tenant_id": tenant_id,
                     "resource_type": resource_type,
                     "id": id,
-                    "version_id": current.version_id(),
-                    "is_deleted": false,
+                    "version_id": expected_version,
+                    "is_deleted": deleted,
                 },
                 search_documents.resource_update(doc! { "$set": set }),
             )
@@ -5579,13 +5732,13 @@ impl MongoBackend {
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
+                    expected_version: expected_version.to_string(),
                     actual_version: "unknown".to_string(),
                 },
             ));
         }
 
-        let created_at = extract_created_at(&existing_doc, now);
+        let created_at = extract_created_at(existing_doc, now);
 
         history
             .insert_one(doc! {
@@ -5616,9 +5769,7 @@ impl MongoBackend {
         .await?;
 
         if resource_type == "SearchParameter" {
-            writes
-                .search_parameter_changes
-                .push(PendingSearchParameterChange::Update);
+            writes.search_parameter_changes.push(change);
         }
 
         Ok(StoredResource::from_storage(

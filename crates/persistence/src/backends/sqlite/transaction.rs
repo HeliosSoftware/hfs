@@ -241,6 +241,116 @@ impl SqliteTransaction {
     ) -> StorageResult<StoredResource> {
         self.create_inner(resource_type, resource, prepared)
     }
+
+    /// Restores a soft-deleted resource with new content inside the
+    /// transaction, continuing its version chain and keeping the FHIR version
+    /// it was stored under, as `SqliteBackend::restore_deleted` does outside a
+    /// Bundle (FHIR http.html#delete; #2145). Returns `None`, having written
+    /// nothing, when no deleted row is stored for the id.
+    pub(crate) async fn restore(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+        resource: &Value,
+    ) -> StorageResult<Option<StoredResource>> {
+        if !self.active {
+            return Err(StorageError::Transaction(
+                TransactionError::InvalidTransaction,
+            ));
+        }
+
+        let conn = self.conn.lock();
+        let tenant_id = self.tenant.tenant_id().as_str();
+
+        let row: Result<(String, String), _> = conn.query_row(
+            "SELECT version_id, fhir_version FROM resources
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 1",
+            params![tenant_id, resource_type, id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        let (deleted_version, fhir_version_str) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => {
+                return Err(internal_error(format!(
+                    "Failed to read deleted resource: {}",
+                    e
+                )));
+            }
+        };
+        self.tenant
+            .check_permission(Operation::Update, resource_type)?;
+
+        let new_version: u64 = deleted_version.parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        let mut data = resource.clone();
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+        }
+        let data_bytes = serde_json::to_vec(&data)
+            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
+
+        let now = Utc::now();
+        let last_updated = now.to_rfc3339();
+
+        conn.execute(
+            "UPDATE resources
+             SET version_id = ?1, data = ?2, last_updated = ?3, is_deleted = 0, deleted_at = NULL
+             WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6 AND is_deleted = 1",
+            params![
+                new_version_str,
+                data_bytes,
+                last_updated,
+                tenant_id,
+                resource_type,
+                id
+            ],
+        )
+        .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
+
+        conn.execute(
+            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![tenant_id, resource_type, id, new_version_str, data_bytes, last_updated, fhir_version_str],
+        )
+        .map_err(|e| internal_error(format!("Failed to insert restore history: {}", e)))?;
+
+        // The delete dropped the search rows; rebuild them for the resource
+        // that is live again, clearing any left behind.
+        self.index_resource(&conn, tenant_id, resource_type, id, &data, true, None)?;
+        drop(conn);
+
+        // A restored overlay-affecting SearchParameter re-enters the tenant's
+        // overlay once the commit makes it readable.
+        if resource_type == "SearchParameter"
+            && self
+                .backend
+                .tenant_registries()
+                .create_affects_overlay(&data)
+        {
+            self.invalidate_registry = true;
+        }
+
+        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+        Ok(Some(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            self.tenant.tenant_id().clone(),
+            data,
+            now,
+            now,
+            None,
+            fhir_version,
+        )))
+    }
 }
 
 impl SqliteTransaction {

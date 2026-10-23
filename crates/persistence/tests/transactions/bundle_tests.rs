@@ -2133,3 +2133,4 @@ sqlite_bundle_identity_test!(put_then_patch_on_one_id_rolls_back);
 sqlite_bundle_identity_test!(two_puts_on_one_id_roll_back);
 sqlite_bundle_identity_test!(conditional_delete_without_a_match_reports_not_found);
 sqlite_bundle_identity_test!(changed_conditional_target_after_a_written_reference_rolls_back);
+sqlite_bundle_identity_test!(put_over_a_deleted_id_restores_it);

@@ -24091,6 +24091,10 @@ mongodb_bundle_identity_test!(
     mongodb_integration_changed_conditional_target_after_a_written_reference_rolls_back,
     changed_conditional_target_after_a_written_reference_rolls_back
 );
+mongodb_bundle_identity_test!(
+    mongodb_integration_put_over_a_deleted_id_restores_it,
+    put_over_a_deleted_id_restores_it
+);
 
 #[path = "mongodb/missing_index.rs"]
 mod missing_index;
