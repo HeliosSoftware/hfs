@@ -11,7 +11,7 @@
 # Tuning-block cells the original reads live from its own containers are read live here
 # too, by running the repo's own scripts unchanged (see the Start ephemeral steps).
 #
-# Files (copy v4/tmp-summary-test/ to .github/tmp-summary-test/):
+# Files (copy v5/tmp-summary-test/ to .github/tmp-summary-test/):
 #   .github/tmp-summary-test/layout                  one word: stacked | sidebyside
 #   .github/tmp-summary-test/<layout>/leg-<leg>.md   one per leg (live cells as @@NAME@@)
 #   .github/tmp-summary-test/<layout>/compare.md

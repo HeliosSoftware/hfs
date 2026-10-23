@@ -75,7 +75,7 @@
 
 **Batch/Transaction Import** (`POST /` Bundles): 996/1000 bundles, 1,465,188 entries in 826 s — **4,972 resources/s** (3.38 Bundles/s) over the 295 s import scenario, after 531 s of k6 setup() (the two seed Bundles). ⚠ **Batch/Transaction Import incomplete — crud/search on this leg ran on a smaller corpus and are not comparable to a 1000/1000 leg** (and abandoned Batch/Transaction Import requests may still have been running server-side)
 
-**Bulk Import (`$bulk-submit`):** 1,630,685/1,630,685 resources in 995.5 s (Bulk Import: ingest 645.3 s + Bulk Import: index rebuild 350.2 s, `completed`) = **1638.1 resources/s** end to end, 2527.0 resources/s ingest only; fresh database, `defer_indexing=true`.
+**Bulk Import (`$bulk-submit`):** 1,630,685/1,630,685 resources in 995.5 s (ingest until Completed 645.3 s + search-index rebuild 350.2 s, `completed`) = **1638.1 resources/s** end to end, 2527.0 resources/s ingest only; fresh database, `defer_indexing=true`.
 
 Search check against the converted corpus: Patient 1,000/1,000 · Observation 689,080/689,080 · `Observation?code=8302-2,29463-7` 33,473/33,473 · `Encounter?class=AMB,EMER` 65,900/65,900 ✓
 
@@ -112,7 +112,7 @@ _totals include 0 crud/prewarm leftovers (Patient: 0) and any Batch/Transaction 
 | Suite | Throughput | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |
 |-------|----:|-------:|-------:|-------:|-----:|-----------:|
 | crud | 875 | 339.9 | 825.6 | 1042.0 | 0.0% | 216,000/0 |
-| Batch/Transaction Import, `POST /` Bundles (resources/s; latency per Bundle) | 4,972 | 4188.9 | 13450.4 | 24764.3 | 0.2% | **996/4** |
+| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles, 20 concurrent clients) (resources/s; latency per Bundle) | 4,972 | 4188.9 | 13450.4 | 24764.3 | 0.2% | **996/4** |
 | insert | 261 | 205.4 | 250.3 | 270.2 | 0.0% | 31,565/0 |
 | prewarm | 97 | 90.0 | 304.3 | 388.9 | 0.0% | 3,240/0 |
 | search | 1,081 | 24.3 | 60.6 | 92.2 | 0.0% | 130,176/0 |
