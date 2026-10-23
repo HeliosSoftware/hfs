@@ -855,11 +855,12 @@ async fn an_earlier_duplicate_is_reported_before_a_later_invalid_entry() {
     }
 }
 
-/// A PUT to the id of a deleted resource creates, and fails as the id is taken.
-/// This pins the answer the Bundle path has always given; a PUT outside a Bundle
-/// restores the resource instead.
+/// A PUT to the id of a deleted resource restores it, as the same PUT outside a
+/// Bundle does, instead of failing as the id is taken (#2145): the entry answers
+/// 201, the version chain continues (create 1, delete 2, restore 3) on the
+/// tombstone's document, and the restored body is searchable.
 #[tokio::test]
-async fn a_put_that_creates_over_a_deleted_id_fails_as_before() {
+async fn a_put_over_a_deleted_id_restores_it() {
     for mode in MODES {
         let name = format!("put_over_deleted_{}", mode.label());
         let Some(backend) = backend_or_skip(&name, mode).await else {
@@ -867,7 +868,7 @@ async fn a_put_that_creates_over_a_deleted_id_fails_as_before() {
         };
         let tenant = create_tenant("chunks-reuse");
         seed_patient(&backend, &tenant, "dup-put", true).await;
-        let before = store_counts(&backend, tenant.tenant_id().as_str()).await;
+        let [resources, history, ..] = store_counts(&backend, tenant.tenant_id().as_str()).await;
 
         let mut entries = patient_posts(6);
         entries[2] = BundleEntry {
@@ -876,15 +877,40 @@ async fn a_put_that_creates_over_a_deleted_id_fails_as_before() {
             resource: Some(json!({
                 "resourceType": "Patient",
                 "id": "dup-put",
-                "name": [{"family": "Put"}],
+                "name": [{"family": "RestoredByPut"}],
             })),
             ..Default::default()
         };
-        let Some(failure) = assert_bundle_error(&backend, &tenant, entries, before, &name).await
+        let Some(result) = process_transaction_or_skip(&backend, &tenant, entries, &name).await
         else {
             return;
         };
-        assert_eq!(failure, (2, already_exists("dup-put")), "{name}");
+        assert_eq!(result.entries[2].status, 201, "{name}: the PUT restores");
+
+        let restored = backend
+            .read(&tenant, "Patient", "dup-put")
+            .await
+            .expect("the restored resource reads")
+            .expect("the restored resource is live");
+        assert_eq!(restored.version_id(), "3", "{name}: the chain continues");
+        assert_eq!(
+            restored.content()["name"][0]["family"],
+            "RestoredByPut",
+            "{name}"
+        );
+
+        // Five POSTs add five documents; the restore reuses the tombstone's.
+        // Every entry adds one history version.
+        let [resources_after, history_after, ..] =
+            store_counts(&backend, tenant.tenant_id().as_str()).await;
+        assert_eq!(resources_after, resources + 5, "{name}: resources");
+        assert_eq!(history_after, history + 6, "{name}: history");
+
+        assert_eq!(
+            patients_by_family(&backend, &tenant, "RestoredByPut").await,
+            vec!["dup-put".to_string()],
+            "{name}: the restored body is searchable"
+        );
     }
 }
 
