@@ -92,12 +92,13 @@ _totals include 0 crud/prewarm leftovers (Patient: 0) and any Batch/Transaction 
 | Suite | Throughput | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |
 |-------|----:|-------:|-------:|-------:|-----:|-----------:|
 | crud | 2,175 | 122.7 | 290.0 | 415.7 | 0.0% | 526,680/0 |
-| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles, 20 concurrent clients) (resources/s; latency per Bundle) | 4,369 | 2673.3 | 26629.8 | 66378.2 | 0.0% | 1,000/0 |
+| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources/s; latency per Bundle) | 4,369 | 2673.3 | 26629.8 | 66378.2 | 0.0% | 1,000/0 |
+| Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) | 1,042 | n/a | n/a | n/a | 0.0% | n/a |
 | insert | 1,425 | 31.9 | 57.7 | 102.9 | 0.0% | 171,220/0 |
 | prewarm | 1,867 | 5.7 | 11.6 | 16.0 | 0.0% | 56,520/0 |
 | search | 2,186 | 7.7 | 40.4 | 114.4 | 0.0% | 262,872/0 |
 
-_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Import** line above)._
+_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Import** line above; k6 drives it with 20 concurrent clients); the Bulk Import row is resources/s end to end until searchable, with no per-request latency (see the **Bulk Import** line above)._
 
 **Environment:** crud Postgres cost **0.19 ms/call** (802 s over 4,258,777 statements, host loadavg 11.99 over 33 containers at crud start).
 
@@ -128,18 +129,41 @@ gantt
 
 <details><summary>Chart: postgres throughput and latency</summary>
 
-**postgres: throughput per suite**
+<table>
+<tr>
+<td valign="top">
 
-One bar per suite, higher is better; values in the Results table above (import is resources/s, the others requests/s); the orange line is the same leg in run 38564965562.
+**postgres: k6 suites throughput (requests/s)**
+
+One bar per k6 suite, higher is better; values in the Results table above; the orange line is the same leg in run 38564965562.
 
 ```mermaid
-%%{init: {"xyChart": {"width": 540, "height": 260, "useMaxWidth": false}, "themeVariables": {"xyChart": {"plotColorPalette": "#2f81f7, #db6d28", "backgroundColor": "transparent"}}}}%%
+%%{init: {"xyChart": {"width": 440, "height": 260, "useMaxWidth": false}, "themeVariables": {"xyChart": {"plotColorPalette": "#2f81f7, #db6d28", "backgroundColor": "transparent"}}}}%%
 xychart-beta
-    x-axis ["crud", "import", "insert", "prewarm", "search"]
-    y-axis "per second" 0 --> 6000
-    bar [2175, 4369, 1425, 1867, 2186]
-    line [856.84, 4704.64, 493.41, 784.59, 701.8]
+    x-axis ["crud", "insert", "prewarm", "search"]
+    y-axis "requests per second" 0 --> 2500
+    bar [2175, 1425, 1867, 2186]
+    line [856.84, 493.41, 784.59, 701.8]
 ```
+
+</td>
+<td valign="top">
+
+**postgres: Import throughput (resources/s)**
+
+One bar per way of loading the corpus, higher is better; values in the Results table above (batch: committed Bundle entries per second of the k6 scenario; bulk: resources until the search index covers them).
+
+```mermaid
+%%{init: {"xyChart": {"width": 440, "height": 260, "useMaxWidth": false}, "themeVariables": {"xyChart": {"plotColorPalette": "#2f81f7", "backgroundColor": "transparent"}}}}%%
+xychart-beta
+    x-axis ["batch import", "bulk import"]
+    y-axis "resources per second" 0 --> 5000
+    bar [4369, 1042]
+```
+
+</td>
+</tr>
+</table>
 
 **postgres: latency per suite (ms)**
 

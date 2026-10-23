@@ -7,7 +7,7 @@ Commit `e0bd5cb` · run 39657850695 · suites: all · 6 of 6 legs have results
 | Suite | sqlite | postgres | mongodb | sqlite+ES | postgres+ES | mongodb+ES |
 |---|---:|---:|---:|---:|---:|---:|
 | prewarm | 1,475 | **1,867** | 1,232 | 90 | 102 | 97 |
-| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles, 20 concurrent clients) (resources/s) | 1,122 ‡ | 4,369 | 1,201 ‡ | 6,325 | 6,141 | 4,972 ‡ |
+| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources/s) | 1,122 ‡ | 4,369 | 1,201 ‡ | 6,325 | 6,141 | 4,972 ‡ |
 | Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) | 1,122 | 1,042 | 620 | **3,057** | 2,565 | 1,638 |
 | ↳ ingest, until Completed (resources/s, seconds) | 4,591 (355 s) | 3,196 (510 s) | 1,752 (930 s) | **7,409** (220 s) | 5,175 (315 s) | 2,527 (645 s) |
 | ↳ search-index rebuild after Completed (seconds) | 1,099 s | 1,054 s | 1,698 s | **313 s** | 321 s | 350 s |
@@ -20,7 +20,7 @@ Commit `e0bd5cb` · run 39657850695 · suites: all · 6 of 6 legs have results
 | Suite | sqlite | postgres | mongodb | sqlite+ES | postgres+ES | mongodb+ES |
 |---|---:|---:|---:|---:|---:|---:|
 | prewarm | 20.6 | **11.6** | 19.9 | 292.3 | 287.7 | 304.3 |
-| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles, 20 concurrent clients) (per Bundle) | 60259.9 ‡ | 26629.8 | 49344.2 ‡ | 10268.1 | 10958.2 | 13450.4 ‡ |
+| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (per Bundle) | 60259.9 ‡ | 26629.8 | 49344.2 ‡ | 10268.1 | 10958.2 | 13450.4 ‡ |
 | Bulk Import (`/ui/bulk-import`: `$bulk-submit`) | n/a (one async job) | n/a (one async job) | n/a (one async job) | n/a (one async job) | n/a (one async job) | n/a (one async job) |
 | crud | 902.2 † | 290.0 | 380.0 † | 749.2 | 798.6 | 825.6 † |
 | search | 17373.9 † | 40.4 | 9387.3 † | 68.9 | 73.0 | 60.6 † |
@@ -31,7 +31,7 @@ Commit `e0bd5cb` · run 39657850695 · suites: all · 6 of 6 legs have results
 | Suite | sqlite | postgres | mongodb | sqlite+ES | postgres+ES | mongodb+ES |
 |---|---:|---:|---:|---:|---:|---:|
 | prewarm | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
-| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles, 20 concurrent clients) | **3.9%** · **78 ✗** | 0.0% | 0.5% · **11 ✗** | 0.0% | 0.0% | 0.2% · **4 ✗** |
+| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) | **3.9%** · **78 ✗** | 0.0% | 0.5% · **11 ✗** | 0.0% | 0.0% | 0.2% · **4 ✗** |
 | Bulk Import (`/ui/bulk-import`: `$bulk-submit`) | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
 | crud | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
 | search | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
@@ -39,7 +39,7 @@ Commit `e0bd5cb` · run 39657850695 · suites: all · 6 of 6 legs have results
 
 `†` crud/search/reindex ran on an incomplete corpus (import below 1000/1000 bundles or not run before it, or the ES index not drained); on Bulk Import and its search-index rebuild, search did not return every resource it ingested · `‡` more than 1% errors or failed checks in that suite (on Bulk Import and its ingest, any resource not ingested; on its search-index rebuild, a rebuild that did not complete or reported errors; on reindex, any reindex error or a failed job) · `⚠` contended host (postgres crud above 3 ms/call) or a backend container died · **bold** = best in its row, shown only when no leg in that row carries a marker or `(partial)` (on the Bulk Import ingest and search-index rebuild rows, also only when every leg indexed the same way) · Bulk Import is resources/s through `$bulk-submit` into a fresh database, kick-off until the search index covers it, and its ingest and search-index rebuild rows split that time (see the note below the tables); reindex is resources/s of one `$reindex` of the type its row names, in the corpus import loaded, `(partial)` when it did not finish (the reason is in that leg's job summary); each is one asynchronous job, so its p95 is n/a · n/a = no result (reason in brackets)
 
-Batch/Transaction Import row (suite `import`): **resources/s** = entries of the transaction Bundles that committed (k6 `bundle_size`) per second of the import scenario's own clock, which starts after k6 setup() has loaded the two seed Bundles (that time is in Leg health) — the unit upstream's report uses. Its p95 is **per Bundle**: one k6 iteration, the corpus fetch plus the transaction POST. k6's `http_reqs` is not used for import: it counts a corpus GET beside every Bundle POST. Bundles/s is in Leg health. Its resources/s is not comparable with the Bulk Import row's: committed Bundle entries per second of the k6 scenario, against resources until the search index covers them.
+Batch/Transaction Import row (suite `import`): **resources/s** = entries of the transaction Bundles that committed (k6 `bundle_size`) per second of the import scenario's own clock, which starts after k6 setup() has loaded the two seed Bundles (that time is in Leg health) — the unit upstream's report uses. Its p95 is **per Bundle**: one k6 iteration, the corpus fetch plus the transaction POST. k6's `http_reqs` is not used for import: it counts a corpus GET beside every Bundle POST. Bundles/s is in Leg health. Its resources/s is not comparable with the Bulk Import row's: committed Bundle entries per second of the k6 scenario, against resources until the search index covers them. k6 drives it with 20 concurrent clients.
 
 Bulk Import ingest and search-index rebuild rows (↳): the same `$bulk-submit` load as the Bulk Import row, split into the two times a user waits for. **Ingest** = resources ingested ÷ seconds from kick-off until the status manifest is final (the web UI then shows the submission as Completed), those seconds in brackets: how long loading the corpus takes. **Search-index rebuild** = seconds from Completed until HFS's deferred search-index rebuild of that freshly loaded data has finished (HFS_BULK_SUBMIT_DEFER_INDEXING, the default); the Search check in the Bulk import table then confirms it is searchable. `inline (during ingest)` = the backend indexed each batch while ingesting (DEFER_INDEXING=false), so its indexing time is inside its ingest seconds — it is not a zero-second rebuild; `+ N s rebuild` is a follow-up rebuild of the types the index rejected. No best is marked on either row when legs indexed differently. Both rows are in the Throughput table only (one asynchronous job: no p95; failed resources are in the Bulk Import Errors row).
 

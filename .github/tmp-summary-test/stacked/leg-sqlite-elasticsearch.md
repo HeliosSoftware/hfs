@@ -97,12 +97,13 @@ _totals include 0 crud/prewarm leftovers (Patient: 0) and any Batch/Transaction 
 | Suite | Throughput | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |
 |-------|----:|-------:|-------:|-------:|-----:|-----------:|
 | crud | 995 | 295.1 | 749.2 | 974.0 | 0.0% | 248,112/0 |
-| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles, 20 concurrent clients) (resources/s; latency per Bundle) | 6,325 | 3523.2 | 10268.1 | 24381.4 | 0.0% | 1,000/0 |
+| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources/s; latency per Bundle) | 6,325 | 3523.2 | 10268.1 | 24381.4 | 0.0% | 1,000/0 |
+| Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) | 3,057 | n/a | n/a | n/a | 0.0% | n/a |
 | insert | 267 | 203.3 | 243.6 | 260.3 | 0.0% | 32,230/0 |
 | prewarm | 90 | 89.8 | 292.3 | 363.9 | 0.0% | 2,988/0 |
 | search | 920 | 28.8 | 68.9 | 101.1 | 0.0% | 110,808/0 |
 
-_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Import** line above)._
+_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Import** line above; k6 drives it with 20 concurrent clients); the Bulk Import row is resources/s end to end until searchable, with no per-request latency (see the **Bulk Import** line above)._
 
 ### Charts
 
@@ -131,16 +132,28 @@ gantt
 
 <details><summary>Chart: sqlite-elasticsearch throughput and latency</summary>
 
-**sqlite-elasticsearch: throughput per suite**
+**sqlite-elasticsearch: k6 suites throughput (requests/s)**
 
-One bar per suite, higher is better; values in the Results table above (import is resources/s, the others requests/s); values span more than 50x, so read short bars in the table.
+One bar per k6 suite, higher is better; values in the Results table above.
 
 ```mermaid
 %%{init: {"xyChart": {"width": 540, "height": 260, "useMaxWidth": false}, "themeVariables": {"xyChart": {"plotColorPalette": "#2f81f7", "backgroundColor": "transparent"}}}}%%
 xychart-beta
-    x-axis ["crud", "import", "insert", "prewarm", "search"]
-    y-axis "per second" 0 --> 8000
-    bar [995, 6325, 267, 90, 920]
+    x-axis ["crud", "insert", "prewarm", "search"]
+    y-axis "requests per second" 0 --> 1200
+    bar [995, 267, 90, 920]
+```
+
+**sqlite-elasticsearch: Import throughput (resources/s)**
+
+One bar per way of loading the corpus, higher is better; values in the Results table above (batch: committed Bundle entries per second of the k6 scenario; bulk: resources until the search index covers them).
+
+```mermaid
+%%{init: {"xyChart": {"width": 400, "height": 260, "useMaxWidth": false}, "themeVariables": {"xyChart": {"plotColorPalette": "#2f81f7", "backgroundColor": "transparent"}}}}%%
+xychart-beta
+    x-axis ["batch import", "bulk import"]
+    y-axis "resources per second" 0 --> 8000
+    bar [6325, 3057]
 ```
 
 **sqlite-elasticsearch: latency per suite (ms)**

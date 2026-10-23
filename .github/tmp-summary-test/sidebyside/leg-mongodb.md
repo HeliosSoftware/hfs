@@ -96,12 +96,13 @@ _totals include 0 crud/prewarm leftovers (Patient: 0) and any Batch/Transaction 
 | Suite | Throughput | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |
 |-------|----:|-------:|-------:|-------:|-----:|-----------:|
 | crud | 1,539 | 206.3 | 380.0 | 536.7 | 0.0% | 377,856/0 |
-| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles, 20 concurrent clients) (resources/s; latency per Bundle) | 1,201 | 18455.1 | 49344.2 | 61241.9 | 0.5% | **989/11** |
+| Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources/s; latency per Bundle) | 1,201 | 18455.1 | 49344.2 | 61241.9 | 0.5% | **989/11** |
+| Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) | 620 | n/a | n/a | n/a | 0.0% | n/a |
 | insert | 1,167 | 38.7 | 71.0 | 111.6 | 0.0% | 140,190/0 |
 | prewarm | 1,232 | 8.6 | 19.9 | 29.6 | 0.0% | 37,260/0 |
 | search | 22 | 137.3 | 9387.3 | 13075.8 | 0.0% | 3,048/0 |
 
-_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Import** line above)._
+_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row (resources/s and per-Bundle latency, see the **Import** line above; k6 drives it with 20 concurrent clients); the Bulk Import row is resources/s end to end until searchable, with no per-request latency (see the **Bulk Import** line above)._
 
 ### Charts
 
@@ -130,17 +131,40 @@ gantt
 
 <details><summary>Chart: mongodb throughput and latency</summary>
 
-**mongodb: throughput per suite**
+<table>
+<tr>
+<td valign="top">
 
-One bar per suite, higher is better; values in the Results table above (import is resources/s, the others requests/s); values span more than 50x, so read short bars in the table.
+**mongodb: k6 suites throughput (requests/s)**
+
+One bar per k6 suite, higher is better; values in the Results table above; values span more than 50x, so read short bars in the table.
 
 ```mermaid
-%%{init: {"xyChart": {"width": 540, "height": 260, "useMaxWidth": false}, "themeVariables": {"xyChart": {"plotColorPalette": "#2f81f7", "backgroundColor": "transparent"}}}}%%
+%%{init: {"xyChart": {"width": 440, "height": 260, "useMaxWidth": false}, "themeVariables": {"xyChart": {"plotColorPalette": "#2f81f7", "backgroundColor": "transparent"}}}}%%
 xychart-beta
-    x-axis ["crud", "import", "insert", "prewarm", "search"]
-    y-axis "per second" 0 --> 2000
-    bar [1539, 1201, 1167, 1232, 22]
+    x-axis ["crud", "insert", "prewarm", "search"]
+    y-axis "requests per second" 0 --> 2000
+    bar [1539, 1167, 1232, 22]
 ```
+
+</td>
+<td valign="top">
+
+**mongodb: Import throughput (resources/s)**
+
+One bar per way of loading the corpus, higher is better; values in the Results table above (batch: committed Bundle entries per second of the k6 scenario; bulk: resources until the search index covers them).
+
+```mermaid
+%%{init: {"xyChart": {"width": 440, "height": 260, "useMaxWidth": false}, "themeVariables": {"xyChart": {"plotColorPalette": "#2f81f7", "backgroundColor": "transparent"}}}}%%
+xychart-beta
+    x-axis ["batch import", "bulk import"]
+    y-axis "resources per second" 0 --> 1500
+    bar [1201, 620]
+```
+
+</td>
+</tr>
+</table>
 
 **mongodb: latency per suite (ms)**
 

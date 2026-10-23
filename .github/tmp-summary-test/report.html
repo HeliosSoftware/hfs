@@ -176,7 +176,7 @@ figure{margin:0}
   <figure class="card chart" id="timeline"></figure>
   <p class="note">There is only one reading at the start and one at the end of each phase; between readings the line is an interpolation. Each band covers the whole suite step (k6 plus diagnostic captures), not just the load.</p>
 
-  <h3>Bulk import (<span class="mono">$bulk-submit</span>) by phase</h3>
+  <h3>Bulk Import (<span class="mono">$bulk-submit</span>) by phase</h3>
   <p class="how"><b>How to read this:</b> each bar is the time until the data can be searched; shorter is better. The official clock adds ingest and index; the NDJSON conversion beforehand is shown separately.</p>
   <div class="legend"><span><span class="sw" style="background:var(--ph1)"></span>conversion (not in the total)</span><span><span class="sw" style="background:var(--ph2)"></span>ingest</span><span><span class="sw" style="background:var(--ph3)"></span>search index build</span></div>
   <figure class="card chart" id="bulk"></figure>
@@ -215,7 +215,7 @@ figure{margin:0}
     <div><b>Leg</b>A storage combination tested separately (e.g. postgres + Elasticsearch).</div>
     <div><b>VU (virtual user)</b>A simulated client with a single request in flight; 300 VUs are 300 clients at once, not 300 req/s.</div>
     <div><b>req/s</b>HTTP requests completed per second (more is better).</div>
-    <div><b>resources/s</b>FHIR resources stored per second; used for import and bulk import, where one request carries many resources.</div>
+    <div><b>resources/s</b>FHIR resources stored per second; used for Batch/Transaction Import and Bulk Import, where one request carries many resources.</div>
     <div><b>p50 / p95 / p99</b>Response time that 50 %, 95 % or 99 % of requests do not exceed (less is better).</div>
     <div><b>Err%</b>Percentage of requests with an HTTP error; it does not check whether the content is correct.</div>
     <div><b>Checks ✓/✗</b>k6 script verifications that passed or failed (e.g. "the Bundle was imported").</div>
@@ -293,7 +293,7 @@ function renderHeader(){
   $("glossMarks").textContent = `† incomplete corpus (<${TH.import_target} Bundles) or ES not drained · ‡ more than ${TH.err_pct_high} % errors or failed checks · ⚠ container down or Postgres contended (>${TH.pg_contended_ms} ms/call in crud).`;
   const src = LEGS.length ? L[LEGS[0]] : null;
   const vus = s => src && src.suites[s] && src.suites[s].vus ? src.suites[s].vus+" VUs" : "n/a";
-  $("glossSuites").textContent = `import ${vus("import")} · crud ${vus("crud")} · search ${vus("search")} · insert ${vus("insert")} · bulk import: one $bulk-submit job, the clock runs until the data can be searched.`;
+  $("glossSuites").textContent = `Batch/Transaction Import ${vus("import")} · crud ${vus("crud")} · search ${vus("search")} · insert ${vus("insert")} · Bulk Import: one $bulk-submit job, the clock runs until the data can be searched.`;
 }
 
 function renderValidity(){
@@ -315,7 +315,7 @@ function renderKpis(){
     : "";
   if(!H){ $("kpis").innerHTML = NODATA; return; }
   const ps = s => P && P.suites[s] ? P.suites[s] : null;
-  const items = [["search","Search","req/s"],["crud","CRUD","req/s"],["insert","Insert","creates/s"],["import","Import","resources/s"],["bulk","Bulk import","resources/s"]];
+  const items = [["search","Search","req/s"],["crud","CRUD","req/s"],["insert","Insert","creates/s"],["import","Batch/Transaction Import","resources/s"],["bulk","Bulk Import","resources/s (until searchable)"]];
   $("kpis").innerHTML = items.map(([k,name,unit])=>{
     let v, p95, pv, pp95, sub;
     if(k==="bulk"){
@@ -390,7 +390,7 @@ function barPanel(el, s, title, unit){
   });
   el.innerHTML = svg(w, top+rows.length*rh+4, b, title+" by leg");
 }
-const THR_P = [["search","Search","req/s"],["crud","CRUD","req/s"],["insert","Insert","creates/s"],["import","Import","resources/s"],["bulk","Bulk import","resources/s (until searchable)"]];
+const THR_P = [["search","Search","req/s"],["crud","CRUD","req/s"],["insert","Insert","creates/s"],["import","Batch/Transaction Import","resources/s"],["bulk","Bulk Import","resources/s (until searchable)"]];
 function renderThr(){ panels("thr","thr",THR_P); THR_P.forEach(([k,t,u])=>barPanel($("thr-"+k), k, t, u)); }
 
 /* ---------- latency ---------- */
@@ -427,7 +427,7 @@ function latPanel(el, s, title){
   });
   el.innerHTML = svg(w, top+rows.length*rh+axisH, b, title+": latency by leg");
 }
-const LAT_P = [["search","Search","per request"],["crud","CRUD","per request"],["insert","Insert","per request"],["import","Import","per whole Bundle (download + POST)"]];
+const LAT_P = [["search","Search","per request"],["crud","CRUD","per request"],["insert","Insert","per request"],["import","Batch/Transaction Import","per whole Bundle (download + POST)"]];
 function renderLat(){ panels("lat","lat",LAT_P); LAT_P.forEach(([k,t])=>latPanel($("lat-"+k), k, t)); }
 
 /* ---------- selectors ---------- */
@@ -507,7 +507,7 @@ function renderBulk(){
     const m = mk(r.leg,"bulk");
     b += txt(lw, y+38, `total ${n0(bk.total)} s · ${thr(bk.rps)} res/s · searchable ${bk.searchable?"✓":"✗"}${m?" "+m:""}`, {size:11, fill:"var(--ink)", weight:isH?600:400});
   });
-  el.innerHTML = svg(w, top+rows.length*rh, b, "Bulk import by phase");
+  el.innerHTML = svg(w, top+rows.length*rh, b, "Bulk Import by phase");
 }
 
 /* ---------- query shapes ---------- */
@@ -607,13 +607,13 @@ function renderFull(){
     const d = L[l], cls = "";
     SUITES.forEach((s,si)=>{
       const v = d.suites[s], m = mk(l,s);
-      const lead = `<tr class="${cls}"><td data-v="${li}">${esc(LBL(l))}</td><td data-v="${si}">${s}${s==="import"?" <span class='note'>(latency per Bundle)</span>":""}</td>`;
+      const lead = `<tr class="${cls}"><td data-v="${li}">${esc(LBL(l))}</td><td data-v="${si}">${s==="import"?"Batch/Transaction Import":s}${s==="import"?" <span class='note'>(latency per Bundle)</span>":""}</td>`;
       if(!v){ h += lead+`<td class="n" data-v="">no data</td>`+"<td></td>".repeat(9)+"</tr>"; return; }
       h += lead+td(v.rps, thr(v.rps))+td(v.unit, v.unit, false)+td(v.p50, ms(v.p50))+td(v.p95, ms(v.p95))+td(v.p99, ms(v.p99))+
         td(v.err, n1(v.err))+td(v.ok, n0(v.ok))+td(v.fail, n0(v.fail))+td(v.vus, n0(v.vus))+td(m, `<span class="mk">${m}</span>`, false)+"</tr>";
     });
     const bk = d.bulk, m = mk(l,"bulk");
-    const lead = `<tr class="${cls}"><td data-v="${li}">${esc(LBL(l))}</td><td data-v="5">bulk import${bk&&ok(bk.total)?` <span class='note'>(${n0(bk.total)} s)</span>`:""}</td>`;
+    const lead = `<tr class="${cls}"><td data-v="${li}">${esc(LBL(l))}</td><td data-v="5">Bulk Import (until searchable)${bk&&ok(bk.total)?` <span class='note'>(${n0(bk.total)} s)</span>`:""}</td>`;
     if(!bk || bk.status!=="complete"){ h += lead+`<td class="n" data-v="">${bk?esc(bk.status):"no data"}</td>`+"<td></td>".repeat(9)+"</tr>"; return; }
     const e = bk.submitted ? bk.failed/bk.submitted*100 : null;
     h += lead+td(bk.rps, thr(bk.rps))+td("resources/s","resources/s",false)+td(null,"—")+td(null,"—")+td(null,"—")+
