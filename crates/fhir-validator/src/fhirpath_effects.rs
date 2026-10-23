@@ -3,18 +3,24 @@
 //! Per resource: the raw JSON is parsed **once** into the typed
 //! `helios_fhir` model (the `crates/sof` pattern) — helios-fhirpath
 //! evaluates against typed resources, not raw JSON. Each constraint is then
-//! evaluated as one combined expression: for a constraint attached below
-//! the root, the validator path is rendered as a relative FHIRPath and the
-//! invariant is wrapped in `.all(...)`:
+//! evaluated in two phases: for a constraint attached below the root, the
+//! validator path is rendered as a relative FHIRPath and evaluated against
+//! the resource to obtain the focused nodes; the invariant is then
+//! evaluated once per node (as `$this`) and each result is coerced on its
+//! own:
 //!
 //! ```text
 //! path Patient.contact.0, expr "name.exists() or telecom.exists()"
-//!   → contact[0].all(name.exists() or telecom.exists())
+//!   → focus contact[0], then evaluate the invariant on each focused node
 //! ```
 //!
-//! `all()` gives the correct per-node focus *and* the FHIR invariant
-//! semantics for absent nodes (empty collection → pass). Root-attached
-//! constraints evaluate as-is.
+//! Outcomes aggregate as: any node failed → failed; else any node not
+//! evaluable → not evaluable; else passed. An absent node (no focused
+//! nodes) passes. Root-attached constraints evaluate as-is, so root and
+//! nested constraints share one coercion rule. (Splicing the invariant into
+//! `path.all(expr)` does not: `all()` counts a per-node empty result as
+//! `false`, which made R4 `ref-1` fail every display-only Reference —
+//! #2171.)
 //!
 //! Result coercion (FHIRPath 5.1.1 / FHIR invariant semantics): empty →
 //! pass; a single boolean → itself; anything else → not evaluable
@@ -27,8 +33,8 @@
 //!
 //! Known limitation (documented in the plan): helios-fhirpath resolves
 //! `%resource`/`%rootResource` to the root resource, so constraints that
-//! depend on nested-resource `%resource` semantics may misfire; and the
-//! `.all()` wrapping makes `%context` the root rather than the node.
+//! depend on nested-resource `%resource` semantics may misfire; and
+//! `%context` resolves to the root rather than the focused node.
 
 use crate::effects::{ConstraintEvaluator, ConstraintOutcome, DeferredConstraint};
 use helios_fhir::{FhirResource, FhirVersion};
@@ -42,7 +48,7 @@ use std::sync::Mutex;
 /// cache.
 #[derive(Default)]
 pub struct FhirPathConstraintEvaluator {
-    /// Combined-expression parse cache.
+    /// Parse cache, keyed by expression text (focus paths and invariants).
     asts: Mutex<HashMap<String, std::sync::Arc<helios_fhirpath::parser::Expression>>>,
 }
 
@@ -75,42 +81,88 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
 
         constraints
             .iter()
-            .map(|c| {
-                let combined = combine(c.path, c.expression);
-                self.evaluate_one(&combined, &context)
-            })
+            .map(|c| self.evaluate_one(c.path, c.expression, &context))
             .collect()
     }
 }
 
 impl FhirPathConstraintEvaluator {
-    fn evaluate_one(&self, expression: &str, context: &EvaluationContext) -> ConstraintOutcome {
-        // Parse (or reuse) the AST, then evaluate.
-        let parsed = {
-            let mut cache = self.asts.lock().expect("ast cache lock");
-            match cache.get(expression) {
-                Some(ast) => std::sync::Arc::clone(ast),
-                None => match helios_fhirpath::parse_expression(expression) {
-                    Ok(ast) => {
-                        let ast = std::sync::Arc::new(ast);
-                        cache.insert(expression.to_string(), std::sync::Arc::clone(&ast));
-                        ast
-                    }
-                    Err(e) => return ConstraintOutcome::NotEvaluable(format!("parse error: {e}")),
-                },
+    fn evaluate_one(
+        &self,
+        path: &str,
+        expression: &str,
+        context: &EvaluationContext,
+    ) -> ConstraintOutcome {
+        let invariant = match self.parse(expression) {
+            Ok(ast) => ast,
+            Err(outcome) => return outcome,
+        };
+        let Some(relative) = relative_path(path) else {
+            return match helios_fhirpath::evaluator::evaluate(&invariant, context, None) {
+                Ok(result) => coerce(result),
+                Err(e) => ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
+            };
+        };
+
+        // Phase 1: the focused nodes. Phase 2: the invariant per node.
+        let focus = match self.parse(&relative) {
+            Ok(ast) => ast,
+            Err(outcome) => return outcome,
+        };
+        let nodes = match helios_fhirpath::evaluator::evaluate(&focus, context, None) {
+            Ok(EvaluationResult::Collection { items, .. }) => items,
+            Ok(EvaluationResult::Empty) => Vec::new(),
+            Ok(single) => vec![single],
+            Err(e) => {
+                return ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}"));
             }
         };
 
-        match helios_fhirpath::evaluator::evaluate(&parsed, context, None) {
-            Ok(result) => coerce(result),
-            Err(e) => ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}")),
+        let mut outcome = ConstraintOutcome::Passed;
+        for node in &nodes {
+            match helios_fhirpath::evaluator::evaluate(&invariant, context, Some(node)) {
+                Ok(result) => match coerce(result) {
+                    ConstraintOutcome::Failed => return ConstraintOutcome::Failed,
+                    ConstraintOutcome::NotEvaluable(detail) => {
+                        if outcome == ConstraintOutcome::Passed {
+                            outcome = ConstraintOutcome::NotEvaluable(detail);
+                        }
+                    }
+                    ConstraintOutcome::Passed => {}
+                },
+                Err(e) => {
+                    if outcome == ConstraintOutcome::Passed {
+                        outcome = ConstraintOutcome::NotEvaluable(format!("evaluation error: {e}"));
+                    }
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Parse (or reuse) the AST for `expression`.
+    fn parse(
+        &self,
+        expression: &str,
+    ) -> Result<std::sync::Arc<helios_fhirpath::parser::Expression>, ConstraintOutcome> {
+        let mut cache = self.asts.lock().expect("ast cache lock");
+        if let Some(ast) = cache.get(expression) {
+            return Ok(std::sync::Arc::clone(ast));
+        }
+        match helios_fhirpath::parse_expression(expression) {
+            Ok(ast) => {
+                let ast = std::sync::Arc::new(ast);
+                cache.insert(expression.to_string(), std::sync::Arc::clone(&ast));
+                Ok(ast)
+            }
+            Err(e) => Err(ConstraintOutcome::NotEvaluable(format!("parse error: {e}"))),
         }
     }
 }
 
-/// Build the combined focus+invariant expression from a dotted validator
-/// path (`Patient.contact.0` → `contact[0].all(<expr>)`).
-fn combine(path: &str, expression: &str) -> String {
+/// Render a dotted validator path as a FHIRPath relative to the resource
+/// (`Patient.contact.0` → `contact[0]`); `None` for the root.
+fn relative_path(path: &str) -> Option<String> {
     let mut relative = String::new();
     for segment in path.split('.').skip(1) {
         if segment.chars().all(|c| c.is_ascii_digit()) && !segment.is_empty() {
@@ -124,11 +176,7 @@ fn combine(path: &str, expression: &str) -> String {
             relative.push_str(segment);
         }
     }
-    if relative.is_empty() {
-        expression.to_string()
-    } else {
-        format!("{relative}.all({expression})")
-    }
+    (!relative.is_empty()).then_some(relative)
 }
 
 /// FHIRPath 5.1.1 boolean coercion with FHIR invariant semantics.
@@ -186,18 +234,85 @@ fn parse_typed(resource: &Value, version: FhirVersion) -> Result<FhirResource, S
 
 #[cfg(test)]
 mod tests {
-    use super::combine;
+    use super::relative_path;
 
     #[test]
-    fn combines_paths_into_focused_expressions() {
-        assert_eq!(combine("Patient", "name.exists()"), "name.exists()");
+    fn renders_relative_focus_paths() {
+        assert_eq!(relative_path("Patient"), None);
         assert_eq!(
-            combine("Patient.contact.0", "name.exists() or telecom.exists()"),
-            "contact[0].all(name.exists() or telecom.exists())"
+            relative_path("Patient.contact.0").as_deref(),
+            Some("contact[0]")
         );
         assert_eq!(
-            combine("Patient.name.2.given", "length() < 10"),
-            "name[2].given.all(length() < 10)"
+            relative_path("Patient.name.2.given").as_deref(),
+            Some("name[2].given")
+        );
+    }
+}
+
+#[cfg(all(test, feature = "R4"))]
+mod evaluation_tests {
+    use super::FhirPathConstraintEvaluator;
+    use crate::effects::{ConstraintEvaluator, ConstraintOutcome, DeferredConstraint};
+    use helios_fhir::FhirVersion;
+    use serde_json::json;
+
+    fn outcome(resource: serde_json::Value, path: &str, expression: &str) -> ConstraintOutcome {
+        let constraint = DeferredConstraint {
+            path,
+            id: "test-1",
+            expression,
+        };
+        FhirPathConstraintEvaluator::new()
+            .evaluate_all(&resource, FhirVersion::R4, &[constraint])
+            .remove(0)
+    }
+
+    fn patient() -> serde_json::Value {
+        json!({
+            "resourceType": "Patient",
+            "contact": [{ "gender": "male" }],
+            "name": [{ "given": ["a", "b"] }]
+        })
+    }
+
+    #[test]
+    fn nested_empty_result_passes() {
+        // `name` is absent on the contact: the invariant is empty, not false.
+        let result = outcome(patient(), "Patient.contact.0", "name.family = 'x'");
+        assert_eq!(result, ConstraintOutcome::Passed);
+    }
+
+    #[test]
+    fn nested_false_result_fails() {
+        let result = outcome(patient(), "Patient.contact.0", "name.exists()");
+        assert_eq!(result, ConstraintOutcome::Failed);
+    }
+
+    #[test]
+    fn nested_non_boolean_result_is_not_evaluable() {
+        let result = outcome(patient(), "Patient.contact.0", "gender");
+        assert!(
+            matches!(result, ConstraintOutcome::NotEvaluable(_)),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn absent_focus_passes() {
+        let result = outcome(patient(), "Patient.contact.3", "name.exists()");
+        assert_eq!(result, ConstraintOutcome::Passed);
+    }
+
+    #[test]
+    fn every_focused_node_must_pass() {
+        assert_eq!(
+            outcome(patient(), "Patient.name.0.given", "length() < 2"),
+            ConstraintOutcome::Passed
+        );
+        assert_eq!(
+            outcome(patient(), "Patient.name.0.given", "$this = 'a'"),
+            ConstraintOutcome::Failed
         );
     }
 }
