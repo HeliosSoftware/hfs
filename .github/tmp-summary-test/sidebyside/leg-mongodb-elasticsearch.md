@@ -113,7 +113,7 @@ _totals include 0 crud/prewarm leftovers (Patient: 0) and any Batch/Transaction 
 |-------|----:|-------:|-------:|-------:|-----:|-----------:|
 | crud | 875 | 339.9 | 825.6 | 1042.0 | 0.0% | 216,000/0 |
 | Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources/s; latency per Bundle) | 4,972 | 4188.9 | 13450.4 | 24764.3 | 0.2% | **996/4** |
-| Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) | 1,638 | n/a | n/a | n/a | 0.0% | n/a |
+| Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) | 1,638 | n/a | n/a | n/a | 0.0% | 1,630,685/0 |
 | insert | 261 | 205.4 | 250.3 | 270.2 | 0.0% | 31,565/0 |
 | prewarm | 97 | 90.0 | 304.3 | 388.9 | 0.0% | 3,240/0 |
 | search | 1,081 | 24.3 | 60.6 | 92.2 | 0.0% | 130,176/0 |
