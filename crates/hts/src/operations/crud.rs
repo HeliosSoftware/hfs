@@ -389,11 +389,16 @@ mod inner {
     ///
     /// 1. Reads the current resource to extract its canonical URL (needed for
     ///    HTS normalized-table cleanup).
-    /// 2. Soft-deletes the raw JSON in `helios-persistence`.
+    /// 2. Soft-deletes the raw JSON in `helios-persistence`, if there is a live
+    ///    row. Content loaded through `POST /import` has none — that path writes
+    ///    only the normalized tables — so a missing row is not an error.
     /// 3. Removes the resource's rows from HTS normalized tables:
-    ///    - SQLite path: via `hts_pool` spawn-blocking helpers.
-    ///    - PostgreSQL path: via `terminology_importer.delete_normalized()`.
-    /// 4. Returns **204 No Content**.
+    ///    - SQLite path: via `hts_pool` spawn-blocking helpers (always by id).
+    ///    - PostgreSQL path: `terminology_importer.delete_normalized()` by the
+    ///      stored URL, or `delete_normalized_by_id()` when there was no store
+    ///      row to read one from.
+    /// 4. Returns **204 No Content**, also for an id that matches nothing, since
+    ///    FHIR DELETE is idempotent.
     async fn delete_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
@@ -408,21 +413,31 @@ mod inner {
         let terminology_importer = state.terminology_importer.clone();
         let ctx = ctx();
 
-        // 1. Read the resource URL before deleting (needed by both HTS cleanup paths).
-        let resource_url: Option<String> = match store.read(&ctx, resource_type, &id).await {
-            Ok(Some(r)) if !r.is_deleted() => r
-                .content()
+        // 1. Read the live store row, if any, for its URL. Not-found and gone
+        //    both mean "no row"; any other read error is a real failure.
+        let stored = match store.read(&ctx, resource_type, &id).await {
+            Ok(Some(r)) if !r.is_deleted() => Some(r),
+            Ok(_) => None,
+            Err(e) if is_gone_or_not_found(&e) => None,
+            Err(e) => return Err(HtsError::StorageError(e.to_string())),
+        };
+        let resource_url: Option<String> = stored.as_ref().and_then(|r| {
+            r.content()
                 .get("url")
                 .and_then(|u| u.as_str())
-                .map(str::to_owned),
-            _ => None,
-        };
+                .map(str::to_owned)
+        });
 
-        // 2. Soft-delete in persistence store.
-        store
-            .delete(&ctx, resource_type, &id)
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        // 2. Soft-delete in persistence store, when there is a row to delete.
+        //    A concurrent DELETE may remove it between the read and here; that
+        //    leaves the same end state, so tolerate it.
+        if stored.is_some() {
+            match store.delete(&ctx, resource_type, &id).await {
+                Ok(()) => {}
+                Err(e) if is_gone_or_not_found(&e) => {}
+                Err(e) => return Err(HtsError::StorageError(e.to_string())),
+            }
+        }
 
         // 3. Delete from HTS normalized tables.
         #[allow(unused_mut, unused_assignments)]
@@ -449,17 +464,25 @@ mod inner {
             })
             .await
             .map_err(|e| HtsError::Internal(e.to_string()))?;
-        } else if let (Some(importer), Some(url)) =
-            (terminology_importer.as_deref(), resource_url.as_deref())
-        {
-            removed = importer.delete_normalized(resource_type, url).await;
+        } else if let Some(importer) = terminology_importer.as_deref() {
+            removed = delete_normalized_via_importer(
+                importer,
+                resource_type,
+                &id,
+                resource_url.as_deref(),
+            )
+            .await;
         }
 
         #[cfg(not(feature = "sqlite"))]
-        if let (Some(importer), Some(url)) =
-            (terminology_importer.as_deref(), resource_url.as_deref())
-        {
-            removed = importer.delete_normalized(resource_type, url).await;
+        if let Some(importer) = terminology_importer.as_deref() {
+            removed = delete_normalized_via_importer(
+                importer,
+                resource_type,
+                &id,
+                resource_url.as_deref(),
+            )
+            .await;
         }
 
         // Evict both cache tiers so a deleted ValueSet (and any CodeSystem whose
@@ -471,6 +494,23 @@ mod inner {
         removed?;
 
         Ok(StatusCode::NO_CONTENT.into_response())
+    }
+
+    /// Clean the normalized tables through a `BundleImportBackend` (the
+    /// PostgreSQL path): by the stored canonical URL when the persistence store
+    /// supplied one, otherwise by id. Without the id fallback, a resource loaded
+    /// through `POST /import` — which has no store row — would answer 204 and
+    /// keep serving `$lookup` / `$expand` (issue #2143).
+    async fn delete_normalized_via_importer(
+        importer: &dyn crate::import::BundleImportBackend,
+        resource_type: &str,
+        id: &str,
+        resource_url: Option<&str>,
+    ) -> Result<(), HtsError> {
+        match resource_url {
+            Some(url) => importer.delete_normalized(resource_type, url).await,
+            None => importer.delete_normalized_by_id(resource_type, id).await,
+        }
     }
 
     // ── Format negotiation helper ──────────────────────────────────────────────
@@ -1758,5 +1798,161 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.display, Some("Concept A".into()));
+    }
+
+    // ── DELETE of content loaded through POST /import (issue #2143) ───────────
+    //
+    // `POST /import` writes only the HTS normalized tables, never a persistence
+    // store row, so DELETE used to fail on the unconditional store delete
+    // (500 "resource not found") and leave the content served.
+
+    /// Router wiring `POST /import`, the reads that prove content is served,
+    /// and DELETE for all three types, over one shared state.
+    fn import_delete_router(state: AppState<SqliteTerminologyBackend>) -> Router {
+        use crate::operations::expand::get_expand_handler;
+        use crate::operations::import_bundle::import_handler;
+        use crate::operations::lookup::get_lookup_handler;
+
+        Router::new()
+            .route("/import", post(import_handler::<SqliteTerminologyBackend>))
+            .route(
+                "/ValueSet/$expand",
+                get(get_expand_handler::<SqliteTerminologyBackend>),
+            )
+            .route(
+                "/CodeSystem/$lookup",
+                get(get_lookup_handler::<SqliteTerminologyBackend>),
+            )
+            .route(
+                "/CodeSystem/{id}",
+                delete(delete_code_system::<SqliteTerminologyBackend>),
+            )
+            .route(
+                "/ValueSet/{id}",
+                delete(delete_value_set::<SqliteTerminologyBackend>),
+            )
+            .route(
+                "/ConceptMap/{id}",
+                delete(delete_concept_map::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    /// A versioned CodeSystem, a versioned ValueSet over it, and a ConceptMap —
+    /// the issue's reproduction plus a ConceptMap.
+    fn imported_bundle() -> Value {
+        json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": "imported-cs",
+                    "url": "http://example.org/imported-cs", "version": "1.0",
+                    "status": "active", "content": "complete",
+                    "concept": [{"code": "RETIRED"}]
+                }},
+                {"resource": {
+                    "resourceType": "ValueSet", "id": "imported-vs",
+                    "url": "http://example.org/imported-vs", "version": "1.0",
+                    "status": "active",
+                    "compose": {"include": [{"system": "http://example.org/imported-cs"}]}
+                }},
+                {"resource": {
+                    "resourceType": "ConceptMap", "id": "imported-cm",
+                    "url": "http://example.org/imported-cm", "status": "active",
+                    "group": [{
+                        "source": "http://example.org/imported-cs",
+                        "target": "http://example.org/other-cs",
+                        "element": [{"code": "RETIRED",
+                            "target": [{"code": "X", "equivalence": "equivalent"}]}]
+                    }]
+                }}
+            ]
+        })
+    }
+
+    fn concept_map_rows(state: &AppState<SqliteTerminologyBackend>) -> i64 {
+        state
+            .backend()
+            .pool()
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM concept_maps WHERE url = 'http://example.org/imported-cm'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deleting_imported_resources_removes_them() {
+        let state = make_state();
+        let app = import_delete_router(state.clone());
+
+        assert_eq!(
+            send_json(&app, "POST", "/import", imported_bundle())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let lookup_uri = "/CodeSystem/$lookup?system=http://example.org/imported-cs&code=RETIRED";
+        let expand_uri = "/ValueSet/$expand?url=http://example.org/imported-vs";
+        assert_eq!(send(&app, "GET", lookup_uri).await.status(), StatusCode::OK);
+        assert_eq!(send(&app, "GET", expand_uri).await.status(), StatusCode::OK);
+        assert_eq!(concept_map_rows(&state), 1, "precondition: map imported");
+
+        // ValueSet first: its expansion depends on the CodeSystem, so deleting
+        // the CodeSystem first would make `$expand` fail for the wrong reason.
+        assert_eq!(
+            send(&app, "DELETE", "/ValueSet/imported-vs").await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            send(&app, "GET", expand_uri).await.status(),
+            StatusCode::NOT_FOUND,
+            "an imported ValueSet must stop expanding once deleted"
+        );
+
+        assert_eq!(
+            send(&app, "DELETE", "/CodeSystem/imported-cs")
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            send(&app, "GET", lookup_uri).await.status(),
+            StatusCode::NOT_FOUND,
+            "an imported CodeSystem must stop answering $lookup once deleted"
+        );
+
+        assert_eq!(
+            send(&app, "DELETE", "/ConceptMap/imported-cm")
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            concept_map_rows(&state),
+            0,
+            "imported ConceptMap must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unknown_id_returns_204() {
+        let app = import_delete_router(make_state());
+        for path in [
+            "/CodeSystem/never-existed",
+            "/ValueSet/never-existed",
+            "/ConceptMap/never-existed",
+        ] {
+            assert_eq!(
+                send(&app, "DELETE", path).await.status(),
+                StatusCode::NO_CONTENT,
+                "DELETE {path} must be idempotent"
+            );
+        }
     }
 }

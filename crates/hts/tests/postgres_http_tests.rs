@@ -329,6 +329,127 @@ async fn crud_delete_also_removes_translate_data() {
     );
 }
 
+/// `true` when a `$translate` response reports a match.
+fn translate_result(body: &serde_json::Value) -> bool {
+    body["parameter"]
+        .as_array()
+        .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .unwrap_or(false)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crud_delete_removes_resources_loaded_through_import() {
+    // Issue #2143: POST /import writes only the normalized tables, so there is
+    // no store row for DELETE to read a URL from. DELETE used to 500 on the
+    // store delete; tolerating that alone would have answered 204 and kept
+    // serving the content, because the PostgreSQL cleanup was keyed by URL.
+    let app = TestAppPg::new().await;
+
+    let cs_url = "http://pg-crud-delete.example/cs/imported-2143";
+    let vs_url = "http://pg-crud-delete.example/vs/imported-2143";
+    let cm_url = "http://pg-crud-delete.example/cm/imported-2143";
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "imported-cs-2143",
+                "url": cs_url, "version": "1.0", "status": "active",
+                "content": "complete", "concept": [{"code": "RETIRED"}]
+            }},
+            {"resource": {
+                "resourceType": "ValueSet", "id": "imported-vs-2143",
+                "url": vs_url, "version": "1.0", "status": "active",
+                "compose": {"include": [{"system": cs_url}]}
+            }},
+            {"resource": {
+                "resourceType": "ConceptMap", "id": "imported-cm-2143",
+                "url": cm_url, "status": "active",
+                "group": [{
+                    "source": cs_url,
+                    "target": "http://pg-crud-delete.example/cs/other",
+                    "element": [{"code": "RETIRED",
+                        "target": [{"code": "X", "equivalence": "equivalent"}]}]
+                }]
+            }}
+        ]
+    })
+    .to_string();
+    app.import_bundle_ok(&bundle).await;
+
+    let lookup = TestAppPg::params(&[
+        ("system", "valueUri", cs_url),
+        ("code", "valueCode", "RETIRED"),
+    ]);
+    let expand = TestAppPg::params(&[("url", "valueUri", vs_url)]);
+    let translate = TestAppPg::params(&[
+        ("url", "valueUri", cm_url),
+        ("system", "valueUri", cs_url),
+        ("code", "valueCode", "RETIRED"),
+    ]);
+
+    let (status, _) = app.post_fhir("/CodeSystem/$lookup", lookup.clone()).await;
+    assert_eq!(status, StatusCode::OK, "precondition: $lookup");
+    let (status, _) = app.post_fhir("/ValueSet/$expand", expand.clone()).await;
+    assert_eq!(status, StatusCode::OK, "precondition: $expand");
+    let (status, body) = app
+        .post_fhir("/ConceptMap/$translate", translate.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "precondition: $translate {body}");
+    assert!(translate_result(&body), "precondition: $translate matches");
+
+    // ValueSet first, so `$expand` failing afterwards is about the ValueSet
+    // and not about the CodeSystem it includes.
+    assert_eq!(
+        app.delete_fhir("/ValueSet/imported-vs-2143").await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, _) = app.post_fhir("/ValueSet/$expand", expand).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an imported ValueSet must stop expanding once deleted"
+    );
+
+    assert_eq!(
+        app.delete_fhir("/CodeSystem/imported-cs-2143").await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, _) = app.post_fhir("/CodeSystem/$lookup", lookup).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an imported CodeSystem must stop answering $lookup once deleted"
+    );
+
+    assert_eq!(
+        app.delete_fhir("/ConceptMap/imported-cm-2143").await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = app.post_fhir("/ConceptMap/$translate", translate).await;
+    assert!(
+        status != StatusCode::OK || !translate_result(&body),
+        "an imported ConceptMap must stop translating once deleted: {status} {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crud_delete_of_unknown_id_returns_204() {
+    let app = TestAppPg::new().await;
+    for path in [
+        "/CodeSystem/never-existed-2143",
+        "/ValueSet/never-existed-2143",
+        "/ConceptMap/never-existed-2143",
+    ] {
+        assert_eq!(
+            app.delete_fhir(path).await,
+            StatusCode::NO_CONTENT,
+            "DELETE {path} must be idempotent"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // By-id operation endpoints
 // ═══════════════════════════════════════════════════════════════════════════════
