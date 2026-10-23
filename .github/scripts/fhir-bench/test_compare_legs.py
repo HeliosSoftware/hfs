@@ -21,12 +21,12 @@ import compare_legs as cl  # noqa: E402
 RUN = "100"
 SUITES = ("prewarm", "import", "crud", "search")
 INSERT_ROW = "insert (creates/s)"
-IMPORT = "Batch/Transaction Import, `POST /` Bundles"  # Errors label; Throughput and p95 add a unit
+IMPORT = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles)"  # Errors label; Throughput and p95 add a unit
 IMPORT_ROW = IMPORT + " (resources/s)"
-BULK = "Bulk Import, `$bulk-submit`"
-BULK_ROW = BULK + " (resources/s)"
-INGEST_ROW = "Bulk Import: ingest (resources/s, seconds)"
-INDEX_ROW = "Bulk Import: index rebuild (seconds)"
+BULK = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`)"
+BULK_ROW = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s)"
+INGEST_ROW = "↳ ingest, until Completed (resources/s, seconds)"
+INDEX_ROW = "↳ search-index rebuild after Completed (seconds)"
 REINDEX = "reindex, `$reindex` Encounter"
 REINDEX_ROW = REINDEX + " (resources/s)"
 _guard = {"on": False}
@@ -450,6 +450,16 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(labels(md, "Errors"), ["prewarm", IMPORT, BULK, REINDEX,
                                                 "crud", "search", "insert"])
         self.assertNotIn("$import", md)  # HFS has none; no label may suggest it
+        # the four import rows sit right after prewarm, in this order, under the UI names
+        t = labels(md, "Throughput")
+        self.assertEqual(t[:5], ["prewarm", IMPORT_ROW, BULK_ROW, INGEST_ROW, INDEX_ROW])
+        self.assertNotIn("20 concurrent clients", IMPORT_ROW)
+        self.assertIn("k6 drives it with 20 concurrent clients.", cl.IMPORT_NOTE)
+        self.assertTrue(INGEST_ROW.startswith("↳ ") and INDEX_ROW.startswith("↳ "))
+        # one vocabulary: "search-index rebuild", never "initial index"
+        self.assertNotIn("initial index", md)
+        self.assertNotIn("initial-index", md)
+        self.assertIn("search-index rebuild", md)
         self.assertIn("`†` crud/search/reindex ran on an incomplete corpus", md)
         self.assertIn("on reindex, any reindex error or a failed job", md)
         self.assertIn("shown only when no leg in that row carries a marker or `(partial)`", md)

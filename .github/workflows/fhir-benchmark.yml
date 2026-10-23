@@ -60,10 +60,10 @@ name: FHIR Server Benchmark
 #     search-index rebuild has finished, capped by BULK_IMPORT_TIMEOUT_S and by
 #     what is left of the leg budget; the bulk database is dropped afterwards.
 #     The comparison reports the one load as three Throughput rows:
-#     `Bulk Import, $bulk-submit (resources/s)` (over both phases),
-#     `Bulk Import: ingest (resources/s, seconds)` (resources/s and the
+#     `Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s)` (over both phases),
+#     `↳ ingest, until Completed (resources/s, seconds)` (resources/s and the
 #     seconds from kick-off until the status manifest is final: how long
-#     loading the corpus takes) and `Bulk Import: index rebuild (seconds)`
+#     loading the corpus takes) and `↳ search-index rebuild after Completed (seconds)`
 #     (seconds of the deferred search-index rebuild that follows: how
 #     long until that freshly loaded data is indexed; `inline (during ingest)`
 #     when HFS indexed while ingesting, HFS_BULK_SUBMIT_DEFER_INDEXING=false).
@@ -101,7 +101,7 @@ name: FHIR Server Benchmark
 # *-elasticsearch legs). Users never run a $reindex when they load data, and it
 # rewrites the search index right before insert and bulk-import, so a run that
 # includes it may skew both. How long freshly loaded data takes to become
-# indexed is the `Bulk Import: index rebuild (seconds)` row instead. Past a 240 s budget the
+# indexed is the `↳ search-index rebuild after Completed (seconds)` row instead. Past a 240 s budget the
 # job is cancelled and reported partial, so it adds at most ~5 min to a leg. See
 # run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh. Its matrix row
 # is labelled `reindex, $reindex Encounter` (resources/s) and sits with the
@@ -145,7 +145,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' = prewarm,import,crud,search,insert,bulk-import | comma-separated from those plus indexing (a timed $reindex; opt-in only, never part of 'all', list it after search; it rewrites the index before insert and bulk-import and may skew both). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and index-rebuild rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,insert' skips it"
+        description: "Suites to run: 'all' = prewarm,import,crud,search,insert,bulk-import | comma-separated from those plus indexing (a timed $reindex; opt-in only, never part of 'all', list it after search; it rewrites the index before insert and bulk-import and may skew both). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and search-index rebuild rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,insert' skips it"
         required: false
         default: "all"
       vus:
@@ -2056,10 +2056,46 @@ jobs:
               it = m.get('iteration_duration', {})
               return rate, it.get('med', 0), it.get('p(95)', 0), it.get('p(99)', 0)
 
+          def bulk_import_row():
+              kv = {}
+              try:
+                  for line in open(f"{results_dir}/bulk-import.txt"):
+                      if "=" in line:
+                          k, v = line.strip().split("=", 1)
+                          kv[k] = v
+                  if kv.get("status") != "complete":
+                      return None
+                  rate = float(kv["resources_per_s"])
+              except (OSError, KeyError, ValueError):
+                  return None
+              try:
+                  failed, sub = float(kv["resources_failed"]), float(kv["resources_submitted"])
+                  err = 100.0 * max(failed, 0) / sub
+                  err_fmt = f"**{err:.1f}%**" if err > 1 else f"{err:.1f}%"
+              except (KeyError, ValueError, ZeroDivisionError):
+                  err_fmt = "n/a"
+              # Checks column: resources loaded / resources that failed, the counterpart of the
+              # Batch/Transaction Import row's Bundles passed / failed.
+              try:
+                  ok, bad = float(kv["resources_ok"]), max(float(kv["resources_failed"]), 0)
+                  chk_fmt = f"{ok:,.0f}/{bad:,.0f}"
+                  if bad > 0:
+                      chk_fmt = f"**{chk_fmt}**"
+              except (KeyError, ValueError):
+                  chk_fmt = "n/a"
+              # A job that completed but whose data is not searchable (or whose index rebuild
+              # failed) must not look healthy: compare_legs.py marks it with the dagger.
+              if kv.get("searchable") == "no" or kv.get("index_status") == "error":
+                  chk_fmt = "**" + chk_fmt.strip("*") + " · not searchable**"
+              return (f"| Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) "
+                      f"| {rate:,.0f} | n/a | n/a | n/a | {err_fmt} | {chk_fmt} |")
+
           print("### Results\n")
           print("| Suite | Throughput | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |")
           print("|-------|----:|-------:|-------:|-------:|-----:|-----------:|")
           has_import = False
+          has_bulk = False
+          bulk_row = bulk_import_row()
           for f in files:
               suite = os.path.basename(f).replace('.json', '')
               try:
@@ -2084,14 +2120,33 @@ jobs:
                   chk_fmt = f"**{chk_fmt}**"
               label = suite
               if suite == "import":
-                  label = "Batch/Transaction Import, `POST /` Bundles (resources/s; latency per Bundle)"
+                  label = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources/s; latency per Bundle)"
                   rps, p50, p95, p99 = import_row(m)
                   has_import = True
               rps_fmt = "n/a" if rps is None else f"{rps:,.0f}"
               print(f"| {label} | {rps_fmt} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
-          if has_import:
-              print("\n_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row "
-                    "(resources/s and per-Bundle latency, see the **Import** line above)._")
+              if suite == "import":
+                  # Bulk import is not a k6 suite: its result is bulk-import.txt (bulk_import.py).
+                  # Row only for a complete job with a numeric resources_per_s (compare_legs.py
+                  # _load_bulk_import is more lenient); missing/skipped/partial/timeout/error: no row.
+                  if bulk_row:
+                      print(bulk_row)
+                      has_bulk = True
+          if bulk_row and not has_bulk:
+              # Some k6 suites ran but not `import`: still show the bulk job, after them.
+              print(bulk_row)
+              has_bulk = True
+          if has_import or has_bulk:
+              note = "Throughput is requests/s and latency is per request"
+              if has_import:
+                  note += (", except on the Batch/Transaction Import row (resources/s and per-Bundle latency, "
+                           "see the **Batch/Transaction Import** line above; k6 drives it with 20 concurrent clients)")
+              if has_bulk:
+                  note += ("; the Bulk Import row is resources/s end to end until searchable, with no per-request "
+                           "latency (see the **Bulk Import** line above)" if has_import else
+                           ", except on the Bulk Import row (resources/s end to end until searchable, with no "
+                           "per-request latency, see the **Bulk Import** line above)")
+              print(f"\n_{note}._")
 
           # ── How loaded the shared Docker host was ──────────────────────────
           #

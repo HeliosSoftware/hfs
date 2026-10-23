@@ -497,7 +497,7 @@ write_search_counts() {
 # Opt-in: it runs only when `tests` names it and is not part of `all`.
 # Users never run a $reindex when they load data, and it rewrites the
 # index right before insert and bulk-import, so a run that includes it
-# may skew both; bulk-import's initial-index row is the default
+# may skew both; bulk-import's search-index rebuild row is the default
 # indexing number.
 #
 # Timing is the job's own `$reindex-status` startedAt → completedAt
