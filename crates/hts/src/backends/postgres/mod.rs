@@ -782,6 +782,85 @@ impl BundleImportBackend for PostgresTerminologyBackend {
 
         Ok(())
     }
+
+    /// Delete all HTS normalized rows for the resource whose FHIR `id` is `id`.
+    ///
+    /// The id predicates mirror the SQLite `fhir_bundle::delete_*` helpers:
+    ///
+    /// - CodeSystem: the storage id, or the FHIR id kept in `resource_json`, so
+    ///   every stored version of a multi-version CodeSystem goes.
+    /// - ValueSet: the storage id, or the `<id>` before the first `|` of a
+    ///   `<id>|<version>` storage id. Not `resource_json->>'id'`: unrelated
+    ///   ValueSets share a FHIR id across canonical URLs, and matching it would
+    ///   delete them too (see `delete_value_set`).
+    /// - ConceptMap: the storage id.
+    ///
+    /// Cached ValueSet expansions are not under the FK cascade from
+    /// `code_systems`, so they are purged for every system URL that was removed.
+    async fn delete_normalized_by_id(&self, resource_type: &str, id: &str) -> Result<(), HtsError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+        match resource_type {
+            "CodeSystem" => {
+                // ON DELETE CASCADE removes concepts, concept_hierarchy,
+                // concept_closure, concept_properties, concept_designations.
+                let removed_urls: Vec<String> = tx
+                    .query(
+                        "DELETE FROM code_systems \
+                         WHERE id = $1 OR resource_json->>'id' = $1 \
+                         RETURNING url",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+                    .iter()
+                    .map(|r| r.get::<_, String>(0))
+                    .collect();
+                if !removed_urls.is_empty() {
+                    tx.execute(
+                        "DELETE FROM value_set_expansions WHERE system_url = ANY($1)",
+                        &[&removed_urls],
+                    )
+                    .await
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+                }
+            }
+            "ValueSet" => {
+                // FHIR ids cannot contain `|`, so `split_part` is unambiguous;
+                // exact equality avoids LIKE-wildcard over-matching.
+                tx.execute(
+                    "DELETE FROM value_sets \
+                     WHERE id = $1 \
+                        OR (strpos(id, '|') > 0 AND split_part(id, '|', 1) = $1)",
+                    &[&id],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+            }
+            "ConceptMap" => {
+                tx.execute("DELETE FROM concept_maps WHERE id = $1", &[&id])
+                    .await
+                    .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+            }
+            _ => {} // Unknown resource type — nothing to clean up.
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+        self.invalidate_caches();
+
+        Ok(())
+    }
 }
 
 // ── PostgreSQL write helpers ───────────────────────────────────────────────────

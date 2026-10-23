@@ -324,6 +324,26 @@ pub trait BundleImportBackend: Send + Sync {
     ) -> Result<(), HtsError> {
         Ok(())
     }
+
+    /// Remove all HTS normalized rows for the resource whose FHIR `id` is `id`.
+    ///
+    /// The id-keyed counterpart of [`delete_normalized`](Self::delete_normalized),
+    /// used by the CRUD DELETE handler when the persistence store holds no row
+    /// to read a canonical URL from — i.e. for content loaded through
+    /// `POST /import`, which writes only the normalized tables. Matches the
+    /// same ids as the SQLite `fhir_bundle::delete_*` helpers, including the
+    /// `<id>|<version>` storage ids minted by `storage_id_for`. An id that
+    /// matches nothing is not an error.
+    ///
+    /// The default implementation is a no-op, for the same reason as
+    /// [`delete_normalized`](Self::delete_normalized).
+    async fn delete_normalized_by_id(
+        &self,
+        _resource_type: &str,
+        _id: &str,
+    ) -> Result<(), HtsError> {
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
