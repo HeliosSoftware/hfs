@@ -1,54 +1,227 @@
 # Throwaway experiment (branch tmp/ci-summary-mermaid-test only; never merge).
-# Reproduces the job-summary structure of a real "FHIR Server Benchmark" run
-# (run 39657850695): one "Benchmark (<leg>) summary" box per leg, in matrix order,
-# then the "Compare legs summary" box. Each box is the original CI text, unchanged,
-# followed by one trailing "### Charts" section of collapsed Mermaid charts.
+# Reproduces the run page of a real "FHIR Server Benchmark" run (run 39657850695):
+#   - the same jobs, ids, display names and `needs` chain as fhir-benchmark.yml:
+#       setup "Resolve backend matrix" -> build "Build HFS binary"
+#       -> benchmark "Benchmark (<backend>)" x6 -> compare "Compare legs"
+#   - the same 14 artifacts, re-published from run 39657850695 under the same names
+#     (download-artifact run-id + upload-artifact), each in the job that produces it in
+#     the real workflow; report.html is a 15th, additional artifact;
+#   - one summary box per leg and the Compare legs box: the original CI text, unchanged,
+#     followed by one trailing "### Charts" section of collapsed Mermaid charts.
+# Tuning-block cells the original reads live from its own containers are read live here
+# too, by running the repo's own scripts unchanged (see the Start ephemeral steps).
 #
 # Files (copy v4/tmp-summary-test/ to .github/tmp-summary-test/):
 #   .github/tmp-summary-test/layout                  one word: stacked | sidebyside
-#   .github/tmp-summary-test/<layout>/leg-<leg>.md   one per leg
+#   .github/tmp-summary-test/<layout>/leg-<leg>.md   one per leg (live cells as @@NAME@@)
 #   .github/tmp-summary-test/<layout>/compare.md
 #   .github/tmp-summary-test/report.html             the full HTML report
-# Only compare.md differs between the two layouts (the cross-leg chart grid).
 name: CI summary mermaid test
 
 on:
   push:
     branches: [tmp/ci-summary-mermaid-test]
 
+# actions: read lets download-artifact read artifacts of another run of this repository.
 permissions:
   contents: read
+  actions: read
+
+env:
+  # The run whose page this test reproduces. Its artifacts are re-published under their
+  # original names, which carry this id (fhir-benchmark.yml names them with github.run_id).
+  SRC_RUN_ID: '39657850695'
 
 jobs:
-  benchmark:
-    name: Benchmark (${{ matrix.leg }})
+  setup:
+    name: Resolve backend matrix
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        leg: [sqlite, postgres, mongodb, sqlite-elasticsearch, postgres-elasticsearch, mongodb-elasticsearch]
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      max_parallel: ${{ steps.matrix.outputs.max_parallel }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Write the job summary
+      # The real step runs resolve-matrix.sh on the dispatch inputs; this prints the values
+      # that run resolved (BENCH_MATRIX in the Compare legs log, max_parallel in the leg logs).
+      - name: Resolve matrix from backend input
+        id: matrix
+        run: |
+          set -euo pipefail
+          {
+            echo 'matrix={"include":[{"backend":"sqlite","port":8081},{"backend":"postgres","port":8082},{"backend":"mongodb","port":8083},{"backend":"sqlite-elasticsearch","port":8084},{"backend":"postgres-elasticsearch","port":8085},{"backend":"mongodb-elasticsearch","port":8086}]}'
+            echo 'max_parallel=1'
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build HFS binary
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # No compile: the binary run 39657850695 built is re-published as-is.
+      - name: Download the original binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-bench-binary-${{ env.SRC_RUN_ID }}
+          path: target/release
+          run-id: ${{ env.SRC_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-bench-binary-${{ env.SRC_RUN_ID }}
+          path: target/release/hfs
+          retention-days: 1
+
+  benchmark:
+    name: Benchmark (${{ matrix.backend }})
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.setup.outputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Checkout HFS
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # Same script, unchanged. Adaptations, all through env: (nothing in the repo is edited):
+      #   DOCKER_HOST_IP=127.0.0.1 and the container/volume/DB names, which the real job's
+      #   earlier steps ("Resolve Docker host and runner IP", "Configure backend env") write;
+      #   GITHUB_STEP_SUMMARY points at a scratch file, because the script's own table also
+      #   prints this runner's volume free space, which is not the original host's. Only the
+      #   cells mongod reports about itself are kept (start-mongodb.sh:152-153).
+      - name: Start ephemeral MongoDB (single-member replica set)
+        if: startsWith(matrix.backend, 'mongodb')
         env:
-          LEG: ${{ matrix.leg }}
+          BACKEND: ${{ matrix.backend }}
+          RUN_ID: ${{ github.run_id }}
+          IN_MONGO_WT_CACHE_GB: '2'
+          IN_HFS_MONGO_MAX_CONNECTIONS: '32'
+          MONGO_CONTAINER: hfs-bench-mongo-${{ matrix.backend }}-${{ github.run_id }}
+          MONGO_VOLUME: hfs-bench-mongo-${{ matrix.backend }}-${{ github.run_id }}
+          HFS_MONGODB_DATABASE: hfs_bench
+          DOCKER_HOST_IP: 127.0.0.1
+        run: |
+          set -euo pipefail
+          LIVE="$RUNNER_TEMP/mongo-tuning-live.md"
+          GITHUB_STEP_SUMMARY="$LIVE" bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/start-mongodb.sh"
+          WT_MAX_BYTES=$(sed -n 's/.*(mongod reports \([0-9?]*\) bytes).*/\1/p' "$LIVE")
+          # shellcheck disable=SC2016  # the backticks are literal Markdown in the pattern
+          TXN_LIFETIME=$(sed -n 's/^| transactionLifetimeLimitSeconds | `\([0-9?]*\)` |$/\1/p' "$LIVE")
+          echo "live: WT_MAX_BYTES=$WT_MAX_BYTES TXN_LIFETIME=$TXN_LIFETIME"
+          { echo "WT_MAX_BYTES=$WT_MAX_BYTES"; echo "TXN_LIFETIME=$TXN_LIFETIME"; } >> "$GITHUB_ENV"
+
+      # Same script, unchanged; its line 99 is the live query whose answer the original
+      # prints as "(reports <version>)":
+      #   curl -sf --max-time 30 "http://$DOCKER_HOST_IP:$ES_PORT/" | jq -r '.version.number'
+      # Same image (elasticsearch:8.15.0, set inside the script). Adaptations as for MongoDB,
+      # plus ES_HEAP_MB=512 (original 1024) so the runner copes; the heap cell is not taken
+      # from here. The original passes ES_HEAP_MB from needs.setup.outputs.es_heap_mb.
+      - name: Start ephemeral Elasticsearch
+        if: endsWith(matrix.backend, '-elasticsearch')
+        env:
+          BACKEND: ${{ matrix.backend }}
+          RUN_ID: ${{ github.run_id }}
+          ES_HEAP_MB: '512'
+          ES_CONTAINER: hfs-bench-es-${{ matrix.backend }}-${{ github.run_id }}
+          ES_VOLUME: hfs-bench-es-${{ matrix.backend }}-${{ github.run_id }}
+          DOCKER_HOST_IP: 127.0.0.1
+        run: |
+          set -euo pipefail
+          LIVE="$RUNNER_TEMP/es-tuning-live.md"
+          GITHUB_STEP_SUMMARY="$LIVE" bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/start-elasticsearch.sh"
+          # shellcheck disable=SC2016  # the backticks are literal Markdown in the pattern
+          ES_VERSION=$(sed -n 's/^| image | `[^`]*` (reports \(.*\)), single node |$/\1/p' "$LIVE")
+          echo "live: ES_VERSION=$ES_VERSION"
+          echo "ES_VERSION=$ES_VERSION" >> "$GITHUB_ENV"
+
+      - name: Download the original leg artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: fhir-benchmark-${{ matrix.backend }}-${{ env.SRC_RUN_ID }}
+          path: bench-results
+          run-id: ${{ env.SRC_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download the original server log
+        uses: actions/download-artifact@v8
+        with:
+          name: fhir-bench-server-log-${{ matrix.backend }}-${{ env.SRC_RUN_ID }}
+          path: server-log
+          run-id: ${{ env.SRC_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-benchmark-${{ matrix.backend }}-${{ env.SRC_RUN_ID }}
+          path: bench-results/
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-bench-server-log-${{ matrix.backend }}-${{ env.SRC_RUN_ID }}
+          path: server-log/hfs-bench-${{ matrix.backend }}.log
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Generate step summary
+        env:
+          LEG: ${{ matrix.backend }}
         run: |
           set -euo pipefail
           LAYOUT=$(tr -d '[:space:]' < .github/tmp-summary-test/layout)
           case "$LAYOUT" in stacked|sidebyside) ;; *) echo "::error::layout must be stacked or sidebyside, got '$LAYOUT'"; exit 1 ;; esac
           F=".github/tmp-summary-test/$LAYOUT/leg-$LEG.md"
-          cat "$F" >> "$GITHUB_STEP_SUMMARY"
-          echo "layout=$LAYOUT file=$F bytes=$(wc -c < "$F")"
+          OUT="$RUNNER_TEMP/box.md"
+          cp "$F" "$OUT"
+          # Fill each live cell with the value this job just read from its own container.
+          for V in ES_VERSION WT_MAX_BYTES TXN_LIFETIME; do
+            grep -q "@@$V@@" "$OUT" || continue
+            VAL="${!V:-}"
+            if ! [[ "$VAL" =~ ^[0-9A-Za-z.?-]+$ ]]; then
+              echo "::error::live value $V='$VAL' is missing or not a plain token"; exit 1
+            fi
+            sed -i "s/@@$V@@/$VAL/" "$OUT"
+          done
+          if grep -n '@@[A-Z_]*@@' "$OUT"; then echo "::error::unfilled placeholder in $F"; exit 1; fi
+          cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          echo "layout=$LAYOUT file=$F bytes=$(wc -c < "$OUT")"
 
   compare:
     name: Compare legs
-    needs: benchmark
+    needs: [setup, benchmark]
+    if: ${{ always() && needs.benchmark.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out benchmark scripts
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Download the original comparison
+        uses: actions/download-artifact@v8
+        with:
+          name: fhir-bench-comparison-${{ env.SRC_RUN_ID }}
+          path: .
+          run-id: ${{ env.SRC_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The one artifact the original does not have.
       - name: Upload the full HTML report without zipping
         id: up
         uses: actions/upload-artifact@v7
@@ -56,7 +229,8 @@ jobs:
           path: .github/tmp-summary-test/report.html
           archive: false
           retention-days: 1
-      - name: Write the job summary
+
+      - name: Write comparison summary
         env:
           ARTIFACT_URL: ${{ steps.up.outputs.artifact-url }}
         run: |
@@ -72,3 +246,13 @@ jobs:
             echo "[Full report (HTML)](${ARTIFACT_URL})"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "layout=$LAYOUT file=$F bytes=$(wc -c < "$F")"
+
+      - name: Upload comparison
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-bench-comparison-${{ env.SRC_RUN_ID }}
+          path: comparison.md
+          retention-days: 1
+          if-no-files-found: ignore

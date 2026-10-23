@@ -3,8 +3,8 @@
 | setting | value |
 |---|---|
 | image | `mongo:7.0` — single-member replica set `rs0`, directConnection |
-| --wiredTigerCacheSizeGB | `2` (mongod reports 2147483648 bytes) |
-| transactionLifetimeLimitSeconds | `900` |
+| --wiredTigerCacheSizeGB | `2` (mongod reports @@WT_MAX_BYTES@@ bytes) |
+| transactionLifetimeLimitSeconds | `@@TXN_LIFETIME@@` |
 | --oplogSize | `2048MB` |
 | HFS_MONGODB_MAX_CONNECTIONS | `32` |
 | HFS_MONGODB_DATABASE | `hfs_bench` |
@@ -13,7 +13,7 @@
 
 | setting | value |
 |---|---|
-| image | `elasticsearch:8.15.0` (reports 8.15.0), single node |
+| image | `elasticsearch:8.15.0` (reports @@ES_VERSION@@), single node |
 | JVM heap (-Xms = -Xmx) | `1024m` |
 | HFS_COMPOSITE_SYNC_MODE | `synchronous` |
 | HFS_ELASTICSEARCH_WRITE_REFRESH | `wait_for` |

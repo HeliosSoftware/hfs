@@ -15,7 +15,7 @@
 
 | setting | value |
 |---|---|
-| image | `elasticsearch:8.15.0` (reports 8.15.0), single node |
+| image | `elasticsearch:8.15.0` (reports @@ES_VERSION@@), single node |
 | JVM heap (-Xms = -Xmx) | `1024m` |
 | HFS_COMPOSITE_SYNC_MODE | `synchronous` |
 | HFS_ELASTICSEARCH_WRITE_REFRESH | `wait_for` |
