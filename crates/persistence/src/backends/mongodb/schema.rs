@@ -72,6 +72,7 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
     ensure_login_sessions_indexes(database).await?;
     ensure_tenants_indexes(database).await?;
     ensure_bulk_submit_indexes(database).await?;
+    ensure_missing_fingerprint_collection(database).await?;
     set_schema_version(database, SCHEMA_VERSION).await?;
     Ok(())
 }
@@ -88,6 +89,7 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
         ensure_login_sessions_indexes(database).await?;
         ensure_tenants_indexes(database).await?;
         ensure_bulk_submit_indexes(database).await?;
+        ensure_missing_fingerprint_collection(database).await?;
         set_schema_version(database, SCHEMA_VERSION).await?;
     }
     Ok(())
@@ -132,7 +134,9 @@ pub(crate) const RESOURCES_MISSING_INDEX: &str = "idx_resources_missing_params";
 /// cross-tenant `count_by_tenant` aggregate is a covered scan of it (#1910).
 /// Not hinted, so not in [`REQUIRED_QUERY_INDEXES`].
 pub(crate) const RESOURCES_LIVE_TENANT_INDEX: &str = "idx_resources_live_tenant";
-pub(crate) const RESOURCES_MISSING_FP_INDEX: &str = "idx_resources_missing_fp";
+/// Partial `missing_params_fp` index serving the #1999 staleness probe.
+/// Built post-boot with `idx_resources_missing_params`, by the same builder.
+pub(crate) const RESOURCES_MISSING_FP_INDEX: &str = "idx_resources_missing_params_fp";
 
 /// The indexes that queries name in `.hint(...)`, by collection. A hinted
 /// query fails when its index is missing, so readiness requires all of them.
@@ -159,9 +163,10 @@ const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
 /// built, or hidden. Startup creates these indexes; this catches one dropped,
 /// rebuilt or hidden (or lost in a restore) while the server runs.
 ///
-/// `missing_index_ready` adds [`RESOURCES_MISSING_INDEX`]: before its post-boot
-/// build completes no query hints it, so a node serves (and is ready) while it
-/// builds; afterwards losing it would fail `:missing=true` searches (#2001).
+/// `missing_index_ready` adds [`RESOURCES_MISSING_INDEX`] and
+/// [`RESOURCES_MISSING_FP_INDEX`]: before their post-boot build completes no
+/// query hints them, so a node serves (and is ready) while it builds;
+/// afterwards losing one would fail `:missing=true` searches (#2001, #1999).
 pub(super) async fn check_required_query_indexes(
     database: &Database,
     missing_index_ready: bool,
@@ -183,6 +188,7 @@ pub(super) async fn check_required_query_indexes(
         let mut required = required.to_vec();
         if missing_index_ready && collection == "resources" {
             required.push(RESOURCES_MISSING_INDEX);
+            required.push(RESOURCES_MISSING_FP_INDEX);
         }
         if let Some(problem) = first_unusable_index(collection, &required, &listed) {
             return Err(unavailable(problem));
@@ -221,9 +227,10 @@ fn unavailable(message: String) -> BackendError {
 async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     let resources = database.collection::<Document>("resources");
 
-    // `idx_resources_missing_params` is not created here: it is a full
-    // `resources` scan on an existing deployment, so `MissingIndexBuilder`
-    // builds it after boot under `HFS_MONGODB_INDEX_BUILD` (#2001).
+    // `idx_resources_missing_params` and `idx_resources_missing_params_fp`
+    // are not created here: each is a full `resources` scan on an existing
+    // deployment, so `MissingIndexBuilder` builds them after boot under
+    // `HFS_MONGODB_INDEX_BUILD` (#2001, #1999).
 
     create_index(
         &resources,
@@ -303,19 +310,6 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     )
     .await?;
 
-    create_index(
-        &resources,
-        doc! {
-            "tenant_id": 1_i32,
-            "resource_type": 1_i32,
-            "is_deleted": 1_i32,
-            "missing_params_fp": 1_i32,
-        },
-        RESOURCES_MISSING_FP_INDEX,
-        false,
-    )
-    .await?;
-
     Ok(())
 }
 
@@ -361,6 +355,29 @@ fn is_missing_index_error(error: &mongodb::error::Error) -> bool {
     }
     let message = error.to_string();
     message.contains("index not found") || message.contains("ns not found")
+}
+
+/// Creates `missing_params_fingerprints` (#1999) up front. Its first record
+/// is written in the background beside live traffic, and an implicit
+/// collection creation there would abort the transactions open at that
+/// moment with a catalog-change conflict.
+async fn ensure_missing_fingerprint_collection(database: &Database) -> StorageResult<()> {
+    const NAMESPACE_EXISTS: i32 = 48;
+    match database
+        .create_collection(super::missing_fingerprint::FINGERPRINT_COLLECTION)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind.as_ref(),
+                mongodb::error::ErrorKind::Command(command) if command.code == NAMESPACE_EXISTS
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {

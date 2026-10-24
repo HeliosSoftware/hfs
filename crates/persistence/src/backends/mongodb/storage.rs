@@ -3595,7 +3595,7 @@ impl MongoBackend {
         }
         let missing_fp = missing_params
             .is_some()
-            .then(|| extractor.missing_fingerprint(resource_type));
+            .then(|| self.stamp_missing_fingerprint(tenant_id, resource_type));
 
         // Also index any contained resources for `_contained` search, into
         // their own collection (`search_index_contained`) rather than mixed

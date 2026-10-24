@@ -527,11 +527,7 @@ impl MongoBackend {
                     resource_type,
                     &id,
                     Some(&[]),
-                    Some(
-                        &self
-                            .tenant_extractor(tenant_id)
-                            .missing_fingerprint(resource_type),
-                    ),
+                    Some(&self.stamp_missing_fingerprint(tenant_id, resource_type)),
                 ));
             }
             marked.push(id);

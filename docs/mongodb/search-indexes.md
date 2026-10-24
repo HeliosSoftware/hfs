@@ -100,10 +100,8 @@ the resource is rewritten or reindexed. This metadata describes top-level
 resources; it does not add contained `:missing` support.
 
 Next to the array, `missing_params_fp` stamps the definition fingerprint it
-was computed from, and the scalar `idx_resources_missing_fp` index
-(`{ tenant_id: 1, resource_type: 1, is_deleted: 1, missing_params_fp: 1 }`,
-created at startup, never hinted) serves the per-search staleness probe — see
-"Definition changes" below.
+was computed from, and the `idx_resources_missing_params_fp` index serves the
+per-search staleness probe — see "Definition changes" below.
 
 The shared `idx_resources_missing_params` multikey index has this key order:
 
@@ -112,10 +110,18 @@ The shared `idx_resources_missing_params` multikey index has this key order:
   missing_params: 1, last_updated: 1, id: 1 }
 ```
 
-On an existing deployment its first build scans every `resources` document
-(about 10.5 GB at 12M resources), so HFS builds it after boot under
-`HFS_MONGODB_INDEX_BUILD`, in its own task beside the `search_index` builder
-(#2001):
+The probe's index is scalar and partial, holding only documents that carry
+the array:
+
+```javascript
+{ tenant_id: 1, resource_type: 1, is_deleted: 1, missing_params_fp: 1 }
+// partialFilterExpression: { missing_params: { $exists: true } }
+```
+
+On an existing deployment the first build of either index scans every
+`resources` document (about 10.5 GB at 12M resources), so HFS builds both
+after boot under `HFS_MONGODB_INDEX_BUILD`, in their own task beside the
+`search_index` builder (#2001):
 
 | value | behaviour |
 |---|---|
@@ -132,9 +138,14 @@ db.resources.createIndex(
     missing_params: 1, last_updated: 1, id: 1 },
   { name: "idx_resources_missing_params" }
 );
+db.resources.createIndex(
+  { tenant_id: 1, resource_type: 1, is_deleted: 1, missing_params_fp: 1 },
+  { name: "idx_resources_missing_params_fp",
+    partialFilterExpression: { missing_params: { $exists: true } } }
+);
 ```
 
-Until the builder has seen the index built and visible, every
+Until the builder has seen both indexes built and visible, every
 `:missing=true` and `:missing=false` search uses the value-index route that
 unsupported parameters use, and never names the index in a hint. Results are
 the same on both routes; only the plan differs. HFS checks once per boot: an
@@ -207,27 +218,47 @@ time is included in the insert timing statistic.
 
 Every writer stamps `missing_params_fp` next to `missing_params`: a
 deterministic fingerprint of the tenant's active definitions for the resource
-type (and its abstract bases) at write time. Before each `:missing=true`
-search the server probes for any live resource of the tenant and type whose
-stamp exists and differs from the current registry's fingerprint — one bounded
-seek of `idx_resources_missing_fp`. When one exists, the metadata route is
-off for that search and the value-index route answers, so creating, changing
-or retiring a SearchParameter gives correct results immediately, on every
-node, with no manual steps: a node still holding the older registry stamps
-its writes with the older fingerprint, which the other nodes distrust.
+type (and its abstract bases) at write time. The first time a process stamps
+a fingerprint it records, in the `missing_params_fingerprints` collection,
+one digest per parameter code under that fingerprint. The collection holds
+one small document per distinct set of definitions and is never rewritten.
+
+Before each `:missing=true` search or count the server probes
+`idx_resources_missing_params_fp` for the live resources of the tenant and
+type whose array is unstamped or whose stamp differs from the current
+registry's fingerprint. The probe reads one key when it finds an unstamped
+array and otherwise one key per distinct stale stamp, never one per resource.
+Then, per parameter:
+
+- no stale or unstamped array: the metadata route answers;
+- only stamps whose recorded digest for this parameter equals the current
+  one: the metadata route answers — those arrays were computed from the same
+  definition, so an unrelated SearchParameter change leaves the parameter on
+  its fast path;
+- otherwise (a new or changed parameter, a stamp missing from the catalog,
+  any unstamped array, more than 32 stale stamps, or a failed probe): the
+  value-index route answers.
+
+Creating, changing or retiring a SearchParameter therefore gives correct
+results immediately, on every node, with no manual steps: a node still
+holding the older registry stamps its writes with the older fingerprint,
+which the other nodes compare parameter by parameter. A search path that did
+not probe, or a definition change since the probe, takes the value-index
+route.
 
 The stamp cannot repair value-index rows: after changing an existing
 definition's *expression*, resources written under the old expression answer
 from their old rows (exactly as ordinary value searches do) until a
 `POST /$reindex` of the affected types rewrites them. `$reindex` also
-restamps the metadata, which restores the metadata fast path; until then
-every `:missing=true` on an affected type pays the value-index route.
+restamps the metadata, which restores the metadata route for the new or
+changed parameter; until then `:missing=true` on that parameter pays the
+value-index route, which is about the cost it had before #1984.
 
-Resources written before the stamp existed carry `missing_params` without
-`missing_params_fp` and remain trusted, preserving their pre-upgrade behavior
-and cost. Stale-definition detection covers them once a write or `$reindex`
-stamps them, so run one `$reindex` after upgrading to bring the whole corpus
-under detection.
+Resources written before the stamp existed (or by a node that predates it)
+carry `missing_params` without `missing_params_fp`. The probe finds them in
+one key and every `:missing=true` on the type takes the value-index route, so
+results are correct after an upgrade without any manual step. Run one
+`$reindex` after upgrading to stamp them and restore the metadata route.
 
 Recovery, when metadata is suspected wrong despite the stamp (a restore from
 backup, a manual edit): `$unset` both fields together for the affected tenant

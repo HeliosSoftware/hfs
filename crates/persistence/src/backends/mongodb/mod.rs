@@ -24,6 +24,7 @@ mod bulk_submit;
 mod composite_search;
 mod deferred_index;
 mod login_sessions;
+mod missing_fingerprint;
 mod missing_index_builder;
 mod probe_cache;
 mod reindex_pipeline;

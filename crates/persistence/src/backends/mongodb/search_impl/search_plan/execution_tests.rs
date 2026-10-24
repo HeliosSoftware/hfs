@@ -161,6 +161,28 @@ struct Row {
     deleted: bool,
 }
 
+/// Stamps the raw `missing_params` arrays a test wrote with the current
+/// fingerprint and runs the staleness probe, as a writer and `search()` do
+/// (#1999); planning entry points called directly do not probe.
+async fn trust_missing_metadata(backend: &MongoBackend, db: &mongodb::Database) {
+    let stamp = backend.stamp_missing_fingerprint(PLAN_TENANT, "Observation");
+    db.collection::<Document>("resources")
+        .update_many(
+            doc! { "tenant_id": PLAN_TENANT, "missing_params": { "$exists": true } },
+            doc! { "$set": { "missing_params_fp": stamp } },
+        )
+        .await
+        .unwrap();
+    let mut absent = parameter("method", "true");
+    absent.modifier = Some(SearchModifier::Missing);
+    backend
+        .refresh_missing_metadata_freshness(
+            PLAN_TENANT,
+            &SearchQuery::new("Observation").with_parameter(absent),
+        )
+        .await;
+}
+
 struct Fixture {
     backend: MongoBackend,
     db: mongodb::Database,
@@ -2188,6 +2210,14 @@ async fn missing_metadata_selection_preserves_other_candidate_routes() {
 
     let mut absent = parameter("method", "true");
     absent.modifier = Some(SearchModifier::Missing);
+    // The metadata route needs a staleness probe first (#1999).
+    fixture
+        .backend
+        .refresh_missing_metadata_freshness(
+            PLAN_TENANT,
+            &SearchQuery::new("Observation").with_parameter(absent.clone()),
+        )
+        .await;
     assert!(
         fixture
             .backend

@@ -132,8 +132,20 @@ pub struct MongoBackend {
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
     reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
-    pub(super) missing_meta_fresh:
-        parking_lot::RwLock<std::collections::HashMap<(String, String), (String, bool)>>,
+    /// Per `(tenant, type)`: the fingerprint the last `:missing=true` probe
+    /// ran under and which parameters it found fresh (#1999).
+    pub(super) missing_meta_fresh: parking_lot::RwLock<
+        std::collections::HashMap<
+            (String, String),
+            (String, super::missing_fingerprint::MissingFreshness),
+        >,
+    >,
+    /// Fingerprints this process has recorded (or is recording) in
+    /// `missing_params_fingerprints`.
+    pub(super) recorded_missing_fps: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// The runtime fingerprint records are spawned on, for stamps computed
+    /// off-runtime on the `$reindex` rayon pool.
+    pub(super) missing_fp_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 impl Debug for MongoBackend {
@@ -982,6 +994,8 @@ impl MongoBackend {
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
             missing_meta_fresh: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            recorded_missing_fps: Arc::default(),
+            missing_fp_runtime: std::sync::OnceLock::new(),
         })
     }
 
