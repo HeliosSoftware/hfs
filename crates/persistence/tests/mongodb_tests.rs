@@ -9381,8 +9381,8 @@ async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
     // so an *unhinted* IXSCAN on the date population also satisfies
     // `planSummary.contains("resource_id: 1")` — this pinned nothing, and
     // would have passed on origin/main's own (unfixed) driver-cursor plan for
-    // this same query too. Pin the literal `hint` field on an actual `find`
-    // command instead, which only a seeded check ever sets.
+    // this same query too. Pin the literal hint on the bounded membership
+    // aggregate instead of inferring access from a plan-summary field name.
     let profile: Collection<Document> = database.collection("system.profile");
     let mut cursor = profile
         .find(doc! { "ns": format!("{db_name}.search_index") })
@@ -9405,7 +9405,7 @@ async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
             total_keys_examined += k;
         }
         if let Ok(command) = entry.get_document("command")
-            && command.contains_key("find")
+            && command.get_str("aggregate") == Ok("search_index")
             && command.get_str("hint") == Ok("idx_search_composite")
         {
             saw_composite_hint = true;
@@ -9413,7 +9413,7 @@ async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
     }
     assert!(
         saw_composite_hint,
-        "expected at least one `find` on search_index hinted onto idx_search_composite, \
+        "expected a membership aggregate on search_index hinted onto idx_search_composite, \
          proving a seeded check ran"
     );
     assert!(
@@ -9730,11 +9730,8 @@ async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
 
     let _ = database.run_command(doc! { "profile": 0_i32 }).await;
 
-    // The sibling `status` check is an unhinted `distinct` bounded to
-    // `resource_id: {"$in": [...]}` (the driver is `code`, so `hint: false`
-    // here — see `retain_matching_candidates`'s doc comment). Its `$in` must
-    // carry only the (up to 3) seed-intersected candidates, not the 303 the
-    // `code` driver cursor actually read.
+    // The sibling status aggregation must carry only the seed-intersected
+    // candidates (at most 3), not the 303 IDs returned by the code driver.
     fn find_resource_id_in_len(doc: &Document) -> Option<usize> {
         if let Ok(sub) = doc.get_document("resource_id")
             && let Ok(arr) = sub.get_array("$in")
@@ -9767,7 +9764,7 @@ async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
     let mut cursor = profile
         .find(doc! {
             "ns": format!("{db_name}.search_index"),
-            "command.distinct": "search_index",
+            "command.aggregate": "search_index",
         })
         .await
         .expect("failed to query system.profile");
@@ -9788,7 +9785,7 @@ async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
         }
     }
     let smallest_in_len = smallest_in_len
-        .expect("expected a `distinct` command on search_index checking `resource_id: $in`");
+        .expect("expected an aggregate command on search_index checking `resource_id: $in`");
     assert!(
         smallest_in_len <= 3,
         "resource_id $in had {smallest_in_len} entries — the sibling `status` check must only \

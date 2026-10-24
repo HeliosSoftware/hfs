@@ -1302,6 +1302,14 @@ impl PostgresSearchIndexWriter {
             return Ok(());
         }
 
+        for row in rows.iter().filter(|r| r.last_updated.is_none()) {
+            crate::backends::postgres::null_timestamp_facts::note_null_rows(
+                tenant_id,
+                resource_type,
+                &row.param_name,
+            );
+        }
+
         // One choke point for the de-duplication: every row this backend writes
         // for a single resource passes through here. See [`dedup_rows`].
         let kept = dedup_rows(rows.iter().map(|row| (resource_type, resource_id, row)));
@@ -1370,6 +1378,13 @@ impl PostgresSearchIndexWriter {
         let mut flat: Vec<(&str, &str, &IndexRow)> = Vec::with_capacity(total);
         for (resource_type, resource_id, rows) in batches {
             for row in rows.iter() {
+                if row.last_updated.is_none() {
+                    crate::backends::postgres::null_timestamp_facts::note_null_rows(
+                        tenant_id,
+                        resource_type,
+                        &row.param_name,
+                    );
+                }
                 flat.push((resource_type, resource_id, row));
             }
         }

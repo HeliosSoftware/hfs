@@ -498,6 +498,7 @@ async fn lookup_concept_status<B: TerminologyBackend>(
     code: &str,
 ) -> Option<String> {
     let req = crate::types::LookupRequest {
+        selected_code_system_id: None,
         system: system.to_string(),
         code: code.to_string(),
         version: None,
@@ -2310,6 +2311,7 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
         )
         .await;
         let req = ValidateCodeRequest {
+            selected_value_set_id: None,
             url: None,
             value_set_version: None,
             system: Some(system.clone()),
@@ -2392,6 +2394,7 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
         let supplements =
             resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
         let req = ValidateCodeRequest {
+            selected_value_set_id: None,
             url: None,
             value_set_version: None,
             system: Some(system.clone()),
@@ -2483,6 +2486,7 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
             )
             .await;
             let req = ValidateCodeRequest {
+                selected_value_set_id: None,
                 url: None,
                 value_set_version: None,
                 system: Some(system.clone()),
@@ -2785,6 +2789,7 @@ async fn suppress_forced_version_mismatch<B: TerminologyBackend>(
         // reflects the canonical display for the forced version, not the
         // expansion's chosen version.
         let cs_req = ValidateCodeRequest {
+            selected_value_set_id: None,
             url: None,
             value_set_version: None,
             system: Some(system_url.to_string()),
@@ -2842,6 +2847,7 @@ async fn suppress_default_versionless_mismatch<B: TerminologyBackend>(
         resp.cs_version = Some(default_version.to_string());
         resp.caused_by_unknown_system = None;
         let cs_req = ValidateCodeRequest {
+            selected_value_set_id: None,
             url: None,
             value_set_version: None,
             system: Some(system_url.to_string()),
@@ -2935,6 +2941,7 @@ async fn transform_default_versionless_mismatch_to_changed<B: TerminologyBackend
     // the response's cs_version + re-resolve the display at that version.
     resp.cs_version = Some(default_version.to_string());
     let cs_req = ValidateCodeRequest {
+        selected_value_set_id: None,
         url: None,
         value_set_version: None,
         system: Some(system_url.to_string()),
@@ -3002,6 +3009,7 @@ async fn apply_default_to_unknown_version_echo<B: TerminologyBackend>(
     }
     resp.cs_version = Some(default_version.to_string());
     let cs_req = ValidateCodeRequest {
+        selected_value_set_id: None,
         url: None,
         value_set_version: None,
         system: Some(system_url.to_string()),
@@ -3480,14 +3488,31 @@ async fn detect_bad_vs_import_inline<B: TerminologyBackend>(
     None
 }
 
+/// Reuse the selected instance for metadata checks as well as membership.
+/// Canonical searches keep their existing version ordering and pagination.
+async fn search_validation_value_set<B: TerminologyBackend>(
+    instance: Option<&Value>,
+    backend: &B,
+    ctx: &TenantContext,
+    query: crate::types::ResourceSearchQuery,
+) -> Result<Vec<Value>, HtsError> {
+    if let Some(resource) = instance {
+        Ok(vec![resource.clone()])
+    } else {
+        ValueSetOperations::search(backend, ctx, query).await
+    }
+}
+
 async fn detect_bad_vs_import<B: TerminologyBackend>(
     backend: &B,
     ctx: &TenantContext,
     vs_url: &str,
     vs_version: Option<&str>,
+    instance: Option<&Value>,
     default_vs_versions: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let mut hits = ValueSetOperations::search(
+    let mut hits = search_validation_value_set(
+        instance,
         backend,
         ctx,
         crate::types::ResourceSearchQuery {
@@ -3568,8 +3593,10 @@ async fn enforce_vs_supplement_extensions<B: TerminologyBackend>(
     ctx: &TenantContext,
     vs_url: &str,
     vs_version: Option<&str>,
+    instance: Option<&Value>,
 ) -> Result<Vec<SupplementInfo>, HtsError> {
-    let mut hits = match ValueSetOperations::search(
+    let mut hits = match search_validation_value_set(
+        instance,
         backend,
         ctx,
         crate::types::ResourceSearchQuery {
@@ -3714,6 +3741,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
     if let Some(ref url) = mimetypes_url {
         for (in_system, in_code, in_display, path) in &coding_attempts {
             let req = ValidateCodeRequest {
+                selected_value_set_id: None,
                 url: Some(url.clone()),
                 value_set_version: vs_resource
                     .get("version")
@@ -3758,6 +3786,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
         // code (matching first-wins coding selection).
         if let Some((_, in_code, in_display, path)) = coding_attempts.first() {
             let req = ValidateCodeRequest {
+                selected_value_set_id: None,
                 url: Some(url.clone()),
                 value_set_version: vs_resource
                     .get("version")
@@ -3809,6 +3838,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
     let expand_req = crate::types::ExpandRequest {
         url: None,
         value_set_version: None,
+        selected_value_set_id: None,
         value_set: Some(vs_resource.clone()),
         filter: None,
         count: None,
@@ -3847,6 +3877,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
             // for the membership echo, but the CS path also computes
             // `cs_version` and triggers display-mismatch detection.
             let cs_req = ValidateCodeRequest {
+                selected_value_set_id: None,
                 url: None,
                 value_set_version: None,
                 system: Some(concept.system.clone()),
@@ -4004,6 +4035,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
     let mut canonical_display: Option<String> = None;
     if let (Some(sys), Some(disp)) = (resolved_system.as_deref(), in_display.as_deref()) {
         let cs_req = ValidateCodeRequest {
+            selected_value_set_id: None,
             url: None,
             value_set_version: None,
             system: Some(sys.to_string()),
@@ -4098,6 +4130,14 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    process_vs_validate_code_selected(state, params, None).await
+}
+
+async fn process_vs_validate_code_selected<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+    instance: Option<&Value>,
+) -> Result<Value, HtsError> {
     // ── Handler-level response cache (VS path) ───────────────────────────────
     // The VS validate-code handler is dominated by pre-call helpers that hit
     // the DB even when no work is needed:
@@ -4106,7 +4146,13 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     //   * `resolve_supplements` / `supplement_url_in_coding_error`
     // A warm hit here returns the previously-built JSON response directly,
     // skipping all of those.  Cleared on every bundle import / CRUD write.
-    let cache_key = build_validate_code_cache_key(&params);
+    let cache_key = build_validate_code_cache_key(&params).map(|key| {
+        serde_json::to_string(&(
+            instance.and_then(|resource| resource.get("id").and_then(Value::as_str)),
+            key,
+        ))
+        .expect("validation cache key contains only strings")
+    });
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.vs_validate_code_handler_cache, key) {
             // Field exprs evaluated only when the probe target is enabled.
@@ -4128,7 +4174,7 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
             .as_ref()
             .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
     );
-    let result = process_vs_validate_code_inner(state, params).await;
+    let result = process_vs_validate_code_inner(state, params, instance).await;
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.vs_validate_code_handler_cache,
@@ -4196,6 +4242,7 @@ fn unresolved_import_response(params: &[Value], unresolved_vs_url: &str) -> Valu
 async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
+    instance: Option<&Value>,
 ) -> Result<Value, HtsError> {
     // ValueSet/$validate-code accepts either `url` (canonical URL of a stored
     // ValueSet) or `valueSet` (an inline ValueSet resource). The IG
@@ -4209,11 +4256,18 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     //
     // A VCL implicit-ValueSet `url` is rewritten to that inline form here
     // (after the handler cache key, which uses the original VCL URL).
-    let is_vcl = find_str_param(&params, "url").is_some_and(|u| crate::vcl::is_vcl_url(&u));
-    let mut params = crate::vcl::rewrite_vcl_params(params)?;
+    let is_vcl = instance.is_none()
+        && find_str_param(&params, "url").is_some_and(|u| crate::vcl::is_vcl_url(&u));
+    let mut params = if instance.is_some() {
+        params
+    } else {
+        crate::vcl::rewrite_vcl_params(params)?
+    };
     // `url=X|V` resolves as `url=X` + `valueSetVersion=V` (#2119). Done after
     // the VCL rewrite, whose URLs may themselves contain `|`.
-    split_versioned_canonical(&mut params, "url", "valueSetVersion");
+    if instance.is_none() {
+        split_versioned_canonical(&mut params, "url", "valueSetVersion");
+    }
     if find_str_param(&params, "url").is_none() {
         if let Some(vs_resource) = find_resource_param(&params, "valueSet") {
             if is_vcl {
@@ -4264,7 +4318,8 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         let want_ver = pipe_ver
             .clone()
             .or_else(|| find_str_param(&params, "valueSetVersion"));
-        let backend_has_vs = ValueSetOperations::search(
+        let backend_has_vs = search_validation_value_set(
+            instance,
             state.backend(),
             &ctx,
             crate::types::ResourceSearchQuery {
@@ -4347,9 +4402,10 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // Skip the lookup for synthesised `?fhir_vs` URLs — those are computed
     // implicit ValueSets that never carry a stored row, so the search would
     // always return empty (iter6 VC03 fast path).
-    let url_is_implicit_fhir_vs = is_implicit_fhir_vs_url(&url);
+    let url_is_implicit_fhir_vs = instance.is_none() && is_implicit_fhir_vs_url(&url);
     if display_language.is_none() && !url_is_implicit_fhir_vs {
-        let vs_for_lang = ValueSetOperations::search(
+        let vs_for_lang = search_validation_value_set(
+            instance,
             state.backend(),
             &ctx,
             crate::types::ResourceSearchQuery {
@@ -4398,9 +4454,14 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // is a no-op for them — skip the search round-trip entirely (iter6
     // VC03 fast path).
     if !url_is_implicit_fhir_vs {
-        let vs_ext_supplements =
-            enforce_vs_supplement_extensions(state.backend(), &ctx, &url, vs_version.as_deref())
-                .await?;
+        let vs_ext_supplements = enforce_vs_supplement_extensions(
+            state.backend(),
+            &ctx,
+            &url,
+            vs_version.as_deref(),
+            instance,
+        )
+        .await?;
         for s in vs_ext_supplements {
             if !supplements
                 .iter()
@@ -4421,19 +4482,21 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // Synthesised `?fhir_vs` URLs have no stored compose at all (they're
     // built from the CodeSystem at validate time), so `detect_bad_vs_import`
     // is a no-op for them — skip the search (iter6 VC03 fast path).
-    let bad_vs_import: Option<String> =
-        if url_is_implicit_fhir_vs || crate::bcp13::is_mimetypes_valueset_url(&url) {
-            None
-        } else {
-            detect_bad_vs_import(
-                state.backend(),
-                &ctx,
-                &url,
-                vs_version.as_deref(),
-                &default_value_set_versions_early,
-            )
-            .await
-        };
+    let bad_vs_import: Option<String> = if instance.is_none()
+        && (url_is_implicit_fhir_vs || crate::bcp13::is_mimetypes_valueset_url(&url))
+    {
+        None
+    } else {
+        detect_bad_vs_import(
+            state.backend(),
+            &ctx,
+            &url,
+            vs_version.as_deref(),
+            instance,
+            &default_value_set_versions_early,
+        )
+        .await
+    };
     if let Some(unresolved_vs_url) = bad_vs_import {
         let cc_value = params
             .iter()
@@ -4513,18 +4576,21 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // Promote a default-valueset-version pin matching the request's `url` to
     // an effective `valueSetVersion` so the backend resolves the correct
     // (url, version) row up front.
-    let effective_vs_version: Option<String> = vs_version.clone().or_else(|| {
-        default_value_set_versions
-            .get(url.as_str())
-            .map(|s| s.to_owned())
-    });
+    let effective_vs_version = if instance.is_some() {
+        vs_version.clone()
+    } else {
+        vs_version
+            .clone()
+            .or_else(|| default_value_set_versions.get(url.as_str()).cloned())
+    };
 
     // Look up the source ValueSet once so we can ask whether a given system
     // is pinned in any include (drives the "default applies only if VS
     // doesn't pin" rule). Only worth doing when there are version-pin
     // parameters to apply.
     let source_vs: Option<Value> = if !force_pins.is_empty() || !effective_defaults.is_empty() {
-        ValueSetOperations::search(
+        search_validation_value_set(
+            instance,
             state.backend(),
             &ctx,
             crate::types::ResourceSearchQuery {
@@ -4641,6 +4707,9 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             original_version.clone()
         };
         let req = ValidateCodeRequest {
+            selected_value_set_id: instance
+                .and_then(|resource| resource.get("id").and_then(Value::as_str))
+                .map(str::to_owned),
             url: Some(url.clone()),
             value_set_version: effective_vs_version.clone(),
             system: system.clone(),
@@ -4829,7 +4898,8 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         } else if url_is_implicit_fhir_vs {
             None
         } else {
-            ValueSetOperations::search(
+            search_validation_value_set(
+                instance,
                 state.backend(),
                 &ctx,
                 crate::types::ResourceSearchQuery {
@@ -4910,7 +4980,8 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             // "Coding has no system. A code with no system has no defined
             // meaning..." text. Result is false because of the error issue.
             // Need vs_version to format the not-in-vs URL with `|version`.
-            let vs_version_owned = crate::traits::ValueSetOperations::search(
+            let vs_version_owned = search_validation_value_set(
+                instance,
                 state.backend(),
                 &ctx,
                 crate::types::ResourceSearchQuery {
@@ -5000,6 +5071,9 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         )
         .await;
         let req = ValidateCodeRequest {
+            selected_value_set_id: instance
+                .and_then(|resource| resource.get("id").and_then(Value::as_str))
+                .map(str::to_owned),
             url: Some(url.clone()),
             value_set_version: effective_vs_version.clone(),
             system: Some(system.clone()),
@@ -5174,7 +5248,8 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         } else if url_is_implicit_fhir_vs {
             None
         } else {
-            ValueSetOperations::search(
+            search_validation_value_set(
+                instance,
                 state.backend(),
                 &ctx,
                 crate::types::ResourceSearchQuery {
@@ -5335,6 +5410,9 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                 .get(&(system.clone(), code.clone()))
                 .cloned();
             let req = ValidateCodeRequest {
+                selected_value_set_id: instance
+                    .and_then(|resource| resource.get("id").and_then(Value::as_str))
+                    .map(str::to_owned),
                 url: Some(url.clone()),
                 value_set_version: effective_vs_version.clone(),
                 system: Some(system.clone()),
@@ -5516,7 +5594,8 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     .copied()
                     .unwrap_or(0);
                 let mut accumulated_issues: Vec<ValidationIssue> = Vec::new();
-                let vs_version_owned = crate::traits::ValueSetOperations::search(
+                let vs_version_owned = search_validation_value_set(
+                    instance,
                     state.backend(),
                     &ctx,
                     crate::types::ResourceSearchQuery {
@@ -5559,6 +5638,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         .flatten();
                     // Per-coding lookup: does the code exist in the CS at all?
                     let req = ValidateCodeRequest {
+                        selected_value_set_id: None,
                         url: None,
                         value_set_version: None,
                         system: Some(other_system.clone()),
@@ -5793,7 +5873,8 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         //      the CodeSystem 'sys' version 'Y'" when the code isn't in CS
         //   3. per-coding info code-invalid/this-code-not-in-vs "The provided
         //      code 'sys#code ('Display')' was not found in the value set ..."
-        let vs_version_owned = crate::traits::ValueSetOperations::search(
+        let vs_version_owned = search_validation_value_set(
+            instance,
             state.backend(),
             &ctx,
             crate::types::ResourceSearchQuery {
@@ -5865,6 +5946,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             // Per-coding lookup: does the code exist in the CS at all?
             let code_in_cs = if cs_exists {
                 let req = ValidateCodeRequest {
+                    selected_value_set_id: None,
                     url: None,
                     value_set_version: None,
                     system: Some(system.clone()),
@@ -6193,17 +6275,31 @@ pub async fn get_vs_validate_code_handler<B: TerminologyBackend>(
 
 // ── Instance-level: /ValueSet/{id}/$validate-code ─────────────────────────────
 
-/// Inject (or replace) the `url` parameter in a params list.
-fn inject_url(mut params: Vec<Value>, url: String) -> Vec<Value> {
-    params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("url"));
-    let mut with_url = vec![json!({"name": "url", "valueUri": url})];
-    with_url.append(&mut params);
-    with_url
+/// The route-selected resource takes precedence over request selectors.
+fn instance_validate_params(
+    mut params: Vec<Value>,
+    resource: &Value,
+) -> Result<Vec<Value>, HtsError> {
+    let url = resource
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HtsError::InvalidRequest("Stored ValueSet has no canonical URL".into()))?;
+    params.retain(|p| {
+        !matches!(
+            p.get("name").and_then(Value::as_str),
+            Some("url" | "valueSetVersion" | "valueSet")
+        )
+    });
+    params.push(json!({"name": "url", "valueUri": url}));
+    if let Some(version) = resource.get("version").and_then(Value::as_str) {
+        params.push(json!({"name": "valueSetVersion", "valueString": version}));
+    }
+    Ok(params)
 }
 
 /// POST /ValueSet/{id}/$validate-code
 ///
-/// Resolves the ValueSet canonical URL from its FHIR `id`, then delegates to
+/// Resolves the exact stored ValueSet from its FHIR `id`, then delegates to
 /// the same validate-code logic used by the system-level endpoint.
 pub async fn vs_validate_by_id_post<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
@@ -6214,18 +6310,18 @@ pub async fn vs_validate_by_id_post<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let url = state
+    let instance = state
         .backend()
-        .resource_url_by_id("ValueSet", &id)
+        .resource_by_id("ValueSet", &id)?
         .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
 
     let raw_params = body
         .and_then(|Json(v)| extract_parameter_array(&v).ok())
         .unwrap_or_default();
-    let mut params = inject_url(raw_params, url);
+    let mut params = instance_validate_params(raw_params, &instance)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, params).await?,
+        process_vs_validate_code_selected(&state, params, Some(&instance)).await?,
         format,
     ))
 }
@@ -6239,17 +6335,17 @@ pub async fn get_vs_validate_by_id<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let url = state
+    let instance = state
         .backend()
-        .resource_url_by_id("ValueSet", &id)
+        .resource_by_id("ValueSet", &id)?
         .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
 
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    let mut params = inject_url(params, url);
+    let mut params = instance_validate_params(params, &instance)?;
     crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, params).await?,
+        process_vs_validate_code_selected(&state, params, Some(&instance)).await?,
         format,
     ))
 }

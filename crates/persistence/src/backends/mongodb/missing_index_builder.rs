@@ -1,4 +1,5 @@
-//! Post-boot builder for `idx_resources_missing_params` (#1908, #2001).
+//! Post-boot builder for `idx_resources_missing_params` (#1908, #2001) and
+//! its staleness-probe companion `idx_resources_missing_params_fp` (#1999).
 //!
 //! The index is a multikey index over every `resources` document, so on an
 //! existing deployment its first build is a full collection scan (about
@@ -6,13 +7,16 @@
 //! `search_index` value indexes instead of holding startup. Until this
 //! builder reports the index ready, `:missing=true` searches take the
 //! value-index route and never hint it (`MongoBackend::missing_params_index_ready`).
+//! The fingerprint index is partial (only documents with `missing_params`),
+//! but building it is a collection scan as well, so it is built here too and
+//! readiness waits for both.
 
 use mongodb::{Database, bson::doc};
 
 use crate::error::StorageResult;
 
 use super::MongoBackend;
-use super::schema::RESOURCES_MISSING_INDEX;
+use super::schema::{RESOURCES_MISSING_FP_INDEX, RESOURCES_MISSING_INDEX};
 use super::search_index_builder::{
     BuildOutcome, IN_PROGRESS_MAX_WAIT, IN_PROGRESS_POLL, IndexBuildMode, ListedIndex, SpecStatus,
     classify_spec, is_namespace_not_found, list_indexes_command, listed_indexes,
@@ -36,6 +40,33 @@ pub(crate) fn missing_index_spec() -> SearchIndexSpec {
         partial: None,
         build: IndexBuild::Background,
     }
+}
+
+/// The catalog entry for `idx_resources_missing_params_fp`: the stamp of
+/// each `missing_params` array. Partial on the array existing, so an array
+/// without a stamp is a null key the probe finds in one seek, and resources
+/// without metadata (failed extraction, pending deferred rows, written before
+/// #1984) are not in it.
+pub(crate) fn missing_fp_index_spec() -> SearchIndexSpec {
+    SearchIndexSpec {
+        name: RESOURCES_MISSING_FP_INDEX,
+        keys: doc! {
+            "tenant_id": 1_i32,
+            "resource_type": 1_i32,
+            "is_deleted": 1_i32,
+            "missing_params_fp": 1_i32,
+        },
+        partial: Some(doc! { "missing_params": { "$exists": true } }),
+        build: IndexBuild::Background,
+    }
+}
+
+fn specs() -> [SearchIndexSpec; 2] {
+    [missing_index_spec(), missing_fp_index_spec()]
+}
+
+fn names(specs: &[&SearchIndexSpec]) -> Vec<String> {
+    specs.iter().map(|spec| spec.name.to_string()).collect()
 }
 
 pub(super) struct MissingIndexBuilder {
@@ -63,30 +94,35 @@ impl MissingIndexBuilder {
     }
 
     async fn run_inner(&self) -> StorageResult<BuildOutcome> {
-        let spec = missing_index_spec();
-        let mut status = self.inspect(&spec).await?;
+        let specs = specs();
+        let mut statuses = self.inspect(&specs).await?;
 
-        if let Some(SpecStatus::Conflicting) = status {
+        if let Some((spec, _)) = specs
+            .iter()
+            .zip(&statuses)
+            .find(|(_, status)| **status == Some(SpecStatus::Conflicting))
+        {
             let message = format!(
-                "resources.{RESOURCES_MISSING_INDEX} exists with a different spec; \
-                 :missing=true searches use the value index until it is dropped and rebuilt"
+                "resources.{} exists with a different spec; \
+                 :missing=true searches use the value index until it is dropped and rebuilt",
+                spec.name
             );
             tracing::error!(expected_keys = ?spec.keys, "{message}");
             return Ok(BuildOutcome::Failed { message });
         }
 
         if self.mode == IndexBuildMode::Off {
-            return Ok(off_mode_decision(status));
+            return Ok(off_mode_decision(&statuses));
         }
 
         // Another process (an HFS node or an operator's mongosh) is building
-        // it: wait rather than issue a second build of the same index.
+        // one: wait rather than issue a second build of the same index.
         let wait_started = std::time::Instant::now();
-        while status == Some(SpecStatus::InProgress) {
+        while statuses.contains(&Some(SpecStatus::InProgress)) {
             if wait_started.elapsed() >= IN_PROGRESS_MAX_WAIT {
                 let message = format!(
-                    "gave up waiting for a foreign build of resources.{RESOURCES_MISSING_INDEX} \
-                     after {} minutes",
+                    "gave up waiting for a foreign build of the resources missing-metadata \
+                     indexes after {} minutes",
                     IN_PROGRESS_MAX_WAIT.as_secs() / 60
                 );
                 tracing::error!("{message}");
@@ -97,44 +133,57 @@ impl MissingIndexBuilder {
                 "waiting for in-progress resources index build"
             );
             tokio::time::sleep(IN_PROGRESS_POLL).await;
-            status = self.inspect(&spec).await?;
+            statuses = self.inspect(&specs).await?;
         }
 
-        if status == Some(SpecStatus::Ready) {
+        let absent: Vec<&SearchIndexSpec> = specs
+            .iter()
+            .zip(&statuses)
+            .filter(|(_, status)| **status != Some(SpecStatus::Ready))
+            .map(|(spec, _)| spec)
+            .collect();
+        if absent.is_empty() {
             return Ok(BuildOutcome::UpToDate);
         }
 
+        let created = names(&absent);
         tracing::info!(
-            index = RESOURCES_MISSING_INDEX,
-            "building resources index; :missing=true searches use the value index until it is ready"
+            indexes = ?created,
+            "building resources indexes; :missing=true searches use the value index until they are ready"
         );
         let started = std::time::Instant::now();
         self.database
             .run_command(create_indexes_command_for(
                 MongoBackend::RESOURCES_COLLECTION,
-                &[&spec],
+                &absent,
             ))
             .await?;
-        if self.inspect(&spec).await? != Some(SpecStatus::Ready) {
+        if let Some((spec, _)) = specs
+            .iter()
+            .zip(self.inspect(&specs).await?)
+            .find(|(_, status)| *status != Some(SpecStatus::Ready))
+        {
             let message = format!(
-                "createIndexes returned but resources.{RESOURCES_MISSING_INDEX} is not ready"
+                "createIndexes returned but resources.{} is not ready",
+                spec.name
             );
             tracing::error!("{message}");
             return Ok(BuildOutcome::Failed { message });
         }
         tracing::info!(
-            index = RESOURCES_MISSING_INDEX,
+            indexes = ?created,
             elapsed_s = started.elapsed().as_secs(),
             "resources index build complete"
         );
         Ok(BuildOutcome::Built {
-            created: vec![RESOURCES_MISSING_INDEX.to_string()],
+            created,
             dropped: Vec::new(),
         })
     }
 
-    /// `None` when the index is absent (or `resources` does not exist yet).
-    async fn inspect(&self, spec: &SearchIndexSpec) -> StorageResult<Option<SpecStatus>> {
+    /// Each spec's status; `None` when that index is absent (or `resources`
+    /// does not exist yet).
+    async fn inspect(&self, specs: &[SearchIndexSpec]) -> StorageResult<Vec<Option<SpecStatus>>> {
         let listed = match self
             .database
             .run_command(list_indexes_command(MongoBackend::RESOURCES_COLLECTION))
@@ -144,7 +193,7 @@ impl MissingIndexBuilder {
             Err(e) if is_namespace_not_found(&e) => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        Ok(classify(spec, &listed))
+        Ok(specs.iter().map(|spec| classify(spec, &listed)).collect())
     }
 }
 
@@ -155,33 +204,40 @@ fn classify(spec: &SearchIndexSpec, listed: &[ListedIndex]) -> Option<SpecStatus
         .map(|index| classify_spec(spec, index))
 }
 
-/// [`IndexBuildMode::Off`]'s decision: report the index ready only when it
-/// is, otherwise warn with the command that builds it. Never builds anything.
-fn off_mode_decision(status: Option<SpecStatus>) -> BuildOutcome {
-    match status {
-        Some(SpecStatus::Ready) => BuildOutcome::UpToDate,
-        Some(SpecStatus::InProgress) => {
-            tracing::warn!(
-                index = RESOURCES_MISSING_INDEX,
-                "HFS_MONGODB_INDEX_BUILD=off: resources index is still being built; \
-                 :missing=true searches use the value index until the next start after it finishes"
-            );
-            BuildOutcome::Skipped {
-                missing: vec![RESOURCES_MISSING_INDEX.to_string()],
-            }
-        }
-        _ => {
-            tracing::warn!(
-                index = RESOURCES_MISSING_INDEX,
-                "HFS_MONGODB_INDEX_BUILD=off: resources index is missing; :missing=true searches \
-                 use the value index. Build it with db.resources.createIndex({{tenant_id: 1, \
-                 resource_type: 1, is_deleted: 1, missing_params: 1, last_updated: 1, id: 1}}, \
-                 {{name: \"{RESOURCES_MISSING_INDEX}\"}}) and restart"
-            );
-            BuildOutcome::Skipped {
-                missing: vec![RESOURCES_MISSING_INDEX.to_string()],
-            }
-        }
+/// [`IndexBuildMode::Off`]'s decision: report the indexes ready only when
+/// both are, otherwise warn with the commands that build them. Never builds
+/// anything.
+fn off_mode_decision(statuses: &[Option<SpecStatus>]) -> BuildOutcome {
+    let specs = specs();
+    let missing: Vec<&SearchIndexSpec> = specs
+        .iter()
+        .zip(statuses)
+        .filter(|(_, status)| **status != Some(SpecStatus::Ready))
+        .map(|(spec, _)| spec)
+        .collect();
+    if missing.is_empty() {
+        return BuildOutcome::UpToDate;
+    }
+    if statuses.contains(&Some(SpecStatus::InProgress)) {
+        tracing::warn!(
+            indexes = ?names(&missing),
+            "HFS_MONGODB_INDEX_BUILD=off: resources index is still being built; \
+             :missing=true searches use the value index until the next start after it finishes"
+        );
+    } else {
+        tracing::warn!(
+            indexes = ?names(&missing),
+            "HFS_MONGODB_INDEX_BUILD=off: resources index is missing; :missing=true searches \
+             use the value index. Build it with db.resources.createIndex({{tenant_id: 1, \
+             resource_type: 1, is_deleted: 1, missing_params: 1, last_updated: 1, id: 1}}, \
+             {{name: \"{RESOURCES_MISSING_INDEX}\"}}) and db.resources.createIndex({{tenant_id: 1, \
+             resource_type: 1, is_deleted: 1, missing_params_fp: 1}}, {{name: \
+             \"{RESOURCES_MISSING_FP_INDEX}\", partialFilterExpression: {{missing_params: \
+             {{$exists: true}}}}}}) and restart"
+        );
+    }
+    BuildOutcome::Skipped {
+        missing: names(&missing),
     }
 }
 
@@ -219,18 +275,32 @@ mod tests {
     }
 
     #[test]
-    fn off_mode_is_up_to_date_only_when_ready() {
-        assert_eq!(
-            off_mode_decision(Some(SpecStatus::Ready)),
-            BuildOutcome::UpToDate
-        );
+    fn off_mode_is_up_to_date_only_when_both_are_ready() {
+        let ready = Some(SpecStatus::Ready);
+        assert_eq!(off_mode_decision(&[ready, ready]), BuildOutcome::UpToDate);
         for status in [None, Some(SpecStatus::InProgress)] {
             assert_eq!(
-                off_mode_decision(status),
+                off_mode_decision(&[status, ready]),
                 BuildOutcome::Skipped {
                     missing: vec![RESOURCES_MISSING_INDEX.to_string()],
                 }
             );
+            assert_eq!(
+                off_mode_decision(&[ready, status]),
+                BuildOutcome::Skipped {
+                    missing: vec![RESOURCES_MISSING_FP_INDEX.to_string()],
+                }
+            );
         }
+    }
+
+    #[test]
+    fn fingerprint_index_is_partial_on_the_metadata_array() {
+        let spec = missing_fp_index_spec();
+        let entry = spec.create_indexes_entry();
+        assert_eq!(
+            entry.get_document("partialFilterExpression").unwrap(),
+            &doc! { "missing_params": { "$exists": true } }
+        );
     }
 }
