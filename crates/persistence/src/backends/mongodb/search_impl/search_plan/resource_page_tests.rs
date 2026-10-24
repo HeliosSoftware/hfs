@@ -270,10 +270,7 @@ async fn missing_membership_work_is_bounded_by_candidate_ids() {
                             )
                             .await
                             .unwrap(),
-                        Some(SearchFilterPlan::ResourceLookups {
-                            index_filter: None,
-                            ..
-                        })
+                        Some(SearchFilterPlan::BatchedIndex(_))
                     ));
                     if reference {
                         let mut excluded = parameter("status", "final");
@@ -500,6 +497,8 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
         if small {
             assert!(plan.is_none());
         } else {
+            // Every resource lacks `method`, so the missing population is not
+            // smaller than the positive driver: the resource scan is kept (#2004).
             assert!(matches!(
                 plan,
                 Some(SearchFilterPlan::ResourceLookups {
@@ -508,9 +507,12 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 })
             ));
         }
+        // The 65-row probe decides the small route alone. A broad count also
+        // sizes its positive driver and the missing population (#2004).
         assert_eq!(
-            facts.requests, 1,
-            "small and count routes must not add a bounded probe"
+            facts.requests,
+            if small { 1 } else { 3 },
+            "{code}: unexpected planning probes"
         );
         let (selected, ids) = backend
             .plan_or_matching_ids(db, PLAN_TENANT, &query, plan)
@@ -774,10 +776,7 @@ async fn missing_id_cursor_candidates_bound_probes_reads_and_cache_keys() {
             .unwrap();
         assert!(matches!(
             count_plan,
-            Some(SearchFilterPlan::ResourceLookups {
-                index_filter: None,
-                ..
-            })
+            Some(SearchFilterPlan::BatchedIndex(_))
         ));
     }
     assert_ne!(boundary_keys[0], boundary_keys[1]);

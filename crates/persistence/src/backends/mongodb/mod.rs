@@ -37,6 +37,7 @@ mod search_deadline;
 mod search_impl;
 pub(crate) mod search_index_builder;
 pub(crate) mod search_index_catalog;
+mod sof_terminology;
 mod storage;
 mod sync_failures;
 mod transaction_bundle_gate;

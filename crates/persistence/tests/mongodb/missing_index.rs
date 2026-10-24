@@ -2392,6 +2392,107 @@ async fn mongodb_missing_staleness_probe_reads_one_key_per_stamp() {
     db.drop().await.unwrap();
 }
 
+/// #2004: a count that combines a broad positive predicate with metadata
+/// `:missing=true` streams the positive index rows in batches. It must not
+/// read the larger missing population, and resources without metadata still
+/// consult their value index.
+#[tokio::test]
+async fn mongodb_missing_metadata_count_drives_from_selective_positive_filter() {
+    use futures::TryStreamExt;
+    let Some(backend) = create_backend("missing_positive_count").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-positive-count");
+    register_parameters(&backend, &tenant).await;
+    let token = &PARAMETERS[1];
+    let present = || {
+        vec![json!({
+            "url": format!("urn:hfs:test:{}", token.name), "valueCode": "present",
+        })]
+    };
+    // 300 positive matches above the selective-candidate limit; every third
+    // lacks the token. 2000 resources of another code all lack it.
+    for number in 0..300 {
+        let values = if number % 3 == 0 { vec![] } else { present() };
+        let mut resource = observation(&format!("common-{number:04}"), values);
+        resource["code"] = json!({"coding": [{"code": "common"}]});
+        backend
+            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    for number in 0..2000 {
+        let mut resource = observation(&format!("other-{number:04}"), vec![]);
+        resource["code"] = json!({"coding": [{"code": "other"}]});
+        backend
+            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let db = backend.get_database().await.unwrap();
+    // Every fifth positive match predates the metadata.
+    for number in (0..300).step_by(5) {
+        db.collection::<Document>("resources")
+            .update_one(
+                doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation",
+                "id": format!("common-{number:04}")},
+                doc! {"$unset": {"missing_params": ""}},
+            )
+            .await
+            .unwrap();
+    }
+    let code = SearchParameter {
+        name: "code".to_owned(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("common")],
+        chain: vec![],
+        components: vec![],
+    };
+    for missing in [true, false] {
+        let query = SearchQuery::new("Observation")
+            .with_parameter(code.clone())
+            .with_parameter(missing_condition(token, missing));
+        let expected = if missing { 100 } else { 200 };
+        clear_profile(&db).await;
+        db.run_command(doc! {"profile": 2}).await.unwrap();
+        let count = backend.search_count(&tenant, &query).await;
+        db.run_command(doc! {"profile": 0}).await.unwrap();
+        assert_eq!(count.unwrap(), expected, "missing={missing}");
+        if missing {
+            let operations: Vec<Document> = db
+                .collection("system.profile")
+                .find(doc! { "ns": format!("{}.resources", db.name()) })
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let examined: i64 = operations
+                .iter()
+                .filter_map(|operation| {
+                    operation
+                        .get_i64("docsExamined")
+                        .or_else(|_| operation.get_i32("docsExamined").map(i64::from))
+                        .ok()
+                })
+                .sum();
+            assert!(
+                examined < 1000,
+                "count must not read the 2100-resource missing population: {examined}"
+            );
+        }
+        let mut summary = query.clone();
+        summary.summary = Some(helios_persistence::types::SummaryMode::Count);
+        for total in [TotalMode::Accurate, TotalMode::Estimate] {
+            summary.total = Some(total);
+            let result = backend.search(&tenant, &summary).await.unwrap();
+            assert_eq!(result.total, Some(expected), "missing={missing}, {total:?}");
+        }
+    }
+    db.drop().await.unwrap();
+}
+
 /// `_id` and `_lastUpdated` are columns of every resource document and
 /// `:missing` on them never reads `missing_params`, so they are not recorded
 /// even though Synthea-style resources carry no `meta.lastUpdated` (#2006).
