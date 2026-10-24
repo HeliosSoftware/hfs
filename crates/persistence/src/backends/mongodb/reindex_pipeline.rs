@@ -169,6 +169,7 @@ impl SubBatchDocs {
                     id: resource.id().to_owned(),
                     version_id: resource.version_id().to_owned(),
                     names,
+                    fp,
                 }
             })
             .collect()
@@ -176,7 +177,8 @@ impl SubBatchDocs {
 }
 
 /// One resource's `missing_params` update statement, with the version it is
-/// guarded on and the value it writes, so [`changed_missing_updates`] can
+/// guarded on and the values it writes (the array and its `missing_params_fp`
+/// stamp), so [`changed_missing_updates`] can
 /// leave it out when the stored document already holds that value (#2005).
 struct MissingUpdate {
     owner: usize,
@@ -185,17 +187,25 @@ struct MissingUpdate {
     id: String,
     version_id: String,
     names: Option<Vec<String>>,
+    fp: Option<String>,
 }
 
 impl MissingUpdate {
     /// Whether `stored`, the live resource document, already holds what this
-    /// update writes, at the version the update is guarded on. Anything else
+    /// update writes, array and stamp, at the version the update is guarded on. Anything else
     /// (another version, a deleted resource, a value of another shape) is
     /// written as before, and the version guard decides.
     fn is_unchanged(&self, stored: &Document) -> bool {
         if stored.get_str("version_id") != Ok(self.version_id.as_str())
             || stored.get_bool("is_deleted") != Ok(false)
         {
+            return false;
+        }
+        // The statement also writes the stamp (#1999), so a stale or absent
+        // stamp is due even when the array matches. Without an array the
+        // statement unsets both.
+        let fp = self.names.as_ref().and(self.fp.as_deref());
+        if stored.get_str("missing_params_fp").ok() != fp {
             return false;
         }
         match (&self.names, stored.get("missing_params")) {
@@ -254,7 +264,8 @@ async fn changed_missing_updates(
     (changed, skipped)
 }
 
-/// Reads `version_id`, `is_deleted` and `missing_params` of every resource
+/// Reads `version_id`, `is_deleted`, `missing_params` and `missing_params_fp`
+/// of every resource
 /// the updates name, keyed by (resource type, id), one query per type.
 async fn stored_missing_params(
     resources: &mongodb::Collection<Document>,
@@ -282,6 +293,7 @@ async fn stored_missing_params(
                 "version_id": 1,
                 "is_deleted": 1,
                 "missing_params": 1,
+                "missing_params_fp": 1,
             })
             .await?;
         while let Some(row) = cursor.try_next().await? {
@@ -2364,6 +2376,14 @@ mod tests {
     }
 
     fn missing_update(version_id: &str, names: Option<&[&str]>) -> MissingUpdate {
+        missing_update_stamped(version_id, names, None)
+    }
+
+    fn missing_update_stamped(
+        version_id: &str,
+        names: Option<&[&str]>,
+        fp: Option<&str>,
+    ) -> MissingUpdate {
         MissingUpdate {
             owner: 0,
             statement: doc! {},
@@ -2371,6 +2391,7 @@ mod tests {
             id: "p".into(),
             version_id: version_id.into(),
             names: names.map(|names| names.iter().map(|name| (*name).to_owned()).collect()),
+            fp: fp.map(str::to_owned),
         }
     }
 
@@ -2412,6 +2433,24 @@ mod tests {
         let mut no_flag = live(array(&["a", "b"]));
         no_flag.remove("is_deleted");
         assert!(!set.is_unchanged(&no_flag));
+
+        // The stamp is written with the array (#1999): a stale or absent stamp
+        // is due, and so is one the update would unset.
+        let stamped = missing_update_stamped("2", Some(&["a", "b"]), Some("fp2"));
+        let with_fp = |fp: &str| {
+            let mut stored = live(array(&["a", "b"]));
+            stored.insert("missing_params_fp", fp);
+            stored
+        };
+        assert!(stamped.is_unchanged(&with_fp("fp2")));
+        assert!(!stamped.is_unchanged(&with_fp("fp1")));
+        assert!(!stamped.is_unchanged(&live(array(&["a", "b"]))));
+        assert!(!set.is_unchanged(&with_fp("fp2")));
+        let unset_stamped = missing_update_stamped("2", None, Some("fp2"));
+        assert!(unset_stamped.is_unchanged(&live(None)));
+        let mut stale_stamp_only = live(None);
+        stale_stamp_only.insert("missing_params_fp", "fp2");
+        assert!(!unset_stamped.is_unchanged(&stale_stamp_only));
     }
 
     #[test]
