@@ -310,6 +310,75 @@ async fn reject_legacy_composites(
     Ok(())
 }
 
+/// Pieces of the newest-first fast-path statement.
+struct FastPathParts<'a> {
+    pred: &'a str,
+    guard: &'a str,
+    boundary: &'a str,
+    order: &'a str,
+    offset: &'a str,
+    outer_order: &'a str,
+    limit: usize,
+    /// Keep the `index_eligible` probe and the fallback sentinel arm.
+    with_probe: bool,
+}
+
+/// Builds the fast-path statement. With the probe, rows carrying a NULL
+/// `last_updated` for the predicate turn the page into a single
+/// `needs_fallback` sentinel row; without it the page is returned directly.
+/// In both shapes the `LEFT JOIN` carries `is_deleted = FALSE` in its `ON`, so
+/// an orphaned index row surfaces as `needs_fallback = TRUE` (no live
+/// `EXISTS` per candidate, see the call site).
+/// Both shapes select the same seven columns, so the caller reads them alike.
+fn fast_path_sql(p: &FastPathParts<'_>) -> String {
+    let probe_cte = if p.with_probe {
+        format!(
+            "WITH index_eligible AS MATERIALIZED ( \
+               SELECT NOT EXISTS (SELECT 1 FROM search_index \
+                                  WHERE tenant_id = $1 AND resource_type = $2 \
+                                    AND last_updated IS NULL AND {pred}) AS usable \
+             ) ",
+            pred = p.pred
+        )
+    } else {
+        String::new()
+    };
+    let usable = if p.with_probe {
+        " WHERE (SELECT usable FROM index_eligible)"
+    } else {
+        ""
+    };
+    let sentinel = if p.with_probe {
+        " UNION ALL \
+         SELECT NULL::text, NULL::text, NULL::jsonb, NULL::timestamptz, \
+                NULL::text, NULL::timestamptz, TRUE AS needs_fallback \
+         WHERE NOT (SELECT usable FROM index_eligible)"
+    } else {
+        ""
+    };
+    format!(
+        "{probe_cte}\
+         SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+                r.last_updated AS sort_key, (r.id IS NULL) AS needs_fallback \
+         FROM ( \
+           SELECT DISTINCT resource_id, last_updated FROM search_index \
+           WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard}{boundary} \
+           ORDER BY {order} LIMIT {lim}{offset} \
+         ) c \
+         LEFT JOIN resources r \
+           ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
+          AND r.is_deleted = FALSE{usable}{sentinel} \
+         ORDER BY {outer_order}",
+        pred = p.pred,
+        guard = p.guard,
+        boundary = p.boundary,
+        order = p.order,
+        offset = p.offset,
+        lim = p.limit,
+        outer_order = p.outer_order,
+    )
+}
+
 /// Decides whether page identities can be selected from `search_index` before
 /// loading resource bodies, returning the predicate to resolve them with.
 ///
@@ -603,6 +672,27 @@ impl PostgresBackend {
             }
         };
 
+        // The per-statement eligibility probe is redundant when a cached fact
+        // says the searched parameter has no NULL-`last_updated` rows; see
+        // `null_timestamp_facts`. Any doubt keeps the probe.
+        let skip_eligibility_probe = match fast_index_pred.as_deref() {
+            Some(pred) if super::null_timestamp_facts::enabled() => {
+                match super::null_timestamp_facts::param_name_of(pred) {
+                    Some(param) => {
+                        super::null_timestamp_facts::param_has_no_null_rows(
+                            client,
+                            tenant_id,
+                            resource_type,
+                            &param,
+                        )
+                        .await
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+
         // Index eligibility and candidate selection share one database snapshot.
         let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
             // Eligible sorts share the non-null `last_updated` keyset. Apply
@@ -651,34 +741,30 @@ impl PostgresBackend {
             // (normal contained memberships carry NULL). Probe that timestamp
             // range using the same predicate, rather than scanning all contained
             // rows of the tenant, and materialize only the eligibility boolean.
-            let sql = format!(
-                "WITH index_eligible AS MATERIALIZED ( \
-                   SELECT NOT EXISTS (SELECT 1 FROM search_index \
-                                      WHERE tenant_id = $1 AND resource_type = $2 \
-                                        AND last_updated IS NULL AND {pred}) AS usable \
-                 ) \
-                 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
-                        r.last_updated AS sort_key, FALSE AS needs_fallback \
-                 FROM ( \
-                   SELECT DISTINCT resource_id, last_updated FROM search_index \
-                   WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard}{boundary} \
-                     AND EXISTS (SELECT 1 FROM resources live \
-                                 WHERE live.tenant_id = $1 AND live.resource_type = $2 \
-                                   AND live.id = search_index.resource_id AND live.is_deleted = FALSE) \
-                   ORDER BY {order} LIMIT {lim}{offset} \
-                 ) c \
-                 JOIN resources r \
-                   ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = c.resource_id \
-                 WHERE r.is_deleted = FALSE AND (SELECT usable FROM index_eligible) \
-                 UNION ALL \
-                 SELECT NULL::text, NULL::text, NULL::jsonb, NULL::timestamptz, \
-                        NULL::text, NULL::timestamptz, TRUE AS needs_fallback \
-                 WHERE NOT (SELECT usable FROM index_eligible) \
-                 ORDER BY {outer_order}",
-                pred = pred,
-                guard = guard,
-                lim = count + 1,
-            );
+            //
+            // There is deliberately no `EXISTS (... resources ... is_deleted =
+            // FALSE)` inside the pre-`LIMIT` subquery: the outer join to
+            // `resources` already filters `is_deleted = FALSE`, and every path
+            // that sets `is_deleted` (soft delete in `storage.rs`/`transaction.rs`)
+            // or removes a resource (`purge`, `purge_all`, tenant purge) deletes
+            // the resource's `search_index` rows in the same transaction, so the
+            // candidate set holds no deleted resources. The per-candidate probe
+            // cost one `resources_pkey` lookup per matching row. Orphaned index
+            // rows (which no HFS write path creates, but a restored dump or a
+            // hand-edited database can) are still handled: the join is a
+            // `LEFT JOIN` whose `ON` carries `is_deleted = FALSE`, so a dead
+            // candidate surfaces as a row with `needs_fallback = TRUE` and the
+            // caller re-runs the page with the general statement.
+            let sql = fast_path_sql(&FastPathParts {
+                pred,
+                guard: &guard,
+                boundary: &boundary,
+                order: &order,
+                offset: &offset,
+                outer_order,
+                limit: count + 1,
+                with_probe: !skip_eligibility_probe,
+            });
             let has_previous = if cursor.is_some() {
                 !backward
             } else {
@@ -723,7 +809,7 @@ impl PostgresBackend {
         // Contained memberships normally carry NULL under their parent's identity.
         // The same-statement sentinel preserves unique parent identities and
         // contained-only matches even when CRUD changes the representation.
-        if fast_index_pred.is_some() && rows.first().is_some_and(|row| row.get::<_, bool>(6)) {
+        if fast_index_pred.is_some() && rows.iter().any(|row| row.get::<_, bool>(6)) {
             let (sql, _) = general_page_sql();
             rows = if statement_is_reusable(query) {
                 query_dyn_cached(client, &sql, &param_refs).await
@@ -2488,5 +2574,194 @@ mod composite_slot_runtime_tests {
                 .len(),
             3
         );
+    }
+}
+
+#[cfg(test)]
+mod fast_path_sql_tests {
+    use super::*;
+
+    fn parts(with_probe: bool) -> FastPathParts<'static> {
+        FastPathParts {
+            pred: "param_name = 'birthdate' AND value_date < $3",
+            guard: "",
+            boundary: "",
+            order: "last_updated DESC, resource_id ASC",
+            offset: "",
+            outer_order: "sort_key DESC, id ASC",
+            limit: 21,
+            with_probe,
+        }
+    }
+
+    #[test]
+    fn probe_shape_keeps_cte_and_sentinel() {
+        let sql = fast_path_sql(&parts(true));
+        assert!(sql.starts_with("WITH index_eligible AS MATERIALIZED ("));
+        assert!(sql.contains("AND last_updated IS NULL AND param_name = 'birthdate'"));
+        assert!(sql.contains("(SELECT usable FROM index_eligible)"));
+        assert!(sql.contains("UNION ALL"));
+        assert!(sql.contains("TRUE AS needs_fallback"));
+        assert!(sql.ends_with("ORDER BY sort_key DESC, id ASC"));
+    }
+
+    #[test]
+    fn direct_shape_has_no_probe_and_same_columns() {
+        let direct = fast_path_sql(&parts(false));
+        assert!(!direct.contains("index_eligible"));
+        assert!(!direct.contains("UNION ALL"));
+        assert!(!direct.contains("last_updated IS NULL"));
+        assert!(direct.contains("AND r.is_deleted = FALSE ORDER BY sort_key DESC, id ASC"));
+        assert!(direct.contains("(r.id IS NULL) AS needs_fallback"));
+        assert!(!direct.contains("EXISTS"));
+        assert!(direct.contains("ORDER BY last_updated DESC, resource_id ASC LIMIT 21"));
+        // The page body is shared byte for byte with the probe shape.
+        let probe = fast_path_sql(&parts(true));
+        let body = |s: &str| {
+            let start = s.find("SELECT r.id").unwrap();
+            let marker = "AND r.is_deleted = FALSE";
+            let end = s.find(marker).unwrap() + marker.len();
+            s[start..end].to_string()
+        };
+        assert_eq!(body(&direct), body(&probe));
+    }
+
+    #[test]
+    fn guard_boundary_and_offset_are_spliced_in_both_shapes() {
+        for with_probe in [true, false] {
+            let mut p = parts(with_probe);
+            p.guard = " AND EXISTS (SELECT 1 FROM search_index g WHERE x)";
+            p.boundary = " AND (last_updated, resource_id) < ($3, $4)";
+            p.offset = " OFFSET 5";
+            let sql = fast_path_sql(&p);
+            assert!(sql.contains(p.guard) && sql.contains(p.boundary));
+            assert!(sql.contains("LIMIT 21 OFFSET 5"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod eligible_cache_runtime_tests {
+    use super::*;
+    use crate::backends::postgres::PostgresConfig;
+    use crate::tenant::{TenantId, TenantPermissions};
+    use crate::types::{SearchParamType, SearchParameter, SearchValue};
+    use serde_json::json;
+    use testcontainers::{ImageExt, runners::AsyncRunner};
+    use testcontainers_modules::postgres::Postgres;
+
+    fn gender_query() -> SearchQuery {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "gender".into(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("male")],
+            ..Default::default()
+        })
+    }
+
+    async fn ids(backend: &PostgresBackend, scope: &TenantContext) -> Vec<String> {
+        backend
+            .search(scope, &gender_query())
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn null_last_updated_rows_force_the_fallback_and_match_the_probe_path() {
+        let container = Postgres::default()
+            .with_tag("16-alpine")
+            .start()
+            .await
+            .unwrap();
+        let config = PostgresConfig {
+            host: container.get_host().await.unwrap().to_string(),
+            port: container.get_host_port_ipv4(5432).await.unwrap(),
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 5,
+            data_dir: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        };
+        let backend = PostgresBackend::new(config).await.unwrap();
+        backend.init_schema().await.unwrap();
+        let tenant = "elig-cache";
+        let scope = TenantContext::new(TenantId::new(tenant), TenantPermissions::full_access());
+        for id in ["a", "b", "c"] {
+            backend
+                .create(
+                    &scope,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":id,"gender":"male"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let client = backend.get_client().await.unwrap();
+
+        // 1. No NULL rows: the fact is learned and the direct shape is used.
+        let first = ids(&backend, &scope).await;
+        assert_eq!(first, vec!["c", "b", "a"]);
+        assert!(
+            crate::backends::postgres::null_timestamp_facts::param_has_no_null_rows(
+                &client, tenant, "Patient", "gender"
+            )
+            .await
+        );
+
+        // 2. Both SQL shapes return identical rows when no NULL row exists.
+        let pred = "param_name = 'gender' AND value_token_code = $3";
+        let run = |with_probe: bool| {
+            let sql = fast_path_sql(&FastPathParts {
+                pred,
+                guard: "",
+                boundary: "",
+                order: "last_updated DESC, resource_id ASC",
+                offset: "",
+                outer_order: "sort_key DESC, id ASC",
+                limit: 21,
+                with_probe,
+            });
+            let client = &client;
+            async move {
+                client
+                    .query(&sql, &[&tenant, &"Patient", &"male"])
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r.get::<_, Option<String>>(0), r.get::<_, bool>(6)))
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(run(true).await, run(false).await);
+
+        // 3. A NULL row appears behind the cache's back (another process).
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code, is_contained, contained_type, contained_local_id) \
+                 VALUES ($1, 'Patient', 'a', 'gender', 'male', TRUE, 'Patient', 'x')",
+                &[&tenant],
+            )
+            .await
+            .unwrap();
+        // The probe shape now yields only the fallback sentinel...
+        assert_eq!(run(true).await, vec![(None, true)]);
+        // ...and once the fact is re-learned, the cache refuses the direct path.
+        crate::backends::postgres::null_timestamp_facts::forget_tenant_for_tests(tenant);
+        assert!(
+            !crate::backends::postgres::null_timestamp_facts::param_has_no_null_rows(
+                &client, tenant, "Patient", "gender"
+            )
+            .await
+        );
+        // Results through the fallback equal the earlier ones (the duplicate
+        // NULL row must not duplicate or reorder the page).
+        assert_eq!(ids(&backend, &scope).await, first);
     }
 }

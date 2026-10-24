@@ -88,13 +88,6 @@ impl ColumnDecode {
             _ => Self::Auto,
         }
     }
-
-    /// Reconciles the decode modes of the same column in two `unionAll`
-    /// branches: equal modes are kept, different ones degrade to
-    /// [`Auto`](Self::Auto).
-    pub fn merge(self, other: Self) -> Self {
-        if self == other { self } else { Self::Auto }
-    }
 }
 
 /// Converts the text of a column value into JSON according to `decode`.
@@ -236,17 +229,5 @@ mod tests {
         assert_eq!(ColumnDecode::Decimal.column_kind(), ColumnKind::Decimal);
         assert_eq!(ColumnDecode::Json.column_kind(), ColumnKind::Deferred);
         assert_eq!(ColumnDecode::Auto.column_kind(), ColumnKind::Deferred);
-    }
-
-    #[test]
-    fn merge_degrades_to_auto() {
-        assert_eq!(
-            ColumnDecode::Text.merge(ColumnDecode::Text),
-            ColumnDecode::Text
-        );
-        assert_eq!(
-            ColumnDecode::Text.merge(ColumnDecode::Json),
-            ColumnDecode::Auto
-        );
     }
 }

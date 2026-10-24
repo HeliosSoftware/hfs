@@ -443,4 +443,82 @@ mod sof_conformance_mongodb_tests {
             failure_msgs.join("\n  "),
         );
     }
+
+    // =========================================================================
+    // Null-guard laziness: the right operand of a comparison must not be
+    // evaluated for a row whose left operand is empty.
+    // =========================================================================
+
+    /// `$sql-run` of a `where` whose right operand always throws (`1 / 0`).
+    /// Returns the HTTP status, or `None` if the stream failed mid-response.
+    async fn run_throwing_where(
+        resources: &[Value],
+    ) -> Option<(bool, Vec<BTreeMap<String, Value>>)> {
+        let backend = create_backend().await;
+        let (tenant, tenant_id) = unique_tenant();
+        seed_resources(&backend, &tenant, resources).await;
+        let server = create_test_server(Arc::clone(&backend)).await;
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }],
+            "where": [{ "path": "value.ofType(Quantity).value = (1 / 0)" }],
+        });
+        AssertUnwindSafe(async {
+            let resp = server
+                .post("/$sql-run?_format=ndjson")
+                .add_header(X_TENANT_ID, HeaderValue::from_str(&tenant_id).unwrap())
+                .add_header(
+                    HeaderName::from_static("content-type"),
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&view)
+                .await;
+            let ok = resp.status_code().is_success();
+            let rows = if ok {
+                parse_ndjson(&resp.text())
+            } else {
+                vec![]
+            };
+            (ok, rows)
+        })
+        .catch_unwind()
+        .await
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn test_comparison_right_operand_not_evaluated_for_empty_left() {
+        let obs = |id: &str, with_value: bool| {
+            let mut o = json!({
+                "resourceType": "Observation",
+                "id": id,
+                "status": "final",
+                "code": { "text": "t" },
+            });
+            if with_value {
+                o["valueQuantity"] = json!({ "value": 5 });
+            }
+            o
+        };
+
+        // Control: with the left field present the right operand is evaluated
+        // and throws, so the test is sensitive to the guard.
+        let control = run_throwing_where(&[obs("with-value", true)]).await;
+        assert!(
+            !matches!(control, Some((true, _))),
+            "control: `1 / 0` was expected to fail the query, got {control:?}"
+        );
+
+        // The row without the left field must not evaluate the right operand.
+        let (ok, rows) = run_throwing_where(&[obs("no-value", false)])
+            .await
+            .expect("row without the left field must not raise a runtime error");
+        assert!(ok, "request failed for a row with an empty left operand");
+        assert!(
+            rows.is_empty(),
+            "empty comparison must filter the row: {rows:?}"
+        );
+    }
 }

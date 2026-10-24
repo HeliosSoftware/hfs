@@ -27,16 +27,14 @@ use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnarBatchBuilder};
 use helios_sof::sqlquery::engine::declared_columns;
 
 use crate::core::sof_runner::{
-    BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+    BatchStream, RowBatchSender, RowBatcher, RowStream, SofError, SofRunner, ViewFilters,
+    row_batch_channel, row_stream, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
 use super::compiler::SqlDialect;
 use super::decode::{ColumnDecode, decode_text};
 use super::runtime::{RuntimeParam, prepare_sql_run};
-
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
 
 /// Channel buffer depth of the columnar path, in batches. A batch holds up to
 /// [`COLUMNAR_BATCH_ROWS`] rows, so a couple of them is plenty of read-ahead.
@@ -106,7 +104,7 @@ impl SofRunner for SqliteInDbRunner {
             .map(SqliteParam::from_runtime)
             .collect();
         let pool = self.pool.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let (tx, rx) = row_batch_channel();
         let guard_tx = tx.clone();
         let producer = tokio::task::spawn_blocking(move || {
             stream_sqlite_rows(
@@ -120,7 +118,7 @@ impl SofRunner for SqliteInDbRunner {
             );
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        Ok(row_stream(rx))
     }
 
     async fn run_view_columnar(
@@ -299,7 +297,7 @@ fn stream_sqlite_rows(
     columns: &[String],
     decodes: &[ColumnDecode],
     limit: Option<usize>,
-    tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    tx: RowBatchSender,
 ) {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -335,6 +333,7 @@ fn stream_sqlite_rows(
         }
     };
 
+    let mut batcher = RowBatcher::new(tx);
     let mut count = 0usize;
     for row_result in row_iter {
         if let Some(cap) = limit {
@@ -344,16 +343,20 @@ fn stream_sqlite_rows(
         }
         count += 1;
 
-        let row = match row_result {
-            Ok(map) => Ok(Value::Object(map)),
-            Err(e) => Err(SofError::Backend(format!("row error: {e}"))),
-        };
-
-        if tx.blocking_send(row).is_err() {
-            // Receiver dropped (client disconnected) — stop iterating
-            break;
+        match row_result {
+            Ok(map) => {
+                if !batcher.blocking_push(Value::Object(map)) {
+                    // Receiver dropped (client disconnected) — stop iterating
+                    return;
+                }
+            }
+            Err(e) => {
+                batcher.blocking_error(SofError::Backend(format!("row error: {e}")));
+                return;
+            }
         }
     }
+    batcher.blocking_finish();
 
     debug!(
         runner = "sqlite-indb",

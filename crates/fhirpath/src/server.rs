@@ -91,6 +91,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
+use helios_observability::redact::redact_url;
 use http::{HeaderValue, Method};
 use std::net::SocketAddr;
 use tower_http::compression::CompressionLayer;
@@ -107,7 +108,10 @@ const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 use crate::handlers::{evaluate_fhirpath, health_check};
 
 /// Server configuration
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the terminology server URL's credentials, query and
+/// fragment: the server logs this struct at startup.
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Port to bind the server to
     pub port: u16,
@@ -127,6 +131,36 @@ pub struct ServerConfig {
     pub max_body_size: usize,
     /// Terminology server URL (defaults based on FHIR version)
     pub terminology_server: Option<String>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            port,
+            host,
+            log_level,
+            enable_cors,
+            cors_origins,
+            cors_methods,
+            cors_headers,
+            max_body_size,
+            terminology_server,
+        } = self;
+        f.debug_struct("ServerConfig")
+            .field("port", port)
+            .field("host", host)
+            .field("log_level", log_level)
+            .field("enable_cors", enable_cors)
+            .field("cors_origins", cors_origins)
+            .field("cors_methods", cors_methods)
+            .field("cors_headers", cors_headers)
+            .field("max_body_size", max_body_size)
+            .field(
+                "terminology_server",
+                &terminology_server.as_deref().map(redact_url),
+            )
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -211,7 +245,7 @@ pub struct ServerArgs {
     pub max_body_size: usize,
 
     /// Terminology server URL (defaults based on FHIR version)
-    #[arg(long, env = "FHIRPATH_TERMINOLOGY_SERVER")]
+    #[arg(long, env = "FHIRPATH_TERMINOLOGY_SERVER", hide_env_values = true)]
     pub terminology_server: Option<String>,
 }
 
@@ -324,8 +358,11 @@ pub fn create_app(config: &ServerConfig) -> Router {
     // used in `crates/rest/src/lib.rs` and `crates/sof/src/server.rs`.
     app = app.layer(DefaultBodyLimit::max(config.max_body_size));
 
-    // Add tracing
-    app = app.layer(TraceLayer::new_for_http());
+    // Add tracing: method and path only, the default span logs the query
+    // string (#2149).
+    app = app.layer(
+        TraceLayer::new_for_http().make_span_with(helios_observability::middleware::request_span),
+    );
 
     // Observability: `/metrics` (state-free) + per-request metrics/trace span.
     app = app
@@ -409,6 +446,21 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use serde_json::json;
     use tower::ServiceExt; // for oneshot
+
+    #[test]
+    fn config_debug_redacts_terminology_server_credentials() {
+        let config = ServerConfig {
+            terminology_server: Some(
+                "https://user:PASSWORD@tx.example.org/r4?api_key=QUERYSECRET".to_string(),
+            ),
+            ..ServerConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("PASSWORD"), "{debug}");
+        assert!(!debug.contains("QUERYSECRET"), "{debug}");
+        assert!(debug.contains("tx.example.org/r4"), "{debug}");
+        assert!(debug.contains("port: 3000"), "{debug}");
+    }
 
     #[tokio::test]
     async fn test_health_check() {

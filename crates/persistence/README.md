@@ -630,6 +630,13 @@ Past the budget the call fails with `BackendError::Timeout` (`504` on the REST e
 the budget, plus the pool checkout and the handler's earlier work, is below `HFS_REQUEST_TIMEOUT`). The session stays owned by the count until
 PostgreSQL ends it, even if the caller is dropped first (#1826, #1911).
 
+Every indexed write confirms its tenant's SearchParameter overlay with a cheap
+`SELECT COUNT(*), MAX(last_updated)` fingerprint probe. `HFS_PG_SP_FINGERPRINT_TTL_MS`
+(default: `0`, every write probes) lets ordinary writes reuse an overlay validated within
+that many milliseconds (for example `1000`) and skip the probe. A SearchParameter written by
+this process invalidates the cache immediately; one committed by another HFS process is seen by
+ordinary writes within the TTL. Bulk submit always probes, whatever the TTL.
+
 Schema v49 adds the partial index `idx_resources_live_tenant ON resources (tenant_id) WHERE
 is_deleted = FALSE`, so the count is an index-only scan of a narrow index instead of the wider
 `idx_resources_reindex_id`. The first startup on v49 builds it with `CREATE INDEX CONCURRENTLY`
@@ -646,6 +653,33 @@ version:
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_resources_live_tenant
   ON resources (tenant_id) WHERE is_deleted = FALSE;
 ```
+
+Schema v50 adds `idx_search_date_recent_end` on `search_index (tenant_id, resource_type, param_name,
+last_updated DESC, resource_id) INCLUDE (value_date, value_date_end) WHERE value_date_end IS NOT NULL`,
+which lets date `gt`/`ge` searches walk the newest-first order and stop at the first qualifying rows
+(Observation, Encounter and Patient `gt`/`ge`: 0.07-0.11 ms on a 7M-row `search_index`; 66 MB). It is
+built the same way as the v49 index (`CREATE INDEX CONCURRENTLY` under the migration lock, recorded only
+once the index is valid, an interrupted build is dropped and rebuilt on the next startup) and runs no
+`ANALYZE`: the planner keeps using the table's per-column statistics, which the index does not change.
+The index is additive and has no opt-out. To keep the build out of the startup path, run it beforehand;
+v50 then finds it and only records the version:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_search_date_recent_end
+  ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+  INCLUDE (value_date, value_date_end) WHERE value_date_end IS NOT NULL;
+```
+
+The newest-first search fast path is only valid when no `search_index` row of the searched parameter
+has `last_updated IS NULL` (contained-resource memberships are written that way). Each fast-path
+statement used to re-run the whole search predicate in an `index_eligible` CTE to prove it. The
+backend now learns, per tenant, which `(resource type, parameter)` pairs have such rows with one
+`SELECT DISTINCT ... WHERE is_contained` and caches the answer for 30 s (plus a 10 s grace window
+served while one request refreshes it). A cached "NULL rows exist" answer, any probe failure, or a
+write by this process that creates contained rows keeps the original SQL, so the cache can only
+remove the probe, never add results. Writes by other processes are noticed after the TTL, so a
+deployment with several writers that create contained resources against one database can turn the
+cache off with `HFS_PG_ELIGIBLE_CACHE=0` (default on; `0`, `false`, `off` and `no` disable it).
 
 ### PostgreSQL + Elasticsearch
 
@@ -749,6 +783,10 @@ MongoDB runtime configuration also supports:
   the cross-tenant `count_by_tenant` aggregate, and of no other command (default: `25000`; must
   be 1 to 2147483647). Past it the call fails with `BackendError::Timeout`. It does not bound
   server selection, waiting for a pooled connection or socket time.
+- `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` for the documents per cursor batch of a SQL-on-FHIR scan
+  (default: `512`; must be 1 to 100000). Lower means lower first-row latency on selective views,
+  higher means fewer round trips against a remote MongoDB. It applies to the in-database
+  aggregate and to the patient/group fallback `find`.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 
@@ -761,6 +799,30 @@ default) does not write its search-index entries inside the transaction, which i
 write set; see
 [Deferred search indexing for large MongoDB transaction Bundles](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
 The measurements below predate that change and describe Bundles under the threshold.
+
+**How a Bundle sends its creates (#1977).** Creating a resource (a POST, or a PUT or conditional
+PUT that creates) no longer starts with a read of `resources` to see whether the id is taken; a
+PUT still looks up its target to choose between create and update. The unique
+`idx_resources_identity` refuses a reused id, live or deleted, and the Bundle fails at that entry
+with the same `400` ("resource already exists") as before. The creates are kept in memory and sent
+in chunks: a chunk goes out once it holds 100 entries, 16 MiB of resource payload (counted as BSON
+once for the `resources` document and once for its history copy, not the memory held) or 5,000
+search rows, and a
+resource of 1 MiB or more is sent on its own. These bounds are fixed in code, not configurable. A
+chunk is one ordered `insert_many` into `resources`, one into `resource_history` and, for natively
+indexed resources, one delete of any old rows of the created ids from each of `search_index` and
+`search_index_contained`, followed by one `insert_many` of the new rows into each that has any. A
+chunk is also sent before any entry that reads what the Bundle wrote (a GET, PUT, PATCH, DELETE,
+or a POST with `ifNoneExist`), before an entry's failure is reported, before the deferred-index
+ledger and before the commit. HFS runs a Bundle's entries in the order DELETE, POST, PUT or PATCH,
+GET, so its plain POSTs are normally one run. A run of plain POSTs within the bounds sends at most
+6 commands per 100 entries, where it sent 6 to 7 per entry before (3 per entry on
+`mongodb-elasticsearch` and above the deferral threshold, which now send 2 per 100); a bound can
+cut a chunk short. A PUT or conditional PUT that creates, and a POST with `ifNoneExist`, make the
+Bundle send what it holds first, so such creates are sent one at a time and save only the
+existence read. The Bundle writes the same documents and index keys, so this shortens how long it
+runs and holds the admission room. For the same reason the cache ceiling below is not expected to
+move; that is inferred. Neither the speed-up nor the ceiling has been measured on the benchmark.
 
 Past what the cache can hold, MongoDB aborts the oldest transaction ("oldest pinned transaction
 ID rolled back for eviction"). HFS replays such aborts (#1641, #1700), except for a Bundle that
@@ -866,12 +928,15 @@ that an unchanged resubmit will fail: the room bounds only this instance's trans
 while single-resource writes, batch Bundles, other HFS instances and other clients share the same
 cache, so a resubmit is unlikely to succeed but can (#1993). It logs one `WARN`, "transaction bundle
 rolled back for eviction while running alone; not retrying", with `lone=true`, `entries`,
-`failed_entry` (absent at commit), `error_code` and `attempt` (#1895). The `Transaction failed`
-`ERROR` line names the cause: `write set too large` for 388, `lone eviction rollback` here. Bundles
-that shared the room, and plain write conflicts, are still replayed. With a weight of `0` or no
-limit no Bundle counts as alone. Raising the limit x the weight above the largest Bundle restores
-the replays, at the cost of sharing the cache. The room is per backend instance: Bundles sent to
-another HFS instance on the same MongoDB are not seen.
+`failed_entry` (absent at commit), `error_code` and `attempt` (#1895). With chunked creates
+(#1977), `failed_entry`, and the "Entry N" of the log-only reasons, is the entry whose document the
+server refused when the error names one, and otherwise the first entry of the chunk being sent, so
+an abort position reads up to 99 entries before the entry the server was writing. The
+`Transaction failed` `ERROR` line names the cause: `write set too large` for 388,
+`lone eviction rollback` here. Bundles that shared the room, and plain write conflicts, are still
+replayed. With a weight of `0` or no limit no Bundle counts as alone. Raising the limit x the
+weight above the largest Bundle restores the replays, at the cost of sharing the cache. The room is
+per backend instance: Bundles sent to another HFS instance on the same MongoDB are not seen.
 
 Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less
 2 s, capped at 120 s) counts from admission. The whole call, wait included, stays within
@@ -1088,16 +1153,17 @@ which MongoDB rolls a lone Bundle back for cache eviction (see
 
 **What the transaction writes.** The `resources` documents and the history rows, as always. Each
 `resources` document whose rows are deferred also carries a transient field,
-`search_rows_pending: <bundle id>`, until its rows are written. The transaction adds a ledger,
-the `search_index_pending` collection, with one document per 5,000 resources (50,000 resources
-write ten), each naming its resources as `Type/id` together with `tenant_id`, `bundle_id`,
-`chunk`, `chunks`, `entries`, `created_at`, `not_before` and `attempts`. The ledger commits or
-aborts with the Bundle, so an aborted or replayed attempt leaves neither a ledger nor markers. A
-failure to write the ledger is a server-side failure of the Bundle and answers `500`, with nothing
-applied (a cache failure still ends as `500` `too-costly`, and a transient abort is replayed as
-before); no entry is blamed for it. The transaction does not insert `search_index` or
-`search_index_contained` rows, and it skips the two deletes of old rows per entry. It still runs
-the search extraction, and each `resources` document still gets its `missing_params`
+`search_rows_pending: <bundle id>`, until its rows are written. The transaction adds a ledger, the
+`search_index_pending` collection, with one document per 5,000 resources (50,000 resources write
+ten), each naming its resources as `Type/id` together with `tenant_id`, `bundle_id`, `chunk`,
+`chunks`, `entries`, `created_at`, `not_before` and `attempts`. The ledger goes in after the last
+chunk of creates (#1977) and before the commit, and it commits or aborts with the Bundle, so an
+aborted or replayed attempt leaves neither a ledger nor markers. A failure to write the ledger is a
+server-side failure of the Bundle and answers `500`, with nothing applied (a cache failure still
+ends as `500` `too-costly`, and a transient abort is replayed as before); no entry is blamed for
+it. The transaction does not insert `search_index` or `search_index_contained` rows, and it skips
+the deletes of old rows that an inline Bundle sends once per chunk of creates (or per update). It
+still runs the search extraction, and each `resources` document still gets its `missing_params`
 ([missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata))
 inside the transaction. That array and its `idx_resources_missing_params` entries are part of the
 transaction's write set; only the rows are deferred. The collection and its `not_before` index
@@ -2098,7 +2164,8 @@ cleared once a generation finishes; backends that do not implement the three
 defaulted methods simply never resume, as before #1125.
 
 The `hfs` binary exposes these as `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS`,
-`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY` and
+`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY`,
+`HFS_ELASTICSEARCH_CONTAINED_SWEEP_CONCURRENCY` and
 `HFS_ELASTICSEARCH_REINDEX_REFRESH`, and the deferred rebuild's page as
 `HFS_REINDEX_BATCH_SIZE` plus `HFS_REINDEX_BATCH_BYTES` (see the
 [hfs README](../hfs/README.md#environment-variables)).

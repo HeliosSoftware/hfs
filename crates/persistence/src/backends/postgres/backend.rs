@@ -43,6 +43,64 @@ struct StoredOverlay {
     /// overlay is empty, otherwise the base with the overlay registered on
     /// top. Built once per fingerprint, never per write.
     registry: Option<Arc<RwLock<SearchParameterRegistry>>>,
+    /// When the fingerprint probe last confirmed this overlay against the
+    /// database. A write within the backend's fingerprint TTL of this instant
+    /// reuses the overlay without probing. Replaced (so `None`) by every
+    /// local SearchParameter write, whose cache reload drops the entry.
+    validated_at: Option<std::time::Instant>,
+}
+
+/// Default window in which a write trusts a validated overlay without probing
+/// the database again: zero, i.e. every write probes (the exact, previous
+/// behavior). Opt in with `HFS_PG_SP_FINGERPRINT_TTL_MS=<ms>` (for example
+/// `1000`): a SearchParameter committed by this process still invalidates the
+/// cache immediately; only one committed by another HFS process can then take
+/// up to that long to be seen by ordinary writes.
+const DEFAULT_OVERLAY_FINGERPRINT_TTL: Duration = Duration::ZERO;
+
+fn overlay_fingerprint_ttl_from_env() -> Duration {
+    std::env::var("HFS_PG_SP_FINGERPRINT_TTL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_OVERLAY_FINGERPRINT_TTL)
+}
+
+/// How fresh the overlay a write extracts with must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayFreshness {
+    /// An overlay validated within the fingerprint TTL is reused without a
+    /// probe. For ordinary single-resource and Bundle writes, where a
+    /// SearchParameter committed by another process may take up to the TTL to
+    /// be seen.
+    WithinTtl,
+    /// Always probe the database fingerprint, whatever the TTL. For callers
+    /// whose batch takes its overlay snapshot under the tenant gate and must
+    /// see every SearchParameter committed before that point (bulk submit).
+    Authoritative,
+}
+
+impl OverlayFreshness {
+    /// Whether a recently validated cached overlay may stand in for a probe.
+    fn may_skip_probe(self, ttl: Duration, pending_search_parameter: bool) -> bool {
+        self == Self::WithinTtl && !pending_search_parameter && !ttl.is_zero()
+    }
+}
+
+/// The tenant's validated overlay registry, if it was confirmed against the
+/// database within `ttl`. `None` means the caller must probe.
+fn fresh_overlay_registry(
+    stored: &StoredByTenant,
+    tenant_id: &str,
+    ttl: Duration,
+) -> Option<Arc<RwLock<SearchParameterRegistry>>> {
+    let stored = stored.read();
+    let overlay = stored.get(tenant_id)?;
+    overlay
+        .validated_at
+        .is_some_and(|t| t.elapsed() < ttl)
+        .then(|| overlay.registry.clone())
+        .flatten()
 }
 
 /// A cheap summary of a tenant's live `SearchParameter` rows (#1897).
@@ -70,6 +128,8 @@ pub struct PostgresBackend {
     registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
     stored_by_tenant: StoredByTenant,
+    /// How long a validated overlay is trusted without a fingerprint probe.
+    overlay_fingerprint_ttl: Duration,
     /// `search_index` layout, read from the marker once the schema is initialized.
     /// Unset until then, which reads as [`IndexLayout::Legacy`] — the form that
     /// is correct against either layout.
@@ -106,7 +166,9 @@ impl Debug for PostgresBackend {
 }
 
 /// Configuration for the PostgreSQL backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so the password never reaches a log line (#2149).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PostgresConfig {
     /// PostgreSQL host.
     #[serde(default = "default_host")]
@@ -402,6 +464,50 @@ fn default_pool_wait_timeout_secs() -> u64 {
     10
 }
 
+impl Debug for PostgresConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            host,
+            port,
+            dbname,
+            user,
+            password,
+            ssl_mode,
+            max_connections,
+            connect_timeout_secs,
+            statement_timeout_ms,
+            count_by_tenant_statement_timeout_ms,
+            plan_cache_mode,
+            pool_wait_timeout_secs,
+            fhir_version,
+            data_dir,
+            search_offloaded,
+        } = self;
+        f.debug_struct("PostgresConfig")
+            .field("host", host)
+            .field("port", port)
+            .field("dbname", dbname)
+            .field("user", user)
+            .field("password", &password.as_ref().map(|_| "[redacted]"))
+            .field("ssl_mode", ssl_mode)
+            .field("max_connections", max_connections)
+            .field("connect_timeout_secs", connect_timeout_secs)
+            .field("statement_timeout_ms", statement_timeout_ms)
+            .field(
+                "count_by_tenant_statement_timeout_ms",
+                count_by_tenant_statement_timeout_ms,
+            )
+            .field("plan_cache_mode", plan_cache_mode)
+            .field("pool_wait_timeout_secs", pool_wait_timeout_secs)
+            .field("fhir_version", fhir_version)
+            .field("data_dir", data_dir)
+            .field("search_offloaded", search_offloaded)
+            .finish()
+    }
+}
+
 impl Default for PostgresConfig {
     fn default() -> Self {
         Self {
@@ -607,6 +713,7 @@ impl PostgresBackend {
             config,
             registries,
             stored_by_tenant,
+            overlay_fingerprint_ttl: overlay_fingerprint_ttl_from_env(),
             index_layout: Arc::new(std::sync::OnceLock::new()),
             patient_export_index_ready: Arc::new(AtomicBool::new(false)),
             fts_table_exists: Arc::new(std::sync::OnceLock::new()),
@@ -620,6 +727,15 @@ impl PostgresBackend {
             #[cfg(test)]
             reindex_test_entered: None,
         })
+    }
+
+    /// Sets how long a write trusts a validated SearchParameter overlay
+    /// without probing the database (see `HFS_PG_SP_FINGERPRINT_TTL_MS`).
+    /// `Duration::ZERO` probes on every write.
+    #[doc(hidden)]
+    pub fn with_overlay_fingerprint_ttl(mut self, ttl: Duration) -> Self {
+        self.overlay_fingerprint_ttl = ttl;
+        self
     }
 
     /// Selects the maximum number of concurrent reindex writers on this instance.
@@ -966,6 +1082,20 @@ impl PostgresBackend {
             .unwrap_or(super::schema::IndexLayout::Legacy)
     }
 
+    /// Declares that `search_index` rows of `(tenant, resource_type, param)`
+    /// carry a NULL `last_updated`, exactly as a writer in this process does
+    /// through `note_null_rows` before it commits such rows.
+    ///
+    /// HFS only ever writes NULL `last_updated` for contained-resource
+    /// memberships (`is_contained`), which the eligibility cache learns from the
+    /// database. A test that fabricates NULLs by raw `UPDATE` on ordinary rows
+    /// plays an out-of-band writer the cache cannot see, so it declares them
+    /// here. `#[doc(hidden)] pub` only for the integration tests.
+    #[doc(hidden)]
+    pub fn declare_null_last_updated_rows(&self, tenant: &str, resource_type: &str, param: &str) {
+        super::null_timestamp_facts::note_null_rows(tenant, resource_type, param);
+    }
+
     /// The statement [`Self::reload_stored_cache`] runs to read every tenant's
     /// stored SearchParameters, at startup and on every refresh.
     ///
@@ -1067,6 +1197,7 @@ impl PostgresBackend {
                         fingerprint: None,
                         definitions: Vec::new(),
                         registry: None,
+                        validated_at: None,
                     })
                     .definitions
                     .push(def);
@@ -1248,10 +1379,49 @@ impl PostgresBackend {
     where
         C: GenericClient + Sync + ?Sized,
     {
+        self.write_extractor_with(
+            client,
+            tenant_id,
+            extracts,
+            pending_search_parameter,
+            OverlayFreshness::WithinTtl,
+        )
+        .await
+    }
+
+    /// [`Self::write_extractor`] with the freshness the caller needs. Callers
+    /// that must see every SearchParameter committed before their snapshot
+    /// pass [`OverlayFreshness::Authoritative`], which always runs the
+    /// fingerprint probe (and so fails if the database cannot answer it);
+    /// the full overlay read still happens only when the fingerprint moved.
+    pub(crate) async fn write_extractor_with<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        extracts: bool,
+        pending_search_parameter: bool,
+        freshness: OverlayFreshness,
+    ) -> StorageResult<SearchParameterExtractor>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
         if !extracts {
             return Ok(SearchParameterExtractor::new(
                 self.registries.base().clone(),
             ));
+        }
+        // Fast path: this overlay was validated moments ago and this
+        // transaction has no uncommitted SearchParameter of its own, so skip
+        // the probe. Local SearchParameter writes drop the entry on commit;
+        // other processes' are seen within the TTL.
+        if freshness.may_skip_probe(self.overlay_fingerprint_ttl, pending_search_parameter)
+            && let Some(registry) = fresh_overlay_registry(
+                &self.stored_by_tenant,
+                tenant_id,
+                self.overlay_fingerprint_ttl,
+            )
+        {
+            return Ok(SearchParameterExtractor::new(registry));
         }
         let fingerprint = self.overlay_fingerprint(client, tenant_id).await?;
         let cached = self
@@ -1264,6 +1434,12 @@ impl PostgresBackend {
                     .flatten()
             });
         if let Some(registry) = cached {
+            if !pending_search_parameter
+                && let Some(overlay) = self.stored_by_tenant.write().get_mut(tenant_id)
+                && overlay.fingerprint == Some(fingerprint)
+            {
+                overlay.validated_at = Some(std::time::Instant::now());
+            }
             return Ok(SearchParameterExtractor::new(registry));
         }
         let definitions = self.read_stored_overlay(client, tenant_id).await?;
@@ -1275,6 +1451,7 @@ impl PostgresBackend {
                     fingerprint: Some(fingerprint),
                     definitions,
                     registry: Some(registry.clone()),
+                    validated_at: Some(std::time::Instant::now()),
                 },
             );
             // The search path's registry for this tenant was built from the
@@ -1649,6 +1826,71 @@ fn is_transient_connect_failure(e: &deadpool_postgres::PoolError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_debug_redacts_password() {
+        let config = PostgresConfig {
+            host: "db.internal".to_string(),
+            password: Some("pg-s3cret-pw".to_string()),
+            ..Default::default()
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("pg-s3cret-pw"), "password leaked: {out}");
+        assert!(out.contains("[redacted]"), "{out}");
+        assert!(out.contains("db.internal"), "{out}");
+    }
+
+    fn overlay(validated_at: Option<std::time::Instant>) -> StoredOverlay {
+        StoredOverlay {
+            fingerprint: Some(OverlayFingerprint {
+                live: 1,
+                newest: None,
+            }),
+            definitions: Vec::new(),
+            registry: Some(Arc::new(RwLock::new(SearchParameterRegistry::new()))),
+            validated_at,
+        }
+    }
+
+    /// Only `WithinTtl` may skip the probe, and never with a pending
+    /// SearchParameter or a zero TTL; `Authoritative` always probes.
+    #[test]
+    fn authoritative_freshness_never_skips_the_probe() {
+        let ttl = Duration::from_secs(60);
+        assert!(OverlayFreshness::WithinTtl.may_skip_probe(ttl, false));
+        assert!(!OverlayFreshness::WithinTtl.may_skip_probe(ttl, true));
+        assert!(!OverlayFreshness::WithinTtl.may_skip_probe(Duration::ZERO, false));
+        assert!(!OverlayFreshness::Authoritative.may_skip_probe(ttl, false));
+        assert!(!OverlayFreshness::Authoritative.may_skip_probe(ttl, true));
+        assert!(!OverlayFreshness::Authoritative.may_skip_probe(Duration::ZERO, false));
+    }
+
+    /// The write-path fast path skips the fingerprint probe only for an
+    /// overlay validated within the TTL; a reload (which replaces the entry
+    /// with an unvalidated one), an expired validation, a missing tenant and a
+    /// zero TTL all force a probe.
+    #[test]
+    fn fingerprint_probe_is_skipped_only_within_ttl() {
+        let stored: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
+        let ttl = Duration::from_secs(60);
+        assert!(fresh_overlay_registry(&stored, "t", ttl).is_none());
+
+        stored
+            .write()
+            .insert("t".into(), overlay(Some(std::time::Instant::now())));
+        assert!(fresh_overlay_registry(&stored, "t", ttl).is_some());
+        assert!(fresh_overlay_registry(&stored, "other", ttl).is_none());
+        assert!(fresh_overlay_registry(&stored, "t", Duration::ZERO).is_none());
+
+        // A SearchParameter write reloads the cache: entry replaced, unvalidated.
+        stored.write().insert("t".into(), overlay(None));
+        assert!(fresh_overlay_registry(&stored, "t", ttl).is_none());
+
+        // Expired validation.
+        let old = std::time::Instant::now() - Duration::from_secs(120);
+        stored.write().insert("t".into(), overlay(Some(old)));
+        assert!(fresh_overlay_registry(&stored, "t", ttl).is_none());
+    }
 
     /// #1793: only a connect that failed before reaching the server is
     /// retried; pool exhaustion, a closed pool and timeouts are not.

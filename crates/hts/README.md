@@ -524,8 +524,11 @@ is unsupported. ID reservation checks assume CRUD and terminology storage share
 the same database, as configured by the server. REST create, update and delete
 commit the resource, its history, and normalized terminology together. A failed
 normalization rolls back the entire resource write. PostgreSQL coordinates
-imports and REST writes using the same identity locks; SQLite serializes writers
-in its transaction. Bulk imports retain their separate partial-success behavior.
+imports and REST writes using the same identity locks. These hash into a fixed
+set of 256 advisory locks, so a transaction holds at most 256 locks however
+large its bundle is. A large import therefore also delays REST writes to
+unrelated resources until it commits. SQLite serializes writers in its
+transaction. Bulk imports retain their separate partial-success behavior.
 A bulk import reports an error for a canonical resource already managed through
 REST, preserving its content and history. Use PUT to change that resource.
 

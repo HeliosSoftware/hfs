@@ -1,5 +1,5 @@
 SELECT
-  json_extract(r.data, '$.id') AS "id"
+  json_extract(CAST(r.data AS TEXT), '$.id') AS "id"
 FROM resources r
 WHERE r.tenant_id = ?1
   AND r.resource_type = ?2

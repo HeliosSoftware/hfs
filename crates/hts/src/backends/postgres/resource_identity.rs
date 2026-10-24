@@ -1,5 +1,7 @@
 //! Allocation and indexed lookup of public terminology resource IDs.
 
+use std::collections::{HashMap, HashSet};
+
 use deadpool_postgres::GenericClient;
 use helios_persistence::tenant::SYSTEM_TENANT;
 use serde_json::Value;
@@ -7,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::backends::resource_identity::{
     ImportIdentity, LegacyIdentitySource, MigrationOwners, ResourceKind, ResourceRecord,
-    matches_persisted_resource, valid_logical_id,
+    persisted_canonical_matches, valid_logical_id,
 };
 use crate::error::HtsError;
 
@@ -15,7 +17,21 @@ fn storage_error(error: tokio_postgres::Error) -> HtsError {
     HtsError::StorageError(super::error_chain(&error))
 }
 
-/// Only imports competing for a source ID or canonical version serialize.
+/// Identity keys hash into this many advisory locks. Every advisory lock held
+/// takes a slot in PostgreSQL's shared lock table, which by default holds
+/// `max_locks_per_transaction` (64) × (`max_connections` + prepared
+/// transactions) entries. One lock per resource made a 5,000-resource
+/// bootstrap batch fail with "out of shared memory". Bucketing caps any
+/// transaction at this many locks, at the cost of unrelated identities
+/// sharing a lock: a large import serializes with every REST write.
+const IDENTITY_LOCK_BUCKETS: u64 = 256;
+
+/// First key of the bucket range ("HTS_ID\0\0"), in the single-`bigint`
+/// advisory key space, clear of `HTS_SCHEMA_LOCK` and the HFS migration lock.
+const IDENTITY_LOCK_BASE: i64 = 0x4854_535f_4944_0000;
+
+/// Only imports competing for a source ID or canonical version (or its lock
+/// bucket) serialize.
 /// Acquire every key in sorted order before writing, so bundles with reversed
 /// resource order cannot deadlock. One command acquires the whole bounded batch.
 pub(crate) async fn lock_import(
@@ -53,7 +69,8 @@ pub(crate) async fn lock_import(
     lock_keys(client, keys).await
 }
 
-async fn lock_keys(client: &impl GenericClient, mut keys: Vec<i64>) -> Result<(), HtsError> {
+async fn lock_keys(client: &impl GenericClient, keys: Vec<i64>) -> Result<(), HtsError> {
+    let mut keys: Vec<i64> = keys.into_iter().map(lock_bucket).collect();
     keys.sort_unstable();
     keys.dedup();
     if !keys.is_empty() {
@@ -99,6 +116,10 @@ fn lock_key(kind: ResourceKind, scope: &str, value: &str, version: &str) -> i64 
     let mut bytes = [0; 8];
     bytes.copy_from_slice(&digest[..8]);
     i64::from_be_bytes(bytes)
+}
+
+fn lock_bucket(key: i64) -> i64 {
+    IDENTITY_LOCK_BASE + (key as u64 % IDENTITY_LOCK_BUCKETS) as i64
 }
 
 #[derive(PartialEq, Eq)]
@@ -174,59 +195,344 @@ pub(crate) async fn lock_mutation(
     Ok(())
 }
 
-/// Bulk imports cannot replace a REST-managed resource without also updating
-/// its history. Strict CRUD normalization deliberately does not use this guard.
-pub(crate) async fn check_import_owner(
-    client: &impl GenericClient,
-    kind: ResourceKind,
-    source_id: &str,
-    url: &str,
-    version: Option<&str>,
-) -> Result<(), HtsError> {
-    if matches!(kind, ResourceKind::ConceptMap) {
-        let reserved: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM resources WHERE tenant_id = $1 AND resource_type = $2 \
-                 AND id = $3)",
-                &[&SYSTEM_TENANT, &kind.resource_type(), &source_id],
+/// Identity decisions for one import or REST write, read in a few set-based
+/// queries per resource kind instead of several round trips per resource.
+///
+/// The caller holds the identity locks of every resource it will write, so
+/// the rows read here cannot change under it. Each decision is recorded, so a
+/// later entry in the same bundle sees the rows that earlier entries wrote,
+/// exactly as per-resource queries would.
+pub(crate) struct ImportIdentities {
+    has_resources: bool,
+    code_systems: KindIdentities,
+    value_sets: KindIdentities,
+    concept_maps: KindIdentities,
+}
+
+#[derive(Default)]
+struct KindIdentities {
+    /// `(url, version or "")` → `(storage id, public id)` of its normalized row.
+    canonical: HashMap<(String, String), (String, String)>,
+    /// Canonicals whose public id is a live REST resource.
+    rest_owners: HashMap<(String, String), String>,
+    /// Storage ids known to exist, complete for every queried candidate.
+    storage_ids: HashSet<String>,
+    /// Public id → storage id, complete for every queried candidate.
+    public_ids: HashMap<String, String>,
+    /// REST resources with a candidate id: `None` when deleted.
+    persisted: HashMap<String, Option<PersistedCanonical>>,
+}
+
+/// The string `url` and `version` of a live REST resource.
+struct PersistedCanonical {
+    url: Option<String>,
+    version: Option<String>,
+}
+
+impl ImportIdentities {
+    /// Read the identity state for every resource in `parsed`. `has_resources`
+    /// says whether the REST resource table exists in this database.
+    pub(crate) async fn load(
+        client: &impl GenericClient,
+        parsed: &crate::import::bundle_parser::ParsedBundle,
+        has_resources: bool,
+    ) -> Result<Self, HtsError> {
+        let code_systems = parsed
+            .code_systems
+            .iter()
+            .map(|cs| (cs.id.as_str(), cs.url.as_str(), cs.version.as_deref()))
+            .collect::<Vec<_>>();
+        let value_sets = parsed
+            .value_sets
+            .iter()
+            .map(|vs| (vs.id.as_str(), vs.url.as_str(), vs.version.as_deref()))
+            .collect::<Vec<_>>();
+        // ConceptMap has one normalized row per URL, regardless of version.
+        let concept_maps = parsed
+            .concept_maps
+            .iter()
+            .map(|cm| (cm.id.as_str(), cm.url.as_str(), None))
+            .collect::<Vec<_>>();
+        Ok(Self {
+            has_resources,
+            code_systems: KindIdentities::load(
+                client,
+                ResourceKind::CodeSystem,
+                &code_systems,
+                has_resources,
             )
-            .await
-            .map_err(storage_error)?
-            .get(0);
-        if reserved {
+            .await?,
+            value_sets: KindIdentities::load(
+                client,
+                ResourceKind::ValueSet,
+                &value_sets,
+                has_resources,
+            )
+            .await?,
+            concept_maps: KindIdentities::load(
+                client,
+                ResourceKind::ConceptMap,
+                &concept_maps,
+                has_resources,
+            )
+            .await?,
+        })
+    }
+
+    fn kind(&mut self, kind: ResourceKind) -> &mut KindIdentities {
+        match kind {
+            ResourceKind::CodeSystem => &mut self.code_systems,
+            ResourceKind::ValueSet => &mut self.value_sets,
+            ResourceKind::ConceptMap => &mut self.concept_maps,
+        }
+    }
+
+    /// Bulk imports cannot replace a REST-managed resource without also
+    /// updating its history. Strict CRUD normalization deliberately does not
+    /// use this guard.
+    pub(crate) fn check_import_owner(
+        &mut self,
+        kind: ResourceKind,
+        source_id: &str,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<(), HtsError> {
+        let identities = self.kind(kind);
+        if matches!(kind, ResourceKind::ConceptMap) && identities.persisted.contains_key(source_id)
+        {
             return Err(HtsError::Conflict(format!(
                 "ConceptMap/{source_id} is reserved by the REST resource store"
             )));
         }
+        let version = if matches!(kind, ResourceKind::ConceptMap) {
+            None
+        } else {
+            version
+        };
+        if let Some(id) = identities.rest_owners.get(&canonical_key(url, version)) {
+            return Err(HtsError::Conflict(format!(
+                "{}/{id} is managed through REST; import cannot replace its content",
+                kind.resource_type(),
+            )));
+        }
+        Ok(())
     }
 
-    let (version_column, version) = if matches!(kind, ResourceKind::ConceptMap) {
-        ("''", None)
-    } else {
-        ("version", version)
-    };
-    let owner: Option<String> = client
-        .query_opt(
-            &format!(
-                "SELECT r.id FROM (SELECT {} AS public_id FROM {}
-         WHERE url = $1 AND COALESCE({version_column}, '') = COALESCE($2, '')) AS normalized
-         JOIN resources r ON r.id = normalized.public_id
-         WHERE r.tenant_id = $3 AND r.resource_type = $4 AND NOT r.is_deleted",
-                kind.postgres_identity_expression(),
-                kind.table(),
-            ),
-            &[&url, &version, &SYSTEM_TENANT, &kind.resource_type()],
-        )
-        .await
-        .map_err(storage_error)?
-        .map(|row| row.get(0));
-    if let Some(id) = owner {
-        return Err(HtsError::Conflict(format!(
-            "{}/{id} is managed through REST; import cannot replace its content",
-            kind.resource_type(),
-        )));
+    /// Choose the storage key and public id for a versioned resource and record
+    /// them as written. A canonical that already has a row keeps both.
+    ///
+    /// The storage key prefers `<source id>|<version>`, then a UUID. The public
+    /// id prefers the source id unless another row or a REST resource for a
+    /// different canonical holds it, then a UUID.
+    pub(crate) fn assign(
+        &mut self,
+        kind: ResourceKind,
+        source_id: &str,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<(String, String), HtsError> {
+        let has_resources = self.has_resources;
+        let identities = self.kind(kind);
+        let key = canonical_key(url, version);
+        if let Some((storage_id, public_id)) = identities.canonical.get(&key) {
+            if !valid_logical_id(public_id) {
+                return Err(HtsError::StorageError(
+                    "Stored public resource id is invalid".into(),
+                ));
+            }
+            return Ok((storage_id.clone(), public_id.clone()));
+        }
+
+        let preferred = crate::import::fhir_bundle::storage_id_for(source_id, version);
+        let storage_id = if identities.storage_ids.contains(&preferred)
+            || identities.public_ids.contains_key(&preferred)
+        {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            preferred
+        };
+        // Only source ids were read from the database. A fresh UUID cannot
+        // collide in practice, so it is checked against this import alone.
+        let mut public_id = if valid_logical_id(source_id) {
+            source_id.to_owned()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        loop {
+            let taken = identities
+                .public_ids
+                .get(&public_id)
+                .is_some_and(|owner| owner != &storage_id);
+            let reserved = has_resources
+                && identities
+                    .persisted
+                    .get(&public_id)
+                    .is_some_and(|resource| {
+                        !resource.as_ref().is_some_and(|persisted| {
+                            persisted_canonical_matches(
+                                persisted.url.as_deref(),
+                                persisted.version.as_deref(),
+                                false,
+                                url,
+                                version,
+                            )
+                        })
+                    });
+            if !taken && !reserved {
+                break;
+            }
+            public_id = uuid::Uuid::new_v4().to_string();
+        }
+
+        identities.storage_ids.insert(storage_id.clone());
+        identities
+            .public_ids
+            .insert(public_id.clone(), storage_id.clone());
+        // A live REST resource with this id now owns the canonical.
+        if identities
+            .persisted
+            .get(&public_id)
+            .is_some_and(Option::is_some)
+        {
+            identities
+                .rest_owners
+                .insert(key.clone(), public_id.clone());
+        }
+        identities
+            .canonical
+            .insert(key, (storage_id.clone(), public_id.clone()));
+        Ok((storage_id, public_id))
     }
-    Ok(())
+}
+
+impl KindIdentities {
+    /// `resources` holds `(source id, url, version)` for every resource of this
+    /// kind in the write.
+    async fn load(
+        client: &impl GenericClient,
+        kind: ResourceKind,
+        resources: &[(&str, &str, Option<&str>)],
+        has_resources: bool,
+    ) -> Result<Self, HtsError> {
+        let mut identities = Self::default();
+        if resources.is_empty() {
+            return Ok(identities);
+        }
+        let table = kind.table();
+        let identity = kind.postgres_identity_expression();
+        let version = if matches!(kind, ResourceKind::ConceptMap) {
+            "''"
+        } else {
+            "COALESCE(n.version, '')"
+        };
+        let urls = resources
+            .iter()
+            .map(|(_, url, _)| (*url).to_owned())
+            .collect::<Vec<_>>();
+        let versions = resources
+            .iter()
+            .map(|(_, _, version)| version.unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+
+        // Existing rows for these canonicals, with any live REST owner.
+        let owner = if has_resources {
+            "(SELECT r.id FROM resources r WHERE r.tenant_id = $3 AND r.resource_type = $4 \
+             AND r.id = n.public_id AND NOT r.is_deleted)"
+        } else {
+            "NULL::text"
+        };
+        let sql = format!(
+            "SELECT n.url, n.version, n.id, n.public_id, {owner} FROM ( \
+             SELECT DISTINCT n.url, {version} AS version, n.id, {identity} AS public_id \
+             FROM {table} n JOIN unnest($1::text[], $2::text[]) AS c(url, version) \
+             ON n.url = c.url AND {version} = c.version) AS n"
+        );
+        let rows = if has_resources {
+            client
+                .query(
+                    &sql,
+                    &[&urls, &versions, &SYSTEM_TENANT, &kind.resource_type()],
+                )
+                .await
+        } else {
+            client.query(&sql, &[&urls, &versions]).await
+        }
+        .map_err(storage_error)?;
+        for row in rows {
+            let key: (String, String) = (row.get(0), row.get(1));
+            let storage_id: String = row.get(2);
+            let public_id: String = row.get(3);
+            if let Some(owner) = row.get::<_, Option<String>>(4) {
+                identities.rest_owners.insert(key.clone(), owner);
+            }
+            identities.storage_ids.insert(storage_id.clone());
+            identities
+                .public_ids
+                .insert(public_id.clone(), storage_id.clone());
+            identities.canonical.insert(key, (storage_id, public_id));
+        }
+
+        // ConceptMap ids are their storage keys; nothing else to allocate.
+        let source_ids = resources
+            .iter()
+            .map(|(id, _, _)| (*id).to_owned())
+            .filter(|id| matches!(kind, ResourceKind::ConceptMap) || valid_logical_id(id))
+            .collect::<Vec<_>>();
+        if !matches!(kind, ResourceKind::ConceptMap) {
+            let mut candidates = resources
+                .iter()
+                .map(|(id, _, version)| crate::import::fhir_bundle::storage_id_for(id, *version))
+                .chain(source_ids.iter().cloned())
+                .collect::<Vec<_>>();
+            candidates.sort_unstable();
+            candidates.dedup();
+            for row in client
+                .query(
+                    &format!(
+                        "SELECT id, {identity} FROM {table} \
+                         WHERE id = ANY($1) OR {identity} = ANY($1)"
+                    ),
+                    &[&candidates],
+                )
+                .await
+                .map_err(storage_error)?
+            {
+                let storage_id: String = row.get(0);
+                identities.storage_ids.insert(storage_id.clone());
+                identities.public_ids.insert(row.get(1), storage_id);
+            }
+        }
+
+        // REST resources whose ids the source ids would take.
+        if has_resources && !source_ids.is_empty() {
+            for row in client
+                .query(
+                    "SELECT id, is_deleted, \
+                     CASE WHEN jsonb_typeof(data->'url') = 'string' THEN data->>'url' END, \
+                     CASE WHEN jsonb_typeof(data->'version') = 'string' \
+                     THEN data->>'version' END \
+                     FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id = ANY($3)",
+                    &[&SYSTEM_TENANT, &kind.resource_type(), &source_ids],
+                )
+                .await
+                .map_err(storage_error)?
+            {
+                let deleted: bool = row.get(1);
+                identities.persisted.insert(
+                    row.get(0),
+                    (!deleted).then(|| PersistedCanonical {
+                        url: row.get(2),
+                        version: row.get(3),
+                    }),
+                );
+            }
+        }
+        Ok(identities)
+    }
+}
+
+fn canonical_key(url: &str, version: Option<&str>) -> (String, String) {
+    (url.to_owned(), version.unwrap_or("").to_owned())
 }
 
 pub(super) async fn migrate(client: &mut deadpool_postgres::Object) -> Result<(), HtsError> {
@@ -316,86 +622,6 @@ pub(super) async fn migrate(client: &mut deadpool_postgres::Object) -> Result<()
         .map_err(storage_error)?;
     }
     tx.commit().await.map_err(storage_error)
-}
-
-pub(crate) async fn allocate(
-    client: &impl GenericClient,
-    kind: ResourceKind,
-    storage_id: &str,
-    source_id: &str,
-    url: &str,
-    version: Option<&str>,
-) -> Result<String, HtsError> {
-    let table = kind.table();
-    let existing = client
-        .query_opt(
-            &format!("SELECT COALESCE(resource_json->>'id', id) FROM {table} WHERE id = $1"),
-            &[&storage_id],
-        )
-        .await
-        .map_err(storage_error)?
-        .and_then(|row| row.get::<_, Option<String>>(0));
-    if let Some(id) = existing {
-        if !valid_logical_id(&id) {
-            return Err(HtsError::StorageError(
-                "Stored public resource id is invalid".into(),
-            ));
-        }
-        return Ok(id);
-    }
-    allocate_available(client, kind, storage_id, source_id, url, version).await
-}
-
-async fn allocate_available(
-    client: &impl GenericClient,
-    kind: ResourceKind,
-    storage_id: &str,
-    source_id: &str,
-    url: &str,
-    version: Option<&str>,
-) -> Result<String, HtsError> {
-    let table = kind.table();
-    let identity = kind.postgres_identity_expression();
-    let has_resources: bool = client
-        .query_one("SELECT to_regclass('resources') IS NOT NULL", &[])
-        .await
-        .map_err(storage_error)?
-        .get(0);
-    let mut candidate = if valid_logical_id(source_id) {
-        source_id.to_owned()
-    } else {
-        uuid::Uuid::new_v4().to_string()
-    };
-    loop {
-        let taken: bool = client
-            .query_one(
-                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {identity} = $1 AND id != $2)"),
-                &[&candidate, &storage_id],
-            )
-            .await
-            .map_err(storage_error)?
-            .get(0);
-        let reserved = if has_resources {
-            client
-                .query_opt(
-                    "SELECT data, is_deleted FROM resources WHERE tenant_id = $1 \
-                     AND resource_type = $2 AND id = $3",
-                    &[&SYSTEM_TENANT, &kind.resource_type(), &candidate],
-                )
-                .await
-                .map_err(storage_error)?
-                .is_some_and(|row| {
-                    !matches_persisted_resource(&row.get::<_, Value>(0), row.get(1), url, version)
-                })
-        } else {
-            false
-        };
-        if !taken && !reserved {
-            break;
-        }
-        candidate = uuid::Uuid::new_v4().to_string();
-    }
-    Ok(candidate)
 }
 
 pub(crate) async fn read(

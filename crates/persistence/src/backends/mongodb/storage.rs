@@ -42,6 +42,7 @@ use crate::types::{
 };
 
 use super::MongoBackend;
+use super::bundle_creates::{PendingCreates, StagedCreate};
 use super::deferred_index::{
     BundleDeferral, DeferredCommit, DeferredIndexSet, SEARCH_INDEX_PENDING_COLLECTION,
     SEARCH_ROWS_PENDING_FIELD, inline_index_types, ledger_documents,
@@ -84,13 +85,17 @@ enum PendingSearchParameterChange {
     Delete,
 }
 
-/// What one attempt at a Bundle transaction has staged for after its commit:
-/// the SearchParameter changes, and, for a Bundle that defers its search rows
-/// (#1975), the resources it left without them. Every attempt starts with its
-/// own, so an aborted attempt leaves nothing behind.
+/// What one attempt at a Bundle transaction has staged: the SearchParameter
+/// changes for after its commit, for a Bundle that defers its search rows
+/// (#1975) the resources it left without them, and the creates not yet sent to
+/// the server (#1977). Every attempt starts with its own, so an aborted attempt
+/// leaves nothing behind.
 struct BundleWrites {
     search_parameter_changes: Vec<PendingSearchParameterChange>,
     deferred: Option<DeferredIndexSet>,
+    /// The creates staged but not yet sent, #1977. The attempt's loop sends them
+    /// ([`MongoBackend::send_staged_creates`]).
+    creates: PendingCreates,
 }
 
 impl BundleWrites {
@@ -98,6 +103,7 @@ impl BundleWrites {
         Self {
             search_parameter_changes: Vec::new(),
             deferred: deferral.map(DeferredIndexSet::new),
+            creates: PendingCreates::default(),
         }
     }
 
@@ -120,11 +126,21 @@ struct CommittedAttempt {
     deferred: Option<DeferredCommit>,
 }
 
-/// Request context shared by every entry in one MongoDB Bundle transaction.
+/// Request context for one entry of a MongoDB Bundle transaction; everything
+/// but `index` is shared by every entry.
 struct BundleEntryContext<'a> {
+    /// The entry's position in the Bundle; a staged create is charged to it.
+    index: usize,
     tenant: &'a TenantContext,
     fhir_version: helios_fhir::FhirVersion,
     patch_validator: Option<&'a dyn PatchCandidateValidator>,
+}
+
+/// Whether the entry's create is only staged (#1977), so that processing the
+/// entry reads nothing: a POST without `ifNoneExist`. Every other entry may
+/// read what an earlier entry wrote, so the staged creates are sent before it.
+fn stages_its_create(entry: &BundleEntry) -> bool {
+    entry.method == BundleMethod::Post && entry.if_none_exist.is_none()
 }
 
 /// Commit retries after a commit whose outcome is unknown
@@ -1315,6 +1331,7 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
             .database(&self.config.database_name)
             .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
             .find(filter)
+            .batch_size(self.config.sof_cursor_batch_size)
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
@@ -4505,6 +4522,17 @@ impl BundleProvider for MongoBackend {
     /// writes the rows after it. Smaller Bundles write their rows in the
     /// transaction, as before.
     ///
+    /// Creates (#1977): a Bundle's creates are staged and sent in chunks of up
+    /// to 100 entries, 16 MiB of payload or 5,000 search rows, and a create does
+    /// no existence read: a reused id is refused by the unique
+    /// `idx_resources_identity` and reported as `AlreadyExists` at its entry, as
+    /// before. The documents and index keys written are the same, so the
+    /// transaction's cache footprint, and with it the ceiling on a Bundle's
+    /// size, are not expected to change (inferred, not measured); a chunk
+    /// shortens the time the Bundle holds its room. `failed_entry`, and the
+    /// entry named by a failed write, is the first entry of the chunk being sent
+    /// unless the driver error names a document ([`super::bundle_creates`]).
+    ///
     /// Dropping this future — the request timed out, the client went away —
     /// drops the session, which aborts the transaction server-side. The slot
     /// frees immediately while that abort is still in flight, so under request
@@ -4740,6 +4768,16 @@ impl MongoBackend {
     /// An attempt of a Bundle that defers its search rows (`deferral`, #1975)
     /// writes its ledger last, inside the transaction, so the ledger commits or
     /// aborts with the Bundle and an aborted attempt leaves no trace of it.
+    ///
+    /// Creates (#1977) are staged in [`BundleWrites`] and sent by
+    /// [`Self::send_staged_creates`] at four points, and only there:
+    ///
+    /// - before any entry that is not a plain POST ([`stages_its_create`]),
+    ///   since it may read what the staged creates wrote;
+    /// - after an entry that leaves the buffer full;
+    /// - before an entry failure is reported, so that a refused create is the
+    ///   failure the client sees, in the order the Bundle ran;
+    /// - after the last entry, before the ledger and the commit.
     #[allow(clippy::too_many_arguments)]
     async fn bundle_transaction_attempt(
         &self,
@@ -4793,7 +4831,14 @@ impl MongoBackend {
         let mut writes = BundleWrites::new(deferral);
 
         let entry_count = entries.len();
+        let tenant_id = tenant.tenant_id().as_str();
         for (idx, entry) in entries.iter_mut().enumerate() {
+            // Anything but a plain POST reads what earlier entries wrote, so the
+            // staged creates go first (#1977).
+            if !stages_its_create(entry) {
+                self.send_staged_creates(db, session, tenant_id, entry_count, &mut writes)
+                    .await?;
+            }
             let mut resource = entry.resource.take();
             let used_references = resource
                 .as_mut()
@@ -4817,6 +4862,7 @@ impl MongoBackend {
                     db,
                     session,
                     BundleEntryContext {
+                        index: idx,
                         tenant,
                         fhir_version,
                         patch_validator: validator,
@@ -4853,13 +4899,38 @@ impl MongoBackend {
                     }
 
                     results.push(entry_result);
+
+                    // A full buffer goes out now, so the next chunk starts empty
+                    // and an attempt never holds more than one (#1977).
+                    if writes.creates.is_full() {
+                        self.send_staged_creates(db, session, tenant_id, entry_count, &mut writes)
+                            .await?;
+                    } else if stages_its_create(entry) {
+                        // Staging a create does no I/O, so without this the
+                        // search extraction of a whole chunk (up to 100 entries)
+                        // would run without giving the worker back; each create
+                        // used to yield on its own writes (#1977).
+                        tokio::task::yield_now().await;
+                    }
                 }
                 Err(e) => {
+                    // The creates staged before this entry went first in the
+                    // order the Bundle ran them, so a refused one is reported
+                    // instead of this entry's error (#1977).
+                    self.send_staged_creates(db, session, tenant_id, entry_count, &mut writes)
+                        .await?;
                     let _ = session.abort_transaction().await;
                     return Err(entry_attempt_error(idx, entry_count, &e));
                 }
             }
         }
+
+        // The creates still staged are sent before the Bundle reports a failed
+        // entry, before the ledger and before the commit: a create the server
+        // refuses is the failure the client sees, as when each create was sent
+        // as its entry ran (#1977).
+        self.send_staged_creates(db, session, tenant_id, entry_count, &mut writes)
+            .await?;
 
         if let Some((index, message)) = error_info {
             let _ = session.abort_transaction().await;
@@ -4923,6 +4994,32 @@ impl MongoBackend {
             search_parameter_changes: writes.search_parameter_changes,
             deferred,
         })
+    }
+
+    /// Sends the creates the attempt has staged (#1977), or does nothing when it
+    /// has none. A create the server refuses aborts the transaction and ends the
+    /// attempt, classified as the entry write that would have failed: the entry
+    /// is the one of the refused document, or the first of the chunk
+    /// ([`MongoBackend::flush_bundle_creates`]).
+    async fn send_staged_creates(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant_id: &str,
+        entry_count: usize,
+        writes: &mut BundleWrites,
+    ) -> Result<(), BundleAttemptError> {
+        if writes.creates.is_empty() {
+            return Ok(());
+        }
+        if let Err((at, err)) = self
+            .flush_bundle_creates(db, session, tenant_id, &mut writes.creates)
+            .await
+        {
+            let _ = session.abort_transaction().await;
+            return Err(entry_attempt_error(at, entry_count, &err));
+        }
+        Ok(())
     }
 
     /// Resolves every URL-borne conditional entry inside the session, before
@@ -4997,6 +5094,7 @@ impl MongoBackend {
         target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
         let BundleEntryContext {
+            index,
             tenant,
             fhir_version,
             patch_validator: validator,
@@ -5056,17 +5154,14 @@ impl MongoBackend {
                     }
                 }
 
-                let created = self
-                    .create_resource_in_bundle_transaction(
-                        db,
-                        session,
-                        tenant,
-                        &resource_type,
-                        resource,
-                        fhir_version,
-                        writes,
-                    )
-                    .await?;
+                let created = self.create_resource_in_bundle_transaction(
+                    index,
+                    tenant,
+                    &resource_type,
+                    resource,
+                    fhir_version,
+                    writes,
+                )?;
                 Ok(BundleEntryResult::created(created))
             }
             BundleMethod::Put => {
@@ -5084,18 +5179,16 @@ impl MongoBackend {
                             )
                             .await?,
                         ),
-                        None => BundleEntryResult::created(
-                            self.create_resource_in_bundle_transaction(
-                                db,
-                                session,
+                        None => {
+                            BundleEntryResult::created(self.create_resource_in_bundle_transaction(
+                                index,
                                 tenant,
                                 &target.resource_type,
                                 resource,
                                 fhir_version,
                                 writes,
-                            )
-                            .await?,
-                        ),
+                            )?)
+                        }
                     });
                 }
 
@@ -5136,17 +5229,14 @@ impl MongoBackend {
                         let mut resource_with_id = resource;
                         resource_with_id["id"] = serde_json::json!(id);
 
-                        let created = self
-                            .create_resource_in_bundle_transaction(
-                                db,
-                                session,
-                                tenant,
-                                &resource_type,
-                                resource_with_id,
-                                fhir_version,
-                                writes,
-                            )
-                            .await?;
+                        let created = self.create_resource_in_bundle_transaction(
+                            index,
+                            tenant,
+                            &resource_type,
+                            resource_with_id,
+                            fhir_version,
+                            writes,
+                        )?;
                         Ok(BundleEntryResult::created(created))
                     }
                 }
@@ -5291,19 +5381,27 @@ impl MongoBackend {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn create_resource_in_bundle_transaction(
+    /// Stages one create of the Bundle (#1977); the attempt's loop sends it
+    /// ([`Self::send_staged_creates`]). It reads and writes nothing, so it
+    /// takes no session.
+    ///
+    /// There is no existence read: `idx_resources_identity` is unique and not
+    /// partial, and a soft-deleted resource keeps its document, so a reused id
+    /// (live or deleted) is refused at the send and reported as
+    /// [`ResourceError::AlreadyExists`] at this entry
+    /// ([`super::bundle_creates::resource_insert_failure`]). The result is
+    /// returned now, as before; it is the stored resource only once the staged
+    /// create has been sent, which the loop does before it reports a failure
+    /// and before the commit.
+    fn create_resource_in_bundle_transaction(
         &self,
-        db: &mongodb::Database,
-        session: &mut ClientSession,
+        index: usize,
         tenant: &TenantContext,
         resource_type: &str,
         resource: Value,
         fhir_version: helios_fhir::FhirVersion,
         writes: &mut BundleWrites,
     ) -> StorageResult<StoredResource> {
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
 
         let id = resource
@@ -5312,30 +5410,15 @@ impl MongoBackend {
             .map(str::to_string)
             .unwrap_or_else(crate::types::new_resource_id);
 
-        let existing = resources
-            .find_one(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": &id,
-            })
-            .session(&mut *session)
-            .await
-            .map_err(|e| {
-                internal_driver_error("Failed to check resource existence in transaction", e)
-            })?;
-
-        if existing.is_some() {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id,
-            }));
-        }
-
         let mut resource = resource;
         ensure_resource_identity(resource_type, &id, &mut resource);
         let search_documents =
             self.search_index_documents(tenant_id, resource_type, &id, &resource);
         let payload = value_to_document(&resource)?;
+        let payload_bytes = bson::RawDocumentBuf::from_document(&payload)
+            .map_err(|e| serialization_error(format!("Failed to serialize resource: {e}")))?
+            .as_bytes()
+            .len();
 
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
@@ -5360,48 +5443,29 @@ impl MongoBackend {
             current.insert(SEARCH_ROWS_PENDING_FIELD, marker);
         }
 
-        resources
-            .insert_one(current)
-            .session(&mut *session)
-            .await
-            .map_err(|e| {
-                if is_duplicate_key_error(&e) {
-                    StorageError::Resource(ResourceError::AlreadyExists {
-                        resource_type: resource_type.to_string(),
-                        id: id.clone(),
-                    })
-                } else {
-                    internal_driver_error("Failed to insert resource in transaction", e)
-                }
-            })?;
+        let history = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": &id,
+            "version_id": &version_id,
+            "data": Bson::Document(payload),
+            "created_at": now_bson,
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": &fhir_version_str,
+        };
 
-        history
-            .insert_one(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": &id,
-                "version_id": &version_id,
-                "data": Bson::Document(payload),
-                "created_at": now_bson,
-                "last_updated": now_bson,
-                "is_deleted": false,
-                "deleted_at": Bson::Null,
-                "fhir_version": &fhir_version_str,
-            })
-            .session(&mut *session)
-            .await
-            .map_err(|e| internal_driver_error("Failed to insert history in transaction", e))?;
-
-        self.index_resource_in_bundle_transaction(
-            db,
-            session,
-            tenant_id,
-            resource_type,
-            &id,
-            search_documents,
-            writes,
-        )
-        .await?;
+        let rows = self.search_rows_in_transaction(writes, resource_type, &id, search_documents);
+        writes.creates.push(StagedCreate {
+            entry: index,
+            resource_type: resource_type.to_string(),
+            id: id.clone(),
+            resource: current,
+            history,
+            payload_bytes,
+            rows,
+        });
 
         if resource_type == "SearchParameter" {
             writes
@@ -6309,14 +6373,45 @@ impl MongoBackend {
         Ok(())
     }
 
-    /// Writes a resource's search rows inside the Bundle's transaction, or, when
-    /// the Bundle defers them for this type (#1975), only notes the resource for
-    /// the post-commit step: neither the two deletes nor the inserts run.
+    /// Decides where a resource's search rows are written: `Some(docs)` when
+    /// they go into the Bundle's transaction, `None` when they do not.
+    ///
+    /// Nothing is written in the transaction while search is offloaded, and
+    /// nothing when the Bundle defers the type (#1975), in which case the
+    /// resource is only noted for the post-commit step.
     ///
     /// The rows come from `docs`, which the caller built from the same
     /// extraction as the resource's `missing_params`. A deferred type drops
     /// `docs`: its `missing_params` are already on the resource document and
     /// its rows are rebuilt after commit.
+    fn search_rows_in_transaction(
+        &self,
+        writes: &mut BundleWrites,
+        resource_type: &str,
+        resource_id: &str,
+        docs: SearchIndexDocuments,
+    ) -> Option<SearchIndexDocuments> {
+        if self.is_search_offloaded() {
+            return None;
+        }
+
+        if let Some(deferred) = writes
+            .deferred
+            .as_mut()
+            .filter(|deferred| deferred.defers(resource_type))
+        {
+            deferred.record(resource_type, resource_id);
+            return None;
+        }
+
+        Some(docs)
+    }
+
+    /// Writes a resource's search rows inside the Bundle's transaction, or, when
+    /// the Bundle defers them for this type (#1975), only notes the resource for
+    /// the post-commit step: neither the two deletes nor the inserts run. See
+    /// [`Self::search_rows_in_transaction`]. A create stages its rows with its
+    /// document instead (#1977).
     #[allow(clippy::too_many_arguments)]
     async fn index_resource_in_bundle_transaction(
         &self,
@@ -6328,18 +6423,10 @@ impl MongoBackend {
         docs: SearchIndexDocuments,
         writes: &mut BundleWrites,
     ) -> StorageResult<()> {
-        if self.is_search_offloaded() {
+        let Some(docs) = self.search_rows_in_transaction(writes, resource_type, resource_id, docs)
+        else {
             return Ok(());
-        }
-
-        if let Some(deferred) = writes
-            .deferred
-            .as_mut()
-            .filter(|deferred| deferred.defers(resource_type))
-        {
-            deferred.record(resource_type, resource_id);
-            return Ok(());
-        }
+        };
 
         self.delete_search_index_rows_for(
             db,
@@ -7583,7 +7670,9 @@ impl ReindexTarget for MongoBackend {
 /// insert. Mirrors `bulk_ingest.rs`'s `INSERT_DOCS_PER_COMMAND` (same value,
 /// same rationale: bound how much the driver serializes per command) without
 /// depending on that module, since a sub-batch's `search_index` documents
-/// are built the same way a batch's are.
+/// are built the same way a batch's are. It also caps the search rows that one
+/// chunk of a transaction Bundle's staged creates holds (`bundle_creates`,
+/// #1977).
 pub(super) const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 
 /// Chunked, unordered `insert_many` of `docs` into `collection`, attributing
@@ -9316,6 +9405,102 @@ mod transient_abort_tests {
                 ..
             })
         ));
+    }
+
+    /// An `insert_many` failure on document `index`, as the driver builds it
+    /// from a reply with `writeErrors` for an ordered insert.
+    fn insert_many_write_error_at(index: usize, code: i32, errmsg: &str) -> MongoError {
+        let insert_many: mongodb::error::InsertManyError = bson::from_document(doc! {
+            "writeErrors": [{ "index": index as i32, "code": code, "errmsg": errmsg }],
+        })
+        .expect("an InsertManyError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::InsertMany(insert_many))
+    }
+
+    /// The entries and `Type/id`s of a chunk of three staged creates, entries
+    /// 20 to 22 of a Bundle of 30.
+    fn staged_chunk() -> (Vec<usize>, Vec<(String, String)>) {
+        (
+            vec![20, 21, 22],
+            (0..3)
+                .map(|n| ("Patient".to_string(), format!("p{n}")))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_duplicate_id_in_a_create_chunk_is_a_bundle_error_at_that_entry_never_a_transient_abort() {
+        let (entries, identities) = staged_chunk();
+        let duplicate = insert_many_write_error_at(
+            1,
+            11000,
+            "E11000 duplicate key error collection: hfs.resources index: idx_resources_identity",
+        );
+        let (at, err) =
+            super::super::bundle_creates::resource_insert_failure(&entries, &identities, duplicate);
+        assert_eq!(at, 21, "the entry of the refused create, not of the chunk");
+        assert!(
+            transient_entry_abort(&err).is_none(),
+            "a reused id is not transient"
+        );
+        match entry_attempt_error(at, 30, &err) {
+            BundleAttemptError::Failed(TransactionError::BundleError { index, message }) => {
+                assert_eq!(index, 21);
+                assert_eq!(
+                    message,
+                    "Entry processing failed: resource already exists: Patient/p1"
+                );
+            }
+            other => panic!("expected a BundleError at entry 21, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_create_chunk_refused_with_388_is_too_large_for_cache() {
+        let (entries, identities) = staged_chunk();
+        let (at, err) = super::super::bundle_creates::resource_insert_failure(
+            &entries,
+            &identities,
+            insert_many_write_error(388),
+        );
+        assert_eq!(at, 20);
+        match entry_attempt_error(at, 30, &err) {
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                entries,
+                cause,
+                reason,
+            }) => {
+                assert_eq!(entries, 30);
+                assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
+                assert!(reason.contains("388"), "{reason}");
+            }
+            other => panic!("expected TooLargeForCache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_eviction_on_a_create_chunk_is_charged_to_its_first_entry() {
+        let (entries, identities) = staged_chunk();
+        // A failed command names no document: the chunk's first entry is charged.
+        let (at, err) = super::super::bundle_creates::resource_insert_failure(
+            &entries,
+            &identities,
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+        );
+        assert_eq!(at, 20);
+        match entry_attempt_error(at, 30, &err) {
+            BundleAttemptError::TransientAbort {
+                entry,
+                code,
+                eviction,
+                ..
+            } => {
+                assert_eq!(entry, Some(20));
+                assert_eq!(code, Some(WRITE_CONFLICT_CODE));
+                assert!(eviction);
+            }
+            other => panic!("expected a TransientAbort, got {other:?}"),
+        }
     }
 
     #[test]

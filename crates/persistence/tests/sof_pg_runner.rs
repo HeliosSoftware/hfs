@@ -786,6 +786,78 @@ mod sof_pg_runner_tests {
         let rows = collect_rows(runner.as_ref(), &tenant, view).await;
         assert_eq!(rows.len(), 2);
     }
+    /// `getReferenceKey()` takes the text after the last `/` (PostgreSQL
+    /// `split_part(x, '/', -1)`); `getReferenceKey(Patient)` additionally
+    /// yields NULL unless the reference has a `Patient/` type segment.
+    #[tokio::test]
+    async fn test_pg_get_reference_key_tail_extraction() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        // (id, subject.reference or None, any_key, patient_key)
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let cases: [Case; 9] = [
+            ("o1", Some("Patient/p1"), Some("p1"), Some("p1")),
+            ("o2", Some("Group/g1"), Some("g1"), None),
+            (
+                "o3",
+                Some("http://x/fhir/Patient/p3"),
+                Some("p3"),
+                Some("p3"),
+            ),
+            ("o4", Some("Patient/p4/_history/2"), Some("2"), Some("2")),
+            ("o5", Some("Patient/p5/"), Some(""), Some("")),
+            ("o6", Some("#c1"), Some("#c1"), None),
+            ("o7", Some("urn:uuid:abc"), Some("urn:uuid:abc"), None),
+            ("o8", Some(""), Some(""), None),
+            ("o9", None, None, None),
+        ];
+        for (id, reference, _, _) in cases {
+            let mut resource = json!({"resourceType": "Observation", "id": id});
+            if let Some(reference) = reference {
+                resource["subject"] = json!({"reference": reference});
+            }
+            backend
+                .create(&tenant, "Observation", resource, FhirVersion::R4)
+                .await
+                .expect("seed observation");
+        }
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "id", "type": "string"},
+                {"path": "subject.getReferenceKey()", "name": "any_key", "type": "string"},
+                {"path": "subject.getReferenceKey(Patient)", "name": "patient_key", "type": "string"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), cases.len(), "rows: {rows:?}");
+        for (id, reference, any_key, patient_key) in cases {
+            let row = rows
+                .iter()
+                .find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id))
+                .unwrap_or_else(|| panic!("missing row {id}: {rows:?}"));
+            let expect = |v: Option<&str>| v.map_or(Value::Null, |s| json!(s));
+            assert_eq!(
+                row.get("any_key"),
+                Some(&expect(any_key)),
+                "{id} any_key for {reference:?}"
+            );
+            assert_eq!(
+                row.get("patient_key"),
+                Some(&expect(patient_key)),
+                "{id} patient_key for {reference:?}"
+            );
+        }
+    }
+
     /// Preserve the database's order and fail on every row error.
     async fn collect_rows_in_order(
         runner: &dyn SofRunner,
@@ -1597,6 +1669,61 @@ mod sof_pg_runner_tests {
     #[tokio::test]
     async fn test_pg_untyped_root_column_stays_string() {
         assert_codes_are_strings(json!({"name": "code", "path": "code.coding.first().code"})).await;
+    }
+
+    /// #1947: when `unionAll` branches type a column differently (`string`,
+    /// `integer`, untyped boolean), each value keeps its own branch's type
+    /// instead of being guessed from its text.
+    #[tokio::test]
+    async fn test_pg_union_branches_with_different_types_keep_each_type() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "QuestionnaireResponse",
+                json!({
+                    "resourceType": "QuestionnaireResponse",
+                    "id": "qr1",
+                    "status": "completed",
+                    "item": [
+                        {"linkId": "2.1", "answer": [{"valueInteger": 7}]},
+                        {"linkId": "true", "answer": [{"valueBoolean": true}]},
+                        {"linkId": "007"}
+                    ]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed questionnaire response");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "QuestionnaireResponse",
+            "select": [{"forEach": "item", "unionAll": [
+                {"column": [{"name": "code", "path": "linkId", "type": "string"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueInteger",
+                             "type": "integer"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueBoolean"}]}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        let mut got: Vec<Value> = rows.iter().map(|r| r["code"].clone()).collect();
+        got.sort_by_key(|v| v.to_string());
+        let mut want = vec![
+            json!("2.1"),
+            json!("true"),
+            json!("007"),
+            json!(7),
+            json!(true),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ];
+        want.sort_by_key(|v| v.to_string());
+        assert_eq!(got, want);
     }
 
     // =========================================================================

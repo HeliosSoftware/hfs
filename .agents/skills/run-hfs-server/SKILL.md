@@ -85,6 +85,7 @@ a startup warning.
 | `HFS_ELASTICSEARCH_MAX_TERMS_COUNT` | `65536` | Index `max_terms_count`: most values one `terms` query carries; a chained or `_has` search that pins more ids is sent as several `terms` clauses of at most this many each (#1548). Set on new indices |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | ES-backed composite write sync mode: asynchronous, synchronous, or hybrid |
+| `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` | `512` | Documents per cursor batch of a SQL-on-FHIR scan (`1` to `100000`; anything else fails startup). Lower = lower first-row latency on selective views (the first row waits for one full batch); higher = fewer round trips against a remote MongoDB (about 3,500 `getMore` per 1.8M rows at `512`, about 7,000 at `256`). Memory is bounded by this many documents per reply. |
 
 Use `HFS_COMPOSITE_SYNC_MODE=synchronous` **and** `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search. Either alone still leaves a window: synchronous mode only guarantees the document reached Elasticsearch, and it is not searchable until the next index refresh. See `crates/persistence/README.md` (Search visibility on Elasticsearch-backed composites). Transaction conditional references (`Organization?identifier=…` in a resource body) and `If-None-Exist` creates are exempt: they make acknowledged writes visible before resolving, on any setting (#1047).
 
@@ -135,8 +136,6 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
 | `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
 | `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
-
-`HFS_S3_KEYSPACE_LAYOUT=v2` only affects new, empty tenants: each tenant's layout is stamped in `history/_keyspace.json` and is immutable; `v2` needs every writing instance on a build that reads the marker.
 
 The standard AWS credential chain applies. For S3-compatible endpoints, set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`. One HFS process shares a single AWS credential chain, so a MinIO primary store and real-AWS bulk-export output store cannot be combined in the same process.
 
@@ -227,7 +226,7 @@ for the rest):
 
 | Prefix | Contents |
 |---|---|
-| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history |
+| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history (`history/_keyspace.json` is the per-tenant layout marker; the policy must allow `GetObject`/`PutObject` on it) |
 | `{tenant}/bulk/submit/` | Bulk-submit staging |
 | `tenants/` | Tenant registry |
 | `_system.user-settings/` | Per-user UI settings (`/_user/settings`) |

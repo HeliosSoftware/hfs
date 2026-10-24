@@ -26,6 +26,11 @@ use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
 use helios_auth::{AuthConfig, JwksBearerAuthProvider, JwksCache};
+use helios_observability::redact::redact_url;
+#[cfg(feature = "mongodb")]
+use helios_persistence::core::database_url::redact_database_url;
+#[cfg(feature = "postgres")]
+use helios_persistence::core::database_url::redact_postgres_location;
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
 use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::{info, warn};
@@ -112,6 +117,17 @@ fn parse_env_bool(var: &str, default_value: bool) -> bool {
 /// An S3 endpoint override, or `None` when it is unset or blank — so an empty
 /// `HFS_*_S3_ENDPOINT=` neither replaces the AWS endpoint nor forces
 /// path-style addressing.
+/// Configured URLs as safe to log: each passed through [`redact_url`], which
+/// drops `user:pass@`, the query and the fragment (#2149). Elasticsearch keeps
+/// credentials written into `HFS_ELASTICSEARCH_NODES` and sends them as Basic
+/// auth, so the raw node list can carry a password.
+// Only the `*-elasticsearch` startups call it; the unit test keeps it
+// exercised in every build.
+#[cfg_attr(not(feature = "elasticsearch"), allow(dead_code))]
+fn redact_urls(urls: &[String]) -> Vec<String> {
+    urls.iter().map(|url| redact_url(url)).collect()
+}
+
 // Only bulk export's S3 output store calls it, and that is built only with a
 // SQL backend; the unit test keeps it exercised in every build.
 #[cfg_attr(
@@ -1265,8 +1281,19 @@ async fn create_postgres_backend(
 
     let mut backend_config = if let Some(ref url) = config.database_url {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            info!(url = %url, "Initializing PostgreSQL backend from connection string");
-            PostgresBackend::config_from_connection_string(url)?
+            let backend_config = PostgresBackend::config_from_connection_string(url)?;
+            // Log the server the parsed config will contact, which can differ
+            // from the driver's reading of `url` (#2142).
+            info!(
+                url = %redact_postgres_location(
+                    url,
+                    &backend_config.host,
+                    backend_config.port,
+                    &backend_config.dbname
+                ),
+                "Initializing PostgreSQL backend from connection string"
+            );
+            backend_config
         } else {
             info!("Initializing PostgreSQL backend from environment variables");
             PostgresBackend::config_from_env()
@@ -1376,7 +1403,7 @@ async fn start_mongodb(
 ) -> anyhow::Result<()> {
     let backend_config = build_mongodb_config(&config, false)?;
     info!(
-        url = %backend_config.connection_string,
+        url = %redact_database_url(&backend_config.connection_string, "mongodb"),
         database = %backend_config.database_name,
         "Initializing MongoDB backend"
     );
@@ -1777,7 +1804,7 @@ async fn init_auth_with_audit(
     let provider = JwksBearerAuthProvider::new(jwks_cache, &auth_config);
 
     info!(
-        jwks_url = %jwks_url,
+        jwks_url = %redact_url(jwks_url),
         issuer = ?auth_config.expected_issuer,
         audience = ?auth_config.expected_audience,
         "Authentication ENABLED"
@@ -1843,8 +1870,8 @@ async fn init_login_sessions(
     info!(
         client_id = %client_id,
         redirect_uri = %redirect_uri,
-        authorization_endpoint = %authorization_endpoint,
-        end_session = ?end_session_endpoint,
+        authorization_endpoint = %redact_url(&authorization_endpoint),
+        end_session = ?end_session_endpoint.as_deref().map(redact_url),
         cookie_secure = auth_config.web_cookie_secure,
         "Interactive browser login ENABLED"
     );
@@ -2039,7 +2066,10 @@ async fn main() -> anyhow::Result<()> {
             unsafe {
                 std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
             }
-            info!(url = %ts_url, "HFS_TERMINOLOGY_SERVER wired to FHIRPath context");
+            info!(
+                url = %redact_url(ts_url),
+                "HFS_TERMINOLOGY_SERVER wired to FHIRPath context"
+            );
         }
     }
 
@@ -2063,7 +2093,7 @@ async fn main() -> anyhow::Result<()> {
         public_base_url = %config.base_url,
         fhir_version = ?config.default_fhir_version,
         storage_backend = %backend_mode,
-        terminology_server = ?config.terminology_server,
+        terminology_server = ?config.terminology_server.as_deref().map(redact_url),
         auth_enabled = auth_config.enabled,
         audit_backend = %audit_config.backend,
         "Starting Helios FHIR Server"
@@ -3506,13 +3536,14 @@ async fn start_sqlite_elasticsearch(
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        contained_sweep_concurrency: config.elasticsearch_contained_sweep_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
         reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
     info!(
-        nodes = ?es_nodes,
+        nodes = ?redact_urls(&es_nodes),
         index_prefix = %config.elasticsearch_index_prefix,
         "Initializing Elasticsearch backend"
     );
@@ -3859,13 +3890,14 @@ async fn start_postgres_elasticsearch(
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        contained_sweep_concurrency: config.elasticsearch_contained_sweep_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
         reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
     info!(
-        nodes = ?es_nodes,
+        nodes = ?redact_urls(&es_nodes),
         index_prefix = %config.elasticsearch_index_prefix,
         "Initializing Elasticsearch backend"
     );
@@ -4040,7 +4072,7 @@ async fn start_mongodb_elasticsearch(
     // Create MongoDB backend
     let backend_config = build_mongodb_config(&config, true)?;
     info!(
-        url = %backend_config.connection_string,
+        url = %redact_database_url(&backend_config.connection_string, "mongodb"),
         database = %backend_config.database_name,
         "Initializing MongoDB backend"
     );
@@ -4093,13 +4125,14 @@ async fn start_mongodb_elasticsearch(
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        contained_sweep_concurrency: config.elasticsearch_contained_sweep_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
         reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
     info!(
-        nodes = ?es_nodes,
+        nodes = ?redact_urls(&es_nodes),
         index_prefix = %config.elasticsearch_index_prefix,
         "Initializing Elasticsearch backend"
     );
@@ -4287,7 +4320,7 @@ async fn start_s3(
         tenancy = %tenancy,
         region = ?s3_config.region,
         prefix = ?s3_config.prefix,
-        endpoint_url = ?s3_config.endpoint_url,
+        endpoint_url = ?s3_config.endpoint_url.as_deref().map(redact_url),
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
         scan_concurrency = s3_config.scan_concurrency,
@@ -4456,7 +4489,7 @@ async fn start_s3_elasticsearch(
         tenancy = %tenancy,
         region = ?s3_config.region,
         prefix = ?s3_config.prefix,
-        endpoint_url = ?s3_config.endpoint_url,
+        endpoint_url = ?s3_config.endpoint_url.as_deref().map(redact_url),
         validate_buckets = s3_config.validate_buckets_on_startup,
         keyspace_layout = ?s3_config.default_keyspace_layout,
         scan_concurrency = s3_config.scan_concurrency,
@@ -4524,13 +4557,14 @@ async fn start_s3_elasticsearch(
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        contained_sweep_concurrency: config.elasticsearch_contained_sweep_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
         reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
     info!(
-        nodes = ?es_nodes,
+        nodes = ?redact_urls(&es_nodes),
         index_prefix = %config.elasticsearch_index_prefix,
         "Initializing Elasticsearch backend (search)"
     );
@@ -4758,6 +4792,24 @@ mod tests {
     use super::*;
     use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
+
+    #[test]
+    fn redact_urls_drops_credentials_and_keeps_hosts() {
+        let nodes = vec![
+            "https://elastic:NODE-SECRET@es1.internal:9200".to_string(),
+            "http://es2.internal:9200/?token=QUERY-SECRET".to_string(),
+            "http://es3.internal:9200".to_string(),
+        ];
+        let logged = format!("{:?}", redact_urls(&nodes));
+        assert!(!logged.contains("SECRET"), "{logged}");
+        for host in [
+            "es1.internal:9200",
+            "es2.internal:9200",
+            "es3.internal:9200",
+        ] {
+            assert!(logged.contains(host), "`{host}` missing from {logged}");
+        }
+    }
 
     #[test]
     fn non_blank_endpoint_drops_unset_and_blank_values() {

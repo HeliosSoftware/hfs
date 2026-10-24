@@ -65,7 +65,9 @@ use std::str::FromStr;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use helios_fhir::FhirVersion;
+use helios_observability::redact::redact_url;
 use helios_persistence::BackendKind;
+use helios_persistence::core::database_url::redact_database_url;
 
 /// Storage backend mode.
 ///
@@ -607,7 +609,8 @@ impl ValidationConfig {
 /// HFS acts as the Data Consumer: it accepts submissions, fetches the referenced
 /// manifests/files, ingests them, and serves a status manifest whose
 /// `output`/`outcome`/`deleted` artifacts are written to the output store below.
-#[derive(Debug, Clone)]
+// `Debug` is hand-written below: it redacts the private and decryption keys.
+#[derive(Clone)]
 pub struct BulkSubmitConfig {
     /// Master switch — when `false`, the `$bulk-submit` endpoints return `501`.
     pub enabled: bool,
@@ -774,6 +777,90 @@ pub struct BulkSubmitConfig {
     pub poll_rate_limit: u32,
     /// Sliding window for [`Self::poll_rate_limit`], in seconds.
     pub poll_rate_window_secs: u64,
+}
+
+/// Prints the keys as `[redacted]` (#2149). Destructures every field, so a
+/// new field fails to compile until it is listed here.
+impl fmt::Debug for BulkSubmitConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            enabled,
+            output_backend,
+            output_dir,
+            s3_bucket,
+            requires_access_token,
+            file_url_ttl_secs,
+            output_ttl_secs,
+            worker_concurrency,
+            file_concurrency,
+            defer_indexing,
+            bulk_index_rebuild,
+            disable_local_worker,
+            max_concurrent_per_tenant,
+            batch_size,
+            fetch_read_timeout_secs,
+            skip_unchanged,
+            index_queue,
+            index_concurrency,
+            index_coalesce,
+            index_max_wait_secs,
+            index_page_bytes,
+            lease_duration_secs,
+            heartbeat_interval_secs,
+            cleanup_interval_secs,
+            block_concurrent_submission,
+            client_id,
+            private_key,
+            signing_alg,
+            decryption_key,
+            outbound_scope,
+            retry_after_secs,
+            pre_ingest_retry_after_secs,
+            manifest_page_size,
+            poll_rate_limit,
+            poll_rate_window_secs,
+        } = self;
+        f.debug_struct("BulkSubmitConfig")
+            .field("enabled", enabled)
+            .field("output_backend", output_backend)
+            .field("output_dir", output_dir)
+            .field("s3_bucket", s3_bucket)
+            .field("requires_access_token", requires_access_token)
+            .field("file_url_ttl_secs", file_url_ttl_secs)
+            .field("output_ttl_secs", output_ttl_secs)
+            .field("worker_concurrency", worker_concurrency)
+            .field("file_concurrency", file_concurrency)
+            .field("defer_indexing", defer_indexing)
+            .field("bulk_index_rebuild", bulk_index_rebuild)
+            .field("disable_local_worker", disable_local_worker)
+            .field("max_concurrent_per_tenant", max_concurrent_per_tenant)
+            .field("batch_size", batch_size)
+            .field("fetch_read_timeout_secs", fetch_read_timeout_secs)
+            .field("skip_unchanged", skip_unchanged)
+            .field("index_queue", index_queue)
+            .field("index_concurrency", index_concurrency)
+            .field("index_coalesce", index_coalesce)
+            .field("index_max_wait_secs", index_max_wait_secs)
+            .field("index_page_bytes", index_page_bytes)
+            .field("lease_duration_secs", lease_duration_secs)
+            .field("heartbeat_interval_secs", heartbeat_interval_secs)
+            .field("cleanup_interval_secs", cleanup_interval_secs)
+            .field("block_concurrent_submission", block_concurrent_submission)
+            .field("client_id", client_id)
+            .field("private_key", &private_key.as_ref().map(|_| "[redacted]"))
+            .field("signing_alg", signing_alg)
+            .field(
+                "decryption_key",
+                &decryption_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("outbound_scope", outbound_scope)
+            .field("retry_after_secs", retry_after_secs)
+            .field("pre_ingest_retry_after_secs", pre_ingest_retry_after_secs)
+            .field("manifest_page_size", manifest_page_size)
+            .field("poll_rate_limit", poll_rate_limit)
+            .field("poll_rate_window_secs", poll_rate_window_secs)
+            .finish()
+    }
 }
 
 impl Default for BulkSubmitConfig {
@@ -1075,7 +1162,8 @@ impl BulkSubmitConfig {
 ///
 /// This struct can be constructed from environment variables using [`ServerConfig::from_env`],
 /// from command line arguments using [`ServerConfig::parse`], or programmatically.
-#[derive(Debug, Clone, Parser)]
+// `Debug` is hand-written below: it redacts credentials (#2149).
+#[derive(Clone, Parser)]
 // `long_about = None` keeps `--help` on the one-line `about`: clap would
 // otherwise print this struct's Rust doc comment (a note about constructors
 // that means nothing to an operator) at the top of the help text.
@@ -1176,7 +1264,7 @@ pub struct ServerConfig {
     pub base_url: String,
 
     /// Database connection string.
-    #[arg(long, env = "HFS_DATABASE_URL")]
+    #[arg(long, env = "HFS_DATABASE_URL", hide_env_values = true)]
     pub database_url: Option<String>,
 
     /// Enable request ID tracking.
@@ -1255,7 +1343,8 @@ pub struct ServerConfig {
     #[arg(
         long,
         env = "HFS_ELASTICSEARCH_NODES",
-        default_value = "http://localhost:9200"
+        default_value = "http://localhost:9200",
+        hide_env_values = true
     )]
     pub elasticsearch_nodes: String,
 
@@ -1268,7 +1357,7 @@ pub struct ServerConfig {
     pub elasticsearch_username: Option<String>,
 
     /// Elasticsearch basic auth password (optional).
-    #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
+    #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD", hide_env_values = true)]
     pub elasticsearch_password: Option<String>,
 
     /// Elasticsearch index refresh interval (e.g. "1s", "200ms", "-1" to disable
@@ -1340,6 +1429,19 @@ pub struct ServerConfig {
     /// back-off, stay sequential within the request that caused them.
     #[arg(long, env = "HFS_ELASTICSEARCH_BULK_CONCURRENCY", default_value = "1")]
     pub elasticsearch_bulk_concurrency: usize,
+
+    /// Most contained-document sweeps (the `_delete_by_query` that removes a
+    /// container's stale `contained[]` documents) in flight at once. `0` (the
+    /// default) keeps the built-in 16. Each sweep opens a scroll context on
+    /// every shard it visits and Elasticsearch allows 500 in all
+    /// (`search.max_open_scroll_context`); a burst beyond that is answered
+    /// `429 too_many_scroll_contexts`.
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_CONTAINED_SWEEP_CONCURRENCY",
+        default_value = "0"
+    )]
+    pub elasticsearch_contained_sweep_concurrency: usize,
 
     /// Refresh behavior for `$reindex` and the deferred post-import rebuild:
     /// "false", "wait_for" or "true". Unset follows
@@ -1459,7 +1561,7 @@ pub struct ServerConfig {
     /// LLM provider API key for natural-language search. Present makes the
     /// feature functional; absent (with the switch on) leaves the UI in an
     /// advertise/setup state and the endpoint non-functional.
-    #[arg(long, env = "HFS_NL_SEARCH_API_KEY")]
+    #[arg(long, env = "HFS_NL_SEARCH_API_KEY", hide_env_values = true)]
     pub nl_search_api_key: Option<String>,
 
     /// LLM model id used for query translation.
@@ -1470,7 +1572,8 @@ pub struct ServerConfig {
     #[arg(
         long,
         env = "HFS_NL_SEARCH_BASE_URL",
-        default_value = "https://api.anthropic.com"
+        default_value = "https://api.anthropic.com",
+        hide_env_values = true
     )]
     pub nl_search_base_url: String,
 
@@ -1515,7 +1618,7 @@ pub struct ServerConfig {
     pub export_s3_region: Option<String>,
 
     /// Custom S3 endpoint URL for the S3 export sink (e.g. MinIO).
-    #[arg(long, env = "HFS_EXPORT_S3_ENDPOINT")]
+    #[arg(long, env = "HFS_EXPORT_S3_ENDPOINT", hide_env_values = true)]
     pub export_s3_endpoint: Option<String>,
 
     /// Use path-style S3 addressing; forced on when an endpoint is set.
@@ -1623,7 +1726,7 @@ pub struct ServerConfig {
     ///
     /// Leave unset (default: none) to disable terminology integration.
     /// Example: `http://localhost:8090`
-    #[arg(long, env = "HFS_TERMINOLOGY_SERVER")]
+    #[arg(long, env = "HFS_TERMINOLOGY_SERVER", hide_env_values = true)]
     pub terminology_server: Option<String>,
 
     /// Multitenancy configuration (loaded from environment variables).
@@ -1641,6 +1744,244 @@ pub struct ServerConfig {
     /// Resource validation configuration (loaded from environment variables).
     #[arg(skip)]
     pub validation: ValidationConfig,
+}
+
+/// Prints secrets as `[redacted]` and configured URLs without their
+/// credentials, query or fragment (#2149). Destructures every field, so a new
+/// field fails to compile until it is listed here.
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            port,
+            host,
+            log_level,
+            max_body_size,
+            request_timeout,
+            batch_max_concurrency,
+            enable_cors,
+            cors_origins,
+            cors_methods,
+            cors_headers,
+            default_tenant,
+            base_url,
+            database_url,
+            enable_request_id,
+            return_gone,
+            enable_versioning,
+            require_if_match,
+            default_fhir_version,
+            data_dir,
+            search_param_cache_ttl,
+            default_page_size,
+            max_page_size,
+            everything_max_unpaged,
+            storage_backend,
+            elasticsearch_nodes,
+            elasticsearch_index_prefix,
+            elasticsearch_username,
+            elasticsearch_password,
+            elasticsearch_refresh_interval,
+            elasticsearch_write_refresh,
+            elasticsearch_nested_objects_limit,
+            elasticsearch_max_terms_count,
+            elasticsearch_request_timeout_ms,
+            elasticsearch_bulk_max_bytes,
+            elasticsearch_bulk_concurrency,
+            elasticsearch_contained_sweep_concurrency,
+            elasticsearch_reindex_refresh,
+            elasticsearch_reindex_prepare_threads,
+            reindex_batch_size,
+            reindex_batch_bytes,
+            reindex_prefetch,
+            sof_enabled,
+            ui_enabled,
+            dashboard_reconcile_interval_secs,
+            dashboard_refresh_secs,
+            dashboard_idle_refresh_secs,
+            nl_search_enabled,
+            nl_search_api_key,
+            nl_search_model,
+            nl_search_base_url,
+            nl_search_rate_limit,
+            nl_search_rate_window_secs,
+            nl_search_daily_limit,
+            nl_search_max_chars,
+            seed_conformance,
+            export_sink,
+            export_dir,
+            export_s3_bucket,
+            export_s3_region,
+            export_s3_endpoint,
+            export_s3_force_path_style,
+            export_presign_ttl_secs,
+            export_max_concurrency,
+            export_max_jobs_per_tenant,
+            export_shard_rows,
+            export_controller,
+            export_output_ttl_secs,
+            export_cleanup_interval_secs,
+            sof_sqlquery_max_rows,
+            sof_sqlquery_max_source_rows_per_vd,
+            sof_sqlquery_max_vds,
+            sof_sqlquery_timeout_secs,
+            sof_runner_header,
+            terminology_server,
+            multitenancy,
+            bulk_export,
+            bulk_submit,
+            validation,
+        } = self;
+        f.debug_struct("ServerConfig")
+            .field("port", port)
+            .field("host", host)
+            .field("log_level", log_level)
+            .field("max_body_size", max_body_size)
+            .field("request_timeout", request_timeout)
+            .field("batch_max_concurrency", batch_max_concurrency)
+            .field("enable_cors", enable_cors)
+            .field("cors_origins", cors_origins)
+            .field("cors_methods", cors_methods)
+            .field("cors_headers", cors_headers)
+            .field("default_tenant", default_tenant)
+            .field("base_url", base_url)
+            .field(
+                "database_url",
+                &database_url
+                    .as_deref()
+                    .map(|url| debug_database_url(url, storage_backend)),
+            )
+            .field("enable_request_id", enable_request_id)
+            .field("return_gone", return_gone)
+            .field("enable_versioning", enable_versioning)
+            .field("require_if_match", require_if_match)
+            .field("default_fhir_version", default_fhir_version)
+            .field("data_dir", data_dir)
+            .field("search_param_cache_ttl", search_param_cache_ttl)
+            .field("default_page_size", default_page_size)
+            .field("max_page_size", max_page_size)
+            .field("everything_max_unpaged", everything_max_unpaged)
+            .field("storage_backend", storage_backend)
+            .field("elasticsearch_nodes", &redact_url_list(elasticsearch_nodes))
+            .field("elasticsearch_index_prefix", elasticsearch_index_prefix)
+            .field("elasticsearch_username", elasticsearch_username)
+            .field(
+                "elasticsearch_password",
+                &elasticsearch_password.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "elasticsearch_refresh_interval",
+                elasticsearch_refresh_interval,
+            )
+            .field("elasticsearch_write_refresh", elasticsearch_write_refresh)
+            .field(
+                "elasticsearch_nested_objects_limit",
+                elasticsearch_nested_objects_limit,
+            )
+            .field(
+                "elasticsearch_max_terms_count",
+                elasticsearch_max_terms_count,
+            )
+            .field(
+                "elasticsearch_request_timeout_ms",
+                elasticsearch_request_timeout_ms,
+            )
+            .field("elasticsearch_bulk_max_bytes", elasticsearch_bulk_max_bytes)
+            .field(
+                "elasticsearch_bulk_concurrency",
+                elasticsearch_bulk_concurrency,
+            )
+            .field(
+                "elasticsearch_contained_sweep_concurrency",
+                elasticsearch_contained_sweep_concurrency,
+            )
+            .field(
+                "elasticsearch_reindex_refresh",
+                elasticsearch_reindex_refresh,
+            )
+            .field(
+                "elasticsearch_reindex_prepare_threads",
+                elasticsearch_reindex_prepare_threads,
+            )
+            .field("reindex_batch_size", reindex_batch_size)
+            .field("reindex_batch_bytes", reindex_batch_bytes)
+            .field("reindex_prefetch", reindex_prefetch)
+            .field("sof_enabled", sof_enabled)
+            .field("ui_enabled", ui_enabled)
+            .field(
+                "dashboard_reconcile_interval_secs",
+                dashboard_reconcile_interval_secs,
+            )
+            .field("dashboard_refresh_secs", dashboard_refresh_secs)
+            .field("dashboard_idle_refresh_secs", dashboard_idle_refresh_secs)
+            .field("nl_search_enabled", nl_search_enabled)
+            .field(
+                "nl_search_api_key",
+                &nl_search_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("nl_search_model", nl_search_model)
+            .field("nl_search_base_url", &redact_url(nl_search_base_url))
+            .field("nl_search_rate_limit", nl_search_rate_limit)
+            .field("nl_search_rate_window_secs", nl_search_rate_window_secs)
+            .field("nl_search_daily_limit", nl_search_daily_limit)
+            .field("nl_search_max_chars", nl_search_max_chars)
+            .field("seed_conformance", seed_conformance)
+            .field("export_sink", export_sink)
+            .field("export_dir", export_dir)
+            .field("export_s3_bucket", export_s3_bucket)
+            .field("export_s3_region", export_s3_region)
+            .field(
+                "export_s3_endpoint",
+                &export_s3_endpoint.as_deref().map(redact_url),
+            )
+            .field("export_s3_force_path_style", export_s3_force_path_style)
+            .field("export_presign_ttl_secs", export_presign_ttl_secs)
+            .field("export_max_concurrency", export_max_concurrency)
+            .field("export_max_jobs_per_tenant", export_max_jobs_per_tenant)
+            .field("export_shard_rows", export_shard_rows)
+            .field("export_controller", export_controller)
+            .field("export_output_ttl_secs", export_output_ttl_secs)
+            .field("export_cleanup_interval_secs", export_cleanup_interval_secs)
+            .field("sof_sqlquery_max_rows", sof_sqlquery_max_rows)
+            .field(
+                "sof_sqlquery_max_source_rows_per_vd",
+                sof_sqlquery_max_source_rows_per_vd,
+            )
+            .field("sof_sqlquery_max_vds", sof_sqlquery_max_vds)
+            .field("sof_sqlquery_timeout_secs", sof_sqlquery_timeout_secs)
+            .field("sof_runner_header", sof_runner_header)
+            .field(
+                "terminology_server",
+                &terminology_server.as_deref().map(redact_url),
+            )
+            .field("multitenancy", multitenancy)
+            .field("bulk_export", bulk_export)
+            .field("bulk_submit", bulk_submit)
+            .field("validation", validation)
+            .finish()
+    }
+}
+
+/// `url` for `Debug` output: the location the primary backend of
+/// `storage_backend` would read from it, credentials and options removed.
+fn debug_database_url(url: &str, storage_backend: &str) -> String {
+    let backend = match storage_backend
+        .parse::<StorageBackendMode>()
+        .map(StorageBackendMode::primary_backend_kind)
+    {
+        Ok(BackendKind::Sqlite) => "sqlite",
+        Ok(BackendKind::Postgres) => "postgres",
+        Ok(BackendKind::MongoDB) => "mongodb",
+        _ => "",
+    };
+    redact_database_url(url, backend)
+}
+
+/// A comma-separated URL list, each entry passed through [`redact_url`].
+fn redact_url_list(urls: &str) -> String {
+    urls.split(',')
+        .map(|url| redact_url(url.trim()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn parse_public_base_url_arg(value: &str) -> Result<String, String> {
@@ -1736,6 +2077,7 @@ impl Default for ServerConfig {
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
+            elasticsearch_contained_sweep_concurrency: 0,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
@@ -2090,6 +2432,7 @@ impl ServerConfig {
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
+            elasticsearch_contained_sweep_concurrency: 0,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
@@ -3674,5 +4017,80 @@ mod tests {
     #[test]
     fn bulk_submit_file_concurrency_default_is_one() {
         assert_eq!(BulkSubmitConfig::default().file_concurrency, 1);
+    }
+
+    // ── Secrets stay out of `--help` and `Debug` (#2149) ─────────────
+
+    /// Every argument whose environment value can carry a credential.
+    const SECRET_ENV_ARGS: &[&str] = &[
+        "HFS_DATABASE_URL",
+        "HFS_ELASTICSEARCH_NODES",
+        "HFS_ELASTICSEARCH_PASSWORD",
+        "HFS_NL_SEARCH_API_KEY",
+        "HFS_NL_SEARCH_BASE_URL",
+        "HFS_EXPORT_S3_ENDPOINT",
+        "HFS_TERMINOLOGY_SERVER",
+    ];
+
+    #[test]
+    fn help_hides_the_values_of_secret_environment_variables() {
+        let command = ServerConfig::command();
+        for name in SECRET_ENV_ARGS {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_env().is_some_and(|env| env == *name))
+                .unwrap_or_else(|| panic!("no argument reads {name}"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "`hfs --help` would print the value of {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_redacts_server_config_secrets() {
+        let config = ServerConfig {
+            storage_backend: "postgres".to_string(),
+            database_url: Some("postgres://hfs:DB-SECRET@db.internal:5432/hfs".to_string()),
+            elasticsearch_nodes: "https://elastic:NODE-SECRET@es1:9200, https://es2:9200"
+                .to_string(),
+            elasticsearch_username: Some("elastic".to_string()),
+            elasticsearch_password: Some("ES-PASSWORD-SECRET".to_string()),
+            nl_search_api_key: Some("sk-NL-KEY-SECRET".to_string()),
+            nl_search_base_url: "https://llm-proxy.internal?key=NL-URL-SECRET".to_string(),
+            export_s3_endpoint: Some("http://minio:9000?X-Amz-Signature=S3-SECRET".to_string()),
+            terminology_server: Some("https://u:TX-SECRET@hts.internal:8090".to_string()),
+            bulk_submit: BulkSubmitConfig {
+                client_id: Some("hfs-client".to_string()),
+                private_key: Some("-----BEGIN PRIVATE KEY----- PRIVATE-SECRET".to_string()),
+                decryption_key: Some("{\"d\":\"DECRYPTION-SECRET\"}".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for debug in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!debug.contains("SECRET"), "secret in Debug output: {debug}");
+            for kept in [
+                "es1:9200",
+                "es2:9200",
+                "elastic",
+                "llm-proxy.internal",
+                "minio:9000",
+                "hts.internal:8090",
+                "hfs-client",
+                "[redacted]",
+            ] {
+                assert!(debug.contains(kept), "`{kept}` missing from {debug}");
+            }
+        }
+    }
+
+    #[test]
+    fn debug_shows_a_sqlite_database_path() {
+        let config = ServerConfig {
+            database_url: Some("./data/fhir.db".to_string()),
+            ..Default::default()
+        };
+        assert!(format!("{config:?}").contains("./data/fhir.db"));
     }
 }

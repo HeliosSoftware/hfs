@@ -108,6 +108,63 @@ read_host_mem() {
   [ -n "$HOSTMEM_AVAIL_MB" ] || HOSTMEM_AVAIL_MB=unknown
 }
 
+# capture_holders [TOP_N]: best-effort, never-fatal record of which containers
+# hold the host's memory (the gate only sees host-wide MemAvailable). Appends a
+# timestamped block to ${BENCH_RESULTS_DIR:-bench-results}/capacity-gate-holders.txt:
+# docker stats sorted by used memory (descending, top 15) plus docker ps
+# image/age/labels. Runs in a subshell with `|| true` everywhere so it can
+# never change the script's exit status.
+holders_stats_sorted() {
+  # Prints "MiB\tID\tName\tMemUsage", biggest first.
+  timeout 60 docker stats --no-stream --format '{{.ID}}\t{{.Name}}\t{{.MemUsage}}' 2>/dev/null \
+    | awk -F'\t' '{
+        u=$3; sub(/ *\/.*/, "", u); v=u+0
+        if (u ~ /[Gg]i?[Bb]$/) v*=1024; else if (u ~ /[Kk]i?[Bb]$/) v/=1024; else if (u ~ /[Mm]i?[Bb]$/) v=v; else if (u ~ /[Bb]$/) v/=1048576
+        printf "%.1f\t%s\t%s\t%s\n", v, $1, $2, $3 }' \
+    | sort -t$'\t' -k1,1 -rn || true
+}
+
+capture_holders() {
+  (
+    set +e
+    dir="${BENCH_RESULTS_DIR:-bench-results}"
+    mkdir -p "$dir" 2>/dev/null || exit 0
+    out="$dir/capacity-gate-holders.txt"
+    {
+      echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) capacity-gate holders (backend=${BACKEND:-?}) ==="
+      echo "--- docker stats, top 15 by memory (MiB, id, name, usage) ---"
+      holders_stats_sorted | head -n 15 || true
+      echo "--- docker ps (id, image, running-for, hfs-ci, hfs-bench-run, testcontainers sessionId) ---"
+      timeout 60 docker ps --no-trunc=false --format '{{.ID}}\t{{.Image}}\t{{.RunningFor}}\t{{.Label "hfs-ci"}}\t{{.Label "hfs-bench-run"}}\t{{.Label "org.testcontainers.sessionId"}}' 2>&1 | head -n 15 || true
+      echo
+    } >> "$out" 2>/dev/null
+  ) || true
+  return 0
+}
+
+# report_holders: final-failure only — top 10 to the job log and, when
+# $GITHUB_STEP_SUMMARY is set, as a markdown table. Never fatal.
+report_holders() {
+  (
+    set +e
+    top=$(holders_stats_sorted | head -n 10)
+    [ -n "$top" ] || { echo "Top memory holders: unavailable (docker stats returned nothing)"; exit 0; }
+    echo "── Top 10 container memory holders ──"
+    printf '%s\n' "$top" | awk -F'\t' '{ printf "  %8s MiB  %s  %s  (%s)\n", $1, $2, $3, $4 }'
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+      {
+        echo "### Capacity gate: top memory holders (${BACKEND:-?})"
+        echo
+        echo "| MiB | Container ID | Name | MemUsage |"
+        echo "|---:|---|---|---|"
+        printf '%s\n' "$top" | awk -F'\t' '{ printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4 }'
+        echo
+      } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
+    fi
+  ) || true
+  return 0
+}
+
 read_host_mem
 MEM_TOTAL_MB="$HOSTMEM_TOTAL_MB"
 case "$MEM_TOTAL_MB" in ''|*[!0-9]*) MEM_TOTAL_MB=0 ;; esac
@@ -156,6 +213,7 @@ while :; do
   # (CAPACITY_AVAIL_MB blanked by the numeric guard) — keep waiting and
   # let the 600s budget below be the only thing that fails the leg.
   echo "  t=${CAPACITY_WAIT_S}s MemAvailable=${CAPACITY_AVAIL_MB:-unknown}MB (source=${CAPACITY_MEM_SOURCE}), need $(( CAPACITY_NEED_MB + 2048 ))MB — waiting"
+  capture_holders
   # Never sleep past the 600s budget: a plain `sleep 60` here could
   # carry the last iteration well beyond it (e.g. wait_s=590 -> next
   # check at 650s). Cap the sleep to whatever is actually left.
@@ -177,5 +235,7 @@ done
 
 if [ "$CAPACITY_OK" -ne 1 ]; then
   echo "::error::Docker host still short of memory for $BACKEND after ${CAPACITY_WAIT_S}s (needed $(( CAPACITY_NEED_MB + 2048 ))MB, last MemAvailable=${CAPACITY_AVAIL_MB:-unknown}MB). Failing this leg rather than risk an OOM on the shared host."
+  capture_holders
+  report_holders
   exit 1
 fi

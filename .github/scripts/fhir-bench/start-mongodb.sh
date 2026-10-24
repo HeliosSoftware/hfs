@@ -40,7 +40,7 @@
 #
 # Also reads, already exported to $GITHUB_ENV by earlier steps:
 #   MONGO_CONTAINER, MONGO_VOLUME, HFS_MONGODB_DATABASE   "Configure backend env"
-#   DOCKER_HOST_IP                                        "Determine runner / Docker host IP"
+#   DOCKER_HOST_IP                                        "Resolve Docker host and runner IP"
 #
 # Outputs (via $GITHUB_ENV): MONGO_VOL_FREE_MB, MONGO_PORT, HFS_DATABASE_URL,
 # MONGO_TXN_LIFETIME_S. Also appends a tuning table to $GITHUB_STEP_SUMMARY.
