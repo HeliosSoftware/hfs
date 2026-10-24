@@ -76,6 +76,7 @@ async fn shared_mongo() -> Option<&'static SharedMongo> {
             let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
             let container = container_cleanup::with_cleanup_label(
                 Mongo::default()
+                    .with_tag("7.0")
                     .with_label("github.run_id", &run_id)
                     .with_cmd([
                         "mongod",

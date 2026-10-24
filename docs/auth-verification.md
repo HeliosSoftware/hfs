@@ -207,7 +207,7 @@ does not transfer to another.
 |-----|------------------------|---------------------|----------------------------|-----------|-------|
 | **Keycloak** | **Themes** (FreeMarker templates + CSS), configurable per realm; also v2 "declarative" simple styling | ✅ full | ✅ full (custom `.ftl` templates) | ❌ Keycloak-specific | Self-hosted → we can ship a Helios theme as a JAR/mounted dir. Most control of the four. |
 | **Okta** | Brands API + custom sign-in widget (hosted or embedded); custom domain | ✅ logo/colors via console; CSS on the widget | ⚠️ widget config, not arbitrary HTML | ❌ | Embedded widget gives more control but pulls the login into our app surface. |
-| **Auth0** | Universal Login + Branding (logo, colors, page templates via Liquid), custom domain | ✅ | ⚠️ page templates (Liquid), bounded | ❌ | "New" Universal Login is config-driven; "Classic" allows more HTML/JS. |
+| **Auth0** | Universal Login + Branding (logo, colors, page templates via Liquid), custom domain | ✅ | ⚠️ page templates (Liquid), bounded | ❌ | "New" Universal Login is config-driven; "Classic" allows more HTML/JS. Hosted by Auth0, so branding is tenant config; we keep it in the repo as a theme JSON plus a Management API script (`docker/auth0/branding/`). Page templates need a custom domain. |
 | **Entra ID** | Company Branding (logo, background, text) per tenant | ✅ limited (logo/background/text strings) | ❌ no template/CSS control | ❌ | Most locked-down; branding only, no layout control. |
 
 ### Recommendation
@@ -221,7 +221,14 @@ does not transfer to another.
   `keycloak` theme with no template forks, so it survives Keycloak upgrades.
   Rendered end to end via the `hfs-web` client (screenshot in the PR). It's the
   one IdP we bundle for dev/self-host and the only one where we control the box.
-- **For Okta/Auth0/Entra, document the branding knobs** (logo + colors + custom
+- **Ship the same branding for Auth0, as tenant config.** Auth0 hosts the login
+  page, so there is no theme directory to mount; instead
+  `docker/auth0/branding/` keeps a Universal Login theme (`theme.json`: logo,
+  Figtree, accent `#33b8ff`, light surface) and `apply-branding.sh`, which pushes
+  it to a tenant through the Management API. Re-runnable, settings only, no Liquid
+  page templates (those need a custom domain). Applied to the #1181 test tenant
+  (screenshot in the PR).
+- **For Okta/Entra, document the branding knobs** (logo + colors + custom
   domain) and stop there. Don't attempt a portable theme — nothing transfers.
 - **HFS-side involvement is limited to the redirect** (§3): send users to the
   IdP and handle the callback. The only "HFS branding" the user sees pre-login is
