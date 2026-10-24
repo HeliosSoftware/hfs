@@ -5177,6 +5177,15 @@ fn call_function(
                                         Some('t') => result.push('\t'),
                                         Some('b') => result.push('\u{0008}'),
                                         Some('f') => result.push('\u{000C}'),
+                                        Some('/') => result.push('/'),
+                                        Some('u') => {
+                                            // \uXXXX, pairing UTF-16 surrogate escapes
+                                            match unescape_json_unicode(&mut chars) {
+                                                Some(c) => result.push(c),
+                                                // Malformed escape, keep it as written
+                                                None => result.push_str("\\u"),
+                                            }
+                                        }
                                         Some(c) => {
                                             // Unknown escape, keep both characters
                                             result.push('\\');
@@ -6960,37 +6969,40 @@ fn add_duration_to_datetime(
     value: Decimal,
     unit: &str,
 ) -> Result<EvaluationResult, EvaluationError> {
-    use chrono::DateTime;
-
     // Store original timezone info if present
-    let (has_tz, tz_str) = if dt_str.ends_with('Z') {
-        (true, "Z".to_string())
+    let tz_str = if dt_str.ends_with('Z') {
+        "Z".to_string()
     } else if let Some(tz_pos) = dt_str.rfind(&['+', '-'][..]) {
         // Check if this is a timezone offset (not just a negative date)
         if tz_pos > 10 && dt_str[tz_pos..].contains(':') {
-            (true, dt_str[tz_pos..].to_string())
+            dt_str[tz_pos..].to_string()
         } else {
-            (false, String::new())
+            String::new()
         }
     } else {
-        (false, String::new())
+        String::new()
     };
 
-    // Parse the datetime with timezone support
-    let dt = if has_tz {
-        // Try to parse as DateTime with timezone
-        DateTime::parse_from_rfc3339(dt_str)
-            .or_else(|_| DateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S%.f%:z"))
-            .or_else(|_| DateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S%:z"))
-            .map(|dt| dt.naive_local())
-            .map_err(|e| EvaluationError::TypeError(format!("Invalid datetime format: {}", e)))?
+    // Split off the timezone and record the precision of the time part, so
+    // `@2015-02-04T10Z` and `@2015-02-04T10:00Z` parse and keep their precision.
+    let local = dt_str[..dt_str.len() - tz_str.len()].trim_start_matches('@');
+    let (date_part, time_part) = local.split_once('T').unwrap_or((local, ""));
+    let time_fields = if time_part.is_empty() {
+        0
     } else {
-        // Parse as naive datetime without timezone
-        NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S%.f")
-            .or_else(|_| NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S"))
-            .or_else(|_| NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M"))
-            .map_err(|e| EvaluationError::TypeError(format!("Invalid datetime format: {}", e)))?
+        time_part.split(':').count()
     };
+    let has_fraction = time_part.contains('.');
+    let normalized_time = match time_fields {
+        1 => format!("{time_part}:00:00"),
+        2 => format!("{time_part}:00"),
+        _ => time_part.to_string(),
+    };
+    let dt = NaiveDateTime::parse_from_str(
+        &format!("{date_part}T{normalized_time}"),
+        "%Y-%m-%dT%H:%M:%S%.f",
+    )
+    .map_err(|e| EvaluationError::TypeError(format!("Invalid datetime format: {}", e)))?;
 
     // Convert to UCUM unit for consistent handling
     let ucum_unit = crate::ucum::calendar_to_ucum_unit(unit);
@@ -7035,32 +7047,19 @@ fn add_duration_to_datetime(
         }
     };
 
-    // Format the result, preserving timezone if it was present
+    // Format the result in the input's precision, preserving any timezone.
     // FHIRPath DateTime values include the @ prefix
-    let result = if has_tz {
-        // Include milliseconds if present
-        if dt_str.contains('.') {
-            format!(
-                "@{}.{:03}{}",
-                new_dt.format("%Y-%m-%dT%H:%M:%S"),
-                new_dt.and_utc().timestamp_subsec_millis(),
-                tz_str
-            )
-        } else {
-            format!("@{}{}", new_dt.format("%Y-%m-%dT%H:%M:%S"), tz_str)
-        }
-    } else {
-        // No timezone
-        if dt_str.contains('.') {
-            format!(
-                "@{}.{:03}",
-                new_dt.format("%Y-%m-%dT%H:%M:%S"),
-                new_dt.and_utc().timestamp_subsec_millis()
-            )
-        } else {
-            format!("@{}", new_dt.format("%Y-%m-%dT%H:%M:%S"))
-        }
+    let local_result = match time_fields {
+        1 => new_dt.format("%Y-%m-%dT%H").to_string(),
+        2 => new_dt.format("%Y-%m-%dT%H:%M").to_string(),
+        _ if has_fraction => format!(
+            "{}.{:03}",
+            new_dt.format("%Y-%m-%dT%H:%M:%S"),
+            new_dt.and_utc().timestamp_subsec_millis()
+        ),
+        _ => new_dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
     };
+    let result = format!("@{local_result}{tz_str}");
 
     Ok(EvaluationResult::datetime(result))
 }
@@ -7279,6 +7278,39 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
     crate::ucum::validate_unit(unit)
 }
 
+/// Decodes the `XXXX` of a JSON `\uXXXX` escape (the `\u` already consumed),
+/// joining a high surrogate with a following `\uXXXX` low surrogate. Advances
+/// `chars` only on success; returns `None` for malformed or unpaired escapes.
+fn unescape_json_unicode(chars: &mut std::str::Chars<'_>) -> Option<char> {
+    fn hex4(chars: &mut std::str::Chars<'_>) -> Option<u32> {
+        let digits: String = chars.by_ref().take(4).collect();
+        if digits.len() == 4 && digits.chars().all(|c| c.is_ascii_hexdigit()) {
+            u32::from_str_radix(&digits, 16).ok()
+        } else {
+            None
+        }
+    }
+
+    let mut ahead = chars.clone();
+    let first = hex4(&mut ahead)?;
+    let c = match first {
+        0xD800..=0xDBFF => {
+            if ahead.next()? != '\\' || ahead.next()? != 'u' {
+                return None;
+            }
+            let low = hex4(&mut ahead)?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return None;
+            }
+            char::from_u32(0x10000 + ((first - 0xD800) << 10) + (low - 0xDC00))?
+        }
+        0xDC00..=0xDFFF => return None,
+        _ => char::from_u32(first)?,
+    };
+    *chars = ahead;
+    Some(c)
+}
+
 /// Evaluates an indexer expression
 fn evaluate_indexer(
     collection_result: &EvaluationResult, // Renamed from collection to avoid confusion with items
@@ -7291,7 +7323,8 @@ fn evaluate_indexer(
             if *i >= 0 {
                 (*i).try_into().ok() // Convert non-negative i64 to usize
             } else {
-                None // Negative index is invalid
+                // A negative index is out of range, so the result is empty
+                return Ok(EvaluationResult::Empty);
             }
         }
         EvaluationResult::Decimal(d, _, _) => {
