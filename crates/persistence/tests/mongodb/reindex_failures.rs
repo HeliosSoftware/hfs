@@ -130,6 +130,33 @@ fn transient_failure_data(command: &str, namespace: &str, write_concern: bool) -
     data
 }
 
+/// Every live fixture Observation of `page`.
+fn live_fixture_scope(tenant: &TenantContext, page: &[StoredResource]) -> Document {
+    doc! {
+        "tenant_id": tenant.tenant_id().as_str(),
+        "resource_type": "Observation",
+        "id": {"$in": page.iter().map(|resource| resource.id()).collect::<Vec<_>>()},
+        "is_deleted": false,
+    }
+}
+
+/// Removes `missing_params` from every live fixture Observation of `page`.
+async fn clear_missing_params(
+    db: &mongodb::Database,
+    tenant: &TenantContext,
+    page: &[StoredResource],
+) {
+    let cleared = db
+        .collection::<Document>("resources")
+        .update_many(
+            live_fixture_scope(tenant, page),
+            doc! {"$unset": {"missing_params": ""}},
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.matched_count, page.len() as u64);
+}
+
 async fn page_failure_matrix(overlap: bool) {
     let Some((backend, tenant, page, db)) = failure_fixture(overlap, false).await else {
         skip_or_fail_unavailable("reindex failure fixture requires MongoDB");
@@ -159,6 +186,12 @@ async fn page_failure_matrix(overlap: bool) {
             ("update", "resources", "metadata"),
         ] {
             for write_concern in [false, true] {
+                if collection == "resources" {
+                    // The page leaves out a metadata update the stored
+                    // resource already satisfies (#2005), and seeding through
+                    // CRUD already wrote it, so remove it to make one due.
+                    clear_missing_params(&db, &tenant, &page).await;
+                }
                 let data = transient_failure_data(
                     command,
                     &format!("{}.{}", db.name(), collection),
@@ -196,17 +229,8 @@ async fn page_failure_matrix(overlap: bool) {
         // Keep this after the matrix so a successful page cannot warm its
         // adaptive sub-batch size before the failure cases exercise overlap.
         let resources = db.collection::<Document>("resources");
-        let scope = doc! {
-            "tenant_id": tenant.tenant_id().as_str(),
-            "resource_type": "Observation",
-            "id": {"$in": page.iter().map(|resource| resource.id()).collect::<Vec<_>>()},
-            "is_deleted": false,
-        };
-        let cleared = resources
-            .update_many(scope.clone(), doc! {"$unset": {"missing_params": ""}})
-            .await
-            .unwrap();
-        assert_eq!(cleared.matched_count, page.len() as u64);
+        let scope = live_fixture_scope(&tenant, &page);
+        clear_missing_params(&db, &tenant, &page).await;
         let mut without_metadata = scope.clone();
         without_metadata.insert("missing_params", doc! {"$exists": false});
         assert_eq!(
