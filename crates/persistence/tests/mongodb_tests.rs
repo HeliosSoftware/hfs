@@ -405,7 +405,7 @@ mod shared_mongo {
                 // `SHARED` is a static and never dropped; the cleanup label
                 // lets the exit hook remove the container.
                 let container = super::container_cleanup::with_cleanup_label(
-                    Mongo::default()
+                    Mongo::default().with_tag("7.0")
                         .with_label("github.run_id", &run_id)
                         // Cap WiredTiger's cache. By default mongod sizes it to
                         // ~50% of *host* RAM (ignoring container limits), so on CI
