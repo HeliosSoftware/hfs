@@ -610,3 +610,55 @@ async fn postgres_opposite_canonical_replacements_conflict_without_deadlocking()
         second
     );
 }
+
+/// Each advisory lock takes a slot in PostgreSQL's shared lock table (by
+/// default 64 × `max_connections` entries). Locking every resource's identity
+/// separately made a 5,000-resource bootstrap batch fail with "out of shared
+/// memory", so an import must hold a bounded number of identity locks.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_import_identity_locks_are_bounded_by_bundle_size() {
+    let app = WriteApp::postgres().await;
+    let pool = app.pool.as_ref().unwrap();
+    let mut gate_client = pool.get().await.unwrap();
+    let observer = pool.get().await.unwrap();
+    install_gate(&gate_client, "code_systems", "INSERT").await;
+    let gate = gate_client.transaction().await.unwrap();
+    gate.execute("SELECT pg_advisory_xact_lock($1)", &[&GATE_KEY])
+        .await
+        .unwrap();
+    let gate_pid: i32 = gate
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let resources = (0..2_000)
+        .map(|index| {
+            code_system(
+                &format!("bounded-{index}"),
+                &format!("http://example.org/bounded-locks/{index}"),
+                "1",
+                "code",
+            )
+        })
+        .collect::<Vec<_>>();
+    let importing = tokio::spawn(import(app.importer.clone(), resources));
+    // The import has taken its identity locks and waits at its first insert.
+    let import_pid = blocked_by(&observer, gate_pid).await;
+    let held: i64 = observer
+        .query_one(
+            "SELECT COUNT(*) FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND granted",
+            &[&import_pid],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    gate.rollback().await.unwrap();
+    assert!(
+        held <= 256,
+        "a 2,000-resource import held {held} advisory locks"
+    );
+    let stats = importing.await.unwrap();
+    assert!(stats.errors.is_empty(), "{:?}", stats.errors);
+    assert_eq!(stats.code_systems, 2_000);
+}

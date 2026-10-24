@@ -15,7 +15,21 @@ fn storage_error(error: tokio_postgres::Error) -> HtsError {
     HtsError::StorageError(super::error_chain(&error))
 }
 
-/// Only imports competing for a source ID or canonical version serialize.
+/// Identity keys hash into this many advisory locks. Every advisory lock held
+/// takes a slot in PostgreSQL's shared lock table, which by default holds
+/// `max_locks_per_transaction` (64) × (`max_connections` + prepared
+/// transactions) entries. One lock per resource made a 5,000-resource
+/// bootstrap batch fail with "out of shared memory". Bucketing caps any
+/// transaction at this many locks, at the cost of unrelated identities
+/// sharing a lock: a large import serializes with every REST write.
+const IDENTITY_LOCK_BUCKETS: u64 = 256;
+
+/// First key of the bucket range ("HTS_ID\0\0"), in the single-`bigint`
+/// advisory key space, clear of `HTS_SCHEMA_LOCK` and the HFS migration lock.
+const IDENTITY_LOCK_BASE: i64 = 0x4854_535f_4944_0000;
+
+/// Only imports competing for a source ID or canonical version (or its lock
+/// bucket) serialize.
 /// Acquire every key in sorted order before writing, so bundles with reversed
 /// resource order cannot deadlock. One command acquires the whole bounded batch.
 pub(crate) async fn lock_import(
@@ -53,7 +67,8 @@ pub(crate) async fn lock_import(
     lock_keys(client, keys).await
 }
 
-async fn lock_keys(client: &impl GenericClient, mut keys: Vec<i64>) -> Result<(), HtsError> {
+async fn lock_keys(client: &impl GenericClient, keys: Vec<i64>) -> Result<(), HtsError> {
+    let mut keys: Vec<i64> = keys.into_iter().map(lock_bucket).collect();
     keys.sort_unstable();
     keys.dedup();
     if !keys.is_empty() {
@@ -99,6 +114,10 @@ fn lock_key(kind: ResourceKind, scope: &str, value: &str, version: &str) -> i64 
     let mut bytes = [0; 8];
     bytes.copy_from_slice(&digest[..8]);
     i64::from_be_bytes(bytes)
+}
+
+fn lock_bucket(key: i64) -> i64 {
+    IDENTITY_LOCK_BASE + (key as u64 % IDENTITY_LOCK_BUCKETS) as i64
 }
 
 #[derive(PartialEq, Eq)]
