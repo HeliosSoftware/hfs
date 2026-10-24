@@ -1653,6 +1653,14 @@ fn contained_composite_value_stages(
     Ok(first)
 }
 
+/// Whether `missing_params` records `name` when absent. `_id` and
+/// `_lastUpdated` live on every resource document and `:missing` on them
+/// never reads the array, so recording them would only add index keys
+/// (#2006).
+pub(super) fn records_missing_metadata(name: &str) -> bool {
+    !matches!(name, "_id" | "_lastUpdated")
+}
+
 /// Which `:missing` parameters of one query `missing_params` answers.
 ///
 /// Classified once per query by [`MongoBackend::classify_missing`] and passed
@@ -1684,7 +1692,7 @@ impl MissingSupport {
     /// Whether `param` is a `:missing=true` that `missing_params` answers on
     /// the resource document.
     pub(super) fn is_resource_parameter(&self, param: &SearchParameter) -> bool {
-        !matches!(param.name.as_str(), "_id" | "_lastUpdated")
+        records_missing_metadata(&param.name)
             && matches!(param.modifier, Some(SearchModifier::Missing))
             && param
                 .values
