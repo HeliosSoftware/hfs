@@ -1487,10 +1487,28 @@ async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
+    process_expand_target(state, params, None).await
+}
+
+/// The selected instance remains a stored ValueSet throughout expansion.
+struct InstanceValueSet {
+    id: String,
+    resource: Value,
+}
+
+async fn process_expand_target<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+    instance: Option<&InstanceValueSet>,
+) -> Result<Bytes, HtsError> {
     // A VCL implicit-ValueSet `url` becomes an inline `valueSet` before any
     // cache key is computed, so the keys hash the translated body and the
     // `url|version` split / negative cache never see the VCL expression.
-    let params = crate::vcl::rewrite_vcl_params(params)?;
+    let params = if instance.is_none() {
+        crate::vcl::rewrite_vcl_params(params)?
+    } else {
+        params
+    };
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips ALL pre-call helpers when the same canonical params have produced
     // a response earlier in this AppState's lifetime.  Cleared on every
@@ -1505,10 +1523,14 @@ async fn process_expand<B: TerminologyBackend>(
     // the request has a `tx-resource` *without* an inline `valueSet`, or
     // carries a skip-listed slow-path knob — bail and call inner directly.
     if let Some(key) = build_expand_cache_key(&params) {
+        let key = match instance {
+            Some(instance) => format!("instance:{}:{key}", instance.id),
+            None => key,
+        };
         if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
             return Ok(cached);
         }
-        let value = process_expand_inner(state, params).await?;
+        let value = process_expand_inner(state, params, instance).await?;
         expand_handler_cache_put(&state.expand_handler_cache, key, value.clone());
         return Ok(value);
     }
@@ -1516,16 +1538,17 @@ async fn process_expand<B: TerminologyBackend>(
         if let Some(cached) = expand_handler_cache_get(&state.inline_compose_handler_cache, &key) {
             return Ok(cached);
         }
-        let value = process_expand_inner(state, params).await?;
+        let value = process_expand_inner(state, params, instance).await?;
         expand_handler_cache_put(&state.inline_compose_handler_cache, key, value.clone());
         return Ok(value);
     }
-    process_expand_inner(state, params).await
+    process_expand_inner(state, params, instance).await
 }
 
 async fn process_expand_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
+    instance: Option<&InstanceValueSet>,
 ) -> Result<Bytes, HtsError> {
     // EX_PROBE: total wall time for the request, plus per-stage breakdown.
     // Stripped after the iter11 diagnosis lands.
@@ -1765,6 +1788,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
             .unwrap_or_default(),
     };
     let cache_key = ExpandCacheKey {
+        selected_value_set_id: instance.map(|selected| selected.id.clone()),
         url_or_body: cache_url_key,
         filter: filter.clone().unwrap_or_default(),
         count: count.unwrap_or(u32::MAX),
@@ -1784,7 +1808,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // URLs that previously returned NotFound are remembered here so we can skip
     // all backend queries on repeated requests (saves 5+ SQLite round-trips per
     // hit).
-    if let Some(ref url_str) = url {
+    if instance.is_none()
+        && let Some(ref url_str) = url
+    {
         if let Ok(neg) = state.not_found_urls.read() {
             if neg.contains(url_str.as_str()) {
                 return Err(HtsError::NotFound(url_str.clone()));
@@ -1824,7 +1850,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     let want_version_for_shortcut = pipe_version
         .clone()
         .or_else(|| find_str_param(&params, "valueSetVersion"));
-    let (url, value_set) = if value_set.is_none() {
+    let (url, value_set) = if value_set.is_none() && instance.is_none() {
         if let Some(ref url_str) = url {
             let want_version = want_version_for_shortcut.as_deref();
             let inline_match = tx_resources.iter().find(|r| {
@@ -1925,6 +1951,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     let req = ExpandRequest {
         url,
         value_set_version: effective_vs_version,
+        selected_value_set_id: instance.map(|selected| selected.id.clone()),
         value_set,
         filter: filter.clone(),
         count,
@@ -1992,7 +2019,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
             // `valueset-version/expand-indirect-expand-zero-pinned-wrong`
             // fixture which pins `default-valueset-version` to a non-existent
             // version of an imported ValueSet.
-            if let Some(ref url_str) = url_for_neg_cache {
+            if instance.is_none()
+                && let Some(ref url_str) = url_for_neg_cache
+            {
                 let msg_names_top =
                     msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
                 if msg_names_top {
@@ -2057,6 +2086,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
         });
     let flags_fut = populate_concept_flags(state.backend(), &ctx, &mut resp.contains);
     let source_vs_fut = async {
+        if instance.is_some() {
+            return None;
+        }
         if let Some(ref u) = url_for_neg_cache {
             ValueSetOperations::search(
                 state.backend(),
@@ -2081,6 +2113,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // it and would echo the re-published copy while the backend expanded the
     // original (issue #200, ValueSet path). Only needed when no version is pinned.
     let resolved_vs_version_fut = async {
+        if instance.is_some() {
+            return None;
+        }
         match (&url_for_neg_cache, &req_vs_version) {
             (Some(u), None) => {
                 ValueSetOperations::value_set_version_for_url(state.backend(), &ctx, u)
@@ -2093,7 +2128,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
     };
     let (_, source_vs_search, resolved_vs_version) =
         tokio::join!(flags_fut, source_vs_fut, resolved_vs_version_fut);
-    let source_vs: Option<Value> = if url_for_neg_cache.is_some() {
+    let source_vs: Option<Value> = if let Some(selected) = instance {
+        Some(selected.resource.clone())
+    } else if url_for_neg_cache.is_some() {
         source_vs_search.and_then(|mut v| {
             // If a specific version was requested, return the row whose
             // `version` matches exactly. Defensive post-filter: the search
@@ -4477,21 +4514,33 @@ pub(crate) fn inject_accept_language(headers: &HeaderMap, params: &mut Vec<Value
     }
 }
 
-/// Inject (or replace) the `url` parameter in a params list.
-///
-/// Removes any existing `url` entry from the caller's params so that the
-/// resource-id-resolved URL always wins, then prepends the canonical URL as a
-/// `valueUri` parameter.
-fn inject_url(mut params: Vec<Value>, url: String) -> Vec<Value> {
-    params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("url"));
-    let mut with_url = vec![json!({"name": "url", "valueUri": url})];
-    with_url.append(&mut params);
-    with_url
+/// Select the instance's canonical URL without turning it into an inline body.
+/// Its public ID travels separately, so an unversioned row cannot resolve to
+/// a versioned sibling and callers cannot inject the internal selector.
+fn instance_expand_params(
+    mut params: Vec<Value>,
+    resource: &Value,
+) -> Result<Vec<Value>, HtsError> {
+    let url = resource
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HtsError::InvalidRequest("Stored ValueSet has no canonical URL".into()))?;
+    params.retain(|param| {
+        !matches!(
+            param.get("name").and_then(Value::as_str),
+            Some("url" | "valueSet" | "valueSetVersion")
+        )
+    });
+    params.push(json!({"name": "url", "valueUri": url}));
+    if let Some(version) = resource.get("version").and_then(Value::as_str) {
+        params.push(json!({"name": "valueSetVersion", "valueString": version}));
+    }
+    Ok(params)
 }
 
 /// POST /ValueSet/{id}/$expand
 ///
-/// Resolves the ValueSet canonical URL from its FHIR `id`, then delegates to
+/// Resolves the exact stored ValueSet from its logical `id`, then delegates to
 /// the same expansion logic used by the system-level endpoint.
 pub async fn expand_by_id_post<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
@@ -4502,27 +4551,28 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let url = state
+    let resource = state
         .backend()
-        .resource_url_by_id("ValueSet", &id)
+        .resource_by_id("ValueSet", &id)?
         .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
 
     let raw_params = body
         .and_then(|Json(v)| extract_parameter_array(&v).ok())
         .unwrap_or_default();
-    let mut params = inject_url(raw_params, url);
+    let mut params = instance_expand_params(raw_params, &resource)?;
+    let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
+        process_expand_target(&state, params, Some(&instance)).await?,
         format,
     ))
 }
 
 /// `GET /ValueSet/{id}/$expand?filter=<text>&count=<n>`
 ///
-/// Instance-level GET variant.  Resolves the ValueSet canonical URL from its
-/// FHIR logical `id` and merges it with the remaining query-string parameters
+/// Instance-level GET variant. Resolves the ValueSet resource by its
+/// logical `id` and merges it with the remaining query-string parameters
 /// before dispatching to the shared expansion pipeline.
 ///
 /// Returns 404 when no ValueSet with the given `id` is found.
@@ -4534,18 +4584,19 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let url = state
+    let resource = state
         .backend()
-        .resource_url_by_id("ValueSet", &id)
+        .resource_by_id("ValueSet", &id)?
         .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
 
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    let mut params = inject_url(params, url);
+    let mut params = instance_expand_params(params, &resource)?;
+    let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
+        process_expand_target(&state, params, Some(&instance)).await?,
         format,
     ))
 }

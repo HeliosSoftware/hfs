@@ -49,6 +49,9 @@ mod tenant_id_fidelity_suite;
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 
+#[path = "common/sof_terminology_suite.rs"]
+mod sof_terminology_suite;
+
 /// The backend-agnostic full-text purge-completeness scenarios (issue #386),
 /// shared verbatim with the SQLite suite that owns the file.
 ///
@@ -10958,6 +10961,15 @@ mod postgres_integration {
             .await
             .unwrap();
         drop(client);
+        // The raw UPDATE above plays an out-of-band writer: HFS itself writes
+        // NULL `last_updated` only on contained memberships, which the
+        // eligibility cache learns from the database. Declare the rows as an
+        // in-process writer would, so the cache cannot serve a stale "none".
+        backend.declare_null_last_updated_rows(
+            tenant.tenant_id().as_str(),
+            "Observation",
+            "patient",
+        );
 
         let default = postgres_2074_query();
         for query in [
@@ -28272,6 +28284,9 @@ mod postgres_integration {
         use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
 
         let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        // A long TTL: were bulk submit to honour it, the overlay warmed by the
+        // create below would skip the probe and this batch would not fail.
+        let backend = backend.with_overlay_fingerprint_ttl(std::time::Duration::from_secs(600));
         let tenant = create_tenant("grouped-snapshot-failure");
         let tenant_id = tenant.tenant_id().as_str().to_string();
         backend
@@ -28633,6 +28648,8 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_write_indexes_with_cluster_mates_search_parameter_without_refresh() {
         let (writer, _dbname) = isolated_reindex_backend().await;
+        // TTL 0: probe on every write (the TTL fast path has its own test below).
+        let writer = writer.with_overlay_fingerprint_ttl(std::time::Duration::ZERO);
         let tenant = create_tenant("sp-fingerprint-mate");
         // Warm the writer's cached overlay with an ordinary write.
         writer
@@ -28678,6 +28695,138 @@ mod postgres_integration {
                 .await
                 .is_empty(),
             "the write before it is not (nothing reindexed)"
+        );
+    }
+
+    /// A write within the fingerprint TTL trusts its validated overlay
+    /// without probing, so a cluster-mate's SearchParameter is not indexed
+    /// until the TTL lapses; the first write after that picks it up.
+    #[tokio::test]
+    async fn postgres_write_skips_fingerprint_probe_within_ttl() {
+        let (writer, _dbname) = isolated_reindex_backend().await;
+        let writer = writer.with_overlay_fingerprint_ttl(std::time::Duration::from_millis(1500));
+        let tenant = create_tenant("sp-fingerprint-ttl");
+        // Warms and validates the overlay.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"warm","name":[{"given":["Warm"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let mate = PostgresBackend::new(writer.config().clone()).await.unwrap();
+        mate.create(
+            &tenant,
+            "SearchParameter",
+            custom_given_search_parameter("givenfp", "givenfp"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"early","name":[{"given":["Early"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            search_patients_by(&mate, &tenant, "givenfp", "Early")
+                .await
+                .is_empty(),
+            "within the TTL the write does not probe, so it is not indexed with the mate's parameter"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"late","name":[{"given":["Late"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_patients_by(&mate, &tenant, "givenfp", "Late").await,
+            vec!["late".to_string()],
+            "after the TTL the next write probes and indexes with the new parameter"
+        );
+    }
+
+    /// Bulk submit takes its overlay snapshot under the tenant gate and must
+    /// see every SearchParameter committed before it, so unlike an ordinary
+    /// write it ignores the fingerprint TTL: even with a TTL far longer than
+    /// the test, a batch indexes with a cluster-mate's new parameter.
+    #[tokio::test]
+    async fn postgres_bulk_submit_probes_fingerprint_despite_ttl() {
+        use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
+
+        let (writer, _dbname) = isolated_reindex_backend().await;
+        let writer = writer.with_overlay_fingerprint_ttl(std::time::Duration::from_secs(600));
+        let tenant = create_tenant("sp-fingerprint-bulk");
+        // Warms and validates the overlay: ordinary writes now skip the probe.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"warm","name":[{"given":["Warm"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let mate = PostgresBackend::new(writer.config().clone()).await.unwrap();
+        mate.create(
+            &tenant,
+            "SearchParameter",
+            custom_given_search_parameter("givenfp", "givenfp"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        // Control: the ordinary write is still inside the TTL and skips the probe.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"ordinary","name":[{"given":["Ordinary"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            search_patients_by(&mate, &tenant, "givenfp", "Ordinary")
+                .await
+                .is_empty()
+        );
+
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&writer, &tenant, "fingerprint-ttl").await;
+        writer
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"bulk","name":[{"given":["Bulked"]}]}),
+                )],
+                &grouped_create_options(std::sync::Arc::new(RecordingBulkSubmitBatches::default()))
+                    .with_defer_indexing(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_patients_by(&mate, &tenant, "givenfp", "Bulked").await,
+            vec!["bulk".to_string()],
+            "the bulk batch probes despite the TTL and indexes with the new parameter"
         );
     }
 
@@ -32609,6 +32758,103 @@ mod postgres_integration {
             &unique_base("fidelity_purge"),
         )
         .await;
+    }
+
+    /// #2185: the SQL-on-FHIR terminology store contract, with the tenant's
+    /// remaining relation, chunk and reference rows as the residue.
+    #[tokio::test]
+    async fn postgres_integration_sof_terminology_store_suite() {
+        let backend = create_backend().await;
+        let base = unique_base("sof_term");
+        let client = std::sync::Arc::new(backend.get_client().await.unwrap());
+        let residue = move |tenant: String| {
+            let client = std::sync::Arc::clone(&client);
+            Box::pin(async move {
+                let row = client
+                    .query_one(
+                        "SELECT (SELECT COUNT(*) FROM sof_terminology_relations WHERE tenant_id = $1)
+                              + (SELECT COUNT(*) FROM sof_terminology_refs WHERE tenant_id = $1)
+                              + (SELECT COUNT(*) FROM sof_terminology_chunks c
+                                   JOIN sof_terminology_relations r ON r.id = c.relation_id
+                                  WHERE r.tenant_id = $1)",
+                        &[&tenant],
+                    )
+                    .await
+                    .unwrap();
+                row.get::<_, i64>(0) as usize
+            }) as futures::future::BoxFuture<'static, usize>
+        };
+        super::sof_terminology_suite::run_all(&backend, &base, Some(&residue)).await;
+    }
+
+    /// #2185: a Library write with no terminology to record or release must
+    /// not queue on the tenant's terminology lock, which another Library's
+    /// materialization holds while it writes a large relation.
+    #[tokio::test]
+    async fn postgres_integration_sof_terminology_noop_release_skips_the_tenant_lock() {
+        use helios_sof::sqlquery::{TerminologyKind, TerminologyRelation};
+        use std::time::Duration;
+
+        let backend = create_backend().await;
+        let tenant_id = unique_base("sof_term_lock");
+        let tenant =
+            TenantContext::new(TenantId::new(&tenant_id), TenantPermissions::full_access());
+        let store = backend.sof_terminology_store().expect("terminology store");
+        store
+            .set_library_dependencies(
+                &tenant,
+                "holder",
+                vec![(
+                    "http://example.org/vs".to_string(),
+                    TerminologyRelation {
+                        kind: TerminologyKind::ValueSet,
+                        rows: vec![serde_json::json!({"code": "a"})],
+                    },
+                )],
+            )
+            .await
+            .unwrap();
+
+        // Hold the lock `set_library_dependencies` takes (see
+        // `SOF_TERMINOLOGY_LOCK_NAMESPACE`), as a long materialization would.
+        let mut holder = backend.get_client().await.unwrap();
+        let txn = holder.transaction().await.unwrap();
+        txn.execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            &[&0x4853_5454_i32, &tenant_id],
+        )
+        .await
+        .unwrap();
+
+        // A Library that never held terminology: nothing to wait for.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            store.set_library_dependencies(&tenant, "plain", vec![]),
+        )
+        .await
+        .expect("a no-op release must not wait for the tenant lock")
+        .unwrap();
+
+        // A Library that holds a reference still serializes on the lock.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            store.set_library_dependencies(&tenant, "holder", vec![]),
+        )
+        .await;
+        assert!(blocked.is_err(), "a real release must take the tenant lock");
+
+        txn.rollback().await.unwrap();
+        store
+            .set_library_dependencies(&tenant, "holder", vec![])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load(&tenant, "http://example.org/vs")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// #1912: the tenant-scoped existence probe answers as `count_by_tenant`
