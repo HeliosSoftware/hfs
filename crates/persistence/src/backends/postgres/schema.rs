@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 50;
+pub const SCHEMA_VERSION: i32 = 51;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -514,6 +514,12 @@ async fn migrate_schema(
             }
             48 => migrate_v48_to_v49(client).await?,
             49 => migrate_v49_to_v50(client).await?,
+            50 => {
+                // Stamps the v51 marker inside its own transaction, like v48.
+                migrate_v50_to_v51(client).await?;
+                version += 1;
+                continue;
+            }
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4843,6 +4849,29 @@ async fn migrate_v49_to_v50(client: &mut deadpool_postgres::Client) -> StorageRe
     Ok(())
 }
 
+/// v50 -> v51: the SQL-on-FHIR terminology tables (#2185), PostgreSQL's
+/// counterpart of SQLite's v41. New, empty tables only, so the step is one
+/// transaction that stamps its own marker. `SET LOCAL statement_timeout = 0`,
+/// like the other transactional steps: a deployment-wide timeout must not fail
+/// the DDL.
+async fn migrate_v50_to_v51(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v51 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v51 migration: {e}")))?;
+    tx.batch_execute(super::sof_terminology::CREATE_TABLES_SQL)
+        .await
+        .map_err(|e| pg_error(format!("Migration v50->v51 failed: {e}")))?;
+    set_schema_version(&tx, 51).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v51 migration: {e}")))?;
+    Ok(())
+}
+
 /// Fresh denormalized databases do not create ordinary legacy probes. Legacy
 /// writers populate slots; its nullable rows may be folded during a transition,
 /// so family-specific predicates distinguish those from ambiguous unfolded rows.
@@ -7976,7 +8005,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 50);
+        assert_eq!(SCHEMA_VERSION, 51);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)

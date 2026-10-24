@@ -1544,6 +1544,14 @@ impl ResourceStorage for MongoBackend {
         true
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        Some(std::sync::Arc::new(
+            super::sof_terminology::MongoTerminologyStore::new(self),
+        ))
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::in_process::{InProcessSofRunner, ResourceScan};
         use crate::sof::mongodb::MongoInDbRunner;
@@ -2403,6 +2411,8 @@ impl ResourceStorage for MongoBackend {
         .delete_many(doc! { "tenant_id": id })
         .await
         .or_query_error("purge delete (bulk_provider_submissions)")?;
+        // SQL query terminology relations are tenant-keyed documents (#2185).
+        self.purge_tenant_sof_terminology(id).await?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
         // do not reach them — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313).
@@ -2489,6 +2499,7 @@ pub(super) struct SearchIndexDocuments {
     pub contained: Vec<Document>,
     /// Known absence outside the FHIR payload; None means extraction was skipped or failed.
     pub missing_params: Option<Vec<String>>,
+    pub missing_fp: Option<String>,
 }
 
 impl SearchIndexDocuments {
@@ -2496,11 +2507,18 @@ impl SearchIndexDocuments {
         if let Some(names) = &self.missing_params {
             document.insert("missing_params", names.clone());
         }
+        if let Some(fp) = &self.missing_fp {
+            document.insert("missing_params_fp", fp.clone());
+        }
         document
     }
 
     pub(super) fn resource_update(&self, update: Document) -> Document {
-        with_missing_metadata_update(update, self.missing_params.as_deref())
+        with_missing_metadata_update(
+            update,
+            self.missing_params.as_deref(),
+            self.missing_fp.as_deref(),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2512,6 +2530,7 @@ impl SearchIndexDocuments {
 pub(super) fn with_missing_metadata_update(
     mut update: Document,
     missing_params: Option<&[String]>,
+    missing_fp: Option<&str>,
 ) -> Document {
     if let Some(names) = missing_params {
         if !update.contains_key("$set") {
@@ -2521,6 +2540,20 @@ pub(super) fn with_missing_metadata_update(
             .get_document_mut("$set")
             .expect("resource update has a set document");
         set.insert("missing_params", names.to_vec());
+        match missing_fp {
+            Some(fp) => {
+                set.insert("missing_params_fp", fp);
+            }
+            None => {
+                if !update.contains_key("$unset") {
+                    update.insert("$unset", doc! {});
+                }
+                let unset = update
+                    .get_document_mut("$unset")
+                    .expect("resource update has an unset document");
+                unset.insert("missing_params_fp", "");
+            }
+        }
     } else {
         if !update.contains_key("$unset") {
             update.insert("$unset", doc! {});
@@ -2529,6 +2562,7 @@ pub(super) fn with_missing_metadata_update(
             .get_document_mut("$unset")
             .expect("resource update has an unset document");
         unset.insert("missing_params", "");
+        unset.insert("missing_params_fp", "");
     }
     update
 }
@@ -3523,8 +3557,8 @@ impl MongoBackend {
         resource_id: &str,
         resource: &Value,
     ) -> (SearchIndexDocuments, Option<String>) {
-        let (own, mut missing_params, failure) = match self
-            .tenant_extractor(tenant_id)
+        let extractor = self.tenant_extractor(tenant_id);
+        let (own, mut missing_params, failure) = match extractor
             .extract_with_missing(resource, resource_type)
         {
             Ok(extraction) => {
@@ -3587,6 +3621,9 @@ impl MongoBackend {
             names.sort_unstable();
             names.dedup();
         }
+        let missing_fp = missing_params
+            .is_some()
+            .then(|| self.stamp_missing_fingerprint(tenant_id, resource_type));
 
         // Also index any contained resources for `_contained` search, into
         // their own collection (`search_index_contained`) rather than mixed
@@ -3615,6 +3652,7 @@ impl MongoBackend {
                 own,
                 contained,
                 missing_params,
+                missing_fp,
             },
             failure,
         )

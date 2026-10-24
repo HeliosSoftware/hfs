@@ -630,6 +630,13 @@ Past the budget the call fails with `BackendError::Timeout` (`504` on the REST e
 the budget, plus the pool checkout and the handler's earlier work, is below `HFS_REQUEST_TIMEOUT`). The session stays owned by the count until
 PostgreSQL ends it, even if the caller is dropped first (#1826, #1911).
 
+Every indexed write confirms its tenant's SearchParameter overlay with a cheap
+`SELECT COUNT(*), MAX(last_updated)` fingerprint probe. `HFS_PG_SP_FINGERPRINT_TTL_MS`
+(default: `0`, every write probes) lets ordinary writes reuse an overlay validated within
+that many milliseconds (for example `1000`) and skip the probe. A SearchParameter written by
+this process invalidates the cache immediately; one committed by another HFS process is seen by
+ordinary writes within the TTL. Bulk submit always probes, whatever the TTL.
+
 Schema v49 adds the partial index `idx_resources_live_tenant ON resources (tenant_id) WHERE
 is_deleted = FALSE`, so the count is an index-only scan of a narrow index instead of the wider
 `idx_resources_reindex_id`. The first startup on v49 builds it with `CREATE INDEX CONCURRENTLY`
