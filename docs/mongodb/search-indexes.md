@@ -210,9 +210,48 @@ time is included in the insert timing statistic.
    before judging `:missing=true` latency. Existing resources without metadata
    remain searchable through the compatibility path while their value indexes
    remain valid.
-3. Run the tenant's `POST /$reindex` to populate metadata for existing resources.
+3. Populate metadata for existing resources with a metadata-only reindex
+   (#2008), which writes `missing_params` and leaves `search_index` and
+   `search_index_contained` untouched:
+
+   ```http
+   POST /$reindex
+   Content-Type: application/fhir+json
+
+   {"resourceType": "Parameters", "parameter": [
+     {"name": "metadataOnly", "valueBoolean": true},
+     {"name": "skipExistingMetadata", "valueBoolean": true}
+   ]}
+   ```
+
    Poll `GET /$reindex-status/{job_id}` on the same node and resolve reported
-   failures before treating the rebuild as complete.
+   failures before treating the backfill as complete. A full `POST /$reindex`
+   (no parameters) populates metadata too, but also deletes and rewrites every
+   value-index row.
+
+### Metadata-only reindex
+
+`metadataOnly` runs the same walk, extraction and version guard as a rebuild:
+each page's resources are extracted exactly as a rebuild would extract them,
+and `missing_params` is written only where the stored version is still the
+one the page read. It writes nothing to `search_index` or
+`search_index_contained`. Because the metadata comes from the same extraction
+that produced the value-index rows, `:missing=true` results are unchanged by
+the backfill as long as those rows were written under the current
+definitions; only the plan moves from the compatibility path to
+`idx_resources_missing_params`.
+
+| Parameter | Effect |
+|---|---|
+| `metadataOnly` | Write only `missing_params`. Cannot be combined with `clearExisting`, `clearOnly` or a bulk index rebuild. Combines with a resource type (`POST /{type}/$reindex`) and with `idStart`/`idEnd`. |
+| `skipExistingMetadata` | With `metadataOnly`, leave alone resources whose `missing_params` already carries the current `missing_params_fp`. Resources without the array, with an unstamped array (written before #1999) or with a stale stamp are written. Every resource in scope is still read and extracted; only the write is skipped. |
+
+`$reindex-status` reports `metadataOnly: true` and `metadataUpdated`, the
+number of resources whose metadata was written; `entriesCreated` stays `0`.
+A resource whose extraction fails has its metadata removed, as in a rebuild,
+and is listed as an error. On a deployment where Elasticsearch owns search
+(`mongodb-elasticsearch`), `missing_params` is never read and
+`metadataOnly` is `501 Not Implemented`, as it is on every other backend.
 
 ### Definition changes (#1999)
 
@@ -257,8 +296,10 @@ value-index route, which is about the cost it had before #1984.
 Resources written before the stamp existed (or by a node that predates it)
 carry `missing_params` without `missing_params_fp`. The probe finds them in
 one key and every `:missing=true` on the type takes the value-index route, so
-results are correct after an upgrade without any manual step. Run one
-`$reindex` after upgrading to stamp them and restore the metadata route.
+results are correct after an upgrade without any manual step. Run the
+metadata-only reindex from the upgrade steps above (`metadataOnly`, with
+`skipExistingMetadata`) to stamp them and restore the metadata route without
+rewriting the value index.
 
 Recovery, when metadata is suspected wrong despite the stamp (a restore from
 backup, a manual edit): `$unset` both fields together for the affected tenant
