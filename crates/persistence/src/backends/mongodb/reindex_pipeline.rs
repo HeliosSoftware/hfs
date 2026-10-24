@@ -572,7 +572,9 @@ async fn update_missing_metadata_counted(
 
 /// One resource's metadata-only update (#2008): the rebuild's
 /// [`SubBatchDocs::missing_updates`] statement, plus, with `skip_existing`, a
-/// guard that leaves a resource already carrying `missing_params` alone.
+/// guard that leaves alone a resource whose `missing_params` already carries
+/// this extraction's fingerprint (#1999). An unstamped array (written before
+/// #1999) or a stale stamp is rewritten, since searches distrust both.
 fn metadata_only_update(
     tenant_id: &str,
     resource: &StoredResource,
@@ -582,7 +584,18 @@ fn metadata_only_update(
 ) -> Document {
     let mut filter = resource_version_filter(tenant_id, resource);
     if skip_existing {
-        filter.insert("missing_params", doc! { "$exists": false });
+        // Skip only arrays already stamped with this extraction's
+        // fingerprint; unstamped (#1984-era) or stale stamps are rewritten.
+        match missing_fp {
+            Some(fp) => filter.insert(
+                "$or",
+                vec![
+                    doc! { "missing_params": { "$exists": false } },
+                    doc! { "missing_params_fp": { "$ne": fp } },
+                ],
+            ),
+            None => filter.insert("missing_params", doc! { "$exists": false }),
+        };
     }
     doc! {
         "q": filter,

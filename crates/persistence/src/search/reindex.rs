@@ -581,8 +581,8 @@ pub trait ReindexTarget: Send + Sync {
     /// per resource, in input order, and how many resources had their
     /// metadata written. A resource whose stored version is no longer the one
     /// in `resources` is left alone: the write that superseded it wrote its
-    /// own metadata. With `skip_existing`, a resource that already carries
-    /// metadata is left alone too.
+    /// own metadata. With `skip_existing`, a resource whose metadata is
+    /// already current is left alone too.
     ///
     /// Called only on a writer whose [`Self::supports_search_metadata`] is
     /// `true`; the default refuses every resource.
@@ -646,9 +646,9 @@ pub struct ReindexRequest {
     #[serde(default)]
     pub metadata_only: bool,
 
-    /// With [`Self::metadata_only`], leave alone the resources that already
-    /// carry metadata, so only those written before it existed are filled in
-    /// (#2008). Every resource in scope is still read and extracted.
+    /// With [`Self::metadata_only`], leave alone the resources whose metadata
+    /// is already current, so only missing, unstamped or stale metadata is
+    /// written (#2008). Every resource in scope is still read and extracted.
     #[serde(default)]
     pub skip_existing_metadata: bool,
 
@@ -780,8 +780,8 @@ impl ReindexRequest {
         self
     }
 
-    /// With [`Self::metadata_only`], skips resources that already carry
-    /// metadata (see the field).
+    /// With [`Self::metadata_only`], skips resources whose metadata is
+    /// already current (see the field).
     pub fn skip_existing_metadata(mut self) -> Self {
         self.skip_existing_metadata = true;
         self

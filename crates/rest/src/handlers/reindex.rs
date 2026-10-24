@@ -23,7 +23,7 @@
 //! | `clearExisting` | `valueBoolean` | Clear the run's scope before rebuilding it |
 //! | `clearOnly` | `valueBoolean` | Clear the run's scope and do not rebuild it |
 //! | `metadataOnly` | `valueBoolean` | Recompute only per-resource search metadata (MongoDB's `missing_params`) and leave the search index untouched |
-//! | `skipExistingMetadata` | `valueBoolean` | With `metadataOnly`, leave alone resources that already carry metadata |
+//! | `skipExistingMetadata` | `valueBoolean` | With `metadataOnly`, leave alone resources whose metadata is already current |
 //! | `batchSize` | `valueInteger` | Resources per page |
 //! | `idStart` | `valueString` | First id to reindex (included); `POST /{type}/$reindex` only |
 //! | `idEnd` | `valueString` | Id where the run stops (not included); `POST /{type}/$reindex` only |

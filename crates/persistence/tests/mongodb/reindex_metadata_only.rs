@@ -326,3 +326,77 @@ async fn mongodb_metadata_only_reindex_is_unsupported_when_search_is_offloaded()
         "{error:?}"
     );
 }
+
+/// `skipExistingMetadata` skips only arrays stamped with the current
+/// fingerprint (#1999). An array written before the stamp existed (v0.2.5,
+/// #1984) or under other definitions sends every `:missing=true` on the type
+/// to the value index, so the backfill must restamp it.
+#[tokio::test]
+async fn mongodb_metadata_only_skip_existing_restamps_unstamped_and_stale_arrays() {
+    let Some(backend) = create_backend_with_full_registry("reindex_metadata_restamp").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant = create_tenant("metadata-restamp");
+    seed(&backend, &tenant).await;
+    let written = metadata(&backend, &tenant).await;
+    let patient = |id: &str| {
+        doc! { "tenant_id": tenant.tenant_id().as_str(), "resource_type": "Patient", "id": id }
+    };
+    let collection = resources(&backend).await;
+    let fp_of = |row: &Document| row.get_str("missing_params_fp").ok().map(str::to_string);
+    let current = fp_of(&collection.find_one(patient("p0")).await.unwrap().unwrap())
+        .expect("writes stamp a fingerprint");
+    // p0: current stamp, sentinel array: must be left alone.
+    collection
+        .update_one(
+            patient("p0"),
+            doc! { "$set": { "missing_params": ["sentinel"] } },
+        )
+        .await
+        .unwrap();
+    // p1: a #1984-era array without a stamp.
+    collection
+        .update_one(
+            patient("p1"),
+            doc! { "$unset": { "missing_params_fp": "" } },
+        )
+        .await
+        .unwrap();
+    // p2: a stamp from other definitions.
+    collection
+        .update_one(
+            patient("p2"),
+            doc! { "$set": { "missing_params": ["sentinel"], "missing_params_fp": "stale" } },
+        )
+        .await
+        .unwrap();
+
+    let progress = run(
+        &backend,
+        &tenant,
+        ReindexRequest::for_types(["Patient"])
+            .metadata_only()
+            .skip_existing_metadata(),
+    )
+    .await;
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+    assert!(progress.errors.is_empty(), "{progress:?}");
+    assert_eq!(
+        progress.metadata_updated, 2,
+        "only p1 and p2 were not current"
+    );
+
+    for id in ["p0", "p1", "p2"] {
+        let row = collection.find_one(patient(id)).await.unwrap().unwrap();
+        assert_eq!(fp_of(&row).as_deref(), Some(current.as_str()), "{id}");
+    }
+    let after = metadata(&backend, &tenant).await;
+    for ((key, names), (_, expected)) in after.iter().zip(&written) {
+        match key.as_str() {
+            "Patient/p0" => assert_eq!(names.as_deref(), Some(&["sentinel".to_string()][..])),
+            _ => assert_eq!(names, expected, "{key}"),
+        }
+    }
+}

@@ -244,7 +244,7 @@ definitions; only the plan moves from the compatibility path to
 | Parameter | Effect |
 |---|---|
 | `metadataOnly` | Write only `missing_params`. Cannot be combined with `clearExisting`, `clearOnly` or a bulk index rebuild. Combines with a resource type (`POST /{type}/$reindex`) and with `idStart`/`idEnd`. |
-| `skipExistingMetadata` | With `metadataOnly`, leave alone resources that already carry the field. Every resource in scope is still read and extracted; only the write is skipped. |
+| `skipExistingMetadata` | With `metadataOnly`, leave alone resources whose `missing_params` already carries the current `missing_params_fp`. Resources without the array, with an unstamped array (written before #1999) or with a stale stamp are written. Every resource in scope is still read and extracted; only the write is skipped. |
 
 `$reindex-status` reports `metadataOnly: true` and `metadataUpdated`, the
 number of resources whose metadata was written; `entriesCreated` stays `0`.
@@ -296,8 +296,10 @@ value-index route, which is about the cost it had before #1984.
 Resources written before the stamp existed (or by a node that predates it)
 carry `missing_params` without `missing_params_fp`. The probe finds them in
 one key and every `:missing=true` on the type takes the value-index route, so
-results are correct after an upgrade without any manual step. Run one
-`$reindex` after upgrading to stamp them and restore the metadata route.
+results are correct after an upgrade without any manual step. Run the
+metadata-only reindex from the upgrade steps above (`metadataOnly`, with
+`skipExistingMetadata`) to stamp them and restore the metadata route without
+rewriting the value index.
 
 Recovery, when metadata is suspected wrong despite the stamp (a restore from
 backup, a manual edit): `$unset` both fields together for the affected tenant
