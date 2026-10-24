@@ -668,21 +668,20 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             .await
             .map_err(|error| HtsError::StorageError(error_chain(&error)))?
             .get(0);
+        let mut identities =
+            resource_identity::ImportIdentities::load(&tx, &parsed, has_resources).await?;
 
         let mut stats = ImportStats::default();
         stats.errors.extend(parsed.parse_errors.iter().cloned());
 
         for cs in &parsed.code_systems {
             if has_resources {
-                if let Err(error) = resource_identity::check_import_owner(
-                    &tx,
+                if let Err(error) = identities.check_import_owner(
                     crate::backends::resource_identity::ResourceKind::CodeSystem,
                     &cs.id,
                     &cs.url,
                     cs.version.as_deref(),
-                )
-                .await
-                {
+                ) {
                     stats
                         .errors
                         .push(format!("CodeSystem '{}' import failed: {error}", cs.url));
@@ -691,7 +690,9 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     continue;
                 }
             }
-            if let Err(e) = write_code_system(&tx, cs, &mut stats, parsed.fresh_load).await {
+            if let Err(e) =
+                write_code_system(&tx, cs, &mut identities, &mut stats, parsed.fresh_load).await
+            {
                 stats
                     .errors
                     .push(format!("CodeSystem '{}' import failed: {e}", cs.url));
@@ -699,22 +700,19 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         }
         for vs in &parsed.value_sets {
             if has_resources {
-                if let Err(error) = resource_identity::check_import_owner(
-                    &tx,
+                if let Err(error) = identities.check_import_owner(
                     crate::backends::resource_identity::ResourceKind::ValueSet,
                     &vs.id,
                     &vs.url,
                     vs.version.as_deref(),
-                )
-                .await
-                {
+                ) {
                     stats
                         .errors
                         .push(format!("ValueSet '{}' import failed: {error}", vs.url));
                     continue;
                 }
             }
-            if let Err(e) = write_value_set(&tx, vs, &mut stats).await {
+            if let Err(e) = write_value_set(&tx, vs, &mut identities, &mut stats).await {
                 stats
                     .errors
                     .push(format!("ValueSet '{}' import failed: {e}", vs.url));
@@ -722,15 +720,12 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         }
         for cm in &parsed.concept_maps {
             if has_resources {
-                if let Err(error) = resource_identity::check_import_owner(
-                    &tx,
+                if let Err(error) = identities.check_import_owner(
                     crate::backends::resource_identity::ResourceKind::ConceptMap,
                     &cm.id,
                     &cm.url,
                     cm.version.as_deref(),
-                )
-                .await
-                {
+                ) {
                     stats
                         .errors
                         .push(format!("ConceptMap '{}' import failed: {error}", cm.url));
@@ -930,9 +925,11 @@ pub(crate) async fn write_resource_in_transaction(
     if let Some(id) = replace_id {
         delete_resource_in_transaction(client, kind, id).await?;
     }
+    // Read after the delete: a replacement may reuse the identity it frees.
+    let mut identities = resource_identity::ImportIdentities::load(client, &parsed, true).await?;
     let mut stats = ImportStats::default();
     for cs in &parsed.code_systems {
-        write_code_system(client, cs, &mut stats, false).await?;
+        write_code_system(client, cs, &mut identities, &mut stats, false).await?;
         let row = client
             .query_one(
                 "SELECT id FROM code_systems WHERE url = $1 AND \
@@ -947,7 +944,7 @@ pub(crate) async fn write_resource_in_transaction(
             .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
     }
     for vs in &parsed.value_sets {
-        write_value_set(client, vs, &mut stats).await?;
+        write_value_set(client, vs, &mut identities, &mut stats).await?;
     }
     for cm in &parsed.concept_maps {
         write_concept_map(client, cm, &mut stats).await?;
@@ -1031,6 +1028,7 @@ fn utc_now() -> String {
 async fn write_code_system(
     client: &impl GenericClient,
     cs: &ParsedCodeSystem,
+    identities: &mut resource_identity::ImportIdentities,
     stats: &mut ImportStats,
     // When `true` the caller guarantees this code system had no concepts before
     // the import session, so the per-concept delete-before-reinsert of
@@ -1049,44 +1047,14 @@ async fn write_code_system(
     // mint a fresh UUID rather than letting the second import silently
     // disappear via ON CONFLICT DO NOTHING. Mirrors
     // sqlite/import/fhir_bundle.rs:189-215.
-    let preferred_id = crate::import::fhir_bundle::storage_id_for(&cs.id, cs.version.as_deref());
-    let existing_for_url_version: Option<String> = client
-        .query_opt(
-            "SELECT id FROM code_systems \
-             WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
-            &[&cs.url, &cs.version],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
-        .and_then(|r| r.get::<_, Option<String>>(0));
-    let storage_id = if let Some(id) = existing_for_url_version {
-        id
-    } else {
-        let preferred_taken: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM code_systems WHERE id = $1 OR \
-                 COALESCE(resource_json->>'id', id) = $1)",
-                &[&preferred_id],
-            )
-            .await
-            .map(|r| r.get::<_, bool>(0))
-            .unwrap_or(false);
-        if preferred_taken {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            preferred_id
-        }
-    };
-
-    let public_id = crate::backends::postgres::resource_identity::allocate(
-        client,
+    // [`resource_identity::ImportIdentities::assign`] makes the choice from
+    // rows read once for the whole write.
+    let (storage_id, public_id) = identities.assign(
         crate::backends::resource_identity::ResourceKind::CodeSystem,
-        &storage_id,
         &cs.id,
         &cs.url,
         cs.version.as_deref(),
-    )
-    .await?;
+    )?;
     let mut stored_resource = cs.resource_json.clone();
     stored_resource["id"] = serde_json::Value::String(public_id);
     let resource_json = Some(stored_resource);
@@ -1321,6 +1289,7 @@ async fn insert_hierarchy(
 async fn write_value_set(
     client: &impl GenericClient,
     vs: &ParsedValueSet,
+    identities: &mut resource_identity::ImportIdentities,
     stats: &mut ImportStats,
 ) -> Result<(), HtsError> {
     let now = utc_now();
@@ -1352,44 +1321,14 @@ async fn write_value_set(
     // for the matching (url, version) or mint a fresh UUID — otherwise
     // the second import gets silently dropped by ON CONFLICT DO NOTHING.
     // Mirrors sqlite/import/fhir_bundle.rs:443-478.
-    let preferred_id = crate::import::fhir_bundle::storage_id_for(&vs.id, vs.version.as_deref());
-    let existing_for_url_version: Option<String> = client
-        .query_opt(
-            "SELECT id FROM value_sets \
-             WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')",
-            &[&vs.url, &vs.version],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?
-        .and_then(|r| r.get::<_, Option<String>>(0));
-    let storage_id = if let Some(id) = existing_for_url_version {
-        id
-    } else {
-        let preferred_taken: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM value_sets WHERE id = $1 OR \
-                 COALESCE(resource_json->>'id', id) = $1)",
-                &[&preferred_id],
-            )
-            .await
-            .map(|r| r.get::<_, bool>(0))
-            .unwrap_or(false);
-        if preferred_taken {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            preferred_id
-        }
-    };
-
-    let public_id = crate::backends::postgres::resource_identity::allocate(
-        client,
+    // [`resource_identity::ImportIdentities::assign`] makes the choice from
+    // rows read once for the whole write.
+    let (storage_id, public_id) = identities.assign(
         crate::backends::resource_identity::ResourceKind::ValueSet,
-        &storage_id,
         &vs.id,
         &vs.url,
         vs.version.as_deref(),
-    )
-    .await?;
+    )?;
     let mut stored_resource = vs.resource_json.clone();
     stored_resource["id"] = serde_json::Value::String(public_id);
     let resource_json = Some(stored_resource);

@@ -67,19 +67,34 @@ pub(crate) fn valid_logical_id(id: &str) -> bool {
 
 /// A persisted resource can lend its ID only to its own normalized row.
 /// Deleted resources reserve their logical ID; reimport may use a new ID.
+#[cfg(feature = "sqlite")]
 pub(crate) fn matches_persisted_resource(
     resource: &Value,
     deleted: bool,
     url: &str,
     version: Option<&str>,
 ) -> bool {
+    persisted_canonical_matches(
+        resource.get("url").and_then(Value::as_str),
+        resource.get("version").and_then(Value::as_str),
+        deleted,
+        url,
+        version,
+    )
+}
+
+/// [`matches_persisted_resource`] over a persisted resource's string `url` and
+/// `version`, for callers that read them without the resource body.
+pub(crate) fn persisted_canonical_matches(
+    persisted_url: Option<&str>,
+    persisted_version: Option<&str>,
+    deleted: bool,
+    url: &str,
+    version: Option<&str>,
+) -> bool {
     !deleted
-        && resource.get("url").and_then(Value::as_str) == Some(url)
-        && resource
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            == version.unwrap_or("")
+        && persisted_url == Some(url)
+        && persisted_version.unwrap_or("") == version.unwrap_or("")
 }
 
 /// Identity inputs read while backfilling a legacy normalized row.

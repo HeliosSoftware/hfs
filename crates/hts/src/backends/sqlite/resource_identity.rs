@@ -136,12 +136,16 @@ pub(crate) fn check_import_owner(
 ) -> Result<(), HtsError> {
     if matches!(kind, ResourceKind::ConceptMap) {
         let reserved: bool = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 \
                  AND id = ?3)",
-                rusqlite::params![SYSTEM_TENANT, kind.resource_type(), source_id],
-                |row| row.get(0),
             )
+            .and_then(|mut statement| {
+                statement.query_row(
+                    rusqlite::params![SYSTEM_TENANT, kind.resource_type(), source_id],
+                    |row| row.get(0),
+                )
+            })
             .map_err(storage_error)?;
         if reserved {
             return Err(HtsError::Conflict(format!(
@@ -156,18 +160,20 @@ pub(crate) fn check_import_owner(
         ("version", version)
     };
     let owner: Option<String> = conn
-        .query_row(
-            &format!(
-                "SELECT r.id FROM (SELECT {} AS public_id FROM {}
+        .prepare_cached(&format!(
+            "SELECT r.id FROM (SELECT {} AS public_id FROM {}
          WHERE url = ?1 AND COALESCE({version_column}, '') = COALESCE(?2, '')) AS normalized
          JOIN resources r ON r.id = normalized.public_id
          WHERE r.tenant_id = ?3 AND r.resource_type = ?4 AND r.is_deleted = 0",
-                kind.sqlite_identity_expression(),
-                kind.table(),
-            ),
-            rusqlite::params![url, version, SYSTEM_TENANT, kind.resource_type()],
-            |row| row.get(0),
-        )
+            kind.sqlite_identity_expression(),
+            kind.table(),
+        ))
+        .and_then(|mut statement| {
+            statement.query_row(
+                rusqlite::params![url, version, SYSTEM_TENANT, kind.resource_type()],
+                |row| row.get(0),
+            )
+        })
         .optional()
         .map_err(storage_error)?;
     if let Some(id) = owner {
@@ -190,14 +196,13 @@ pub(crate) fn allocate(
 ) -> Result<String, HtsError> {
     let table = kind.table();
     let existing = conn
-        .query_row(
-            &format!(
-                "SELECT COALESCE(json_extract(resource_json, '$.id'), id) FROM {table} \
-                 WHERE id = ?1"
-            ),
-            [storage_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
+        .prepare_cached(&format!(
+            "SELECT COALESCE(json_extract(resource_json, '$.id'), id) FROM {table} \
+             WHERE id = ?1"
+        ))
+        .and_then(|mut statement| {
+            statement.query_row([storage_id], |row| row.get::<_, Option<String>>(0))
+        })
         .optional()
         .map_err(storage_error)?
         .flatten();
@@ -222,10 +227,13 @@ fn allocate_available(
 ) -> Result<String, HtsError> {
     let table = kind.table();
     let identity = kind.sqlite_identity_expression();
-    let has_resources: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'resources')",
-        [], |row| row.get(0),
-    ).map_err(storage_error)?;
+    let has_resources: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' \
+             AND name = 'resources')",
+        )
+        .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
+        .map_err(storage_error)?;
     let mut candidate = if valid_logical_id(source_id) {
         source_id.to_owned()
     } else {
@@ -233,19 +241,24 @@ fn allocate_available(
     };
     loop {
         let taken: bool = conn
-            .query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {identity} = ?1 AND id != ?2)"),
-                rusqlite::params![candidate, storage_id],
-                |row| row.get(0),
-            )
+            .prepare_cached(&format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE {identity} = ?1 AND id != ?2)"
+            ))
+            .and_then(|mut statement| {
+                statement.query_row(rusqlite::params![candidate, storage_id], |row| row.get(0))
+            })
             .map_err(storage_error)?;
         let reserved = if has_resources {
-            conn.query_row(
+            conn.prepare_cached(
                 "SELECT data, is_deleted FROM resources WHERE tenant_id = ?1 \
                  AND resource_type = ?2 AND id = ?3",
-                rusqlite::params![SYSTEM_TENANT, kind.resource_type(), candidate],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
             )
+            .and_then(|mut statement| {
+                statement.query_row(
+                    rusqlite::params![SYSTEM_TENANT, kind.resource_type(), candidate],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
+                )
+            })
             .optional()
             .map_err(storage_error)?
             .map(|(data, deleted)| {
