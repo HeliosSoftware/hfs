@@ -9,6 +9,12 @@
 //! dropped when the last Library referencing it is deleted or rewritten
 //! without the dependency.
 //!
+//! Every backend with a SQL-on-FHIR runner implements it (#2185): SQLite and
+//! PostgreSQL in one transaction, MongoDB and S3 by compare-and-swap of a
+//! per-tenant registry (see `backends::sof_terminology_cas`). Composites hand
+//! out their primary's store. The contract is checked on every backend by
+//! `tests/common/sof_terminology_suite.rs`.
+//!
 //! `$sql-run` and `$sql-export` read the stored rows back with
 //! [`SofTerminologyStore::load`] and copy them into the request's in-memory SQL
 //! engine under the dependency's label, so the terminology server stays off

@@ -44,6 +44,9 @@ mod container_cleanup;
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 
+#[path = "common/sof_terminology_suite.rs"]
+mod sof_terminology_suite;
+
 const DEFAULT_MINIO_IMAGE: &str = "ghcr.io/coollabsio/minio";
 const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-10-15T17-29-55Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
@@ -2376,6 +2379,30 @@ async fn test_minio_discover_tenants_resumes_beyond_1000_groups() {
         seen, expected,
         "no duplicates and no omissions across slices"
     );
+}
+
+/// #2185: the SQL-on-FHIR terminology store contract on the real SDK path —
+/// conditional registry swaps included — with the tenant's remaining
+/// generation objects as the residue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_sof_terminology_store_suite() {
+    if skip_if_disabled("test_minio_sof_terminology_store_suite") {
+        return;
+    }
+
+    let harness = std::sync::Arc::new(make_prefix_backend("sof-terminology").await);
+    let counted = std::sync::Arc::clone(&harness);
+    let residue = move |tenant: String| {
+        let harness = std::sync::Arc::clone(&counted);
+        Box::pin(async move {
+            tenant_keys(&harness, &tenant)
+                .await
+                .into_iter()
+                .filter(|k| k.contains("/bulk/sof-terminology/generations/"))
+                .count()
+        }) as futures::future::BoxFuture<'static, usize>
+    };
+    sof_terminology_suite::run_all(&harness.backend, "sof-term", Some(&residue)).await;
 }
 
 /// #1912: on the real SDK path, the tenant-scoped `MaxKeys=1` probe answers as

@@ -136,7 +136,7 @@ struct SubBatchDocs {
     own_docs: Vec<Document>,
     contained_owners: Vec<usize>,
     contained_docs: Vec<Document>,
-    missing_params: Vec<(usize, Option<Vec<String>>)>,
+    missing_params: Vec<(usize, Option<Vec<String>>, Option<String>)>,
 }
 
 impl SubBatchDocs {
@@ -151,13 +151,17 @@ impl SubBatchDocs {
     ) -> Vec<(usize, Document)> {
         std::mem::take(&mut self.missing_params)
             .into_iter()
-            .map(|(owner, names)| {
+            .map(|(owner, names, fp)| {
                 let resource = &resources[owner];
                 (
                     owner,
                     doc! {
                         "q": resource_version_filter(tenant_id, resource),
-                        "u": super::storage::with_missing_metadata_update(doc! {}, names.as_deref()),
+                        "u": super::storage::with_missing_metadata_update(
+                            doc! {},
+                            names.as_deref(),
+                            fp.as_deref(),
+                        ),
                         "multi": false,
                         "upsert": false,
                     },
@@ -189,7 +193,9 @@ fn flatten_sub_batch(
         let i = start + offset;
         doc_counts[i] = docs.own.len() + docs.contained.len();
         extract_failures[i] = failure;
-        batch.missing_params.push((i, docs.missing_params));
+        batch
+            .missing_params
+            .push((i, docs.missing_params, docs.missing_fp));
         for d in docs.own {
             batch.own_owners.push(i);
             batch.own_docs.push(d);
@@ -571,6 +577,7 @@ fn metadata_only_update(
     tenant_id: &str,
     resource: &StoredResource,
     missing_params: Option<&[String]>,
+    missing_fp: Option<&str>,
     skip_existing: bool,
 ) -> Document {
     let mut filter = resource_version_filter(tenant_id, resource);
@@ -579,7 +586,7 @@ fn metadata_only_update(
     }
     doc! {
         "q": filter,
-        "u": super::storage::with_missing_metadata_update(doc! {}, missing_params),
+        "u": super::storage::with_missing_metadata_update(doc! {}, missing_params, missing_fp),
         "multi": false,
         "upsert": false,
     }
@@ -1505,6 +1512,7 @@ impl super::MongoBackend {
                     tenant_id,
                     &resources[i],
                     docs.missing_params.as_deref(),
+                    docs.missing_fp.as_deref(),
                     skip_existing,
                 ),
             ));
@@ -2303,6 +2311,7 @@ mod tests {
                     own: vec![own_a.clone()],
                     contained: vec![contained_a.clone()],
                     missing_params: Some(vec!["absent".into()]),
+                    missing_fp: Some("fp1".into()),
                 },
                 None,
             ),
@@ -2311,6 +2320,7 @@ mod tests {
                     own: vec![own_b.clone()],
                     contained: Vec::new(),
                     missing_params: None,
+                    missing_fp: None,
                 },
                 Some("boom".to_string()),
             ),
@@ -2329,7 +2339,10 @@ mod tests {
         assert_eq!(batch.len(), 3);
         assert_eq!(
             batch.missing_params,
-            vec![(5, Some(vec!["absent".to_owned()])), (6, None)]
+            vec![
+                (5, Some(vec!["absent".to_owned()]), Some("fp1".to_owned())),
+                (6, None, None),
+            ]
         );
         assert_eq!(doc_counts[5], 2);
         assert_eq!(doc_counts[6], 1);

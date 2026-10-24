@@ -24,9 +24,10 @@
 //! `subjectResource` Library, which was never written) is expanded through the
 //! terminology server for that request only.
 //!
-//! Only backends that provide a [`SofTerminologyStore`] (SQLite, and
-//! composites whose primary is SQLite) serve these dependencies; elsewhere a
-//! terminology dependency is `501`.
+//! Every backend with a SQL-on-FHIR runner provides a [`SofTerminologyStore`]
+//! (SQLite, PostgreSQL, MongoDB, S3, and composites through their primary), so
+//! the `501` for a storage without one is unreachable in a SOF-capable
+//! deployment.
 //!
 //! [`SofTerminologyStore`]: helios_persistence::core::sof_terminology::SofTerminologyStore
 
@@ -254,7 +255,8 @@ where
             return Err(RestError::NotImplemented {
                 feature: format!(
                     "SQL query dependency '{url}' is a {kind}; ValueSet and ConceptMap \
-                     dependencies are only supported on the SQLite storage backend"
+                     dependencies need a storage backend that persists terminology \
+                     relations, and this one does not"
                 ),
             });
         }

@@ -511,6 +511,35 @@ impl S3Keyspace {
         self.join(&["bulk", "provider-submissions", "/"])
     }
 
+    /// Key of the tenant's SQL-on-FHIR terminology registry (#2185): which
+    /// generation object holds each ValueSet/ConceptMap relation, and which
+    /// Libraries reference it.
+    ///
+    /// Tenant-scoped under the `bulk/` sweep root, like
+    /// [`bulk_provider_key`](Self::bulk_provider_key), rather than under a new
+    /// root: adding a root to `SWEEP_ROOT_SEGMENTS` would change which tenant
+    /// ids [`with_tenant_prefix`](Self::with_tenant_prefix) escapes, and so
+    /// move objects S3 is the system of record for.
+    pub fn sof_terminology_registry_key(&self) -> String {
+        self.join(&["bulk", "sof-terminology", "registry.json"])
+    }
+
+    /// Key of one terminology generation object. `generation` is a UUID
+    /// (path-safe by construction).
+    pub fn sof_terminology_generation_key(&self, generation: &str) -> String {
+        self.join(&[
+            "bulk",
+            "sof-terminology",
+            "generations",
+            &format!("{generation}.json"),
+        ])
+    }
+
+    /// Prefix holding all of the tenant's terminology objects (tenant purge).
+    pub fn sof_terminology_prefix(&self) -> String {
+        self.join(&["bulk", "sof-terminology", "/"])
+    }
+
     /// sub-prefix of its tenant segment, so even a tenant named
     /// `_system.bulk-submit` cannot reach one. (`_system.bulk-submit` is also in
     /// [`RESERVED_TENANT_SEGMENTS`](crate::tenant::RESERVED_TENANT_SEGMENTS), as
