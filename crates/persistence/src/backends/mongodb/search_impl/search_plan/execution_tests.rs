@@ -416,6 +416,7 @@ fn batched_plan(remaining: Vec<IndexPredicate>) -> BatchedIndexPlan {
         page_policy: NoTotalPagePolicy::Streaming,
         page_cache: None,
         probe_timeout: Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS),
+        missing: Vec::new(),
     }
 }
 
