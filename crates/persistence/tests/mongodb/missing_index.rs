@@ -2374,9 +2374,22 @@ async fn mongodb_missing_staleness_probe_reads_one_key_per_stamp() {
     // The unstamped seek, then the stamp seeks: the current one, then none.
     let stamped = probes(&operations);
     assert_eq!(stamped.len(), 3, "{operations:?}");
+    // Before MongoDB 7.0 the planner re-checks the partial filter's
+    // `missing_params: {$exists: true}` with a FETCH, so a seek that finds a
+    // stamp reads its document (the test container is 5.0; servers run 7.0+).
+    let build_info = db.run_command(doc! { "buildInfo": 1 }).await.unwrap();
+    let major = build_info
+        .get_array("versionArray")
+        .ok()
+        .and_then(|version| version.first())
+        .and_then(|major| major.as_i32())
+        .unwrap_or(0);
+    let max_docs = if major >= 7 { 0 } else { 1 };
     assert!(
-        stamped.iter().all(|&(keys, docs)| keys <= 1 && docs == 0),
-        "{stamped:?}"
+        stamped
+            .iter()
+            .all(|&(keys, docs)| keys <= 1 && docs <= max_docs),
+        "{stamped:?} (MongoDB {major})"
     );
 
     unstamp(&db, &tenant).await;
