@@ -163,6 +163,10 @@ pub struct ReindexPageStats {
     /// that cleanup cannot safely delete. Their resources are reported as failed.
     /// Missing expected IDs and changed versions are reported as errors, not rows.
     pub stale_rows_remaining: u64,
+    /// Per-resource metadata writes the writer left out because the stored
+    /// value already matched; MongoDB's `missing_params` (#2005). Zero for a
+    /// writer that keeps no such metadata.
+    pub metadata_updates_skipped: u64,
 }
 
 impl ReindexPageStats {
@@ -191,6 +195,7 @@ impl ReindexPageStats {
         self.verify += other.verify;
         self.stale_rows_found += other.stale_rows_found;
         self.stale_rows_remaining += other.stale_rows_remaining;
+        self.metadata_updates_skipped += other.metadata_updates_skipped;
         self.db_wait = db_wait;
     }
 }
@@ -2561,7 +2566,8 @@ fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted) {
 /// elapsed_ms, entries, failed, pages, fetch_ms, write_ms, extract_ms,
 /// delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms, deleted,
 /// inserted, insert_commands, fetch_wait_ms, db_wait_ms, sub_batches,
-/// pool_sub_batches, stale_found, stale_remaining`. `outcome` is this type's
+/// pool_sub_batches, stale_found, stale_remaining, metadata_skipped`.
+/// `outcome` is this type's
 /// own exit path — a type that
 /// finished all its pages is always `completed`, even if a later type or the
 /// job as a whole fails or is cancelled. Every counter and phase field
@@ -2615,6 +2621,7 @@ fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
         pool_sub_batches = s.counters.writer.pool_sub_batches,
         stale_found = s.counters.writer.stale_rows_found,
         stale_remaining = s.counters.writer.stale_rows_remaining,
+        metadata_skipped = s.counters.writer.metadata_updates_skipped,
         "reindex type finished"
     );
 }
@@ -2692,8 +2699,8 @@ fn log_progress(tenant: &str, job_id: &str, s: &ProgressSnapshot) {
 /// elapsed_ms, resources_per_s, entries, failed, pages, fetch_ms, write_ms,
 /// extract_ms, delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms,
 /// deleted, inserted, insert_commands, fetch_wait_ms, db_wait_ms,
-/// sub_batches, pool_sub_batches, stale_found, stale_remaining`. `outcome`
-/// is the job's already-written
+/// sub_batches, pool_sub_batches, stale_found, stale_remaining,
+/// metadata_skipped`. `outcome` is the job's already-written
 /// terminal status if one exists, otherwise the exit path's outcome
 /// (`job_outcome`). `types_done` counts types whose L3 said `completed`.
 /// Every counter and phase field (`entries` through `pool_sub_batches`) is
@@ -2740,6 +2747,7 @@ fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
         pool_sub_batches = s.counters.writer.pool_sub_batches,
         stale_found = s.counters.writer.stale_rows_found,
         stale_remaining = s.counters.writer.stale_rows_remaining,
+        metadata_skipped = s.counters.writer.metadata_updates_skipped,
         "reindex job finished"
     );
 }
@@ -2749,8 +2757,8 @@ fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
 /// or id batch. Field order: `tenant, job_id, resource_type, page, resources,
 /// type_elapsed_ms, entries, failed, fetch_ms, write_ms, extract_ms,
 /// delete_ms, insert_ms, deleted, inserted, insert_commands, fetch_wait_ms,
-/// db_wait_ms, sub_batches, pool_sub_batches, stale_found, stale_remaining`.
-/// Every counter and phase field
+/// db_wait_ms, sub_batches, pool_sub_batches, stale_found, stale_remaining,
+/// metadata_skipped`. Every counter and phase field
 /// describes only this one page — `page` is the 1-based page number within
 /// the open type, `resources` is this page's own count. L6 has no derived
 /// `other_ms`/`writer_other_ms` fields: `fetch_ms`/`write_ms` are the
@@ -2792,6 +2800,7 @@ fn log_page(
         pool_sub_batches = r.writer.pool_sub_batches,
         stale_found = r.writer.stale_rows_found,
         stale_remaining = r.writer.stale_rows_remaining,
+        metadata_skipped = r.writer.metadata_updates_skipped,
         "reindex page"
     );
 }
@@ -3583,6 +3592,7 @@ mod tests {
             deleted_entries: 4,
             inserted_entries: 5,
             insert_commands: 6,
+            metadata_updates_skipped: 7,
             ..ReindexPageStats::default()
         };
         let other = ReindexPageStats {
@@ -3592,6 +3602,7 @@ mod tests {
             deleted_entries: 40,
             inserted_entries: 50,
             insert_commands: 60,
+            metadata_updates_skipped: 70,
             ..ReindexPageStats::default()
         };
         total.accumulate(&other);
@@ -3601,6 +3612,7 @@ mod tests {
         assert_eq!(total.deleted_entries, 44);
         assert_eq!(total.inserted_entries, 55);
         assert_eq!(total.insert_commands, 66);
+        assert_eq!(total.metadata_updates_skipped, 77);
     }
 
     /// The default `_timed` must behave exactly like calling
@@ -7409,6 +7421,7 @@ mod tests {
         "pool_sub_batches",
         "stale_found",
         "stale_remaining",
+        "metadata_skipped",
     ];
     const PROGRESS_FIELDS: &[&str] = &[
         "tenant",
@@ -7472,6 +7485,7 @@ mod tests {
         "pool_sub_batches",
         "stale_found",
         "stale_remaining",
+        "metadata_skipped",
     ];
     const PAGE_FIELDS: &[&str] = &[
         "tenant",
@@ -7496,6 +7510,7 @@ mod tests {
         "pool_sub_batches",
         "stale_found",
         "stale_remaining",
+        "metadata_skipped",
     ];
 
     /// One captured `reindex ...` event: field names in printed (macro) order,
@@ -7612,7 +7627,8 @@ mod tests {
     #[test]
     fn field_lists_append_fetch_wait_and_db_wait() {
         // Appended only: the writer-wait pair, then the sub-batch pair, then the
-        // stale-row pair from delete verification.
+        // stale-row pair from delete verification, then the skipped metadata
+        // writes (#2005).
         let appended = [
             "fetch_wait_ms",
             "db_wait_ms",
@@ -7620,9 +7636,10 @@ mod tests {
             "pool_sub_batches",
             "stale_found",
             "stale_remaining",
+            "metadata_skipped",
         ];
         assert_eq!(
-            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 6..],
+            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 7..],
             appended
         );
         assert_eq!(
@@ -7634,10 +7651,10 @@ mod tests {
             "L4 must not carry sub_batches, pool_sub_batches or the stale-row pair (#1403)"
         );
         assert_eq!(
-            &JOB_FINISHED_FIELDS[JOB_FINISHED_FIELDS.len() - 6..],
+            &JOB_FINISHED_FIELDS[JOB_FINISHED_FIELDS.len() - 7..],
             appended
         );
-        assert_eq!(&PAGE_FIELDS[PAGE_FIELDS.len() - 6..], appended);
+        assert_eq!(&PAGE_FIELDS[PAGE_FIELDS.len() - 7..], appended);
     }
 
     #[test]
