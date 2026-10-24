@@ -415,6 +415,7 @@ mod tests {
                 own: vec![Document::new(); own],
                 contained: vec![Document::new(); contained],
                 missing_params: None,
+                missing_fp: None,
             }),
         }
     }
