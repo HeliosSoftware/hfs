@@ -926,6 +926,13 @@ impl MongoBackend {
                 driver = Some((position, filter));
             }
         }
+        if matches!(purpose, SearchFilterPurpose::Count)
+            && let Some(plan) = self
+                .missing_count_plan(db, tenant_id, query, &indexed, facts)
+                .await?
+        {
+            return Ok(Some(SearchFilterPlan::BatchedIndex(plan)));
+        }
         let mut filters = Vec::new();
         let mut exclusions = Vec::new();
         let mut missing = Vec::new();
@@ -1041,6 +1048,129 @@ impl MongoBackend {
             index_filter: driver.map(|(_, filter)| filter.into()),
             stages,
         }))
+    }
+
+    /// Counts that combine positive predicates with metadata-backed
+    /// `:missing=true` (#2004). Stream the most selective positive predicate
+    /// in bounded batches and check each batch's absence through the identity
+    /// index, unless the probed missing population is smaller than that
+    /// predicate; then the resource scan over the missing population stays.
+    async fn missing_count_plan(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        indexed: &[&SearchParameter],
+        facts: &mut ProbeFacts,
+    ) -> StorageResult<Option<BatchedIndexPlan>> {
+        let resource_type = &query.resource_type;
+        let mut positive = Vec::new();
+        let mut missing = Vec::new();
+        for param in indexed {
+            if self.is_missing_resource_parameter(tenant_id, resource_type, param) {
+                missing.push(missing_presence_filter(tenant_id, resource_type, param));
+            } else if matches!(param.modifier, Some(SearchModifier::Not))
+                || matches!(param.modifier, Some(SearchModifier::Missing))
+            {
+                // Other complements keep their existence-check stages.
+                return Ok(None);
+            } else {
+                positive.push(*param);
+            }
+        }
+        if positive.is_empty() || missing.is_empty() || !self.search_indexes_ready() {
+            return Ok(None);
+        }
+        let probe_timeout = self.probe_timeout();
+        let filters = positive
+            .iter()
+            .map(|param| {
+                self.build_search_index_filter(tenant_id, resource_type, param)
+                    .map(|filter| {
+                        self.planning_predicate(db, tenant_id, resource_type, param, filter, true)
+                    })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        let positive_rows = probe_candidates(db, &filters, &self.probe_cache, facts, probe_timeout)
+            .await?
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some(missing_rows) = self
+            .probe_missing_population(db, tenant_id, query, &missing, facts)
+            .await?
+            && positive_rows.is_none_or(|rows| missing_rows < rows)
+        {
+            return Ok(None);
+        }
+        let mut plan = BatchedIndexPlan::new(
+            db,
+            filters,
+            &self.probe_cache,
+            NoTotalPagePolicy::Streaming,
+            SearchFilterPurpose::Count,
+            facts,
+            probe_timeout,
+        )
+        .await?;
+        plan.missing = missing;
+        Ok(Some(plan))
+    }
+
+    /// Live resources that may satisfy every metadata absence, capped like an
+    /// index probe. Resources without metadata are included as an upper bound.
+    async fn probe_missing_population(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing: &[Document],
+        facts: &mut ProbeFacts,
+    ) -> StorageResult<Option<u64>> {
+        let mut conditions = vec![doc! {
+            "tenant_id": tenant_id,
+            "resource_type": &query.resource_type,
+            "is_deleted": false,
+        }];
+        for presence in missing {
+            let name = presence
+                .get_str("param_name")
+                .map_err(|_| internal_error("Missing predicate parameter name".into()))?;
+            conditions.push(super::missing_resource_condition(name));
+        }
+        let filter = doc! { "$and": conditions };
+        let hint = Hint::Name(super::super::schema::RESOURCES_MISSING_INDEX.to_owned());
+        let probe_timeout = self.probe_timeout();
+        let key = ProbeFacts::key(
+            db,
+            &filter,
+            Some(hint.clone()),
+            MAX_CANDIDATE_ROWS + 1,
+            Some(probe_timeout),
+        );
+        if let Some(count) = key.as_deref().and_then(|key| facts.reuse(key)) {
+            return Ok(count);
+        }
+        facts.requests += 1;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let count = with_probe_hint_fallback(
+            Some(hint),
+            || probe_timeout,
+            |hint| {
+                let probe = resources
+                    .count_documents(filter.clone())
+                    .limit(MAX_CANDIDATE_ROWS + 1);
+                match hint {
+                    Some(hint) => probe.hint(hint),
+                    None => probe,
+                }
+            },
+        )
+        .await?;
+        if let Some(key) = key {
+            facts.remember(key, count);
+        }
+        Ok(count)
     }
 
     /// Server execution budget for each optional planning probe.
@@ -2088,6 +2218,9 @@ pub(super) struct BatchedIndexPlan {
     page_policy: NoTotalPagePolicy,
     page_cache: Option<(ProbeCache, ProbeKey)>,
     probe_timeout: Duration,
+    // Metadata-backed `:missing=true` presence filters. The resource filter
+    // checks recorded metadata; each batch checks resources without it.
+    missing: Vec<Document>,
 }
 
 #[derive(Clone)]
@@ -2262,6 +2395,7 @@ impl BatchedIndexPlan {
             page_policy,
             page_cache,
             probe_timeout,
+            missing: Vec::new(),
         })
     }
 
@@ -2306,6 +2440,11 @@ impl BatchedIndexPlan {
         index_cursor_filter: Option<Document>,
         selection: BatchSelection,
     ) -> StorageResult<BatchMatches> {
+        // Index rows cannot show absence, so missing checks always count live resources.
+        let selection = match selection {
+            BatchSelection::EstimatedCount if !self.missing.is_empty() => BatchSelection::Count,
+            selection => selection,
+        };
         if matches!(selection, BatchSelection::EstimatedCount) && self.remaining.is_empty() {
             return Ok(BatchMatches {
                 count: self.count_estimated_seed(db).await?,
@@ -3128,7 +3267,12 @@ impl BatchedIndexPlan {
                 .match_estimated_page_batch(db, resource_filter, selection, batch, result)
                 .await;
         }
-        let ids = Self::remaining_candidates(db, batch, &self.remaining).await?;
+        let mut ids = Self::remaining_candidates(db, batch, &self.remaining).await?;
+        if !self.missing.is_empty() {
+            let mut candidates = ids.into_iter().collect();
+            filter_missing_candidates(db, &mut candidates, &self.missing, true).await?;
+            ids = candidates.into_iter().collect();
+        }
         if ids.is_empty() {
             return Ok(false);
         }
@@ -4056,6 +4200,7 @@ mod candidate_tests {
             page_policy: NoTotalPagePolicy::SampleSelectivity,
             page_cache: Some((cache.clone(), cache_key.clone())),
             probe_timeout: Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS),
+            missing: Vec::new(),
         };
         for direction in [1, -1] {
             let mut ordered: Vec<_> = (DELETED_PREFIX..ROWS).map(|n| format!("r{n:05}")).collect();
@@ -4307,6 +4452,7 @@ mod candidate_tests {
             page_policy: NoTotalPagePolicy::Streaming,
             page_cache: None,
             probe_timeout: Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS),
+            missing: Vec::new(),
         });
         assert!(
             plan.pipeline(doc! { "is_deleted": false }, None, None)
@@ -4324,6 +4470,7 @@ mod candidate_tests {
             page_policy: NoTotalPagePolicy::Streaming,
             page_cache: None,
             probe_timeout: Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS),
+            missing: Vec::new(),
         };
         for (direction, operator) in [(1, "$gt"), (-1, "$lt")] {
             let boundary = doc! { "resource_id": { operator: "o0256" } };
@@ -4352,6 +4499,7 @@ mod candidate_tests {
             page_policy: NoTotalPagePolicy::Streaming,
             page_cache: None,
             probe_timeout: Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS),
+            missing: Vec::new(),
         };
         assert_eq!(
             plan.seed_pipeline(None, None),
