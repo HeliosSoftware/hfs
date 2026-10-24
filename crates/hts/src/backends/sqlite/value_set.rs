@@ -44,6 +44,7 @@ use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
+use crate::backends::hierarchy::ConceptKey;
 use crate::ecl;
 use crate::error::HtsError;
 use crate::traits::ValueSetOperations;
@@ -244,7 +245,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         // `http://hl7.org/fhir/test/ValueSet/version`).  Falling through to
         // `spawn_blocking` ensures `resolve_value_set_versioned` filters on
         // version correctly.
-        if req.value_set.is_none() && req.value_set_version.is_none() {
+        if req.value_set.is_none()
+            && req.value_set_version.is_none()
+            && req.selected_value_set_id.is_none()
+        {
             if let Some(url) = req.url.as_deref() {
                 if let Ok(guard) = self.implicit_index.read() {
                     if let Some(concept_idx) = guard.get(url).cloned() {
@@ -807,14 +811,16 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 // `resolve_value_set_versioned` win would expand its empty/skeleton
                 // compose and silently return zero codes for SNOMED — masking the
                 // working `bfs_isa_page`/implicit-cache traversal below.
-                let implicit_short_circuit = parse_fhir_vs_url(url).is_some();
+                let implicit_short_circuit = req.selected_value_set_id.is_none()
+                    && parse_fhir_vs_url(url).is_some();
                 let resolution = if implicit_short_circuit {
                     Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
                 } else {
-                    resolve_value_set_versioned(
+                    resolve_selected_value_set(
                         &conn,
                         url,
                         req.value_set_version.as_deref(),
+                        req.selected_value_set_id.as_deref(),
                         req.date.as_deref(),
                     )
                 };
@@ -993,7 +999,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             cached
                         }
                     }
-                    Err(HtsError::NotFound(_)) => {
+                    Err(HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
                         // ── BFS fast path for cold-cache implicit ValueSets ───────────
                         // When the cache is empty and the client requested a bounded page
                         // (count > 0), serve it immediately from BFS/SQL traversal and
@@ -1336,7 +1342,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         // rare on the hot path.
         let cache_key: Option<String> = if req.default_value_set_versions.is_empty() {
             Some(format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                req.selected_value_set_id.as_deref().unwrap_or(""),
                 url,
                 req.value_set_version.as_deref().unwrap_or(""),
                 req.system.as_deref().unwrap_or(""),
@@ -1378,9 +1385,19 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-            if let Some(resp) = crate::bcp13::validate_mimetypes_code(&url, &req) {
-                return Ok(resp);
-            }
+            let selected_vs_version = if let Some(id) = req.selected_value_set_id.as_deref() {
+                conn.query_row(
+                    "SELECT version FROM value_sets WHERE \
+                     COALESCE(json_extract(resource_json, '$.id'), id) = ?1",
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|error| HtsError::StorageError(error.to_string()))?
+                .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?
+            } else {
+                lookup_value_set_version(&backend, &conn, &url)
+            };
 
             // Resolve the expansion — try explicit ValueSet first, then the two
             // implicit-ValueSet fallbacks used by $expand.
@@ -1392,20 +1409,38 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // `resolve_value_set_versioned` win would expand its empty/skeleton
             // compose to zero codes and force `result=false` for every input —
             // masking the targeted `validate_fhir_vs` lookup below.
-            let implicit_short_circuit = parse_fhir_vs_url(&url).is_some();
+            let implicit_short_circuit =
+                req.selected_value_set_id.is_none() && parse_fhir_vs_url(&url).is_some();
             let resolution = if implicit_short_circuit {
                 Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
             } else {
-                resolve_value_set_versioned(
+                resolve_selected_value_set(
                     &conn,
                     &url,
                     req.value_set_version.as_deref(),
+                    req.selected_value_set_id.as_deref(),
                     req.date.as_deref(),
                 )
             };
             let (all_codes, compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
                 match resolution {
                     Ok((vs_id, compose_json)) => {
+                        if let Some(response) = crate::bcp13::validate_stored_mimetypes_code(
+                            &url,
+                            compose_json.as_deref(),
+                            &req,
+                        ) {
+                            let bcp13_loaded: bool = conn
+                                .query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = ?1)",
+                                    [crate::bcp13::BCP13_SYSTEM],
+                                    |row| row.get(0),
+                                )
+                                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+                            if !bcp13_loaded {
+                                return Ok(response);
+                            }
+                        }
                         let saved = compose_json.clone();
                         // Bypass the `value_set_expansions` cache when the
                         // compose describes a multi-version overload — the
@@ -1465,7 +1500,21 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         };
                         (codes, saved)
                     }
-                    Err(HtsError::NotFound(_)) => {
+                    Err(error @ HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
+                        // A version or date miss must not bypass a stored definition.
+                        if let Some(response) = crate::bcp13::validate_mimetypes_code(&url, &req) {
+                            let has_stored_definition: bool = conn
+                                .query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM value_sets WHERE url = ?1)",
+                                    [&url],
+                                    |row| row.get(0),
+                                )
+                                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+                            if has_stored_definition {
+                                return Err(error);
+                            }
+                            return Ok(response);
+                        }
                         // ?fhir_vs implicit ValueSet: do a targeted O(1)/O(depth) lookup
                         // instead of materializing all concepts (which times out for large
                         // code systems like SNOMED CT with ~350k concepts).
@@ -1512,7 +1561,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 .as_deref()
                                 .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
                                 .unwrap_or(false);
-                            let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
+                            let vs_version_owned = selected_vs_version.clone();
                             return finish_validate_code_response(
                                 found,
                                 &req.code,
@@ -1574,7 +1623,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             .as_deref()
                             .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
                             .unwrap_or(false);
-                        let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
+                        let vs_version_owned = selected_vs_version.clone();
                         return finish_validate_code_response(
                             found,
                             &req.code,
@@ -1689,7 +1738,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .collect();
                 if distinct_systems.len() >= 2 {
                     distinct_systems.sort();
-                    let vs_v = lookup_value_set_version(&backend, &conn,&url);
+                    let vs_v = selected_vs_version.clone();
                     let vs_canonical = match vs_v.as_deref() {
                         Some(v) if !v.is_empty() => format!("{url}|{v}"),
                         _ => url.clone(),
@@ -1861,7 +1910,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // supplied) against stored CS versions and the VS include pin.
             // Also fires when the caller supplies no version but the VS pins
             // a version that doesn't exist in the DB.
-            let vs_version_for_mismatch = lookup_value_set_version(&backend, &conn,&url);
+            let vs_version_for_mismatch = selected_vs_version.clone();
             let mismatch = if let (Some(req_ver), Some(system)) =
                 (req.version.as_deref(), effective_system.as_deref())
             {
@@ -2026,7 +2075,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     .or(from_compose)
                     .or_else(|| cs_version_for_msg(&backend, &conn,s))
             });
-            let vs_version_owned = lookup_value_set_version(&backend, &conn,&url);
+            let vs_version_owned = selected_vs_version.clone();
             let cs_is_fragment = system_for_msg
                 .as_deref()
                 .map(|s| cs_content_for_url(&backend, &conn,s).as_deref() == Some("fragment"))
@@ -2149,7 +2198,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             {
                 let mut stmt = conn
                     .prepare_cached(
-                        "SELECT id, url, version, name, title, status
+                        "SELECT COALESCE(json_extract(resource_json, '$.id'), id), url, version, \
+                         name, title, status
                          FROM value_sets
                          WHERE (?1 IS NULL OR url = ?1)
                            AND (?2 IS NULL OR version = ?2)
@@ -2202,7 +2252,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
 
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, url, version, name, title, status, resource_json
+                    "SELECT COALESCE(json_extract(resource_json, '$.id'), id), url, version, name, \
+                     title, status, resource_json
                      FROM value_sets
                      WHERE (?1 IS NULL OR url = ?1)
                        AND (?2 IS NULL OR version = ?2)
@@ -2244,7 +2295,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 let (id, url, version, name, title, status, resource_json) =
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                let resource = resource_json
+                let mut resource = resource_json
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         super::code_system::build_synthetic_resource(
@@ -2257,6 +2308,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             &status,
                         )
                     });
+                resource["id"] = serde_json::Value::String(id);
                 results.push(resource);
             }
             Ok(results)
@@ -2282,6 +2334,30 @@ fn resolve_value_set(
     date: Option<&str>,
 ) -> Result<(String, Option<String>), HtsError> {
     resolve_value_set_versioned(conn, url, None, date)
+}
+
+/// Exact instance lookup uses the public-ID index and rejoins the stored
+/// expansion path, including its persistent cache and version overrides.
+fn resolve_selected_value_set(
+    conn: &Connection,
+    url: &str,
+    version: Option<&str>,
+    selected_id: Option<&str>,
+    date: Option<&str>,
+) -> Result<(String, Option<String>), HtsError> {
+    let Some(id) = selected_id else {
+        return resolve_value_set_versioned(conn, url, version, date);
+    };
+    conn.query_row(
+        "SELECT id, compose_json FROM value_sets
+         WHERE COALESCE(json_extract(resource_json, '$.id'), id) = ?1
+           AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2)",
+        rusqlite::params![id, date],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| HtsError::StorageError(e.to_string()))?
+    .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))
 }
 
 /// Look up a ValueSet by canonical URL with an optional version pin.
@@ -6290,37 +6366,41 @@ fn build_hierarchical_expansion(
         return Ok(flat);
     }
 
-    // Set of all (system_url, code) pairs in the expansion for fast membership checks.
-    let expansion_set: HashSet<(String, String)> = flat
+    let expansion_set: HashSet<ConceptKey> = flat
         .iter()
-        .map(|c| (c.system.clone(), c.code.clone()))
+        .map(|c| (c.system.clone(), c.code.clone(), c.version.clone()))
         .collect();
 
-    // For each unique system URL, pick the latest-versioned id so the
-    // hierarchy edges we walk reflect the most recent revision when the
-    // expansion combines codes from multiple versions of the same URL.
-    let system_urls: HashSet<String> = flat.iter().map(|c| c.system.clone()).collect();
-    let mut system_id_map: HashMap<String, String> = HashMap::new();
-    for sys_url in &system_urls {
+    // Use the version already resolved for each concept, including compose
+    // pins and request overrides. Only concepts with no version metadata keep
+    // the existing precedence fallback.
+    let systems: HashSet<(String, Option<String>)> = flat
+        .iter()
+        .map(|c| (c.system.clone(), c.version.clone()))
+        .collect();
+    let mut system_id_map: HashMap<(String, Option<String>), String> = HashMap::new();
+    for (sys_url, version) in &systems {
         let sql = format!(
-            "SELECT id FROM code_systems WHERE url = ?1 ORDER BY {} LIMIT 1",
+            "SELECT id FROM code_systems WHERE url = ?1 AND (?2 IS NULL OR version = ?2) \
+             ORDER BY {} LIMIT 1",
             crate::backends::cs_precedence_order_by("code_systems")
         );
         if let Some(id) = conn
-            .query_row(&sql, [sys_url], |row| row.get::<_, String>(0))
+            .query_row(&sql, rusqlite::params![sys_url, version], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()
             .map_err(|e| HtsError::StorageError(e.to_string()))?
         {
-            system_id_map.insert(sys_url.clone(), id);
+            system_id_map.insert((sys_url.clone(), version.clone()), id);
         }
     }
 
     // For each system, query all parent-child edges; keep only those where
     // both endpoints are in the expansion.
-    // parent_to_children: (system_url, parent_code) → Vec<(system_url, child_code)>
-    let mut parent_to_children: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+    let mut parent_to_children: HashMap<ConceptKey, Vec<ConceptKey>> = HashMap::new();
 
-    for (sys_url, sys_id) in &system_id_map {
+    for ((sys_url, version), sys_id) in &system_id_map {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT parent_code, child_code
@@ -6338,8 +6418,8 @@ fn build_hierarchical_expansion(
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
         for (parent_code, child_code) in edges {
-            let parent_key = (sys_url.clone(), parent_code);
-            let child_key = (sys_url.clone(), child_code);
+            let parent_key = (sys_url.clone(), parent_code, version.clone());
+            let child_key = (sys_url.clone(), child_code, version.clone());
             if expansion_set.contains(&parent_key) && expansion_set.contains(&child_key) {
                 parent_to_children
                     .entry(parent_key)
