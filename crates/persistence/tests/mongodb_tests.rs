@@ -24130,6 +24130,10 @@ mongodb_bundle_identity_test!(
 #[path = "mongodb/missing_index.rs"]
 mod missing_index;
 
+/// #2006: write, storage and cache cost of `missing_params` metadata.
+#[path = "mongodb/missing_params_cost_bench.rs"]
+mod missing_params_cost_bench;
+
 /// #2004: positive filters combined with metadata `:missing=true` at volume.
 #[path = "mongodb/missing_positive_bench.rs"]
 mod missing_positive_bench;

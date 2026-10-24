@@ -3598,23 +3598,26 @@ impl MongoBackend {
                 // unparseable date, a Period end that is not a date) is as
                 // absent as one that extracted nothing: without this it would
                 // match neither `:missing=true` nor `:missing=false` (#2000).
-                let missing = extraction
-                    .missing
-                    .into_iter()
-                    .map(|parameter| parameter.name)
-                    .chain(
-                        extraction
-                            .present
-                            .into_iter()
-                            .filter(|parameter| {
-                                !own.iter().any(|row| row_marks_present(row, parameter))
-                            })
-                            .map(|parameter| parameter.name),
-                    )
-                    .collect::<Vec<_>>();
+                let missing = self.config().missing_metadata.then(|| {
+                    extraction
+                        .missing
+                        .into_iter()
+                        .map(|parameter| parameter.name)
+                        .chain(
+                            extraction
+                                .present
+                                .into_iter()
+                                .filter(|parameter| {
+                                    !own.iter().any(|row| row_marks_present(row, parameter))
+                                })
+                                .map(|parameter| parameter.name),
+                        )
+                        .filter(|name| super::search_impl::records_missing_metadata(name))
+                        .collect::<Vec<_>>()
+                });
                 (
                     own,
-                    Some(missing),
+                    missing,
                     (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
                 )
             }
