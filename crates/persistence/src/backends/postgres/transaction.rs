@@ -182,6 +182,245 @@ impl std::fmt::Debug for PostgresTransaction {
 }
 
 impl PostgresTransaction {
+    /// Read the current revision, including its deletion timestamp when it is
+    /// a tombstone. Ordinary transaction reads continue to hide deleted rows.
+    pub async fn read_including_deleted(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<StoredResource>> {
+        self.read_resource(resource_type, id, true).await
+    }
+
+    /// Restore a tombstone as its next revision in this transaction. The
+    /// supplied tombstone must belong to this tenant and still match the
+    /// stored deletion state and version. History and search indexes are
+    /// updated with the resource; callers must roll back on any write error.
+    pub async fn restore(
+        &mut self,
+        deleted: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        if !deleted.is_deleted() || deleted.tenant_id() != self.tenant.tenant_id() {
+            return Err(StorageError::Validation(
+                crate::error::ValidationError::InvalidResource {
+                    message: "Restore requires a deleted resource from the transaction's tenant"
+                        .into(),
+                    details: Vec::new(),
+                },
+            ));
+        }
+        self.write_revision(deleted, resource, true).await
+    }
+
+    async fn read_resource(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+        include_deleted: bool,
+    ) -> StorageResult<Option<StoredResource>> {
+        self.ensure_usable()?;
+        self.ensure_planned_key(resource_type, id, false)?;
+
+        // Buffered creates must be visible to everything that is not another
+        // create. This is what keeps `read`/`update`/`delete` — and therefore a
+        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
+        // what they saw before: the batch is a wire-level optimisation, never a
+        // change of visibility inside the transaction.
+        self.flush().await?;
+
+        let client = self.client()?;
+        let tenant_id = self.tenant.tenant_id().as_str();
+
+        let row = query_opt_cached(
+            client,
+            "SELECT version_id, data, last_updated, is_deleted, fhir_version, deleted_at
+                 FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
+
+        match row {
+            Some(row) => {
+                let version_id: String = row.get(0);
+                let data: serde_json::Value = row.get(1);
+                let last_updated: chrono::DateTime<Utc> = row.get(2);
+                let is_deleted: bool = row.get(3);
+                let fhir_version_str: String = row.get(4);
+
+                let deleted_at: Option<chrono::DateTime<Utc>> = row.get(5);
+
+                if is_deleted && !include_deleted {
+                    return Ok(None);
+                }
+
+                // Older tombstones may lack deleted_at. Preserve their deleted
+                // state using the timestamp of the deletion revision.
+                let deleted_at = is_deleted.then_some(deleted_at.unwrap_or(last_updated));
+
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+                Ok(Some(StoredResource::from_storage(
+                    resource_type,
+                    id,
+                    version_id,
+                    self.tenant.tenant_id().clone(),
+                    data,
+                    last_updated,
+                    last_updated,
+                    deleted_at,
+                    fhir_version,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn write_revision(
+        &mut self,
+        current: &StoredResource,
+        resource: Value,
+        expected_deleted: bool,
+    ) -> StorageResult<StoredResource> {
+        self.tenant
+            .check_permission(Operation::Update, current.resource_type())?;
+
+        self.ensure_usable()?;
+        self.ensure_planned_key(current.resource_type(), current.id(), false)?;
+
+        // Buffered creates must be visible to everything that is not another
+        // create. This is what keeps `read`/`update`/`delete` — and therefore a
+        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
+        // what they saw before: the batch is a wire-level optimisation, never a
+        // change of visibility inside the transaction.
+        self.flush().await?;
+        self.refresh_search_snapshot_if_dirty().await?;
+        self.poisoned = true;
+
+        let client = self.client()?;
+        let tenant_id = self.tenant.tenant_id().as_str().to_string();
+        let resource_type = current.resource_type();
+        let id = current.id();
+
+        // The expected version is `current`'s, and the UPDATE below only matches a
+        // row that still carries it — so the new version follows from what the
+        // caller already read, with no round trip to ask what is stored.
+        let expected_version = current.version_id().to_string();
+        let new_version: u64 = current.version_id().parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Build the resource with id and resourceType
+        let mut data = resource;
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+        }
+
+        let now = Utc::now();
+        let fhir_version = current.fhir_version();
+        let fhir_version_str = fhir_version.as_mime_param();
+        // Version check, update and history row in one statement. Folding the
+        // expected version into the `WHERE` makes the check and write atomic:
+        // a concurrent writer cannot bump the version between two statements
+        // and have this update overwrite it while reporting success.
+        let updated = execute_cached(
+            client,
+            "WITH upd AS (
+                 UPDATE resources SET version_id = $1, data = $2, last_updated = $3,
+                     is_deleted = FALSE, deleted_at = NULL
+                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                   AND is_deleted = $9 AND version_id = $7
+                 RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
+             )
+             INSERT INTO resource_history (tenant_id, resource_type, id, version_id, \
+                 data, last_updated, is_deleted, fhir_version)
+             SELECT tenant_id, resource_type, id, version_id, data, last_updated, \
+                 is_deleted, $8 FROM upd",
+            &[
+                &new_version_str,
+                &data,
+                &now,
+                &tenant_id,
+                &resource_type,
+                &id,
+                &expected_version,
+                &fhir_version_str,
+                &expected_deleted,
+            ],
+        )
+        .await
+        .or_query_error("Failed to update resource")?;
+
+        if updated == 0 {
+            // The statement matched nothing because the row is missing,
+            // in the wrong deletion state, or has a different version. Only
+            // the last case is a concurrency conflict; the lookup is needed only on this error
+            // path to distinguish it from the two not-found cases.
+            let actual = query_opt_cached(
+                client,
+                "SELECT version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = $4",
+                &[&tenant_id, &resource_type, &id, &expected_deleted],
+            )
+            .await
+            .or_query_error("Failed to get current version")?;
+
+            return match actual {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version,
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
+
+        // Re-index the resource for search
+        if resource_type == "SearchParameter" {
+            self.search_snapshot_dirty = true;
+            self.refresh_search_snapshot_if_dirty().await?;
+        }
+        if let Err(error) = self
+            .index_resource(
+                &tenant_id,
+                resource_type,
+                id,
+                now,
+                super::storage::IndexWrite::Replace,
+                &data,
+            )
+            .await
+        {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.poisoned = false;
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            self.tenant.tenant_id().clone(),
+            data,
+            now,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
     /// Create a new transaction.
     ///
     /// With a `plan` the transaction takes the tenant gate shared plus the
@@ -1095,58 +1334,7 @@ impl Transaction for PostgresTransaction {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<Option<StoredResource>> {
-        self.ensure_usable()?;
-        self.ensure_planned_key(resource_type, id, false)?;
-
-        // Buffered creates must be visible to everything that is not another
-        // create. This is what keeps `read`/`update`/`delete` — and therefore a
-        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
-        // what they saw before: the batch is a wire-level optimisation, never a
-        // change of visibility inside the transaction.
-        self.flush().await?;
-
-        let client = self.client()?;
-        let tenant_id = self.tenant.tenant_id().as_str();
-
-        let row = query_opt_cached(
-            client,
-            "SELECT version_id, data, last_updated, is_deleted, fhir_version
-                 FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
-            &[&tenant_id, &resource_type, &id],
-        )
-        .await
-        .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
-
-        match row {
-            Some(row) => {
-                let version_id: String = row.get(0);
-                let data: serde_json::Value = row.get(1);
-                let last_updated: chrono::DateTime<Utc> = row.get(2);
-                let is_deleted: bool = row.get(3);
-                let fhir_version_str: String = row.get(4);
-
-                if is_deleted {
-                    return Ok(None);
-                }
-
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-
-                Ok(Some(StoredResource::from_storage(
-                    resource_type,
-                    id,
-                    version_id,
-                    self.tenant.tenant_id().clone(),
-                    data,
-                    last_updated,
-                    last_updated,
-                    None,
-                    fhir_version,
-                )))
-            }
-            None => Ok(None),
-        }
+        self.read_resource(resource_type, id, false).await
     }
 
     async fn update(
@@ -1154,136 +1342,7 @@ impl Transaction for PostgresTransaction {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        self.tenant
-            .check_permission(Operation::Update, current.resource_type())?;
-
-        self.ensure_usable()?;
-        self.ensure_planned_key(current.resource_type(), current.id(), false)?;
-
-        // Buffered creates must be visible to everything that is not another
-        // create. This is what keeps `read`/`update`/`delete` — and therefore a
-        // bundle's PUT and DELETE entries, conditional or not — seeing exactly
-        // what they saw before: the batch is a wire-level optimisation, never a
-        // change of visibility inside the transaction.
-        self.flush().await?;
-        self.refresh_search_snapshot_if_dirty().await?;
-        self.poisoned = true;
-
-        let client = self.client()?;
-        let tenant_id = self.tenant.tenant_id().as_str().to_string();
-        let resource_type = current.resource_type();
-        let id = current.id();
-
-        // The expected version is `current`'s, and the UPDATE below only matches a
-        // row that still carries it — so the new version follows from what the
-        // caller already read, with no round trip to ask what is stored.
-        let expected_version = current.version_id().to_string();
-        let new_version: u64 = current.version_id().parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-
-        // Build the resource with id and resourceType
-        let mut data = resource;
-        if let Some(obj) = data.as_object_mut() {
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-        }
-
-        let now = Utc::now();
-        let fhir_version = current.fhir_version();
-        let fhir_version_str = fhir_version.as_mime_param();
-        // Version check, update and history row in one statement. Folding the
-        // expected version into the `WHERE` makes the check and write atomic:
-        // a concurrent writer cannot bump the version between two statements
-        // and have this update overwrite it while reporting success.
-        let updated = execute_cached(
-            client,
-            "WITH upd AS (
-                 UPDATE resources SET version_id = $1, data = $2, last_updated = $3
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
-                   AND is_deleted = FALSE AND version_id = $7
-                 RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
-             )
-             INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-             SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
-            &[
-                &new_version_str,
-                &data,
-                &now,
-                &tenant_id,
-                &resource_type,
-                &id,
-                &expected_version,
-                &fhir_version_str,
-            ],
-        )
-        .await
-        .or_query_error("Failed to update resource")?;
-
-        if updated == 0 {
-            // The statement matched nothing because the row is missing,
-            // soft-deleted, or has a different version. Only the last case is
-            // a concurrency conflict; the lookup is needed only on this error
-            // path to distinguish it from the two not-found cases.
-            let actual = query_opt_cached(
-                client,
-                "SELECT version_id FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .or_query_error("Failed to get current version")?;
-
-            return match actual {
-                Some(row) => Err(StorageError::Concurrency(
-                    ConcurrencyError::VersionConflict {
-                        resource_type: resource_type.to_string(),
-                        id: id.to_string(),
-                        expected_version,
-                        actual_version: row.get::<_, String>(0),
-                    },
-                )),
-                None => Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                })),
-            };
-        }
-
-        // Re-index the resource for search
-        if resource_type == "SearchParameter" {
-            self.search_snapshot_dirty = true;
-            self.refresh_search_snapshot_if_dirty().await?;
-        }
-        if let Err(error) = self
-            .index_resource(
-                &tenant_id,
-                resource_type,
-                id,
-                now,
-                super::storage::IndexWrite::Replace,
-                &data,
-            )
-            .await
-        {
-            self.poisoned = true;
-            return Err(error);
-        }
-        self.poisoned = false;
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version_str,
-            self.tenant.tenant_id().clone(),
-            data,
-            now,
-            now,
-            None,
-            fhir_version,
-        ))
+        self.write_revision(current, resource, false).await
     }
 
     async fn delete(&mut self, resource_type: &str, id: &str) -> StorageResult<()> {
@@ -1563,6 +1622,283 @@ mod reindex_groups_tests {
         .expect("backend");
         backend.init_schema().await.expect("schema");
         backend
+    }
+
+    async fn assert_restore_rows(
+        tx: &PostgresTransaction,
+        versions: &[(&str, bool)],
+        tag: Option<&str>,
+    ) {
+        let client = tx.client().unwrap();
+        let rows = client
+            .query(
+                "SELECT version_id, is_deleted FROM resource_history
+             WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = 'restored'
+             ORDER BY version_id::integer",
+                &[&tx.tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        let actual: Vec<(String, bool)> = rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+        assert_eq!(
+            actual,
+            versions
+                .iter()
+                .map(|(v, deleted)| (v.to_string(), *deleted))
+                .collect::<Vec<_>>()
+        );
+        let rows = client
+            .query(
+                "SELECT value_token_code FROM search_index
+             WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'restored'
+               AND param_name = '_tag'",
+                &[&tx.tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        let tags: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+        assert_eq!(
+            tags,
+            tag.into_iter().map(str::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_handles_a_legacy_tombstone_without_deleted_at() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("restore-legacy-tombstone"),
+            TenantPermissions::full_access(),
+        );
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let body = json!({"resourceType":"Patient", "id":"legacy-tombstone"});
+        tx.create("Patient", body.clone()).await.unwrap();
+        tx.delete("Patient", "legacy-tombstone").await.unwrap();
+        tx.transaction_client()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE resources SET deleted_at = NULL WHERE tenant_id = $1 \
+                 AND id = 'legacy-tombstone'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            tx.read("Patient", "legacy-tombstone")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let deleted = tx
+            .read_including_deleted("Patient", "legacy-tombstone")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deleted.is_deleted());
+        assert_eq!(deleted.deleted_at(), Some(deleted.last_modified()));
+        let restored = tx.restore(&deleted, body).await.unwrap();
+        assert_eq!(restored.version_id(), "3");
+        assert!(!restored.is_deleted());
+        Box::new(tx).rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_history_and_indexes_across_commit_and_rollback() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("restore-revisions"),
+            TenantPermissions::full_access(),
+        );
+        let body = |tag| {
+            json!({"resourceType":"Patient", "id":"restored",
+            "meta":{"tag":[{"system":"http://example.com/tags", "code":tag}]}})
+        };
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let created = tx.create("Patient", body("original")).await.unwrap();
+        // This also exercises PostgreSQL's buffered-create flush.
+        assert_eq!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "1"
+        );
+        assert!(matches!(
+            tx.restore(&created, body("invalid")).await,
+            Err(StorageError::Validation(_))
+        ));
+        tx.delete("Patient", "restored").await.unwrap();
+        assert!(tx.read("Patient", "restored").await.unwrap().is_none());
+        let deleted = tx
+            .read_including_deleted("Patient", "restored")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deleted.is_deleted());
+        assert!(deleted.deleted_at().is_some());
+        assert_eq!(deleted.version_id(), "2");
+        assert_restore_rows(&tx, &[("1", false), ("2", true)], None).await;
+        Box::new(tx).commit().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let restored = tx.restore(&deleted, body("rolled-back")).await.unwrap();
+        assert_eq!(restored.version_id(), "3");
+        assert!(!restored.is_deleted());
+        assert_eq!(restored.fhir_version(), created.fhir_version());
+        assert_eq!(
+            tx.read("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "3"
+        );
+        assert_restore_rows(
+            &tx,
+            &[("1", false), ("2", true), ("3", false)],
+            Some("rolled-back"),
+        )
+        .await;
+        Box::new(tx).rollback().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(tx.read("Patient", "restored").await.unwrap().is_none());
+        assert_eq!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "2"
+        );
+        assert_restore_rows(&tx, &[("1", false), ("2", true)], None).await;
+        tx.restore(&deleted, body("committed")).await.unwrap();
+        Box::new(tx).commit().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let read = tx.read("Patient", "restored").await.unwrap().unwrap();
+        assert_eq!(read.version_id(), "3");
+        assert_eq!(read.fhir_version(), created.fhir_version());
+        assert_eq!(read.content(), &body("committed"));
+        assert_restore_rows(
+            &tx,
+            &[("1", false), ("2", true), ("3", false)],
+            Some("committed"),
+        )
+        .await;
+        assert!(matches!(
+            tx.restore(&deleted, body("must-not-overwrite-live")).await,
+            Err(StorageError::Resource(ResourceError::NotFound { .. }))
+        ));
+        Box::new(tx).rollback().await.unwrap();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tx.read("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "3"
+        );
+        tx.delete("Patient", "restored").await.unwrap();
+        Box::new(tx).commit().await.unwrap();
+
+        // The same old tombstone must not overwrite a later delete revision.
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.restore(&deleted, body("stale")).await,
+            Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                expected_version,
+                actual_version,
+                ..
+            })) if expected_version == "2" && actual_version == "4"
+        ));
+        Box::new(tx).rollback().await.unwrap();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "4"
+        );
+        assert_restore_rows(
+            &tx,
+            &[("1", false), ("2", true), ("3", false), ("4", true)],
+            None,
+        )
+        .await;
+        Box::new(tx).rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_tombstone_from_another_tenant() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("restore-tenant-validation"),
+            TenantPermissions::full_access(),
+        );
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        tx.create("Patient", json!({"id":"restored"}))
+            .await
+            .unwrap();
+        tx.delete("Patient", "restored").await.unwrap();
+        let deleted = tx
+            .read_including_deleted("Patient", "restored")
+            .await
+            .unwrap()
+            .unwrap();
+        Box::new(tx).commit().await.unwrap();
+        let other = TenantContext::new(
+            TenantId::new("restore-other-tenant"),
+            TenantPermissions::full_access(),
+        );
+        let mut tx = backend
+            .begin_transaction(&other, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.restore(&deleted, json!({"resourceType":"Patient"}))
+                .await,
+            Err(StorageError::Validation(_))
+        ));
+        assert!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        Box::new(tx).rollback().await.unwrap();
     }
 
     #[tokio::test]

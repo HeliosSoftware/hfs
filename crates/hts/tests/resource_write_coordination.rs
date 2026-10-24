@@ -611,6 +611,167 @@ async fn postgres_opposite_canonical_replacements_conflict_without_deadlocking()
     );
 }
 
+#[cfg(feature = "postgres")]
+async fn concurrent_put_creation_contract(recreate: bool) {
+    let app = WriteApp::postgres().await;
+    let url = "http://example.org/create-put-race";
+    let path = "/CodeSystem/chosen";
+    if recreate {
+        let (status, body) = app
+            .request(
+                "PUT",
+                path,
+                Some(code_system("chosen", url, "1", "original")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            app.request("DELETE", path, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let pool = app.pool.as_ref().unwrap();
+    let mut gate_client = pool.get().await.unwrap();
+    let observer = pool.get().await.unwrap();
+    install_gate(
+        &gate_client,
+        "resources",
+        if recreate { "UPDATE" } else { "INSERT" },
+    )
+    .await;
+    let gate = gate_client.transaction().await.unwrap();
+    gate.execute("SELECT pg_advisory_xact_lock($1)", &[&GATE_KEY])
+        .await
+        .unwrap();
+    let gate_pid: i32 = gate
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let first = tokio::spawn(request(
+        app.router.clone(),
+        "PUT",
+        path,
+        Some(code_system("chosen", url, "1", "first")),
+    ));
+    let first_pid = blocked_by(&observer, gate_pid).await;
+    let second = tokio::spawn(request(
+        app.router.clone(),
+        "PUT",
+        path,
+        Some(code_system("chosen", url, "1", "second")),
+    ));
+    blocked_by(&observer, first_pid).await;
+    gate.rollback().await.unwrap();
+    let (first_status, first_body) = first.await.unwrap();
+    let (second_status, second_body) = second.await.unwrap();
+    assert_eq!(first_status, StatusCode::CREATED, "{first_body}");
+    assert_eq!(second_status, StatusCode::OK, "{second_body}");
+    let first_version = if recreate { "3" } else { "1" };
+    let second_version = if recreate { "4" } else { "2" };
+    assert_eq!(first_body["meta"]["versionId"], first_version);
+    assert_eq!(second_body["meta"]["versionId"], second_version);
+    assert_eq!(app.request("GET", path, None).await.1, second_body);
+    let rows = app.search("CodeSystem", url).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "chosen");
+    assert_eq!(rows[0]["concept"][0]["code"], "second");
+    let tenant = TenantContext::system();
+    let history = observer
+        .query(
+            "SELECT version_id, data->'concept'->0->>'code'
+             FROM resource_history
+             WHERE tenant_id = $1 AND resource_type = 'CodeSystem' AND id = 'chosen'
+             ORDER BY version_id",
+            &[&tenant.tenant_id().as_str()],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    let mut expected = if recreate {
+        vec![
+            ("1".to_owned(), "original".to_owned()),
+            ("2".to_owned(), "original".to_owned()),
+        ]
+    } else {
+        vec![]
+    };
+    expected.extend([
+        (first_version.to_owned(), "first".to_owned()),
+        (second_version.to_owned(), "second".to_owned()),
+    ]);
+    assert_eq!(
+        history, expected,
+        "waiting PUT must observe the committed creation/restoration"
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_put_creation_has_one_create_and_one_update() {
+    concurrent_put_creation_contract(false).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_put_recreation_preserves_deleted_history() {
+    concurrent_put_creation_contract(true).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_posts_for_one_canonical_leave_one_owner() {
+    let app = WriteApp::postgres().await;
+    let pool = app.pool.as_ref().unwrap();
+    let mut gate_client = pool.get().await.unwrap();
+    let observer = pool.get().await.unwrap();
+    install_gate(&gate_client, "code_systems", "INSERT").await;
+    let gate = gate_client.transaction().await.unwrap();
+    gate.execute("SELECT pg_advisory_xact_lock($1)", &[&GATE_KEY])
+        .await
+        .unwrap();
+    let gate_pid: i32 = gate
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let url = "http://example.org/create-post-race";
+    let first = tokio::spawn(request(
+        app.router.clone(),
+        "POST",
+        "/CodeSystem",
+        Some(code_system("ignored", url, "1", "first")),
+    ));
+    let first_pid = blocked_by(&observer, gate_pid).await;
+    let second = tokio::spawn(request(
+        app.router.clone(),
+        "POST",
+        "/CodeSystem",
+        Some(code_system("also-ignored", url, "1", "second")),
+    ));
+    blocked_by(&observer, first_pid).await;
+    gate.rollback().await.unwrap();
+    let (first_status, first_body) = first.await.unwrap();
+    let (second_status, second_body) = second.await.unwrap();
+    assert_eq!(first_status, StatusCode::CREATED, "{first_body}");
+    assert_eq!(second_status, StatusCode::BAD_REQUEST, "{second_body}");
+    assert_eq!(second_body["resourceType"], "OperationOutcome");
+    let rows = app.search("CodeSystem", url).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], first_body["id"]);
+    assert_eq!(rows[0]["concept"][0]["code"], "first");
+    for table in ["resources", "resource_history", "code_systems"] {
+        let count: i64 = observer
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 1, "losing POST must not leave rows in {table}");
+    }
+}
+
 /// Each advisory lock takes a slot in PostgreSQL's shared lock table (by
 /// default 64 × `max_connections` entries). Locking every resource's identity
 /// separately made a 5,000-resource bootstrap batch fail with "out of shared

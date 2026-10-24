@@ -602,9 +602,10 @@ async fn crud_identity_contract(app: IdentityApp) {
             .await;
         assert_eq!(
             status,
-            StatusCode::BAD_REQUEST,
-            "POST must reject a reserved imported ID: {response}"
+            StatusCode::CREATED,
+            "POST must ignore a supplied imported ID: {response}"
         );
+        assert_ne!(public_id(&response), imported_id);
         let imported_read = app
             .expect(
                 "GET",
@@ -1194,108 +1195,562 @@ fn rich_code_system(id: &str, url: &str, version: &str) -> Value {
     resource
 }
 
-async fn rejected_post_contract(app: IdentityApp) {
+async fn post_identity_contract(app: IdentityApp) {
     for resource_type in ["CodeSystem", "ValueSet", "ConceptMap"] {
-        let empty = app.snapshot().await;
-        for id in [
+        let supplied_ids = [
             json!(""),
             json!("x|1"),
             json!("x".repeat(65)),
             json!(123),
             Value::Null,
             json!([]),
-        ] {
-            let mut resource = terminology(
-                resource_type,
-                "placeholder",
-                &format!("{ROOT}/rejected/{resource_type}"),
-                Some("1"),
-                "one",
+            json!({"id":"nested"}),
+            json!("chosen-id"),
+        ];
+        for (index, id) in supplied_ids.into_iter().enumerate() {
+            let url = format!("{ROOT}/post/{resource_type}/{index}");
+            let mut resource = terminology(resource_type, "placeholder", &url, Some("1"), "one");
+            resource["id"] = id.clone();
+            resource["meta"] = json!({
+                "versionId": "9999", "lastUpdated": "2000-01-01T00:00:00Z",
+                "tag": [{"system": "http://example.org/tags", "code": "retained"}],
+                "profile": ["http://example.org/profiles/terminology"]
+            });
+            let supplied_meta = resource["meta"].clone();
+            let (status, headers, created) = app
+                .request_with_headers("POST", &format!("/{resource_type}"), Some(resource), None)
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+            assert_ne!(
+                created["id"], id,
+                "POST must discard supplied identity before parsing"
             );
-            resource["id"] = id;
-            app.expect(
-                "POST",
-                &format!("/{resource_type}"),
-                Some(resource),
-                StatusCode::BAD_REQUEST,
-            )
-            .await;
-            assert_eq!(
-                app.snapshot().await,
-                empty,
-                "rejected ID must not create raw/history/normalized rows"
-            );
+            assert_write_identity(&app, resource_type, &created, &headers, status, "1").await;
+            assert_ne!(created["meta"]["lastUpdated"], supplied_meta["lastUpdated"]);
+            assert_eq!(created["meta"]["tag"], supplied_meta["tag"]);
+            assert_eq!(created["meta"]["profile"], supplied_meta["profile"]);
+            if index == 0 {
+                let mut replacement = created.clone();
+                replacement["name"] = json!("UpdatedAfterPost");
+                let (status, updated_headers, updated) = app
+                    .request_with_headers(
+                        "PUT",
+                        &format!("/{resource_type}/{}", public_id(&created)),
+                        Some(replacement),
+                        Some("W/\"1\""),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{updated}");
+                assert_write_identity(&app, resource_type, &updated, &updated_headers, status, "2")
+                    .await;
+                assert_resource_read(
+                    &app,
+                    headers["location"].to_str().unwrap(),
+                    &created,
+                    &headers,
+                )
+                .await;
+            }
         }
-        let valid = terminology(
+
+        let original = terminology(
             resource_type,
-            "owned-id",
-            &format!("{ROOT}/owned/{resource_type}"),
+            "occupied",
+            &format!("{ROOT}/occupied/{resource_type}"),
             Some("1"),
             "one",
         );
-        let created = app
+        let path = format!("/{resource_type}/occupied");
+        let saved = app
+            .expect("PUT", &path, Some(original.clone()), StatusCode::CREATED)
+            .await;
+        let imported = terminology(
+            resource_type,
+            "imported-post",
+            &format!("{ROOT}/imported-post/{resource_type}"),
+            Some("1"),
+            "one",
+        );
+        app.import(std::slice::from_ref(&imported)).await;
+        for supplied_id in ["occupied", "imported-post"] {
+            let unrelated = terminology(
+                resource_type,
+                supplied_id,
+                &format!("{ROOT}/ignored/{resource_type}/{supplied_id}"),
+                None,
+                "other",
+            );
+            let created = app
+                .expect(
+                    "POST",
+                    &format!("/{resource_type}"),
+                    Some(unrelated),
+                    StatusCode::CREATED,
+                )
+                .await;
+            assert_ne!(public_id(&created), supplied_id);
+        }
+        assert_eq!(app.expect("GET", &path, None, StatusCode::OK).await, saved);
+        let imported_read = app
+            .expect(
+                "GET",
+                &format!("/{resource_type}/imported-post"),
+                None,
+                StatusCode::OK,
+            )
+            .await;
+        assert_eq!(key(&imported_read), key(&imported));
+
+        let before = app.snapshot().await;
+        let collision = app
             .expect(
                 "POST",
                 &format!("/{resource_type}"),
-                Some(valid.clone()),
+                Some(original.clone()),
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        assert_eq!(collision["resourceType"], "OperationOutcome");
+        assert_eq!(
+            app.snapshot().await,
+            before,
+            "canonical conflict must roll back every write"
+        );
+        app.expect("DELETE", &path, None, StatusCode::NO_CONTENT)
+            .await;
+        let old_history: Vec<_> = app
+            .rows("resource_history")
+            .await
+            .into_iter()
+            .filter(|row| row["resource_type"] == resource_type && row["id"] == "occupied")
+            .collect();
+        let replacement = app
+            .expect(
+                "POST",
+                &format!("/{resource_type}"),
+                Some(original),
                 StatusCode::CREATED,
             )
             .await;
+        assert_ne!(public_id(&replacement), "occupied");
+        app.expect("GET", &path, None, StatusCode::NOT_FOUND).await;
+        let after_history: Vec<_> = app
+            .rows("resource_history")
+            .await
+            .into_iter()
+            .filter(|row| row["resource_type"] == resource_type && row["id"] == "occupied")
+            .collect();
         assert_eq!(
-            created["id"], "owned-id",
-            "this change preserves valid client IDs"
+            after_history, old_history,
+            "POST must not resurrect or alter the old identity"
         );
+    }
+}
+
+async fn assert_resource_read(
+    app: &IdentityApp,
+    path: &str,
+    resource: &Value,
+    write_headers: &HeaderMap,
+) {
+    let (status, headers, read) = app.request_with_headers("GET", path, None, None).await;
+    assert_eq!(status, StatusCode::OK, "GET {path}: {read}");
+    assert_eq!(
+        &read, resource,
+        "GET {path} must return the selected revision"
+    );
+    assert_eq!(headers["etag"], write_headers["etag"]);
+    assert_eq!(headers["last-modified"], write_headers["last-modified"]);
+    assert!(!headers.contains_key("location"));
+}
+
+async fn assert_write_identity(
+    app: &IdentityApp,
+    resource_type: &str,
+    resource: &Value,
+    headers: &HeaderMap,
+    status: StatusCode,
+    version: &str,
+) {
+    let id = public_id(resource);
+    let path = format!("/{resource_type}/{id}");
+    assert_eq!(resource["meta"]["versionId"], version);
+    let modified =
+        chrono::DateTime::parse_from_rfc2822(headers["last-modified"].to_str().unwrap()).unwrap();
+    let updated =
+        chrono::DateTime::parse_from_rfc3339(resource["meta"]["lastUpdated"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(modified.timestamp(), updated.timestamp());
+    assert_eq!(
+        headers["etag"].to_str().unwrap(),
+        format!("W/\"{version}\"")
+    );
+    if status == StatusCode::CREATED {
+        let location = headers["location"].to_str().unwrap();
+        assert_eq!(location, format!("{path}/_history/{version}"));
+        // Follow the actual response header: a correctly spelled but unserved
+        // version URL must fail this contract.
+        assert_resource_read(app, location, resource, headers).await;
+    } else {
+        assert_eq!(status, StatusCode::OK);
+        assert!(!headers.contains_key("location"));
+    }
+    assert_resource_read(app, &path, resource, headers).await;
+    let rows = app
+        .search(
+            resource_type,
+            &format!("&url={}", resource["url"].as_str().unwrap()),
+        )
+        .await;
+    let searched = rows
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap_or_else(|| panic!("search must publish the returned ID: {rows:?}"));
+    assert_eq!(key(searched), key(resource));
+    assert_eq!(
+        searched["meta"], resource["meta"],
+        "search must publish server-managed metadata"
+    );
+}
+
+async fn put_creation_contract(app: IdentityApp) {
+    for kind in ["CodeSystem", "ValueSet", "ConceptMap"] {
+        let path = format!("/{kind}/chosen");
+        let mut original = terminology(
+            kind,
+            "chosen",
+            &format!("{ROOT}/put/{kind}"),
+            Some("1"),
+            "one",
+        );
+        original["meta"] = json!({
+            "versionId": "9999", "lastUpdated": "2000-01-01T00:00:00Z",
+            "tag": [{"system": "http://example.org/tags", "code": "retained"}],
+            "profile": ["http://example.org/profiles/terminology"]
+        });
+        for invalid_id in [None, Some(json!("different")), Some(Value::Null)] {
+            let mut invalid = original.clone();
+            match invalid_id {
+                Some(id) => {
+                    invalid["id"] = id;
+                }
+                None => {
+                    invalid.as_object_mut().unwrap().remove("id");
+                }
+            }
+            let before = app.snapshot().await;
+            app.expect("PUT", &path, Some(invalid), StatusCode::BAD_REQUEST)
+                .await;
+            assert_eq!(app.snapshot().await, before);
+        }
         let before = app.snapshot().await;
-        let mut canonical_collision = valid.clone();
-        canonical_collision["id"] = json!("different-id");
+        let (status, _, _) = app
+            .request_with_headers("PUT", &path, Some(original.clone()), Some("W/\"1\""))
+            .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            app.snapshot().await,
+            before,
+            "If-Match cannot create an absent resource"
+        );
+        let (status, headers, created) = app
+            .request_with_headers("PUT", &path, Some(original.clone()), None)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_write_identity(&app, kind, &created, &headers, status, "1").await;
+        let created_headers = headers.clone();
+        for missing in [
+            format!("{path}/_history/999"),
+            format!("/{kind}/unknown/_history/1"),
+        ] {
+            let response = app
+                .expect("GET", &missing, None, StatusCode::NOT_FOUND)
+                .await;
+            assert_eq!(response["resourceType"], "OperationOutcome");
+        }
+        assert_ne!(
+            created["meta"]["lastUpdated"],
+            original["meta"]["lastUpdated"]
+        );
+        assert_eq!(created["meta"]["tag"], original["meta"]["tag"]);
+        assert_eq!(created["meta"]["profile"], original["meta"]["profile"]);
+        let mut updated = original.clone();
+        updated["name"] = json!("Updated");
+        let (status, headers, updated) = app
+            .request_with_headers("PUT", &path, Some(updated), Some("W/\"1\""))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_write_identity(&app, kind, &updated, &headers, status, "2").await;
+        assert_resource_read(
+            &app,
+            created_headers["location"].to_str().unwrap(),
+            &created,
+            &created_headers,
+        )
+        .await;
+        assert_eq!(updated["meta"]["tag"], original["meta"]["tag"]);
+        assert_eq!(updated["meta"]["profile"], original["meta"]["profile"]);
+        let before = app.snapshot().await;
+        let (status, _, _) = app
+            .request_with_headers("PUT", &path, Some(original.clone()), Some("W/\"1\""))
+            .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(app.snapshot().await, before);
+
+        // Use a separate identity to pin create v1 → delete v2 → recreate v3.
+        let mut restored = original.clone();
+        restored["id"] = json!("restored");
+        restored["url"] = json!(format!("{ROOT}/restore/{kind}"));
+        let restored_path = format!("/{kind}/restored");
+        let (status, original_headers, before_delete) = app
+            .request_with_headers("PUT", &restored_path, Some(restored.clone()), None)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{before_delete}");
+        assert_write_identity(&app, kind, &before_delete, &original_headers, status, "1").await;
+        app.expect("DELETE", &restored_path, None, StatusCode::NO_CONTENT)
+            .await;
+        let deleted = app.snapshot().await;
+        assert_resource_read(
+            &app,
+            original_headers["location"].to_str().unwrap(),
+            &before_delete,
+            &original_headers,
+        )
+        .await;
+        let deletion_path = format!("{restored_path}/_history/2");
+        let deletion = app
+            .expect("GET", &deletion_path, None, StatusCode::GONE)
+            .await;
+        assert_eq!(deletion["resourceType"], "OperationOutcome");
+        assert_eq!(deletion["issue"][0]["code"], "deleted");
+        assert!(deletion.get("id").is_none());
+        assert!(deletion.get("url").is_none());
+        let (status, _, _) = app
+            .request_with_headers(
+                "PUT",
+                &restored_path,
+                Some(restored.clone()),
+                Some("W/\"2\""),
+            )
+            .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            app.snapshot().await,
+            deleted,
+            "If-Match cannot restore a deleted resource"
+        );
+        let (status, headers, result) = app
+            .request_with_headers("PUT", &restored_path, Some(restored.clone()), None)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{result}");
+        assert_write_identity(&app, kind, &result, &headers, status, "3").await;
+        assert_resource_read(
+            &app,
+            original_headers["location"].to_str().unwrap(),
+            &before_delete,
+            &original_headers,
+        )
+        .await;
+        app.expect("GET", &deletion_path, None, StatusCode::GONE)
+            .await;
+        let history: Vec<_> = app
+            .rows("resource_history")
+            .await
+            .into_iter()
+            .filter(|row| row["resource_type"] == kind && row["id"] == "restored")
+            .collect();
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history
+                .iter()
+                .map(|row| row["version_id"].as_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["1", "2", "3"])
+        );
+        for old in deleted["resource_history"]
+            .iter()
+            .filter(|row| row["resource_type"] == kind && row["id"] == "restored")
+        {
+            assert!(
+                history.contains(old),
+                "recreation must preserve earlier history verbatim"
+            );
+        }
+        app.expect("DELETE", &restored_path, None, StatusCode::NO_CONTENT)
+            .await;
+        let replacement = app
+            .expect(
+                "POST",
+                &format!("/{kind}"),
+                Some(restored.clone()),
+                StatusCode::CREATED,
+            )
+            .await;
+        let before = app.snapshot().await;
         app.expect(
-            "POST",
-            &format!("/{resource_type}"),
-            Some(canonical_collision),
+            "PUT",
+            &restored_path,
+            Some(restored),
             StatusCode::BAD_REQUEST,
         )
         .await;
         assert_eq!(
             app.snapshot().await,
             before,
-            "canonical/version already belongs to a different public ID"
+            "restore must not take another resource's canonical identity"
         );
-        app.expect(
-            "POST",
-            &format!("/{resource_type}"),
-            Some(valid.clone()),
-            StatusCode::BAD_REQUEST,
+        app.expect("GET", &restored_path, None, StatusCode::NOT_FOUND)
+            .await;
+        assert_eq!(
+            app.expect(
+                "GET",
+                &format!("/{kind}/{}", public_id(&replacement)),
+                None,
+                StatusCode::OK
+            )
+            .await,
+            replacement
+        );
+    }
+    let metadata = app.expect("GET", "/metadata", None, StatusCode::OK).await;
+    for kind in ["CodeSystem", "ValueSet", "ConceptMap"] {
+        let entry = metadata["rest"][0]["resource"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["type"] == kind)
+            .unwrap();
+        assert_eq!(
+            entry["updateCreate"], true,
+            "{kind} must advertise create-through-PUT"
+        );
+        assert!(
+            entry["interaction"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|interaction| { interaction["code"] == "vread" })
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_put_create_update_and_restore_preserve_identity_and_history() {
+    put_creation_contract(IdentityApp::sqlite(true)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_put_create_update_and_restore_preserve_identity_and_history() {
+    put_creation_contract(IdentityApp::postgres().await).await;
+}
+
+async fn failed_creation_contract(app: IdentityApp) {
+    for (kind, table) in [
+        ("CodeSystem", "code_systems"),
+        ("ValueSet", "value_sets"),
+        ("ConceptMap", "concept_maps"),
+    ] {
+        let path = format!("/{kind}/restore-failure");
+        let original = terminology(
+            kind,
+            "restore-failure",
+            &format!("{ROOT}/failed-restore/{kind}"),
+            Some("1"),
+            "one",
+        );
+        app.expect("PUT", &path, Some(original.clone()), StatusCode::CREATED)
+            .await;
+        app.expect("DELETE", &path, None, StatusCode::NO_CONTENT)
+            .await;
+        app.execute(
+            &format!(
+                "CREATE TRIGGER reject_create_{table} BEFORE INSERT ON {table}
+                 WHEN NEW.name = 'RejectNormalization'
+                 BEGIN SELECT RAISE(ABORT, 'forced creation failure'); END;"
+            ),
+            &format!(
+                "CREATE FUNCTION reject_create_{table}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                     IF NEW.name = 'RejectNormalization' THEN
+                         RAISE EXCEPTION 'forced creation failure';
+                     END IF;
+                     RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER reject_create_{table} BEFORE INSERT ON {table}
+                 FOR EACH ROW EXECUTE FUNCTION reject_create_{table}();"
+            ),
         )
         .await;
-        assert_eq!(app.snapshot().await, before);
+        let before = app.snapshot().await;
+        let mut rejected = original.clone();
+        rejected["name"] = json!("RejectNormalization");
         app.expect(
-            "DELETE",
-            &format!("/{resource_type}/owned-id"),
-            None,
-            StatusCode::NO_CONTENT,
-        )
-        .await;
-        let deleted = app.snapshot().await;
-        app.expect(
-            "POST",
-            &format!("/{resource_type}"),
-            Some(valid),
-            StatusCode::BAD_REQUEST,
+            "PUT",
+            &path,
+            Some(rejected.clone()),
+            StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
         assert_eq!(
             app.snapshot().await,
-            deleted,
-            "tombstone conflict must leave all rows unchanged"
+            before,
+            "failed {kind} restoration must preserve tombstone and history"
         );
+        app.expect("GET", &path, None, StatusCode::NOT_FOUND).await;
+        rejected["id"] = json!("new-failure");
+        rejected["url"] = json!(format!("{ROOT}/failed-create/{kind}"));
+        app.expect(
+            "PUT",
+            &format!("/{kind}/new-failure"),
+            Some(rejected.clone()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        assert_eq!(
+            app.snapshot().await,
+            before,
+            "failed {kind} PUT creation must leave no partial rows"
+        );
+        app.expect(
+            "POST",
+            &format!("/{kind}"),
+            Some(rejected),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        assert_eq!(
+            app.snapshot().await,
+            before,
+            "failed {kind} POST creation must leave no partial rows"
+        );
+        // A failed attempt must not consume a version or poison the next transaction.
+        let (status, headers, restored) = app
+            .request_with_headers("PUT", &path, Some(original), None)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{restored}");
+        assert_write_identity(&app, kind, &restored, &headers, status, "3").await;
     }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_failed_create_and_restore_roll_back_all_stores() {
+    failed_creation_contract(IdentityApp::sqlite(true)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_failed_create_and_restore_roll_back_all_stores() {
+    failed_creation_contract(IdentityApp::postgres().await).await;
 }
 
 async fn atomic_failure_contract(app: IdentityApp) {
     let original = rich_code_system("atomic", &format!("{ROOT}/atomic"), "1");
     app.expect(
-        "POST",
-        "/CodeSystem",
+        "PUT",
+        "/CodeSystem/atomic",
         Some(original.clone()),
         StatusCode::CREATED,
     )
@@ -1416,6 +1871,23 @@ async fn atomic_failure_contract(app: IdentityApp) {
     assert_eq!(after, read);
 }
 
+async fn assert_imported_baseline(app: &IdentityApp, path: &str, original: &Value) {
+    let (status, headers, mut baseline) = app
+        .request_with_headers("GET", &format!("{path}/_history/1"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{baseline}");
+    assert_eq!(baseline["meta"]["versionId"], "1");
+    assert_eq!(headers["etag"], "W/\"1\"");
+    assert!(baseline["meta"]["lastUpdated"].is_string());
+    let mut expected = original.clone();
+    baseline.as_object_mut().unwrap().remove("meta");
+    expected.as_object_mut().unwrap().remove("meta");
+    assert_eq!(
+        baseline, expected,
+        "promotion must expose the original imported revision"
+    );
+}
+
 async fn imported_write_contract(app: IdentityApp) {
     for resource_type in ["CodeSystem", "ValueSet"] {
         let url = format!("{ROOT}/imported-write/{resource_type}");
@@ -1437,6 +1909,13 @@ async fn imported_write_contract(app: IdentityApp) {
             !headers.contains_key("etag"),
             "import-only resource has no persistence version yet"
         );
+        app.expect(
+            "GET",
+            &format!("{path}/_history/1"),
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
         let baseline = app.snapshot().await;
         let mut replacement = imported.clone();
         replacement["name"] = json!("Updated");
@@ -1465,6 +1944,7 @@ async fn imported_write_contract(app: IdentityApp) {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(updated["id"], id);
         assert_eq!(headers["etag"], "W/\"2\"");
+        assert_imported_baseline(&app, &path, &before_read).await;
         let history = app
             .rows("resource_history")
             .await
@@ -1550,24 +2030,18 @@ async fn imported_write_contract(app: IdentityApp) {
             reimported["id"], sibling["id"],
             "reimport must not resurrect tombstoned ID"
         );
-
-        let absent_path = format!("/{resource_type}/never-used");
         let before = app.snapshot().await;
-        let absent = terminology(
-            resource_type,
-            "never-used",
-            &format!("{ROOT}/absent/{resource_type}"),
+        app.expect(
+            "DELETE",
+            &format!("/{resource_type}/never-used"),
             None,
-            "one",
-        );
-        app.expect("PUT", &absent_path, Some(absent), StatusCode::NOT_FOUND)
-            .await;
-        app.expect("DELETE", &absent_path, None, StatusCode::NOT_FOUND)
-            .await;
+            StatusCode::NOT_FOUND,
+        )
+        .await;
         assert_eq!(
             app.snapshot().await,
             before,
-            "never-used IDs must not become creates"
+            "DELETE of a never-used ID must not write any rows"
         );
     }
 }
@@ -1597,6 +2071,13 @@ async fn imported_concept_map_write_contract(app: IdentityApp) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(original["id"], "imported-map");
     assert!(!headers.contains_key("etag"));
+    app.expect(
+        "GET",
+        &format!("{path}/_history/1"),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
     let translation_path = format!("{path}/$translate?system={source}&code=one");
     let before = app
         .expect("GET", &translation_path, None, StatusCode::OK)
@@ -1630,6 +2111,7 @@ async fn imported_concept_map_write_contract(app: IdentityApp) {
     assert_eq!(headers["etag"], "W/\"2\"");
     assert_eq!(updated["id"], original["id"]);
     assert_eq!(app.expect("GET", path, None, StatusCode::OK).await, updated);
+    assert_imported_baseline(&app, path, &original).await;
     let history = app
         .rows("resource_history")
         .await
@@ -1792,13 +2274,13 @@ async fn delete_cascade_contract(app: IdentityApp) {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test(flavor = "multi_thread")]
-async fn sqlite_post_validation_and_reserved_ids_do_not_write() {
-    rejected_post_contract(IdentityApp::sqlite(true)).await;
+async fn sqlite_post_discards_supplied_ids_and_preserves_existing_owners() {
+    post_identity_contract(IdentityApp::sqlite(true)).await;
 }
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
-async fn postgres_post_validation_and_reserved_ids_do_not_write() {
-    rejected_post_contract(IdentityApp::postgres().await).await;
+async fn postgres_post_discards_supplied_ids_and_preserves_existing_owners() {
+    post_identity_contract(IdentityApp::postgres().await).await;
 }
 #[cfg(feature = "sqlite")]
 #[tokio::test(flavor = "multi_thread")]
