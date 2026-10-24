@@ -11,6 +11,9 @@ use std::path::PathBuf;
 #[path = "resource_page_tests.rs"]
 mod resource_page_tests;
 
+#[path = "legacy_candidates_tests.rs"]
+mod legacy_candidates_tests;
+
 #[path = "deadline_tests.rs"]
 mod deadline_tests;
 
