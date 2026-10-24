@@ -513,6 +513,9 @@ mod tenant_id_fidelity_suite;
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 
+#[path = "common/sof_terminology_suite.rs"]
+mod sof_terminology_suite;
+
 /// Backend-agnostic `PUT/DELETE [type]?[criteria]` transaction scenarios
 /// (#859), shared with the SQLite and PostgreSQL suites.
 #[path = "transactions/conditional_url_suite.rs"]
@@ -13441,6 +13444,41 @@ async fn mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact() 
     };
     tenant_id_fidelity_suite::purging_one_tenant_leaves_the_look_alikes_intact(&backend, "acme")
         .await;
+}
+
+/// #2185: the SQL-on-FHIR terminology store contract, with the tenant's row
+/// chunks and registry entries as the residue.
+#[tokio::test]
+async fn mongodb_integration_sof_terminology_store_suite() {
+    let Some(backend) = create_backend("sof_terminology").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sof_terminology_store_suite (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let db = backend.get_database().await.expect("database");
+    let residue = move |tenant: String| {
+        let db = db.clone();
+        Box::pin(async move {
+            let rows = db
+                .collection::<mongodb::bson::Document>("sof_terminology_rows")
+                .count_documents(mongodb::bson::doc! { "tenant_id": &tenant })
+                .await
+                .unwrap() as usize;
+            let entries = db
+                .collection::<mongodb::bson::Document>("sof_terminology_registry")
+                .find_one(mongodb::bson::doc! { "tenant_id": &tenant })
+                .await
+                .unwrap()
+                .map_or(0, |doc| {
+                    let registry: serde_json::Value =
+                        serde_json::from_str(doc.get_str("registry").unwrap()).unwrap();
+                    registry["entries"].as_array().map_or(0, Vec::len)
+                });
+            rows + entries
+        }) as futures::future::BoxFuture<'static, usize>
+    };
+    sof_terminology_suite::run_all(&backend, "sof-term", Some(&residue)).await;
 }
 
 /// #1912: the tenant-scoped existence probe answers as `count_by_tenant` did.

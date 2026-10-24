@@ -85,6 +85,7 @@ pub(crate) mod null_timestamp_facts;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;
+mod sof_terminology;
 mod storage;
 mod sync_failures;
 mod transaction;
