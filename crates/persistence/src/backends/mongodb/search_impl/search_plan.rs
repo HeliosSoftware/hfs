@@ -37,8 +37,9 @@ const PAGE_CANDIDATE_BATCH_ROWS: usize = 256;
 const COUNT_CANDIDATE_BATCH_ROWS: usize = 4096;
 // Sparse resource-order pages may check this many candidates, including the
 // first sample, before trying the capped ID set. Batches remain at most 4096
-// rows; this bounds ordered work before trying the ID set. If that set is too
-// large, the original ordered scan still resumes.
+// rows; this bounds ordered work before trying the ID set. The continuation
+// stops sooner once the observed match rate projects the page past this
+// budget. If that set is too large, the original ordered scan still resumes.
 const RESOURCE_PAGE_SCAN_BUDGET: usize = 100_000;
 // Exact counts need no ordering. Overlap two bounded validations without
 // creating a task per batch or retaining the complete candidate set.
@@ -1640,13 +1641,16 @@ impl ResourcePageRun<'_> {
     }
 
     /// Gives a sparse prefix a bounded chance to fill the page in index order.
-    /// The first sample counts against the budget. An incomplete result keeps
-    /// the cursor, offset and retained IDs intact so `finish` can resume it.
+    /// The first sample counts against the budget, and the scan stops early
+    /// when even an optimistic match rate cannot fill the page within it, so
+    /// an empty or near-empty result does not read the whole budget before the
+    /// ID set. An incomplete result keeps the cursor, offset and retained IDs
+    /// intact so `finish` can resume it.
     pub(super) async fn try_finish_sparse_page(
         &mut self,
         db: &mongodb::Database,
     ) -> StorageResult<Option<Vec<String>>> {
-        self.try_finish_page_with_budget(db, RESOURCE_PAGE_SCAN_BUDGET)
+        self.try_finish_page_with_budget(db, RESOURCE_PAGE_SCAN_BUDGET, true)
             .await
     }
 
@@ -1654,8 +1658,11 @@ impl ResourcePageRun<'_> {
         &mut self,
         db: &mongodb::Database,
         candidate_budget: usize,
+        project: bool,
     ) -> StorageResult<Option<Vec<String>>> {
-        while self.scan.candidates_checked < candidate_budget {
+        while self.scan.candidates_checked < candidate_budget
+            && !(project && self.scan.projected_past(candidate_budget))
+        {
             let remaining = candidate_budget - self.scan.candidates_checked;
             if self.step(db, remaining).await? {
                 return Ok(Some(std::mem::take(&mut self.scan.ids)));
@@ -1689,7 +1696,9 @@ impl ResourcePageRun<'_> {
             // A byte-budget flush may already have carried a row into this
             // batch. Match a filled bounded step before reading another row.
             if self.scan.batch.len() >= self.scan.batch_rows.min(max_batch_rows) {
-                return self.scan.match_full_batch(db).await;
+                // A step truncated by the budget keeps the current batch size.
+                let grow = self.scan.batch.len() >= self.scan.batch_rows;
+                return self.scan.match_full_batch(db, grow).await;
             }
             let Some(row) = self.cursor.next().await? else {
                 self.scan.match_batch(db).await?;
@@ -1709,7 +1718,7 @@ impl ResourcePageRun<'_> {
             // A batch is matched as soon as it is full, before another row is
             // read, so a page that fits in one batch never fetches a second.
             if self.scan.bytes.saturating_add(size) > MAX_CANDIDATE_BYTES {
-                let complete = self.scan.match_full_batch(db).await?;
+                let complete = self.scan.match_full_batch(db, true).await?;
                 self.scan.batch.push(id);
                 self.scan.bytes += size;
                 return Ok(complete);
@@ -1791,13 +1800,29 @@ impl<'a> ResourcePageScan<'a> {
         Ok(())
     }
 
-    async fn match_full_batch(&mut self, db: &mongodb::Database) -> StorageResult<bool> {
+    async fn match_full_batch(
+        &mut self,
+        db: &mongodb::Database,
+        grow: bool,
+    ) -> StorageResult<bool> {
         self.match_batch(db).await?;
         if self.ids.len() == self.limit {
             return Ok(true);
         }
-        self.batch_rows = (self.batch_rows * 2).min(COUNT_CANDIDATE_BATCH_ROWS);
+        if grow {
+            self.batch_rows = (self.batch_rows * 2).min(COUNT_CANDIDATE_BATCH_ROWS);
+        }
         Ok(false)
+    }
+
+    /// Whether the page cannot fill within `budget` candidates even if the
+    /// candidates checked so far had held one more match: the optimistic rate
+    /// lets a page with no matches yet keep scanning for a while.
+    fn projected_past(&self, budget: usize) -> bool {
+        let checked = self.candidates_checked as u64;
+        let needed = self.skip + (self.limit - self.ids.len()) as u64;
+        let further = needed.saturating_mul(checked) / (self.live_matches + 1);
+        checked.saturating_add(further) > budget as u64
     }
 }
 
@@ -1851,14 +1876,12 @@ impl ResourcePageCursor {
         if timestamp_direction == id_direction {
             Ok(Self::Ordered(Self::open(&resources, filter, sort).await?))
         } else {
-            Ok(Self::TimestampGroups(TimestampGroupCursor {
+            Ok(Self::TimestampGroups(TimestampGroupCursor::new(
                 resources,
                 filter,
                 timestamp_direction,
                 id_direction,
-                after: None,
-                current: None,
-            }))
+            )))
         }
     }
 
@@ -1900,26 +1923,66 @@ impl ResourcePageCursor {
     }
 }
 
+/// Timestamp groups up to this size are read from one ordered stream and
+/// reversed in memory; a larger group gets its own ID-ordered cursor, so a tie
+/// shared by most of a type still streams instead of being buffered.
+const TIMESTAMP_GROUP_BUFFER_ROWS: usize = PAGE_CANDIDATE_BATCH_ROWS;
+
+/// Serves a timestamp order whose ID direction differs. One cursor reads the
+/// timestamp index in the timestamp direction; each group of equal timestamps
+/// is buffered and emitted in the requested ID direction. A group past
+/// `TIMESTAMP_GROUP_BUFFER_ROWS` is reread through a per-group cursor and the
+/// stream reopens after it, so neither path collects or sorts a large tie.
 struct TimestampGroupCursor {
     resources: mongodb::Collection<Document>,
     filter: Document,
     timestamp_direction: i32,
     id_direction: i32,
+    /// Every row at or before this timestamp has been emitted or is in `group`
+    /// or `current`; a reopened stream starts after it.
     after: Option<mongodb::bson::DateTime>,
+    stream: Option<mongodb::Cursor<Document>>,
+    stream_done: bool,
+    /// The first row of the next group, read while closing the previous one.
+    pending: Option<Document>,
+    /// The current group in stream order; popped from the end, which reverses it.
+    group: Vec<Document>,
+    /// An oversized group read in ID direction.
     current: Option<mongodb::Cursor<Document>>,
 }
 
 impl TimestampGroupCursor {
-    async fn next(&mut self) -> StorageResult<Option<Document>> {
-        loop {
-            if let Some(cursor) = &mut self.current
-                && let Some(row) = cursor
-                    .try_next()
-                    .await
-                    .or_query_error("Failed to read timestamp group candidate")?
-            {
-                return Ok(Some(row));
-            }
+    fn new(
+        resources: mongodb::Collection<Document>,
+        filter: Document,
+        timestamp_direction: i32,
+        id_direction: i32,
+    ) -> Self {
+        Self {
+            resources,
+            filter,
+            timestamp_direction,
+            id_direction,
+            after: None,
+            stream: None,
+            stream_done: false,
+            pending: None,
+            group: Vec::new(),
+            current: None,
+        }
+    }
+
+    fn timestamp(row: &Document) -> StorageResult<mongodb::bson::DateTime> {
+        row.get_datetime("last_updated")
+            .copied()
+            .map_err(|_| internal_error("Resource candidate is missing timestamp".to_owned()))
+    }
+
+    async fn stream_next(&mut self) -> StorageResult<Option<Document>> {
+        if self.stream_done {
+            return Ok(None);
+        }
+        if self.stream.is_none() {
             let filter = match self.after {
                 None => self.filter.clone(),
                 Some(timestamp) => {
@@ -1934,38 +1997,85 @@ impl TimestampGroupCursor {
                     )
                 }
             };
-            // Discover only the next timestamp; never collect or sort a group.
-            let next = self
-                .resources
-                .find_one(filter)
-                .search_deadline()?
-                .projection(doc! { "_id": 0, "last_updated": 1 })
-                .sort(doc! {
-                    "last_updated": self.timestamp_direction, "id": self.timestamp_direction,
-                })
-                .hint(ResourcePageCursor::hint(&self.filter))
-                .await
-                .or_query_error("Failed to find next resource timestamp")?;
-            let Some(next) = next else {
-                return Ok(None);
-            };
-            let timestamp = *next.get_datetime("last_updated").map_err(|_| {
-                internal_error("Resource candidate is missing timestamp".to_owned())
-            })?;
-            self.after = Some(timestamp);
-            self.current = Some(
+            self.stream = Some(
                 ResourcePageCursor::open(
                     &self.resources,
-                    constrain_resource_page_filter(
-                        &self.filter,
-                        doc! { "last_updated": timestamp },
-                    ),
-                    // The timestamp is fixed, but including it lets MongoDB
-                    // merge cursor ranges in index order without a sort stage.
-                    doc! { "last_updated": self.id_direction, "id": self.id_direction },
+                    filter,
+                    doc! {
+                        "last_updated": self.timestamp_direction,
+                        "id": self.timestamp_direction,
+                    },
                 )
                 .await?,
             );
+        }
+        let row = match &mut self.stream {
+            Some(stream) => stream
+                .try_next()
+                .await
+                .or_query_error("Failed to read timestamp group candidate")?,
+            None => None,
+        };
+        if row.is_none() {
+            self.stream = None;
+            self.stream_done = true;
+        }
+        Ok(row)
+    }
+
+    async fn next(&mut self) -> StorageResult<Option<Document>> {
+        loop {
+            if let Some(cursor) = &mut self.current {
+                if let Some(row) = cursor
+                    .try_next()
+                    .await
+                    .or_query_error("Failed to read timestamp group candidate")?
+                {
+                    return Ok(Some(row));
+                }
+                self.current = None;
+            }
+            if let Some(row) = self.group.pop() {
+                return Ok(Some(row));
+            }
+            let first = match self.pending.take() {
+                Some(row) => row,
+                None => match self.stream_next().await? {
+                    Some(row) => row,
+                    None => return Ok(None),
+                },
+            };
+            let timestamp = Self::timestamp(&first)?;
+            self.after = Some(timestamp);
+            self.group.push(first);
+            while let Some(row) = self.stream_next().await? {
+                if Self::timestamp(&row)? != timestamp {
+                    self.pending = Some(row);
+                    break;
+                }
+                self.group.push(row);
+                if self.group.len() > TIMESTAMP_GROUP_BUFFER_ROWS {
+                    // Too large to buffer: reread this group in ID direction
+                    // and reopen the stream after it.
+                    self.group.clear();
+                    self.stream = None;
+                    self.current = Some(
+                        ResourcePageCursor::open(
+                            &self.resources,
+                            constrain_resource_page_filter(
+                                &self.filter,
+                                doc! { "last_updated": timestamp },
+                            ),
+                            // The timestamp is fixed, but including it lets
+                            // MongoDB merge cursor ranges in index order
+                            // without a sort stage.
+                            doc! { "last_updated": self.id_direction, "id": self.id_direction },
+                        )
+                        .await?,
+                    );
+                    break;
+                }
+            }
         }
     }
 }

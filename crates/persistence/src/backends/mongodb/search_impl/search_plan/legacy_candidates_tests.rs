@@ -120,7 +120,7 @@ async fn sparse_positive_date_pages_preserve_discovery_and_membership_access() {
     };
     // Both date predicates exceed the bounded planner's 10k cap. More than
     // 100k timestamp/ID-ordered candidates precede the first match, forcing
-    // the capped-ID fallback after the complete ordered continuation budget.
+    // the capped-ID fallback after the ordered continuation.
     let recent = 10_500;
     add_dates(&fixture, recent).await;
     let mut expected: Vec<_> = fixture.rows[1..recent]
@@ -307,7 +307,8 @@ async fn sparse_positive_date_pages_preserve_discovery_and_membership_access() {
             "the first resource batch must actually be sampled"
         );
     }
-    // An empty ordered prefix must stop at the same fixed candidate budget,
+    // An empty ordered prefix stops once even an optimistic match rate cannot
+    // fill the page within the budget, well before reading the whole budget,
     // even though this fixture contains substantially more live resources.
     let empty = ResourceBatchPlan {
         filters: vec![predicate("code", "never-present")],
@@ -335,7 +336,10 @@ async fn sparse_positive_date_pages_preserve_discovery_and_membership_access() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(run.scan.candidates_checked, RESOURCE_PAGE_SCAN_BUDGET);
+    // 256 + 512 + 1,024 + 2,048 still projects within the budget; the next
+    // 4,096-row batch does not.
+    assert_eq!(run.scan.candidates_checked, 7_936);
+    assert!(run.scan.projected_past(RESOURCE_PAGE_SCAN_BUDGET));
     assert_eq!(run.scan.live_matches, 0);
     assert_eq!(run.scan.batch_rows, COUNT_CANDIDATE_BATCH_ROWS);
     assert!(!run.exhausted);

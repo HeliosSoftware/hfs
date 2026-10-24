@@ -1938,6 +1938,61 @@ async fn mixed_timestamp_orders_stream_large_ties_without_blocking_sort() {
 }
 
 #[tokio::test]
+async fn mixed_timestamp_orders_read_small_groups_from_one_stream() {
+    let Some(data) = TimestampFixture::new("timestamp-small-groups").await else {
+        return;
+    };
+    let db = &data.fixture.db;
+    let plan = ResourceBatchPlan {
+        filters: vec![predicate("code", "frequent")],
+        exclusions: Vec::new(),
+        missing: Vec::new(),
+    };
+    let rows = data.expected(&["frequent"]);
+    for (timestamp_direction, id_direction) in [(1, -1), (-1, 1)] {
+        let mut expected = rows.clone();
+        expected.sort_by(|a, b| {
+            let by_time = data.timestamps[a].cmp(&data.timestamps[b]);
+            let by_id = a.cmp(b);
+            (if timestamp_direction == 1 {
+                by_time
+            } else {
+                by_time.reverse()
+            })
+            .then(if id_direction == 1 {
+                by_id
+            } else {
+                by_id.reverse()
+            })
+        });
+        start_profiling(db).await;
+        let actual = plan
+            .execute_page(
+                db,
+                resource_filter(),
+                None,
+                doc! { "last_updated": timestamp_direction, "id": id_direction },
+                0,
+                expected.len() + 1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        let operations = candidate_stream_operations(db).await;
+        assert_covered_index_order(&operations, "the grouped stream must use index order");
+        // Every fixture group fits the buffer, so all twelve timestamps come
+        // from one find and its getMores rather than two finds per timestamp.
+        let finds = operations
+            .iter()
+            .filter(|operation| operation.get_str("op") == Ok("query"))
+            .count();
+        assert_eq!(finds, 1, "{operations:?}");
+    }
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
+    data.fixture.close().await;
+}
+
+#[tokio::test]
 async fn complement_pages_batch_exclusions_and_preserve_absence_and_cursors() {
     let Some(data) = TimestampFixture::new("complement-pages").await else {
         return;
@@ -2801,7 +2856,7 @@ async fn bounded_ordered_continuation_preserves_offsets_and_resume_state() {
                 ResourcePageSample::Sparse { .. }
             ));
             assert!(
-                run.try_finish_page_with_budget(db, budget)
+                run.try_finish_page_with_budget(db, budget, false)
                     .await
                     .unwrap()
                     .is_none()
@@ -2848,7 +2903,11 @@ async fn bounded_ordered_continuation_matches_a_carried_last_row_before_reading(
     run.scan.candidates_checked = RESOURCE_PAGE_SCAN_BUDGET - 1;
     run.scan.bytes = carried.len() + 16;
     run.scan.batch.push(carried.clone());
-    let page = run.try_finish_sparse_page(db).await.unwrap().unwrap();
+    let page = run
+        .try_finish_page_with_budget(db, RESOURCE_PAGE_SCAN_BUDGET, false)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(page, [carried]);
     assert_eq!(run.scan.candidates_checked, RESOURCE_PAGE_SCAN_BUDGET);
     assert!(run.scan.batch.is_empty());
