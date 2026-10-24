@@ -671,8 +671,11 @@ fn test_function_subsetting_indexer() {
         eval("(10 | 20 | 30)[3]", &context).unwrap(),
         EvaluationResult::Empty
     ); // Index out of bounds -> Empty, Add unwrap
-    // Negative index should error
-    assert!(eval("(10 | 20 | 30)[-1]", &context).is_err());
+    // A negative index is out of range -> Empty
+    assert_eq!(
+        eval("(10 | 20 | 30)[-1]", &context).unwrap(),
+        EvaluationResult::Empty
+    );
     // Non-integer index should error
     assert!(eval("(10 | 20 | 30)['a']", &context).is_err());
 }

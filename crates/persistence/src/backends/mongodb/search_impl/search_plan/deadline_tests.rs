@@ -621,8 +621,20 @@ async fn sparse_resource_sample_resume_and_fallback_share_expiry() {
         exclusions: vec![],
         missing: vec![],
     };
+    enum ExpiredStage {
+        Resume,
+        Continuation,
+        Fallback,
+    }
     // Cover both the ordinary cursor and opposite-direction timestamp groups.
-    for (id_direction, resume) in [(1, true), (-1, false)] {
+    for (id_direction, stage) in [
+        (1, ExpiredStage::Resume),
+        (-1, ExpiredStage::Resume),
+        (1, ExpiredStage::Continuation),
+        (-1, ExpiredStage::Continuation),
+        (1, ExpiredStage::Fallback),
+        (-1, ExpiredStage::Fallback),
+    ] {
         assert_timeout(
             search_deadline::run(1000, async {
                 let mut page = plan
@@ -640,10 +652,12 @@ async fn sparse_resource_sample_resume_and_fallback_share_expiry() {
                     ResourcePageSample::Sparse { live_matches: 0 }
                 ));
                 tokio::time::sleep(Duration::from_millis(1000)).await;
-                if resume {
-                    page.finish(&fixture.db).await.map(|_| ())
-                } else {
-                    bounded_candidates(
+                match stage {
+                    ExpiredStage::Resume => page.finish(&fixture.db).await.map(|_| ()),
+                    ExpiredStage::Continuation => {
+                        page.try_finish_sparse_page(&fixture.db).await.map(|_| ())
+                    }
+                    ExpiredStage::Fallback => bounded_candidates(
                         &fixture.db,
                         &plan.filters,
                         &fixture.backend.probe_cache,
@@ -651,7 +665,7 @@ async fn sparse_resource_sample_resume_and_fallback_share_expiry() {
                         fixture.backend.probe_timeout(),
                     )
                     .await
-                    .map(|_| ())
+                    .map(|_| ()),
                 }
             })
             .await,

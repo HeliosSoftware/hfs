@@ -37,11 +37,26 @@ pub struct DesignationValue {
     pub source: Option<String>,
 }
 
+/// Scalar metadata for a resource selected by its public logical ID.
+///
+/// Instance operations use this projection without loading large CodeSystem
+/// resources. An absent version identifies an unversioned row, not the latest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceIdentity {
+    pub id: String,
+    pub url: String,
+    pub version: Option<String>,
+    pub language: Option<String>,
+}
+
 // ─── $lookup ──────────────────────────────────────────────────────────────────
 
 /// Request for `CodeSystem/$lookup`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct LookupRequest {
+    /// Exact stored instance selected by the route, never a client parameter.
+    #[serde(skip)]
+    pub selected_code_system_id: Option<String>,
     /// CodeSystem canonical URL.
     pub system: String,
     /// Concept code to look up.
@@ -90,6 +105,9 @@ pub struct LookupResponse {
 /// Either `url` (for a ValueSet) or `system` (for a CodeSystem) should be set.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ValidateCodeRequest {
+    /// Exact stored ValueSet selected by the route, including unversioned rows.
+    #[serde(skip)]
+    pub selected_value_set_id: Option<String>,
     /// ValueSet URL (used when validating against a value set).
     pub url: Option<String>,
     /// ValueSet version pin (per FHIR `valueSetVersion` request param). When
@@ -348,6 +366,10 @@ pub struct ExpandRequest {
     /// it the highest-versioned ValueSet sharing the URL wins.
     #[serde(default)]
     pub value_set_version: Option<String>,
+    /// Exact stored ValueSet selected by an instance operation. This is internal
+    /// routing state, not a client-supplied expansion parameter.
+    #[serde(skip)]
+    pub selected_value_set_id: Option<String>,
     /// Inline ValueSet resource (used when no `url` is provided).
     pub value_set: Option<serde_json::Value>,
     /// Free-text filter applied to code + display.
@@ -628,6 +650,50 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: ExpandRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn lookup_and_validation_instance_selection_is_internal_only() {
+        let mut lookup_json = serde_json::to_value(LookupRequest::default()).unwrap();
+        lookup_json["selected_code_system_id"] = serde_json::json!("spoofed");
+        let mut lookup: LookupRequest = serde_json::from_value(lookup_json).unwrap();
+        assert!(lookup.selected_code_system_id.is_none());
+        lookup.selected_code_system_id = Some("selected".into());
+        assert!(
+            serde_json::to_value(lookup)
+                .unwrap()
+                .get("selected_code_system_id")
+                .is_none()
+        );
+
+        let mut validate_json = serde_json::to_value(ValidateCodeRequest::default()).unwrap();
+        validate_json["selected_value_set_id"] = serde_json::json!("spoofed");
+        let mut validate: ValidateCodeRequest = serde_json::from_value(validate_json).unwrap();
+        assert!(validate.selected_value_set_id.is_none());
+        validate.selected_value_set_id = Some("selected".into());
+        assert!(
+            serde_json::to_value(validate)
+                .unwrap()
+                .get("selected_value_set_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expand_instance_selection_is_internal_only() {
+        let request: ExpandRequest = serde_json::from_value(serde_json::json!({
+            "url": "http://example.org/vs",
+            "selected_value_set_id": "another-instance"
+        }))
+        .unwrap();
+        assert!(request.selected_value_set_id.is_none());
+
+        let internal = ExpandRequest {
+            selected_value_set_id: Some("selected-instance".into()),
+            ..request
+        };
+        let encoded = serde_json::to_value(internal).unwrap();
+        assert!(encoded.get("selected_value_set_id").is_none());
     }
 
     #[test]

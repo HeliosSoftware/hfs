@@ -957,7 +957,7 @@ mod tests {
             let conn = backend.pool().get().unwrap();
             conn.execute(
                 "INSERT INTO code_systems (id, url, version, status, content, created_at, updated_at, authority_rank)
-                 VALUES ('legacy|4.0.1', ?1, '4.0.1', 'active', 'complete', 'x', 'x', NULL)",
+                 VALUES ('legacy', ?1, '4.0.1', 'active', 'complete', 'x', 'x', NULL)",
                 rusqlite::params![URL],
             )
             .unwrap();
