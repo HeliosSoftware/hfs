@@ -150,6 +150,7 @@ async fn missing_membership_work_is_bounded_by_candidate_ids() {
                     .unwrap();
             }
         }
+        trust_missing_metadata(&fixture.backend, db).await;
         for (size, reference) in [(65, false), (129, false), (129, true)] {
             let positive = if reference {
                 let mut patient = parameter("patient", "Patient/selected");
@@ -420,6 +421,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
         )
         .await
         .unwrap();
+    trust_missing_metadata(backend, db).await;
     let mut absent = parameter("method", "true");
     absent.modifier = Some(SearchModifier::Missing);
     let mut query = SearchQuery::new("Observation")
@@ -648,6 +650,7 @@ async fn missing_id_cursor_candidates_bound_probes_reads_and_cache_keys() {
         )
         .await
         .unwrap();
+    trust_missing_metadata(backend, db).await;
     let positive = parameter("code", "base");
     let filter = backend
         .build_search_index_filter(PLAN_TENANT, "Observation", &positive)
@@ -1013,6 +1016,7 @@ async fn missing_id_batches_navigate_fifty_pages_with_independent_date_bounds() 
                 ).await.unwrap();
             }
         }
+        trust_missing_metadata(&fixture.backend, &fixture.db).await;
         for direction in ["_id", "-_id"] {
             let mut ordered = expected.clone();
             if direction == "-_id" {
@@ -2401,6 +2405,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
     };
     let backend = &data.fixture.backend;
     let db = &data.fixture.db;
+    trust_missing_metadata(backend, db).await;
     let start = DateTime::from_millis(1_767_225_600_000);
     let end = DateTime::from_millis(start.timestamp_millis() + 86_400_000);
     db.collection::<Document>("search_index")

@@ -972,6 +972,8 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
         let Some(timeout) = self
             .config()
             .search_timeout_ms
@@ -987,6 +989,8 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
         let Some(timeout) = self
             .config()
             .search_timeout_ms
@@ -1656,7 +1660,7 @@ impl MongoBackend {
                 && self
                     .tenant_extractor(tenant_id)
                     .supports_missing(resource_type, &definition)
-        })
+        }) && self.missing_param_fresh(tenant_id, resource_type, &param.name)
     }
 
     fn is_missing_resource_parameter(
