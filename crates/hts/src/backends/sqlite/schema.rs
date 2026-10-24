@@ -13,6 +13,8 @@
 //! `concept_maps`, and their child tables (properties, designations, group
 //! elements) — plus `concept_closure` used by `$closure`.
 
+use std::collections::{HashMap, VecDeque};
+
 /// SQL DDL for the HTS SQLite schema.
 ///
 /// All statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
@@ -322,11 +324,17 @@ pub fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
 /// per row.  Without this, autocommit INSERTs on EBS-backed CI storage
 /// (~1 500 IOPS) would take ~7 hours for SNOMED.
 pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> rusqlite::Result<()> {
-    use std::collections::{HashMap, VecDeque};
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    build_concept_closure_in_transaction(&tx, system_id)?;
+    tx.commit()
+}
 
-    // Load all concept codes for this system (reads run outside the write
-    // transaction — cheap on WAL, and avoids holding an exclusive lock while
-    // we build the in-memory graph).
+/// Build closure within the caller's transaction, including uncommitted concepts.
+pub(crate) fn build_concept_closure_in_transaction(
+    conn: &rusqlite::Connection,
+    system_id: &str,
+) -> rusqlite::Result<()> {
+    // Read concepts and hierarchy from the same transaction snapshot.
     let concepts: Vec<String> = {
         let mut stmt = conn.prepare_cached("SELECT code FROM concepts WHERE system_id = ?1")?;
         stmt.query_map(rusqlite::params![system_id], |r| r.get::<_, String>(0))?
@@ -368,60 +376,49 @@ pub fn build_concept_closure(conn: &rusqlite::Connection, system_id: &str) -> ru
         }
     }
 
-    // All data is now in memory. Open an exclusive write transaction so all
-    // BFS inserts commit in one WAL write instead of one fsync per row.
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let write_result: rusqlite::Result<()> = (|| {
-        conn.execute(
-            "DELETE FROM concept_closure WHERE system_id = ?1",
-            rusqlite::params![system_id],
-        )?;
+    // The caller owns the transaction covering all BFS inserts.
+    conn.execute(
+        "DELETE FROM concept_closure WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    )?;
 
-        // BFS from every concept to enumerate all its descendants (including self).
-        // A u32 generation counter replaces a boolean visited array: the generation
-        // for BFS from concept at index anc_idx is anc_idx+1, which is always
-        // distinct from all previous and future BFS generations.
-        let mut visit_gen: Vec<u32> = vec![0; concepts.len()];
-        let mut queue: VecDeque<usize> = VecDeque::new();
+    // BFS from every concept to enumerate all its descendants (including self).
+    // A u32 generation counter replaces a boolean visited array: the generation
+    // for BFS from concept at index anc_idx is anc_idx+1, which is always
+    // distinct from all previous and future BFS generations.
+    let mut visit_gen: Vec<u32> = vec![0; concepts.len()];
+    let mut queue: VecDeque<usize> = VecDeque::new();
 
-        let mut insert_stmt = conn.prepare_cached(
-            "INSERT INTO concept_closure (system_id, ancestor_code, descendant_code)
-             VALUES (?1, ?2, ?3)",
-        )?;
+    let mut insert_stmt = conn.prepare_cached(
+        "INSERT INTO concept_closure (system_id, ancestor_code, descendant_code)
+         VALUES (?1, ?2, ?3)",
+    )?;
 
-        for anc_idx in 0..concepts.len() {
-            let g = (anc_idx as u32) + 1;
+    for anc_idx in 0..concepts.len() {
+        let g = (anc_idx as u32) + 1;
 
-            queue.clear();
-            queue.push_back(anc_idx);
+        queue.clear();
+        queue.push_back(anc_idx);
 
-            while let Some(idx) = queue.pop_front() {
-                if visit_gen[idx] == g {
-                    continue;
-                }
-                visit_gen[idx] = g;
+        while let Some(idx) = queue.pop_front() {
+            if visit_gen[idx] == g {
+                continue;
+            }
+            visit_gen[idx] = g;
 
-                insert_stmt.execute(rusqlite::params![
-                    system_id,
-                    &concepts[anc_idx],
-                    &concepts[idx],
-                ])?;
+            insert_stmt.execute(rusqlite::params![
+                system_id,
+                &concepts[anc_idx],
+                &concepts[idx],
+            ])?;
 
-                for &ci in &children[idx] {
-                    if visit_gen[ci] != g {
-                        queue.push_back(ci);
-                    }
+            for &ci in &children[idx] {
+                if visit_gen[ci] != g {
+                    queue.push_back(ci);
                 }
             }
         }
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
-        return write_result;
     }
-    conn.execute_batch("COMMIT")?;
     Ok(())
 }
 

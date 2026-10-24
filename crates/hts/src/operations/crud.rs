@@ -3,44 +3,35 @@
 //! Handlers for GET / POST / PUT / DELETE on CodeSystem, ValueSet, and
 //! ConceptMap resources.
 //!
-//! Raw FHIR JSON is stored and versioned via `helios-persistence`
-//! (`SqliteBackend`).  The HTS normalized terminology tables
+//! Raw FHIR JSON is stored and versioned via `helios-persistence`.
+//! The HTS normalized terminology tables
 //! (code_systems, concepts, value_sets, …) are kept in sync by the same
 //! import / delete helpers used by the `POST /import` pipeline.
 //!
 //! # ETag / versioning
 //!
-//! Every stored resource carries a `version_id` (starting at `"1"`, monotonically
-//! increasing).  GET responses include an `ETag: W/"<version_id>"` header.
+//! Persistence-managed resources carry a `version_id` and an `ETag` header.
+//! Imported-only reads have no ETag until a write establishes real history.
 //! PUT requests may include an `If-Match` header; when present, the handler
 //! returns **412 Precondition Failed** if the version no longer matches.
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod inner {
+    use crate::backends::resource_identity::ResourceKind;
+    use crate::operations::crud_transaction::{self, CrudTransaction, storage_error};
     use axum::{
         Json,
         extract::{Path, RawQuery, State},
         http::{HeaderMap, HeaderValue, StatusCode, header},
         response::{IntoResponse, Response},
     };
-    use helios_fhir::FhirVersion;
     use helios_persistence::tenant::TenantContext;
+    use helios_persistence::types::StoredResource;
     use serde_json::Value;
 
     use crate::error::HtsError;
     use crate::state::AppState;
     use crate::traits::TerminologyBackend;
-
-    #[cfg(feature = "sqlite")]
-    use crate::import::ImportStats;
-    #[cfg(feature = "sqlite")]
-    use crate::import::fhir_bundle::{
-        delete_code_system as hts_delete_cs, delete_concept_map as hts_delete_cm,
-        delete_value_set as hts_delete_vs, get_code_system_url as hts_get_cs_url,
-        import_code_system as hts_import_cs, import_concept_map as hts_import_cm,
-        import_value_set as hts_import_vs,
-        invalidate_expansion_cache_for_system as hts_invalidate_expansion_cache,
-    };
 
     use super::super::format::{ResponseFormat, fhir_respond, negotiate_format};
 
@@ -48,18 +39,6 @@ mod inner {
 
     fn ctx() -> TenantContext {
         TenantContext::system()
-    }
-
-    // ── Error helpers ──────────────────────────────────────────────────────────
-
-    /// Returns `true` if the storage error represents a resource that is
-    /// deleted (Gone) or never existed (NotFound).  Both cases map to HTTP 404.
-    fn is_gone_or_not_found(e: &helios_persistence::StorageError) -> bool {
-        use helios_persistence::error::{ResourceError, StorageError as SE};
-        matches!(
-            e,
-            SE::Resource(ResourceError::Gone { .. }) | SE::Resource(ResourceError::NotFound { .. })
-        )
     }
 
     // ── Cache invalidation seam ───────────────────────────────────────────────
@@ -89,7 +68,8 @@ mod inner {
     ///
     /// # Ordering
     ///
-    /// Callers evict *after* the storage write, never before. Evicting first
+    /// Callers evict after the shared transaction settles, never before.
+    /// Evicting first
     /// leaves a window in which a concurrent reader repopulates from pre-write
     /// state and that entry never expires. Evicting afterwards still leaves a
     /// narrow race — a reader that began its query before the write commits may
@@ -102,374 +82,230 @@ mod inner {
         state.backend().invalidate_caches();
     }
 
-    // ── HTS re-index helper (generic / async path) ────────────────────────────
-
-    /// Wrap `content` in a synthetic single-resource Bundle and call
-    /// `importer.import_bundle()` to (re-)index it into the HTS normalized tables.
-    ///
-    /// Used by the PostgreSQL CRUD path in place of the SQLite-specific `hts_pool`
-    /// spawn-blocking approach.
-    async fn hts_reindex_via_importer(
-        importer: &dyn crate::import::BundleImportBackend,
-        resource_type: &str,
-        content: Value,
-        ctx: &TenantContext,
-    ) -> Result<(), HtsError> {
-        if !matches!(resource_type, "CodeSystem" | "ValueSet" | "ConceptMap") {
-            return Err(HtsError::InvalidRequest(format!(
-                "Unsupported resource type for CRUD: {resource_type}"
-            )));
+    /// Settle the transaction explicitly. No raw resource, history entry or
+    /// normalized row is committed when any step of a CRUD request fails.
+    async fn finish<T>(
+        transaction: Box<dyn CrudTransaction>,
+        result: Result<T, HtsError>,
+    ) -> Result<T, HtsError> {
+        match result {
+            Ok(value) => {
+                transaction.commit().await.map_err(storage_error)?;
+                Ok(value)
+            }
+            Err(error) => {
+                transaction.rollback().await.map_err(|rollback| {
+                    HtsError::StorageError(format!("{error}; rollback failed: {rollback}"))
+                })?;
+                Err(error)
+            }
         }
-        let bundle = serde_json::json!({
-            "resourceType": "Bundle",
-            "type": "collection",
-            "entry": [{"resource": content}]
-        });
-        let bytes =
-            serde_json::to_vec(&bundle).expect("in-memory bundle serialization cannot fail");
-        importer
-            .import_bundle(ctx, &bytes)
-            .await
-            .map_err(|e| HtsError::StorageError(format!("HTS re-index failed: {e}")))?;
-        Ok(())
     }
 
-    /// (Re-)index `content` into the HTS normalized tables.
-    ///
-    /// Shared by create and update so both verbs cannot drift apart again.
-    /// `replace_id`, when supplied, names an existing resource whose normalized
-    /// rows are removed first — the update path, where the new content may have
-    /// *dropped* concepts that an upsert alone would leave behind.
-    ///
-    /// Two backend paths, matching how the state was wired:
-    ///
-    /// - SQLite: writes through `hts_pool` on a blocking thread, because
-    ///   `rusqlite` is synchronous.
-    /// - Everything else (PostgreSQL): wraps `content` in a one-entry Bundle and
-    ///   hands it to the async importer.
-    ///
-    /// This function does **not** evict caches — callers do that through
-    /// [`evict_caches_after_write`] on every exit path, including this one
-    /// failing. That split is deliberate: the SQLite update path deletes the old
-    /// normalized rows before re-importing, so a failure part-way through leaves
-    /// storage genuinely changed, and caches must be dropped anyway. The
-    /// invariant is that a cache may be colder than storage, never hotter.
-    // `replace_id` is consumed only by the SQLite delete-then-reimport branch;
-    // a postgres-only build would otherwise trip `unused_variables` under the
-    // workspace's deny-warnings clippy job.
-    #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
-    async fn hts_reindex<B: TerminologyBackend>(
-        state: &AppState<B>,
-        resource_type: &'static str,
-        content: Value,
-        ctx: &TenantContext,
-        replace_id: Option<String>,
-    ) -> Result<(), HtsError> {
-        #[cfg(feature = "sqlite")]
-        if let Some(pool) = state.hts_pool.clone() {
-            let joined = tokio::task::spawn_blocking(move || {
-                let conn = pool
-                    .get()
-                    .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
-
-                // Update path: drop the old normalized rows first (ON DELETE
-                // CASCADE propagates to concepts, designations, properties and
-                // hierarchy). For a CodeSystem, also evict the persistent
-                // expansion cache rows derived from it — those are DB state, not
-                // process memory, so no amount of in-process eviction covers them.
-                if let Some(ref resource_id) = replace_id {
-                    match resource_type {
-                        "CodeSystem" => {
-                            if let Some(url) = hts_get_cs_url(&conn, resource_id)? {
-                                hts_invalidate_expansion_cache(&conn, &url)?;
-                            }
-                            hts_delete_cs(&conn, resource_id)?;
-                        }
-                        "ValueSet" => hts_delete_vs(&conn, resource_id)?,
-                        "ConceptMap" => hts_delete_cm(&conn, resource_id)?,
-                        _ => {}
-                    }
-                }
-
-                let mut stats = ImportStats::default();
-                match resource_type {
-                    "CodeSystem" => hts_import_cs(&conn, &content, &mut stats),
-                    "ValueSet" => hts_import_vs(&conn, &content, &mut stats),
-                    "ConceptMap" => hts_import_cm(&conn, &content, &mut stats),
-                    _ => Err(HtsError::InvalidRequest(format!(
-                        "Unsupported resource type for CRUD: {resource_type}"
-                    ))),
-                }
-            })
-            .await
-            .map_err(|e| HtsError::Internal(e.to_string()))?;
-            return joined;
-        }
-
-        // PostgreSQL: `import_bundle` upserts by URL, so no explicit delete is
-        // needed for the update path.
-        if let Some(importer) = state.terminology_importer.clone() {
-            return hts_reindex_via_importer(&*importer, resource_type, content, ctx).await;
-        }
-
-        Ok(())
+    fn resource_kind(resource_type: &str) -> Result<ResourceKind, HtsError> {
+        ResourceKind::from_resource_type(resource_type).ok_or_else(|| {
+            HtsError::InvalidRequest(format!("Unsupported resource type: {resource_type}"))
+        })
     }
 
-    // ── Generic CRUD helpers ───────────────────────────────────────────────────
+    /// Imported resources become persistence-managed only inside the write
+    /// transaction. Their original content is version 1; the actual update or
+    /// delete follows through the normal persistence API in that transaction.
+    async fn current_resource(
+        transaction: &mut dyn CrudTransaction,
+        kind: ResourceKind,
+        id: &str,
+        if_match: Option<&str>,
+    ) -> Result<StoredResource, HtsError> {
+        let resource_type = kind.resource_type();
+        if let Some(current) = transaction
+            .read(resource_type, id)
+            .await
+            .map_err(storage_error)?
+        {
+            if let Some(etag) = if_match
+                && !current.matches_etag(etag)
+            {
+                return Err(HtsError::PreconditionFailed(format!(
+                    "ETag mismatch: supplied {etag}, current {}",
+                    current.etag()
+                )));
+            }
+            return Ok(current);
+        }
+        let content = transaction
+            .normalized_resource(kind, id)
+            .await?
+            .ok_or_else(|| HtsError::NotFound(format!("{resource_type}/{id}")))?;
+        if if_match.is_some() {
+            return Err(HtsError::PreconditionFailed(
+                "Imported resource has no persisted ETag; read \
+                 it and update without If-Match to establish history"
+                    .into(),
+            ));
+        }
+        transaction
+            .create(resource_type, content)
+            .await
+            .map_err(storage_error)
+    }
 
-    /// POST /<ResourceType> — create a new resource.
-    ///
-    /// 1. Stores raw JSON in `helios-persistence` (auto-generates version / ETag).
-    /// 2. Indexes the stored content into the HTS normalized tables.
-    /// 3. Evicts every cache derived from terminology content.
-    /// 4. Returns **201 Created** with `Location` and `ETag` headers.
-    ///
-    /// Step 3 is not optional: creating a resource has to un-cache the *absence*
-    /// recorded for its URL by any earlier `$expand` / `$lookup` that 404'd, or
-    /// the server keeps denying that a resource it just returned `201` for
-    /// exists (issue #304).
+    /// Create raw content and normalized terminology in one transaction.
     async fn create_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
-        body: Value,
+        mut body: Value,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        let store = state
-            .active_resource_store()
-            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
-
-        let ctx = ctx();
-
-        // 1. Persist raw FHIR JSON (version_id = "1", ETag = W/"1").
-        let stored = store
-            .create(&ctx, resource_type, body, FhirVersion::default_enabled())
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-        // 2. Index into HTS normalized tables using the canonical content
-        //    (persistence layer injects the correct `id` into the JSON).
-        let reindexed =
-            hts_reindex(&state, resource_type, stored.content().clone(), &ctx, None).await;
-
-        // 3. Evict regardless of whether the re-index succeeded: the resource is
-        //    already in the resource store, so any cached "does not exist" answer
-        //    is wrong either way.
+        crate::import::parse_crud_resource(resource_type, &body)?;
+        let kind = resource_kind(resource_type)?;
+        let id = body
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(helios_persistence::types::new_resource_id);
+        body["id"] = Value::String(id.clone());
+        let mut transaction = crud_transaction::begin(&state, kind, &id).await?;
+        let result = async {
+            transaction.prepare(kind, &id, Some(&body)).await?;
+            if let Some(id) = body.get("id").and_then(Value::as_str)
+                && transaction.normalized_resource(kind, id).await?.is_some()
+            {
+                return Err(HtsError::InvalidRequest(format!(
+                    "{resource_type}/{id} already exists"
+                )));
+            }
+            let stored = transaction
+                .create(resource_type, body)
+                .await
+                .map_err(storage_error)?;
+            transaction
+                .normalize(kind, stored.content().clone(), false)
+                .await?;
+            Ok(stored)
+        }
+        .await;
+        let result = finish(transaction, result).await;
         evict_caches_after_write(&state);
-        reindexed?;
-
-        let etag = stored.etag().to_string();
-        let location = format!("/{}/{}", resource_type, stored.id());
-
+        let stored = result?;
         let mut response = fhir_respond(stored.content().clone(), format);
         *response.status_mut() = StatusCode::CREATED;
-        let headers = response.headers_mut();
-        if let Ok(v) = HeaderValue::from_str(&location) {
-            headers.insert(header::LOCATION, v);
+        if let Ok(value) = HeaderValue::from_str(&format!("/{resource_type}/{}", stored.id())) {
+            response.headers_mut().insert(header::LOCATION, value);
         }
-        if let Ok(v) = HeaderValue::from_str(&etag) {
-            headers.insert(header::ETAG, v);
+        if let Ok(value) = HeaderValue::from_str(stored.etag()) {
+            response.headers_mut().insert(header::ETAG, value);
         }
         Ok(response)
     }
 
     /// GET /<ResourceType>/:id — read stored FHIR JSON.
     ///
-    /// Returns **200 OK** with `ETag` header, or **404 Not Found** if the
-    /// resource does not exist or has been deleted.
+    /// Returns **200 OK**, with an `ETag` for persistence-managed resources,
+    /// or **404 Not Found** if absent or deleted.
     async fn read_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        let store = state
-            .active_resource_store()
-            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
-        let ctx = ctx();
-
-        match store.read(&ctx, resource_type, &id).await {
-            Ok(Some(resource)) if !resource.is_deleted() => {
-                let etag = resource.etag().to_string();
-                let mut response = fhir_respond(resource.content().clone(), format);
-                if let Ok(v) = HeaderValue::from_str(&etag) {
-                    response.headers_mut().insert(header::ETAG, v);
+        if let Some(store) = state.active_resource_store() {
+            match store.read(&ctx(), resource_type, &id).await {
+                Ok(Some(resource)) if !resource.is_deleted() => {
+                    let etag = resource.etag().to_string();
+                    let mut response = fhir_respond(resource.content().clone(), format);
+                    if let Ok(value) = HeaderValue::from_str(&etag) {
+                        response.headers_mut().insert(header::ETAG, value);
+                    }
+                    return Ok(response);
                 }
-                Ok(response)
+                Ok(Some(_)) => return Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
+                Ok(None) => {}
+                // A tombstone is authoritative. Never resurrect it from imports.
+                Err(helios_persistence::StorageError::Resource(
+                    helios_persistence::error::ResourceError::Gone { .. },
+                )) => return Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
+                Err(helios_persistence::StorageError::Resource(
+                    helios_persistence::error::ResourceError::NotFound { .. },
+                )) => {}
+                Err(error) => return Err(HtsError::StorageError(error.to_string())),
             }
-            Ok(Some(_)) | Ok(None) => Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
-            // The persistence layer returns Gone for soft-deleted resources;
-            // from the caller's perspective that is still a 404.
-            Err(e) if is_gone_or_not_found(&e) => {
-                Err(HtsError::NotFound(format!("{resource_type}/{id}")))
-            }
-            Err(e) => Err(HtsError::StorageError(e.to_string())),
         }
+        state
+            .backend()
+            .resource_by_id(resource_type, &id)?
+            .map(|resource| fhir_respond(resource, format))
+            .ok_or_else(|| HtsError::NotFound(format!("{resource_type}/{id}")))
     }
 
-    /// PUT /<ResourceType>/:id — update an existing resource.
-    ///
-    /// If the `If-Match` header is present it must match the current ETag;
-    /// a mismatch returns **412 Precondition Failed**.
-    ///
-    /// On success:
-    /// 1. Updates raw JSON in `helios-persistence` (version_id incremented).
-    /// 2. Deletes old HTS normalized data and re-imports the new content.
-    /// 3. Evicts every cache derived from terminology content.
-    /// 4. Returns **200 OK** with the updated `ETag`.
-    ///
-    /// Step 3 is not optional: without it a `PUT` is indexed into storage and
-    /// then shadowed by pre-update bytes held in the handler-level `$expand` /
-    /// `$lookup` / `$validate-code` caches and the backend's own response memos
-    /// (issue #304).
+    /// Replace an existing resource atomically, including history, terminology
+    /// rows and derived closure data. A never-used ID remains a 404.
     async fn update_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
         if_match: Option<String>,
-        body: Value,
+        mut body: Value,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        let store = state
-            .active_resource_store()
-            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
-
-        let ctx = ctx();
-
-        // 1. Read current version.
-        let current = match store.read(&ctx, resource_type, &id).await {
-            Ok(Some(r)) if !r.is_deleted() => r,
-            Ok(_) => return Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
-            Err(e) if is_gone_or_not_found(&e) => {
-                return Err(HtsError::NotFound(format!("{resource_type}/{id}")));
-            }
-            Err(e) => return Err(HtsError::StorageError(e.to_string())),
-        };
-
-        // 2. Check If-Match (optimistic concurrency).
-        if let Some(ref etag) = if_match {
-            if !current.matches_etag(etag) {
-                return Err(HtsError::PreconditionFailed(format!(
-                    "ETag mismatch: supplied {etag}, current {}",
-                    current.etag()
-                )));
-            }
+        if let Some(body_id) = body.get("id")
+            && body_id.as_str() != Some(id.as_str())
+        {
+            return Err(HtsError::InvalidRequest(
+                "Body id must match the request URL".into(),
+            ));
         }
-
-        // 3. Update raw JSON in persistence store (version incremented).
-        let updated = store
-            .update(&ctx, &current, body)
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-        // 4. Re-index normalized HTS tables, replacing the previous rows.
-        let reindexed = hts_reindex(
-            &state,
-            resource_type,
-            updated.content().clone(),
-            &ctx,
-            Some(updated.id().to_string()),
-        )
+        body.as_object_mut()
+            .ok_or_else(|| HtsError::InvalidRequest("Resource must be a JSON object".into()))?
+            .insert("id".into(), Value::String(id.clone()));
+        crate::import::parse_crud_resource(resource_type, &body)?;
+        let kind = resource_kind(resource_type)?;
+        let mut transaction = crud_transaction::begin(&state, kind, &id).await?;
+        let result = async {
+            transaction.prepare(kind, &id, Some(&body)).await?;
+            let current =
+                current_resource(&mut *transaction, kind, &id, if_match.as_deref()).await?;
+            let updated = transaction
+                .update(&current, body)
+                .await
+                .map_err(storage_error)?;
+            transaction
+                .normalize(kind, updated.content().clone(), true)
+                .await?;
+            Ok(updated)
+        }
         .await;
-
-        // 5. Evict regardless of the re-index outcome. The SQLite path deletes
-        //    the old normalized rows before re-importing, so a failure in
-        //    between leaves storage changed and every cached answer stale.
+        let result = finish(transaction, result).await;
         evict_caches_after_write(&state);
-        reindexed?;
-
-        let etag = updated.etag().to_string();
+        let updated = result?;
         let mut response = fhir_respond(updated.content().clone(), format);
-        if let Ok(v) = HeaderValue::from_str(&etag) {
-            response.headers_mut().insert(header::ETAG, v);
+        if let Ok(value) = HeaderValue::from_str(updated.etag()) {
+            response.headers_mut().insert(header::ETAG, value);
         }
         Ok(response)
     }
 
-    /// DELETE /<ResourceType>/:id — soft-delete a resource.
-    ///
-    /// 1. Reads the current resource to extract its canonical URL (needed for
-    ///    HTS normalized-table cleanup).
-    /// 2. Soft-deletes the raw JSON in `helios-persistence`.
-    /// 3. Removes the resource's rows from HTS normalized tables:
-    ///    - SQLite path: via `hts_pool` spawn-blocking helpers.
-    ///    - PostgreSQL path: via `terminology_importer.delete_normalized()`.
-    /// 4. Returns **204 No Content**.
+    /// Delete the resource and its exact normalized identity in one transaction.
     async fn delete_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
     ) -> Result<Response, HtsError> {
-        let store = state
-            .active_resource_store()
-            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
-
-        #[cfg(feature = "sqlite")]
-        let hts_pool = state.hts_pool.clone();
-        let terminology_importer = state.terminology_importer.clone();
-        let ctx = ctx();
-
-        // 1. Read the resource URL before deleting (needed by both HTS cleanup paths).
-        let resource_url: Option<String> = match store.read(&ctx, resource_type, &id).await {
-            Ok(Some(r)) if !r.is_deleted() => r
-                .content()
-                .get("url")
-                .and_then(|u| u.as_str())
-                .map(str::to_owned),
-            _ => None,
-        };
-
-        // 2. Soft-delete in persistence store.
-        store
-            .delete(&ctx, resource_type, &id)
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-        // 3. Delete from HTS normalized tables.
-        #[allow(unused_mut, unused_assignments)]
-        let mut removed: Result<(), HtsError> = Ok(());
-
-        #[cfg(feature = "sqlite")]
-        if let Some(pool) = hts_pool {
-            let resource_id = id.clone();
-            removed = tokio::task::spawn_blocking(move || {
-                let conn = pool
-                    .get()
-                    .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
-                match resource_type {
-                    "CodeSystem" => {
-                        if let Some(url) = hts_get_cs_url(&conn, &resource_id)? {
-                            hts_invalidate_expansion_cache(&conn, &url)?;
-                        }
-                        hts_delete_cs(&conn, &resource_id)
-                    }
-                    "ValueSet" => hts_delete_vs(&conn, &resource_id),
-                    "ConceptMap" => hts_delete_cm(&conn, &resource_id),
-                    _ => Ok(()),
-                }
-            })
-            .await
-            .map_err(|e| HtsError::Internal(e.to_string()))?;
-        } else if let (Some(importer), Some(url)) =
-            (terminology_importer.as_deref(), resource_url.as_deref())
-        {
-            removed = importer.delete_normalized(resource_type, url).await;
+        let kind = resource_kind(resource_type)?;
+        let mut transaction = crud_transaction::begin(&state, kind, &id).await?;
+        let result = async {
+            transaction.prepare(kind, &id, None).await?;
+            current_resource(&mut *transaction, kind, &id, None).await?;
+            transaction
+                .delete(resource_type, &id)
+                .await
+                .map_err(storage_error)?;
+            transaction.remove_normalized(kind, &id).await
         }
-
-        #[cfg(not(feature = "sqlite"))]
-        if let (Some(importer), Some(url)) =
-            (terminology_importer.as_deref(), resource_url.as_deref())
-        {
-            removed = importer.delete_normalized(resource_type, url).await;
-        }
-
-        // Evict both cache tiers so a deleted ValueSet (and any CodeSystem whose
-        // concepts would otherwise linger in a cached expansion or response memo)
-        // stops being served from memory. Runs even when the normalized delete
-        // failed — the resource is already soft-deleted in the resource store, so
-        // holding on to cached answers about it is wrong either way.
+        .await;
+        let result = finish(transaction, result).await;
         evict_caches_after_write(&state);
-        removed?;
-
+        result?;
         Ok(StatusCode::NO_CONTENT.into_response())
     }
 
@@ -653,6 +489,7 @@ mod tests {
         routing::{delete, get, post, put},
     };
     use serde_json::{Value, json};
+    use tempfile::TempDir;
     use tower::ServiceExt;
 
     use helios_persistence::backends::sqlite::SqliteBackend;
@@ -664,23 +501,22 @@ mod tests {
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    fn make_state() -> AppState<SqliteTerminologyBackend> {
-        let backend = SqliteTerminologyBackend::in_memory().expect("HTS in-memory backend");
-        let hts_pool = backend.pool().clone();
-
-        let resource_store = SqliteBackend::in_memory().expect("persistence in-memory backend");
+    fn make_state() -> (TempDir, AppState<SqliteTerminologyBackend>) {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let path = directory.path().join("crud.db");
+        let resource_store = SqliteBackend::open(&path).expect("open persistence store");
         resource_store
             .init_schema()
             .expect("init persistence schema");
-
-        AppState::new(backend)
-            .with_resource_store(resource_store)
-            .with_hts_pool(hts_pool)
+        let backend = SqliteTerminologyBackend::new(path.to_str().expect("UTF-8 database path"))
+            .expect("open terminology store");
+        let state = AppState::new(backend).with_resource_store(resource_store);
+        (directory, state)
     }
 
-    fn code_system_router() -> Router {
-        let state = make_state();
-        Router::new()
+    fn code_system_router() -> (TempDir, Router) {
+        let (directory, state) = make_state();
+        let router = Router::new()
             .route(
                 "/CodeSystem",
                 post(create_code_system::<SqliteTerminologyBackend>),
@@ -697,12 +533,13 @@ mod tests {
                 "/CodeSystem/{id}",
                 delete(delete_code_system::<SqliteTerminologyBackend>),
             )
-            .with_state(state)
+            .with_state(state);
+        (directory, router)
     }
 
-    fn value_set_router() -> Router {
-        let state = make_state();
-        Router::new()
+    fn value_set_router() -> (TempDir, Router) {
+        let (directory, state) = make_state();
+        let router = Router::new()
             .route(
                 "/ValueSet",
                 post(create_value_set::<SqliteTerminologyBackend>),
@@ -719,12 +556,13 @@ mod tests {
                 "/ValueSet/{id}",
                 delete(delete_value_set::<SqliteTerminologyBackend>),
             )
-            .with_state(state)
+            .with_state(state);
+        (directory, router)
     }
 
-    fn concept_map_router() -> Router {
-        let state = make_state();
-        Router::new()
+    fn concept_map_router() -> (TempDir, Router) {
+        let (directory, state) = make_state();
+        let router = Router::new()
             .route(
                 "/ConceptMap",
                 post(create_concept_map::<SqliteTerminologyBackend>),
@@ -741,7 +579,8 @@ mod tests {
                 "/ConceptMap/{id}",
                 delete(delete_concept_map::<SqliteTerminologyBackend>),
             )
-            .with_state(state)
+            .with_state(state);
+        (directory, router)
     }
 
     fn cs_body(id: &str) -> Value {
@@ -920,7 +759,7 @@ mod tests {
     /// that set.
     #[tokio::test]
     async fn create_value_set_evicts_the_expand_negative_cache() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         // A CodeSystem to include, so the post-create expansion is non-empty.
@@ -990,7 +829,7 @@ mod tests {
     /// update adds — the `$lookup` twin of the `$expand` negative cache.
     #[tokio::test]
     async fn update_code_system_evicts_the_lookup_negative_cache() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         assert_eq!(
@@ -1051,12 +890,12 @@ mod tests {
     /// the handler recompute, and the recomputation is then served straight back
     /// from `SqliteTerminologyBackend::lookup_response_cache`, whose key
     /// (`system|code|version|lang|date|props`) is unchanged by a display edit.
-    /// The SQLite CRUD path writes through `hts_pool` and never reaches
-    /// `BundleImportBackend::import_bundle`, so before this fix nothing on any
-    /// CRUD verb cleared that memo. A Tier-1-only fix leaves this test red.
+    /// CRUD normalizes within the persistence transaction and does not call
+    /// `BundleImportBackend::import_bundle`. It must therefore invalidate the
+    /// backend memo explicitly as well as the handler-level cache.
     #[tokio::test]
     async fn update_code_system_evicts_the_backend_response_memo() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         assert_eq!(
@@ -1120,7 +959,7 @@ mod tests {
     /// this because its ValueSet fixtures carry no `version`.
     #[tokio::test]
     async fn deleting_a_versioned_value_set_stops_it_expanding() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         assert_eq!(
@@ -1174,7 +1013,7 @@ mod tests {
     /// behaviour rather than either mechanism.
     #[tokio::test]
     async fn updating_a_value_set_refreshes_its_expansion() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         let system = "http://example.org/cs/cs-upd";
@@ -1226,7 +1065,7 @@ mod tests {
 
     #[tokio::test]
     async fn cs_create_returns_201_with_etag() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1246,7 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn cs_read_after_create_returns_200() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
         // POST
         let post_resp = app
             .clone()
@@ -1290,7 +1129,7 @@ mod tests {
 
     #[tokio::test]
     async fn cs_get_nonexistent_returns_404() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1306,7 +1145,7 @@ mod tests {
 
     #[tokio::test]
     async fn cs_full_crud_round_trip() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
 
         // 1. POST → 201
         let post_resp = app
@@ -1423,7 +1262,7 @@ mod tests {
 
     #[tokio::test]
     async fn cs_put_with_wrong_etag_returns_412() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
 
         // POST first
         app.clone()
@@ -1456,13 +1295,8 @@ mod tests {
 
     #[tokio::test]
     async fn cs_create_indexes_into_hts_tables() {
-        let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let hts_pool = backend.pool().clone();
-        let resource_store = SqliteBackend::in_memory().unwrap();
-        resource_store.init_schema().unwrap();
-        let state = AppState::new(backend)
-            .with_resource_store(resource_store)
-            .with_hts_pool(hts_pool.clone());
+        let (_directory, state) = make_state();
+        let hts_pool = state.backend().pool().clone();
 
         let app = Router::new()
             .route(
@@ -1511,13 +1345,8 @@ mod tests {
 
     #[tokio::test]
     async fn cs_delete_removes_hts_normalized_rows() {
-        let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let hts_pool = backend.pool().clone();
-        let resource_store = SqliteBackend::in_memory().unwrap();
-        resource_store.init_schema().unwrap();
-        let state = AppState::new(backend)
-            .with_resource_store(resource_store)
-            .with_hts_pool(hts_pool.clone());
+        let (_directory, state) = make_state();
+        let hts_pool = state.backend().pool().clone();
 
         let app = Router::new()
             .route(
@@ -1583,7 +1412,7 @@ mod tests {
 
     #[tokio::test]
     async fn vs_full_crud_round_trip() {
-        let app = value_set_router();
+        let (_directory, app) = value_set_router();
 
         // POST → 201
         let post_resp = app
@@ -1646,7 +1475,7 @@ mod tests {
 
     #[tokio::test]
     async fn cm_full_crud_round_trip() {
-        let app = concept_map_router();
+        let (_directory, app) = concept_map_router();
 
         // POST → 201
         let post_resp = app
@@ -1713,14 +1542,7 @@ mod tests {
         use crate::types::LookupRequest;
         use helios_persistence::tenant::TenantContext;
 
-        let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let hts_pool = backend.pool().clone();
-        let resource_store = SqliteBackend::in_memory().unwrap();
-        resource_store.init_schema().unwrap();
-
-        let state = AppState::new(backend)
-            .with_resource_store(resource_store)
-            .with_hts_pool(hts_pool);
+        let (_directory, state) = make_state();
 
         let app = Router::new()
             .route(

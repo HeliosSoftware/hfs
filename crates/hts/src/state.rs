@@ -3,8 +3,8 @@
 //! The [`AppState`] struct is generic over the concrete [`TerminologyBackend`]
 //! implementation so that the SQLite and PostgreSQL paths can reuse the same
 //! handler bodies.  It also carries the raw FHIR resource store used by CRUD
-//! handlers and the asynchronous re-index hook (`terminology_importer`)
-//! triggered after create/update operations.
+//! handlers. CRUD commits the raw resource, history, and normalized terminology
+//! through one backend transaction.
 //!
 //! [`TerminologyBackend`]: crate::traits::TerminologyBackend
 
@@ -12,20 +12,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use crate::traits::TerminologyBackend;
 use bytes::Bytes;
 use helios_persistence::ResourceStorage;
 #[cfg(feature = "postgres")]
 use helios_persistence::backends::postgres::PostgresBackend;
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
-#[cfg(feature = "sqlite")]
-use r2d2::Pool;
-#[cfg(feature = "sqlite")]
-use r2d2_sqlite::SqliteConnectionManager;
-
-use crate::error::HtsError;
-use crate::import::BundleImportBackend;
-use crate::traits::TerminologyBackend;
 
 /// Key for the in-process `$expand` result cache.
 ///
@@ -35,6 +28,8 @@ use crate::traits::TerminologyBackend;
 /// bytes every iteration).
 #[derive(Hash, Eq, PartialEq, Clone)]
 pub struct ExpandCacheKey {
+    /// Exact instance selection, distinct from canonical latest-version lookup.
+    pub selected_value_set_id: Option<String>,
     /// Canonical ValueSet URL, or compact JSON of the inline `valueSet` body.
     pub url_or_body: String,
     /// Text filter (`""` when absent).
@@ -144,17 +139,10 @@ pub const LOOKUP_HANDLER_CACHE_MAX: usize = 16384;
 ///
 /// ## CRUD storage fields
 ///
-/// - **SQLite path**: `resource_store` (SQLite persistence) + `hts_pool` (SQLite
-///   re-index pool) are set via [`Self::with_resource_store`] /
-///   [`Self::with_hts_pool`].
-/// - **PostgreSQL path**: `resource_store_pg` (persistence) + `terminology_importer`
-///   (async re-index via `BundleImportBackend`) are set via the
-///   `with_resource_store_pg` / [`Self::with_terminology_importer`]
-///   methods.  (`with_resource_store_pg` is only available with the `postgres`
-///   feature enabled.)
-///
-/// CRUD handlers check the SQLite fields first (backward compat) and fall back
-/// to the generic fields for the PostgreSQL backend.
+/// Attach the persistence backend that shares the terminology database via
+/// `with_resource_store` (SQLite) or `with_resource_store_pg` (PostgreSQL).
+/// CRUD handlers use that store's transaction for both raw resources and
+/// normalized terminology, so a failed write cannot leave them inconsistent.
 #[derive(Clone)]
 pub struct AppState<B: TerminologyBackend> {
     /// The backing terminology store.
@@ -164,18 +152,9 @@ pub struct AppState<B: TerminologyBackend> {
     #[cfg(feature = "sqlite")]
     pub resource_store: Option<Arc<SqliteBackend>>,
 
-    /// r2d2 pool for HTS normalized-table re-indexing (SQLite path).
-    #[cfg(feature = "sqlite")]
-    pub hts_pool: Option<Arc<Pool<SqliteConnectionManager>>>,
-
     /// Raw FHIR resource store for versioned CRUD (PostgreSQL path).
     #[cfg(feature = "postgres")]
     pub resource_store_pg: Option<Arc<PostgresBackend>>,
-
-    /// Async re-index hook used after create / update operations (PostgreSQL
-    /// path).  Wraps the `PostgresTerminologyBackend` so CRUD handlers can call
-    /// `import_bundle` without knowing the concrete type.
-    pub terminology_importer: Option<Arc<dyn BundleImportBackend>>,
 
     /// Maximum number of codes allowed in a single `$expand` response.
     /// Requests that would exceed this limit receive `HtsError::TooCostly`.
@@ -274,11 +253,8 @@ impl<B: TerminologyBackend> AppState<B> {
             backend: Arc::new(backend),
             #[cfg(feature = "sqlite")]
             resource_store: None,
-            #[cfg(feature = "sqlite")]
-            hts_pool: None,
             #[cfg(feature = "postgres")]
             resource_store_pg: None,
-            terminology_importer: None,
             max_expansion_size: 10_000,
             expand_cache: Arc::new(RwLock::new(HashMap::new())),
             not_found_urls: Arc::new(RwLock::new(HashSet::new())),
@@ -352,13 +328,6 @@ impl<B: TerminologyBackend> AppState<B> {
         self
     }
 
-    /// Attach the HTS r2d2 pool for normalized-table re-indexing during CRUD.
-    #[cfg(feature = "sqlite")]
-    pub fn with_hts_pool(mut self, pool: Pool<SqliteConnectionManager>) -> Self {
-        self.hts_pool = Some(Arc::new(pool));
-        self
-    }
-
     /// Attach a `helios-persistence` PostgreSQL backend for raw FHIR resource storage.
     #[cfg(feature = "postgres")]
     pub fn with_resource_store_pg(mut self, store: PostgresBackend) -> Self {
@@ -366,24 +335,9 @@ impl<B: TerminologyBackend> AppState<B> {
         self
     }
 
-    /// Attach an async re-index hook (e.g. `PostgresTerminologyBackend`) for
-    /// create/update operations.  Used by the PostgreSQL CRUD path.
-    pub fn with_terminology_importer(mut self, importer: Arc<dyn BundleImportBackend>) -> Self {
-        self.terminology_importer = Some(importer);
-        self
-    }
-
     /// Access the terminology backend directly (avoids cloning the `Arc`).
     pub fn backend(&self) -> &B {
         &self.backend
-    }
-
-    /// Clone the HTS pool Arc, returning an error if not initialised.
-    #[cfg(feature = "sqlite")]
-    pub fn require_hts_pool(&self) -> Result<Arc<Pool<SqliteConnectionManager>>, HtsError> {
-        self.hts_pool
-            .clone()
-            .ok_or_else(|| HtsError::Internal("HTS pool not initialized".into()))
     }
 
     /// Return the active raw FHIR resource store, if any.

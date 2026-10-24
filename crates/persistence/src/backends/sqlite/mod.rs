@@ -84,3 +84,5 @@ mod wal;
 
 pub use backend::{SqliteBackend, SqliteBackendConfig};
 pub use wal::WalMaintenance;
+
+pub use transaction::SqliteTransaction;
