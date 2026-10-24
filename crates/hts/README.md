@@ -468,8 +468,81 @@ hts run --storage-backend postgres \
 | search | GET | `/CodeSystem`, `/ValueSet`, `/ConceptMap` |
 | create | POST | `/CodeSystem`, `/ValueSet`, `/ConceptMap` |
 | read | GET | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
+| version read | GET | `/{type}/{id}/_history/{versionId}` |
 | update | PUT | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
 | delete | DELETE | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
+
+POST assigns a new server-generated logical ID, ignoring any submitted `id`.
+PUT requires a body `id` matching the URL. It creates a new ID or restores a
+deleted resource with **201 Created**, and updates a live or imported resource
+with **200 OK**. Restoration continues the existing version history. These
+resources advertise `updateCreate: true` in the CapabilityStatement.
+
+Successful POST and PUT requests return server-managed `meta.versionId` and
+`meta.lastUpdated`, with `ETag` and `Last-Modified` headers. A 201 response also
+includes a version-specific `Location`, such as
+`/CodeSystem/{id}/_history/{versionId}`.
+`If-Match` requires a live persistence-managed resource and a matching ETag;
+absent, deleted, or imported-only resources return **412 Precondition Failed**.
+Canonical ownership checks still apply, so creating or restoring a resource
+cannot overwrite another ID's canonical resource.
+
+Version reads return the exact stored revision, including its `meta`, `ETag`,
+and `Last-Modified`, even after later updates or deletion. Unknown revisions
+return **404 Not Found**; a deletion revision returns **410 Gone**.
+Imported-only resources have no readable persistence revisions until a REST
+write establishes history. The CapabilityStatement advertises `vread`; history
+listing is not supported.
+
+### Imported resource identities
+
+CodeSystem and ValueSet search results use a unique FHIR logical `id`, separate
+from the internal storage key and the canonical `url` plus business `version`.
+Use the returned ID for reads and instance operations. Instance `$lookup`,
+`$validate-code`, and `$expand` select that resource's business version,
+including an unversioned resource when versioned siblings exist. Importing the
+same canonical version again preserves its ID while it remains import-managed.
+When several imported business versions reuse a source ID, the first one
+imported keeps that ID if it is available. Later versions receive UUIDs; their
+assigned IDs remain stable when reimported. Initial allocation therefore depends
+on import order. Invalid source IDs also receive UUIDs. Discover assigned IDs
+through search rather than constructing them from canonical versions.
+
+Public IDs are stored in the existing `resource_json.id` field. Startup repairs
+legacy IDs and adds unique expression indexes; it does not add columns or change
+internal keys. Valid synthetic rows without JSON use their existing internal ID.
+Only rows needing a different public ID receive a JSON update. Existing live
+CRUD identities and deleted-resource reservations take precedence. Otherwise
+migration preserves the ID previously published by each backend where it is
+valid and unique: the PostgreSQL storage key or the SQLite resource JSON ID.
+Ambiguous or invalid legacy IDs need to be rediscovered through search. Internal
+keys and references remain unchanged.
+
+Stop all HTS writers sharing the database before upgrading, and upgrade them
+all before resuming imports. Mixing old writers with the new identity indexes
+is unsupported. ID reservation checks assume CRUD and terminology storage share
+the same database, as configured by the server. REST create, update and delete
+commit the resource, its history, and normalized terminology together. A failed
+normalization rolls back the entire resource write. PostgreSQL coordinates
+imports and REST writes using the same identity locks. These hash into a fixed
+set of 256 advisory locks, so a transaction holds at most 256 locks however
+large its bundle is. A large import therefore also delays REST writes to
+unrelated resources until it commits. SQLite serializes writers in its
+transaction. Bulk imports retain their separate partial-success behavior.
+A bulk import reports an error for a canonical resource already managed through
+REST, preserving its content and history. Use PUT to change that resource.
+
+Imported-only resources can be read, updated and deleted by their assigned ID.
+They have no persistence ETag until a REST write establishes history. An update
+records the imported content as version 1 and the replacement as version 2 in
+one transaction. An If-Match request without a persisted ETag fails with 412
+and makes no changes. A delete creates a persisted tombstone in the same
+transaction as the terminology deletion. Repeating DELETE returns 404 and does
+not add history. The deleted logical ID remains reserved. Reimporting a
+CodeSystem or ValueSet with the same canonical URL and business version assigns
+a new logical ID; it does not restore the deleted ID. ConceptMap imports do not
+allocate replacement IDs: a reimport whose source ID is reserved must supply a
+different ID. Neither rule permanently prohibits importing that canonical URL.
 
 ### Utility
 

@@ -60,10 +60,11 @@ name: FHIR Server Benchmark
 #     search-index rebuild has finished, capped by BULK_IMPORT_TIMEOUT_S and by
 #     what is left of the leg budget; the bulk database is dropped afterwards.
 #     The comparison reports the one load as three Throughput rows:
-#     `bulk-import` (resources/s over both phases), `bulk-import ingest`
-#     (resources/s and the seconds from kick-off until the status manifest is
-#     final: how long loading the corpus takes) and `bulk-import initial
-#     index` (seconds of the deferred search-index rebuild that follows: how
+#     `Bulk Import, $bulk-submit (resources/s)` (over both phases),
+#     `Bulk Import: ingest (resources/s, seconds)` (resources/s and the
+#     seconds from kick-off until the status manifest is final: how long
+#     loading the corpus takes) and `Bulk Import: index rebuild (seconds)`
+#     (seconds of the deferred search-index rebuild that follows: how
 #     long until that freshly loaded data is indexed; `inline (during ingest)`
 #     when HFS indexed while ingesting, HFS_BULK_SUBMIT_DEFER_INDEXING=false).
 #     It starts no containers, so the capacity gate is unchanged. Logic in
@@ -100,11 +101,16 @@ name: FHIR Server Benchmark
 # *-elasticsearch legs). Users never run a $reindex when they load data, and it
 # rewrites the search index right before insert and bulk-import, so a run that
 # includes it may skew both. How long freshly loaded data takes to become
-# indexed is bulk-import's `initial index` row instead. Past a 240 s budget the
+# indexed is the `Bulk Import: index rebuild (seconds)` row instead. Past a 240 s budget the
 # job is cancelled and reported partial, so it adds at most ~5 min to a leg. See
 # run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh. Its matrix row
 # is labelled `reindex, $reindex Encounter` (resources/s) and sits with the
-# import (`POST /` transaction Bundles) and bulk-import (`$bulk-submit`) rows.
+# Batch/Transaction Import (`POST /` Bundles; suite `import`) and Bulk Import
+# (`$bulk-submit`; suite `bulk-import`) rows.
+#
+# The Batch/Transaction Import and Bulk Import rows are not comparable: they
+# differ in numerator and denominator (committed Bundle entries per second of
+# the k6 scenario vs resources until the search index covers them).
 #
 # Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
 #   • Rust toolchain buildable (clang + lld linker, configured below).
@@ -139,7 +145,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' = prewarm,import,crud,search,insert,bulk-import | comma-separated from those plus indexing (a timed $reindex; opt-in only, never part of 'all', list it after search; it rewrites the index before insert and bulk-import and may skew both). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and initial-index rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,insert' skips it"
+        description: "Suites to run: 'all' = prewarm,import,crud,search,insert,bulk-import | comma-separated from those plus indexing (a timed $reindex; opt-in only, never part of 'all', list it after search; it rewrites the index before insert and bulk-import and may skew both). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and index-rebuild rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,insert' skips it"
         required: false
         default: "all"
       vus:
@@ -1335,7 +1341,7 @@ jobs:
           # 'indexing' (a timed $reindex, not a k6 suite — run_indexing_suite)
           # is opt-in and not in CANONICAL, so 'all' never runs it: users do
           # not run $reindex when they load data, and rewriting the index here
-          # would skew insert and bulk-import, whose initial-index row measures
+          # would skew insert and bulk-import, whose Bulk Import index-rebuild row measures
           # indexing instead. Named explicitly, it runs where `tests` lists it
           # (put it after search so it cannot disturb crud/search) and always
           # before insert and bulk-import, which are moved last below.
@@ -2027,7 +2033,7 @@ jobs:
               print("### Results\n\n_No summary files were produced._")
               sys.exit(0)
 
-          # The import row is reported as upstream's report and the "Compare legs"
+          # The Batch/Transaction Import row (suite `import`) is reported as upstream's report and the "Compare legs"
           # matrix report it: resources/s, the entries of committed Bundles over the
           # import scenario's own seconds (import-completeness.txt `entries` and
           # `scenario_seconds`, k6 setup() excluded; see suite-lib.sh
@@ -2078,13 +2084,13 @@ jobs:
                   chk_fmt = f"**{chk_fmt}**"
               label = suite
               if suite == "import":
-                  label = "import (resources/s; latency per Bundle)"
+                  label = "Batch/Transaction Import, `POST /` Bundles (resources/s; latency per Bundle)"
                   rps, p50, p95, p99 = import_row(m)
                   has_import = True
               rps_fmt = "n/a" if rps is None else f"{rps:,.0f}"
               print(f"| {label} | {rps_fmt} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
           if has_import:
-              print("\n_Throughput is requests/s and latency is per request, except on the import row "
+              print("\n_Throughput is requests/s and latency is per request, except on the Batch/Transaction Import row "
                     "(resources/s and per-Bundle latency, see the **Import** line above)._")
 
           # ── How loaded the shared Docker host was ──────────────────────────
@@ -2177,9 +2183,9 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
-  # errors; the import, bulk-import and reindex rows name the operation each
-  # times and sit together; the Throughput table also splits bulk-import into
-  # its ingest and initial-index rows right under it; the reindex row appears
+  # errors; the Batch/Transaction Import, Bulk Import and reindex rows name the
+  # operation each times and sit together; the Throughput table also splits
+  # Bulk Import into its ingest and index-rebuild rows right under it; the reindex row appears
   # only when a leg ran the opt-in indexing suite) and a leg-health table, so
   # a reader does not have to scroll six stacked per-leg summaries.
   # Display only: the job is continue-on-error and

@@ -1,16 +1,21 @@
 //! SQLite FHIR Bundle write layer.
 //!
 //! Consumes the backend-agnostic [`ParsedBundle`] produced by
-//! [`bundle_parser::parse_bundle`] and writes every resource into the
+//! [`crate::import::bundle_parser::parse_bundle`] and writes every resource into the
 //! SQLite normalized terminology tables.
 //!
 //! Import order is always: CodeSystems → ValueSets → ConceptMaps, matching
-//! the order guaranteed by [`bundle_parser::parse_bundle`].
+//! the order guaranteed by [`crate::import::bundle_parser::parse_bundle`].
 
 #[cfg(feature = "sqlite")]
+use crate::backends::resource_identity::ResourceKind;
+#[cfg(feature = "sqlite")]
 use crate::backends::sqlite::schema;
+#[cfg(feature = "sqlite")]
 use crate::error::HtsError;
+#[cfg(feature = "sqlite")]
 use crate::import::ImportStats;
+#[cfg(feature = "sqlite")]
 use crate::import::bundle_parser::{
     self, ParsedBundle, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet,
 };
@@ -52,50 +57,15 @@ pub(crate) fn import_parsed_sync(
         .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
     let mut stats = ImportStats::default();
 
-    // Before the transaction: decide which code systems get their closure
-    // rebuilt once the bundle commits. `write_code_system` deletes a system's
-    // closure on every write, so any system left out of this list answers
-    // `$subsumes` / `is-a` from an empty closure until the next
-    // `migrate_concept_closure` (issue #2128).
-    //
-    // A plain import rebuilds every code system it writes. A batch of a chunked
-    // bulk load (`defer_closure`, e.g. SNOMED RF2 chunks) only rebuilds systems
-    // that had no concepts before it: rebuilding an existing system after every
-    // batch is O(n²) for SNOMED CT (~640K concepts, ~1 280 batches = hours), so
-    // the bulk importer's caller rebuilds once via `finalize_after_bootstrap`.
-    // Probed with EXISTS rather than COUNT(*): the answer only distinguishes
-    // empty from non-empty, and a COUNT over an ever-growing concept set would
-    // make each batch of a chunked bulk load (SNOMED RF2, LOINC) scan all
-    // previously imported rows.
-    let systems_needing_closure: Vec<(String, Option<String>)> = parsed
-        .code_systems
-        .iter()
-        .filter(|cs| {
-            !parsed.defer_closure
-                || !conn
-                    .query_row(
-                        "SELECT EXISTS(
-                             SELECT 1 FROM concepts c
-                             JOIN code_systems s ON c.system_id = s.id
-                             WHERE s.url = ?1
-                         )",
-                        rusqlite::params![cs.url],
-                        |r| r.get::<_, bool>(0),
-                    )
-                    .unwrap_or(false)
-        })
-        .map(|cs| (cs.url.clone(), cs.version.clone()))
-        .collect();
-
     // Wrap the whole bundle in a single transaction so that the thousands of
     // per-concept / per-property / per-designation inserts that a bulk
     // terminology load produces commit once, not once per row. Combined with
     // `prepare_cached` inside the `write_*` helpers, this is the dominant
     // speed-up for `hts import`.
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| HtsError::StorageError(format!("Begin transaction: {e}")))?;
-    write_parsed_bundle(&tx, parsed, &mut stats)?;
+    let systems_needing_closure = write_parsed_bundle(&tx, parsed, &mut stats)?;
     tx.commit()
         .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
 
@@ -145,25 +115,71 @@ fn rebuild_closure_for(conn: &Connection, url: &str, version: Option<&str>) {
 /// Write a [`ParsedBundle`] into the SQLite normalized tables.
 ///
 /// All three resource types are processed in dependency order:
-/// CodeSystems first, then ValueSets, then ConceptMaps.
+/// CodeSystems first, then ValueSets, then ConceptMaps. Return only successfully
+/// written systems that need a closure rebuild; rejected REST-owned resources
+/// must not have their derived data touched by a package import.
 #[cfg(feature = "sqlite")]
-pub(crate) fn write_parsed_bundle(
+fn write_parsed_bundle(
     conn: &Connection,
     parsed: &ParsedBundle,
     stats: &mut ImportStats,
-) -> Result<(), HtsError> {
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    let has_resources: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'resources')",
+        [], |row| row.get(0),
+    ).map_err(|error| HtsError::StorageError(error.to_string()))?;
+    let mut systems_needing_closure = Vec::new();
     stats.errors.extend(parsed.parse_errors.iter().cloned());
     for cs in &parsed.code_systems {
         let url = cs.url.as_str();
-        if let Err(e) = write_code_system(conn, cs, stats, parsed.fresh_load) {
+        let ownership = if has_resources {
+            crate::backends::sqlite::resource_identity::check_import_owner(
+                conn,
+                ResourceKind::CodeSystem,
+                &cs.id,
+                &cs.url,
+                cs.version.as_deref(),
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(error) = ownership {
             stats
                 .errors
-                .push(format!("CodeSystem '{url}' import failed: {e}"));
+                .push(format!("CodeSystem '{url}' import failed: {error}"));
+            continue;
+        }
+        // Chunked loaders rebuild existing systems once after their final
+        // batch. Use EXISTS, not a count over an ever-growing concept set.
+        let needs_closure = !parsed.defer_closure || !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM concepts c JOIN code_systems s ON c.system_id = s.id \
+             WHERE s.url = ?1)",
+            [url], |row| row.get::<_, bool>(0),
+        ).map_err(|error| HtsError::StorageError(error.to_string()))?;
+        match write_code_system(conn, cs, stats, parsed.fresh_load) {
+            Ok(()) if needs_closure => {
+                systems_needing_closure.push((cs.url.clone(), cs.version.clone()))
+            }
+            Ok(()) => {}
+            Err(error) => stats
+                .errors
+                .push(format!("CodeSystem '{url}' import failed: {error}")),
         }
     }
     for vs in &parsed.value_sets {
         let url = vs.url.as_str();
-        if let Err(e) = write_value_set(conn, vs, stats) {
+        let ownership = if has_resources {
+            crate::backends::sqlite::resource_identity::check_import_owner(
+                conn,
+                ResourceKind::ValueSet,
+                &vs.id,
+                &vs.url,
+                vs.version.as_deref(),
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(e) = ownership.and_then(|()| write_value_set(conn, vs, stats)) {
             stats
                 .errors
                 .push(format!("ValueSet '{url}' import failed: {e}"));
@@ -171,39 +187,27 @@ pub(crate) fn write_parsed_bundle(
     }
     for cm in &parsed.concept_maps {
         let url = cm.url.as_str();
-        if let Err(e) = write_concept_map(conn, cm, stats) {
+        let ownership = if has_resources {
+            crate::backends::sqlite::resource_identity::check_import_owner(
+                conn,
+                ResourceKind::ConceptMap,
+                &cm.id,
+                &cm.url,
+                cm.version.as_deref(),
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(e) = ownership.and_then(|()| write_concept_map(conn, cm, stats)) {
             stats
                 .errors
                 .push(format!("ConceptMap '{url}' import failed: {e}"));
         }
     }
-    Ok(())
+    Ok(systems_needing_closure)
 }
 
 // ── CodeSystem write ──────────────────────────────────────────────────────────
-
-#[cfg(feature = "sqlite")]
-pub(crate) fn import_code_system(
-    conn: &Connection,
-    cs_json: &serde_json::Value,
-    stats: &mut ImportStats,
-) -> Result<(), HtsError> {
-    if let Some(parsed) = bundle_parser::parse_code_system_value(cs_json) {
-        // CRUD single-resource path: the target may already hold concepts, so
-        // always replace (never skip the child delete).
-        write_code_system(conn, &parsed, stats, false)?;
-        // `write_code_system` dropped this system's closure; rebuild it so
-        // `$subsumes` / `is-a` see the new hierarchy now rather than after the
-        // next restart (#2128). The CRUD caller runs on an autocommit
-        // connection, so the rebuild's own transaction is safe to open here.
-        rebuild_closure_for(conn, &parsed.url, parsed.version.as_deref());
-        Ok(())
-    } else {
-        Err(HtsError::InvalidRequest(
-            "CodeSystem.url is required".into(),
-        ))
-    }
-}
 
 #[cfg(feature = "sqlite")]
 fn write_code_system(
@@ -216,7 +220,6 @@ fn write_code_system(
     // first-time bulk loads). See [`ParsedBundle::fresh_load`].
     skip_child_delete: bool,
 ) -> Result<(), HtsError> {
-    let resource_json = serde_json::to_string(&cs.resource_json).ok();
     let now = utc_now();
 
     // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when version
@@ -246,7 +249,8 @@ fn write_code_system(
     } else {
         let preferred_taken: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM code_systems WHERE id = ?1",
+                "SELECT COUNT(*) FROM code_systems WHERE id = ?1 OR \
+                 COALESCE(json_extract(resource_json, '$.id'), id) = ?1",
                 rusqlite::params![preferred_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -258,6 +262,19 @@ fn write_code_system(
             preferred_id
         }
     };
+
+    let public_id = crate::backends::sqlite::resource_identity::allocate(
+        conn,
+        crate::backends::resource_identity::ResourceKind::CodeSystem,
+        &storage_id,
+        &cs.id,
+        &cs.url,
+        cs.version.as_deref(),
+    )?;
+    let mut stored_resource = cs.resource_json.clone();
+    stored_resource["id"] = serde_json::Value::String(public_id);
+    let resource_json = serde_json::to_string(&stored_resource)
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
 
     // Upsert keyed on (url, version): a re-import of the same version updates
     // the existing row rather than creating a new one or wiping sibling
@@ -503,17 +520,7 @@ fn write_code_system(
         rusqlite::params![system_id],
     );
 
-    // Invalidate any cached implicit-ValueSet expansions for this code system.
-    // The implicit_expansion_cache is otherwise persistent across restarts; stale
-    // entries from a previous version of this system must be evicted on re-import.
-    let _ = conn.execute(
-        "DELETE FROM implicit_expansion_cache WHERE system_url = ?1",
-        rusqlite::params![cs.url],
-    );
-    let _ = conn.execute(
-        "DELETE FROM implicit_expansion_fts WHERE system_url = ?1",
-        rusqlite::params![cs.url],
-    );
+    invalidate_expansion_cache_for_system(conn, &cs.url)?;
 
     // The process-wide URL→system_id cache may have memoised a now-stale row
     // (e.g. an empty stub that this import is about to replace, or a
@@ -546,25 +553,11 @@ fn insert_hierarchy(
 // ── ValueSet write ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-pub(crate) fn import_value_set(
-    conn: &Connection,
-    vs_json: &serde_json::Value,
-    stats: &mut ImportStats,
-) -> Result<(), HtsError> {
-    if let Some(parsed) = bundle_parser::parse_value_set_value(vs_json) {
-        write_value_set(conn, &parsed, stats)
-    } else {
-        Err(HtsError::InvalidRequest("ValueSet.url is required".into()))
-    }
-}
-
-#[cfg(feature = "sqlite")]
 fn write_value_set(
     conn: &Connection,
     vs: &ParsedValueSet,
     stats: &mut ImportStats,
 ) -> Result<(), HtsError> {
-    let resource_json = serde_json::to_string(&vs.resource_json).ok();
     let now = utc_now();
 
     // Synthetic storage id: `<fhir-id>|<version>` (or `<fhir-id>` when version
@@ -590,7 +583,8 @@ fn write_value_set(
     } else {
         let preferred_taken: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM value_sets WHERE id = ?1",
+                "SELECT COUNT(*) FROM value_sets WHERE id = ?1 OR \
+                 COALESCE(json_extract(resource_json, '$.id'), id) = ?1",
                 rusqlite::params![preferred_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -602,6 +596,19 @@ fn write_value_set(
             preferred_id
         }
     };
+
+    let public_id = crate::backends::sqlite::resource_identity::allocate(
+        conn,
+        crate::backends::resource_identity::ResourceKind::ValueSet,
+        &storage_id,
+        &vs.id,
+        &vs.url,
+        vs.version.as_deref(),
+    )?;
+    let mut stored_resource = vs.resource_json.clone();
+    stored_resource["id"] = serde_json::Value::String(public_id);
+    let resource_json = serde_json::to_string(&stored_resource)
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
 
     // Drop any materialized expansion derived from the previous content of this
     // ValueSet. `value_set_expansions` cascades on *row delete*, and the upsert
@@ -680,21 +687,6 @@ fn write_value_set(
 // ── ConceptMap write ──────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
-pub(crate) fn import_concept_map(
-    conn: &Connection,
-    cm_json: &serde_json::Value,
-    stats: &mut ImportStats,
-) -> Result<(), HtsError> {
-    if let Some(parsed) = bundle_parser::parse_concept_map_value(cm_json) {
-        write_concept_map(conn, &parsed, stats)
-    } else {
-        Err(HtsError::InvalidRequest(
-            "ConceptMap.url is required".into(),
-        ))
-    }
-}
-
-#[cfg(feature = "sqlite")]
 fn write_concept_map(
     conn: &Connection,
     cm: &ParsedConceptMap,
@@ -748,147 +740,119 @@ fn write_concept_map(
 
 // ── Normalized-table delete helpers (used by CRUD handlers) ───────────────────
 
-/// Look up a CodeSystem's canonical URL by its FHIR resource `id`.
-///
-/// Falls back to matching the original FHIR id stored inside `resource_json`
-/// when the synthetic storage id (`<id>|<version>`) doesn't directly match —
-/// this is what CRUD callers see in URL paths like `/CodeSystem/version`.
-/// When several versions share the same FHIR id we return the latest version
-/// (sorted descending as text) so the caller has a defined target.
-///
-/// Returns `Ok(None)` when no code system with that `id` exists.
+/// Resolve the canonical URL of one public CodeSystem identity.
 #[cfg(feature = "sqlite")]
 pub(crate) fn get_code_system_url(conn: &Connection, id: &str) -> Result<Option<String>, HtsError> {
-    use rusqlite::OptionalExtension;
-    if let Some(url) = conn
-        .query_row(
-            "SELECT url FROM code_systems WHERE id = ?1",
-            rusqlite::params![id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-    {
-        return Ok(Some(url));
-    }
-    let sql = format!(
-        "SELECT url FROM code_systems \
-         WHERE json_extract(resource_json, '$.id') = ?1 \
-         ORDER BY {} LIMIT 1",
-        crate::backends::cs_precedence_order_by("code_systems")
-    );
-    conn.query_row(&sql, rusqlite::params![id], |row| row.get::<_, String>(0))
-        .optional()
-        .map_err(|e| HtsError::StorageError(e.to_string()))
+    conn.query_row(
+        "SELECT url FROM code_systems WHERE COALESCE(json_extract(resource_json, '$.id'), id) = ?1",
+        [id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| HtsError::StorageError(error.to_string()))
 }
 
-/// Delete all cached value set expansion rows that were derived from the given
-/// code system URL.
+/// Invalidate complete stored and implicit expansions containing this system.
 ///
-/// Called before a CodeSystem is updated or deleted to prevent stale cached
-/// expansions from being returned by subsequent `$expand` calls.
+/// Runs inside the CodeSystem write transaction so content changes and cache
+/// eviction commit together before subsequent `$expand` requests.
 #[cfg(feature = "sqlite")]
 pub(crate) fn invalidate_expansion_cache_for_system(
     conn: &Connection,
     system_url: &str,
 ) -> Result<(), HtsError> {
+    // Any remaining row marks an expansion as populated. Invalidate the whole
+    // affected entry, including other systems in the same compose, so the next
+    // request recomputes a complete result. Unrelated expansions stay cached.
     conn.execute(
-        "DELETE FROM value_set_expansions WHERE system_url = ?1",
-        rusqlite::params![system_url],
+        "DELETE FROM value_set_expansions WHERE value_set_id IN (
+             SELECT value_set_id FROM value_set_expansions WHERE system_url = ?1
+         )",
+        [system_url],
     )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    .map_err(|error| HtsError::StorageError(error.to_string()))?;
+
+    // Remove FTS mirrors before their source rows, while affected URLs can
+    // still be identified. The direct condition also clears orphaned mirrors.
+    for table in ["implicit_expansion_fts", "implicit_expansion_word_fts"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE system_url = ?1 OR url IN (
+                     SELECT url FROM implicit_expansion_cache WHERE system_url = ?1
+                 )"
+            ),
+            [system_url],
+        )
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    }
+    conn.execute(
+        "DELETE FROM implicit_expansion_cache WHERE url IN (
+             SELECT url FROM implicit_expansion_cache WHERE system_url = ?1
+         )",
+        [system_url],
+    )
+    .map_err(|error| HtsError::StorageError(error.to_string()))?;
     Ok(())
 }
 
-/// Delete a CodeSystem and all its normalized data by its FHIR resource `id`.
-///
-/// Multi-version: matches both the synthetic storage id (`<id>|<version>`)
-/// and the original FHIR id captured in `resource_json.id`, so a CRUD DELETE
-/// `/CodeSystem/version` removes every stored version of that resource.
+/// Delete one CodeSystem and its child rows by public logical ID.
 #[cfg(feature = "sqlite")]
 pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsError> {
-    // Collect the storage ids being removed (a multi-version CodeSystem can own
-    // several rows sharing one FHIR id) so we can clear their concept FTS rows.
-    // The concepts_fts* tables have no foreign key to cascade from, so — now that
-    // startup no longer wipes and rebuilds the whole index (issue #295) —
-    // deleting a CodeSystem would otherwise orphan its FTS rows and its
-    // concepts_fts_built marker. Mirrors the per-system invalidation in
-    // write_code_system.
+    // Closure and concept FTS tables have no foreign keys, so retain the exact
+    // storage ID for their cleanup after deleting the CodeSystem. This leaves
+    // derived rows for other versions of the same canonical URL untouched.
     let system_ids: Vec<String> = conn
         .prepare(
             "SELECT id FROM code_systems \
-             WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
+             WHERE COALESCE(json_extract(resource_json, '$.id'), id) = ?1",
         )
         .and_then(|mut s| {
             s.query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
         })
-        .unwrap_or_default();
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
 
     conn.execute(
         "DELETE FROM code_systems \
-         WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
+         WHERE COALESCE(json_extract(resource_json, '$.id'), id) = ?1",
         rusqlite::params![id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     for sid in &system_ids {
-        let _ = conn.execute(
-            "DELETE FROM concepts_fts WHERE system_id = ?1",
-            rusqlite::params![sid],
-        );
-        let _ = conn.execute(
-            "DELETE FROM concepts_word_fts WHERE system_id = ?1",
-            rusqlite::params![sid],
-        );
-        let _ = conn.execute(
-            "DELETE FROM concepts_search_fts WHERE system_id = ?1",
-            rusqlite::params![sid],
-        );
-        let _ = conn.execute(
-            "DELETE FROM concepts_fts_built WHERE system_id = ?1",
-            rusqlite::params![sid],
-        );
+        conn.execute("DELETE FROM concept_closure WHERE system_id = ?1", [sid])
+            .map_err(|error| HtsError::StorageError(error.to_string()))?;
+        for table in [
+            "concepts_fts",
+            "concepts_word_fts",
+            "concepts_search_fts",
+            "concepts_fts_built",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .map_err(|error| HtsError::StorageError(error.to_string()))?;
+            if exists {
+                conn.execute(&format!("DELETE FROM {table} WHERE system_id = ?1"), [sid])
+                    .map_err(|error| HtsError::StorageError(error.to_string()))?;
+            }
+        }
     }
 
-    crate::backends::sqlite::invalidate_cs_id_cache();
-    crate::backends::sqlite::invalidate_cs_language_cache();
     Ok(())
 }
 
 /// Delete a ValueSet and its materialized expansion cache by FHIR resource `id`.
 #[cfg(feature = "sqlite")]
 pub(crate) fn delete_value_set(conn: &Connection, id: &str) -> Result<(), HtsError> {
-    // Multi-version: match the plain FHIR id *and* every synthetic storage id
-    // derived from it. `write_value_set` mints `<fhir-id>|<version>` via
-    // `storage_id_for`, so matching only `id = ?1` — as this did — silently
-    // no-ops for any ValueSet that carries a `version`. Two consequences, both
-    // reachable from the REST API: `DELETE /ValueSet/{id}` returned 204 while
-    // leaving the ValueSet fully expandable, and `PUT /ValueSet/{id}` skipped
-    // the delete-then-reimport, so the FK cascade never fired and
-    // `value_set_expansions` kept serving the pre-update codes. The existing
-    // round-trip tests missed both because their ValueSet fixtures carry no
-    // `version`.
-    //
-    // The second predicate compares the segment before the first `|` for exact
-    // equality rather than using `LIKE '<id>|%'`, so an id containing a LIKE
-    // wildcard cannot over-match, and no escaping is required. FHIR ids cannot
-    // contain `|`, so the split is unambiguous.
-    //
-    // Deliberately NOT matched: `json_extract(resource_json, '$.id')`, which is
-    // what `delete_code_system` uses. ValueSets legitimately share a FHIR id
-    // across *different* canonical URLs (the tx-ecosystem fixtures do this, and
-    // `write_value_set` mints a UUID storage id for the collision), so matching
-    // on the embedded id would delete unrelated ValueSets. The remaining gap —
-    // a ValueSet stored under such a minted UUID is still not reachable by id —
-    // needs URL-based resolution and is out of scope here.
     conn.execute(
-        "DELETE FROM value_sets \
-         WHERE id = ?1 \
-            OR (instr(id, '|') > 0 AND substr(id, 1, instr(id, '|') - 1) = ?1)",
-        rusqlite::params![id],
+        "DELETE FROM value_sets WHERE COALESCE(json_extract(resource_json, '$.id'), id) = ?1",
+        [id],
     )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    .map_err(|error| HtsError::StorageError(error.to_string()))?;
     Ok(())
 }
 
@@ -903,8 +867,134 @@ pub(crate) fn delete_concept_map(conn: &Connection, id: &str) -> Result<(), HtsE
     Ok(())
 }
 
+/// Strict replacement on the caller's active resource transaction.
+#[cfg(feature = "sqlite")]
+pub(crate) fn write_resource_in_transaction(
+    conn: &Connection,
+    resource_type: &str,
+    content: &serde_json::Value,
+    replace_id: Option<&str>,
+) -> Result<(), HtsError> {
+    let parsed = crate::import::parse_crud_resource(resource_type, content)?;
+    let kind = ResourceKind::from_resource_type(resource_type).ok_or_else(|| {
+        HtsError::InvalidRequest(format!("Unsupported resource type: {resource_type}"))
+    })?;
+    let id = content["id"]
+        .as_str()
+        .ok_or_else(|| HtsError::InvalidRequest("Resource id is required".into()))?;
+    let version_column = if matches!(kind, ResourceKind::ConceptMap) {
+        "''"
+    } else {
+        "version"
+    };
+    let canonical_version = if matches!(kind, ResourceKind::ConceptMap) {
+        None
+    } else {
+        content.get("version").and_then(serde_json::Value::as_str)
+    };
+    let owner: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT {} FROM {} WHERE url = ?1 AND COALESCE({version_column}, '') = \
+                 COALESCE(?2, '')",
+                kind.sqlite_identity_expression(),
+                kind.table()
+            ),
+            rusqlite::params![content["url"].as_str(), canonical_version],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    if owner.as_deref().is_some_and(|owner| owner != id) {
+        return Err(HtsError::InvalidRequest(
+            "Canonical URL and version already belong to another resource id".into(),
+        ));
+    }
+    if replace_id.is_none() {
+        let exists: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM {} WHERE {} = ?1)",
+                    kind.table(),
+                    kind.sqlite_identity_expression()
+                ),
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|error| HtsError::StorageError(error.to_string()))?;
+        if exists {
+            return Err(HtsError::InvalidRequest(
+                "Resource id already identifies an imported resource".into(),
+            ));
+        }
+    }
+    if let Some(id) = replace_id {
+        delete_resource_in_transaction(conn, kind, id)?;
+    }
+    let mut stats = ImportStats::default();
+    for cs in &parsed.code_systems {
+        write_code_system(conn, cs, &mut stats, false)?;
+        let sid: String = conn
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = ?1 AND \
+                 COALESCE(version, '') = COALESCE(?2, '')",
+                rusqlite::params![cs.url, cs.version],
+                |row| row.get(0),
+            )
+            .map_err(|error| HtsError::StorageError(error.to_string()))?;
+        schema::build_concept_closure_in_transaction(conn, &sid)
+            .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    }
+    for vs in &parsed.value_sets {
+        write_value_set(conn, vs, &mut stats)?;
+    }
+    for cm in &parsed.concept_maps {
+        write_concept_map(conn, cm, &mut stats)?;
+    }
+    let assigned: String = conn
+        .query_row(
+            &format!(
+                "SELECT {} FROM {} WHERE url = ?1 AND COALESCE({version_column}, '') = \
+                 COALESCE(?2, '')",
+                kind.sqlite_identity_expression(),
+                kind.table()
+            ),
+            rusqlite::params![content["url"].as_str(), canonical_version],
+            |row| row.get(0),
+        )
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
+    if assigned != id {
+        return Err(HtsError::InvalidRequest(
+            "Resource id is reserved by another terminology resource".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Delete exactly one identity, including derived data, in the caller's transaction.
+#[cfg(feature = "sqlite")]
+pub(crate) fn delete_resource_in_transaction(
+    conn: &Connection,
+    kind: crate::backends::resource_identity::ResourceKind,
+    id: &str,
+) -> Result<(), HtsError> {
+    match kind {
+        ResourceKind::CodeSystem => {
+            let url = get_code_system_url(conn, id)?;
+            delete_code_system(conn, id)?;
+            if let Some(url) = url {
+                invalidate_expansion_cache_for_system(conn, &url)?;
+            }
+            Ok(())
+        }
+        ResourceKind::ValueSet => delete_value_set(conn, id),
+        ResourceKind::ConceptMap => delete_concept_map(conn, id),
+    }
+}
+
 // ── Timestamp helper ───────────────────────────────────────────────────────────
 
+#[cfg(feature = "sqlite")]
 fn utc_now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -1413,19 +1503,20 @@ mod tests {
         assert_eq!(subsumes_a_a0(&b).await, SubsumptionOutcome::Subsumes);
     }
 
-    /// The SQLite CRUD path writes through `import_code_system` rather than
-    /// `import_bundle`; it must build the closure too.
+    /// Strict CRUD normalization builds closure before its transaction commits.
     #[tokio::test]
     async fn crud_import_code_system_builds_closure() {
         use crate::types::SubsumptionOutcome;
         let b = backend();
         {
             let conn = b.pool().get().unwrap();
-            let mut stats = crate::import::ImportStats::default();
-            super::import_code_system(&conn, &hierarchical_cs(), &mut stats).unwrap();
-            // A second write is the CRUD update shape: the old closure is
-            // deleted and must come back.
-            super::import_code_system(&conn, &hierarchical_cs(), &mut stats).unwrap();
+            let resource = hierarchical_cs();
+            for replace_id in [None, resource["id"].as_str()] {
+                let tx = conn.unchecked_transaction().unwrap();
+                super::write_resource_in_transaction(&tx, "CodeSystem", &resource, replace_id)
+                    .unwrap();
+                tx.commit().unwrap();
+            }
         }
         crate::traits::TerminologyCaches::invalidate_caches(&b);
         assert_eq!(subsumes_a_a0(&b).await, SubsumptionOutcome::Subsumes);

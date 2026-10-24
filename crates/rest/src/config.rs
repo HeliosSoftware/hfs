@@ -1430,6 +1430,19 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_BULK_CONCURRENCY", default_value = "1")]
     pub elasticsearch_bulk_concurrency: usize,
 
+    /// Most contained-document sweeps (the `_delete_by_query` that removes a
+    /// container's stale `contained[]` documents) in flight at once. `0` (the
+    /// default) keeps the built-in 16. Each sweep opens a scroll context on
+    /// every shard it visits and Elasticsearch allows 500 in all
+    /// (`search.max_open_scroll_context`); a burst beyond that is answered
+    /// `429 too_many_scroll_contexts`.
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_CONTAINED_SWEEP_CONCURRENCY",
+        default_value = "0"
+    )]
+    pub elasticsearch_contained_sweep_concurrency: usize,
+
     /// Refresh behavior for `$reindex` and the deferred post-import rebuild:
     /// "false", "wait_for" or "true". Unset follows
     /// `HFS_ELASTICSEARCH_WRITE_REFRESH`, so "false" lets a rebuild skip the
@@ -1774,6 +1787,7 @@ impl fmt::Debug for ServerConfig {
             elasticsearch_request_timeout_ms,
             elasticsearch_bulk_max_bytes,
             elasticsearch_bulk_concurrency,
+            elasticsearch_contained_sweep_concurrency,
             elasticsearch_reindex_refresh,
             elasticsearch_reindex_prepare_threads,
             reindex_batch_size,
@@ -1875,6 +1889,10 @@ impl fmt::Debug for ServerConfig {
             .field(
                 "elasticsearch_bulk_concurrency",
                 elasticsearch_bulk_concurrency,
+            )
+            .field(
+                "elasticsearch_contained_sweep_concurrency",
+                elasticsearch_contained_sweep_concurrency,
             )
             .field(
                 "elasticsearch_reindex_refresh",
@@ -2059,6 +2077,7 @@ impl Default for ServerConfig {
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
+            elasticsearch_contained_sweep_concurrency: 0,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
@@ -2413,6 +2432,7 @@ impl ServerConfig {
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
+            elasticsearch_contained_sweep_concurrency: 0,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
