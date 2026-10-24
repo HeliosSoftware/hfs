@@ -32787,6 +32787,76 @@ mod postgres_integration {
         super::sof_terminology_suite::run_all(&backend, &base, Some(&residue)).await;
     }
 
+    /// #2185: a Library write with no terminology to record or release must
+    /// not queue on the tenant's terminology lock, which another Library's
+    /// materialization holds while it writes a large relation.
+    #[tokio::test]
+    async fn postgres_integration_sof_terminology_noop_release_skips_the_tenant_lock() {
+        use helios_sof::sqlquery::{TerminologyKind, TerminologyRelation};
+        use std::time::Duration;
+
+        let backend = create_backend().await;
+        let tenant_id = unique_base("sof_term_lock");
+        let tenant =
+            TenantContext::new(TenantId::new(&tenant_id), TenantPermissions::full_access());
+        let store = backend.sof_terminology_store().expect("terminology store");
+        store
+            .set_library_dependencies(
+                &tenant,
+                "holder",
+                vec![(
+                    "http://example.org/vs".to_string(),
+                    TerminologyRelation {
+                        kind: TerminologyKind::ValueSet,
+                        rows: vec![serde_json::json!({"code": "a"})],
+                    },
+                )],
+            )
+            .await
+            .unwrap();
+
+        // Hold the lock `set_library_dependencies` takes (see
+        // `SOF_TERMINOLOGY_LOCK_NAMESPACE`), as a long materialization would.
+        let mut holder = backend.get_client().await.unwrap();
+        let txn = holder.transaction().await.unwrap();
+        txn.execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            &[&0x4853_5454_i32, &tenant_id],
+        )
+        .await
+        .unwrap();
+
+        // A Library that never held terminology: nothing to wait for.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            store.set_library_dependencies(&tenant, "plain", vec![]),
+        )
+        .await
+        .expect("a no-op release must not wait for the tenant lock")
+        .unwrap();
+
+        // A Library that holds a reference still serializes on the lock.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            store.set_library_dependencies(&tenant, "holder", vec![]),
+        )
+        .await;
+        assert!(blocked.is_err(), "a real release must take the tenant lock");
+
+        txn.rollback().await.unwrap();
+        store
+            .set_library_dependencies(&tenant, "holder", vec![])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load(&tenant, "http://example.org/vs")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// #1912: the tenant-scoped existence probe answers as `count_by_tenant`
     /// did.
     #[tokio::test]

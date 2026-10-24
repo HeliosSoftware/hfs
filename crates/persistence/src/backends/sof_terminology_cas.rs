@@ -25,7 +25,9 @@
 //! [`load`] reads the registry, then the generation it names. A concurrent
 //! write can delete that generation in between; the read then comes back
 //! missing or short of the registered row count, and [`load`] re-reads the
-//! registry.
+//! registry. If it keeps coming back that way, [`load`] reports the relation
+//! as not stored, so `$sql-run` expands it through the terminology server
+//! instead of failing.
 //!
 //! [`SofTerminologyStore`]: crate::core::sof_terminology::SofTerminologyStore
 
@@ -232,10 +234,11 @@ pub(crate) async fn set_library_dependencies<S: GenerationStore>(
                 return Ok(());
             }
             Ok(false) => continue,
-            Err(e) => {
-                discard(store, tenant, &written, None).await;
-                return Err(e);
-            }
+            // An error does not say the swap failed: a timeout can arrive
+            // after the store applied it. Discarding blindly would delete
+            // generations the registry now names, and every later `load` of
+            // them would fail. Re-read the registry and decide from that.
+            Err(e) => return settle_failed_swap(store, tenant, &written, &next, &garbage, e).await,
         }
     }
     discard(store, tenant, &written, None).await;
@@ -247,6 +250,54 @@ pub(crate) async fn set_library_dependencies<S: GenerationStore>(
             actual_etag: None,
         },
     ))
+}
+
+/// Resolves a swap that came back with `error`, which may or may not have
+/// been applied.
+///
+/// If the registry now reads as `next`, the swap landed: finish the write
+/// (delete `garbage`) and succeed. Otherwise discard only the `written`
+/// generations the registry does not name, and fail with `error`. If the
+/// registry cannot be read, nothing is discarded: an unreferenced generation
+/// is harmless (a tenant purge removes it), a deleted referenced one is not.
+async fn settle_failed_swap<S: GenerationStore>(
+    store: &S,
+    tenant: &TenantContext,
+    written: &[WrittenGeneration],
+    next: &TerminologyRegistry,
+    garbage: &[String],
+    error: StorageError,
+) -> StorageResult<()> {
+    let now = match store.read_registry(tenant).await {
+        Ok((now, _)) => now,
+        Err(read_error) => {
+            tracing::warn!(
+                error = %error,
+                read_error = %read_error,
+                generations = written.len(),
+                "SQL query terminology registry swap failed and could not be re-read; \
+                 keeping the new rows"
+            );
+            return Err(error);
+        }
+    };
+    if &now == next {
+        if let Err(e) = store.delete_generations(tenant, garbage).await {
+            tracing::warn!(
+                error = %e,
+                generations = garbage.len(),
+                "failed to delete superseded SQL query terminology rows"
+            );
+        }
+        return Ok(());
+    }
+    let unreferenced: Vec<WrittenGeneration> = written
+        .iter()
+        .filter(|w| !now.entries.iter().any(|e| e.generation == w.generation))
+        .cloned()
+        .collect();
+    discard(store, tenant, &unreferenced, None).await;
+    Err(error)
 }
 
 /// Best-effort removal of generations a failed write left unreferenced.
@@ -288,14 +339,16 @@ pub(crate) async fn load<S: GenerationStore>(
             _ => continue,
         }
     }
-    Err(StorageError::Concurrency(
-        ConcurrencyError::OptimisticLockFailure {
-            resource_type: "SofTerminologyRegistry".to_string(),
-            id: canonical.to_string(),
-            expected_etag: "W/\"*\"".to_string(),
-            actual_etag: None,
-        },
-    ))
+    // Under sustained rewrites, or with a registry naming rows that are gone.
+    // Neither is the caller's precondition failing, so do not answer with a
+    // concurrency error: report the relation as not stored, and the read
+    // path expands it through the terminology server.
+    tracing::warn!(
+        canonical,
+        attempts = MAX_LOAD_ATTEMPTS,
+        "SQL query terminology rows kept changing or are missing; not serving them from storage"
+    );
+    Ok(None)
 }
 
 /// Implements `SofTerminologyStore` for a backend that is a
@@ -344,6 +397,9 @@ mod tests {
         generations: Mutex<HashMap<(String, String), Vec<Value>>>,
         /// Swaps to fail before succeeding, to exercise the retry.
         lose_swaps: Mutex<usize>,
+        /// Fails the next swap with an error, after applying it when the flag
+        /// is `Some(true)` (a timeout on a write that landed).
+        fail_swap: Mutex<Option<bool>>,
     }
 
     #[async_trait]
@@ -376,6 +432,19 @@ mod tests {
                     return Ok(false);
                 }
             }
+            let fail = self.fail_swap.lock().unwrap().take();
+            let error = || {
+                Err(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "memory".to_string(),
+                        message: "swap timed out".to_string(),
+                        source: None,
+                    },
+                ))
+            };
+            if fail == Some(false) {
+                return error();
+            }
             let mut map = self.registry.lock().unwrap();
             let slot = map
                 .entry(tenant.tenant_id().as_str().to_string())
@@ -384,6 +453,9 @@ mod tests {
                 return Ok(false);
             }
             *slot = (registry.clone(), expected + 1);
+            if fail == Some(true) {
+                return error();
+            }
             Ok(true)
         }
 
@@ -487,6 +559,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_swap_that_errors_after_landing_completes_the_write() {
+        let store = Memory::default();
+        let t = tenant();
+        set_library_dependencies(&store, &t, "a", vec![("u".into(), vs(&["1"]))])
+            .await
+            .unwrap();
+        *store.fail_swap.lock().unwrap() = Some(true);
+        set_library_dependencies(&store, &t, "b", vec![("u".into(), vs(&["1", "2"]))])
+            .await
+            .expect("the swap landed, so the write succeeded");
+        // The new generation is kept and the superseded one deleted.
+        assert_eq!(load(&store, &t, "u").await.unwrap(), Some(vs(&["1", "2"])));
+        assert_eq!(store.generations.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_swap_that_errors_without_landing_keeps_the_old_relation() {
+        let store = Memory::default();
+        let t = tenant();
+        set_library_dependencies(&store, &t, "a", vec![("u".into(), vs(&["1"]))])
+            .await
+            .unwrap();
+        *store.fail_swap.lock().unwrap() = Some(false);
+        let err = set_library_dependencies(&store, &t, "b", vec![("u".into(), vs(&["1", "2"]))])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Backend(_)));
+        // The unregistered generation is discarded; the registered one stays.
+        assert_eq!(load(&store, &t, "u").await.unwrap(), Some(vs(&["1"])));
+        assert_eq!(store.generations.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn releasing_an_unknown_library_writes_nothing() {
         let store = Memory::default();
         // Every swap would fail; an unchanged registry must not attempt one.
@@ -507,10 +612,7 @@ mod tests {
         for rows in store.generations.lock().unwrap().values_mut() {
             rows.pop();
         }
-        assert!(matches!(
-            load(&store, &t, "u").await,
-            Err(StorageError::Concurrency(_))
-        ));
+        assert_eq!(load(&store, &t, "u").await.unwrap(), None);
     }
 
     #[test]

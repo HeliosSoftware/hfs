@@ -146,6 +146,25 @@ impl SofTerminologyStore for PostgresBackend {
     ) -> StorageResult<()> {
         let tenant_id = tenant.tenant_id().as_str();
         let mut client = self.guarded_client().await?;
+        // Every Library write lands here, most with nothing to record. When
+        // the Library holds no references either, the write changes nothing,
+        // so skip the tenant lock: otherwise it would wait behind another
+        // Library's materialization, which holds the lock for as long as it
+        // takes to write a large relation's chunks.
+        if relations.is_empty()
+            && !client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM sof_terminology_refs
+                                     WHERE tenant_id = $1 AND library_id = $2)",
+                    &[&tenant_id, &library_id],
+                )
+                .await
+                .or_query_error("probe terminology refs")?
+                .get::<_, bool>(0)
+        {
+            client.mark_settled();
+            return Ok(());
+        }
         let txn = client
             .transaction()
             .await
