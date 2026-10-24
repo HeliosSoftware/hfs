@@ -7722,6 +7722,33 @@ impl ReindexTarget for MongoBackend {
         self.write_search_entries_page_timed(tenant, resources, &mut stats)
             .await
     }
+
+    /// `missing_params` is this backend's search metadata (#1984), and only
+    /// while it owns search: an offloaded deployment never reads it.
+    fn supports_search_metadata(&self) -> bool {
+        !self.is_search_offloaded()
+    }
+
+    /// Backfills `missing_params` without a rebuild (#2008); see
+    /// `write_metadata_page`.
+    async fn write_search_metadata_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        skip_existing: bool,
+    ) -> (Vec<StorageResult<()>>, u64) {
+        if resources.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let n = resources.len();
+        let db = match self.get_database().await {
+            Ok(db) => db,
+            Err(e) => return super::reindex_pipeline::PageFailure::storage(e).fan_out_metadata(n),
+        };
+        self.write_metadata_page(&db, tenant.tenant_id().as_str(), resources, skip_existing)
+            .await
+            .unwrap_or_else(|failure| failure.fan_out_metadata(n))
+    }
 }
 
 /// Documents per `insert_many` when the serial or overlapped writer's
