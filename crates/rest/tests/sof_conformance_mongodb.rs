@@ -65,7 +65,9 @@ mod sof_conformance_mongodb_tests {
                 // process exit.
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 let container = super::container_cleanup::with_cleanup_label(
-                    Mongo::default().with_label("github.run_id", &run_id),
+                    Mongo::default()
+                        .with_tag("7.0")
+                        .with_label("github.run_id", &run_id),
                 )
                 .start()
                 .await
