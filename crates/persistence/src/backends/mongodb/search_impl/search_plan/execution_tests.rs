@@ -106,6 +106,7 @@ mod shared_mongo {
         let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
         let container = crate::container_cleanup::with_cleanup_label(
             Mongo::default()
+                .with_tag("7.0")
                 .with_label("github.run_id", &run_id)
                 // Every fixture owns a database of collection and index files,
                 // and WiredTiger panics (taking `mongod` down) on EMFILE. Some

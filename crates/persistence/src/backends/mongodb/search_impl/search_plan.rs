@@ -4106,11 +4106,13 @@ mod candidate_tests {
     #[tokio::test]
     async fn misleading_samples_and_cached_decisions_preserve_live_offset_pages() {
         use crate::backends::mongodb::MongoBackendConfig;
+        use testcontainers::ImageExt;
         use testcontainers::runners::AsyncRunner;
         // Standalone is enough: this test performs no transactions.
         let (uri, _container) = match std::env::var("HFS_TEST_MONGODB_URL") {
             Ok(uri) => (uri, None),
             Err(_) => match testcontainers_modules::mongo::Mongo::default()
+                .with_tag("7.0")
                 .start()
                 .await
             {
