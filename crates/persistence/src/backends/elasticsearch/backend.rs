@@ -171,6 +171,17 @@ pub struct ElasticsearchConfig {
     #[serde(default = "default_bulk_concurrency")]
     pub bulk_concurrency: usize,
 
+    /// Most contained-document sweeps (the `_delete_by_query` that removes a
+    /// container's stale `contained[]` documents) in flight at once
+    /// (default: `0` = the built-in 16).
+    ///
+    /// Each sweep opens a scroll context on every shard of every index of the
+    /// tenant and the cluster allows `search.max_open_scroll_context` (500) in
+    /// all, so an unbounded burst of sweeps is answered with `429
+    /// too_many_scroll_contexts`.
+    #[serde(default)]
+    pub contained_sweep_concurrency: usize,
+
     /// Refresh behavior for `$reindex` and the deferred rebuild's `_bulk`
     /// writes (default: `None`, which follows [`Self::write_refresh`]).
     ///
@@ -244,6 +255,9 @@ fn default_bulk_max_bytes() -> usize {
     DEFAULT_BULK_MAX_BYTES
 }
 
+/// Built-in for [`ElasticsearchConfig::contained_sweep_concurrency`].
+pub(crate) const DEFAULT_CONTAINED_SWEEP_CONCURRENCY: usize = 16;
+
 /// Default for [`ElasticsearchConfig::bulk_concurrency`]: one request at a
 /// time, which is what every release before #1125 did.
 pub const DEFAULT_BULK_CONCURRENCY: usize = 1;
@@ -288,6 +302,7 @@ impl Debug for ElasticsearchConfig {
             request_timeout_ms,
             bulk_max_bytes,
             bulk_concurrency,
+            contained_sweep_concurrency,
             reindex_refresh,
             reindex_prepare_threads,
             auth,
@@ -311,6 +326,7 @@ impl Debug for ElasticsearchConfig {
             .field("request_timeout_ms", request_timeout_ms)
             .field("bulk_max_bytes", bulk_max_bytes)
             .field("bulk_concurrency", bulk_concurrency)
+            .field("contained_sweep_concurrency", contained_sweep_concurrency)
             .field("reindex_refresh", reindex_refresh)
             .field("reindex_prepare_threads", reindex_prepare_threads)
             .field("auth", auth)
@@ -338,6 +354,7 @@ impl Default for ElasticsearchConfig {
             request_timeout_ms: default_request_timeout_ms(),
             bulk_max_bytes: default_bulk_max_bytes(),
             bulk_concurrency: default_bulk_concurrency(),
+            contained_sweep_concurrency: 0,
             reindex_refresh: None,
             reindex_prepare_threads: 0,
             auth: None,
@@ -420,6 +437,9 @@ pub struct ElasticsearchBackend {
     /// Whether `elasticsearch reindex writer configuration` has already been
     /// logged for this instance (#1250).
     reindex_mode_logged: std::sync::atomic::AtomicBool,
+    /// Admission gate of the contained-document sweeps; see
+    /// [`ElasticsearchConfig::contained_sweep_concurrency`].
+    pub(super) contained_sweeps: tokio::sync::Semaphore,
 }
 
 impl Debug for ElasticsearchBackend {
@@ -506,6 +526,7 @@ impl ElasticsearchBackend {
             );
         }
 
+        let sweep_permits = Self::sweep_permits(&config);
         Ok(Self {
             client,
             config,
@@ -514,6 +535,7 @@ impl ElasticsearchBackend {
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
+            contained_sweeps: tokio::sync::Semaphore::new(sweep_permits),
         })
     }
 
@@ -529,6 +551,7 @@ impl ElasticsearchBackend {
         Self::validate_config(&config)?;
         let client = Self::build_client(&config)?;
 
+        let sweep_permits = Self::sweep_permits(&config);
         Ok(Self {
             client,
             config,
@@ -537,6 +560,7 @@ impl ElasticsearchBackend {
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
+            contained_sweeps: tokio::sync::Semaphore::new(sweep_permits),
         })
     }
 
@@ -675,6 +699,14 @@ impl ElasticsearchBackend {
     /// The client's per-request timeout, as configured.
     pub(crate) fn request_timeout_ms(&self) -> u64 {
         self.config.request_timeout_ms
+    }
+
+    /// Permits of the contained-sweep gate, never below 1.
+    fn sweep_permits(config: &ElasticsearchConfig) -> usize {
+        match config.contained_sweep_concurrency {
+            0 => DEFAULT_CONTAINED_SWEEP_CONCURRENCY,
+            n => n,
+        }
     }
 
     /// How many `_bulk` requests of one page may be in flight, never below 1.

@@ -16,6 +16,8 @@ use std::sync::LazyLock;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod hierarchy;
 
+pub(crate) mod resource_identity;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 

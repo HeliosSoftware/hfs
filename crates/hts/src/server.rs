@@ -42,7 +42,8 @@ use crate::import::BundleImportBackend;
 use crate::operations::closure::closure_handler;
 use crate::operations::crud::{
     create_code_system, create_concept_map, create_value_set, delete_code_system,
-    delete_concept_map, delete_value_set, read_code_system, read_concept_map, read_value_set,
+    delete_concept_map, delete_value_set, read_code_system, read_code_system_version,
+    read_concept_map, read_concept_map_version, read_value_set, read_value_set_version,
     update_code_system, update_concept_map, update_value_set,
 };
 use crate::operations::expand::{
@@ -209,6 +210,10 @@ where
             get(get_lookup_by_id::<B>).post(lookup_by_id_post::<B>),
         )
         .route(
+            "/CodeSystem/{id}/_history/{version}",
+            get(read_code_system_version::<B>),
+        )
+        .route(
             "/CodeSystem/{id}",
             get(read_code_system::<B>)
                 .put(update_code_system::<B>)
@@ -230,6 +235,10 @@ where
             get(get_vs_validate_by_id::<B>).post(vs_validate_by_id_post::<B>),
         )
         .route(
+            "/ValueSet/{id}/_history/{version}",
+            get(read_value_set_version::<B>),
+        )
+        .route(
             "/ValueSet/{id}",
             get(read_value_set::<B>)
                 .put(update_value_set::<B>)
@@ -244,6 +253,10 @@ where
         .route(
             "/ConceptMap/{id}/$translate",
             get(get_translate_by_id::<B>).post(translate_by_id_post::<B>),
+        )
+        .route(
+            "/ConceptMap/{id}/_history/{version}",
+            get(read_concept_map_version::<B>),
         )
         .route(
             "/ConceptMap/{id}",

@@ -66,6 +66,16 @@ pub(super) fn is_transient_bulk_status(status: u64) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
+/// Rounds a contained-document sweep is repeated on its own (each round is
+/// itself [`send_write_with_retry`]'s attempts) before it fails the write.
+const SWEEP_ATTEMPTS: u32 = 4;
+
+/// Wait before the first repeat of a failed sweep; doubles, then jittered.
+const SWEEP_BACKOFF_BASE_MS: u64 = 200;
+
+/// Upper bound on one wait between sweep rounds.
+const SWEEP_BACKOFF_MAX_MS: u64 = 3_000;
+
 /// Attempts an operation Elasticsearch answers `429` gets, the first included,
 /// before it is reported as a transient failure.
 const BULK_MAX_ATTEMPTS: u32 = 5;
@@ -84,6 +94,20 @@ fn backoff_delay(resend: u32) -> Duration {
     BULK_BACKOFF_BASE
         .saturating_mul(1u32 << doublings)
         .min(BULK_BACKOFF_MAX)
+}
+
+/// A uniform draw from `[0, 1)`, for jitter. Taken from a v4 UUID (the crate
+/// already depends on it) rather than from a new RNG dependency: its first 48
+/// bits are random and fit an `f64` mantissa exactly.
+fn jitter_fraction() -> f64 {
+    let bits = (uuid::Uuid::new_v4().as_u128() >> 80) as u64;
+    bits as f64 / (1u64 << 48) as f64
+}
+
+/// `base_ms` spread over `[base_ms / 2, 3 * base_ms / 2)`, so writers that were
+/// all released by the same event do not retry in lockstep.
+fn jittered_ms(base_ms: u64) -> u64 {
+    base_ms / 2 + (jitter_fraction() * base_ms as f64) as u64
 }
 
 /// Groups consecutive operations, given their sizes in bytes, into `_bulk`
@@ -948,7 +972,7 @@ async fn send_write_with_retry(
         }
 
         if attempt < MAX_SEARCH_RETRIES {
-            let delay_ms = RETRY_BASE_DELAY_MS << attempt;
+            let delay_ms = jittered_ms(RETRY_BASE_DELAY_MS << attempt);
             tracing::warn!(
                 attempt = attempt + 1,
                 max = MAX_SEARCH_RETRIES + 1,
@@ -1027,8 +1051,40 @@ impl ElasticsearchBackend {
              (its own document is already written; repeat the write or reindex the \
              resource to bring them back in step)"
         );
-        delete_by_query_scoped(self, &pattern, body, &what).await?;
-        Ok(())
+        // At most `contained_sweep_concurrency` sweeps run at once (a permit is
+        // held for the request only, not for the back-off between attempts). A
+        // sweep the cluster throttles or cannot take is repeated on its own,
+        // with jittered exponential back-off, `SWEEP_ATTEMPTS` times before it
+        // fails the write: the container's own document is already written,
+        // and repeating the whole event (document, sweep, contained documents)
+        // for a failure of the sweep alone multiplies the load of a throttled
+        // cluster.
+        let mut attempt = 0u32;
+        loop {
+            let result = {
+                let _permit = self.contained_sweeps.acquire().await.map_err(|_| {
+                    internal_error("the contained sweep gate was closed".to_string())
+                })?;
+                delete_by_query_scoped(self, &pattern, body.clone(), &what).await
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(e) if is_unavailable(&e) && attempt + 1 < SWEEP_ATTEMPTS => {
+                    let delay_ms = jittered_ms(SWEEP_BACKOFF_BASE_MS << attempt.min(5))
+                        .min(SWEEP_BACKOFF_MAX_MS);
+                    attempt += 1;
+                    tracing::warn!(
+                        attempt,
+                        max = SWEEP_ATTEMPTS,
+                        delay_ms,
+                        error = %e,
+                        "Contained-document sweep failed; repeating the sweep alone"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Extracts and indexes a container's `contained[]` resources as separate
@@ -3161,7 +3217,7 @@ mod tests {
     use super::{
         BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, ValueOrigin, backoff_delay, build_es_document,
         chunk_ranges, describe_item_error, error_detail, es_index_date, is_transient_bulk_status,
-        is_unavailable, searched_no_shards,
+        is_unavailable, jittered_ms, searched_no_shards,
     };
     use crate::error::{BackendError, StorageError};
     use crate::search::converters::IndexValue;
@@ -3169,6 +3225,114 @@ mod tests {
     use chrono::{DateTime, Utc};
     use helios_fhir::FhirVersion;
     use serde_json::json;
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sweep_backend(server: &MockServer, permits: usize) -> super::ElasticsearchBackend {
+        super::ElasticsearchBackend::new(super::super::backend::ElasticsearchConfig {
+            nodes: vec![server.uri()],
+            request_timeout_ms: 5_000,
+            index_prefix: "hfs".to_string(),
+            contained_sweep_concurrency: permits,
+            ..Default::default()
+        })
+        .expect("lazy client")
+    }
+
+    fn deleted_none() -> serde_json::Value {
+        json!({ "deleted": 0, "version_conflicts": 0, "failures": [], "timed_out": false })
+    }
+
+    /// Many sweeps at once never exceed the configured number in flight.
+    #[tokio::test]
+    async fn sweeps_in_flight_are_limited() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/_delete_by_query$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(deleted_none()),
+            )
+            .mount(&server)
+            .await;
+        let run = |permits: usize| {
+            let server = &server;
+            async move {
+                let backend = std::sync::Arc::new(sweep_backend(server, permits));
+                let started = Instant::now();
+                let tasks: Vec<_> = (0..12)
+                    .map(|i| {
+                        let backend = backend.clone();
+                        tokio::spawn(async move {
+                            backend
+                                .delete_contained_docs("t", "Patient", &i.to_string())
+                                .await
+                        })
+                    })
+                    .collect();
+                for task in tasks {
+                    task.await.unwrap().expect("sweep");
+                }
+                started.elapsed()
+            }
+        };
+        // 12 sweeps of 150 ms through 3 permits take four rounds.
+        let limited = run(3).await;
+        assert!(
+            limited >= Duration::from_millis(570),
+            "at most 3 sweeps at once: {limited:?}"
+        );
+        // Through 12 permits they overlap completely.
+        let unlimited = run(12).await;
+        assert!(
+            unlimited < limited,
+            "all at once is faster: {unlimited:?} vs {limited:?}"
+        );
+    }
+
+    /// A sweep the cluster throttles beyond the write retries is repeated on
+    /// its own, after a back-off; nothing else is sent again, and the write is
+    /// not failed.
+    #[tokio::test]
+    async fn a_throttled_sweep_is_repeated_alone() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/_delete_by_query$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "error": { "type": "too_many_scroll_contexts_exception", "reason": "too many" },
+                "status": 429
+            })))
+            .up_to_n_times(4)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/_delete_by_query$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(deleted_none()))
+            .mount(&server)
+            .await;
+        let backend = sweep_backend(&server, 0);
+        backend
+            .delete_contained_docs("t", "Patient", "1")
+            .await
+            .expect("the sweep is repeated until it is taken");
+        let all = server.received_requests().await.unwrap();
+        assert_eq!(all.len(), 5, "4 refusals and the sweep that went through");
+        assert!(
+            all.iter()
+                .all(|r| r.url.path().ends_with("/_delete_by_query"))
+        );
+    }
+
+    /// Retry waits are spread, not the same for every writer.
+    #[test]
+    fn retry_waits_are_jittered_within_half_to_one_and_a_half_times() {
+        let waits: std::collections::HashSet<u64> = (0..200).map(|_| jittered_ms(200)).collect();
+        assert!(waits.iter().all(|w| (100..300).contains(w)), "{waits:?}");
+        assert!(waits.len() > 20, "varies: {} distinct", waits.len());
+    }
 
     /// A fixed resource instant, nowhere near "now".
     fn test_instant() -> DateTime<Utc> {

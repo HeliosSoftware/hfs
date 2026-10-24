@@ -10961,6 +10961,15 @@ mod postgres_integration {
             .await
             .unwrap();
         drop(client);
+        // The raw UPDATE above plays an out-of-band writer: HFS itself writes
+        // NULL `last_updated` only on contained memberships, which the
+        // eligibility cache learns from the database. Declare the rows as an
+        // in-process writer would, so the cache cannot serve a stale "none".
+        backend.declare_null_last_updated_rows(
+            tenant.tenant_id().as_str(),
+            "Observation",
+            "patient",
+        );
 
         let default = postgres_2074_query();
         for query in [
@@ -11130,13 +11139,13 @@ mod postgres_integration {
                     && !eligibility.contains("contained_type = $2")
                     && !eligibility.contains("resource_id > $4")
                     && !eligibility.contains("resource_id < $4")
-                    && sql.contains("FALSE AS needs_fallback")
+                    && sql.contains("(r.id IS NULL) AS needs_fallback")
                     && sql.contains("TRUE AS needs_fallback"),
                 "representation eligibility must cover matching NULL timestamps in the same snapshot, before any page boundary: {sql}"
             );
             let candidate_page = sql
                 .split_once("FROM ( ")
-                .and_then(|(_, tail)| tail.split_once(") c JOIN resources r"))
+                .and_then(|(_, tail)| tail.split_once(") c LEFT JOIN resources r"))
                 .map(|(page, _)| page)
                 .expect("the production page must select index identities before loading bodies");
             assert!(
@@ -11144,20 +11153,14 @@ mod postgres_integration {
                     .starts_with("SELECT DISTINCT resource_id, last_updated FROM search_index"),
                 "duplicate memberships must be eliminated in the candidate page: {sql}"
             );
-            let live_check = candidate_page
-                .find("EXISTS (SELECT 1 FROM resources live")
-                .expect("page selection must check live identities");
-            let page_limit = candidate_page.find("LIMIT 6").unwrap();
+            // The live check is the outer LEFT JOIN, not a per-candidate probe
+            // before LIMIT; dead candidates surface as `needs_fallback` rows.
             assert!(
-                live_check < page_limit,
-                "dead candidates must be excluded before LIMIT: {sql}"
-            );
-            assert!(
-                candidate_page.contains("live.tenant_id = $1 AND live.resource_type = $2")
-                    && candidate_page
-                        .contains("live.id = search_index.resource_id AND live.is_deleted = FALSE")
-                    && !candidate_page.contains(".data"),
-                "the pre-limit check must be scoped to a live identity without loading bodies: {sql}"
+                !candidate_page.contains("resources live")
+                    && !candidate_page.contains(".data")
+                    && sql.contains("LEFT JOIN resources r")
+                    && sql.contains("AND r.is_deleted = FALSE"),
+                "live identities are checked by the outer join: {sql}"
             );
             let mut args = vec![
                 format!("'{}'", tenant.tenant_id().as_str()),
@@ -28281,6 +28284,9 @@ mod postgres_integration {
         use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
 
         let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        // A long TTL: were bulk submit to honour it, the overlay warmed by the
+        // create below would skip the probe and this batch would not fail.
+        let backend = backend.with_overlay_fingerprint_ttl(std::time::Duration::from_secs(600));
         let tenant = create_tenant("grouped-snapshot-failure");
         let tenant_id = tenant.tenant_id().as_str().to_string();
         backend
@@ -28642,6 +28648,8 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_write_indexes_with_cluster_mates_search_parameter_without_refresh() {
         let (writer, _dbname) = isolated_reindex_backend().await;
+        // TTL 0: probe on every write (the TTL fast path has its own test below).
+        let writer = writer.with_overlay_fingerprint_ttl(std::time::Duration::ZERO);
         let tenant = create_tenant("sp-fingerprint-mate");
         // Warm the writer's cached overlay with an ordinary write.
         writer
@@ -28687,6 +28695,138 @@ mod postgres_integration {
                 .await
                 .is_empty(),
             "the write before it is not (nothing reindexed)"
+        );
+    }
+
+    /// A write within the fingerprint TTL trusts its validated overlay
+    /// without probing, so a cluster-mate's SearchParameter is not indexed
+    /// until the TTL lapses; the first write after that picks it up.
+    #[tokio::test]
+    async fn postgres_write_skips_fingerprint_probe_within_ttl() {
+        let (writer, _dbname) = isolated_reindex_backend().await;
+        let writer = writer.with_overlay_fingerprint_ttl(std::time::Duration::from_millis(1500));
+        let tenant = create_tenant("sp-fingerprint-ttl");
+        // Warms and validates the overlay.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"warm","name":[{"given":["Warm"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let mate = PostgresBackend::new(writer.config().clone()).await.unwrap();
+        mate.create(
+            &tenant,
+            "SearchParameter",
+            custom_given_search_parameter("givenfp", "givenfp"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"early","name":[{"given":["Early"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            search_patients_by(&mate, &tenant, "givenfp", "Early")
+                .await
+                .is_empty(),
+            "within the TTL the write does not probe, so it is not indexed with the mate's parameter"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"late","name":[{"given":["Late"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_patients_by(&mate, &tenant, "givenfp", "Late").await,
+            vec!["late".to_string()],
+            "after the TTL the next write probes and indexes with the new parameter"
+        );
+    }
+
+    /// Bulk submit takes its overlay snapshot under the tenant gate and must
+    /// see every SearchParameter committed before it, so unlike an ordinary
+    /// write it ignores the fingerprint TTL: even with a TTL far longer than
+    /// the test, a batch indexes with a cluster-mate's new parameter.
+    #[tokio::test]
+    async fn postgres_bulk_submit_probes_fingerprint_despite_ttl() {
+        use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
+
+        let (writer, _dbname) = isolated_reindex_backend().await;
+        let writer = writer.with_overlay_fingerprint_ttl(std::time::Duration::from_secs(600));
+        let tenant = create_tenant("sp-fingerprint-bulk");
+        // Warms and validates the overlay: ordinary writes now skip the probe.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"warm","name":[{"given":["Warm"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let mate = PostgresBackend::new(writer.config().clone()).await.unwrap();
+        mate.create(
+            &tenant,
+            "SearchParameter",
+            custom_given_search_parameter("givenfp", "givenfp"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        // Control: the ordinary write is still inside the TTL and skips the probe.
+        writer
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"ordinary","name":[{"given":["Ordinary"]}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            search_patients_by(&mate, &tenant, "givenfp", "Ordinary")
+                .await
+                .is_empty()
+        );
+
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&writer, &tenant, "fingerprint-ttl").await;
+        writer
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"bulk","name":[{"given":["Bulked"]}]}),
+                )],
+                &grouped_create_options(std::sync::Arc::new(RecordingBulkSubmitBatches::default()))
+                    .with_defer_indexing(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_patients_by(&mate, &tenant, "givenfp", "Bulked").await,
+            vec!["bulk".to_string()],
+            "the bulk batch probes despite the TTL and indexes with the new parameter"
         );
     }
 

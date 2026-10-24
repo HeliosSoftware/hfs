@@ -1,6 +1,6 @@
 //! PostgreSQL implementation of the [`SofTerminologyStore`] (#2185).
 //!
-//! Three tables, created by the v50 migration:
+//! Three tables, created by the v51 migration:
 //!
 //! - `sof_terminology_relations`: one row per (tenant, canonical) relation.
 //! - `sof_terminology_chunks`: the relation's rows, as JSONB arrays of at most
@@ -35,7 +35,7 @@ const CHUNK_ROWS: usize = 1000;
 /// in `user_settings.rs` for why the namespace is a fixed constant.
 const SOF_TERMINOLOGY_LOCK_NAMESPACE: i32 = 0x4853_5454; // "HSTT" (HFS Sof TerminologY Tables)
 
-/// The v49 -> v50 migration body.
+/// The v50 -> v51 migration body.
 pub(super) const CREATE_TABLES_SQL: &str = "
     CREATE TABLE IF NOT EXISTS sof_terminology_relations (
         id BIGSERIAL PRIMARY KEY,

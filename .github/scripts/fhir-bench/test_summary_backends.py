@@ -48,14 +48,14 @@ def bulk_txt(**kv):
 class SummaryBulkImportTest(SummaryRunMixin, unittest.TestCase):
     def test_bulk_line_deferred_unchanged(self):
         out = self.summary({"bulk-import.txt": bulk_txt()})
-        self.assertIn("resources in 2400 s (ingest 600 s + search-index rebuild 1800 s, "
+        self.assertIn("resources in 2400 s (Bulk Import: ingest 600 s + Bulk Import: index rebuild 1800 s, "
                       "`completed`) = **679.5 resources/s** end to end, 2717.8 resources/s "
                       "ingest only; fresh database, `defer_indexing=true`.", out)
 
     def test_bulk_line_inline(self):
         out = self.summary({"bulk-import.txt": bulk_txt(
             defer_indexing="false", index_status="inline", index_seconds=0, total_seconds=600)})
-        self.assertIn("(ingest 600 s, search index built inline during ingest)", out)
+        self.assertIn("(Bulk Import: ingest 600 s, search index built inline during ingest)", out)
         self.assertNotIn("rebuild 0 s", out)
         self.assertNotIn("search-index rebuild", out)
 
@@ -63,7 +63,7 @@ class SummaryBulkImportTest(SummaryRunMixin, unittest.TestCase):
         out = self.summary({"bulk-import.txt": bulk_txt(
             defer_indexing="false", index_status="completed", index_seconds=12,
             total_seconds=612)})
-        self.assertIn("(ingest 600 s, search index built inline during ingest + 12 s rebuild "
+        self.assertIn("(Bulk Import: ingest 600 s, search index built inline during ingest + 12 s rebuild "
                       "of rejected types, `completed`)", out)
         self.assertNotIn("search-index rebuild", out)
 
