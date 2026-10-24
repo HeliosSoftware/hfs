@@ -148,14 +148,14 @@ impl SubBatchDocs {
         &mut self,
         tenant_id: &str,
         resources: &[StoredResource],
-    ) -> Vec<(usize, Document)> {
+    ) -> Vec<MissingUpdate> {
         std::mem::take(&mut self.missing_params)
             .into_iter()
             .map(|(owner, names, fp)| {
                 let resource = &resources[owner];
-                (
+                MissingUpdate {
                     owner,
-                    doc! {
+                    statement: doc! {
                         "q": resource_version_filter(tenant_id, resource),
                         "u": super::storage::with_missing_metadata_update(
                             doc! {},
@@ -165,10 +165,144 @@ impl SubBatchDocs {
                         "multi": false,
                         "upsert": false,
                     },
-                )
+                    resource_type: resource.resource_type().to_owned(),
+                    id: resource.id().to_owned(),
+                    version_id: resource.version_id().to_owned(),
+                    names,
+                    fp,
+                }
             })
             .collect()
     }
+}
+
+/// One resource's `missing_params` update statement, with the version it is
+/// guarded on and the values it writes (the array and its `missing_params_fp`
+/// stamp), so [`changed_missing_updates`] can
+/// leave it out when the stored document already holds that value (#2005).
+struct MissingUpdate {
+    owner: usize,
+    statement: Document,
+    resource_type: String,
+    id: String,
+    version_id: String,
+    names: Option<Vec<String>>,
+    fp: Option<String>,
+}
+
+impl MissingUpdate {
+    /// Whether `stored`, the live resource document, already holds what this
+    /// update writes, array and stamp, at the version the update is guarded on. Anything else
+    /// (another version, a deleted resource, a value of another shape) is
+    /// written as before, and the version guard decides.
+    fn is_unchanged(&self, stored: &Document) -> bool {
+        if stored.get_str("version_id") != Ok(self.version_id.as_str())
+            || stored.get_bool("is_deleted") != Ok(false)
+        {
+            return false;
+        }
+        // The statement also writes the stamp (#1999), so a stale or absent
+        // stamp is due even when the array matches. Without an array the
+        // statement unsets both.
+        let fp = self.names.as_ref().and(self.fp.as_deref());
+        if stored.get_str("missing_params_fp").ok() != fp {
+            return false;
+        }
+        match (&self.names, stored.get("missing_params")) {
+            (None, None) => true,
+            (Some(names), Some(Bson::Array(current))) => {
+                current.len() == names.len()
+                    && current
+                        .iter()
+                        .zip(names)
+                        .all(|(current, name)| current.as_str() == Some(name.as_str()))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Drops the updates whose resource already stores the same `missing_params`
+/// at the same version, returning the rest and how many were dropped (#2005).
+/// MongoDB already turns such an update into a no-op write, but each
+/// statement still costs the server an index lookup and a document fetch,
+/// about four times what reading the whole page costs, and on a routine
+/// reindex that is most of the page. One projected read per resource type
+/// replaces them. If that read fails, every update is sent, as before.
+///
+/// A writer that changes the resource after the read stores its own
+/// `missing_params` under a new version, which the skipped update would not
+/// have matched anyway.
+async fn changed_missing_updates(
+    resources: &mongodb::Collection<Document>,
+    tenant_id: &str,
+    updates: Vec<MissingUpdate>,
+) -> (Vec<(usize, Document)>, u64) {
+    let stored = match stored_missing_params(resources, tenant_id, &updates).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::debug!(
+                tenant = %tenant_id,
+                error = %error,
+                "mongodb reindex could not read stored missing_params; sending every update"
+            );
+            HashMap::new()
+        }
+    };
+    let mut skipped = 0;
+    let changed = updates
+        .into_iter()
+        .filter(|update| {
+            let unchanged = stored
+                .get(&(update.resource_type.clone(), update.id.clone()))
+                .is_some_and(|stored| update.is_unchanged(stored));
+            skipped += u64::from(unchanged);
+            !unchanged
+        })
+        .map(|update| (update.owner, update.statement))
+        .collect();
+    (changed, skipped)
+}
+
+/// Reads `version_id`, `is_deleted`, `missing_params` and `missing_params_fp`
+/// of every resource
+/// the updates name, keyed by (resource type, id), one query per type.
+async fn stored_missing_params(
+    resources: &mongodb::Collection<Document>,
+    tenant_id: &str,
+    updates: &[MissingUpdate],
+) -> mongodb::error::Result<HashMap<(String, String), Document>> {
+    let mut ids_by_type: HashMap<&str, Vec<&str>> = HashMap::new();
+    for update in updates {
+        ids_by_type
+            .entry(update.resource_type.as_str())
+            .or_default()
+            .push(update.id.as_str());
+    }
+    let mut stored = HashMap::new();
+    for (resource_type, ids) in ids_by_type {
+        let mut cursor = resources
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "id": { "$in": ids },
+            })
+            .projection(doc! {
+                "_id": 0,
+                "id": 1,
+                "version_id": 1,
+                "is_deleted": 1,
+                "missing_params": 1,
+                "missing_params_fp": 1,
+            })
+            .await?;
+        while let Some(row) = cursor.try_next().await? {
+            if let Ok(id) = row.get_str("id") {
+                stored.insert((resource_type.to_owned(), id.to_owned()), row);
+            }
+        }
+    }
+    Ok(stored)
 }
 
 /// Moves sub-batch `[start, start + prepared.len())`'s extracted documents
@@ -527,6 +661,26 @@ fn metadata_update_result(
         return Err("Reindex metadata matched count exceeds batch".into());
     }
     Ok((matched, failures))
+}
+
+/// Writes a page's `missing_params` once its search rows are written and
+/// verified, leaving out every update the stored documents already satisfy
+/// (#2005). Runs after verification so that verification's read of resource
+/// versions stays the page's first read of `resources`. Returns per-resource
+/// write errors; a command or acknowledgement error fails the page.
+async fn write_page_metadata(
+    db: &mongodb::Database,
+    tenant_id: &str,
+    updates: Vec<MissingUpdate>,
+    stats: &mut ReindexPageStats,
+) -> Result<HashMap<usize, String>, PageFailure> {
+    let started = std::time::Instant::now();
+    let resources = db.collection::<Document>(super::MongoBackend::RESOURCES_COLLECTION);
+    let (updates, skipped) = changed_missing_updates(&resources, tenant_id, updates).await;
+    stats.metadata_updates_skipped += skipped;
+    let result = update_missing_metadata(db, &updates).await;
+    stats.insert += started.elapsed();
+    result
 }
 
 /// Update metadata in bounded commands, never overwriting a newer live version.
@@ -973,8 +1127,6 @@ async fn snapshot_row_ids(
 async fn insert_sub_batch(
     own: mongodb::Collection<Document>,
     contained: mongodb::Collection<Document>,
-    db: mongodb::Database,
-    missing_updates: Vec<(usize, Document)>,
     mut docs: SubBatchDocs,
 ) -> DbTask<SubBatchInsert> {
     let mut stats = ReindexPageStats::default();
@@ -992,7 +1144,7 @@ async fn insert_sub_batch(
     )
     .await;
     stats.insert += started.elapsed();
-    let mut own_failures = match own_result {
+    let own_failures = match own_result {
         Ok(failures) => failures,
         Err(msg) => {
             return DbTask {
@@ -1022,24 +1174,6 @@ async fn insert_sub_batch(
                 };
             }
         };
-    }
-    let started = std::time::Instant::now();
-    let metadata_result = update_missing_metadata(&db, &missing_updates).await;
-    stats.insert += started.elapsed();
-    match metadata_result {
-        Ok(failures) => {
-            for (owner, message) in failures {
-                own_failures.entry(owner).or_insert(message);
-            }
-        }
-        Err(message) => {
-            return DbTask {
-                stats,
-                result: Err(message
-                    .with_permanent(contained_failures)
-                    .with_permanent(own_failures)),
-            };
-        }
     }
     DbTask {
         stats,
@@ -1597,17 +1731,10 @@ impl super::MongoBackend {
             }
         };
 
-        let done = insert_sub_batch(
-            own.clone(),
-            contained.clone(),
-            db.clone(),
-            missing_updates,
-            batch,
-        )
-        .await;
+        let done = insert_sub_batch(own.clone(), contained.clone(), batch).await;
         absorb_db_task(stats, &done.stats);
         stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
-        let (insert_failures, inserted) = match done.result {
+        let (mut insert_failures, inserted) = match done.result {
             Ok(sub_batch) => {
                 let mut into = HashMap::new();
                 merge_insert_failures(&mut into, sub_batch.failures);
@@ -1635,6 +1762,13 @@ impl super::MongoBackend {
         stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
         let verification_failures = verification_failures
             .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?;
+        let metadata_failures = write_page_metadata(db, tenant_id, missing_updates, stats).await;
+        stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
+        for (owner, message) in metadata_failures
+            .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?
+        {
+            insert_failures.entry(owner).or_insert(message);
+        }
 
         let docs: u64 = doc_counts.iter().sum::<usize>() as u64;
         record_page_perf(stats, stats.db_wait.unwrap_or_default(), docs);
@@ -1692,6 +1826,7 @@ impl super::MongoBackend {
         let mut previous = PreviousIds::default();
         let mut in_flight: Option<AbortOnDrop<DbTask<SubBatchInsert>>> = None;
         let mut page_wait = Duration::ZERO;
+        let mut missing_updates = Vec::with_capacity(n);
 
         while let Some(range) = planner.next_range() {
             // Extract this sub-batch; it overlaps the delete, or the
@@ -1704,7 +1839,7 @@ impl super::MongoBackend {
                 &mut extract_failures,
                 &mut doc_counts,
             );
-            let missing_updates = batch.missing_updates(tenant_id, resources);
+            missing_updates.extend(batch.missing_updates(tenant_id, resources));
             stats.extract += started.elapsed();
             stats.sub_batches += 1;
             stats.pool_sub_batches += u64::from(on_pool);
@@ -1745,8 +1880,6 @@ impl super::MongoBackend {
             in_flight = Some(AbortOnDrop::spawn(insert_sub_batch(
                 own.clone(),
                 contained.clone(),
-                db.clone(),
-                missing_updates,
                 batch,
             )));
         }
@@ -1784,6 +1917,14 @@ impl super::MongoBackend {
         add_db_wait(stats, &mut page_wait, waited.elapsed());
         let verification_failures = verification_failures
             .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?;
+        let waited = std::time::Instant::now();
+        let metadata_failures = write_page_metadata(db, tenant_id, missing_updates, stats).await;
+        add_db_wait(stats, &mut page_wait, waited.elapsed());
+        for (owner, message) in metadata_failures
+            .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?
+        {
+            insert_failures.entry(owner).or_insert(message);
+        }
 
         // Success only: remember the type's documents per resource, forward to perf.
         let docs: u64 = doc_counts.iter().sum::<usize>() as u64;
@@ -2362,6 +2503,84 @@ mod tests {
         assert_eq!(doc_counts[0], 0);
         assert_eq!(extract_failures[5], None);
         assert_eq!(extract_failures[6], Some("boom".to_string()));
+    }
+
+    fn missing_update(version_id: &str, names: Option<&[&str]>) -> MissingUpdate {
+        missing_update_stamped(version_id, names, None)
+    }
+
+    fn missing_update_stamped(
+        version_id: &str,
+        names: Option<&[&str]>,
+        fp: Option<&str>,
+    ) -> MissingUpdate {
+        MissingUpdate {
+            owner: 0,
+            statement: doc! {},
+            resource_type: "Patient".into(),
+            id: "p".into(),
+            version_id: version_id.into(),
+            names: names.map(|names| names.iter().map(|name| (*name).to_owned()).collect()),
+            fp: fp.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn missing_update_is_unchanged_only_for_the_same_live_version_and_value() {
+        let set = missing_update("2", Some(&["a", "b"]));
+        let unset = missing_update("2", None);
+        let live = |missing: Option<Bson>| {
+            let mut stored = doc! { "id": "p", "version_id": "2", "is_deleted": false };
+            if let Some(missing) = missing {
+                stored.insert("missing_params", missing);
+            }
+            stored
+        };
+        let array = |names: &[&str]| Some(Bson::from(names.to_vec()));
+
+        assert!(set.is_unchanged(&live(array(&["a", "b"]))));
+        assert!(unset.is_unchanged(&live(None)));
+
+        // A different value, order or shape is written.
+        assert!(!set.is_unchanged(&live(array(&["a"]))));
+        assert!(!set.is_unchanged(&live(array(&["a", "b", "c"]))));
+        assert!(!set.is_unchanged(&live(array(&["b", "a"]))));
+        assert!(!set.is_unchanged(&live(array(&[]))));
+        assert!(!set.is_unchanged(&live(None)));
+        assert!(!set.is_unchanged(&live(Some(Bson::Null))));
+        assert!(!set.is_unchanged(&live(Some(Bson::from(vec![1, 2])))));
+        assert!(!unset.is_unchanged(&live(array(&[]))));
+        assert!(!unset.is_unchanged(&live(Some(Bson::Null))));
+        assert!(missing_update("2", Some(&[])).is_unchanged(&live(array(&[]))));
+
+        // Another version or a deleted resource is left to the version guard.
+        let mut newer = live(array(&["a", "b"]));
+        newer.insert("version_id", "3");
+        assert!(!set.is_unchanged(&newer));
+        let mut deleted = live(array(&["a", "b"]));
+        deleted.insert("is_deleted", true);
+        assert!(!set.is_unchanged(&deleted));
+        let mut no_flag = live(array(&["a", "b"]));
+        no_flag.remove("is_deleted");
+        assert!(!set.is_unchanged(&no_flag));
+
+        // The stamp is written with the array (#1999): a stale or absent stamp
+        // is due, and so is one the update would unset.
+        let stamped = missing_update_stamped("2", Some(&["a", "b"]), Some("fp2"));
+        let with_fp = |fp: &str| {
+            let mut stored = live(array(&["a", "b"]));
+            stored.insert("missing_params_fp", fp);
+            stored
+        };
+        assert!(stamped.is_unchanged(&with_fp("fp2")));
+        assert!(!stamped.is_unchanged(&with_fp("fp1")));
+        assert!(!stamped.is_unchanged(&live(array(&["a", "b"]))));
+        assert!(!set.is_unchanged(&with_fp("fp2")));
+        let unset_stamped = missing_update_stamped("2", None, Some("fp2"));
+        assert!(unset_stamped.is_unchanged(&live(None)));
+        let mut stale_stamp_only = live(None);
+        stale_stamp_only.insert("missing_params_fp", "fp2");
+        assert!(!unset_stamped.is_unchanged(&stale_stamp_only));
     }
 
     #[test]

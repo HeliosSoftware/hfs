@@ -214,6 +214,14 @@ const TEMPORARILY_UNAVAILABLE_CODE: i32 = 365;
 /// is replayed, as before (#1895).
 const EVICTION_ROLLBACK_REASON: &str = "rolled back for eviction";
 
+/// The part of mongod's `WriteConflict` message for a transaction whose
+/// snapshot predates a catalog change on the collection it writes, such as an
+/// index build starting or committing ("Unable to write to collection ... due
+/// to catalog changes; please retry the operation"). MongoDB 7.0 fails such a
+/// write at once. Nobody won a race on the document, so it is retried like any
+/// abort without a conflicting writer, not reported as a lost race.
+const CATALOG_CHANGE_REASON: &str = "due to catalog changes";
+
 /// The server's `TransactionTooLargeForCache` code: WiredTiger rolled the
 /// transaction back because its own write set will not fit in the cache
 /// ("transaction is too large and will not fit in the storage engine cache",
@@ -274,11 +282,15 @@ impl WriteAttemptError {
     /// Classifies a driver error raised inside the attempt's session. Only the
     /// `WriteConflict` code says another writer got to the document, and not
     /// when its message names a rollback for eviction ([`is_eviction_rollback`]):
-    /// that one is cache pressure, with nobody having won. A transaction the
+    /// that one is cache pressure, with nobody having won. Nor when it names a
+    /// catalog change ([`is_catalog_change_conflict`]). A transaction the
     /// server aborted for any other reason keeps its driver error so
     /// [`replay_aborted_writes`] can decide what to do with it.
     fn driver(context: &str, err: MongoError) -> Self {
-        if has_server_code(&err, WRITE_CONFLICT_CODE) && !is_eviction_rollback(&err) {
+        if has_server_code(&err, WRITE_CONFLICT_CODE)
+            && !is_eviction_rollback(&err)
+            && !is_catalog_change_conflict(&err)
+        {
             Self::Conflict(err)
         } else {
             Self::Storage(internal_driver_error(context, err))
@@ -288,7 +300,8 @@ impl WriteAttemptError {
 
 /// The driver error behind `err` when the server aborted the write's
 /// transaction for a reason other than a conflicting writer: labelled
-/// `TransientTransactionError` without the `WriteConflict` code. A chunk
+/// `TransientTransactionError` without the `WriteConflict` code, or with one
+/// that names a catalog change ([`is_catalog_change_conflict`]). A chunk
 /// migration holding the critical section of one of the write's collections
 /// (`StaleConfig`) is the common case. The aborted attempt committed nothing;
 /// another attempt must still check the original version precondition. An
@@ -297,7 +310,7 @@ fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError>
     kept_driver_error(err).filter(|driver| {
         driver.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
             && !driver.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
-            && !has_server_code(driver, WRITE_CONFLICT_CODE)
+            && (!has_server_code(driver, WRITE_CONFLICT_CODE) || is_catalog_change_conflict(driver))
             && !is_eviction_rollback(driver)
     })
 }
@@ -448,6 +461,14 @@ fn is_eviction_rollback(err: &MongoError) -> bool {
     is_temporarily_unavailable(err)
         || server_error_message(err, WRITE_CONFLICT_CODE)
             .is_some_and(|message| message.contains(EVICTION_ROLLBACK_REASON))
+}
+
+/// True when `err` is a `WriteConflict` whose transaction's snapshot predates
+/// a catalog change on the collection ([`CATALOG_CHANGE_REASON`]), not a write
+/// that lost a race to another writer.
+fn is_catalog_change_conflict(err: &MongoError) -> bool {
+    server_error_message(err, WRITE_CONFLICT_CODE)
+        .is_some_and(|message| message.contains(CATALOG_CHANGE_REASON))
 }
 
 /// True when `err` is `TransactionTooLargeForCache` (388): as a failed command
@@ -9343,6 +9364,30 @@ mod transient_abort_tests {
             assert!(rolled_back_for_eviction(&err).is_some(), "{err}");
             assert!(aborted_without_conflicting_writer(&err).is_none(), "{err}");
         }
+    }
+
+    #[test]
+    fn a_catalog_change_conflict_is_not_a_lost_race() {
+        const CATALOG_112: &str = "Caused by :: Unable to write to collection 'db.resources' due to catalog changes; please retry the operation :: Please retry your operation or multi-document transaction.";
+        for driver in [
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", CATALOG_112),
+            write_conflict_write_error(CATALOG_112),
+        ] {
+            assert!(is_catalog_change_conflict(&driver), "{driver}");
+            let WriteAttemptError::Storage(err) =
+                WriteAttemptError::driver("Failed to insert resource (session)", driver)
+            else {
+                panic!("a catalog change is not a lost race");
+            };
+            assert!(rolled_back_for_eviction(&err).is_none(), "{err}");
+            // Replayed once the server's `TransientTransactionError` label is
+            // on it, which a constructed error cannot carry.
+            assert!(kept_driver_error(&err).is_some_and(is_catalog_change_conflict));
+        }
+        assert!(!is_catalog_change_conflict(&command_error(
+            WRITE_CONFLICT_CODE,
+            "WriteConflict"
+        )));
     }
 
     #[test]
