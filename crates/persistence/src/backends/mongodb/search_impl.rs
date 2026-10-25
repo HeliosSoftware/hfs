@@ -264,7 +264,7 @@ const MAX_SEARCH_PARAM_SORT_KEYS: usize = 15;
 const CANDIDATE_BATCH_SIZE: usize = 512;
 const PROBE_ROW_LIMIT: u64 = 100_000;
 // 300k × ~45 bytes/UUID ≈ 13.5 MB — safely under the 16 MB BSON document cap.
-pub(super) const MAX_RESULT_ID_SET: usize = 300_000;
+const MAX_RESULT_ID_SET: usize = 300_000;
 
 /// Targets a reference `:identifier` search may resolve to (#1408). They
 /// travel in one `$in`, two entries each; 10 000 stays near 1 MB, well under
@@ -655,7 +655,7 @@ fn missing_metadata_hint(filter: &Document) -> Option<Hint> {
     has_missing.then(|| Hint::Name(super::schema::RESOURCES_MISSING_INDEX.to_owned()))
 }
 
-fn missing_resource_condition(name: &str) -> Document {
+pub(super) fn missing_resource_condition(name: &str) -> Document {
     doc! { "$or": [
         { "missing_params": name },
         { "missing_params": { "$exists": false } },
@@ -3982,10 +3982,21 @@ impl MongoBackend {
         )));
         stages.push(doc! { "$project": { "_id": 0, "id": 1 } });
         let collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        // A bounded candidate set is a few identity seeks; left to itself the
+        // planner may walk the shared `missing_params` index instead, reading
+        // every absent key of the type for each batch (#2233).
+        let options = mongodb::options::AggregateOptions::builder()
+            .hint(
+                candidates
+                    .is_some()
+                    .then(|| Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned())),
+            )
+            .build();
         match session {
             Some(session) => {
                 let mut cursor = collection
                     .aggregate(stages)
+                    .with_options(options)
                     .session(&mut *session)
                     .await
                     .or_query_error("Failed to check missing resource metadata")?;
@@ -4007,6 +4018,7 @@ impl MongoBackend {
             None => {
                 let cursor = collection
                     .aggregate(stages)
+                    .with_options(options)
                     .await
                     .or_query_error("Failed to check missing resource metadata")?;
                 collect_id_set(cursor, "id").await

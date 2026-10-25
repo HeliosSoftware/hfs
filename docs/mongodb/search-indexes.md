@@ -101,9 +101,13 @@ resources; it does not add contained `:missing` support. Transaction and
 batch conditional criteria (`ifNoneExist`, conditional update/delete URLs)
 evaluate `:missing=true` with the same semantics inside the transaction's
 session (#2003): the metadata predicate with the value-index fallback when
-the fingerprint is fresh, the typed complement otherwise. `ifNoneExist` sees
-resources written earlier in the same bundle; URL-borne criteria are resolved
-before any write, as the R4 overlap rule requires.
+the fingerprint is fresh, the absence of a value row otherwise. As in search
+(#2004), the check runs on each batch of candidates the other criteria
+produced, so its cost follows the candidates, not the resource type; criteria
+with nothing else to drive from (only `_id`, `_lastUpdated` and
+`:missing=true`) scan the type in batches and stop at the second match.
+`ifNoneExist` sees resources written earlier in the same bundle; URL-borne
+criteria are resolved before any write, as the R4 overlap rule requires.
 
 Next to the array, `missing_params_fp` stamps the definition fingerprint it
 was computed from, and the `idx_resources_missing_params_fp` index serves the

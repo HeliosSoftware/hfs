@@ -5966,12 +5966,17 @@ impl MongoBackend {
         )
         .await?;
 
-        let absent_ids = self
-            .absent_ids_in_bundle_transaction(db, session, tenant, resource_type, &typed_params)
-            .await?;
-        if absent_ids.as_ref().is_some_and(HashSet::is_empty) {
-            return Ok(Vec::new());
-        }
+        // `:missing=true` is applied to each candidate batch below, after the
+        // other criteria have narrowed it, as search does (#2004): a pass over
+        // the whole type here would cost in proportion to the type, not to
+        // the candidates (#2003).
+        let missing: Vec<&SearchParameter> = typed_params
+            .iter()
+            .filter(|p| is_missing_true_param(p))
+            .collect();
+        let missing_support = self
+            .classify_missing_in_bundle_transaction(tenant, resource_type, &missing)
+            .await;
 
         let index_params: Vec<_> = typed_params
             .iter()
@@ -5992,7 +5997,7 @@ impl MongoBackend {
                 ..Default::default()
             };
             let tenant_id = tenant.tenant_id().as_str();
-            let mut filter = self.build_resource_filter(
+            let filter = self.build_resource_filter(
                 tenant_id,
                 resource_type,
                 &query,
@@ -6000,28 +6005,33 @@ impl MongoBackend {
                 None,
                 None,
             )?;
-            if let Some(ids) = &absent_ids {
-                filter = doc! {
-                    "$and": [
-                        filter,
-                        { "id": { "$in": ids.iter().cloned().collect::<Vec<_>>() } }
-                    ]
-                };
-            }
             let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-            let cursor = resources
-                .find(filter)
-                .limit(2)
-                .session(&mut *session)
-                .await
-                .map_err(|e| {
-                    internal_driver_error("Failed to query resources in transaction", e)
-                })?;
-            let docs = collect_session_documents(cursor, session).await?;
-            return docs
-                .into_iter()
-                .map(|doc| document_to_stored_resource(&doc, tenant, resource_type))
-                .collect();
+            if missing.is_empty() {
+                let cursor = resources
+                    .find(filter)
+                    .limit(2)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| {
+                        internal_driver_error("Failed to query resources in transaction", e)
+                    })?;
+                let docs = collect_session_documents(cursor, session).await?;
+                return docs
+                    .into_iter()
+                    .map(|doc| document_to_stored_resource(&doc, tenant, resource_type))
+                    .collect();
+            }
+            return self
+                .scan_absent_in_bundle_transaction(
+                    db,
+                    session,
+                    tenant,
+                    resource_type,
+                    filter,
+                    &missing,
+                    &missing_support,
+                )
+                .await;
         }
 
         let tenant_id = tenant.tenant_id().as_str();
@@ -6193,8 +6203,18 @@ impl MongoBackend {
                 candidate_ids.retain(|id| passing.contains(id));
             }
 
-            if let Some(absent) = &absent_ids {
-                candidate_ids.retain(|id| absent.contains(id));
+            if !missing.is_empty() && !candidate_ids.is_empty() {
+                candidate_ids = self
+                    .retain_absent_in_bundle_transaction(
+                        db,
+                        session,
+                        tenant_id,
+                        resource_type,
+                        &missing,
+                        &missing_support,
+                        candidate_ids,
+                    )
+                    .await?;
             }
             candidate_ids.retain(|id| !matched_ids.contains(id));
             if !candidate_ids.is_empty() {
@@ -6263,131 +6283,175 @@ impl MongoBackend {
         Ok(matches)
     }
 
-    async fn absent_ids_in_bundle_transaction(
+    /// Classifies a conditional entry's `:missing=true` criteria once, after
+    /// the same freshness probe search runs (#1999, #2007).
+    async fn classify_missing_in_bundle_transaction(
         &self,
-        db: &mongodb::Database,
-        session: &mut ClientSession,
         tenant: &TenantContext,
         resource_type: &str,
-        typed_params: &[SearchParameter],
-    ) -> StorageResult<Option<HashSet<String>>> {
-        let missing: Vec<&SearchParameter> = typed_params
-            .iter()
-            .filter(|p| is_missing_true_param(p))
-            .collect();
+        missing: &[&SearchParameter],
+    ) -> MissingSupport {
         if missing.is_empty() {
-            return Ok(None);
+            return MissingSupport::none();
         }
         let tenant_id = tenant.tenant_id().as_str();
-        let probe_query = SearchQuery {
+        let query = SearchQuery {
             resource_type: resource_type.to_string(),
             parameters: missing.iter().map(|p| (*p).clone()).collect(),
             ..Default::default()
         };
-        self.refresh_missing_metadata_freshness(tenant_id, &probe_query)
+        self.refresh_missing_metadata_freshness(tenant_id, &query)
             .await;
-        let support = self.classify_missing(tenant_id, resource_type, &probe_query);
-        let mut combined: Option<HashSet<String>> = None;
-        for param in missing {
-            let ids = if support.is_resource_parameter(param) {
-                self.metadata_missing_ids(
-                    db,
-                    tenant_id,
-                    resource_type,
-                    param,
-                    combined.as_ref(),
-                    Some(&mut *session),
-                )
-                .await?
-            } else {
-                self.complement_absent_ids_in_transaction(
-                    db,
-                    session,
-                    tenant_id,
-                    resource_type,
-                    param,
-                    combined.as_ref(),
-                )
-                .await?
-            };
-            if ids.is_empty() {
-                return Ok(Some(ids));
-            }
-            combined = Some(ids);
-        }
-        Ok(combined)
+        self.classify_missing(tenant_id, resource_type, &query)
     }
 
-    async fn complement_absent_ids_in_transaction(
+    /// Keeps the `candidates` every `:missing=true` criterion holds for, read
+    /// in the transaction's session so earlier writes of the Bundle count:
+    /// `missing_params` with the value-index fallback where it answers the
+    /// parameter, the absence of a value row otherwise — the same routes
+    /// search takes. The cost follows the candidate batch, not the type.
+    #[allow(clippy::too_many_arguments)]
+    async fn retain_absent_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
         tenant_id: &str,
         resource_type: &str,
-        param: &SearchParameter,
-        candidates: Option<&HashSet<String>>,
+        missing: &[&SearchParameter],
+        missing_support: &MissingSupport,
+        mut candidates: HashSet<String>,
     ) -> StorageResult<HashSet<String>> {
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let mut presence =
-            super::search_impl::missing_presence_filter(tenant_id, resource_type, param);
-        if let Some(ids) = candidates {
+        for param in missing {
+            if candidates.is_empty() {
+                break;
+            }
+            if missing_support.is_resource_parameter(param) {
+                candidates = self
+                    .metadata_missing_ids(
+                        db,
+                        tenant_id,
+                        resource_type,
+                        param,
+                        Some(&candidates),
+                        Some(&mut *session),
+                    )
+                    .await?;
+                continue;
+            }
+            let mut presence =
+                super::search_impl::missing_presence_filter(tenant_id, resource_type, param);
             presence.insert(
                 "resource_id",
-                doc! { "$in": ids.iter().cloned().collect::<Vec<_>>() },
+                doc! { "$in": candidates.iter().cloned().collect::<Vec<_>>() },
             );
+            let present: HashSet<String> = search_index
+                .distinct("resource_id", presence)
+                .session(&mut *session)
+                .await
+                .map_err(|e| {
+                    internal_driver_error("Failed presence distinct for missing criteria", e)
+                })?
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            candidates.retain(|id| !present.contains(id));
         }
-        let present: HashSet<String> = search_index
-            .distinct("resource_id", presence)
+        Ok(candidates)
+    }
+
+    /// Criteria with no search-index parameter to drive from: only
+    /// `_id` / `_lastUpdated` (in `filter`) and `:missing=true`. The entry
+    /// needs at most two matches, so an unsorted cursor over `filter` is read
+    /// in batches, each checked by [`Self::retain_absent_in_bundle_transaction`],
+    /// until two match or the type runs out. Metadata-answered criteria also
+    /// narrow the cursor itself through `idx_resources_missing_params`.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_absent_in_bundle_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        resource_type: &str,
+        filter: Document,
+        missing: &[&SearchParameter],
+        missing_support: &MissingSupport,
+    ) -> StorageResult<Vec<StoredResource>> {
+        const BATCH_SIZE: usize = 512;
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut conditions = vec![filter];
+        conditions.extend(
+            missing
+                .iter()
+                .filter(|p| missing_support.is_resource_parameter(p))
+                .map(|p| super::search_impl::missing_resource_condition(&p.name)),
+        );
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let mut cursor = resources
+            .find(doc! { "$and": conditions })
+            .projection(doc! { "_id": 0, "id": 1 })
+            .batch_size(BATCH_SIZE as u32)
             .session(&mut *session)
             .await
-            .map_err(|e| internal_driver_error("Failed presence distinct for missing criteria", e))?
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        match candidates {
-            Some(ids) => Ok(ids
-                .iter()
-                .filter(|id| !present.contains(*id))
-                .cloned()
-                .collect()),
-            None => {
-                let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-                let mut cursor = resources
-                    .find(doc! {
-                        "tenant_id": tenant_id,
-                        "resource_type": resource_type,
-                        "is_deleted": false,
-                    })
-                    .projection(doc! { "_id": 0, "id": 1 })
-                    .limit((super::search_impl::MAX_RESULT_ID_SET + 1) as i64)
-                    .session(&mut *session)
-                    .await
-                    .map_err(|e| {
-                        internal_driver_error("Failed to list live ids for missing criteria", e)
-                    })?;
-                let mut all: HashSet<String> = HashSet::new();
-                while cursor
-                    .advance(&mut *session)
-                    .await
-                    .map_err(|e| internal_driver_error("Failed to advance live id cursor", e))?
-                {
-                    let doc = cursor.deserialize_current().map_err(|e| {
-                        internal_error(format!("Failed to deserialize live id: {e}"))
-                    })?;
-                    if let Ok(id) = doc.get_str("id") {
-                        all.insert(id.to_string());
-                    }
+            .map_err(|e| {
+                internal_driver_error("Failed to scan resources for missing criteria", e)
+            })?;
+        let mut matched: Vec<String> = Vec::with_capacity(2);
+        let mut batch: HashSet<String> = HashSet::with_capacity(BATCH_SIZE);
+        loop {
+            let more = cursor
+                .advance(&mut *session)
+                .await
+                .map_err(|e| internal_driver_error("Failed to advance missing-criteria scan", e))?;
+            if more {
+                let doc = cursor.deserialize_current().map_err(|e| {
+                    internal_error(format!("Failed to deserialize resource id: {e}"))
+                })?;
+                if let Ok(id) = doc.get_str("id") {
+                    batch.insert(id.to_string());
                 }
-                if all.len() > super::search_impl::MAX_RESULT_ID_SET {
-                    return Err(StorageError::Search(SearchError::TooManyResults {
-                        count: all.len(),
-                        max: super::search_impl::MAX_RESULT_ID_SET,
-                    }));
+                if batch.len() < BATCH_SIZE {
+                    continue;
                 }
-                all.retain(|id| !present.contains(id));
-                Ok(all)
+            }
+            if !batch.is_empty() {
+                let absent = self
+                    .retain_absent_in_bundle_transaction(
+                        db,
+                        session,
+                        tenant_id,
+                        resource_type,
+                        missing,
+                        missing_support,
+                        std::mem::take(&mut batch),
+                    )
+                    .await?;
+                matched.extend(absent.into_iter().take(2 - matched.len()));
+            }
+            if matched.len() >= 2 || !more {
+                break;
             }
         }
+        if matched.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cursor = resources
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+                "id": { "$in": matched },
+            })
+            .session(&mut *session)
+            .await
+            .map_err(|e| {
+                internal_driver_error("Failed to fetch resources for missing criteria", e)
+            })?;
+        collect_session_documents(cursor, session)
+            .await?
+            .into_iter()
+            .map(|doc| document_to_stored_resource(&doc, tenant, resource_type))
+            .collect()
     }
 
     /// Matches `ifNoneExist` criteria against the raw `resources` documents.
