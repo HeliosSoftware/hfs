@@ -10,13 +10,15 @@
 //! - **[`AuditEventBuilder`]** — Fluent builder for typed `AuditEvent` structs
 //! - **[`AuditBridge`]** — Bridges `helios_auth::AuditEventSink` to `AuditSink`
 //! - **[`AuditMiddlewareState`]** — Axum middleware for FHIR REST audit logging
+//! - **[`QueuedSink`]** — Bounded queue + writer pool in front of a sink
 //!
 //! ## Design Principles
 //!
 //! 1. **Zero-cost when disabled** — `NullSink` compiles to no-ops
 //! 2. **Uses the FHIR model directly** — No custom intermediate representation
 //! 3. **Async-first** — All sink implementations are async
-//! 4. **Fire-and-forget** — Audit failures are logged, never propagated
+//! 4. **Fire-and-forget** — Audit failures are logged and counted
+//!    (`audit_events_dropped_total`), never propagated
 //! 5. **Single active backend** — One configured sink at a time
 //! 6. **Immutable audit trail** — No UPDATE or DELETE on AuditEvent via REST
 //!
@@ -29,6 +31,10 @@
 //! | `HFS_AUDIT_DATABASE_URL` | — | Dedicated DB URL (optional) |
 //! | `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | AuditEvent.source.observer |
 //! | `HFS_AUDIT_EXCLUDE_PATHS` | — | Comma-separated paths to skip |
+//! | `HFS_AUDIT_QUEUE_CAPACITY` | `10000` | Events queued before the overflow policy applies |
+//! | `HFS_AUDIT_WRITERS` | 4 × cores | Writer tasks draining the queue |
+//! | `HFS_AUDIT_OVERFLOW` | `block` | Full queue: `block` the request or `drop` the event |
+//! | `HFS_AUDIT_WRITE_RETRIES` | `5` | Retries of a transient database write |
 
 /// Version-agnostic alias for the FHIR model module backing `AuditEvent`.
 ///
@@ -57,6 +63,7 @@ pub mod error;
 pub mod exclusion;
 pub mod helpers;
 pub mod lifecycle;
+pub mod metrics;
 pub mod middleware;
 pub mod patient;
 pub mod sink;
@@ -73,4 +80,4 @@ pub use middleware::{AuditAgent, AuditMiddlewareState, AuditResponseContext};
 pub use sink::AuditSink;
 #[cfg(feature = "cloudwatch")]
 pub use sinks::CloudWatchLogsSink;
-pub use sinks::{DatabaseSink, FileSink, NullSink};
+pub use sinks::{DatabaseSink, FileSink, NullSink, OverflowPolicy, QueueConfig, QueuedSink};

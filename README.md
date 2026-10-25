@@ -411,6 +411,10 @@ JWT/bearer auth (`HFS_AUTH_*`, e.g. `HFS_AUTH_ENABLED`, `HFS_AUTH_JWKS_URL`, `HF
 | `HFS_AUDIT_S3_VALIDATE_BUCKETS` | *(none)* | Optional dedicated S3 bucket validation toggle for audit events |
 | `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | Sets `AuditEvent.source.observer` |
 | `HFS_AUDIT_EXCLUDE_PATHS` | *(none)* | Comma-separated paths to exclude from audit middleware |
+| `HFS_AUDIT_QUEUE_CAPACITY` | `10000` | Audit write-queue capacity |
+| `HFS_AUDIT_WRITERS` | 4 × cores (4–64) | Writer tasks draining the audit queue (bounds concurrent audit writes) |
+| `HFS_AUDIT_OVERFLOW` | `block` | Full audit queue: `block` the response until queued, or `drop` the event (counted in `audit_events_dropped_total`) |
+| `HFS_AUDIT_WRITE_RETRIES` | `5` | Retries of a transient database-sink write before the event is dropped and counted |
 | `HFS_AUDIT_CLOUDWATCH_LOG_GROUP` | *(none)* | Required when `HFS_AUDIT_BACKEND=cloudwatch`; CloudWatch Logs log group name |
 | `HFS_AUDIT_CLOUDWATCH_LOG_STREAM` | `hfs-audit` | CloudWatch Logs log stream name |
 | `HFS_AUDIT_CLOUDWATCH_REGION` | *(AWS chain)* | AWS region override for CloudWatch Logs |

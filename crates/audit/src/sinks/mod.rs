@@ -5,9 +5,11 @@ pub mod cloudwatch;
 pub mod database;
 pub mod file;
 pub mod null;
+pub mod queued;
 
 #[cfg(feature = "cloudwatch")]
 pub use cloudwatch::CloudWatchLogsSink;
 pub use database::DatabaseSink;
 pub use file::FileSink;
 pub use null::NullSink;
+pub use queued::{OverflowPolicy, QueueConfig, QueuedSink};
