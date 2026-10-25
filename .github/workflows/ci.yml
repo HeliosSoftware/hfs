@@ -47,9 +47,9 @@ jobs:
     name: Test Rust
     runs-on: [self-hosted]
     # Bound the whole job so a genuine hang fails fast instead of parking a
-    # runner for hours. A healthy run (full all-features build + tests) fits
-    # comfortably under this.
-    timeout-minutes: 120
+    # runner for hours. Healthy runs on the slower runners (agent5/agent9)
+    # take ~105-115 min, so 120 cancelled good runs; 180 leaves headroom.
+    timeout-minutes: 180
     steps:
       - name: Verify DOCKER_HOST is set
         if: env.DOCKER_HOST == ''
