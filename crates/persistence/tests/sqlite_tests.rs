@@ -52,6 +52,18 @@ async fn sqlite_tenant_has_resources_matches_discovery() {
     tenant_existence_suite::child_data_is_not_the_parents(&backend, "exist").await;
 }
 
+#[path = "common/sof_terminology_suite.rs"]
+mod sof_terminology_suite;
+
+/// #2185: the SQL-on-FHIR terminology store contract every SOF-capable
+/// backend shares. Physical-table residue is checked by the SQLite module's
+/// own unit tests, which can reach the connection.
+#[tokio::test]
+async fn sqlite_sof_terminology_store_suite() {
+    let backend = create_backend();
+    sof_terminology_suite::run_all(&backend, "sof-term", None).await;
+}
+
 /// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
 /// relative to this file, the same arrangement the other backends' binaries
 /// use for their shared suites.

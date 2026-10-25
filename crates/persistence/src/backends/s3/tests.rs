@@ -9392,3 +9392,142 @@ mod scan_read_limit {
         assert_eq!(backend.scan_limit.available_permits(), 2);
     }
 }
+
+/// The SQL-on-FHIR terminology store on S3 (#2185). The store contract runs
+/// against MinIO in `tests/minio_s3_tests.rs`; these pin what only the mock
+/// can show: where the objects live, that released generations are deleted,
+/// and that a lost registry swap never drops a concurrent reference.
+mod sof_terminology {
+    use super::*;
+    use crate::core::sof_terminology::SofTerminologyStore;
+    use helios_sof::sqlquery::{TerminologyKind, TerminologyRelation};
+
+    const BUCKET: &str = "test-bucket";
+    const URL: &str = "http://example.org/vs";
+
+    fn tenant(id: &str) -> TenantContext {
+        TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
+    }
+
+    fn vs(codes: &[&str]) -> TerminologyRelation {
+        TerminologyRelation {
+            kind: TerminologyKind::ValueSet,
+            rows: codes.iter().map(|c| json!({"code": c})).collect(),
+        }
+    }
+
+    fn setup() -> (Arc<MockS3Client>, S3Backend) {
+        let mock = Arc::new(MockS3Client::with_buckets(&[BUCKET]));
+        let backend = make_prefix_backend(mock.clone());
+        (mock, backend)
+    }
+
+    fn terminology_keys(mock: &MockS3Client) -> Vec<String> {
+        mock.keys(BUCKET)
+            .into_iter()
+            .filter(|k| k.contains("sof-terminology"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn objects_live_under_the_tenants_bulk_root_and_go_with_the_last_reference() {
+        let (mock, backend) = setup();
+        let t = tenant("acme");
+        backend
+            .set_library_dependencies(&t, "a", vec![(URL.into(), vs(&["1"]))])
+            .await
+            .unwrap();
+        backend
+            .set_library_dependencies(&t, "b", vec![(URL.into(), vs(&["1", "2"]))])
+            .await
+            .unwrap();
+        let keys = terminology_keys(&mock);
+        assert_eq!(
+            keys.len(),
+            2,
+            "registry + the one current generation: {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .all(|k| k.starts_with("acme/bulk/sof-terminology/")),
+            "{keys:?}"
+        );
+
+        backend
+            .set_library_dependencies(&t, "a", vec![])
+            .await
+            .unwrap();
+        backend
+            .set_library_dependencies(&t, "b", vec![])
+            .await
+            .unwrap();
+        assert!(backend.load(&t, URL).await.unwrap().is_none());
+        assert_eq!(
+            terminology_keys(&mock),
+            vec!["acme/bulk/sof-terminology/registry.json".to_string()],
+            "only the (empty) registry remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_deletes_every_terminology_object_of_the_tenant() {
+        let (mock, backend) = setup();
+        for id in ["acme", "other"] {
+            backend
+                .set_library_dependencies(&tenant(id), "a", vec![(URL.into(), vs(&["1"]))])
+                .await
+                .unwrap();
+        }
+        backend.purge_tenant_data("acme").await.unwrap();
+        let keys = terminology_keys(&mock);
+        assert!(keys.iter().all(|k| k.starts_with("other/")), "{keys:?}");
+        assert!(backend.load(&tenant("other"), URL).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_conditional_write_is_retried() {
+        let (mock, backend) = setup();
+        mock.conflict_puts_at("acme/bulk/sof-terminology/registry.json", 3);
+        backend
+            .set_library_dependencies(&tenant("acme"), "a", vec![(URL.into(), vs(&["1"]))])
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.load(&tenant("acme"), URL).await.unwrap(),
+            Some(vs(&["1"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_swap_keeps_the_winners_reference() {
+        let (mock, backend) = setup();
+        let t = tenant("acme");
+        let registry_key = "acme/bulk/sof-terminology/registry.json";
+        backend
+            .set_library_dependencies(&t, "a", vec![(URL.into(), vs(&["1"]))])
+            .await
+            .unwrap();
+
+        // A concurrent writer adds Library b's reference to the same relation
+        // between our read of the registry and our swap.
+        let mut stolen: Value =
+            serde_json::from_slice(&mock.object_body(BUCKET, registry_key).unwrap()).unwrap();
+        stolen["version"] = json!(stolen["version"].as_u64().unwrap() + 1);
+        stolen["registry"]["entries"][0]["libraries"] = json!(["a", "b"]);
+        mock.steal_once(BUCKET, registry_key, serde_json::to_vec(&stolen).unwrap());
+
+        // Releasing a must lose the swap, re-read, and leave b's reference.
+        backend
+            .set_library_dependencies(&t, "a", vec![])
+            .await
+            .unwrap();
+        assert_eq!(backend.load(&t, URL).await.unwrap(), Some(vs(&["1"])));
+        let puts = mock.recorded_puts();
+        assert!(
+            puts.iter()
+                .filter(|p| p.key == registry_key)
+                .all(|p| p.if_match.is_some() || p.if_none_match.as_deref() == Some("*")),
+            "every registry write is conditional"
+        );
+    }
+}

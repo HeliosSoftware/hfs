@@ -46,6 +46,8 @@ pub fn skip_function(
         EvaluationResult::Integer(i, _, _) => {
             if *i < 0 { 0 } else { *i as usize } // Treat negative skip as 0
         }
+        // An empty count propagates: `x.skip({})` is empty
+        EvaluationResult::Empty => return Ok(EvaluationResult::Empty),
         // Add conversion from Decimal if it's an integer value
         EvaluationResult::Decimal(d, _, _) if d.is_integer() && d.is_sign_positive() => {
             d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
@@ -192,6 +194,8 @@ pub fn take_function(
         EvaluationResult::Integer(i, _, _) => {
             if *i <= 0 { 0 } else { *i as usize } // Treat non-positive take as 0
         }
+        // An empty count propagates: `x.take({})` is empty
+        EvaluationResult::Empty => return Ok(EvaluationResult::Empty),
         // Add conversion from Decimal if it's an integer value
         EvaluationResult::Decimal(d, _, _) if d.is_integer() && d.is_sign_positive() => {
             d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal

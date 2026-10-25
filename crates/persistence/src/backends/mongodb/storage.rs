@@ -49,6 +49,7 @@ use super::deferred_index::{
 };
 use super::retry::{BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, jitter_fraction};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
+use super::search_impl::MissingSupport;
 
 pub(super) fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -214,6 +215,14 @@ const TEMPORARILY_UNAVAILABLE_CODE: i32 = 365;
 /// is replayed, as before (#1895).
 const EVICTION_ROLLBACK_REASON: &str = "rolled back for eviction";
 
+/// The part of mongod's `WriteConflict` message for a transaction whose
+/// snapshot predates a catalog change on the collection it writes, such as an
+/// index build starting or committing ("Unable to write to collection ... due
+/// to catalog changes; please retry the operation"). MongoDB 7.0 fails such a
+/// write at once. Nobody won a race on the document, so it is retried like any
+/// abort without a conflicting writer, not reported as a lost race.
+const CATALOG_CHANGE_REASON: &str = "due to catalog changes";
+
 /// The server's `TransactionTooLargeForCache` code: WiredTiger rolled the
 /// transaction back because its own write set will not fit in the cache
 /// ("transaction is too large and will not fit in the storage engine cache",
@@ -274,11 +283,15 @@ impl WriteAttemptError {
     /// Classifies a driver error raised inside the attempt's session. Only the
     /// `WriteConflict` code says another writer got to the document, and not
     /// when its message names a rollback for eviction ([`is_eviction_rollback`]):
-    /// that one is cache pressure, with nobody having won. A transaction the
+    /// that one is cache pressure, with nobody having won. Nor when it names a
+    /// catalog change ([`is_catalog_change_conflict`]). A transaction the
     /// server aborted for any other reason keeps its driver error so
     /// [`replay_aborted_writes`] can decide what to do with it.
     fn driver(context: &str, err: MongoError) -> Self {
-        if has_server_code(&err, WRITE_CONFLICT_CODE) && !is_eviction_rollback(&err) {
+        if has_server_code(&err, WRITE_CONFLICT_CODE)
+            && !is_eviction_rollback(&err)
+            && !is_catalog_change_conflict(&err)
+        {
             Self::Conflict(err)
         } else {
             Self::Storage(internal_driver_error(context, err))
@@ -288,7 +301,8 @@ impl WriteAttemptError {
 
 /// The driver error behind `err` when the server aborted the write's
 /// transaction for a reason other than a conflicting writer: labelled
-/// `TransientTransactionError` without the `WriteConflict` code. A chunk
+/// `TransientTransactionError` without the `WriteConflict` code, or with one
+/// that names a catalog change ([`is_catalog_change_conflict`]). A chunk
 /// migration holding the critical section of one of the write's collections
 /// (`StaleConfig`) is the common case. The aborted attempt committed nothing;
 /// another attempt must still check the original version precondition. An
@@ -297,7 +311,7 @@ fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError>
     kept_driver_error(err).filter(|driver| {
         driver.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
             && !driver.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
-            && !has_server_code(driver, WRITE_CONFLICT_CODE)
+            && (!has_server_code(driver, WRITE_CONFLICT_CODE) || is_catalog_change_conflict(driver))
             && !is_eviction_rollback(driver)
     })
 }
@@ -448,6 +462,14 @@ fn is_eviction_rollback(err: &MongoError) -> bool {
     is_temporarily_unavailable(err)
         || server_error_message(err, WRITE_CONFLICT_CODE)
             .is_some_and(|message| message.contains(EVICTION_ROLLBACK_REASON))
+}
+
+/// True when `err` is a `WriteConflict` whose transaction's snapshot predates
+/// a catalog change on the collection ([`CATALOG_CHANGE_REASON`]), not a write
+/// that lost a race to another writer.
+fn is_catalog_change_conflict(err: &MongoError) -> bool {
+    server_error_message(err, WRITE_CONFLICT_CODE)
+        .is_some_and(|message| message.contains(CATALOG_CHANGE_REASON))
 }
 
 /// True when `err` is `TransactionTooLargeForCache` (388): as a failed command
@@ -1543,6 +1565,14 @@ impl ResourceStorage for MongoBackend {
         true
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        Some(std::sync::Arc::new(
+            super::sof_terminology::MongoTerminologyStore::new(self),
+        ))
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::in_process::{InProcessSofRunner, ResourceScan};
         use crate::sof::mongodb::MongoInDbRunner;
@@ -2402,6 +2432,8 @@ impl ResourceStorage for MongoBackend {
         .delete_many(doc! { "tenant_id": id })
         .await
         .or_query_error("purge delete (bulk_provider_submissions)")?;
+        // SQL query terminology relations are tenant-keyed documents (#2185).
+        self.purge_tenant_sof_terminology(id).await?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
         // do not reach them — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313).
@@ -2488,6 +2520,7 @@ pub(super) struct SearchIndexDocuments {
     pub contained: Vec<Document>,
     /// Known absence outside the FHIR payload; None means extraction was skipped or failed.
     pub missing_params: Option<Vec<String>>,
+    pub missing_fp: Option<String>,
 }
 
 impl SearchIndexDocuments {
@@ -2495,11 +2528,18 @@ impl SearchIndexDocuments {
         if let Some(names) = &self.missing_params {
             document.insert("missing_params", names.clone());
         }
+        if let Some(fp) = &self.missing_fp {
+            document.insert("missing_params_fp", fp.clone());
+        }
         document
     }
 
     pub(super) fn resource_update(&self, update: Document) -> Document {
-        with_missing_metadata_update(update, self.missing_params.as_deref())
+        with_missing_metadata_update(
+            update,
+            self.missing_params.as_deref(),
+            self.missing_fp.as_deref(),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2511,6 +2551,7 @@ impl SearchIndexDocuments {
 pub(super) fn with_missing_metadata_update(
     mut update: Document,
     missing_params: Option<&[String]>,
+    missing_fp: Option<&str>,
 ) -> Document {
     if let Some(names) = missing_params {
         if !update.contains_key("$set") {
@@ -2520,6 +2561,20 @@ pub(super) fn with_missing_metadata_update(
             .get_document_mut("$set")
             .expect("resource update has a set document");
         set.insert("missing_params", names.to_vec());
+        match missing_fp {
+            Some(fp) => {
+                set.insert("missing_params_fp", fp);
+            }
+            None => {
+                if !update.contains_key("$unset") {
+                    update.insert("$unset", doc! {});
+                }
+                let unset = update
+                    .get_document_mut("$unset")
+                    .expect("resource update has an unset document");
+                unset.insert("missing_params_fp", "");
+            }
+        }
     } else {
         if !update.contains_key("$unset") {
             update.insert("$unset", doc! {});
@@ -2528,6 +2583,7 @@ pub(super) fn with_missing_metadata_update(
             .get_document_mut("$unset")
             .expect("resource update has an unset document");
         unset.insert("missing_params", "");
+        unset.insert("missing_params_fp", "");
     }
     update
 }
@@ -3522,8 +3578,8 @@ impl MongoBackend {
         resource_id: &str,
         resource: &Value,
     ) -> (SearchIndexDocuments, Option<String>) {
-        let (own, mut missing_params, failure) = match self
-            .tenant_extractor(tenant_id)
+        let extractor = self.tenant_extractor(tenant_id);
+        let (own, mut missing_params, failure) = match extractor
             .extract_with_missing(resource, resource_type)
         {
             Ok(extraction) => {
@@ -3543,23 +3599,26 @@ impl MongoBackend {
                 // unparseable date, a Period end that is not a date) is as
                 // absent as one that extracted nothing: without this it would
                 // match neither `:missing=true` nor `:missing=false` (#2000).
-                let missing = extraction
-                    .missing
-                    .into_iter()
-                    .map(|parameter| parameter.name)
-                    .chain(
-                        extraction
-                            .present
-                            .into_iter()
-                            .filter(|parameter| {
-                                !own.iter().any(|row| row_marks_present(row, parameter))
-                            })
-                            .map(|parameter| parameter.name),
-                    )
-                    .collect::<Vec<_>>();
+                let missing = self.config().missing_metadata.then(|| {
+                    extraction
+                        .missing
+                        .into_iter()
+                        .map(|parameter| parameter.name)
+                        .chain(
+                            extraction
+                                .present
+                                .into_iter()
+                                .filter(|parameter| {
+                                    !own.iter().any(|row| row_marks_present(row, parameter))
+                                })
+                                .map(|parameter| parameter.name),
+                        )
+                        .filter(|name| super::search_impl::records_missing_metadata(name))
+                        .collect::<Vec<_>>()
+                });
                 (
                     own,
-                    Some(missing),
+                    missing,
                     (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
                 )
             }
@@ -3586,6 +3645,9 @@ impl MongoBackend {
             names.sort_unstable();
             names.dedup();
         }
+        let missing_fp = missing_params
+            .is_some()
+            .then(|| self.stamp_missing_fingerprint(tenant_id, resource_type));
 
         // Also index any contained resources for `_contained` search, into
         // their own collection (`search_index_contained`) rather than mixed
@@ -3614,6 +3676,7 @@ impl MongoBackend {
                 own,
                 contained,
                 missing_params,
+                missing_fp,
             },
             failure,
         )
@@ -5906,8 +5969,14 @@ impl MongoBackend {
                 ..Default::default()
             };
             let tenant_id = tenant.tenant_id().as_str();
-            let filter =
-                self.build_resource_filter(tenant_id, resource_type, &query, None, None)?;
+            let filter = self.build_resource_filter(
+                tenant_id,
+                resource_type,
+                &query,
+                &MissingSupport::none(),
+                None,
+                None,
+            )?;
             let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
             let cursor = resources
                 .find(filter)
@@ -6118,6 +6187,7 @@ impl MongoBackend {
                     tenant_id,
                     resource_type,
                     &resource_query,
+                    &MissingSupport::none(),
                     None,
                     None,
                 )?;
@@ -6233,6 +6303,7 @@ impl MongoBackend {
                 tenant_id,
                 resource_type,
                 &query,
+                &MissingSupport::none(),
                 None,
                 None,
             )?);
@@ -7662,6 +7733,33 @@ impl ReindexTarget for MongoBackend {
         let mut stats = ReindexPageStats::default();
         self.write_search_entries_page_timed(tenant, resources, &mut stats)
             .await
+    }
+
+    /// `missing_params` is this backend's search metadata (#1984), and only
+    /// while it owns search: an offloaded deployment never reads it.
+    fn supports_search_metadata(&self) -> bool {
+        !self.is_search_offloaded()
+    }
+
+    /// Backfills `missing_params` without a rebuild (#2008); see
+    /// `write_metadata_page`.
+    async fn write_search_metadata_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        skip_existing: bool,
+    ) -> (Vec<StorageResult<()>>, u64) {
+        if resources.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let n = resources.len();
+        let db = match self.get_database().await {
+            Ok(db) => db,
+            Err(e) => return super::reindex_pipeline::PageFailure::storage(e).fan_out_metadata(n),
+        };
+        self.write_metadata_page(&db, tenant.tenant_id().as_str(), resources, skip_existing)
+            .await
+            .unwrap_or_else(|failure| failure.fan_out_metadata(n))
     }
 }
 
@@ -9278,6 +9376,30 @@ mod transient_abort_tests {
             assert!(rolled_back_for_eviction(&err).is_some(), "{err}");
             assert!(aborted_without_conflicting_writer(&err).is_none(), "{err}");
         }
+    }
+
+    #[test]
+    fn a_catalog_change_conflict_is_not_a_lost_race() {
+        const CATALOG_112: &str = "Caused by :: Unable to write to collection 'db.resources' due to catalog changes; please retry the operation :: Please retry your operation or multi-document transaction.";
+        for driver in [
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", CATALOG_112),
+            write_conflict_write_error(CATALOG_112),
+        ] {
+            assert!(is_catalog_change_conflict(&driver), "{driver}");
+            let WriteAttemptError::Storage(err) =
+                WriteAttemptError::driver("Failed to insert resource (session)", driver)
+            else {
+                panic!("a catalog change is not a lost race");
+            };
+            assert!(rolled_back_for_eviction(&err).is_none(), "{err}");
+            // Replayed once the server's `TransientTransactionError` label is
+            // on it, which a constructed error cannot carry.
+            assert!(kept_driver_error(&err).is_some_and(is_catalog_change_conflict));
+        }
+        assert!(!is_catalog_change_conflict(&command_error(
+            WRITE_CONFLICT_CODE,
+            "WriteConflict"
+        )));
     }
 
     #[test]

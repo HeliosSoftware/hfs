@@ -10,6 +10,8 @@
 //! - `name TEXT` is included in `concept_maps` from the start
 //! - Trigram GIN index on `concepts.display` for fast substring search
 
+use std::collections::{HashMap, VecDeque};
+
 /// Full PostgreSQL DDL for the HTS normalized schema.
 pub const SCHEMA: &str = "
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -315,6 +317,9 @@ BEGIN
 END $$;
 ";
 
+/// Shared by base schema DDL and identity migration on the same database.
+pub(super) const HTS_SCHEMA_LOCK: i64 = 0x4854_535f_5343_484du64 as i64; // "HTS_SCHM"
+
 /// Apply the HTS PostgreSQL schema to the given client connection.
 ///
 /// Safe to call on every startup — all statements are idempotent. Concurrent
@@ -323,11 +328,6 @@ END $$;
 /// `pg_extension_name_index` (Postgres's `IF NOT EXISTS` guard is not
 /// transactional with concurrent writers).
 pub async fn apply(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    // Arbitrary constant — must match across all callers that apply this
-    // schema. Use an application-scoped value that won't collide with
-    // user-chosen advisory locks.
-    const HTS_SCHEMA_LOCK: i64 = 0x4854_535f_5343_484du64 as i64; // "HTS_SCHM"
-
     client
         .execute("SELECT pg_advisory_lock($1)", &[&HTS_SCHEMA_LOCK])
         .await?;
@@ -360,8 +360,16 @@ pub async fn build_concept_closure_pg(
     client: &mut tokio_postgres::Client,
     system_id: &str,
 ) -> Result<(), tokio_postgres::Error> {
-    use std::collections::{HashMap, VecDeque};
+    let tx = client.transaction().await?;
+    build_concept_closure_in_transaction(&tx, system_id).await?;
+    tx.commit().await
+}
 
+/// Build closure within a resource transaction, before any replacement is visible.
+pub(crate) async fn build_concept_closure_in_transaction(
+    tx: &impl tokio_postgres::GenericClient,
+    system_id: &str,
+) -> Result<(), tokio_postgres::Error> {
     // Do the whole build in ONE transaction that first pins the parent
     // `code_systems` row with `FOR SHARE`. A concurrent `DELETE FROM
     // code_systems` (e.g. `delete_normalized` removing a CodeSystem, which
@@ -370,7 +378,6 @@ pub async fn build_concept_closure_pg(
     // INSERTs below violate `concept_closure_system_id_fkey`. If the row is
     // already gone, another writer deleted the system first, so there is
     // nothing to build.
-    let tx = client.transaction().await?;
     if tx
         .query_opt(
             "SELECT 1 FROM code_systems WHERE id = $1 FOR SHARE",
@@ -379,7 +386,6 @@ pub async fn build_concept_closure_pg(
         .await?
         .is_none()
     {
-        tx.commit().await?;
         return Ok(());
     }
 
@@ -400,7 +406,6 @@ pub async fn build_concept_closure_pg(
             &[&system_id],
         )
         .await?;
-        tx.commit().await?;
         return Ok(());
     }
 
@@ -484,7 +489,6 @@ pub async fn build_concept_closure_pg(
             .await?;
     }
 
-    tx.commit().await?;
     Ok(())
 }
 
