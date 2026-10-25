@@ -563,6 +563,11 @@ cargo build --bin hfs --release
 
 SQLite handles all CRUD operations, versioning, history, and search using its built-in FTS5 full-text search engine. Data is stored in `fhir.db` by default.
 
+For a first-page search on a single parameter, SQLite reads at most 2,001 index rows of that parameter to decide
+whether its key list is short enough to drive the query from, instead of letting the planner walk `resources` in
+`last_updated` order. Set `HFS_SQLITE_SEARCH_PROBE=0` (`false`, `off` and `no` also work) to turn the probe off and
+always use the planner's plan; it is read once per process and defaults to on. Results are the same either way.
+
 ### SQLite + Elasticsearch
 
 SQLite handles CRUD, versioning, history, and transactions. Elasticsearch handles all search operations with:

@@ -49,6 +49,7 @@ use super::deferred_index::{
 };
 use super::retry::{BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, jitter_fraction};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
+use super::search_impl::MissingSupport;
 
 pub(super) fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -3598,23 +3599,26 @@ impl MongoBackend {
                 // unparseable date, a Period end that is not a date) is as
                 // absent as one that extracted nothing: without this it would
                 // match neither `:missing=true` nor `:missing=false` (#2000).
-                let missing = extraction
-                    .missing
-                    .into_iter()
-                    .map(|parameter| parameter.name)
-                    .chain(
-                        extraction
-                            .present
-                            .into_iter()
-                            .filter(|parameter| {
-                                !own.iter().any(|row| row_marks_present(row, parameter))
-                            })
-                            .map(|parameter| parameter.name),
-                    )
-                    .collect::<Vec<_>>();
+                let missing = self.config().missing_metadata.then(|| {
+                    extraction
+                        .missing
+                        .into_iter()
+                        .map(|parameter| parameter.name)
+                        .chain(
+                            extraction
+                                .present
+                                .into_iter()
+                                .filter(|parameter| {
+                                    !own.iter().any(|row| row_marks_present(row, parameter))
+                                })
+                                .map(|parameter| parameter.name),
+                        )
+                        .filter(|name| super::search_impl::records_missing_metadata(name))
+                        .collect::<Vec<_>>()
+                });
                 (
                     own,
-                    Some(missing),
+                    missing,
                     (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
                 )
             }
@@ -5965,8 +5969,14 @@ impl MongoBackend {
                 ..Default::default()
             };
             let tenant_id = tenant.tenant_id().as_str();
-            let filter =
-                self.build_resource_filter(tenant_id, resource_type, &query, None, None)?;
+            let filter = self.build_resource_filter(
+                tenant_id,
+                resource_type,
+                &query,
+                &MissingSupport::none(),
+                None,
+                None,
+            )?;
             let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
             let cursor = resources
                 .find(filter)
@@ -6177,6 +6187,7 @@ impl MongoBackend {
                     tenant_id,
                     resource_type,
                     &resource_query,
+                    &MissingSupport::none(),
                     None,
                     None,
                 )?;
@@ -6292,6 +6303,7 @@ impl MongoBackend {
                 tenant_id,
                 resource_type,
                 &query,
+                &MissingSupport::none(),
                 None,
                 None,
             )?);
@@ -7721,6 +7733,33 @@ impl ReindexTarget for MongoBackend {
         let mut stats = ReindexPageStats::default();
         self.write_search_entries_page_timed(tenant, resources, &mut stats)
             .await
+    }
+
+    /// `missing_params` is this backend's search metadata (#1984), and only
+    /// while it owns search: an offloaded deployment never reads it.
+    fn supports_search_metadata(&self) -> bool {
+        !self.is_search_offloaded()
+    }
+
+    /// Backfills `missing_params` without a rebuild (#2008); see
+    /// `write_metadata_page`.
+    async fn write_search_metadata_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        skip_existing: bool,
+    ) -> (Vec<StorageResult<()>>, u64) {
+        if resources.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let n = resources.len();
+        let db = match self.get_database().await {
+            Ok(db) => db,
+            Err(e) => return super::reindex_pipeline::PageFailure::storage(e).fan_out_metadata(n),
+        };
+        self.write_metadata_page(&db, tenant.tenant_id().as_str(), resources, skip_existing)
+            .await
+            .unwrap_or_else(|failure| failure.fan_out_metadata(n))
     }
 }
 

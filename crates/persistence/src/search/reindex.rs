@@ -571,6 +571,45 @@ pub trait ReindexTarget: Send + Sync {
     ) -> Vec<StorageResult<usize>> {
         self.write_search_entries_page(tenant, resources).await
     }
+
+    /// Whether this writer keeps per-resource search metadata that a
+    /// metadata-only run can rewrite on its own
+    /// ([`ReindexRequest::metadata_only`], #2008). MongoDB's `missing_params`
+    /// is the only such metadata today; the default is `false`, and a
+    /// metadata-only run skips a writer that says so.
+    fn supports_search_metadata(&self) -> bool {
+        false
+    }
+
+    /// Recomputes and writes only the per-resource search metadata of a page,
+    /// leaving the search index itself untouched (#2008). Returns one result
+    /// per resource, in input order, and how many resources had their
+    /// metadata written. A resource whose stored version is no longer the one
+    /// in `resources` is left alone: the write that superseded it wrote its
+    /// own metadata. With `skip_existing`, a resource whose metadata is
+    /// already current is left alone too.
+    ///
+    /// Called only on a writer whose [`Self::supports_search_metadata`] is
+    /// `true`; the default refuses every resource.
+    async fn write_search_metadata_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        skip_existing: bool,
+    ) -> (Vec<StorageResult<()>>, u64) {
+        let _ = (tenant, skip_existing);
+        let results = resources
+            .iter()
+            .map(|_| {
+                Err(crate::error::BackendError::UnsupportedCapability {
+                    backend_name: "reindex target".to_string(),
+                    capability: "metadata-only reindex".to_string(),
+                }
+                .into())
+            })
+            .collect();
+        (results, 0)
+    }
 }
 
 /// A backend that is both a [`ReindexSource`] and a [`ReindexTarget`] —
@@ -604,6 +643,19 @@ pub struct ReindexRequest {
     /// without rebuilding it (#1739).
     #[serde(default)]
     pub clear_only: bool,
+
+    /// Recompute and write only each resource's search metadata (MongoDB's
+    /// `missing_params`), with the same extraction and version guard as a
+    /// rebuild, and leave the search index untouched (#2008). Runs only on
+    /// writers whose [`ReindexTarget::supports_search_metadata`] is `true`.
+    #[serde(default)]
+    pub metadata_only: bool,
+
+    /// With [`Self::metadata_only`], leave alone the resources whose metadata
+    /// is already current, so only missing, unstamped or stale metadata is
+    /// written (#2008). Every resource in scope is still read and extracted.
+    #[serde(default)]
+    pub skip_existing_metadata: bool,
 
     /// First resource id to reindex (included). Requires exactly one
     /// resource type (#1739).
@@ -652,6 +704,8 @@ impl Default for ReindexRequest {
             batch_size: default_batch_size(),
             clear_existing: false,
             clear_only: false,
+            metadata_only: false,
+            skip_existing_metadata: false,
             id_start: None,
             id_end: None,
             bulk_index_rebuild: false,
@@ -725,6 +779,19 @@ impl ReindexRequest {
         self
     }
 
+    /// Writes only search metadata, not the search index (see the field).
+    pub fn metadata_only(mut self) -> Self {
+        self.metadata_only = true;
+        self
+    }
+
+    /// With [`Self::metadata_only`], skips resources whose metadata is
+    /// already current (see the field).
+    pub fn skip_existing_metadata(mut self) -> Self {
+        self.skip_existing_metadata = true;
+        self
+    }
+
     /// The id range this request selects, or `None` when it has no bounds.
     pub fn id_range(&self) -> Option<ReindexIdRange> {
         (self.id_start.is_some() || self.id_end.is_some()).then(|| ReindexIdRange {
@@ -746,6 +813,20 @@ impl ReindexRequest {
         }
         if self.clear_only && self.bulk_index_rebuild {
             return invalid("clearOnly cannot be combined with a bulk index rebuild");
+        }
+        if self.skip_existing_metadata && !self.metadata_only {
+            return invalid("skipExistingMetadata requires metadataOnly");
+        }
+        if self.metadata_only {
+            if self.clear_existing {
+                return invalid("metadataOnly cannot be combined with clearExisting");
+            }
+            if self.clear_only {
+                return invalid("metadataOnly cannot be combined with clearOnly");
+            }
+            if self.bulk_index_rebuild {
+                return invalid("metadataOnly cannot be combined with a bulk index rebuild");
+            }
         }
         if self.id_range().is_none() {
             return Ok(());
@@ -867,6 +948,15 @@ pub struct ReindexProgress {
     /// must not let it clear them (#1125).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resource_scoped: bool,
+
+    /// Whether the job wrote only search metadata
+    /// ([`ReindexRequest::metadata_only`], #2008).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub metadata_only: bool,
+
+    /// Resources whose search metadata a metadata-only job wrote.
+    #[serde(default)]
+    pub metadata_updated: u64,
 }
 
 /// An error encountered during reindexing.
@@ -1010,6 +1100,8 @@ impl ReindexProgress {
             error_message: None,
             current_resource_type: None,
             resource_scoped: false,
+            metadata_only: false,
+            metadata_updated: 0,
         }
     }
 
@@ -1053,6 +1145,12 @@ impl ReindexProgress {
             serde_json::json!({"name": "errorCount", "valueInteger": self.errors.len()}),
             serde_json::json!({"name": "percentage", "valueDecimal": self.percentage()}),
         ];
+        if self.metadata_only {
+            parameter.push(serde_json::json!({"name": "metadataOnly", "valueBoolean": true}));
+            parameter.push(
+                serde_json::json!({"name": "metadataUpdated", "valueInteger": self.metadata_updated}),
+            );
+        }
         if let Some(started_at) = &self.started_at {
             parameter.push(serde_json::json!({"name": "startedAt", "valueDateTime": started_at}));
         }
@@ -1495,6 +1593,11 @@ impl ReindexOperation {
         agent: Option<String>,
     ) -> Result<(String, oneshot::Receiver<()>), ReindexError> {
         request.validate()?;
+        if request.metadata_only && !self.writers.iter().any(|w| w.supports_search_metadata()) {
+            return Err(ReindexError::Unsupported {
+                capability: "metadata-only reindex".to_string(),
+            });
+        }
         let source = match request.id_range() {
             Some(range) => self
                 .source
@@ -1516,6 +1619,7 @@ impl ReindexOperation {
         let mut progress = ReindexProgress::new(&job_id);
         progress.tenant_id = Some(tenant.tenant_id().as_str().to_string());
         progress.resource_scoped = request.resource_ids.is_some();
+        progress.metadata_only = request.metadata_only;
 
         // Store the job
         self.jobs.write().insert(job_id.clone(), progress);
@@ -2364,7 +2468,22 @@ async fn write_resource_batch(
     resource_type: &str,
     resources: &[StoredResource],
     extra_processed: u64,
+    metadata: Option<MetadataOnly>,
 ) -> BatchOutcome {
+    if let Some(metadata) = metadata {
+        return write_metadata_batch(
+            tenant,
+            writers,
+            jobs,
+            job_id,
+            failures,
+            resource_type,
+            resources,
+            extra_processed,
+            metadata,
+        )
+        .await;
+    }
     let mut wrote_any: Vec<bool> = vec![false; resources.len()];
     let mut entry_counts: Vec<u64> = vec![0; resources.len()];
     let mut batch = BatchOutcome::default();
@@ -2412,6 +2531,66 @@ async fn write_resource_batch(
     if let Some(progress) = jobs_guard.get_mut(job_id) {
         progress.processed_resources += resources.len() as u64 + extra_processed;
         progress.entries_created += entries;
+    }
+    drop(jobs_guard);
+
+    batch
+}
+
+/// A metadata-only run's options (#2008); see
+/// [`ReindexRequest::metadata_only`].
+#[derive(Clone, Copy)]
+struct MetadataOnly {
+    skip_existing: bool,
+}
+
+/// The metadata-only counterpart of [`write_resource_batch`] (#2008): writes
+/// each resource's search metadata through every writer, and advances
+/// `metadata_updated` instead of `entries_created`. `writers` holds only those
+/// that support it.
+#[allow(clippy::too_many_arguments)]
+async fn write_metadata_batch(
+    tenant: &TenantContext,
+    writers: &[Arc<dyn ReindexTarget>],
+    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    job_id: &str,
+    failures: &mut ResourceFailureLog,
+    resource_type: &str,
+    resources: &[StoredResource],
+    extra_processed: u64,
+    metadata: MetadataOnly,
+) -> BatchOutcome {
+    let mut batch = BatchOutcome::default();
+    let mut updated = 0;
+    if !resources.is_empty() {
+        for writer in writers {
+            let started = Instant::now();
+            let (outcomes, written) = writer
+                .write_search_metadata_page(tenant, resources, metadata.skip_existing)
+                .await;
+            batch.write += started.elapsed();
+            updated = updated.max(written);
+            for (i, outcome) in outcomes.into_iter().enumerate() {
+                if let Err(e) = outcome {
+                    batch.failed += 1;
+                    record_resource_failure(
+                        jobs,
+                        job_id,
+                        failures,
+                        resource_type,
+                        resources[i].id(),
+                        format!("Failed to write search metadata: {e}"),
+                        is_transient_error(&e),
+                    )
+                }
+            }
+        }
+    }
+
+    let mut jobs_guard = jobs.write();
+    if let Some(progress) = jobs_guard.get_mut(job_id) {
+        progress.processed_resources += resources.len() as u64 + extra_processed;
+        progress.metadata_updated += updated;
     }
     drop(jobs_guard);
 
@@ -2947,6 +3126,20 @@ async fn run_reindex(
         },
     };
 
+    // A metadata-only run writes through the writers that keep metadata, and
+    // only those; `start` refused it if there are none (#2008).
+    let metadata = request.metadata_only.then_some(MetadataOnly {
+        skip_existing: request.skip_existing_metadata,
+    });
+    let writers: Vec<Arc<dyn ReindexTarget>> = if metadata.is_some() {
+        writers
+            .into_iter()
+            .filter(|writer| writer.supports_search_metadata())
+            .collect()
+    } else {
+        writers
+    };
+
     // A clear-only run pages no type.
     let paged_types: &[String] = if request.clear_only {
         &[]
@@ -3142,6 +3335,7 @@ async fn run_reindex(
                         resource_type,
                         &resources,
                         missing,
+                        metadata,
                     )
                     .await;
                     record_and_log_page(
@@ -3269,6 +3463,7 @@ async fn run_reindex(
                     resource_type,
                     &page.resources,
                     page.skipped.len() as u64,
+                    metadata,
                 )
                 .await;
 
@@ -6232,6 +6427,231 @@ mod tests {
         async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
             Ok(0)
         }
+    }
+
+    /// A writer with search metadata (#2008): records each metadata page and
+    /// fails `fail` transiently; its index writes must never be called.
+    #[derive(Default)]
+    struct MetadataTarget {
+        pages: parking_lot::Mutex<Vec<(Vec<String>, bool)>>,
+        fail: BTreeSet<String>,
+    }
+
+    #[async_trait]
+    impl ReindexTarget for MetadataTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            panic!("a metadata-only run deletes no index entries")
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            panic!("a metadata-only run writes no index entries")
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            panic!("a metadata-only run clears nothing")
+        }
+
+        fn supports_search_metadata(&self) -> bool {
+            true
+        }
+
+        async fn write_search_metadata_page(
+            &self,
+            _: &TenantContext,
+            resources: &[StoredResource],
+            skip_existing: bool,
+        ) -> (Vec<StorageResult<()>>, u64) {
+            self.pages.lock().push((
+                resources.iter().map(|r| r.id().to_string()).collect(),
+                skip_existing,
+            ));
+            let results: Vec<StorageResult<()>> = resources
+                .iter()
+                .map(|r| {
+                    if self.fail.contains(r.id()) {
+                        Err(crate::error::BackendError::Unavailable {
+                            backend_name: "metadata".into(),
+                            message: format!("injected failure of {}", r.id()),
+                        }
+                        .into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .collect();
+            let written = results.iter().filter(|r| r.is_ok()).count() as u64;
+            (results, written)
+        }
+    }
+
+    /// A metadata-only run (#2008) writes only through the writers that keep
+    /// metadata, counts what they wrote as `metadata_updated` rather than
+    /// entries, records their per-resource failures, and says so in
+    /// `$reindex-status`.
+    #[tokio::test]
+    async fn metadata_only_run_writes_only_metadata_through_supporting_writers() {
+        let metadata = Arc::new(MetadataTarget {
+            fail: BTreeSet::from(["p1".to_string()]),
+            ..MetadataTarget::default()
+        });
+        let index = Arc::new(RecordingTarget::default());
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(5)),
+            vec![index.clone(), metadata.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let request = ReindexRequest::all()
+            .metadata_only()
+            .skip_existing_metadata()
+            .with_batch_size(2);
+        let id = op
+            .start(TenantContext::system(), request, None)
+            .await
+            .unwrap();
+        // Pages are spaced by `REINDEX_PAGE_YIELD`, longer than
+        // `await_terminal`'s yields last.
+        let progress = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match op.get_progress(&id).await {
+                    Some(progress) if progress.status.is_finished() => break progress,
+                    _ => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+        })
+        .await
+        .expect("job reaches a terminal status");
+
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert!(progress.metadata_only);
+        assert_eq!(progress.processed_resources, 5);
+        assert_eq!(progress.metadata_updated, 4);
+        assert_eq!(progress.entries_created, 0);
+        assert_eq!(progress.errors.len(), 1);
+        assert_eq!(progress.errors[0].resource_id, "p1");
+        assert!(progress.errors[0].retryable);
+        assert!(
+            progress.errors[0]
+                .error
+                .starts_with("Failed to write search metadata:")
+        );
+        assert_eq!(
+            *metadata.pages.lock(),
+            vec![
+                (vec!["p0".to_string(), "p1".to_string()], true),
+                (vec!["p2".to_string(), "p3".to_string()], true),
+                (vec!["p4".to_string()], true),
+            ]
+        );
+        assert!(
+            index.written.lock().is_empty(),
+            "the index writer is skipped"
+        );
+
+        let parameters = progress.to_parameters();
+        let parameter = |name: &str| {
+            parameters["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == name)
+                .cloned()
+        };
+        assert_eq!(parameter("metadataOnly").unwrap()["valueBoolean"], true);
+        assert_eq!(parameter("metadataUpdated").unwrap()["valueInteger"], 4);
+        let rebuild = ReindexProgress::new("rebuild").to_parameters();
+        assert!(
+            !rebuild.to_string().contains("metadataOnly"),
+            "a rebuild's status has no metadata fields"
+        );
+    }
+
+    /// Without a writer that keeps metadata, a metadata-only run is refused
+    /// before a job id is issued, and the default page write refuses every
+    /// resource (#2008).
+    #[tokio::test]
+    async fn metadata_only_run_is_unsupported_without_a_metadata_writer() {
+        let index = Arc::new(RecordingTarget::default());
+        assert!(!index.supports_search_metadata());
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(2)),
+            vec![index.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let error = op
+            .start(
+                TenantContext::system(),
+                ReindexRequest::all().metadata_only(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ReindexError::Unsupported { capability } if capability == "metadata-only reindex"),
+            "{error:?}"
+        );
+        assert!(op.list_jobs().is_empty());
+
+        let resources = PagedSource::new(2)
+            .fetch_resources_page(&TenantContext::system(), "Patient", None, 2)
+            .await
+            .unwrap()
+            .resources;
+        let (results, written) = index
+            .write_search_metadata_page(&TenantContext::system(), &resources, false)
+            .await;
+        assert_eq!(written, 0);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| matches!(
+            r,
+            Err(crate::error::StorageError::Backend(
+                crate::error::BackendError::UnsupportedCapability { .. }
+            ))
+        )));
+    }
+
+    #[test]
+    fn metadata_only_rejects_what_would_touch_the_index() {
+        for (request, expected) in [
+            (
+                ReindexRequest::all().metadata_only().clear_existing(),
+                "metadataOnly cannot be combined with clearExisting",
+            ),
+            (
+                ReindexRequest::all().metadata_only().clear_only(),
+                "metadataOnly cannot be combined with clearOnly",
+            ),
+            (
+                ReindexRequest::all()
+                    .metadata_only()
+                    .with_bulk_index_rebuild(true),
+                "metadataOnly cannot be combined with a bulk index rebuild",
+            ),
+            (
+                ReindexRequest::all().skip_existing_metadata(),
+                "skipExistingMetadata requires metadataOnly",
+            ),
+        ] {
+            let error = request.validate().unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert!(
+            ReindexRequest {
+                id_start: Some("4".to_string()),
+                ..ReindexRequest::for_types(["Patient"]).metadata_only()
+            }
+            .validate()
+            .is_ok(),
+            "an id range combines with metadataOnly"
+        );
     }
 
     /// Records the scope of every clear (#1624). Its page write replaces

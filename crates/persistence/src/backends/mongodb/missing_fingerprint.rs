@@ -49,7 +49,7 @@ pub(super) enum MissingFreshness {
 }
 
 impl MissingFreshness {
-    fn allows(&self, code: &str) -> bool {
+    pub(super) fn allows(&self, code: &str) -> bool {
         match self {
             Self::All => true,
             Self::Only(codes) => codes.contains(code),
@@ -167,27 +167,23 @@ impl MongoBackend {
         stamp
     }
 
-    /// Whether `:missing=true` on `code` may read `missing_params`: only
-    /// after this registry's probe found the parameter fresh. A missing or
-    /// outdated probe result (a search path that did not probe, or a
-    /// definition change since) is not trusted.
-    pub(super) fn missing_param_fresh(
+    /// Which codes of `resource_type` may read `missing_params`: only those
+    /// this registry's probe found fresh. A missing or outdated probe result
+    /// (a search path that did not probe, or a definition change since) is
+    /// `None`, which trusts no code.
+    pub(super) fn missing_freshness(
         &self,
         tenant_id: &str,
         resource_type: &str,
-        code: &str,
-    ) -> bool {
+    ) -> Option<MissingFreshness> {
         let key = (tenant_id.to_string(), resource_type.to_string());
-        let Some((fingerprint, freshness)) = self.missing_meta_fresh.read().get(&key).cloned()
-        else {
-            return false;
-        };
-        freshness.allows(code)
-            && fingerprint
-                == self
-                    .tenant_extractor(tenant_id)
-                    .missing_fingerprint(resource_type)
-                    .fingerprint
+        let (fingerprint, freshness) = self.missing_meta_fresh.read().get(&key).cloned()?;
+        (fingerprint
+            == self
+                .tenant_extractor(tenant_id)
+                .missing_fingerprint(resource_type)
+                .fingerprint)
+            .then_some(freshness)
     }
 
     /// Probes `idx_resources_missing_params_fp` before a `:missing=true`

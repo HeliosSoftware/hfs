@@ -1256,6 +1256,10 @@ mod reindex_fetch_by_ids;
 #[path = "mongodb/reindex_id_range.rs"]
 mod reindex_id_range;
 
+/// #2008: metadata-only `$reindex` backfills `missing_params`.
+#[path = "mongodb/reindex_metadata_only.rs"]
+mod reindex_metadata_only;
+
 /// #1586: a transaction bundle the server aborts with a
 /// `TransientTransactionError` is re-run instead of failing with a 400.
 #[path = "mongodb/transaction_retry.rs"]
@@ -24129,6 +24133,10 @@ mongodb_bundle_identity_test!(
 
 #[path = "mongodb/missing_index.rs"]
 mod missing_index;
+
+/// #2006: write, storage and cache cost of `missing_params` metadata.
+#[path = "mongodb/missing_params_cost_bench.rs"]
+mod missing_params_cost_bench;
 
 /// #2004: positive filters combined with metadata `:missing=true` at volume.
 #[path = "mongodb/missing_positive_bench.rs"]
