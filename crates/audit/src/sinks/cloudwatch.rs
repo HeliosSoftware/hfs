@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use aws_sdk_cloudwatchlogs::Client;
 use aws_sdk_cloudwatchlogs::types::InputLogEvent;
 
+use crate::metrics;
 use crate::sink::AuditSink;
 
 /// CloudWatch Logs audit sink.
@@ -79,6 +80,7 @@ impl CloudWatchLogsSink {
         let json = match serde_json::to_string(event) {
             Ok(j) => j,
             Err(e) => {
+                metrics::record_dropped("cloudwatch", metrics::REASON_SERIALIZE, 1);
                 tracing::error!(error = %e, "Failed to serialize audit event");
                 return None;
             }
@@ -98,6 +100,7 @@ impl CloudWatchLogsSink {
         if events.is_empty() {
             return;
         }
+        let count = events.len() as u64;
         if let Err(e) = self
             .client
             .put_log_events()
@@ -107,6 +110,7 @@ impl CloudWatchLogsSink {
             .send()
             .await
         {
+            metrics::record_dropped("cloudwatch", metrics::REASON_WRITE_FAILED, count);
             tracing::error!(
                 error = %e,
                 log_group = %self.log_group,

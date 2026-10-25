@@ -941,12 +941,21 @@ impl helios_audit::sinks::database::AuditStorage for HfsAuditStorageAdapter {
         resource_type: &str,
         resource: serde_json::Value,
         fhir_version: helios_fhir::FhirVersion,
-    ) -> Result<(), String> {
+    ) -> Result<(), helios_audit::sinks::database::AuditStorageError> {
+        use helios_audit::sinks::database::AuditStorageError;
         self.storage
             .create(&self.tenant, resource_type, resource, fhir_version)
             .await
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| {
+                // Pool exhausted, connection refused, server saturated: the
+                // sink retries these before giving the event up (#2234).
+                if e.is_unavailable() {
+                    AuditStorageError::transient(e.to_string())
+                } else {
+                    AuditStorageError::permanent(e.to_string())
+                }
+            })
     }
 }
 
@@ -1958,10 +1967,14 @@ async fn init_audit(
             let storage =
                 create_database_audit_storage(server_config, backend_mode, &config).await?;
             let adapter = Arc::new(HfsAuditStorageAdapter::new(storage));
-            Arc::new(helios_audit::DatabaseSink::new(
-                adapter,
-                server_config.default_fhir_version,
-            ))
+            let retry = helios_audit::sinks::database::RetryPolicy {
+                max_retries: config.write_retries,
+                ..Default::default()
+            };
+            Arc::new(
+                helios_audit::DatabaseSink::new(adapter, server_config.default_fhir_version)
+                    .with_retry(retry),
+            )
         }
         #[cfg(feature = "cloudwatch")]
         AuditBackend::CloudWatch => {
@@ -1991,6 +2004,20 @@ async fn init_audit(
                  Build with: cargo build --features cloudwatch"
             );
         }
+    };
+
+    // Every real sink sits behind a bounded queue drained by a fixed pool of
+    // writers, so audit writes cannot stampede the store under load (#2234).
+    let sink: Arc<dyn AuditSink> = if config.backend == AuditBackend::None {
+        sink
+    } else {
+        info!(
+            capacity = config.queue.capacity,
+            writers = config.queue.writers,
+            overflow = %config.queue.overflow,
+            "Audit events are queued for background writers"
+        );
+        Arc::new(helios_audit::QueuedSink::new(sink, config.queue))
     };
 
     let audit_state = if config.backend != AuditBackend::None {

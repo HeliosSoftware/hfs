@@ -3314,6 +3314,7 @@ dependencies = [
  "axum",
  "chrono",
  "helios-fhir",
+ "metrics",
  "serde",
  "serde_json",
  "tempfile",

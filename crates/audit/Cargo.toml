@@ -41,6 +41,9 @@ chrono.workspace = true
 # Logging
 tracing = "0.1"
 
+# Prometheus series via the facade the servers' recorder listens on
+metrics = "0.24"
+
 # Error handling
 thiserror = "2"
 
