@@ -8,8 +8,8 @@ use std::collections::HashSet;
 
 use crate::error::SearchError;
 use crate::types::{
-    CompartmentMembership, ContainedMode, SearchModifier, SearchParamType, SearchParameter,
-    SearchQuery, SearchValue, strip_reference_version,
+    CompartmentMembership, CompositeSearchComponent, ContainedMode, SearchModifier,
+    SearchParamType, SearchParameter, SearchQuery, SearchValue, strip_reference_version,
 };
 
 use super::modifier_handlers::{build_missing_condition, get_missing_value, is_missing_modifier};
@@ -234,9 +234,126 @@ impl ParameterCondition {
 /// the searched tenant (`?1`) and type (`?2`), that satisfy `condition`.
 fn parameter_rows(name: &str, condition: &str) -> String {
     format!(
-        "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} AND ({condition})",
+        "{PARAMETER_ROWS_HEAD}param_name = {} AND ({condition})",
         sql_string_literal(name)
     )
+}
+
+/// What every [`parameter_rows`] subquery starts with, up to its
+/// `param_name` test.
+const PARAMETER_ROWS_HEAD: &str =
+    "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND ";
+
+/// Whether `sql` is exactly one [`parameter_rows`] select: a single
+/// parameter's membership, nothing intersected with it.
+pub(crate) fn is_parameter_rows(sql: &str) -> bool {
+    (sql.starts_with(PARAMETER_ROWS_HEAD) || sql.starts_with(COMPOSITE_PAIR_HEAD))
+        && !sql.contains(" INTERSECT ")
+}
+
+/// The same membership as a correlated `EXISTS` on the outer `resources` row,
+/// for a subquery built by [`parameter_rows`]: `rowid IN (<rows>)` becomes
+/// `EXISTS (<rows> for outer_key)`, which lets the outer query walk
+/// `resources` in page order and stop at the first full page instead of
+/// materializing every matching key first. Reuses the subquery's numbered
+/// placeholders, so the same parameters bind. `None` for anything that is not
+/// one plain `parameter_rows` select or a `UNION ALL` of them (a date's
+/// ranges, tested as `EXISTS (…) OR EXISTS (…)`); an `INTERSECT` or a nested
+/// subquery keeps `rowid IN (…)`.
+pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
+    // The code-first composite pairing: its one nested `EXISTS` stays inside,
+    // and `c.resource_key = outer_key` joins the seek on `(…, code,
+    // resource_key)`.
+    if let Some(rest) = rows_sql.strip_prefix(COMPOSITE_PAIR_HEAD) {
+        if [" UNION ", " INTERSECT ", " EXCEPT ", " GROUP BY "]
+            .iter()
+            .any(|keyword| rest.contains(keyword))
+            || rest.matches("SELECT").count() != 1
+        {
+            return None;
+        }
+        return Some(format!(
+            "EXISTS (SELECT 1 FROM search_index AS c INDEXED BY idx_search_token \
+             WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND c.resource_key = {outer_key} AND {rest})"
+        ));
+    }
+    // A `UNION ALL` of parameter selects (a date's `ne`/`le`/`ge` ranges): a
+    // resource is a member when any one range holds for it, so the branches
+    // are `EXISTS`-es joined by `OR`.
+    if rows_sql.contains(" UNION ALL ") {
+        let branches = rows_sql
+            .split(" UNION ALL ")
+            .map(|branch| parameter_exists_predicate(branch, outer_key))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(format!("({})", branches.join(" OR ")));
+    }
+    parameter_exists_predicate(rows_sql, outer_key)
+}
+
+/// [`membership_exists_predicate`] for one plain [`parameter_rows`] select.
+fn parameter_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
+    let rest = rows_sql.strip_prefix(PARAMETER_ROWS_HEAD)?;
+    if [" UNION ", " INTERSECT ", " EXCEPT ", "SELECT"]
+        .iter()
+        .any(|keyword| rest.contains(keyword))
+    {
+        return None;
+    }
+    Some(format!(
+        "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = {outer_key} AND {rest})"
+    ))
+}
+
+/// What a [`composite_pair_rows`] subquery starts with, up to its
+/// `param_name` test.
+const COMPOSITE_PAIR_HEAD: &str = "SELECT c.resource_key FROM search_index AS c INDEXED BY idx_search_token WHERE c.tenant_id = ?1 AND c.resource_type = ?2 AND ";
+
+/// The keys of the resources with a composite group in which a token row
+/// matches the token component and a row of the same group matches the
+/// quantity component: the rows of the whole-parameter
+/// `GROUP BY resource_key, composite_group HAVING MAX(CASE token) AND
+/// MAX(CASE quantity)` for a two-component token+quantity composite, without
+/// reading every row of the parameter. The code-first token index
+/// (`idx_search_token`, which carries `composite_group` and `is_contained`)
+/// finds the token rows by code; each one is
+/// then paired by a probe of `idx_search_composite_cov` on `(resource_key,
+/// composite_group)`. A key can be listed once per matching token row, which
+/// the `rowid IN (…)` callers ignore.
+///
+/// `None` (keep the `GROUP BY`) unless the composite is exactly one token and
+/// one quantity component and the token part tests `value_token_code = ?`: a
+/// `system|` token has no code to seek. The fragments' columns are unqualified; the token part sits in the
+/// outer select, so it binds to `c`, and the quantity part in the `EXISTS`,
+/// so it binds to `q`. Both `INDEXED BY` hints need the partial-index terms
+/// spelled out in the `WHERE`.
+fn composite_pair_rows(
+    name: &str,
+    components: &[CompositeSearchComponent],
+    fragments: &[SqlFragment],
+) -> Option<String> {
+    if components.len() != 2 || fragments.len() != 2 {
+        return None;
+    }
+    let (token, quantity) = match (components[0].param_type, components[1].param_type) {
+        (SearchParamType::Token, SearchParamType::Quantity) => (&fragments[0], &fragments[1]),
+        (SearchParamType::Quantity, SearchParamType::Token) => (&fragments[1], &fragments[0]),
+        _ => return None,
+    };
+    if !token.sql.contains("value_token_code = ?") {
+        return None;
+    }
+    let name = sql_string_literal(name);
+    Some(format!(
+        "{COMPOSITE_PAIR_HEAD}c.param_name = {name} AND c.is_contained = 0 \
+         AND c.composite_group IS NOT NULL AND c.value_token_code IS NOT NULL AND ({token_sql}) \
+         AND EXISTS (SELECT 1 FROM search_index AS q INDEXED BY idx_search_composite_cov \
+         WHERE q.tenant_id = ?1 AND q.resource_type = ?2 AND q.param_name = {name} \
+         AND q.resource_key = c.resource_key AND q.composite_group = c.composite_group \
+         AND q.composite_group IS NOT NULL AND q.is_contained = 0 AND ({quantity_sql}))",
+        token_sql = token.sql,
+        quantity_sql = quantity.sql,
+    ))
 }
 
 /// Builds SQL queries from FHIR search parameters.
@@ -252,6 +369,12 @@ pub struct QueryBuilder {
     param_offset: usize,
     /// Whether to skip tenant/resource type params (they're shared with outer query).
     skip_base_params: bool,
+    /// Whether a token+quantity composite is built as the code-first pairing
+    /// ([`composite_pair_rows`], hinted to `idx_search_token` and
+    /// `idx_search_composite_cov`) instead of a whole-parameter `GROUP BY`.
+    /// Off unless the caller has seen both indexes exist: `INDEXED BY` fails
+    /// to prepare against a missing one (a bulk rebuild drops them).
+    composite_rewrite: bool,
 }
 
 impl QueryBuilder {
@@ -262,7 +385,16 @@ impl QueryBuilder {
             resource_type: resource_type.into(),
             param_offset: 0,
             skip_base_params: false,
+            composite_rewrite: false,
         }
+    }
+
+    /// Builds a token+quantity composite as the code-first pairing, which
+    /// needs `idx_search_token` (in its code-first shape) and
+    /// `idx_search_composite_cov` to exist (see [`composite_pair_rows`]). The rows are the same set.
+    pub fn with_composite_rewrite(mut self, enabled: bool) -> Self {
+        self.composite_rewrite = enabled;
+        self
     }
 
     /// Sets the parameter offset for embedded subqueries.
@@ -977,6 +1109,22 @@ impl QueryBuilder {
                 param_offset + total_params,
             ) {
                 Some(fragments) if !fragments.is_empty() => {
+                    // One value only: an OR of values is wrapped by the caller
+                    // in a scan of the type's rows (not a positive membership),
+                    // and there the pairing measured slower than the GROUP BY
+                    // (0.30 s -> 0.59 s for two wide codes).
+                    if self.composite_rewrite
+                        && param.values.len() == 1
+                        && let Some(rows) =
+                            composite_pair_rows(&param.name, &param.components, &fragments)
+                    {
+                        for f in fragments {
+                            total_params += f.params.len();
+                            params.extend(f.params);
+                        }
+                        or_conditions.push(format!("resource_key IN ({rows})"));
+                        continue;
+                    }
                     let havings: Vec<String> = fragments
                         .iter()
                         .map(|f| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", f.sql))
@@ -1475,6 +1623,36 @@ fn positive_membership_subquery(condition: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exists_form_only_for_one_plain_parameter_select() {
+        let rows = parameter_rows("code", "value_token_code = ?3");
+        let exists = membership_exists_predicate(&rows, "w.rk").unwrap();
+        assert!(
+            exists
+                .starts_with("EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite")
+        );
+        assert!(
+            exists.contains(
+                "resource_key = w.rk AND param_name = 'code' AND (value_token_code = ?3)"
+            )
+        );
+        assert!(is_parameter_rows(&rows));
+        let union = format!("{rows} UNION ALL {rows}");
+        let exists_union = membership_exists_predicate(&union, "w.rk").unwrap();
+        assert!(exists_union.starts_with("(EXISTS (SELECT 1 FROM search_index INDEXED BY"));
+        assert_eq!(exists_union.matches(") OR EXISTS (").count(), 1);
+        let nested = format!("{rows} UNION ALL SELECT resource_key FROM search_index");
+        assert!(membership_exists_predicate(&nested, "w.rk").is_none());
+        let union_all_then_union = format!("{rows} UNION {rows}");
+        assert!(membership_exists_predicate(&union_all_then_union, "w.rk").is_none());
+        let intersect = format!("{rows} INTERSECT {rows}");
+        assert!(!is_parameter_rows(&intersect));
+        assert!(
+            membership_exists_predicate("SELECT DISTINCT resource_key FROM search_index", "w.rk")
+                .is_none()
+        );
+    }
 
     #[test]
     fn positive_membership_subquery_takes_exactly_one_membership() {
