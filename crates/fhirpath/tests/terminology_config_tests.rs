@@ -131,6 +131,34 @@ fn member_of_without_a_server_fails_instead_of_returning_false() {
 }
 
 #[test]
+fn member_of_on_empty_input_is_empty_without_a_server() {
+    if env_server_is_set() {
+        eprintln!("SKIP: FHIRPATH_TERMINOLOGY_SERVER is set in this environment");
+        return;
+    }
+
+    let context = EvaluationContext::new_empty_with_default_version();
+
+    // FHIRPath propagates an empty input as an empty result; no server is needed for it.
+    for expr in [
+        format!("{{}}.memberOf('{}')", GENDER_VS),
+        format!("{{}}.memberOf('{}').empty()", GENDER_VS),
+        format!("%terminologies.validateVS('{}', {{}})", GENDER_VS),
+        "%terminologies.lookup({})".to_string(),
+        "%terminologies.subsumes('http://example.org/cs', 'a', {})".to_string(),
+    ] {
+        let result = evaluate_expression(&expr, &context)
+            .unwrap_or_else(|e| panic!("{expr} should not need a server, got: {e}"));
+        let expected_empty = !expr.ends_with(".empty()");
+        match result {
+            EvaluationResult::Empty if expected_empty => {}
+            EvaluationResult::Boolean(true, ..) if !expected_empty => {}
+            other => panic!("{expr}: unexpected result {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn referencing_terminologies_without_calling_it_needs_no_server() {
     if env_server_is_set() {
         eprintln!("SKIP: FHIRPATH_TERMINOLOGY_SERVER is set in this environment");

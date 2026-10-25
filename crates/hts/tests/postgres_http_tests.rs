@@ -1174,8 +1174,8 @@ async fn reimport_changed_display_refreshes_filtered_expand_pg() {
 ///
 /// The SQLite twin of this test lives in `operations/crud.rs`; this one exists
 /// because the eviction seam is generic over the backend and the PostgreSQL CRUD
-/// path reaches it through a different re-index route (the async importer rather
-/// than the `hts_pool` blocking path).
+/// path uses a PostgreSQL transaction for raw and normalized data instead of
+/// the SQLite transaction connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_value_set_evicts_the_expand_negative_cache() {
     let app = TestAppPg::new().await;
@@ -1270,8 +1270,10 @@ async fn update_code_system_refreshes_lookup_display() {
     assert_eq!(status, StatusCode::OK, "warm lookup: {body}");
     assert_eq!(display_of(&body).as_deref(), Some("Alpha"));
 
+    let mut replacement: serde_json::Value = serde_json::from_str(&make_cs("Alpha v2")).unwrap();
+    replacement["id"] = serde_json::json!(id);
     let (status, body) = app
-        .put_fhir(&format!("/CodeSystem/{id}"), make_cs("Alpha v2"), None)
+        .put_fhir(&format!("/CodeSystem/{id}"), replacement.to_string(), None)
         .await;
     assert_eq!(status, StatusCode::OK, "PUT: {body}");
 

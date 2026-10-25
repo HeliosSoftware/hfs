@@ -1969,3 +1969,300 @@ async fn mongodb_integration_reindex_prefetch_logs_id_phase_finished_after_the_l
         1
     );
 }
+
+/// Runs one page write with the profiler recording every operation, and
+/// returns its outcomes, stats and the `missing_params` update statements it
+/// sent to `resources` (#2005). `None` when the server refuses profiling.
+async fn write_page_profiling_resource_updates(
+    backend: &MongoBackend,
+    db: &mongodb::Database,
+    tenant: &TenantContext,
+    page: &[StoredResource],
+) -> Option<(Vec<StorageResult<usize>>, ReindexPageStats, Vec<Document>)> {
+    db.run_command(doc! { "profile": 0_i32 }).await.ok()?;
+    db.collection::<Document>("system.profile")
+        .drop()
+        .await
+        .expect("reset system.profile");
+    db.run_command(doc! { "profile": 2_i32 }).await.ok()?;
+    let mut stats = ReindexPageStats::default();
+    let outcomes = backend
+        .write_search_entries_page_timed(tenant, page, &mut stats)
+        .await;
+    db.run_command(doc! { "profile": 0_i32 })
+        .await
+        .expect("disable profiling");
+    let ns = format!("{}.resources", db.name());
+    let updates = db
+        .collection::<Document>("system.profile")
+        .find(doc! { "ns": ns.as_str(), "op": "update" })
+        .await
+        .expect("read system.profile")
+        .try_collect()
+        .await
+        .expect("collect system.profile");
+    Some((outcomes, stats, updates))
+}
+
+/// The stored `missing_params` of one live Patient, or `None` when absent.
+async fn stored_missing_params(
+    db: &mongodb::Database,
+    tenant: &TenantContext,
+    id: &str,
+) -> Option<Vec<String>> {
+    let stored = db
+        .collection::<Document>("resources")
+        .find_one(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Patient",
+            "id": id,
+        })
+        .await
+        .expect("read resource")
+        .expect("resource exists");
+    let names = stored.get_array("missing_params").ok()?;
+    Some(
+        names
+            .iter()
+            .map(|name| name.as_str().expect("string name").to_owned())
+            .collect(),
+    )
+}
+
+/// #2005: reindexing resources whose stored `missing_params` already match
+/// what the page computes sends no metadata update for them; a stale or
+/// absent array is still written, under its version guard.
+async fn reindex_skips_unchanged_missing_params(overlap: bool) {
+    let test_name = format!("reindex_unchanged_missing_overlap_{overlap}");
+    let Some(backend) = create_backend_with(&test_name, |c| {
+        c.reindex_overlap = overlap;
+        c.reindex_prepare_threads = 1;
+    })
+    .await
+    else {
+        eprintln!("Skipping {test_name} (requires Docker)");
+        return;
+    };
+    let tenant = create_tenant("reindex-unchanged-missing-tenant");
+    // More than REINDEX_SUBBATCH_FIRST (32), so overlap=true splits the page.
+    let mut page = Vec::new();
+    for i in 0..40 {
+        let id = format!("unchanged-{i:02}");
+        let (resource, _) = backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                &id,
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "name": [{"family": format!("F{i}")}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed patient");
+        page.push(resource);
+    }
+    let db = backend.get_database().await.unwrap();
+    let expected = stored_missing_params(&db, &tenant, page[2].id())
+        .await
+        .expect("create writes missing_params");
+    assert!(
+        !expected.is_empty(),
+        "a name-only Patient misses parameters"
+    );
+
+    // Every resource already holds what the page computes.
+    let Some((outcomes, stats, updates)) =
+        write_page_profiling_resource_updates(&backend, &db, &tenant, &page).await
+    else {
+        eprintln!("{test_name}: server refused {{profile: 2}}; skipping");
+        return;
+    };
+    assert!(outcomes.iter().all(|o| o.is_ok()), "{outcomes:?}");
+    assert_eq!(
+        stats.metadata_updates_skipped,
+        page.len() as u64,
+        "{stats:?}"
+    );
+    assert!(
+        updates.is_empty(),
+        "no metadata update is sent: {updates:?}"
+    );
+    if overlap {
+        assert!(stats.sub_batches >= 2, "{stats:?}");
+    }
+
+    // One stale array and one absent array are written; the rest still skip.
+    let resources = db.collection::<Document>("resources");
+    for (id, update) in [
+        (
+            page[0].id(),
+            doc! { "$set": { "missing_params": ["stale"] } },
+        ),
+        (page[1].id(), doc! { "$unset": { "missing_params": "" } }),
+    ] {
+        let changed = resources
+            .update_one(
+                doc! {
+                    "tenant_id": tenant.tenant_id().as_str(),
+                    "resource_type": "Patient",
+                    "id": id,
+                },
+                update,
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed.modified_count, 1);
+    }
+    let (outcomes, stats, updates) =
+        write_page_profiling_resource_updates(&backend, &db, &tenant, &page)
+            .await
+            .expect("profiling was accepted above");
+    assert!(outcomes.iter().all(|o| o.is_ok()), "{outcomes:?}");
+    assert_eq!(
+        stats.metadata_updates_skipped,
+        page.len() as u64 - 2,
+        "{stats:?}"
+    );
+    let modified: i64 = updates
+        .iter()
+        .map(|update| i64::from(update.get_i32("nModified").unwrap_or(0)))
+        .sum();
+    assert_eq!(updates.len(), 2, "only the two due updates: {updates:?}");
+    assert_eq!(modified, 2, "{updates:?}");
+    for id in [page[0].id(), page[1].id()] {
+        assert_eq!(
+            stored_missing_params(&db, &tenant, id).await.as_ref(),
+            Some(&expected),
+            "{id}"
+        );
+    }
+    db.drop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_serial_skips_unchanged_missing_params() {
+    reindex_skips_unchanged_missing_params(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_overlapped_skips_unchanged_missing_params() {
+    reindex_skips_unchanged_missing_params(true).await;
+}
+
+/// The stored `missing_params_fp` stamp of one live Patient, or `None` when
+/// absent.
+async fn stored_missing_fp(
+    db: &mongodb::Database,
+    tenant: &TenantContext,
+    id: &str,
+) -> Option<String> {
+    db.collection::<Document>("resources")
+        .find_one(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Patient",
+            "id": id,
+        })
+        .await
+        .expect("read resource")
+        .expect("resource exists")
+        .get_str("missing_params_fp")
+        .ok()
+        .map(str::to_owned)
+}
+
+/// #2005 with #1999: an unchanged array under a stale or absent stamp (a
+/// registry change that left it alone, or an array written before stamps)
+/// is still written, so `$reindex` brings the stamp up to date.
+async fn reindex_refreshes_stale_missing_fp(overlap: bool) {
+    let test_name = format!("reindex_stale_missing_fp_overlap_{overlap}");
+    let Some(backend) = create_backend_with(&test_name, |c| {
+        c.reindex_overlap = overlap;
+        c.reindex_prepare_threads = 1;
+    })
+    .await
+    else {
+        eprintln!("Skipping {test_name} (requires Docker)");
+        return;
+    };
+    let tenant = create_tenant("reindex-stale-missing-fp-tenant");
+    // More than REINDEX_SUBBATCH_FIRST (32), so overlap=true splits the page.
+    let mut page = Vec::new();
+    for i in 0..40 {
+        let id = format!("stamp-{i:02}");
+        let (resource, _) = backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                &id,
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "name": [{"family": format!("F{i}")}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed patient");
+        page.push(resource);
+    }
+    let db = backend.get_database().await.unwrap();
+    let expected = stored_missing_fp(&db, &tenant, page[2].id())
+        .await
+        .expect("create stamps missing_params");
+
+    let resources = db.collection::<Document>("resources");
+    for (id, update) in [
+        (
+            page[0].id(),
+            doc! { "$set": { "missing_params_fp": "older-registry" } },
+        ),
+        (page[1].id(), doc! { "$unset": { "missing_params_fp": "" } }),
+    ] {
+        let changed = resources
+            .update_one(
+                doc! {
+                    "tenant_id": tenant.tenant_id().as_str(),
+                    "resource_type": "Patient",
+                    "id": id,
+                },
+                update,
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed.modified_count, 1);
+    }
+    let Some((outcomes, stats, updates)) =
+        write_page_profiling_resource_updates(&backend, &db, &tenant, &page).await
+    else {
+        eprintln!("{test_name}: server refused {{profile: 2}}; skipping");
+        return;
+    };
+    assert!(outcomes.iter().all(|o| o.is_ok()), "{outcomes:?}");
+    assert_eq!(
+        stats.metadata_updates_skipped,
+        page.len() as u64 - 2,
+        "{stats:?}"
+    );
+    assert_eq!(updates.len(), 2, "only the two due updates: {updates:?}");
+    for id in [page[0].id(), page[1].id()] {
+        assert_eq!(
+            stored_missing_fp(&db, &tenant, id).await.as_deref(),
+            Some(expected.as_str()),
+            "{id}"
+        );
+    }
+    db.drop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_serial_refreshes_stale_missing_fp() {
+    reindex_refreshes_stale_missing_fp(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mongodb_integration_reindex_overlapped_refreshes_stale_missing_fp() {
+    reindex_refreshes_stale_missing_fp(true).await;
+}

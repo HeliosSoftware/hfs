@@ -8,8 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::types::ExpansionContains;
 
-/// `(system_url, code)`.
-pub(crate) type ConceptKey = (String, String);
+/// `(system_url, code, resolved_version)`.
+/// The same code in different CodeSystem versions is a distinct tree node.
+pub(crate) type ConceptKey = (String, String, Option<String>);
 
 /// Nest `flat` into a tree using `parent_to_children`.
 ///
@@ -36,13 +37,17 @@ pub(crate) fn nest_expansion(
 
     let mut ordered: Vec<ConceptKey> = flat
         .iter()
-        .map(|c| (c.system.clone(), c.code.clone()))
+        .map(|c| (c.system.clone(), c.code.clone(), c.version.clone()))
         .collect();
-    ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    ordered.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.2.cmp(&b.2))
+    });
 
     let items_map: HashMap<ConceptKey, ExpansionContains> = flat
         .into_iter()
-        .map(|c| ((c.system.clone(), c.code.clone()), c))
+        .map(|c| ((c.system.clone(), c.code.clone(), c.version.clone()), c))
         .collect();
 
     let mut placed: HashSet<ConceptKey> = HashSet::new();
@@ -69,7 +74,12 @@ pub(crate) fn nest_expansion(
         ));
     }
 
-    roots.sort_by(|a, b| a.code.cmp(&b.code));
+    roots.sort_by(|a, b| {
+        a.code
+            .cmp(&b.code)
+            .then_with(|| a.system.cmp(&b.system))
+            .then_with(|| a.version.cmp(&b.version))
+    });
     roots
 }
 
@@ -100,7 +110,12 @@ fn build_subtree(
             }
         }
         path.remove(key);
-        child_items.sort_by(|a, b| a.code.cmp(&b.code));
+        child_items.sort_by(|a, b| {
+            a.code
+                .cmp(&b.code)
+                .then_with(|| a.system.cmp(&b.system))
+                .then_with(|| a.version.cmp(&b.version))
+        });
         item.contains = child_items;
     }
     item
@@ -208,7 +223,7 @@ fn source_cycle_roots<'a>(
 }
 
 fn collect_keys(node: &ExpansionContains, out: &mut HashSet<ConceptKey>) {
-    out.insert((node.system.clone(), node.code.clone()));
+    out.insert((node.system.clone(), node.code.clone(), node.version.clone()));
     for child in &node.contains {
         collect_keys(child, out);
     }
@@ -221,7 +236,7 @@ mod tests {
     const SYS: &str = "http://snomed.info/sct";
 
     fn key(code: &str) -> ConceptKey {
-        (SYS.to_string(), code.to_string())
+        (SYS.to_string(), code.to_string(), None)
     }
 
     fn node(code: &str) -> ExpansionContains {
@@ -273,6 +288,50 @@ mod tests {
             &edges(&[("root", "b"), ("root", "a"), ("a", "c")]),
         );
         assert_eq!(render(&tree), "root(a(c) b)");
+    }
+
+    #[test]
+    fn keeps_same_codes_in_different_versions_and_systems_distinct() {
+        let groups = [
+            (SYS, None),
+            (SYS, Some("1")),
+            (SYS, Some("2")),
+            ("http://example.org/other", Some("1")),
+        ];
+        let mut nodes = Vec::new();
+        let mut edges = HashMap::new();
+        for (system, version) in groups.into_iter().rev() {
+            let version = version.map(str::to_owned);
+            for code in ["child", "parent"] {
+                let mut item = node(code);
+                item.system = system.to_owned();
+                item.version = version.clone();
+                item.display = Some(format!("{system}/{version:?}/{code}"));
+                nodes.push(item);
+            }
+            edges.insert(
+                (system.to_owned(), "parent".to_owned(), version.clone()),
+                vec![(system.to_owned(), "child".to_owned(), version)],
+            );
+        }
+        let tree = nest_expansion(nodes, &edges);
+        assert_eq!(tree.len(), groups.len());
+        // Equal codes retain a deterministic system/version order, regardless
+        // of the order the backend returned the concepts and edges.
+        let mut expected = groups.to_vec();
+        expected.sort();
+        for (parent, (system, version)) in tree.iter().zip(expected) {
+            assert_eq!(parent.code, "parent");
+            assert_eq!(parent.system, system);
+            assert_eq!(parent.version.as_deref(), version);
+            assert_eq!(parent.contains.len(), 1);
+            let child = &parent.contains[0];
+            assert_eq!(child.code, "child");
+            assert_eq!(child.system, system);
+            assert_eq!(child.version.as_deref(), version);
+            assert_eq!(child.display, Some(format!("{system}/{version:?}/child")));
+            assert!(child.contains.is_empty());
+        }
     }
 
     /// The overflow that took the server down: `root → a`, plus `a ⇄ b`.

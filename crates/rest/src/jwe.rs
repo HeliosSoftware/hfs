@@ -278,43 +278,72 @@ fn load_private_keys_pem(pem: &str) -> Result<Vec<PrivateKey>> {
     }
 }
 
-/// Re-serializes an EC JWK keeping only the members RFC 7518 §6.2 defines.
-///
-/// The `elliptic-curve` JWK parser rejects unknown members, so `kid`, `alg`,
-/// `use`, and friends — routinely present on real keys and on the `epk` of an
-/// ECDH-ES header — have to be dropped first.
-fn ec_jwk_str(jwk: &Value) -> String {
-    let mut out = Map::new();
-    for name in ["kty", "crv", "x", "y", "d"] {
-        if let Some(v) = jwk.get(name) {
-            out.insert(name.to_string(), v.clone());
-        }
+/// Decodes the base64url JWK member `name`, which RFC 7518 §6.2.1.2 requires
+/// to be exactly the curve's field width (`len` bytes, leading zeros kept).
+fn ec_jwk_member(jwk: &Value, name: &str, len: usize) -> Result<Vec<u8>> {
+    let raw = jwk
+        .get(name)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("missing '{name}'"))?;
+    let bytes = b64(raw).map_err(|e| format!("'{name}': {e}"))?;
+    if bytes.len() != len {
+        return Err(format!("'{name}' is {} bytes, expected {len}", bytes.len()));
     }
-    Value::Object(out).to_string()
+    Ok(bytes)
 }
+
+/// The SEC1 uncompressed encoding (`0x04 || x || y`) of an EC JWK's point.
+fn ec_jwk_point(jwk: &Value, len: usize) -> Result<Vec<u8>> {
+    let mut point = Vec::with_capacity(1 + 2 * len);
+    point.push(0x04);
+    point.extend(ec_jwk_member(jwk, "x", len)?);
+    point.extend(ec_jwk_member(jwk, "y", len)?);
+    Ok(point)
+}
+
+/// Per-curve EC JWK decoding (RFC 7518 §6.2). Members other than `x`, `y` and
+/// `d` — `kid`, `alg`, `use`, … — are ignored. `from_sec1_bytes` rejects
+/// points that are not on the curve, and a private key whose `d` does not
+/// match its `x`/`y` is refused.
+macro_rules! ec_jwk_decoders {
+    ($curve:ident, $len:expr, $public:ident, $secret:ident) => {
+        fn $public(jwk: &Value) -> Result<$curve::PublicKey> {
+            $curve::PublicKey::from_sec1_bytes(&ec_jwk_point(jwk, $len)?)
+                .map_err(|_| "point is not on the curve".to_string())
+        }
+
+        fn $secret(jwk: &Value) -> Result<$curve::SecretKey> {
+            let d = p256::elliptic_curve::zeroize::Zeroizing::new(ec_jwk_member(jwk, "d", $len)?);
+            let key = $curve::SecretKey::from_slice(&d)
+                .map_err(|_| "'d' is not a valid scalar".to_string())?;
+            if key.public_key() != $public(jwk)? {
+                return Err("'d' does not match 'x'/'y'".to_string());
+            }
+            Ok(key)
+        }
+    };
+}
+
+ec_jwk_decoders!(p256, 32, p256_public_from_jwk, p256_secret_from_jwk);
+ec_jwk_decoders!(p384, 48, p384_public_from_jwk, p384_secret_from_jwk);
 
 fn private_key_from_jwk(jwk: &Value) -> Result<PrivateKey> {
     let kid = jwk.get("kid").and_then(|v| v.as_str()).map(str::to_string);
     match jwk.get("kty").and_then(|v| v.as_str()) {
         Some("RSA") => Err(RSA_UNSUPPORTED.to_string()),
-        Some("EC") => {
-            let jwk_str = ec_jwk_str(jwk);
-            match jwk.get("crv").and_then(|v| v.as_str()) {
-                Some("P-256") => Ok(PrivateKey::P256 {
-                    kid,
-                    key: p256::SecretKey::from_jwk_str(&jwk_str)
-                        .map_err(|e| format!("invalid P-256 JWK: {e}"))?,
-                }),
-                Some("P-384") => Ok(PrivateKey::P384 {
-                    kid,
-                    key: p384::SecretKey::from_jwk_str(&jwk_str)
-                        .map_err(|e| format!("invalid P-384 JWK: {e}"))?,
-                }),
-                other => Err(format!(
-                    "unsupported EC JWK crv {other:?} (expected P-256 or P-384)"
-                )),
-            }
-        }
+        Some("EC") => match jwk.get("crv").and_then(|v| v.as_str()) {
+            Some("P-256") => Ok(PrivateKey::P256 {
+                kid,
+                key: p256_secret_from_jwk(jwk).map_err(|e| format!("invalid P-256 JWK: {e}"))?,
+            }),
+            Some("P-384") => Ok(PrivateKey::P384 {
+                kid,
+                key: p384_secret_from_jwk(jwk).map_err(|e| format!("invalid P-384 JWK: {e}"))?,
+            }),
+            other => Err(format!(
+                "unsupported EC JWK crv {other:?} (expected P-256 or P-384)"
+            )),
+        },
         other => Err(format!("unsupported JWK kty {other:?} (expected EC)")),
     }
 }
@@ -683,7 +712,6 @@ fn ecdh_shared_secret(header: &Map<String, Value>, keys: &DecryptionKeys) -> Res
     let epk = header
         .get("epk")
         .ok_or_else(|| "JWE ECDH-ES header is missing 'epk'".to_string())?;
-    let epk_str = ec_jwk_str(epk);
     let crv = epk
         .get("crv")
         .and_then(|v| v.as_str())
@@ -697,8 +725,7 @@ fn ecdh_shared_secret(header: &Map<String, Value>, keys: &DecryptionKeys) -> Res
     }
     match crv {
         "P-256" => {
-            let epk = p256::PublicKey::from_jwk_str(&epk_str)
-                .map_err(|e| format!("invalid P-256 'epk': {e}"))?;
+            let epk = p256_public_from_jwk(epk).map_err(|e| format!("invalid P-256 'epk': {e}"))?;
             for key in candidates {
                 if let PrivateKey::P256 { key, .. } = key {
                     let z = p256::ecdh::diffie_hellman(key.to_nonzero_scalar(), epk.as_affine());
@@ -708,8 +735,7 @@ fn ecdh_shared_secret(header: &Map<String, Value>, keys: &DecryptionKeys) -> Res
             Err("JWE ECDH-ES with crv=P-256 needs a configured P-256 private key".to_string())
         }
         "P-384" => {
-            let epk = p384::PublicKey::from_jwk_str(&epk_str)
-                .map_err(|e| format!("invalid P-384 'epk': {e}"))?;
+            let epk = p384_public_from_jwk(epk).map_err(|e| format!("invalid P-384 'epk': {e}"))?;
             for key in candidates {
                 if let PrivateKey::P384 { key, .. } = key {
                     let z = p384::ecdh::diffie_hellman(key.to_nonzero_scalar(), epk.as_affine());
@@ -940,9 +966,43 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// EC JWK encoders for tests, standing in for the `jwk` feature that
+/// `elliptic-curve` 0.14 dropped.
+#[cfg(test)]
+pub(crate) mod test_jwk {
+    use super::B64URL;
+    use base64::Engine;
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    use serde_json::{Value, json};
+
+    macro_rules! encoders {
+        ($curve:ident, $crv:literal, $public:ident, $private:ident) => {
+            pub(crate) fn $public(key: &$curve::PublicKey) -> Value {
+                let point = key.to_sec1_point(false);
+                json!({
+                    "kty": "EC",
+                    "crv": $crv,
+                    "x": B64URL.encode(point.x().unwrap()),
+                    "y": B64URL.encode(point.y().unwrap()),
+                })
+            }
+
+            pub(crate) fn $private(key: &$curve::SecretKey) -> Value {
+                let mut jwk = $public(&key.public_key());
+                jwk["d"] = Value::String(B64URL.encode(key.to_bytes()));
+                jwk
+            }
+        };
+    }
+
+    encoders!(p256, "P-256", p256_public, p256_private);
+    encoders!(p384, "P-384", p384_public, p384_private);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::elliptic_curve::Generate;
 
     /// Builds `hdr..iv.ct.tag` for an `alg=dir` compact JWE.
     fn dir_compact(header: &str, iv: &[u8], ct: &[u8], tag: &[u8]) -> String {
@@ -1224,10 +1284,8 @@ mod tests {
 
     #[test]
     fn ecdh_es_without_a_configured_key_names_the_missing_configuration() {
-        use rand::rngs::OsRng;
-
-        let ephemeral = p256::SecretKey::random(&mut OsRng);
-        let epk: Value = serde_json::from_str(&ephemeral.public_key().to_jwk_string()).unwrap();
+        let ephemeral = p256::SecretKey::generate();
+        let epk = test_jwk::p256_public(&ephemeral.public_key());
         let header = serde_json::json!({"alg": "ECDH-ES", "enc": "A256GCM", "epk": epk});
         let compact = dir_compact(
             &serde_json::to_string(&header).unwrap(),
@@ -1241,12 +1299,10 @@ mod tests {
 
     #[test]
     fn ecdh_es_direct_round_trip() {
-        use rand::rngs::OsRng;
-
-        let recipient = p256::SecretKey::random(&mut OsRng);
+        let recipient = p256::SecretKey::generate();
         let recipient_pub = recipient.public_key();
-        let ephemeral = p256::SecretKey::random(&mut OsRng);
-        let epk: Value = serde_json::from_str(&ephemeral.public_key().to_jwk_string()).unwrap();
+        let ephemeral = p256::SecretKey::generate();
+        let epk = test_jwk::p256_public(&ephemeral.public_key());
 
         // Sender side: Z from the ephemeral private key + recipient public key.
         let z =
@@ -1279,11 +1335,9 @@ mod tests {
     fn ecdh_es_a128kw_round_trip() {
         use aes::Aes128;
         use aes_kw::Kek;
-        use rand::rngs::OsRng;
-
-        let recipient = p384::SecretKey::random(&mut OsRng);
-        let ephemeral = p384::SecretKey::random(&mut OsRng);
-        let epk: Value = serde_json::from_str(&ephemeral.public_key().to_jwk_string()).unwrap();
+        let recipient = p384::SecretKey::generate();
+        let ephemeral = p384::SecretKey::generate();
+        let epk = test_jwk::p384_public(&ephemeral.public_key());
         let z = p384::ecdh::diffie_hellman(
             ephemeral.to_nonzero_scalar(),
             recipient.public_key().as_affine(),
@@ -1369,16 +1423,14 @@ mod tests {
     #[test]
     fn load_private_keys_reads_pkcs8_ec_pem() {
         use p256::pkcs8::{EncodePrivateKey, LineEnding};
-        use rand::rngs::OsRng;
-
-        let p256_pem = p256::SecretKey::random(&mut OsRng)
+        let p256_pem = p256::SecretKey::generate()
             .to_pkcs8_pem(LineEnding::LF)
             .unwrap()
             .to_string();
         let keys = load_private_keys(&p256_pem).unwrap();
         assert!(matches!(keys.as_slice(), [PrivateKey::P256 { .. }]));
 
-        let p384_pem = p384::SecretKey::random(&mut OsRng)
+        let p384_pem = p384::SecretKey::generate()
             .to_pkcs8_pem(LineEnding::LF)
             .unwrap()
             .to_string();
@@ -1401,15 +1453,54 @@ mod tests {
 
     #[test]
     fn load_private_keys_reads_a_jwk_set() {
-        use rand::rngs::OsRng;
-
-        let ec = p256::SecretKey::random(&mut OsRng);
-        let mut jwk: Value = serde_json::from_str(&ec.to_jwk_string()).unwrap();
+        let ec = p256::SecretKey::generate();
+        let mut jwk = test_jwk::p256_private(&ec);
         jwk["kid"] = Value::String("k1".into());
         let jwks = serde_json::json!({ "keys": [jwk] }).to_string();
         let keys = load_private_keys(&jwks).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].kid(), Some("k1"));
+    }
+
+    #[test]
+    fn ec_jwk_decoding_round_trips_and_ignores_extra_members() {
+        let key = p384::SecretKey::generate();
+        let mut jwk = test_jwk::p384_private(&key);
+        jwk["kid"] = Value::String("k".into());
+        jwk["alg"] = Value::String("ECDH-ES".into());
+        assert_eq!(p384_secret_from_jwk(&jwk).unwrap(), key);
+        assert_eq!(p384_public_from_jwk(&jwk).unwrap(), key.public_key());
+    }
+
+    #[test]
+    fn ec_jwk_decoding_rejects_malformed_keys() {
+        let key = p256::SecretKey::generate();
+        let good = test_jwk::p256_private(&key);
+
+        // Coordinates must be the full field width.
+        let mut short = good.clone();
+        short["x"] = Value::String(B64URL.encode([1u8; 31]));
+        let err = p256_public_from_jwk(&short).unwrap_err();
+        assert!(err.contains("'x' is 31 bytes"), "{err}");
+
+        // A point that is not on the curve.
+        let mut off_curve = good.clone();
+        off_curve["y"] = Value::String(B64URL.encode([1u8; 32]));
+        assert!(p256_public_from_jwk(&off_curve).is_err());
+
+        // A `d` belonging to a different key.
+        let mut mismatched = good.clone();
+        mismatched["d"] = Value::String(B64URL.encode(p256::SecretKey::generate().to_bytes()));
+        let err = p256_secret_from_jwk(&mismatched).unwrap_err();
+        assert!(err.contains("does not match"), "{err}");
+
+        // A private key needs `d`, and `d` must be a non-zero scalar.
+        let mut public_only = good.clone();
+        public_only.as_object_mut().unwrap().remove("d");
+        assert!(p256_secret_from_jwk(&public_only).is_err());
+        let mut zero = good;
+        zero["d"] = Value::String(B64URL.encode([0u8; 32]));
+        assert!(p256_secret_from_jwk(&zero).is_err());
     }
 
     #[test]
@@ -1421,9 +1512,8 @@ mod tests {
 
     #[test]
     fn kid_selects_the_matching_key() {
-        use rand::rngs::OsRng;
-        let a = p256::SecretKey::random(&mut OsRng);
-        let b = p256::SecretKey::random(&mut OsRng);
+        let a = p256::SecretKey::generate();
+        let b = p256::SecretKey::generate();
         let keys = DecryptionKeys::private(vec![
             PrivateKey::P256 {
                 kid: Some("a".into()),

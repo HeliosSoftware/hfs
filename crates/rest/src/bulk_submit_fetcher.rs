@@ -1796,13 +1796,13 @@ mod tests {
 
     #[test]
     fn test_unwraps_a_jwe_wrapped_content_encryption_key() {
-        use rand::rngs::OsRng;
+        use p256::elliptic_curve::Generate;
 
         // The provider delivers the CEK as an ECDH-ES JWE addressed to HFS's
         // public key, rather than putting the raw key in `value`.
-        let recipient = p256::SecretKey::random(&mut OsRng);
-        let ephemeral = p256::SecretKey::random(&mut OsRng);
-        let epk: Value = serde_json::from_str(&ephemeral.public_key().to_jwk_string()).unwrap();
+        let recipient = p256::SecretKey::generate();
+        let ephemeral = p256::SecretKey::generate();
+        let epk = crate::jwe::test_jwk::p256_public(&ephemeral.public_key());
         let z = p256::ecdh::diffie_hellman(
             ephemeral.to_nonzero_scalar(),
             recipient.public_key().as_affine(),

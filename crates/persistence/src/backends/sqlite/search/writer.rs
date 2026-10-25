@@ -193,6 +193,32 @@ impl SqliteSearchIndexWriter {
         })
     }
 
+    /// Most rows [`Self::insert_sql_rows`] carries: 512 x 28 = 14,336
+    /// parameters, well under SQLite's variable limit.
+    pub const MAX_ROWS_PER_INSERT: usize = 512;
+
+    /// One INSERT carrying `rows` rows (1..=[`Self::MAX_ROWS_PER_INSERT`], each
+    /// [`Self::COLUMNS`] positional parameters): a resource's whole index in
+    /// one statement instead of one per row (or one per eight). The text is
+    /// built once per row count and kept, so the connection's prepared
+    /// statement cache sees one stable string per count.
+    pub fn insert_sql_rows(rows: usize) -> &'static str {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        assert!((1..=Self::MAX_ROWS_PER_INSERT).contains(&rows));
+        static CACHE: OnceLock<Mutex<HashMap<usize, &'static str>>> = OnceLock::new();
+        let mut cache = CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.entry(rows).or_insert_with(|| {
+            let base = Self::insert_sql();
+            let cols = &base[..base.find("VALUES").expect("insert_sql has VALUES")];
+            let group = format!("({})", ["?"; Self::COLUMNS].join(", "));
+            Box::leak(format!("{cols}VALUES {}", vec![group; rows].join(", ")).into_boxed_str())
+        })
+    }
+
     /// Number of base columns [`Self::insert_sql`] writes, and so the length of
     /// every vector [`Self::to_sql_params`] returns.
     pub const COLUMNS: usize = 28;
@@ -464,6 +490,31 @@ mod tests {
     use super::*;
     use crate::search::DateEnd;
     use crate::types::{DatePrecision, SearchParamType};
+
+    #[test]
+    fn multi_row_insert_has_one_group_per_row_and_is_stable() {
+        for rows in [
+            1usize,
+            2,
+            8,
+            19,
+            SqliteSearchIndexWriter::MAX_ROWS_PER_INSERT,
+        ] {
+            let sql = SqliteSearchIndexWriter::insert_sql_rows(rows);
+            assert_eq!(
+                sql.matches('?').count(),
+                rows * SqliteSearchIndexWriter::COLUMNS
+            );
+            assert!(std::ptr::eq(
+                sql,
+                SqliteSearchIndexWriter::insert_sql_rows(rows)
+            ));
+        }
+        assert_eq!(
+            SqliteSearchIndexWriter::insert_sql_rows(8),
+            SqliteSearchIndexWriter::insert_sql_rows8()
+        );
+    }
 
     #[test]
     fn composite_slot_survives_single_batch_and_contained_inserts() {

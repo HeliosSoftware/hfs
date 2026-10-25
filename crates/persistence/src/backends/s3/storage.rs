@@ -1227,6 +1227,12 @@ impl ResourceStorage for S3Backend {
         true
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::in_process::{InProcessSofRunner, ResourceScan};
         use crate::sof::reference_resolver::StorageBackedResolver;
@@ -1866,6 +1872,9 @@ impl ResourceStorage for S3Backend {
         }
         self.pin_legacy_layout_after_purge(&location, &marker_key)
             .await?;
+        // SQL query terminology relations live under the tenant's `bulk/`
+        // root, which the sweep above leaves alone (#2185).
+        self.purge_tenant_sof_terminology(&tenant).await?;
         // Per-user settings live outside every tenant prefix (they are
         // user-global), so the sweep above structurally cannot reach them — see
         // `S3Keyspace::user_settings_key`. They nonetheless hold PHI-derived
