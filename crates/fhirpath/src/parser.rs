@@ -1061,7 +1061,7 @@ pub fn parser<'src>()
     // DELIMITEDIDENTIFIER: '`' (ESC | .)*? '`'
     let delimited_identifier = just('`')
         .ignore_then(
-            none_of("`")
+            none_of("\\`")
                 .map(|c: char| c as u32)
                 .or(esc)
                 .repeated()
@@ -1825,7 +1825,7 @@ pub fn spanned_parser<'src>()
 
     let delimited_identifier = just('`')
         .ignore_then(
-            none_of("`")
+            none_of("\\`")
                 .map(|c: char| c as u32)
                 .or(esc)
                 .repeated()

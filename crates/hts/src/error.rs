@@ -10,20 +10,24 @@
 //! | Variant | HTTP status | FHIR issue code | tx-issue-type |
 //! |---------|-------------|-----------------|---------------|
 //! | [`NotFound`] | 404 | `not-found` | `not-found` |
+//! | [`Gone`] | 410 | `deleted` | `not-found` |
 //! | [`NotSupported`] | 501 | `not-supported` | `not-supported` |
 //! | [`InvalidRequest`] | 400 | `invalid` | `invalid` |
 //! | [`VsInvalid`] | 400 | `invalid` | `vs-invalid` |
 //! | [`Internal`] | 500 | `exception` | `exception` |
 //! | [`StorageError`] | 500 | `exception` | `exception` |
+//! | [`Conflict`] | 409 | `conflict` | `conflict` |
 //! | [`PreconditionFailed`] | 412 | `conflict` | `conflict` |
 //! | [`TooCostly`] | 422 | `too-costly` | `too-costly` |
 //!
 //! [`NotFound`]: HtsError::NotFound
+//! [`Gone`]: HtsError::Gone
 //! [`NotSupported`]: HtsError::NotSupported
 //! [`InvalidRequest`]: HtsError::InvalidRequest
 //! [`VsInvalid`]: HtsError::VsInvalid
 //! [`Internal`]: HtsError::Internal
 //! [`StorageError`]: HtsError::StorageError
+//! [`Conflict`]: HtsError::Conflict
 //! [`PreconditionFailed`]: HtsError::PreconditionFailed
 //! [`TooCostly`]: HtsError::TooCostly
 
@@ -48,6 +52,10 @@ pub enum HtsError {
     /// not exist in the store.  Maps to HTTP 404.
     #[error("Resource not found: {0}")]
     NotFound(String),
+
+    /// The requested history revision records deletion. Maps to HTTP 410.
+    #[error("Resource version deleted: {0}")]
+    Gone(String),
 
     /// The operation or parameter is valid FHIR but is not implemented by this
     /// server (e.g., SNOMED post-coordination expressions).  Maps to HTTP 501.
@@ -76,6 +84,11 @@ pub enum HtsError {
     /// A database or connection-pool error.  Maps to HTTP 500.
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    /// The selected resource changed while the mutation acquired its locks.
+    /// The caller may read the current resource and retry. Maps to HTTP 409.
+    #[error("Resource conflict: {0}")]
+    Conflict(String),
 
     /// An optimistic-concurrency conflict: the `If-Match` version does not
     /// match the stored version.  Maps to HTTP 412.
@@ -140,6 +153,7 @@ impl IntoResponse for HtsError {
                 "not-found",
                 msg.as_str(),
             ),
+            HtsError::Gone(msg) => (StatusCode::GONE, "deleted", "not-found", msg.as_str()),
             HtsError::NotSupported(msg) => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
@@ -167,6 +181,7 @@ impl IntoResponse for HtsError {
                 "exception",
                 msg.as_str(),
             ),
+            HtsError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", "conflict", msg.as_str()),
             HtsError::PreconditionFailed(msg) => (
                 StatusCode::PRECONDITION_FAILED,
                 "conflict",

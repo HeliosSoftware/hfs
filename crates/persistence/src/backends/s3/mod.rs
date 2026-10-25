@@ -17,6 +17,7 @@ mod keyspace;
 mod login_sessions;
 mod models;
 mod output_store;
+mod sof_terminology;
 mod storage;
 mod submit_worker;
 mod user_settings;
