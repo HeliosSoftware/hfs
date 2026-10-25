@@ -300,6 +300,16 @@ fn parse_prepared(expr: &str) -> Result<Arc<FhirPathExpression>, String> {
     helios_fhirpath::parse_expression(expr).map(Arc::new)
 }
 
+/// See [`SearchParameterExtractor::missing_fingerprint`].
+#[cfg(feature = "mongodb")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingFingerprint {
+    /// Stamped next to each `missing_params` array.
+    pub fingerprint: String,
+    /// Parameter code → digest of its definition(s).
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
 /// Extracts searchable values from FHIR resources using FHIRPath.
 pub struct SearchParameterExtractor {
     registry: Arc<RwLock<SearchParameterRegistry>>,
@@ -320,6 +330,66 @@ impl SearchParameterExtractor {
         resource_type: &str,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
         self.extract_internal(resource, resource_type, None)
+    }
+
+    /// The definitions `missing_params` of `resource_type` is computed from:
+    /// one digest per parameter code, and the type's fingerprint over all of
+    /// them. Backends stamp the fingerprint on each array and keep the
+    /// per-code digests so an unchanged parameter stays trusted after
+    /// another one changes (#1999).
+    #[cfg(feature = "mongodb")]
+    pub(crate) fn missing_fingerprint(&self, resource_type: &str) -> MissingFingerprint {
+        use sha2::{Digest, Sha256};
+
+        let params = {
+            let registry = self.registry.read();
+            let mut params = registry.get_active_params(resource_type);
+            for base in ABSTRACT_BASE_TYPES {
+                params.extend(registry.get_active_params(base));
+            }
+            params
+        };
+        let mut entries: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for param in params
+            .iter()
+            .filter(|param| self.supports_missing(resource_type, param))
+        {
+            let mut entry = format!("{:?}\u{1}{}", param.param_type, param.expression);
+            if let Some(components) = &param.component {
+                for component in components {
+                    entry.push('\u{1}');
+                    entry.push_str(&component.definition);
+                    entry.push('\u{1}');
+                    entry.push_str(&component.expression);
+                }
+            }
+            entries.entry(param.code.clone()).or_default().push(entry);
+        }
+        let hex = |digest: &[u8]| digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let mut type_hasher = Sha256::new();
+        let params = entries
+            .into_iter()
+            .map(|(code, mut definitions)| {
+                definitions.sort();
+                let mut hasher = Sha256::new();
+                hasher.update(code.as_bytes());
+                for definition in &definitions {
+                    hasher.update([0u8]);
+                    hasher.update(definition.as_bytes());
+                }
+                let digest: String = hex(&hasher.finalize());
+                type_hasher.update(code.as_bytes());
+                type_hasher.update([1u8]);
+                type_hasher.update(digest.as_bytes());
+                type_hasher.update([0u8]);
+                (code, digest)
+            })
+            .collect();
+        MissingFingerprint {
+            fingerprint: hex(&type_hasher.finalize()),
+            params,
+        }
     }
 
     /// Also report absent parameters for backends that index absence.

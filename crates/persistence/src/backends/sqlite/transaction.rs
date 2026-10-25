@@ -1,5 +1,6 @@
 //! Transaction support for SQLite backend.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -92,10 +93,30 @@ pub(super) fn bundle_begin_error(err: StorageError) -> TransactionError {
     }
 }
 
+/// Keep rollback responsibility with the pooled connection, including when a
+/// cancelled caller leaves extension work running on a blocking thread.
+struct TransactionConnection(PooledConnection<SqliteConnectionManager>);
+
+impl Deref for TransactionConnection {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TransactionConnection {
+    fn drop(&mut self) {
+        if !self.is_autocommit() {
+            let _ = self.execute("ROLLBACK", []);
+        }
+    }
+}
+
 /// A SQLite transaction.
 pub struct SqliteTransaction {
     /// The connection used for this transaction.
-    conn: Arc<Mutex<PooledConnection<SqliteConnectionManager>>>,
+    conn: Arc<Mutex<TransactionConnection>>,
     /// Whether the transaction is still active.
     active: bool,
     /// The tenant context for this transaction.
@@ -124,6 +145,284 @@ impl std::fmt::Debug for SqliteTransaction {
 }
 
 impl SqliteTransaction {
+    /// Read the current revision, including its deletion timestamp when it is
+    /// a tombstone. Ordinary transaction reads continue to hide deleted rows.
+    pub async fn read_including_deleted(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<StoredResource>> {
+        self.read_resource(resource_type, id, true).await
+    }
+
+    /// Restore a tombstone as its next revision in this transaction. The
+    /// supplied tombstone must belong to this tenant and still match the
+    /// stored deletion state and version. History and search indexes are
+    /// updated with the resource; callers must roll back on any write error.
+    pub async fn restore(
+        &mut self,
+        deleted: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        if !deleted.is_deleted() || deleted.tenant_id() != self.tenant.tenant_id() {
+            return Err(StorageError::Validation(
+                crate::error::ValidationError::InvalidResource {
+                    message: "Restore requires a deleted resource from the transaction's tenant"
+                        .into(),
+                    details: Vec::new(),
+                },
+            ));
+        }
+        self.write_revision(deleted, resource, true).await
+    }
+
+    async fn read_resource(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+        include_deleted: bool,
+    ) -> StorageResult<Option<StoredResource>> {
+        if !self.active {
+            return Err(StorageError::Transaction(
+                TransactionError::InvalidTransaction,
+            ));
+        }
+
+        let conn = self.conn.lock();
+        let tenant_id = self.tenant.tenant_id().as_str();
+
+        let result = conn.query_row(
+            "SELECT version_id, data, last_updated, is_deleted, fhir_version, deleted_at
+             FROM resources
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+            params![tenant_id, resource_type, id],
+            |row| {
+                let version_id: String = row.get(0)?;
+                let data: Vec<u8> = row.get(1)?;
+                let last_updated: String = row.get(2)?;
+                let is_deleted: i32 = row.get(3)?;
+                let fhir_version: String = row.get(4)?;
+                let deleted_at: Option<String> = row.get(5)?;
+                Ok((
+                    version_id,
+                    data,
+                    last_updated,
+                    is_deleted,
+                    fhir_version,
+                    deleted_at,
+                ))
+            },
+        );
+
+        match result {
+            Ok((version_id, data, last_updated, is_deleted, fhir_version_str, deleted_at)) => {
+                if is_deleted != 0 && !include_deleted {
+                    return Ok(None);
+                }
+
+                let json_data: serde_json::Value = serde_json::from_slice(&data).map_err(|e| {
+                    serialization_error(format!("Failed to deserialize resource: {}", e))
+                })?;
+
+                let last_updated = chrono::DateTime::parse_from_rfc3339(&last_updated)
+                    .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
+                    .with_timezone(&Utc);
+
+                // Older tombstones may lack deleted_at. Preserve their deleted
+                // state using the timestamp of the deletion revision.
+                let deleted_at = if is_deleted != 0 {
+                    Some(
+                        deleted_at
+                            .map(|value| {
+                                chrono::DateTime::parse_from_rfc3339(&value)
+                                    .map(|value| value.with_timezone(&Utc))
+                                    .map_err(|error| {
+                                        internal_error(format!(
+                                            "Failed to parse deleted_at: {error}"
+                                        ))
+                                    })
+                            })
+                            .transpose()?
+                            .unwrap_or(last_updated),
+                    )
+                } else {
+                    None
+                };
+
+                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+                Ok(Some(StoredResource::from_storage(
+                    resource_type,
+                    id,
+                    version_id,
+                    self.tenant.tenant_id().clone(),
+                    json_data,
+                    last_updated,
+                    last_updated,
+                    deleted_at,
+                    fhir_version,
+                )))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(internal_error(format!("Failed to read resource: {}", e))),
+        }
+    }
+
+    async fn write_revision(
+        &mut self,
+        current: &StoredResource,
+        resource: Value,
+        expected_deleted: bool,
+    ) -> StorageResult<StoredResource> {
+        let _update_span = perf::span(Phase::Update);
+        self.tenant
+            .check_permission(Operation::Update, current.resource_type())?;
+
+        if !self.active {
+            return Err(StorageError::Transaction(
+                TransactionError::InvalidTransaction,
+            ));
+        }
+
+        let conn = self.conn.lock();
+        let tenant_id = self.tenant.tenant_id().as_str();
+        let resource_type = current.resource_type();
+        let id = current.id();
+
+        // Verify current version still matches (optimistic locking)
+        let db_version: Result<String, _> = conn.query_row(
+            "SELECT version_id FROM resources
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = ?4",
+            params![tenant_id, resource_type, id, expected_deleted],
+            |row| row.get(0),
+        );
+
+        let db_version = match db_version {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+            Err(e) => {
+                return Err(internal_error(format!(
+                    "Failed to get current version: {}",
+                    e
+                )));
+            }
+        };
+
+        if db_version != current.version_id() {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: current.version_id().to_string(),
+                    actual_version: db_version,
+                },
+            ));
+        }
+
+        // Calculate new version
+        let new_version: u64 = db_version.parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Build the resource with id and resourceType
+        let mut data = resource;
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+        }
+
+        // Serialize the resource data
+        let data_bytes = {
+            let _span = perf::span(Phase::Serialize);
+            serde_json::to_vec(&data)
+                .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?
+        };
+
+        let now = Utc::now();
+        let last_updated = now.to_rfc3339();
+
+        // Preserve FHIR version from the current resource
+        let fhir_version = current.fhir_version();
+        let fhir_version_str = fhir_version.as_mime_param();
+
+        // Update the resource
+        let _update_row_span = perf::span(Phase::ResourceUpdate);
+        let updated = conn
+            .execute(
+                "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3,
+                 is_deleted = 0, deleted_at = NULL
+             WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6
+               AND version_id = ?7 AND is_deleted = ?8",
+                params![
+                    new_version_str,
+                    data_bytes,
+                    last_updated,
+                    tenant_id,
+                    resource_type,
+                    id,
+                    current.version_id(),
+                    expected_deleted
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+        if updated != 1 {
+            return Err(internal_error(
+                "Resource changed while writing its revision".into(),
+            ));
+        }
+        drop(_update_row_span);
+
+        // Insert into history
+        {
+            let _span = perf::span(Phase::HistoryInsert);
+            conn.execute(
+                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, \
+                 data, last_updated, is_deleted, fhir_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                params![
+                    tenant_id,
+                    resource_type,
+                    id,
+                    new_version_str,
+                    data_bytes,
+                    last_updated,
+                    fhir_version_str,
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        }
+
+        // Re-index the resource for search, clearing the previous version's rows.
+        self.index_resource(&conn, tenant_id, resource_type, id, &data, true, None)?;
+        drop(conn);
+
+        // A SearchParameter write invalidates this tenant's cached registry
+        // (after commit), mirroring the storage path.
+        if resource_type == "SearchParameter" {
+            self.invalidate_registry = true;
+        }
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            self.tenant.tenant_id().clone(),
+            data,
+            now,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
     /// Create a new transaction.
     fn new(
         conn: PooledConnection<SqliteConnectionManager>,
@@ -137,7 +436,7 @@ impl SqliteTransaction {
             .map_err(|e| begin_error(&e))?;
 
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(Mutex::new(TransactionConnection(conn))),
             active: true,
             tenant,
             backend,
@@ -161,6 +460,40 @@ impl SqliteTransaction {
         }
         let conn = self.conn.lock();
         f(&conn)
+    }
+
+    /// Run extension-table work on the active resource transaction, off the
+    /// async runtime. The callback must not begin, commit or roll back a
+    /// transaction. Its connection cannot escape the callback.
+    ///
+    /// Callers must roll back when extension work fails. If the awaiting task
+    /// is cancelled, connection ownership keeps queued work isolated from the
+    /// pool; work that starts after rollback is refused.
+    pub async fn run_on_connection<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Connection) -> StorageResult<T> + Send + 'static,
+    ) -> StorageResult<T> {
+        if !self.active {
+            return Err(StorageError::Transaction(
+                TransactionError::InvalidTransaction,
+            ));
+        }
+        let connection = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let connection = connection.lock();
+            if connection.is_autocommit() {
+                return Err(StorageError::Transaction(
+                    TransactionError::InvalidTransaction,
+                ));
+            }
+            operation(&connection)
+        })
+        .await
+        .map_err(|error| {
+            StorageError::Transaction(TransactionError::RolledBack {
+                reason: format!("Transaction extension task failed: {error}"),
+            })
+        })?
     }
 
     /// Generate a new ID for a resource.
@@ -385,62 +718,7 @@ impl Transaction for SqliteTransaction {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<Option<StoredResource>> {
-        if !self.active {
-            return Err(StorageError::Transaction(
-                TransactionError::InvalidTransaction,
-            ));
-        }
-
-        let conn = self.conn.lock();
-        let tenant_id = self.tenant.tenant_id().as_str();
-
-        let result = conn.query_row(
-            "SELECT version_id, data, last_updated, is_deleted, fhir_version
-             FROM resources
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
-            params![tenant_id, resource_type, id],
-            |row| {
-                let version_id: String = row.get(0)?;
-                let data: Vec<u8> = row.get(1)?;
-                let last_updated: String = row.get(2)?;
-                let is_deleted: i32 = row.get(3)?;
-                let fhir_version: String = row.get(4)?;
-                Ok((version_id, data, last_updated, is_deleted, fhir_version))
-            },
-        );
-
-        match result {
-            Ok((version_id, data, last_updated, is_deleted, fhir_version_str)) => {
-                if is_deleted != 0 {
-                    return Ok(None);
-                }
-
-                let json_data: serde_json::Value = serde_json::from_slice(&data).map_err(|e| {
-                    serialization_error(format!("Failed to deserialize resource: {}", e))
-                })?;
-
-                let last_updated = chrono::DateTime::parse_from_rfc3339(&last_updated)
-                    .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
-                    .with_timezone(&Utc);
-
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-
-                Ok(Some(StoredResource::from_storage(
-                    resource_type,
-                    id,
-                    version_id,
-                    self.tenant.tenant_id().clone(),
-                    json_data,
-                    last_updated,
-                    last_updated,
-                    None,
-                    fhir_version,
-                )))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(internal_error(format!("Failed to read resource: {}", e))),
-        }
+        self.read_resource(resource_type, id, false).await
     }
 
     async fn update(
@@ -448,133 +726,7 @@ impl Transaction for SqliteTransaction {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let _update_span = perf::span(Phase::Update);
-        self.tenant
-            .check_permission(Operation::Update, current.resource_type())?;
-
-        if !self.active {
-            return Err(StorageError::Transaction(
-                TransactionError::InvalidTransaction,
-            ));
-        }
-
-        let conn = self.conn.lock();
-        let tenant_id = self.tenant.tenant_id().as_str();
-        let resource_type = current.resource_type();
-        let id = current.id();
-
-        // Verify current version still matches (optimistic locking)
-        let db_version: Result<String, _> = conn.query_row(
-            "SELECT version_id FROM resources
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
-            params![tenant_id, resource_type, id],
-            |row| row.get(0),
-        );
-
-        let db_version = match db_version {
-            Ok(v) => v,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-            Err(e) => {
-                return Err(internal_error(format!(
-                    "Failed to get current version: {}",
-                    e
-                )));
-            }
-        };
-
-        if db_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version: db_version,
-                },
-            ));
-        }
-
-        // Calculate new version
-        let new_version: u64 = db_version.parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-
-        // Build the resource with id and resourceType
-        let mut data = resource.clone();
-        if let Some(obj) = data.as_object_mut() {
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-        }
-
-        // Serialize the resource data
-        let data_bytes = {
-            let _span = perf::span(Phase::Serialize);
-            serde_json::to_vec(&data)
-                .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?
-        };
-
-        let now = Utc::now();
-        let last_updated = now.to_rfc3339();
-
-        // Preserve FHIR version from the current resource
-        let fhir_version = current.fhir_version();
-        let fhir_version_str = fhir_version.as_mime_param();
-
-        // Update the resource
-        let _update_row_span = perf::span(Phase::ResourceUpdate);
-        conn.execute(
-            "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3
-             WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6",
-            params![
-                new_version_str,
-                data_bytes,
-                last_updated,
-                tenant_id,
-                resource_type,
-                id
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
-        drop(_update_row_span);
-
-        // Insert into history
-        {
-            let _span = perf::span(Phase::HistoryInsert);
-            conn.execute(
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-                params![tenant_id, resource_type, id, new_version_str, data_bytes, last_updated, fhir_version_str],
-            )
-            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
-        }
-
-        // Re-index the resource for search, clearing the previous version's rows.
-        self.index_resource(&conn, tenant_id, resource_type, id, &data, true, None)?;
-        drop(conn);
-
-        // A SearchParameter write invalidates this tenant's cached registry
-        // (after commit), mirroring the storage path.
-        if resource_type == "SearchParameter" {
-            self.invalidate_registry = true;
-        }
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version_str,
-            self.tenant.tenant_id().clone(),
-            data,
-            now,
-            now,
-            None,
-            fhir_version,
-        ))
+        self.write_revision(current, resource, false).await
     }
 
     async fn delete(&mut self, resource_type: &str, id: &str) -> StorageResult<()> {
@@ -701,10 +853,14 @@ impl Transaction for SqliteTransaction {
 
 impl Drop for SqliteTransaction {
     fn drop(&mut self) {
-        // If transaction wasn't explicitly committed or rolled back, roll it back
         if self.active {
-            let conn = self.conn.lock();
-            let _ = conn.execute("ROLLBACK", []);
+            // Never wait on a blocking callback from the async worker. If it
+            // owns the mutex, its Arc retains the connection and the final
+            // TransactionConnection drop rolls back before returning it to
+            // the pool. No runtime is needed to schedule that cleanup.
+            if let Some(conn) = self.conn.try_lock() {
+                let _ = conn.execute("ROLLBACK", []);
+            }
         }
     }
 }
@@ -799,6 +955,277 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    fn assert_restore_rows(tx: &SqliteTransaction, versions: &[(&str, bool)], tag: Option<&str>) {
+        tx.with_connection(|conn| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT version_id, is_deleted FROM resource_history
+                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND id = 'restored'
+                 ORDER BY CAST(version_id AS INTEGER)",
+                )
+                .unwrap();
+            let actual: Vec<(String, bool)> = statement
+                .query_map([tx.tenant.tenant_id().as_str()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                actual,
+                versions
+                    .iter()
+                    .map(|(v, deleted)| (v.to_string(), *deleted))
+                    .collect::<Vec<_>>()
+            );
+            let mut statement = conn
+                .prepare(
+                    "SELECT value_token_code FROM search_index
+                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND resource_id = 'restored'
+                   AND param_name = '_tag'",
+                )
+                .unwrap();
+            let tags: Vec<String> = statement
+                .query_map([tx.tenant.tenant_id().as_str()], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                tags,
+                tag.into_iter().map(str::to_string).collect::<Vec<_>>()
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_handles_a_legacy_tombstone_without_deleted_at() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let body = json!({"resourceType":"Patient", "id":"legacy-tombstone"});
+        tx.create("Patient", body.clone()).await.unwrap();
+        tx.delete("Patient", "legacy-tombstone").await.unwrap();
+        tx.with_connection(|conn| {
+            conn.execute(
+                "UPDATE resources SET deleted_at = NULL WHERE tenant_id = ?1 \
+                 AND id = 'legacy-tombstone'",
+                [tenant.tenant_id().as_str()],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            tx.read("Patient", "legacy-tombstone")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let deleted = tx
+            .read_including_deleted("Patient", "legacy-tombstone")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deleted.is_deleted());
+        assert_eq!(deleted.deleted_at(), Some(deleted.last_modified()));
+        let restored = tx.restore(&deleted, body).await.unwrap();
+        assert_eq!(restored.version_id(), "3");
+        assert!(!restored.is_deleted());
+        Box::new(tx).rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_history_and_indexes_across_commit_and_rollback() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let body = |tag| {
+            json!({"resourceType":"Patient", "id":"restored",
+            "meta":{"tag":[{"system":"http://example.com/tags", "code":tag}]}})
+        };
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let created = tx.create("Patient", body("original")).await.unwrap();
+        assert_eq!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "1"
+        );
+        assert!(matches!(
+            tx.restore(&created, body("invalid")).await,
+            Err(StorageError::Validation(_))
+        ));
+        tx.delete("Patient", "restored").await.unwrap();
+        assert!(tx.read("Patient", "restored").await.unwrap().is_none());
+        let deleted = tx
+            .read_including_deleted("Patient", "restored")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deleted.is_deleted());
+        assert!(deleted.deleted_at().is_some());
+        assert_eq!(deleted.version_id(), "2");
+        // Transactional delete retains index rows; searches exclude them using
+        // the resource's deleted state. Restore must replace those old rows.
+        assert_restore_rows(&tx, &[("1", false), ("2", true)], Some("original"));
+        Box::new(tx).commit().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let restored = tx.restore(&deleted, body("rolled-back")).await.unwrap();
+        assert_eq!(restored.version_id(), "3");
+        assert!(!restored.is_deleted());
+        assert_eq!(restored.fhir_version(), created.fhir_version());
+        assert_eq!(
+            tx.read("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "3"
+        );
+        assert_restore_rows(
+            &tx,
+            &[("1", false), ("2", true), ("3", false)],
+            Some("rolled-back"),
+        );
+        Box::new(tx).rollback().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(tx.read("Patient", "restored").await.unwrap().is_none());
+        assert_eq!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "2"
+        );
+        assert_restore_rows(&tx, &[("1", false), ("2", true)], Some("original"));
+        tx.restore(&deleted, body("committed")).await.unwrap();
+        Box::new(tx).commit().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let read = tx.read("Patient", "restored").await.unwrap().unwrap();
+        assert_eq!(read.version_id(), "3");
+        assert_eq!(read.fhir_version(), created.fhir_version());
+        assert_eq!(read.content(), &body("committed"));
+        assert_restore_rows(
+            &tx,
+            &[("1", false), ("2", true), ("3", false)],
+            Some("committed"),
+        );
+        assert!(matches!(
+            tx.restore(&deleted, body("must-not-overwrite-live")).await,
+            Err(StorageError::Resource(ResourceError::NotFound { .. }))
+        ));
+        Box::new(tx).rollback().await.unwrap();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tx.read("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "3"
+        );
+        tx.delete("Patient", "restored").await.unwrap();
+        Box::new(tx).commit().await.unwrap();
+
+        // The same old tombstone must not overwrite a later delete revision.
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.restore(&deleted, body("stale")).await,
+            Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                expected_version,
+                actual_version,
+                ..
+            })) if expected_version == "2" && actual_version == "4"
+        ));
+        Box::new(tx).rollback().await.unwrap();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "4"
+        );
+        assert_restore_rows(
+            &tx,
+            &[("1", false), ("2", true), ("3", false), ("4", true)],
+            Some("committed"),
+        );
+        Box::new(tx).rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_tombstone_from_another_tenant() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        tx.create("Patient", json!({"id":"restored"}))
+            .await
+            .unwrap();
+        tx.delete("Patient", "restored").await.unwrap();
+        let deleted = tx
+            .read_including_deleted("Patient", "restored")
+            .await
+            .unwrap()
+            .unwrap();
+        Box::new(tx).commit().await.unwrap();
+        let other = TenantContext::new(
+            TenantId::new("restore-other-tenant"),
+            TenantPermissions::full_access(),
+        );
+        let mut tx = backend
+            .begin_transaction(&other, TransactionOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.restore(&deleted, json!({"resourceType":"Patient"}))
+                .await,
+            Err(StorageError::Validation(_))
+        ));
+        assert!(
+            tx.read_including_deleted("Patient", "restored")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        Box::new(tx).rollback().await.unwrap();
     }
 
     #[tokio::test]
@@ -1054,6 +1481,150 @@ mod tests {
         // Verify resource does NOT exist (auto-rollback)
         let result = backend.read(&tenant, "Patient", "patient-1").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_extension_work_does_not_block_the_runtime_and_rolls_back() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let mut transaction = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        transaction
+            .create(
+                "Patient",
+                json!({"resourceType":"Patient","id":"extension-cancel"}),
+            )
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            transaction
+                .run_on_connection(move |connection| {
+                    connection
+                        .execute_batch("CREATE TABLE extension_cancel_proof(value INTEGER)")
+                        .unwrap();
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    connection
+                        .execute("INSERT INTO extension_cancel_proof VALUES (1)", [])
+                        .unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            Box::new(transaction).commit().await.unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The external watchdog releases the callback even if the old blocking
+        // Drop stalls this single-thread runtime. A passing test must signal
+        // runtime progress while the callback is still held, before release.
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let progressed = progress_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok();
+            release_tx.send(()).unwrap();
+            progressed
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = progress_tx.send(());
+        })
+        .await
+        .unwrap();
+        assert!(
+            watchdog.join().unwrap(),
+            "cancellation blocked unrelated runtime work"
+        );
+
+        // Acquiring a new write transaction also proves that deferred cleanup
+        // released the old write lock, not merely that another reader cannot
+        // see the uncommitted changes. The released callback still has to
+        // finish and roll back on its blocking thread, so retry until it has.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut proof = loop {
+            match backend
+                .begin_transaction(&tenant, TransactionOptions::default())
+                .await
+            {
+                Ok(proof) => break proof,
+                Err(StorageError::Transaction(TransactionError::Transient { .. }))
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("could not start verification transaction: {error}"),
+            }
+        };
+        assert!(
+            proof
+                .read("Patient", "extension-cancel")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let tables: i64 = proof
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master \
+                         WHERE name = 'extension_cancel_proof'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| internal_error(error.to_string()))
+            })
+            .unwrap();
+        assert_eq!(
+            tables, 0,
+            "extension DDL and resource must roll back together"
+        );
+        Box::new(proof).rollback().await.unwrap();
+    }
+
+    #[test]
+    fn dropped_transaction_rolls_back_without_a_runtime() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let transaction = runtime.block_on(async {
+            let mut transaction = backend
+                .begin_transaction(&tenant, TransactionOptions::default())
+                .await
+                .unwrap();
+            transaction
+                .create(
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"no-runtime"}),
+                )
+                .await
+                .unwrap();
+            transaction
+        });
+        drop(runtime);
+        drop(transaction);
+        let connection = backend.get_connection().unwrap();
+        assert!(connection.is_autocommit());
+        let resources: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM resources WHERE id = 'no-runtime'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resources, 0);
     }
 
     #[tokio::test]

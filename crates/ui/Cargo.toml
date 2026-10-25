@@ -110,7 +110,7 @@ jsonwebtoken = "9"
 # serde_urlencoded offers (#537).
 form_urlencoded = "1"
 # RFC 7638 thumbprint derivation for the bulk-submit signing key kid (#529).
-p384 = { version = "0.13", features = ["pem", "pkcs8"] }
+p384 = { version = "0.14", features = ["pem", "pkcs8"] }
 sha2 = "0.10"
 base64 = "0.22"
 

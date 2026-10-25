@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 51;
+pub const SCHEMA_VERSION: i32 = 52;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -515,9 +515,15 @@ async fn migrate_schema(
             48 => migrate_v48_to_v49(client).await?,
             49 => migrate_v49_to_v50(client).await?,
             50 => {
-                // The helper writes the v51 marker inside its own transaction,
-                // like v48, so the common loop must not stamp it again.
+                // Stamps the v51 marker inside its own transaction, like v48.
                 migrate_v50_to_v51(client).await?;
+                version += 1;
+                continue;
+            }
+            51 => {
+                // The helper writes the v52 marker inside its own transaction,
+                // like v48, so the common loop must not stamp it again.
+                migrate_v51_to_v52(client).await?;
                 version += 1;
                 continue;
             }
@@ -4850,7 +4856,30 @@ async fn migrate_v49_to_v50(client: &mut deadpool_postgres::Client) -> StorageRe
     Ok(())
 }
 
-/// v50 -> v51: the #1125 deferred-rebuild marker on `bulk_manifests` (#1283).
+/// v50 -> v51: the SQL-on-FHIR terminology tables (#2185), PostgreSQL's
+/// counterpart of SQLite's v41. New, empty tables only, so the step is one
+/// transaction that stamps its own marker. `SET LOCAL statement_timeout = 0`,
+/// like the other transactional steps: a deployment-wide timeout must not fail
+/// the DDL.
+async fn migrate_v50_to_v51(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v51 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v51 migration: {e}")))?;
+    tx.batch_execute(super::sof_terminology::CREATE_TABLES_SQL)
+        .await
+        .map_err(|e| pg_error(format!("Migration v50->v51 failed: {e}")))?;
+    set_schema_version(&tx, 51).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v51 migration: {e}")))?;
+    Ok(())
+}
+
+/// v51 -> v52: the #1125 deferred-rebuild marker on `bulk_manifests` (#1283).
 ///
 /// `index_pending` says the manifest was ingested with search indexing
 /// deferred and its rebuild has not finished; `index_pending_types` are the
@@ -4860,15 +4889,15 @@ async fn migrate_v49_to_v50(client: &mut deadpool_postgres::Client) -> StorageRe
 /// rows. Both columns have constant defaults, so the `ALTER` rewrites nothing.
 /// Like v48 it runs in one transaction with `statement_timeout` disabled and
 /// stamps its own marker.
-async fn migrate_v50_to_v51(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v51_to_v52(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
     let tx = client
         .transaction()
         .await
-        .map_err(|e| pg_error(format!("begin v51 migration: {e}")))?;
+        .map_err(|e| pg_error(format!("begin v52 migration: {e}")))?;
     // The caller's session `statement_timeout` must not fail startup.
     tx.execute("SET LOCAL statement_timeout = 0", &[])
         .await
-        .map_err(|e| pg_error(format!("disable statement timeout for v51 migration: {e}")))?;
+        .map_err(|e| pg_error(format!("disable statement timeout for v52 migration: {e}")))?;
     tx.batch_execute(
         "ALTER TABLE bulk_manifests
              ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE,
@@ -4877,11 +4906,11 @@ async fn migrate_v50_to_v51(client: &mut deadpool_postgres::Client) -> StorageRe
              ON bulk_manifests (added_at) WHERE index_pending",
     )
     .await
-    .map_err(|e| pg_error(format!("Migration v50->v51 failed: {e}")))?;
-    set_schema_version(&tx, 51).await?;
+    .map_err(|e| pg_error(format!("Migration v51->v52 failed: {e}")))?;
+    set_schema_version(&tx, 52).await?;
     tx.commit()
         .await
-        .map_err(|e| pg_error(format!("commit v51 migration: {e}")))?;
+        .map_err(|e| pg_error(format!("commit v52 migration: {e}")))?;
     Ok(())
 }
 
@@ -7955,16 +7984,16 @@ mod postgres_integration_migrations {
         assert_eq!(advisory_locks, 0, "the migration lock must not be taken");
     }
 
-    /// #1283: v50 -> v51 adds the deferred-rebuild marker to `bulk_manifests`
+    /// #1283: v51 -> v52 adds the deferred-rebuild marker to `bulk_manifests`
     /// even under a session `statement_timeout` shorter than the index build,
     /// stamps its own marker, gives the session its timeout back, and is a
     /// no-op on a restart that finds the columns and index but not the marker.
     #[tokio::test]
-    async fn postgres_integration_v50_to_v51_adds_index_pending_under_a_short_timeout() {
+    async fn postgres_integration_v51_to_v52_adds_index_pending_under_a_short_timeout() {
         let _guard = POSTGRES_TEST_LOCK.lock().await;
         let backend = create_database(
             shared_pg().await,
-            &format!("hfs_v51_test_{}", uuid::Uuid::new_v4().simple()),
+            &format!("hfs_v52_test_{}", uuid::Uuid::new_v4().simple()),
         )
         .await;
         let mut client = backend.get_client().await.unwrap();
@@ -7978,52 +8007,52 @@ mod postgres_integration_migrations {
                      DROP COLUMN index_pending, DROP COLUMN index_pending_types",
             )
             .await
-            .expect("remove the v51 marker from the fixture");
-        set_schema_version(&client, 50)
+            .expect("remove the v52 marker from the fixture");
+        set_schema_version(&client, 51)
             .await
-            .expect("mark fixture as v50");
+            .expect("mark fixture as v51");
         client
             .batch_execute(
                 "SET statement_timeout = '50ms';
-                 CREATE FUNCTION delay_v51_create_index() RETURNS event_trigger
+                 CREATE FUNCTION delay_v52_create_index() RETURNS event_trigger
                  LANGUAGE plpgsql AS $$
                  BEGIN
                      PERFORM pg_sleep(0.2);
                  END
                  $$;
-                 CREATE EVENT TRIGGER delay_v51_create_index
+                 CREATE EVENT TRIGGER delay_v52_create_index
                  ON ddl_command_start WHEN TAG IN ('CREATE INDEX')
-                 EXECUTE FUNCTION delay_v51_create_index();",
+                 EXECUTE FUNCTION delay_v52_create_index();",
             )
             .await
-            .expect("install delayed v51 CREATE INDEX injection");
+            .expect("install delayed v52 CREATE INDEX injection");
 
         initialize_schema(&mut client)
             .await
-            .expect("migrate v50 to v51");
+            .expect("migrate v51 to v52");
         client
             .batch_execute(
-                "DROP EVENT TRIGGER delay_v51_create_index;
-                 DROP FUNCTION delay_v51_create_index();",
+                "DROP EVENT TRIGGER delay_v52_create_index;
+                 DROP FUNCTION delay_v52_create_index();",
             )
             .await
-            .expect("remove delayed v51 CREATE INDEX injection");
-        assert_eq!(get_schema_version(&client).await.unwrap(), 51);
+            .expect("remove delayed v52 CREATE INDEX injection");
+        assert_eq!(get_schema_version(&client).await.unwrap(), 52);
         assert_eq!(statement_timeout(&client).await, "50ms");
         let definition = index_definition(&client, "idx_bulk_manifests_index_pending")
             .await
-            .expect("v51 index must exist");
+            .expect("v52 index must exist");
         assert!(
             definition.contains("(added_at)") && definition.contains("WHERE index_pending"),
-            "unexpected v51 index: {definition}"
+            "unexpected v52 index: {definition}"
         );
 
         // A restart that finds the columns and index but lost the marker.
-        set_schema_version(&client, 50).await.unwrap();
+        set_schema_version(&client, 51).await.unwrap();
         initialize_schema(&mut client)
             .await
-            .expect("re-run v51 over an applied schema");
-        assert_eq!(get_schema_version(&client).await.unwrap(), 51);
+            .expect("re-run v52 over an applied schema");
+        assert_eq!(get_schema_version(&client).await.unwrap(), 52);
     }
 
     /// Seeds live and soft-deleted rows for two tenants.
@@ -8089,7 +8118,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 51);
+        assert_eq!(SCHEMA_VERSION, 52);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)

@@ -15,6 +15,7 @@ pub mod schema;
 
 mod code_system;
 mod concept_map;
+pub(crate) mod resource_identity;
 mod value_set;
 
 pub(crate) use code_system::invalidate_cs_language_cache;
@@ -93,8 +94,13 @@ fn search_resources_in_transaction(
     search: ResourceStringSearch,
     synthetic_summary: bool,
 ) -> Result<Vec<serde_json::Value>, HtsError> {
+    let public_id = if table == "concept_maps" {
+        "id"
+    } else {
+        "COALESCE(json_extract(resource_json, '$.id'), id)"
+    };
     let metadata_sql = format!(
-        "SELECT id, url, version, name, title, status
+        "SELECT id, url, version, name, title, status, {public_id}
          FROM {table}
          WHERE (?1 IS NULL OR url = ?1)
            AND (?2 IS NULL OR version = ?2)
@@ -114,6 +120,7 @@ fn search_resources_in_transaction(
             |row| {
                 Ok(ResourceSearchRow {
                     id: row.get(0)?,
+                    public_id: Some(row.get(6)?),
                     url: row.get(1)?,
                     version: row.get(2)?,
                     name: row.get(3)?,
@@ -157,14 +164,15 @@ fn search_resources_in_transaction(
 
     let mut results = Vec::with_capacity(selected.len());
     for row in selected {
-        let resource = stored_resources
+        let public_id = row.public_id.as_deref().unwrap_or(&row.id);
+        let mut resource = stored_resources
             .remove(&row.id)
             .flatten()
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_else(|| {
                 code_system::build_synthetic_resource(
                     resource_type,
-                    &row.id,
+                    public_id,
                     &row.url,
                     row.version.as_deref(),
                     row.name.as_deref(),
@@ -172,6 +180,7 @@ fn search_resources_in_transaction(
                     &row.status,
                 )
             });
+        resource["id"] = serde_json::Value::String(public_id.to_owned());
         results.push(resource);
     }
     Ok(results)
@@ -568,6 +577,7 @@ impl SqliteTerminologyBackend {
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
+            resource_identity::migrate(&mut conn)?;
             schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
             })?;
@@ -745,6 +755,7 @@ impl SqliteTerminologyBackend {
             // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
             // (issue #802): clears the ICD-9-CM ledger row exactly once so an
             // already-bootstrapped database re-imports it with the fixed parser.
+            resource_identity::migrate(&mut conn)?;
             schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
             })?;
@@ -781,6 +792,59 @@ impl SqliteTerminologyBackend {
 // ── TerminologyMetadata ────────────────────────────────────────────────────────
 
 impl TerminologyMetadata for SqliteTerminologyBackend {
+    fn resource_identity_by_id(
+        &self,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<Option<crate::types::ResourceIdentity>, HtsError> {
+        let Some(kind) =
+            crate::backends::resource_identity::ResourceKind::from_resource_type(resource_type)
+        else {
+            return Ok(None);
+        };
+        use rusqlite::OptionalExtension;
+        let conn = self
+            .pool
+            .get()
+            .map_err(|error| HtsError::StorageError(error.to_string()))?;
+        conn.query_row(
+            &format!(
+                "SELECT url, version, json_extract(resource_json, '$.language') FROM {} \
+                 WHERE {} = ?1",
+                kind.table(),
+                kind.sqlite_identity_expression()
+            ),
+            [id],
+            |row| {
+                Ok(crate::types::ResourceIdentity {
+                    id: id.to_owned(),
+                    url: row.get(0)?,
+                    version: row.get(1)?,
+                    language: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| HtsError::StorageError(error.to_string()))
+    }
+
+    fn resource_by_id(
+        &self,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, HtsError> {
+        let Some(kind) =
+            crate::backends::resource_identity::ResourceKind::from_resource_type(resource_type)
+        else {
+            return Ok(None);
+        };
+        let conn = self
+            .pool
+            .get()
+            .map_err(|error| HtsError::StorageError(error.to_string()))?;
+        resource_identity::read(&conn, kind, id)
+    }
+
     fn backend_name(&self) -> &'static str {
         "sqlite"
     }
@@ -808,63 +872,13 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
         true
     }
 
-    /// Look up the canonical URL for a ValueSet or ConceptMap by its FHIR `id`.
-    ///
-    /// CodeSystem rows can share a FHIR id across versions (the synthetic
-    /// storage id encodes the version), so for CodeSystem we also try matching
-    /// `resource_json.id` and pick the latest version when several rows match.
-    ///
+    /// Look up the canonical URL through the unique public resource ID.
     /// Returns `None` when the ID is unknown.
     fn resource_url_by_id(&self, resource_type: &str, id: &str) -> Option<String> {
+        let kind =
+            crate::backends::resource_identity::ResourceKind::from_resource_type(resource_type)?;
         let conn = self.pool.get().ok()?;
-        match resource_type {
-            "CodeSystem" => {
-                if let Ok(url) = conn.query_row(
-                    "SELECT url FROM code_systems WHERE id = ?1",
-                    rusqlite::params![id],
-                    |row| row.get::<_, String>(0),
-                ) {
-                    return Some(url);
-                }
-                let sql = format!(
-                    "SELECT url FROM code_systems \
-                     WHERE json_extract(resource_json, '$.id') = ?1 \
-                     ORDER BY {} LIMIT 1",
-                    crate::backends::cs_precedence_order_by("code_systems")
-                );
-                conn.query_row(&sql, rusqlite::params![id], |row| row.get::<_, String>(0))
-                    .ok()
-            }
-            "ValueSet" => {
-                if let Ok(url) = conn.query_row(
-                    "SELECT url FROM value_sets WHERE id = ?1",
-                    rusqlite::params![id],
-                    |row| row.get::<_, String>(0),
-                ) {
-                    return Some(url);
-                }
-                // Multi-version path: storage rows are keyed `<fhir-id>|<version>`,
-                // so when the URL-path id is the bare FHIR id, fall back to a
-                // resource_json scan and pick the latest version (matches how
-                // CodeSystem reads handle the same case).
-                let sql = format!(
-                    "SELECT url FROM value_sets \
-                     WHERE json_extract(resource_json, '$.id') = ?1 \
-                     ORDER BY {} LIMIT 1",
-                    crate::backends::vs_precedence_order_by("value_sets")
-                );
-                conn.query_row(&sql, rusqlite::params![id], |row| row.get::<_, String>(0))
-                    .ok()
-            }
-            "ConceptMap" => conn
-                .query_row(
-                    "SELECT url FROM concept_maps WHERE id = ?1",
-                    rusqlite::params![id],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok(),
-            _ => None,
-        }
+        resource_identity::url(&conn, kind, id).ok().flatten()
     }
 }
 
@@ -987,8 +1001,8 @@ impl TerminologyCaches for SqliteTerminologyBackend {
         );
 
         // Process-global caches shared by every backend instance in this
-        // process. `import_code_system` / `delete_code_system` already drop
-        // these on the paths they cover; doing it here too makes the hook total
+        // process. CodeSystem writes and deletes already drop these on the
+        // paths they cover; doing it here too makes the hook total
         // regardless of which resource type was written, and both are cheap.
         invalidate_cs_id_cache();
         invalidate_cs_language_cache();
