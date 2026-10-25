@@ -144,6 +144,15 @@ fn stages_its_create(entry: &BundleEntry) -> bool {
     entry.method == BundleMethod::Post && entry.if_none_exist.is_none()
 }
 
+fn is_missing_true_param(param: &SearchParameter) -> bool {
+    !matches!(param.name.as_str(), "_id" | "_lastUpdated")
+        && matches!(param.modifier, Some(crate::types::SearchModifier::Missing))
+        && param
+            .values
+            .first()
+            .is_some_and(|value| value.value == "true")
+}
+
 /// Commit retries after a commit whose outcome is unknown
 /// (`UnknownTransactionCommitResult`), on top of the first commit. Only the
 /// commit is re-sent: the transaction's writes may already be applied, so the
@@ -5956,20 +5965,34 @@ impl MongoBackend {
             Some(&mut *session),
         )
         .await?;
+
+        let absent_ids = self
+            .absent_ids_in_bundle_transaction(db, session, tenant, resource_type, &typed_params)
+            .await?;
+        if absent_ids.as_ref().is_some_and(HashSet::is_empty) {
+            return Ok(Vec::new());
+        }
+
         let index_params: Vec<_> = typed_params
             .iter()
-            .filter(|p| !matches!(p.name.as_str(), "_id" | "_lastUpdated"))
+            .filter(|p| {
+                !matches!(p.name.as_str(), "_id" | "_lastUpdated") && !is_missing_true_param(p)
+            })
             .collect();
 
         if index_params.is_empty() {
             let query = SearchQuery {
                 resource_type: resource_type.to_string(),
-                parameters: typed_params,
+                parameters: typed_params
+                    .iter()
+                    .filter(|p| !is_missing_true_param(p))
+                    .cloned()
+                    .collect(),
                 count: Some(2),
                 ..Default::default()
             };
             let tenant_id = tenant.tenant_id().as_str();
-            let filter = self.build_resource_filter(
+            let mut filter = self.build_resource_filter(
                 tenant_id,
                 resource_type,
                 &query,
@@ -5977,6 +6000,14 @@ impl MongoBackend {
                 None,
                 None,
             )?;
+            if let Some(ids) = &absent_ids {
+                filter = doc! {
+                    "$and": [
+                        filter,
+                        { "id": { "$in": ids.iter().cloned().collect::<Vec<_>>() } }
+                    ]
+                };
+            }
             let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
             let cursor = resources
                 .find(filter)
@@ -6162,6 +6193,9 @@ impl MongoBackend {
                 candidate_ids.retain(|id| passing.contains(id));
             }
 
+            if let Some(absent) = &absent_ids {
+                candidate_ids.retain(|id| absent.contains(id));
+            }
             candidate_ids.retain(|id| !matched_ids.contains(id));
             if !candidate_ids.is_empty() {
                 let remaining = (2 - matches.len()) as i64;
@@ -6227,6 +6261,133 @@ impl MongoBackend {
         }
 
         Ok(matches)
+    }
+
+    async fn absent_ids_in_bundle_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        resource_type: &str,
+        typed_params: &[SearchParameter],
+    ) -> StorageResult<Option<HashSet<String>>> {
+        let missing: Vec<&SearchParameter> = typed_params
+            .iter()
+            .filter(|p| is_missing_true_param(p))
+            .collect();
+        if missing.is_empty() {
+            return Ok(None);
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let probe_query = SearchQuery {
+            resource_type: resource_type.to_string(),
+            parameters: missing.iter().map(|p| (*p).clone()).collect(),
+            ..Default::default()
+        };
+        self.refresh_missing_metadata_freshness(tenant_id, &probe_query)
+            .await;
+        let support = self.classify_missing(tenant_id, resource_type, &probe_query);
+        let mut combined: Option<HashSet<String>> = None;
+        for param in missing {
+            let ids = if support.is_resource_parameter(param) {
+                self.metadata_missing_ids(
+                    db,
+                    tenant_id,
+                    resource_type,
+                    param,
+                    combined.as_ref(),
+                    Some(&mut *session),
+                )
+                .await?
+            } else {
+                self.complement_absent_ids_in_transaction(
+                    db,
+                    session,
+                    tenant_id,
+                    resource_type,
+                    param,
+                    combined.as_ref(),
+                )
+                .await?
+            };
+            if ids.is_empty() {
+                return Ok(Some(ids));
+            }
+            combined = Some(ids);
+        }
+        Ok(combined)
+    }
+
+    async fn complement_absent_ids_in_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant_id: &str,
+        resource_type: &str,
+        param: &SearchParameter,
+        candidates: Option<&HashSet<String>>,
+    ) -> StorageResult<HashSet<String>> {
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let mut presence =
+            super::search_impl::missing_presence_filter(tenant_id, resource_type, param);
+        if let Some(ids) = candidates {
+            presence.insert(
+                "resource_id",
+                doc! { "$in": ids.iter().cloned().collect::<Vec<_>>() },
+            );
+        }
+        let present: HashSet<String> = search_index
+            .distinct("resource_id", presence)
+            .session(&mut *session)
+            .await
+            .map_err(|e| internal_driver_error("Failed presence distinct for missing criteria", e))?
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        match candidates {
+            Some(ids) => Ok(ids
+                .iter()
+                .filter(|id| !present.contains(*id))
+                .cloned()
+                .collect()),
+            None => {
+                let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+                let mut cursor = resources
+                    .find(doc! {
+                        "tenant_id": tenant_id,
+                        "resource_type": resource_type,
+                        "is_deleted": false,
+                    })
+                    .projection(doc! { "_id": 0, "id": 1 })
+                    .limit((super::search_impl::MAX_RESULT_ID_SET + 1) as i64)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| {
+                        internal_driver_error("Failed to list live ids for missing criteria", e)
+                    })?;
+                let mut all: HashSet<String> = HashSet::new();
+                while cursor
+                    .advance(&mut *session)
+                    .await
+                    .map_err(|e| internal_driver_error("Failed to advance live id cursor", e))?
+                {
+                    let doc = cursor.deserialize_current().map_err(|e| {
+                        internal_error(format!("Failed to deserialize live id: {e}"))
+                    })?;
+                    if let Ok(id) = doc.get_str("id") {
+                        all.insert(id.to_string());
+                    }
+                }
+                if all.len() > super::search_impl::MAX_RESULT_ID_SET {
+                    return Err(StorageError::Search(SearchError::TooManyResults {
+                        count: all.len(),
+                        max: super::search_impl::MAX_RESULT_ID_SET,
+                    }));
+                }
+                all.retain(|id| !present.contains(id));
+                Ok(all)
+            }
+        }
     }
 
     /// Matches `ifNoneExist` criteria against the raw `resources` documents.

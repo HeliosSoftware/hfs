@@ -264,7 +264,7 @@ const MAX_SEARCH_PARAM_SORT_KEYS: usize = 15;
 const CANDIDATE_BATCH_SIZE: usize = 512;
 const PROBE_ROW_LIMIT: u64 = 100_000;
 // 300k × ~45 bytes/UUID ≈ 13.5 MB — safely under the 16 MB BSON document cap.
-const MAX_RESULT_ID_SET: usize = 300_000;
+pub(super) const MAX_RESULT_ID_SET: usize = 300_000;
 
 /// Targets a reference `:identifier` search may resolve to (#1408). They
 /// travel in one `$in`, two entries each; 10 000 stays near 1 MB, well under
@@ -3710,7 +3710,14 @@ impl MongoBackend {
             }
             if missing_support.is_resource_parameter(param) {
                 candidates = self
-                    .metadata_missing_ids(db, tenant_id, resource_type, param, Some(&candidates))
+                    .metadata_missing_ids(
+                        db,
+                        tenant_id,
+                        resource_type,
+                        param,
+                        Some(&candidates),
+                        None,
+                    )
                     .await?;
                 continue;
             }
@@ -3844,7 +3851,14 @@ impl MongoBackend {
         for param in missing {
             if missing_support.is_resource_parameter(param) {
                 let ids = self
-                    .metadata_missing_ids(db, tenant_id, resource_type, param, matched.as_ref())
+                    .metadata_missing_ids(
+                        db,
+                        tenant_id,
+                        resource_type,
+                        param,
+                        matched.as_ref(),
+                        None,
+                    )
                     .await?;
                 matched = Some(ids);
                 continue;
@@ -3942,13 +3956,14 @@ impl MongoBackend {
         ))
     }
 
-    async fn metadata_missing_ids(
+    pub(super) async fn metadata_missing_ids(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         param: &SearchParameter,
         candidates: Option<&HashSet<String>>,
+        session: Option<&mut mongodb::ClientSession>,
     ) -> StorageResult<HashSet<String>> {
         let mut scope =
             doc! { "tenant_id": tenant_id, "resource_type": resource_type, "is_deleted": false };
@@ -3966,12 +3981,37 @@ impl MongoBackend {
             param,
         )));
         stages.push(doc! { "$project": { "_id": 0, "id": 1 } });
-        let cursor = db
-            .collection::<Document>(Self::RESOURCES_COLLECTION)
-            .aggregate(stages)
-            .await
-            .or_query_error("Failed to check missing resource metadata")?;
-        collect_id_set(cursor, "id").await
+        let collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        match session {
+            Some(session) => {
+                let mut cursor = collection
+                    .aggregate(stages)
+                    .session(&mut *session)
+                    .await
+                    .or_query_error("Failed to check missing resource metadata")?;
+                let mut ids = HashSet::new();
+                while cursor
+                    .advance(&mut *session)
+                    .await
+                    .or_query_error("Failed to advance missing metadata cursor")?
+                {
+                    let doc = cursor.deserialize_current().map_err(|e| {
+                        internal_error(format!("Failed to deserialize missing metadata: {e}"))
+                    })?;
+                    if let Ok(id) = doc.get_str("id") {
+                        ids.insert(id.to_string());
+                    }
+                }
+                Ok(ids)
+            }
+            None => {
+                let cursor = collection
+                    .aggregate(stages)
+                    .await
+                    .or_query_error("Failed to check missing resource metadata")?;
+                collect_id_set(cursor, "id").await
+            }
+        }
     }
 
     pub(super) fn build_search_index_filter(

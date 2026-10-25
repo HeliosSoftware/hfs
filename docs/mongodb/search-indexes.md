@@ -97,7 +97,13 @@ Other parameters can still produce rows and metadata, so a present field does
 not prove that every parameter extracted successfully. Affected missing-field
 results can remain incomplete until the extraction problem is corrected and
 the resource is rewritten or reindexed. This metadata describes top-level
-resources; it does not add contained `:missing` support.
+resources; it does not add contained `:missing` support. Transaction and
+batch conditional criteria (`ifNoneExist`, conditional update/delete URLs)
+evaluate `:missing=true` with the same semantics inside the transaction's
+session (#2003): the metadata predicate with the value-index fallback when
+the fingerprint is fresh, the typed complement otherwise. `ifNoneExist` sees
+resources written earlier in the same bundle; URL-borne criteria are resolved
+before any write, as the R4 overlap rule requires.
 
 Next to the array, `missing_params_fp` stamps the definition fingerprint it
 was computed from, and the `idx_resources_missing_params_fp` index serves the
