@@ -655,7 +655,7 @@ fn missing_metadata_hint(filter: &Document) -> Option<Hint> {
     has_missing.then(|| Hint::Name(super::schema::RESOURCES_MISSING_INDEX.to_owned()))
 }
 
-fn missing_resource_condition(name: &str) -> Document {
+pub(super) fn missing_resource_condition(name: &str) -> Document {
     doc! { "$or": [
         { "missing_params": name },
         { "missing_params": { "$exists": false } },
@@ -3710,7 +3710,14 @@ impl MongoBackend {
             }
             if missing_support.is_resource_parameter(param) {
                 candidates = self
-                    .metadata_missing_ids(db, tenant_id, resource_type, param, Some(&candidates))
+                    .metadata_missing_ids(
+                        db,
+                        tenant_id,
+                        resource_type,
+                        param,
+                        Some(&candidates),
+                        None,
+                    )
                     .await?;
                 continue;
             }
@@ -3844,7 +3851,14 @@ impl MongoBackend {
         for param in missing {
             if missing_support.is_resource_parameter(param) {
                 let ids = self
-                    .metadata_missing_ids(db, tenant_id, resource_type, param, matched.as_ref())
+                    .metadata_missing_ids(
+                        db,
+                        tenant_id,
+                        resource_type,
+                        param,
+                        matched.as_ref(),
+                        None,
+                    )
                     .await?;
                 matched = Some(ids);
                 continue;
@@ -3942,13 +3956,14 @@ impl MongoBackend {
         ))
     }
 
-    async fn metadata_missing_ids(
+    pub(super) async fn metadata_missing_ids(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         param: &SearchParameter,
         candidates: Option<&HashSet<String>>,
+        session: Option<&mut mongodb::ClientSession>,
     ) -> StorageResult<HashSet<String>> {
         let mut scope =
             doc! { "tenant_id": tenant_id, "resource_type": resource_type, "is_deleted": false };
@@ -3966,12 +3981,49 @@ impl MongoBackend {
             param,
         )));
         stages.push(doc! { "$project": { "_id": 0, "id": 1 } });
-        let cursor = db
-            .collection::<Document>(Self::RESOURCES_COLLECTION)
-            .aggregate(stages)
-            .await
-            .or_query_error("Failed to check missing resource metadata")?;
-        collect_id_set(cursor, "id").await
+        let collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        // A bounded candidate set is a few identity seeks; left to itself the
+        // planner may walk the shared `missing_params` index instead, reading
+        // every absent key of the type for each batch (#2233).
+        let options = mongodb::options::AggregateOptions::builder()
+            .hint(
+                candidates
+                    .is_some()
+                    .then(|| Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned())),
+            )
+            .build();
+        match session {
+            Some(session) => {
+                let mut cursor = collection
+                    .aggregate(stages)
+                    .with_options(options)
+                    .session(&mut *session)
+                    .await
+                    .or_query_error("Failed to check missing resource metadata")?;
+                let mut ids = HashSet::new();
+                while cursor
+                    .advance(&mut *session)
+                    .await
+                    .or_query_error("Failed to advance missing metadata cursor")?
+                {
+                    let doc = cursor.deserialize_current().map_err(|e| {
+                        internal_error(format!("Failed to deserialize missing metadata: {e}"))
+                    })?;
+                    if let Ok(id) = doc.get_str("id") {
+                        ids.insert(id.to_string());
+                    }
+                }
+                Ok(ids)
+            }
+            None => {
+                let cursor = collection
+                    .aggregate(stages)
+                    .with_options(options)
+                    .await
+                    .or_query_error("Failed to check missing resource metadata")?;
+                collect_id_set(cursor, "id").await
+            }
+        }
     }
 
     pub(super) fn build_search_index_filter(

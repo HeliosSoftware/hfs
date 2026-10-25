@@ -1489,7 +1489,7 @@ async fn mongodb_missing_metadata_definition_maintenance_restores_fallback_and_r
 }
 
 #[tokio::test]
-async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
+async fn mongodb_missing_conditional_transactions_match_absence() {
     let Some(backend) = create_backend("missing_conditional").await else {
         return;
     };
@@ -1541,30 +1541,103 @@ async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
                 },
             )
         };
-        let error = backend
+        assert_results(
+            &backend,
+            &tenant,
+            &missing_query(&PARAMETERS[1], true),
+            &["absent"],
+        )
+        .await;
+        let result = backend
             .process_transaction(
                 &tenant,
                 vec![put.clone(), delete(true)],
                 FhirVersion::default(),
             )
             .await
-            .unwrap_err();
-        assert!(format!("{error}").contains("missing=true"), "{error:?}");
+            .unwrap();
+        assert_eq!(result.entries[0].status, 201);
+        assert_eq!(result.entries[1].status, 204);
+        assert!(
+            matches!(
+                backend.read(&tenant, "Observation", "absent").await,
+                Err(StorageError::Resource(ResourceError::Gone { .. }))
+            ),
+            "absence criteria must delete the resource GET would have matched"
+        );
         assert!(
             backend
                 .read(&tenant, "Observation", "present")
                 .await
                 .unwrap()
-                .is_none(),
-            "unsupported absence criteria must roll back the preceding write"
-        );
-        assert!(
-            backend
-                .read(&tenant, "Observation", "absent")
-                .await
-                .unwrap()
                 .is_some()
         );
+
+        let bare_put = BundleEntry {
+            method: BundleMethod::Put,
+            url: "Observation/bare".into(),
+            resource: Some(observation("bare", vec![])),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+            criteria: None,
+        };
+        let absent_conditional_create = BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".into(),
+            resource: Some(observation("never-created", extensions(false))),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some("missing-token:missing=true".into()),
+            full_url: None,
+            criteria: None,
+        };
+        let result = backend
+            .process_transaction(
+                &tenant,
+                vec![bare_put, absent_conditional_create],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].status, 201);
+        assert_eq!(
+            result.entries[1].status, 200,
+            "ifNoneExist absence must match the resource written earlier in the same bundle"
+        );
+        assert_eq!(
+            result.entries[1].reference().as_deref(),
+            Some("Observation/bare")
+        );
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                observation("bare2", vec![]),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .process_transaction(&tenant, vec![delete(true)], FhirVersion::default())
+            .await
+            .unwrap_err();
+        for id in ["bare", "bare2"] {
+            assert!(
+                backend
+                    .read(&tenant, "Observation", id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "a multi-match conditional delete must change nothing"
+            );
+        }
+        backend
+            .delete(&tenant, "Observation", "bare2")
+            .await
+            .unwrap();
         // Presence reads the value rows written earlier in the same transaction.
         let conditional_create = BundleEntry {
             method: BundleMethod::Post,
@@ -1603,7 +1676,7 @@ async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
         );
         assert!(
             backend
-                .read(&tenant, "Observation", "absent")
+                .read(&tenant, "Observation", "bare")
                 .await
                 .unwrap()
                 .is_some()
@@ -1612,7 +1685,7 @@ async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
             &backend,
             &tenant,
             &missing_query(&PARAMETERS[1], true),
-            &["absent"],
+            &["bare"],
         )
         .await;
     }
@@ -2646,5 +2719,206 @@ async fn mongodb_missing_metadata_disabled_keeps_missing_results() {
                 assert_results(&disabled, &tenant, &query, expected).await;
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn mongodb_missing_conditional_matches_same_bundle_write_on_empty_tenant() {
+    let Some(backend) = create_backend("missing_conditional_empty").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-conditional-empty");
+    register_parameters(&backend, &tenant).await;
+    let bare_put = BundleEntry {
+        method: BundleMethod::Put,
+        url: "Observation/only".into(),
+        resource: Some(observation("only", vec![])),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: None,
+        criteria: None,
+    };
+    let conditional = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".into(),
+        resource: Some(observation("never", extensions(false))),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("missing-token:missing=true".into()),
+        full_url: None,
+        criteria: None,
+    };
+    let result = backend
+        .process_transaction(&tenant, vec![bare_put, conditional], FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(
+        result.entries[1].status, 200,
+        "empty tenant: ifNoneExist absence must match the same-bundle write"
+    );
+
+    let spec_tenant = create_tenant("missing-conditional-spec");
+    let put = BundleEntry {
+        method: BundleMethod::Put,
+        url: "Patient/m2".into(),
+        resource: Some(json!({"resourceType": "Patient", "id": "m2", "active": true})),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: None,
+        criteria: None,
+    };
+    let conditional = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".into(),
+        resource: Some(json!({"resourceType": "Patient", "gender": "other"})),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("gender:missing=true".into()),
+        full_url: None,
+        criteria: None,
+    };
+    let result = backend
+        .process_transaction(&spec_tenant, vec![put, conditional], FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(
+        result.entries[1].status, 200,
+        "spec param: ifNoneExist absence must match the same-bundle write"
+    );
+    let db = backend.get_database().await.unwrap();
+    db.drop().await.unwrap();
+}
+
+/// #2003: `:missing=true` in conditional criteria is applied per candidate
+/// batch, after the other criteria narrow it, on both routes: metadata and,
+/// with metadata disabled, the value index. The absent resource is written
+/// after 600 present ones, so it lies beyond the first batch of the
+/// index-driven pager (128) and of the resource scan (512).
+#[tokio::test]
+async fn mongodb_missing_conditional_criteria_cross_candidate_batches() {
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        return;
+    };
+    for metadata in [true, false] {
+        let database_name = build_test_database_name(if metadata {
+            "missing_cond_batches_md"
+        } else {
+            "missing_cond_batches_vi"
+        });
+        let Some(backend) = build_backend(MongoBackendConfig {
+            connection_string: connection_string.clone(),
+            database_name,
+            data_dir: Some(repo_data_dir()),
+            missing_metadata: metadata,
+            ..Default::default()
+        })
+        .await
+        else {
+            return;
+        };
+        let tenant = create_tenant("missing-cond-batches");
+        register_parameters(&backend, &tenant).await;
+        let put = |id: String, values: Vec<Value>| BundleEntry {
+            method: BundleMethod::Put,
+            url: format!("Observation/{id}"),
+            resource: Some(observation(&id, values)),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+            criteria: None,
+        };
+        for chunk in 0..6 {
+            let entries = (0..100)
+                .map(|i| put(format!("present-{}", chunk * 100 + i), extensions(false)))
+                .collect();
+            backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        backend
+            .process_transaction(
+                &tenant,
+                vec![put("absent-a".into(), vec![])],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let conditional = |criteria: &str| BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".into(),
+            resource: Some(observation("conditional", extensions(false))),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some(criteria.to_owned()),
+            full_url: None,
+            criteria: None,
+        };
+        let run = |criteria: &'static str| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .process_transaction(
+                        tenant,
+                        vec![conditional(criteria)],
+                        FhirVersion::default(),
+                    )
+                    .await
+            }
+        };
+        for criteria in [
+            "missing-token:missing=true",
+            "code=fixture&missing-token:missing=true",
+            "_id=absent-a&missing-token:missing=true",
+            "missing-token:missing=true&missing-string:missing=true",
+        ] {
+            let result = run(criteria).await.unwrap();
+            assert_eq!(
+                (result.entries[0].status, result.entries[0].reference()),
+                (200, Some("Observation/absent-a".to_owned())),
+                "metadata={metadata} criteria={criteria}"
+            );
+        }
+
+        backend
+            .process_transaction(
+                &tenant,
+                vec![put("absent-b".into(), vec![])],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_results(
+            &backend,
+            &tenant,
+            &missing_query(&PARAMETERS[1], true),
+            &["absent-a", "absent-b"],
+        )
+        .await;
+        for criteria in [
+            "missing-token:missing=true",
+            "code=fixture&missing-token:missing=true",
+        ] {
+            let error = run(criteria).await.unwrap_err();
+            assert!(
+                format!("{error}").contains("412"),
+                "metadata={metadata} criteria={criteria}: {error}"
+            );
+        }
+        // A present resource does not match, so the entry creates.
+        let result = run("_id=present-3&missing-token:missing=true")
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].status, 201, "metadata={metadata}");
+
+        let db = backend.get_database().await.unwrap();
+        db.drop().await.unwrap();
     }
 }
