@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 52;
+pub const SCHEMA_VERSION: i32 = 53;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -520,7 +520,14 @@ async fn migrate_schema(
                 version += 1;
                 continue;
             }
-            51 => migrate_v51_to_v52(client).await?,
+            51 => {
+                // The helper writes the v52 marker inside its own transaction,
+                // like v48, so the common loop must not stamp it again.
+                migrate_v51_to_v52(client).await?;
+                version += 1;
+                continue;
+            }
+            52 => migrate_v52_to_v53(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4873,13 +4880,48 @@ async fn migrate_v50_to_v51(client: &mut deadpool_postgres::Client) -> StorageRe
     Ok(())
 }
 
-/// The two denormalized composite indexes v52 rebuilds, with the v28 key and
+/// v51 -> v52: the #1125 deferred-rebuild marker on `bulk_manifests` (#1283).
+///
+/// `index_pending` says the manifest was ingested with search indexing
+/// deferred and its rebuild has not finished; `index_pending_types` are the
+/// types that rebuild covers, so a restarted server re-fires it without a
+/// `DISTINCT` over the manifest's `bulk_entry_results` (one row per ingested
+/// resource). The partial index keeps the startup lookup to the outstanding
+/// rows. Both columns have constant defaults, so the `ALTER` rewrites nothing.
+/// Like v48 it runs in one transaction with `statement_timeout` disabled and
+/// stamps its own marker.
+async fn migrate_v51_to_v52(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v52 migration: {e}")))?;
+    // The caller's session `statement_timeout` must not fail startup.
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v52 migration: {e}")))?;
+    tx.batch_execute(
+        "ALTER TABLE bulk_manifests
+             ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE,
+             ADD COLUMN IF NOT EXISTS index_pending_types TEXT[] NOT NULL DEFAULT '{}';
+         CREATE INDEX IF NOT EXISTS idx_bulk_manifests_index_pending
+             ON bulk_manifests (added_at) WHERE index_pending",
+    )
+    .await
+    .map_err(|e| pg_error(format!("Migration v51->v52 failed: {e}")))?;
+    set_schema_version(&tx, 52).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v52 migration: {e}")))?;
+    Ok(())
+}
+
+/// The two denormalized composite indexes v53 rebuilds, with the v28 key and
 /// payload unchanged and `is_contained = FALSE` added to the partial predicate.
 /// The build is not date-specific; it reuses the v43 machinery as v50 does.
 const COMPOSITE_UNCONTAINED_INDEXES: [DateIndexSpec; 2] = [
     DateIndexSpec {
         name: "idx_search_composite_token_quantity",
-        temp_name: "idx_search_composite_token_quantity_v52_new",
+        temp_name: "idx_search_composite_token_quantity_v53_new",
         create: "(tenant_id, resource_type, param_name, value_token_code,
                   last_updated DESC, resource_id ASC)
                  INCLUDE (value_quantity_value, value_token_system)
@@ -4889,7 +4931,7 @@ const COMPOSITE_UNCONTAINED_INDEXES: [DateIndexSpec; 2] = [
     },
     DateIndexSpec {
         name: "idx_search_composite_token_token",
-        temp_name: "idx_search_composite_token_token_v52_new",
+        temp_name: "idx_search_composite_token_token_v53_new",
         create: "(tenant_id, resource_type, param_name, value_token_code,
                   value_token_code_2, last_updated DESC, resource_id ASC)
                  INCLUDE (value_token_system, value_token_system_2)
@@ -4899,7 +4941,7 @@ const COMPOSITE_UNCONTAINED_INDEXES: [DateIndexSpec; 2] = [
     },
 ];
 
-/// v51 -> v52: the denormalized composite indexes become partial on
+/// v52 -> v53: the denormalized composite indexes become partial on
 /// `is_contained = FALSE` (#1952).
 ///
 /// #1886 (v48) added `is_contained = FALSE` to `build_composite_condition`, so
@@ -4923,7 +4965,7 @@ const COMPOSITE_UNCONTAINED_INDEXES: [DateIndexSpec; 2] = [
 /// continue during the build, and a failure leaves the version unstamped so the
 /// next startup retries. A pre-v18 (legacy) database is left alone, as v28
 /// left it: the legacy composite query reads neither index.
-async fn migrate_v51_to_v52(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v52_to_v53(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
     if read_index_layout(client).await != IndexLayout::Denormalized {
         tracing::info!(
             "search_index predates v18; the composite fast-path indexes are not rebuilt"
@@ -4935,7 +4977,7 @@ async fn migrate_v51_to_v52(client: &mut deadpool_postgres::Client) -> StorageRe
         .await
         .map_err(|e| {
             pg_error(format!(
-                "Migration v51->v52 failed: read statement_timeout: {e}"
+                "Migration v52->v53 failed: read statement_timeout: {e}"
             ))
         })?
         .get(0);
@@ -4944,30 +4986,30 @@ async fn migrate_v51_to_v52(client: &mut deadpool_postgres::Client) -> StorageRe
         .await
         .map_err(|e| {
             pg_error(format!(
-                "Migration v51->v52 failed: disable statement_timeout: {e}"
+                "Migration v52->v53 failed: disable statement_timeout: {e}"
             ))
         })?;
     let mut result = Ok(());
     for spec in &COMPOSITE_UNCONTAINED_INDEXES {
         tracing::info!(
             index = spec.name,
-            "Migration v51->v52: rebuilding the index CONCURRENTLY (startup waits for it; large search_index tables take a while)"
+            "Migration v52->v53: rebuilding the index CONCURRENTLY (startup waits for it; large search_index tables take a while)"
         );
         let started = std::time::Instant::now();
-        result = rebuild_date_index(client, spec, "v51->v52").await;
+        result = rebuild_date_index(client, spec, "v52->v53").await;
         let elapsed_s = started.elapsed().as_secs_f64();
         match &result {
             Ok(()) => tracing::info!(
                 index = spec.name,
                 elapsed_s,
-                "Migration v51->v52: index ready"
+                "Migration v52->v53: index ready"
             ),
             Err(error) => {
                 tracing::error!(
                     index = spec.name,
                     elapsed_s,
                     %error,
-                    "Migration v51->v52: index build failed; it is retried at the next startup"
+                    "Migration v52->v53: index build failed; it is retried at the next startup"
                 );
                 break;
             }
@@ -4981,13 +5023,13 @@ async fn migrate_v51_to_v52(client: &mut deadpool_postgres::Client) -> StorageRe
         .await;
     if let Err(error) = result {
         if let Err(restore_error) = restore {
-            tracing::warn!(%restore_error, "Could not restore statement_timeout after v52 failure");
+            tracing::warn!(%restore_error, "Could not restore statement_timeout after v53 failure");
         }
         return Err(error);
     }
     restore.map_err(|e| {
         pg_error(format!(
-            "Migration v51->v52 failed: restore statement_timeout: {e}"
+            "Migration v52->v53 failed: restore statement_timeout: {e}"
         ))
     })?;
     Ok(())
@@ -8063,6 +8105,77 @@ mod postgres_integration_migrations {
         assert_eq!(advisory_locks, 0, "the migration lock must not be taken");
     }
 
+    /// #1283: v51 -> v52 adds the deferred-rebuild marker to `bulk_manifests`
+    /// even under a session `statement_timeout` shorter than the index build,
+    /// stamps its own marker, gives the session its timeout back, and is a
+    /// no-op on a restart that finds the columns and index but not the marker.
+    #[tokio::test]
+    async fn postgres_integration_v51_to_v52_adds_index_pending_under_a_short_timeout() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_v52_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize current schema fixture");
+        client
+            .batch_execute(
+                "DROP INDEX idx_bulk_manifests_index_pending;
+                 ALTER TABLE bulk_manifests
+                     DROP COLUMN index_pending, DROP COLUMN index_pending_types",
+            )
+            .await
+            .expect("remove the v52 marker from the fixture");
+        set_schema_version(&client, 51)
+            .await
+            .expect("mark fixture as v51");
+        client
+            .batch_execute(
+                "SET statement_timeout = '50ms';
+                 CREATE FUNCTION delay_v52_create_index() RETURNS event_trigger
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     PERFORM pg_sleep(0.2);
+                 END
+                 $$;
+                 CREATE EVENT TRIGGER delay_v52_create_index
+                 ON ddl_command_start WHEN TAG IN ('CREATE INDEX')
+                 EXECUTE FUNCTION delay_v52_create_index();",
+            )
+            .await
+            .expect("install delayed v52 CREATE INDEX injection");
+
+        initialize_schema(&mut client)
+            .await
+            .expect("migrate v51 to v52");
+        client
+            .batch_execute(
+                "DROP EVENT TRIGGER delay_v52_create_index;
+                 DROP FUNCTION delay_v52_create_index();",
+            )
+            .await
+            .expect("remove delayed v52 CREATE INDEX injection");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(statement_timeout(&client).await, "50ms");
+        let definition = index_definition(&client, "idx_bulk_manifests_index_pending")
+            .await
+            .expect("v52 index must exist");
+        assert!(
+            definition.contains("(added_at)") && definition.contains("WHERE index_pending"),
+            "unexpected v52 index: {definition}"
+        );
+
+        // A restart that finds the columns and index but lost the marker.
+        set_schema_version(&client, 51).await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("re-run v52 over an applied schema");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+    }
+
     /// Seeds live and soft-deleted rows for two tenants.
     async fn seed_live_and_deleted_resources(client: &deadpool_postgres::Client) {
         client
@@ -8126,7 +8239,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 52);
+        assert_eq!(SCHEMA_VERSION, 53);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)
@@ -8338,15 +8451,15 @@ mod postgres_integration_migrations {
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
     }
 
-    /// v51 -> v52 makes both composite indexes partial on `is_contained = FALSE`
+    /// v52 -> v53 makes both composite indexes partial on `is_contained = FALSE`
     /// (#1952), on a fresh database and over the v28 shape, and the composite
     /// fast path is index-only against them again.
     #[tokio::test]
-    async fn postgres_integration_v51_to_v52_composite_indexes_exclude_contained_rows() {
+    async fn postgres_integration_v52_to_v53_composite_indexes_exclude_contained_rows() {
         let _guard = POSTGRES_TEST_LOCK.lock().await;
         let backend = create_database(
             shared_pg().await,
-            &format!("hfs_v52_test_{}", uuid::Uuid::new_v4().simple()),
+            &format!("hfs_v53_test_{}", uuid::Uuid::new_v4().simple()),
         )
         .await;
         let mut client = backend.get_client().await.unwrap();
@@ -8380,14 +8493,14 @@ mod postgres_integration_migrations {
             )
             .await
             .unwrap();
-        set_schema_version(&client, 51).await.unwrap();
-        initialize_schema(&mut client).await.expect("v51 to v52");
+        set_schema_version(&client, 52).await.unwrap();
+        initialize_schema(&mut client).await.expect("v52 to v53");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(statement_timeout(&client).await, "777ms");
         for spec in &COMPOSITE_UNCONTAINED_INDEXES {
             let rebuilt = index_definition(&client, spec.name)
                 .await
-                .expect("v52 rebuilds the index");
+                .expect("v53 rebuilds the index");
             assert!(rebuilt.ends_with(spec.definition), "{rebuilt}");
         }
 
@@ -8435,8 +8548,8 @@ mod postgres_integration_migrations {
             .await
             .unwrap();
 
-        set_schema_version(&client, 51).await.unwrap();
-        initialize_schema(&mut client).await.expect("repeat v52");
+        set_schema_version(&client, 52).await.unwrap();
+        initialize_schema(&mut client).await.expect("repeat v53");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
     }
 

@@ -29,13 +29,15 @@ impl ExportDataProvider for S3Backend {
     ) -> StorageResult<Vec<String>> {
         let location = self.resource_location(tenant).await?;
 
+        // A requested type is kept when it holds any live resource, as the
+        // SQL and MongoDB backends decide it: the `_since` / `_until` window is
+        // applied by the batches, and a type with nothing in it writes no
+        // output. Counting here read every object of the type one at a time
+        // before the export wrote anything (#2140).
         if !request.resource_types.is_empty() {
             let mut found = Vec::new();
             for resource_type in &request.resource_types {
-                let count = self
-                    .count_export_resources(tenant, request, resource_type)
-                    .await?;
-                if count > 0 {
+                if self.has_live_current(&location, resource_type).await? {
                     found.push(resource_type.clone());
                 }
             }
@@ -64,31 +66,12 @@ impl ExportDataProvider for S3Backend {
             .await?;
 
         let mut count = 0u64;
-        for key in keys {
-            let Some((resource, _)) = self
-                .get_json_object::<crate::types::StoredResource>(&location.bucket, &key)
-                .await?
-            else {
-                continue;
-            };
-
-            if resource.is_deleted() {
-                continue;
+        self.for_each_current(&location, keys, |resource| {
+            if export_window_keeps(request, &resource) {
+                count += 1;
             }
-
-            if let Some(since) = request.since {
-                if resource.last_modified() < since {
-                    continue;
-                }
-            }
-            if let Some(until) = request.until {
-                if resource.last_modified() > until {
-                    continue;
-                }
-            }
-
-            count += 1;
-        }
+        })
+        .await?;
 
         Ok(count)
     }
@@ -134,6 +117,78 @@ fn export_window_keeps(request: &ExportRequest, resource: &StoredResource) -> bo
 const KEY_CURSOR_PREFIX: &str = "k:";
 
 impl S3Backend {
+    /// Whether `resource_type` holds at least one live (non-deleted)
+    /// resource.
+    ///
+    /// Walks the type's listing a page at a time and reads its objects in
+    /// rounds that start at one and double up to `scan_concurrency`, stopping
+    /// at the first live one. A type whose first object is live costs one LIST
+    /// and one GET; only a run of deleted objects at the start costs more.
+    async fn has_live_current(
+        &self,
+        location: &ResourceLocation,
+        resource_type: &str,
+    ) -> StorageResult<bool> {
+        let bucket = &location.bucket;
+        let mut width = 1usize;
+        let mut token: Option<String> = None;
+        loop {
+            let (mut keys, next) = self
+                .list_current_keys_page(location, resource_type, None, token.as_deref())
+                .await?;
+            keys.sort();
+            let mut rest = keys.as_slice();
+            while !rest.is_empty() {
+                let (round, tail) = rest.split_at(width.min(rest.len()));
+                rest = tail;
+                let fetched = futures::future::join_all(
+                    round
+                        .iter()
+                        .map(|key| self.get_json_object_limited::<StoredResource>(bucket, key)),
+                )
+                .await;
+                for object in fetched {
+                    if let Some((resource, _)) = object?
+                        && !resource.is_deleted()
+                    {
+                        return Ok(true);
+                    }
+                }
+                width = (width * 2).min(self.scan_concurrency().max(1));
+            }
+            token = next;
+            if token.is_none() {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Reads the `current.json` objects at `keys` concurrently, under the
+    /// backend-wide read limit (`scan_concurrency`, #2063), and hands each one
+    /// that exists to `visit`, in completion order.
+    async fn for_each_current(
+        &self,
+        location: &ResourceLocation,
+        keys: Vec<String>,
+        mut visit: impl FnMut(StoredResource),
+    ) -> StorageResult<()> {
+        use futures::stream::{self, StreamExt};
+
+        let bucket = &location.bucket;
+        let mut fetched = stream::iter(keys)
+            .map(|key| async move {
+                self.get_json_object_limited::<StoredResource>(bucket, &key)
+                    .await
+            })
+            .buffer_unordered(self.scan_concurrency().max(1));
+        while let Some(object) = fetched.next().await {
+            if let Some((resource, _)) = object? {
+                visit(resource);
+            }
+        }
+        Ok(())
+    }
+
     /// One export batch over the `current.json` objects of a type, in key
     /// order.
     ///
@@ -279,23 +334,18 @@ impl PatientExportProvider for S3Backend {
         let keys = self.list_current_keys(&location, Some("Patient")).await?;
 
         let mut ids: Vec<String> = Vec::new();
-        for key in keys {
-            let Some((resource, _)) = self
-                .get_json_object::<StoredResource>(&location.bucket, &key)
-                .await?
-            else {
-                continue;
-            };
+        self.for_each_current(&location, keys, |resource| {
             if resource.is_deleted() {
-                continue;
+                return;
             }
             if let Some(since) = request.since
                 && resource.last_modified() < since
             {
-                continue;
+                return;
             }
             ids.push(resource.id().to_string());
-        }
+        })
+        .await?;
         ids.sort();
 
         let start = match cursor {

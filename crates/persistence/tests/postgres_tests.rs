@@ -2040,6 +2040,26 @@ mod postgres_integration {
         .await;
     }
 
+    mod index_pending_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/index_pending_contract.rs"
+        ));
+    }
+
+    /// See `index_pending_contract::marked_manifest_is_listed_until_cleared` (#1283).
+    #[tokio::test]
+    async fn postgres_bulk_submit_marked_manifest_is_listed_until_cleared() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        index_pending_contract::marked_manifest_is_listed_until_cleared(
+            &create_backend().await,
+            &create_tenant("submit-index-pending"),
+            true,
+        )
+        .await;
+    }
+
     mod claim_contract {
         use helios_persistence as persistence;
         include!(concat!(
