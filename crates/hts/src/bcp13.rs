@@ -101,6 +101,81 @@ pub fn validate_mimetypes_code(
     })
 }
 
+/// MIME syntax validation for a stored mimetypes ValueSet that includes all of
+/// BCP-13.
+///
+/// Call after resolving the stored row (including any requested date), for
+/// canonical and instance requests alike, and use the response only when
+/// BCP-13 is not loaded locally. Harmless compose metadata and display requests
+/// keep syntax validation. Subsets, exclusions, modifiers and CodeSystem version
+/// pins still require normal terminology evaluation; syntax alone cannot
+/// establish their meaning.
+pub fn validate_stored_mimetypes_code(
+    url: &str,
+    compose_json: Option<&str>,
+    req: &ValidateCodeRequest,
+) -> Option<ValidateCodeResponse> {
+    if !is_mimetypes_valueset_url(url) || req.version.is_some() {
+        return None;
+    }
+
+    let compose: serde_json::Value = serde_json::from_str(compose_json?).ok()?;
+    if !compose_includes_all_bcp13(&compose) {
+        return None;
+    }
+
+    validate_mimetypes_code(url, req)
+}
+
+fn compose_includes_all_bcp13(compose: &serde_json::Value) -> bool {
+    let Some(compose) = compose.as_object() else {
+        return false;
+    };
+    // Only these compose fields have known, unrestricted semantics here.
+    // Inactive filtering cannot remove intrinsic MIME codes without a local
+    // CodeSystem; local terminology always takes the normal evaluation path.
+    if !compose.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "include" | "exclude" | "inactive" | "id" | "extension"
+        )
+    }) || !has_no_elements(compose.get("exclude"))
+    {
+        return false;
+    }
+    let Some(includes) = compose.get("include").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    !includes.is_empty()
+        && includes.iter().all(|include| {
+            let Some(include) = include.as_object() else {
+                return false;
+            };
+            include.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "system" | "concept" | "filter" | "valueSet" | "version" | "id" | "extension"
+                )
+            }) && include.get("system").and_then(serde_json::Value::as_str) == Some(BCP13_SYSTEM)
+                && ["concept", "filter", "valueSet"]
+                    .iter()
+                    .all(|key| has_no_elements(include.get(*key)))
+                && match include.get("version") {
+                    None | Some(serde_json::Value::Null) => true,
+                    Some(serde_json::Value::String(version)) => version.is_empty(),
+                    _ => false,
+                }
+        })
+}
+
+fn has_no_elements(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(elements)) => elements.is_empty(),
+        _ => false,
+    }
+}
+
 /// Build a canonical mimetypes VS URL from a ValueSet resource JSON body.
 pub fn mimetypes_url_from_resource(vs: &serde_json::Value) -> Option<String> {
     let base = vs.get("url")?.as_str()?;
@@ -159,9 +234,9 @@ mod tests {
         assert!(!is_valid_mime_type("type/"));
     }
 
-    #[test]
-    fn mimetypes_validate_success_without_system() {
-        let req = ValidateCodeRequest {
+    fn mimetypes_request() -> ValidateCodeRequest {
+        ValidateCodeRequest {
+            selected_value_set_id: None,
             url: Some(format!("{MIMETYPES_VS_URL}|4.0.1")),
             value_set_version: Some("4.0.1".into()),
             system: None,
@@ -173,9 +248,135 @@ mod tests {
             input_form: None,
             lenient_display_validation: None,
             default_value_set_versions: Default::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn mimetypes_validate_success_without_system() {
+        let req = mimetypes_request();
         let resp = validate_mimetypes_code(MIMETYPES_VS_URL, &req).unwrap();
         assert!(resp.result);
         assert_eq!(resp.system.as_deref(), Some(BCP13_SYSTEM));
+    }
+
+    #[test]
+    fn stored_whole_system_uses_mime_syntax_and_requested_version() {
+        let compose = r#"{"include":[{"system":"urn:ietf:bcp:13"}]}"#;
+        let mut req = mimetypes_request();
+        let response = validate_stored_mimetypes_code(MIMETYPES_VS_URL, Some(compose), &req)
+            .expect("unrestricted stored compose");
+        assert!(response.result);
+        assert_eq!(response.system.as_deref(), Some(BCP13_SYSTEM));
+
+        req.code = "invalid".into();
+        let response = validate_stored_mimetypes_code(MIMETYPES_VS_URL, Some(compose), &req)
+            .expect("invalid syntax is still handled");
+        assert!(!response.result);
+        assert!(response.message.unwrap().contains("mimetypes|4.0.1"));
+
+        req.value_set_version = None;
+        let response = validate_stored_mimetypes_code(MIMETYPES_VS_URL, Some(compose), &req)
+            .expect("unversioned stored compose");
+        assert!(!response.message.unwrap().contains("mimetypes|"));
+    }
+
+    #[test]
+    fn stored_mime_restrictions_require_normal_evaluation() {
+        let req = mimetypes_request();
+        let unrestricted = serde_json::json!({"include": [{"system": BCP13_SYSTEM}]});
+        for (field, value) in [
+            ("concept", serde_json::json!([{"code": "application/json"}])),
+            (
+                "filter",
+                serde_json::json!([{"property": "code", "op": "=", "value": "text/cql"}]),
+            ),
+            (
+                "valueSet",
+                serde_json::json!(["http://example.org/restriction"]),
+            ),
+            ("version", serde_json::json!("1.0")),
+            ("modifierExtension", serde_json::json!([])),
+        ] {
+            let mut compose = unrestricted.clone();
+            compose["include"][0][field] = value;
+            assert!(
+                validate_stored_mimetypes_code(MIMETYPES_VS_URL, Some(&compose.to_string()), &req)
+                    .is_none(),
+                "include.{field}"
+            );
+        }
+        for (field, value) in [
+            (
+                "exclude",
+                serde_json::json!([{"system": BCP13_SYSTEM, "concept": [{"code": "text/cql"}]}]),
+            ),
+            ("lockedDate", serde_json::json!("2020-01-01")),
+            ("modifierExtension", serde_json::json!([])),
+        ] {
+            let mut compose = unrestricted.clone();
+            compose[field] = value;
+            assert!(
+                validate_stored_mimetypes_code(MIMETYPES_VS_URL, Some(&compose.to_string()), &req)
+                    .is_none(),
+                "compose.{field}"
+            );
+        }
+        for compose in [
+            "null",
+            "{}",
+            "{",
+            r#"{"include":[]}"#,
+            r#"{"include":[{"system":"other"}]}"#,
+        ] {
+            assert!(
+                validate_stored_mimetypes_code(MIMETYPES_VS_URL, Some(compose), &req).is_none(),
+                "{compose}"
+            );
+        }
+        assert!(validate_stored_mimetypes_code(MIMETYPES_VS_URL, None, &req).is_none());
+    }
+
+    #[test]
+    fn stored_mime_metadata_display_and_resolved_date_preserve_syntax_validation() {
+        let compose = serde_json::json!({
+            "id": "compose-metadata",
+            "extension": [{"url": "http://example.org/note", "valueString": "metadata"}],
+            "inactive": false,
+            "exclude": [],
+            "include": [{
+                "system": BCP13_SYSTEM,
+                "id": "include-metadata",
+                "extension": [{"url": "http://example.org/note", "valueString": "metadata"}],
+                "concept": [],
+                "filter": [],
+                "valueSet": [],
+                "version": ""
+            }]
+        });
+        let mut req = mimetypes_request();
+        req.display = Some("Clinical Quality Language".into());
+        req.date = Some("2020-01-01".into());
+        let response =
+            validate_stored_mimetypes_code(MIMETYPES_VS_URL, Some(&compose.to_string()), &req)
+                .expect("metadata and already-resolved date do not restrict membership");
+        assert!(response.result);
+        assert_eq!(response.system.as_deref(), Some(BCP13_SYSTEM));
+    }
+
+    #[test]
+    fn stored_mime_request_constraints_require_normal_evaluation() {
+        let compose = Some(r#"{"include":[{"system":"urn:ietf:bcp:13"}]}"#);
+
+        let mut versioned = mimetypes_request();
+        versioned.version = Some("unknown".into());
+        assert!(validate_stored_mimetypes_code(MIMETYPES_VS_URL, compose, &versioned).is_none());
+
+        let mut other_system = mimetypes_request();
+        other_system.system = Some("http://example.org/other".into());
+        assert!(validate_stored_mimetypes_code(MIMETYPES_VS_URL, compose, &other_system).is_none());
+
+        let other_value_set = "http://example.org/other";
+        let req = mimetypes_request();
+        assert!(validate_stored_mimetypes_code(other_value_set, compose, &req).is_none());
     }
 }

@@ -150,6 +150,7 @@ async fn missing_membership_work_is_bounded_by_candidate_ids() {
                     .unwrap();
             }
         }
+        trust_missing_metadata(&fixture.backend, db).await;
         for (size, reference) in [(65, false), (129, false), (129, true)] {
             let positive = if reference {
                 let mut patient = parameter("patient", "Patient/selected");
@@ -198,6 +199,11 @@ async fn missing_membership_work_is_bounded_by_candidate_ids() {
                         db,
                         PLAN_TENANT,
                         &query,
+                        &fixture.backend.classify_missing(
+                            PLAN_TENANT,
+                            &query.resource_type,
+                            &query,
+                        ),
                         SearchFilterPurpose::Page,
                         NoTotalPagePolicy::Streaming,
                         None,
@@ -262,6 +268,11 @@ async fn missing_membership_work_is_bounded_by_candidate_ids() {
                                 db,
                                 PLAN_TENANT,
                                 &query,
+                                &fixture.backend.classify_missing(
+                                    PLAN_TENANT,
+                                    &query.resource_type,
+                                    &query
+                                ),
                                 SearchFilterPurpose::Count,
                                 NoTotalPagePolicy::Streaming,
                                 None,
@@ -269,10 +280,7 @@ async fn missing_membership_work_is_bounded_by_candidate_ids() {
                             )
                             .await
                             .unwrap(),
-                        Some(SearchFilterPlan::ResourceLookups {
-                            index_filter: None,
-                            ..
-                        })
+                        Some(SearchFilterPlan::BatchedIndex(_))
                     ));
                     if reference {
                         let mut excluded = parameter("status", "final");
@@ -420,6 +428,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
         )
         .await
         .unwrap();
+    trust_missing_metadata(backend, db).await;
     let mut absent = parameter("method", "true");
     absent.modifier = Some(SearchModifier::Missing);
     let mut query = SearchQuery::new("Observation")
@@ -452,6 +461,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -464,7 +474,14 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
         };
         assert_eq!(facts.reuses, 1);
         let filter = backend
-            .build_resource_filter(PLAN_TENANT, "Observation", &query, None, None)
+            .build_resource_filter(
+                PLAN_TENANT,
+                "Observation",
+                &query,
+                &backend.classify_missing(PLAN_TENANT, "Observation", &query),
+                None,
+                None,
+            )
             .unwrap();
         let actual = plan
             .execute_page(db, filter, None, doc! { "id": 1 }, 0, 21)
@@ -488,6 +505,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 purpose,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -498,6 +516,8 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
         if small {
             assert!(plan.is_none());
         } else {
+            // Every resource lacks `method`, so the missing population is not
+            // smaller than the positive driver: the resource scan is kept (#2004).
             assert!(matches!(
                 plan,
                 Some(SearchFilterPlan::ResourceLookups {
@@ -506,12 +526,21 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 })
             ));
         }
+        // The 65-row probe decides the small route alone. A broad count also
+        // sizes its positive driver and the missing population (#2004).
         assert_eq!(
-            facts.requests, 1,
-            "small and count routes must not add a bounded probe"
+            facts.requests,
+            if small { 1 } else { 3 },
+            "{code}: unexpected planning probes"
         );
         let (selected, ids) = backend
-            .plan_or_matching_ids(db, PLAN_TENANT, &query, plan)
+            .plan_or_matching_ids(
+                db,
+                PLAN_TENANT,
+                &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
+                plan,
+            )
             .await
             .unwrap();
         if small {
@@ -551,6 +580,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -573,7 +603,13 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
             "pure missing pages must not acquire a probe"
         );
         let (selected, ids) = backend
-            .plan_or_matching_ids(db, PLAN_TENANT, &query, plan)
+            .plan_or_matching_ids(
+                db,
+                PLAN_TENANT,
+                &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
+                plan,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -602,6 +638,7 @@ async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -648,6 +685,7 @@ async fn missing_id_cursor_candidates_bound_probes_reads_and_cache_keys() {
         )
         .await
         .unwrap();
+    trust_missing_metadata(backend, db).await;
     let positive = parameter("code", "base");
     let filter = backend
         .build_search_index_filter(PLAN_TENANT, "Observation", &positive)
@@ -728,6 +766,7 @@ async fn missing_id_cursor_candidates_bound_probes_reads_and_cache_keys() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 Some(&boundary),
@@ -762,6 +801,7 @@ async fn missing_id_cursor_candidates_bound_probes_reads_and_cache_keys() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
                 Some(&boundary),
@@ -771,10 +811,7 @@ async fn missing_id_cursor_candidates_bound_probes_reads_and_cache_keys() {
             .unwrap();
         assert!(matches!(
             count_plan,
-            Some(SearchFilterPlan::ResourceLookups {
-                index_filter: None,
-                ..
-            })
+            Some(SearchFilterPlan::BatchedIndex(_))
         ));
     }
     assert_ne!(boundary_keys[0], boundary_keys[1]);
@@ -1013,6 +1050,7 @@ async fn missing_id_batches_navigate_fifty_pages_with_independent_date_bounds() 
                 ).await.unwrap();
             }
         }
+        trust_missing_metadata(&fixture.backend, &fixture.db).await;
         for direction in ["_id", "-_id"] {
             let mut ordered = expected.clone();
             if direction == "-_id" {
@@ -1027,6 +1065,11 @@ async fn missing_id_batches_navigate_fifty_pages_with_independent_date_bounds() 
                         db,
                         PLAN_TENANT,
                         &query,
+                        &fixture.backend.classify_missing(
+                            PLAN_TENANT,
+                            &query.resource_type,
+                            &query
+                        ),
                         SearchFilterPurpose::Page,
                         NoTotalPagePolicy::Streaming,
                         None,
@@ -1042,6 +1085,9 @@ async fn missing_id_batches_navigate_fifty_pages_with_independent_date_bounds() 
                     db,
                     PLAN_TENANT,
                     &query,
+                    &fixture
+                        .backend
+                        .classify_missing(PLAN_TENANT, &query.resource_type, &query),
                     SearchFilterPurpose::Count,
                     NoTotalPagePolicy::Streaming,
                     None,
@@ -1243,8 +1289,12 @@ struct TimestampFixture {
 
 impl TimestampFixture {
     async fn new(label: &str) -> Option<Self> {
+        Self::with_count(label, 2048).await
+    }
+
+    async fn with_count(label: &str, count: usize) -> Option<Self> {
         // Late matches lie beyond the first 256 + 512 + 1,024 candidates.
-        let mut fixture = Fixture::new(label, 2048).await?;
+        let mut fixture = Fixture::new(label, count).await?;
         fixture.mark_deleted(1, 130).await;
         let resources = fixture.db.collection::<Document>("resources");
         let index = fixture.db.collection::<Document>("search_index");
@@ -1416,6 +1466,11 @@ async fn start_profiling(db: &mongodb::Database) {
         .drop()
         .await
         .unwrap();
+    db.create_collection("system.profile")
+        .capped(true)
+        .size(32 * 1024 * 1024)
+        .await
+        .unwrap();
     db.run_command(doc! { "profile": 2 }).await.unwrap();
 }
 
@@ -1557,6 +1612,11 @@ async fn timestamp_pages_filter_before_offsets_and_preserve_cursor_totals() {
                         &data.fixture.db,
                         PLAN_TENANT,
                         &query,
+                        &data.fixture.backend.classify_missing(
+                            PLAN_TENANT,
+                            &query.resource_type,
+                            &query
+                        ),
                         SearchFilterPurpose::Page,
                         NoTotalPagePolicy::Streaming,
                         None,
@@ -1929,6 +1989,61 @@ async fn mixed_timestamp_orders_stream_large_ties_without_blocking_sort() {
 }
 
 #[tokio::test]
+async fn mixed_timestamp_orders_read_small_groups_from_one_stream() {
+    let Some(data) = TimestampFixture::new("timestamp-small-groups").await else {
+        return;
+    };
+    let db = &data.fixture.db;
+    let plan = ResourceBatchPlan {
+        filters: vec![predicate("code", "frequent")],
+        exclusions: Vec::new(),
+        missing: Vec::new(),
+    };
+    let rows = data.expected(&["frequent"]);
+    for (timestamp_direction, id_direction) in [(1, -1), (-1, 1)] {
+        let mut expected = rows.clone();
+        expected.sort_by(|a, b| {
+            let by_time = data.timestamps[a].cmp(&data.timestamps[b]);
+            let by_id = a.cmp(b);
+            (if timestamp_direction == 1 {
+                by_time
+            } else {
+                by_time.reverse()
+            })
+            .then(if id_direction == 1 {
+                by_id
+            } else {
+                by_id.reverse()
+            })
+        });
+        start_profiling(db).await;
+        let actual = plan
+            .execute_page(
+                db,
+                resource_filter(),
+                None,
+                doc! { "last_updated": timestamp_direction, "id": id_direction },
+                0,
+                expected.len() + 1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        let operations = candidate_stream_operations(db).await;
+        assert_covered_index_order(&operations, "the grouped stream must use index order");
+        // Every fixture group fits the buffer, so all twelve timestamps come
+        // from one find and its getMores rather than two finds per timestamp.
+        let finds = operations
+            .iter()
+            .filter(|operation| operation.get_str("op") == Ok("query"))
+            .count();
+        assert_eq!(finds, 1, "{operations:?}");
+    }
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
+    data.fixture.close().await;
+}
+
+#[tokio::test]
 async fn complement_pages_batch_exclusions_and_preserve_absence_and_cursors() {
     let Some(data) = TimestampFixture::new("complement-pages").await else {
         return;
@@ -2085,6 +2200,11 @@ async fn complement_pages_batch_exclusions_and_preserve_absence_and_cursors() {
                     db,
                     PLAN_TENANT,
                     &query,
+                    &data.fixture.backend.classify_missing(
+                        PLAN_TENANT,
+                        &query.resource_type,
+                        &query,
+                    ),
                     SearchFilterPurpose::Page,
                     NoTotalPagePolicy::Streaming,
                     None,
@@ -2245,6 +2365,7 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2282,6 +2403,7 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2309,6 +2431,7 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2337,6 +2460,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
     };
     let backend = &data.fixture.backend;
     let db = &data.fixture.db;
+    trust_missing_metadata(backend, db).await;
     let start = DateTime::from_millis(1_767_225_600_000);
     let end = DateTime::from_millis(start.timestamp_millis() + 86_400_000);
     db.collection::<Document>("search_index")
@@ -2384,6 +2508,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2425,6 +2550,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
                 db,
                 PLAN_TENANT,
                 &query,
+                &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -2462,6 +2588,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
             db,
             PLAN_TENANT,
             &query,
+            &backend.classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Page,
             NoTotalPagePolicy::Streaming,
             None,
@@ -2497,27 +2624,29 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
     data.fixture.close().await;
 }
 
-/// A first batch with at most sixteen matches sends the page to the bounded
-/// id set instead of scanning the rest of the type; the page is the same.
+/// A sparse first batch does not abandon an ordered scan that can fill the
+/// page or exhaust a small resource type within the continuation budget.
 #[tokio::test]
-async fn sparse_first_batches_page_from_the_id_set() {
+async fn sparse_prefixes_finish_within_the_ordered_scan_budget() {
     let Some(data) = TimestampFixture::new("sparse-fallback").await else {
         return;
     };
     let db = &data.fixture.db;
     let first_batch = PAGE_CANDIDATE_BATCH_ROWS as i64;
     let live_rows = data.ordered.len() as i64;
-    // (conditions, candidates the stream may return, membership batches per
-    // predicate): a dense page fills in one batch, a medium one keeps
-    // scanning; sparse, late, empty and intersected pages stop after one
-    // batch and come from the id set.
+    // Dense pages retain their one-batch fast path. Sparse pages keep their
+    // ordered cursor until the page fills or this small fixture is exhausted.
     for (conditions, rows, batches) in [
         (vec!["frequent"], 1..=first_batch, 1..=1),
         (vec!["medium"], first_batch + 1..=live_rows, 2..=i64::MAX),
-        (vec!["sparse"], first_batch..=first_batch, 1..=1),
-        (vec!["late"], first_batch..=first_batch, 1..=1),
-        (vec!["empty"], first_batch..=first_batch, 1..=1),
-        (vec!["left", "right"], first_batch..=first_batch, 1..=1),
+        (
+            vec!["sparse"],
+            first_batch + 1..=live_rows - 1,
+            2..=i64::MAX,
+        ),
+        (vec!["late"], live_rows..=live_rows, 2..=i64::MAX),
+        (vec!["empty"], live_rows..=live_rows, 2..=i64::MAX),
+        (vec!["left", "right"], live_rows..=live_rows, 2..=i64::MAX),
     ] {
         let context = format!("search-{conditions:?}");
         let query = data.query(&conditions);
@@ -2546,8 +2675,9 @@ async fn sparse_first_batches_page_from_the_id_set() {
             batches.contains(&per_predicate),
             "{context}: {per_predicate} membership batches per predicate, expected {batches:?}"
         );
+        assert!(id_set_operations(db).await.is_empty(), "{context}");
         if expected.len() > 20 {
-            // A cursor page takes the same decision from the same first batch.
+            // Cursor pages retain the same bounded continuation rule.
             let next = data
                 .search_ids(
                     &query
@@ -2756,5 +2886,202 @@ async fn sampled_runs_classify_the_first_batch_and_resume() {
         live_rows
     );
     db.run_command(doc! { "profile": 0 }).await.unwrap();
+    data.fixture.close().await;
+}
+
+#[tokio::test]
+async fn bounded_ordered_continuation_preserves_offsets_and_resume_state() {
+    let Some(data) = TimestampFixture::new("bounded-page-resume").await else {
+        return;
+    };
+    let db = &data.fixture.db;
+    let plan = ResourceBatchPlan {
+        filters: vec![predicate("code", "base"), predicate("code", "sparse")],
+        exclusions: Vec::new(),
+        missing: Vec::new(),
+    };
+    let expected = data.expected(&["sparse"]);
+    for (budget, next_batch) in [(768, 1024), (1792, 2048)] {
+        for offset in [0, 10] {
+            let mut run = plan
+                .start_page(
+                    db,
+                    resource_filter(),
+                    None,
+                    doc! { "last_updated": -1, "id": -1 },
+                    offset,
+                    50,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                run.sample(db).await.unwrap(),
+                ResourcePageSample::Sparse { .. }
+            ));
+            assert!(
+                run.try_finish_page_with_budget(db, budget, false)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(run.scan.candidates_checked, budget);
+            assert_eq!(run.scan.batch_rows, next_batch);
+            if budget == 1792 {
+                assert!(run.scan.live_matches > SPARSE_SAMPLE_MAX_LIVE);
+            }
+            // An oversized fallback set must resume this exact state, including
+            // matches already skipped for the offset and IDs already retained.
+            assert_eq!(
+                run.finish(db).await.unwrap(),
+                expected
+                    .iter()
+                    .skip(offset as usize)
+                    .take(50)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    data.fixture.close().await;
+}
+
+#[tokio::test]
+async fn bounded_ordered_continuation_matches_a_carried_last_row_before_reading() {
+    let Some(data) = TimestampFixture::new("bounded-page-carried-row").await else {
+        return;
+    };
+    let db = &data.fixture.db;
+    let plan = ResourceBatchPlan {
+        filters: vec![predicate("code", "base")],
+        exclusions: Vec::new(),
+        missing: Vec::new(),
+    };
+    let mut run = plan
+        .start_page(db, resource_filter(), None, doc! { "id": -1 }, 0, 1)
+        .await
+        .unwrap();
+    let carried = data.ordered[0].clone();
+    // Reproduce the state after a byte-budget flush: one row is already in
+    // the next batch, and exactly one checked row remains in the total budget.
+    run.scan.candidates_checked = RESOURCE_PAGE_SCAN_BUDGET - 1;
+    run.scan.bytes = carried.len() + 16;
+    run.scan.batch.push(carried.clone());
+    let page = run
+        .try_finish_page_with_budget(db, RESOURCE_PAGE_SCAN_BUDGET, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(page, [carried]);
+    assert_eq!(run.scan.candidates_checked, RESOURCE_PAGE_SCAN_BUDGET);
+    assert!(run.scan.batch.is_empty());
+    data.fixture.close().await;
+}
+
+#[tokio::test]
+async fn sparse_ordered_pages_cross_fifty_pages_without_collecting_the_full_id_set() {
+    let Some(mut data) = TimestampFixture::with_count("bounded-page-walk", 21_000).await else {
+        return;
+    };
+    let selected: Vec<_> = data.ordered.iter().skip(300).step_by(20).cloned().collect();
+    assert!(selected.len() > 1000);
+    let index = data.fixture.db.collection::<Document>("search_index");
+    for chunk in selected.chunks(500) {
+        index
+            .insert_many(
+                chunk
+                    .iter()
+                    .map(|id| index_row(id, "code", "walk"))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+    }
+    data.markers.insert("walk".into(), selected);
+    let db = &data.fixture.db;
+    let expected = data.expected(&["walk"]);
+    let query = data.query(&["walk"]);
+    data.force_broad_observations(&query);
+    start_profiling(db).await;
+    let mut request = query.clone();
+    let mut all_ids = Vec::new();
+    for page in 0..50 {
+        let result = data.search_ids(&request).await;
+        let actual = result_ids(&result);
+        assert_eq!(actual, expected[page * 20..(page + 1) * 20]);
+        assert_eq!(result.total, None);
+        all_ids.extend(actual);
+        request = query
+            .clone()
+            .with_cursor(result.resources.page_info.next_cursor.unwrap());
+    }
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
+    assert_eq!(all_ids, expected[..1000]);
+    assert!(
+        id_set_operations(db).await.is_empty(),
+        "every page must stay on the ordered path"
+    );
+    let operations = candidate_stream_operations(db).await;
+    assert_covered_index_order(&operations, "fifty sparse pages");
+    assert!(profile_sum(&operations, "nreturned") < 50 * 2048);
+
+    // The independent expected order also covers mixed timestamp/ID directions,
+    // ties, offsets, both total modes, previous links and a short final page.
+    for sort in [None, Some("-_lastUpdated"), Some("_lastUpdated")] {
+        let mut ordered = expected.clone();
+        if sort == Some("_lastUpdated") {
+            ordered.sort_by(|a, b| {
+                data.timestamps[a]
+                    .cmp(&data.timestamps[b])
+                    .then_with(|| b.cmp(a))
+            });
+        }
+        for mode in [TotalMode::None, TotalMode::Accurate] {
+            let mut query = data.query(&["walk"]);
+            query.total = Some(mode);
+            if let Some(sort) = sort {
+                query = query.with_sort(SortDirective::parse(sort));
+            }
+            let first = data.search_ids(&query).await;
+            assert_eq!(result_ids(&first), ordered[..20]);
+            assert_eq!(
+                first.total,
+                (mode == TotalMode::Accurate).then_some(ordered.len() as u64)
+            );
+            let next = data
+                .search_ids(
+                    &query
+                        .clone()
+                        .with_cursor(first.resources.page_info.next_cursor.unwrap()),
+                )
+                .await;
+            assert_eq!(result_ids(&next), ordered[20..40]);
+            let previous = data
+                .search_ids(
+                    &query
+                        .clone()
+                        .with_cursor(next.resources.page_info.previous_cursor.unwrap()),
+                )
+                .await;
+            assert_eq!(result_ids(&previous), ordered[..20]);
+            for offset in [7, ordered.len() - 7] {
+                let mut offset_query = query.clone();
+                offset_query.offset = Some(offset as u32);
+                let result = data.search_ids(&offset_query).await;
+                assert_eq!(
+                    result_ids(&result),
+                    ordered
+                        .iter()
+                        .skip(offset)
+                        .take(20)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    result.resources.page_info.has_next,
+                    offset + 20 < ordered.len()
+                );
+            }
+        }
+    }
     data.fixture.close().await;
 }

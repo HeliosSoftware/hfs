@@ -910,6 +910,21 @@ jobs:
         #     classical-only and there is nothing to downgrade.
         # Remove these with the h2 entry above, once the AWS SDK drops its
         # hyper 0.14 fallback client.
+        #
+        # crypto-bigint 0.4.9 and 0.5.5 (RUSTSEC-2026-0387, constant-time
+        # operations that may branch on secret data; patched in >= 0.7.6).
+        # Our own EC code (p256/p384 ECDH-ES for bulk-submit JWE, ES384 JWKS)
+        # is on the 0.14 line, which uses the patched 0.7, so neither copy is
+        # in the default build. Both are left only through aws-sigv4's
+        # `sigv4a` feature (aws-sdk-s3 under `s3`, aws-config under
+        # `cloudwatch`): 0.5.5 directly, 0.4.9 via its p256 0.11. There is no
+        # upgrade: even aws-sigv4 1.6.3 requires crypto-bigint ^0.5.4 (and its
+        # Rust 1.94.1 MSRV is above ours, so the resolver keeps 1.4.0). SigV4a
+        # only signs requests for S3 Multi-Region Access Points, on the client
+        # side, using the deployment's own AWS credentials. Exploiting the
+        # leak would need fine-grained timing of that signing inside our
+        # process, not just the inputs a FHIR client controls. Remove this once
+        # aws-sigv4 moves to crypto-bigint >= 0.7.6.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0098
@@ -921,6 +936,7 @@ jobs:
           --ignore RUSTSEC-2026-0258
           --ignore RUSTSEC-2026-0346
           --ignore RUSTSEC-2026-0349
+          --ignore RUSTSEC-2026-0387
 
       # See the note in `test-rust`.
       - name: Cap target dir size

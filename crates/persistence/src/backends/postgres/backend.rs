@@ -123,6 +123,10 @@ struct OverlayFingerprint {
 #[derive(Clone)]
 pub struct PostgresBackend {
     pool: Pool,
+    /// This pool's share of the server's connection budget, handed back to the
+    /// other pools when the last clone is dropped. `None` when the server's
+    /// `max_connections` could not be read.
+    _pool_registration: Option<Arc<super::pool_budget::PoolRegistration>>,
     config: PostgresConfig,
     /// Per-tenant search parameter registries (shared base + per-tenant overlay).
     registries: Arc<TenantSearchRegistries>,
@@ -197,6 +201,17 @@ pub struct PostgresConfig {
     /// Maximum number of connections in the pool.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+
+    /// Treat `max_connections` as a default to fit the server, not a fixed size.
+    ///
+    /// When set, [`PostgresBackend::new`] limits the pool at startup to its share of
+    /// half of the server's `max_connections`, shared with the other pools this
+    /// process opens against the same host and port (#2216). The URL and
+    /// environment constructors set it when `HFS_PG_MAX_CONNECTIONS` gives no
+    /// size; a config built by hand keeps `max_connections` as given unless the
+    /// caller sets it.
+    #[serde(default)]
+    pub limit_pool_to_server: bool,
 
     /// Upper bound, in seconds, for establishing a connection to the server.
     ///
@@ -400,6 +415,14 @@ fn default_user() -> String {
 /// The old fixed default of 10 throttled search badly — at 30 concurrent clients
 /// with multi-second queries, two-thirds of every request's latency was spent
 /// waiting for a connection (issue #224).
+///
+/// Doubling it did not help on a database with cores of its own: 300 concurrent
+/// CRUD clients against 8 dedicated PostgreSQL cores ran at a median ~4,400 req/s
+/// with 64 connections against ~5,030 with 32, using more database CPU per
+/// request (#2216). A database sharing the cores with `hfs` and bound on the WAL
+/// flush gained from 64; set `HFS_PG_MAX_CONNECTIONS` there. Started from the
+/// URL or the environment, the default is also limited by what the server
+/// accepts, see [`PostgresConfig::limit_pool_to_server`].
 fn default_max_connections() -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -476,6 +499,7 @@ impl Debug for PostgresConfig {
             password,
             ssl_mode,
             max_connections,
+            limit_pool_to_server,
             connect_timeout_secs,
             statement_timeout_ms,
             count_by_tenant_statement_timeout_ms,
@@ -493,6 +517,7 @@ impl Debug for PostgresConfig {
             .field("password", &password.as_ref().map(|_| "[redacted]"))
             .field("ssl_mode", ssl_mode)
             .field("max_connections", max_connections)
+            .field("limit_pool_to_server", limit_pool_to_server)
             .field("connect_timeout_secs", connect_timeout_secs)
             .field("statement_timeout_ms", statement_timeout_ms)
             .field(
@@ -518,6 +543,7 @@ impl Default for PostgresConfig {
             password: None,
             ssl_mode: PostgresSslMode::default(),
             max_connections: default_max_connections(),
+            limit_pool_to_server: false,
             connect_timeout_secs: default_connect_timeout_secs(),
             statement_timeout_ms: default_statement_timeout_ms(),
             count_by_tenant_statement_timeout_ms: default_count_by_tenant_statement_timeout_ms(),
@@ -539,11 +565,17 @@ impl PostgresConfig {
     /// only overwrote host/port/user/password/dbname — so the pool size was pinned
     /// at its default and *no* environment variable could change it (issue #224).
     fn apply_env_overrides(&mut self) {
-        if let Some(v) = std::env::var("HFS_PG_MAX_CONNECTIONS")
+        // A size that does not parse is ignored like the other knobs, and leaves
+        // the default, so it is limited to the server like an unset variable.
+        match std::env::var("HFS_PG_MAX_CONNECTIONS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
-            self.max_connections = v;
+            Some(v) => {
+                self.max_connections = v;
+                self.limit_pool_to_server = false;
+            }
+            None => self.limit_pool_to_server = true,
         }
         if let Some(v) = std::env::var("HFS_PG_STATEMENT_TIMEOUT_MS")
             .ok()
@@ -659,7 +691,7 @@ impl PostgresBackend {
     }
 
     /// Creates a new PostgreSQL backend with the given configuration.
-    pub async fn new(config: PostgresConfig) -> StorageResult<Self> {
+    pub async fn new(mut config: PostgresConfig) -> StorageResult<Self> {
         check_count_by_tenant_statement_timeout_ms(config.count_by_tenant_statement_timeout_ms)
             .map_err(|message| {
                 crate::error::StorageError::Backend(BackendError::Internal {
@@ -684,7 +716,31 @@ impl PostgresBackend {
                 message: e.to_string(),
             })
         })?;
+
+        // Keep default-sized pools within what the server accepts, together with
+        // the other pools of this process on the same server (see `pool_budget`).
+        // An explicit size is used as given, with a warning when the pools add up
+        // to more than the server's limit. A failed probe leaves the pool alone.
+        let server_max = client
+            .query_one("SELECT current_setting('max_connections')::int4", &[])
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<_, i32>(0).ok())
+            .and_then(|n| usize::try_from(n).ok());
         drop(client);
+        let pool_registration = server_max.map(|server_max| {
+            Arc::new(super::pool_budget::register(
+                &config.host,
+                config.port,
+                server_max,
+                config.max_connections,
+                config.limit_pool_to_server,
+                &pool,
+            ))
+        });
+        if pool_registration.is_some() && config.limit_pool_to_server {
+            config.max_connections = pool.status().max_size;
+        }
 
         // Initialize the per-tenant search parameter registries. Base params
         // (embedded + spec + custom) go into the shared base; each tenant's
@@ -710,6 +766,7 @@ impl PostgresBackend {
 
         Ok(Self {
             pool,
+            _pool_registration: pool_registration,
             config,
             registries,
             stored_by_tenant,
@@ -789,7 +846,8 @@ impl PostgresBackend {
     /// - `HFS_PG_DBNAME` (default: "helios")
     /// - `HFS_PG_USER` (default: "helios")
     /// - `HFS_PG_PASSWORD`
-    /// - `HFS_PG_MAX_CONNECTIONS` (default: `cores * 4`, clamped to 16..=64)
+    /// - `HFS_PG_MAX_CONNECTIONS` (default: `cores * 4`, clamped to 16..=64 and, at
+    ///   startup, to this pool's share of half of the server's `max_connections`)
     /// - `HFS_PG_CONNECT_TIMEOUT_SECS` (default: 5)
     /// - `HFS_PG_STATEMENT_TIMEOUT_MS` (default: 30000)
     /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
@@ -2030,6 +2088,14 @@ mod tests {
     }
 
     #[test]
+    fn pool_default_is_cores_times_four_within_the_band() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        assert_eq!(default_max_connections(), (cores * 4).clamp(16, 64));
+    }
+
+    #[test]
     fn default_timeouts_match_documented_values() {
         assert_eq!(default_statement_timeout_ms(), 30_000);
         assert_eq!(default_pool_wait_timeout_secs(), 10);
@@ -2186,6 +2252,46 @@ mod tests {
         // A value that fails to parse is ignored (parse → None), leaving the
         // default untouched rather than zeroing the pool.
         assert_eq!(cfg.max_connections, before);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("HFS_PG_MAX_CONNECTIONS");
+        }
+    }
+
+    #[test]
+    fn only_a_size_from_the_environment_escapes_the_server_limit() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        // A config built by hand keeps its size.
+        assert!(!PostgresConfig::default().limit_pool_to_server);
+
+        // Unset, empty or unparseable: the default, limited to the server (#2216).
+        for raw in [None, Some(""), Some("lots")] {
+            // SAFETY: serialized by ENV_GUARD, removed before releasing the lock.
+            unsafe {
+                match raw {
+                    Some(raw) => std::env::set_var("HFS_PG_MAX_CONNECTIONS", raw),
+                    None => std::env::remove_var("HFS_PG_MAX_CONNECTIONS"),
+                }
+            }
+            let mut cfg = PostgresConfig::default();
+            cfg.apply_env_overrides();
+            assert!(cfg.limit_pool_to_server, "{raw:?}");
+            assert_eq!(cfg.max_connections, default_max_connections(), "{raw:?}");
+        }
+
+        // A size that parses is used as given, even when it equals the default.
+        for size in [40, default_max_connections()] {
+            // SAFETY: see above.
+            unsafe {
+                std::env::set_var("HFS_PG_MAX_CONNECTIONS", size.to_string());
+            }
+            let mut cfg = PostgresConfig::default();
+            cfg.apply_env_overrides();
+            assert!(!cfg.limit_pool_to_server, "{size}");
+            assert_eq!(cfg.max_connections, size);
+        }
 
         // SAFETY: see above.
         unsafe {
