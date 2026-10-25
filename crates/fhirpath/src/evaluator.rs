@@ -2822,8 +2822,9 @@ fn evaluate_invocation(
                             == Some("TerminologyFunctions")
                         {
                             // This is a method call on %terminologies
-                            use crate::terminology_functions::TerminologyFunctions;
-                            let terminology = TerminologyFunctions::new(context)?;
+                            use crate::terminology_functions::{
+                                TerminologyFunctions, terminologies_call_has_empty_coded_input,
+                            };
 
                             // Evaluate arguments
                             let mut evaluated_args = Vec::with_capacity(args_exprs.len());
@@ -2834,6 +2835,13 @@ fn evaluate_invocation(
                                     current_item_for_args,
                                 )?);
                             }
+
+                            // An empty coded argument propagates as an empty result, before a
+                            // terminology server is required.
+                            if terminologies_call_has_empty_coded_input(name, &evaluated_args) {
+                                return Ok(EvaluationResult::Empty);
+                            }
+                            let terminology = TerminologyFunctions::new(context)?;
 
                             // Call the appropriate terminology function
                             match name.as_str() {

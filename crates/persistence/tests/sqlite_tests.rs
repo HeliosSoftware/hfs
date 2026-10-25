@@ -668,6 +668,20 @@ async fn sqlite_concurrent_update_and_plain_delete_stay_consistent() {
     .await;
 }
 
+/// #2111: unconditional PUTs racing onto one tombstone all succeed, and the
+/// history stays contiguous with the live body as its newest entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_puts_onto_a_tombstone_all_succeed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed(
+        backend,
+        "restore-race-2111",
+        40,
+    )
+    .await;
+}
+
 /// #1404: `delete_versioned` compares and deletes in one step.
 #[tokio::test]
 async fn sqlite_versioned_delete_is_a_compare_and_swap() {
@@ -5424,6 +5438,25 @@ async fn test_bulk_submit_release_after_abort_is_a_no_op() {
     release_contract::release_after_abort_is_a_no_op(
         &create_backend(),
         &create_tenant("submit-release-abort"),
+    )
+    .await;
+}
+
+mod index_pending_contract {
+    use helios_persistence as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/index_pending_contract.rs"
+    ));
+}
+
+/// See `index_pending_contract::marked_manifest_is_listed_until_cleared` (#1283).
+#[tokio::test]
+async fn test_bulk_submit_marked_manifest_is_listed_until_cleared() {
+    index_pending_contract::marked_manifest_is_listed_until_cleared(
+        &create_backend(),
+        &create_tenant("submit-index-pending"),
+        false,
     )
     .await;
 }

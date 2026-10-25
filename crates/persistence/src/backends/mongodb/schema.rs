@@ -33,11 +33,13 @@ use super::search_index_catalog::{
 /// the `search_index_pending` ledger of deferred search rows and its
 /// `not_before` index (#1975). v14 adds the SQL-on-FHIR terminology
 /// collections `sof_terminology_registry` and `sof_terminology_rows` (#2185).
+/// v15 adds `idx_bulk_manifests_index_pending`, the partial index behind the
+/// deferred-rebuild marker's startup scan (#1283).
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
 /// not change for them.
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -610,6 +612,17 @@ async fn ensure_bulk_submit_indexes(database: &Database) -> StorageResult<()> {
         doc! { "status": 1_i32, "lease_expiry": 1_i32, "added_at": 1_i32 },
         "idx_bulk_manifests_claim",
         false,
+    )
+    .await?;
+    // Startup re-fires the rebuilds a stopped server left outstanding (#1125);
+    // only those manifests carry `index_pending`, so the index stays tiny.
+    create_index_with(
+        &manifests,
+        doc! { "added_at": 1_i32 },
+        IndexOptions::builder()
+            .name(Some("idx_bulk_manifests_index_pending".to_string()))
+            .partial_filter_expression(Some(doc! { "index_pending": true }))
+            .build(),
     )
     .await?;
 

@@ -14990,6 +14990,28 @@ mod bulk_submit {
         .await;
     }
 
+    mod index_pending_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/index_pending_contract.rs"
+        ));
+    }
+
+    /// See `index_pending_contract::marked_manifest_is_listed_until_cleared` (#1283).
+    #[tokio::test]
+    async fn test_submit_marked_manifest_is_listed_until_cleared() {
+        let Some(backend) = create_backend("submit_index_pending").await else {
+            return;
+        };
+        index_pending_contract::marked_manifest_is_listed_until_cleared(
+            &backend,
+            &create_tenant("submit-index-pending"),
+            true,
+        )
+        .await;
+    }
+
     mod claim_contract {
         use helios_persistence as persistence;
         include!(concat!(

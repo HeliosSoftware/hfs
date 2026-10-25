@@ -1568,6 +1568,102 @@ async fn bulk_export_key_cursor_reads_each_object_once() {
     assert_eq!(legacy.next_cursor.as_deref(), Some("8"));
 }
 
+/// #2140: deciding whether a requested `_type` has anything to export stops at
+/// the first live object instead of reading the whole type one GET at a time
+/// (35 minutes for 11,704 Patients against real S3). A type is kept on any
+/// live resource, window or not, as the SQL and MongoDB backends decide it:
+/// the batches apply `_since` / `_until`.
+#[tokio::test]
+async fn bulk_export_requested_types_probe_stops_at_first_live_object() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    for i in 0..50 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("p{i:02}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    for i in 0..3 {
+        let id = format!("o{i}");
+        backend
+            .create(
+                &tenant,
+                "Organization",
+                json!({"resourceType":"Organization","id":id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Organization", &id).await.unwrap();
+    }
+
+    let types = vec![
+        "Patient".to_string(),
+        "Organization".to_string(),
+        "Location".to_string(),
+    ];
+    let gets_before = mock.get_count();
+    let found = backend
+        .list_export_types(&tenant, &ExportRequest::system().with_types(types.clone()))
+        .await
+        .unwrap();
+    assert_eq!(found, vec!["Patient".to_string()]);
+    // One GET finds a live Patient; the three deleted Organizations are each
+    // read once to rule the type out; Location has nothing to read.
+    let gets = mock.get_count() - gets_before;
+    assert!(
+        gets <= 1 + 3,
+        "{gets} GETs to probe 50 Patients and 3 Organizations"
+    );
+
+    // Out of the window still counts as present: the batches filter it.
+    let past = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let request = ExportRequest::system()
+        .with_types(vec!["Patient".to_string()])
+        .with_until(past);
+    assert_eq!(
+        backend.list_export_types(&tenant, &request).await.unwrap(),
+        vec!["Patient".to_string()]
+    );
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 100)
+        .await
+        .unwrap();
+    assert!(batch.lines.is_empty() && batch.is_last);
+    assert_eq!(
+        backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A live object behind a run of deleted ones is still found.
+    backend.delete(&tenant, "Patient", "p00").await.unwrap();
+    backend.delete(&tenant, "Patient", "p01").await.unwrap();
+    let found = backend
+        .list_export_types(&tenant, &ExportRequest::system().with_types(types))
+        .await
+        .unwrap();
+    assert_eq!(found, vec!["Patient".to_string()]);
+    assert_eq!(
+        backend
+            .count_export_resources(&tenant, &ExportRequest::system(), "Patient")
+            .await
+            .unwrap(),
+        48
+    );
+}
+
 /// #1273: every exported NDJSON line carries the server's `meta.versionId`
 /// and `meta.lastUpdated` (the same `meta` a read returns) while keeping
 /// client-supplied `meta` members, on both the type-level and the
@@ -9230,6 +9326,44 @@ mod scan_read_limit {
         assert!(peak >= 2, "peak {peak}: the test never overlapped any GETs");
         assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
         assert_eq!(backend.scan_limit.available_permits(), 3);
+    }
+
+    /// #2140: the export count and the Patient-id listing read a type's
+    /// objects concurrently under the read limit, not one GET at a time.
+    #[tokio::test(start_paused = true)]
+    async fn export_count_and_patient_ids_overlap_gets() {
+        let (backend, client) = gauged_backend(4);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 20).await;
+        backend.delete(&t, "Patient", "p07").await.unwrap();
+        client.peak.store(0, Ordering::SeqCst);
+
+        let request = ExportRequest::system();
+        let count = backend
+            .count_export_resources(&t, &request, "Patient")
+            .await
+            .unwrap();
+        assert_eq!(count, 19);
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!((2..=4).contains(&peak), "count: peak {peak} GETs in flight");
+
+        client.peak.store(0, Ordering::SeqCst);
+        let (ids, next) = backend
+            .list_patient_ids(&t, &request, None, 100)
+            .await
+            .unwrap();
+        let expected: Vec<String> = (0..20)
+            .filter(|i| *i != 7)
+            .map(|i| format!("p{i:02}"))
+            .collect();
+        assert_eq!(ids, expected, "sorted, deleted one left out");
+        assert!(next.is_none());
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!(
+            (2..=4).contains(&peak),
+            "patient ids: peak {peak} GETs in flight"
+        );
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
     }
 
     /// The setting really bounds a single call, and a limit of one still lets
