@@ -532,6 +532,17 @@ impl PageFailure {
             })
             .collect()
     }
+
+    /// [`Self::fan_out`] for a metadata-only page (#2008): every resource
+    /// fails and none had its metadata written.
+    pub(super) fn fan_out_metadata(&self, n: usize) -> (Vec<StorageResult<()>>, u64) {
+        let results = self
+            .fan_out(n)
+            .into_iter()
+            .map(|outcome| outcome.map(|_| ()))
+            .collect();
+        (results, 0)
+    }
 }
 
 impl From<String> for PageFailure {
@@ -679,7 +690,19 @@ async fn update_missing_metadata(
     db: &mongodb::Database,
     updates: &[(usize, Document)],
 ) -> Result<HashMap<usize, String>, PageFailure> {
+    update_missing_metadata_counted(db, updates)
+        .await
+        .map(|(failures, _)| failures)
+}
+
+/// [`update_missing_metadata`], also returning how many resources the updates
+/// matched: what a metadata-only run reports as written (#2008).
+async fn update_missing_metadata_counted(
+    db: &mongodb::Database,
+    updates: &[(usize, Document)],
+) -> Result<(HashMap<usize, String>, u64), PageFailure> {
     let mut failures = HashMap::new();
+    let mut matched_total = 0u64;
     for chunk in updates.chunks(REINDEX_SUBBATCH_MAX) {
         let statements: Vec<_> = chunk.iter().map(|(_, update)| update.clone()).collect();
         let reply = db
@@ -693,11 +716,47 @@ async fn update_missing_metadata(
                 PageFailure::driver("Failed to update reindex missing metadata", error)
                     .with_permanent(failures.clone())
             })?;
-        let (_, write_failures) = metadata_update_result(&reply, chunk)
+        let (matched, write_failures) = metadata_update_result(&reply, chunk)
             .map_err(|failure| failure.with_permanent(failures.clone()))?;
+        matched_total += matched as u64;
         failures.extend(write_failures);
     }
-    Ok(failures)
+    Ok((failures, matched_total))
+}
+
+/// One resource's metadata-only update (#2008): the rebuild's
+/// [`SubBatchDocs::missing_updates`] statement, plus, with `skip_existing`, a
+/// guard that leaves alone a resource whose `missing_params` already carries
+/// this extraction's fingerprint (#1999). An unstamped array (written before
+/// #1999) or a stale stamp is rewritten, since searches distrust both.
+fn metadata_only_update(
+    tenant_id: &str,
+    resource: &StoredResource,
+    missing_params: Option<&[String]>,
+    missing_fp: Option<&str>,
+    skip_existing: bool,
+) -> Document {
+    let mut filter = resource_version_filter(tenant_id, resource);
+    if skip_existing {
+        // Skip only arrays already stamped with this extraction's
+        // fingerprint; unstamped (#1984-era) or stale stamps are rewritten.
+        match missing_fp {
+            Some(fp) => filter.insert(
+                "$or",
+                vec![
+                    doc! { "missing_params": { "$exists": false } },
+                    doc! { "missing_params_fp": { "$ne": fp } },
+                ],
+            ),
+            None => filter.insert("missing_params", doc! { "$exists": false }),
+        };
+    }
+    doc! {
+        "q": filter,
+        "u": super::storage::with_missing_metadata_update(doc! {}, missing_params, missing_fp),
+        "multi": false,
+        "upsert": false,
+    }
 }
 
 /// What a database task hands back to the page's own thread when joined:
@@ -1560,6 +1619,63 @@ impl super::MongoBackend {
         self.search_index_documents_checked(tenant_id, r.resource_type(), r.id(), r.content())
     }
 
+    /// Metadata-only page write (#2008): extracts every resource exactly as a
+    /// rebuild does, then writes only its `missing_params`, under the same
+    /// version guard, and never touches `search_index` or
+    /// `search_index_contained`. A resource whose extraction failed has its
+    /// metadata removed rather than claimed, as in a rebuild, and is reported
+    /// as failed. Returns the per-resource outcomes and how many resources the
+    /// updates matched.
+    pub(super) async fn write_metadata_page(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resources: &[StoredResource],
+        skip_existing: bool,
+    ) -> Result<(Vec<StorageResult<()>>, u64), PageFailure> {
+        let n = resources.len();
+        let prepare = |i: usize| self.extract_one(tenant_id, &resources[i]);
+        let pool = if tokio_multi_thread_runtime() && n >= REINDEX_SERIAL_POOL_MIN_PAGE {
+            self.reindex_prepare_pool()
+        } else {
+            None
+        };
+        let prepared: Vec<(SearchIndexDocuments, Option<String>)> = if pool.is_some() {
+            let env = PrepareEnv {
+                pool,
+                gate: self.reindex_prepare_gate(),
+            };
+            extract_range(&env, 0..n, &prepare).0
+        } else {
+            (0..n).map(&prepare).collect()
+        };
+
+        let mut extract_failures: Vec<Option<String>> = Vec::with_capacity(n);
+        let mut updates: Vec<(usize, Document)> = Vec::with_capacity(n);
+        for (i, (docs, failure)) in prepared.into_iter().enumerate() {
+            updates.push((
+                i,
+                metadata_only_update(
+                    tenant_id,
+                    &resources[i],
+                    docs.missing_params.as_deref(),
+                    docs.missing_fp.as_deref(),
+                    skip_existing,
+                ),
+            ));
+            extract_failures.push(failure);
+        }
+
+        let (write_failures, matched) = update_missing_metadata_counted(db, &updates)
+            .await
+            .map_err(|failure| failure.with_outcomes(extract_failures.clone(), HashMap::new()))?;
+        let outcomes = page_outcomes(extract_failures, write_failures, &vec![0; n])
+            .into_iter()
+            .map(|outcome| outcome.map(|_| ()))
+            .collect();
+        Ok((outcomes, matched))
+    }
+
     /// Serial writer: extracts every resource, deletes the page's stale
     /// entries, then inserts the new ones, one command at a time (own rows,
     /// then contained rows). Uses the rayon pool only for pages of at least
@@ -2114,6 +2230,20 @@ mod tests {
             &outcomes[4],
             Err(StorageError::Backend(BackendError::Unavailable { .. }))
         ));
+    }
+
+    #[test]
+    fn metadata_fan_out_fails_every_resource_and_writes_none() {
+        let mut permanent = HashMap::new();
+        permanent.insert(1, "metadata rejected".to_string());
+        let failure =
+            PageFailure::driver("metadata page", command_error(2)).with_permanent(permanent);
+        let (results, written) = failure.fan_out_metadata(3);
+        assert_eq!(written, 0);
+        assert_eq!(results.len(), 3);
+        assert!(matches!(&results[0], Err(e) if e.to_string().contains("metadata page")));
+        assert!(matches!(&results[1], Err(e) if e.to_string().contains("metadata rejected")));
+        assert!(matches!(&results[2], Err(e) if e.to_string().contains("metadata page")));
     }
 
     #[test]
