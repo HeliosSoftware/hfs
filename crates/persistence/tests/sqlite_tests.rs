@@ -5428,6 +5428,25 @@ async fn test_bulk_submit_release_after_abort_is_a_no_op() {
     .await;
 }
 
+mod index_pending_contract {
+    use helios_persistence as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/index_pending_contract.rs"
+    ));
+}
+
+/// See `index_pending_contract::marked_manifest_is_listed_until_cleared` (#1283).
+#[tokio::test]
+async fn test_bulk_submit_marked_manifest_is_listed_until_cleared() {
+    index_pending_contract::marked_manifest_is_listed_until_cleared(
+        &create_backend(),
+        &create_tenant("submit-index-pending"),
+        false,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn sqlite_reindex_scoped_clear_preserves_other_types_and_tenants() {
     scoped_clear::assert_scoped_clear(&create_backend()).await;
