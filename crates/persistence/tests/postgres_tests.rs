@@ -208,7 +208,7 @@ fn test_postgres_config_defaults() {
     assert_eq!(config.dbname, "helios");
     assert_eq!(config.user, "helios");
     assert!(config.password.is_none());
-    // Derived from the core count (cores * 8, clamped) rather than a fixed 10, which
+    // Derived from the core count (cores * 4, clamped) rather than a fixed 10, which
     // throttled search badly under concurrent load — see #224. Assert the contract
     // (the clamp bounds), not the machine-dependent value.
     assert!(
@@ -2862,39 +2862,45 @@ mod postgres_integration {
             .expect("Failed to create PostgresBackend")
     }
 
-    /// The pool default is limited to half of the server's `max_connections`
-    /// (100 on this stock container, so at most 50), a size given explicitly is
-    /// used as given (#2216).
+    /// Default-sized pools share half of the server's `max_connections` (100 on
+    /// this stock container, so 50) instead of each taking half; an explicit size
+    /// is used as given (#2216).
     #[tokio::test]
-    async fn postgres_2216_pool_default_is_limited_by_the_server_and_explicit_sizes_are_kept() {
-        // An operator-set size takes the explicit path by design; nothing to check.
-        if std::env::var("HFS_PG_MAX_CONNECTIONS").is_ok() {
-            return;
-        }
+    async fn postgres_2216_default_pools_share_half_of_the_server_and_explicit_sizes_are_kept() {
         let pg = shared_pg().await;
-        let config_with = |max_connections: usize| PostgresConfig {
+        let config_with = |max_connections: usize, limit_pool_to_server: bool| PostgresConfig {
             host: pg.host.clone(),
             port: pg.port,
             dbname: "postgres".to_string(),
             user: "postgres".to_string(),
             password: Some("postgres".to_string()),
             max_connections,
+            limit_pool_to_server,
             ..Default::default()
         };
+        let size = |backend: &PostgresBackend| backend.pool_status().max_size;
 
-        let default_size = PostgresConfig::default().max_connections;
-        let backend = PostgresBackend::new(config_with(default_size))
+        // Two pools that each want everything, like `hfs` with the database
+        // audit sink. Pools of concurrent tests in this binary only shrink what
+        // is left, so the two never exceed half together; each keeps at least one.
+        let first = PostgresBackend::new(config_with(64, true))
             .await
             .expect("Failed to create PostgresBackend");
-        assert_eq!(backend.config().max_connections, default_size.min(50));
-
-        // Anything other than the default is an explicit size, kept even above
-        // what the server accepts (it only warns).
-        let explicit = default_size + 1;
-        let backend = PostgresBackend::new(config_with(explicit))
+        assert!((1..=50).contains(&size(&first)), "{}", size(&first));
+        let second = PostgresBackend::new(config_with(64, true))
             .await
             .expect("Failed to create PostgresBackend");
-        assert_eq!(backend.config().max_connections, explicit);
+        let (a, b) = (size(&first), size(&second));
+        assert!(a >= 1 && b >= 1, "{a} + {b}");
+        assert!(a + b <= 50 || a + b == 2, "{a} + {b} exceed half of 100");
+
+        // An explicit size is kept, even above what the budget leaves (it only
+        // warns once the pools add up to more than the server accepts).
+        let explicit = PostgresBackend::new(config_with(51, false))
+            .await
+            .expect("Failed to create PostgresBackend");
+        assert_eq!(size(&explicit), 51);
+        assert_eq!(explicit.config().max_connections, 51);
     }
 
     /// Creates a tenant with a unique ID suffix to isolate tests sharing the same database.

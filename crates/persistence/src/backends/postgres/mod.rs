@@ -82,6 +82,7 @@ mod cleanup;
 mod lock_protocol;
 mod login_sessions;
 pub(crate) mod null_timestamp_facts;
+mod pool_budget;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;
