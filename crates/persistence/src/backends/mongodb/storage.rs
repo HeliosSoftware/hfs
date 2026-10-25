@@ -49,6 +49,7 @@ use super::deferred_index::{
 };
 use super::retry::{BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, jitter_fraction};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
+use super::search_impl::MissingSupport;
 
 pub(super) fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -5968,8 +5969,14 @@ impl MongoBackend {
                 ..Default::default()
             };
             let tenant_id = tenant.tenant_id().as_str();
-            let filter =
-                self.build_resource_filter(tenant_id, resource_type, &query, None, None)?;
+            let filter = self.build_resource_filter(
+                tenant_id,
+                resource_type,
+                &query,
+                &MissingSupport::none(),
+                None,
+                None,
+            )?;
             let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
             let cursor = resources
                 .find(filter)
@@ -6180,6 +6187,7 @@ impl MongoBackend {
                     tenant_id,
                     resource_type,
                     &resource_query,
+                    &MissingSupport::none(),
                     None,
                     None,
                 )?;
@@ -6295,6 +6303,7 @@ impl MongoBackend {
                 tenant_id,
                 resource_type,
                 &query,
+                &MissingSupport::none(),
                 None,
                 None,
             )?);

@@ -1,6 +1,7 @@
 //! Access paths and result parity for the bounded legacy candidate collector.
 
 use super::super::super::CANDIDATE_BATCH_SIZE;
+use super::super::super::MissingSupport;
 use super::super::super::search_access::SEARCH_TOKEN_MEMBERSHIP_INDEX;
 use super::*;
 use crate::backends::mongodb::schema::RESOURCES_TYPE_SCAN_INDEX;
@@ -457,7 +458,13 @@ async fn legacy_date_discovery_retries_only_a_missing_date_index() {
         for query in &queries {
             let actual = fixture
                 .backend
-                .matching_resource_ids(&fixture.db, PLAN_TENANT, "Observation", query)
+                .matching_resource_ids(
+                    &fixture.db,
+                    PLAN_TENANT,
+                    "Observation",
+                    query,
+                    &MissingSupport::none(),
+                )
                 .await
                 .unwrap();
             assert_eq!(actual, Some(expected.clone()));
@@ -498,7 +505,13 @@ async fn legacy_discovery_errors_and_required_membership_index_errors_propagate(
             .await;
         let result = fixture
             .backend
-            .matching_resource_ids(&fixture.db, PLAN_TENANT, "Observation", query)
+            .matching_resource_ids(
+                &fixture.db,
+                PLAN_TENANT,
+                "Observation",
+                query,
+                &MissingSupport::none(),
+            )
             .await;
         let after = disable_failpoint(&session).await;
         assert!(
@@ -517,7 +530,13 @@ async fn legacy_discovery_errors_and_required_membership_index_errors_propagate(
     profile_start(&fixture.db).await;
     let error = fixture
         .backend
-        .matching_resource_ids(&fixture.db, PLAN_TENANT, "Observation", &pair)
+        .matching_resource_ids(
+            &fixture.db,
+            PLAN_TENANT,
+            "Observation",
+            &pair,
+            &MissingSupport::none(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -642,6 +661,7 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
             let actual = fixture
                 .backend
                 .retain_matching_candidates(
+                    &fixture.db,
                     &index,
                     PLAN_TENANT,
                     "Observation",
@@ -649,6 +669,7 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
                     &HashMap::new(),
                     &[],
                     &[],
+                    &MissingSupport::none(),
                     None,
                     skip,
                     candidates.clone(),
@@ -699,6 +720,7 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
         let absent = fixture
             .backend
             .retain_matching_candidates(
+                &fixture.db,
                 &index,
                 PLAN_TENANT,
                 "Observation",
@@ -706,6 +728,11 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
                 &HashMap::new(),
                 &[&missing],
                 &[],
+                &fixture.backend.classify_missing(
+                    PLAN_TENANT,
+                    "Observation",
+                    &SearchQuery::new("Observation").with_parameter(missing.clone()),
+                ),
                 None,
                 skip,
                 candidates.clone(),
@@ -722,6 +749,7 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
         let not_red = fixture
             .backend
             .retain_matching_candidates(
+                &fixture.db,
                 &index,
                 PLAN_TENANT,
                 "Observation",
@@ -729,6 +757,7 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
                 &HashMap::new(),
                 &[],
                 &[&excluded],
+                &MissingSupport::none(),
                 None,
                 skip,
                 candidates.clone(),
@@ -745,6 +774,7 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
         let in_compartment = fixture
             .backend
             .retain_matching_candidates(
+                &fixture.db,
                 &index,
                 PLAN_TENANT,
                 "Observation",
@@ -752,6 +782,7 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
                 &HashMap::new(),
                 &[],
                 &[],
+                &MissingSupport::none(),
                 Some(&compartment),
                 skip,
                 candidates.clone(),
@@ -805,6 +836,7 @@ async fn legacy_token_membership_shares_named_system_fallback() {
             let actual = fixture
                 .backend
                 .retain_matching_candidates(
+                    &fixture.db,
                     &index,
                     PLAN_TENANT,
                     "Observation",
@@ -812,6 +844,7 @@ async fn legacy_token_membership_shares_named_system_fallback() {
                     &HashMap::new(),
                     &[],
                     &[],
+                    &MissingSupport::none(),
                     None,
                     skip,
                     candidates.clone(),
@@ -890,6 +923,7 @@ async fn membership_intersects_occurrences_without_requiring_one_matching_value(
         let actual = fixture
             .backend
             .retain_matching_candidates(
+                &fixture.db,
                 &index,
                 PLAN_TENANT,
                 "Observation",
@@ -897,6 +931,7 @@ async fn membership_intersects_occurrences_without_requiring_one_matching_value(
                 &HashMap::new(),
                 &[],
                 &[],
+                &MissingSupport::none(),
                 None,
                 skip,
                 initial.clone(),
