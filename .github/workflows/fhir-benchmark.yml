@@ -1739,28 +1739,6 @@ jobs:
           write_containers_state
           check_leg_containers_alive
 
-      # ── Artifacts ────────────────────────────────────────────────────────
-      # Deliberately placed immediately after the suites and BEFORE the
-      # post-processing steps below. When run 30550776427's runner was killed
-      # during per-shape attribution, these steps — which sat after it — never
-      # ran, so the server log and raw results were lost precisely for the run
-      # that most needed diagnosing. Everything after this point is derived data
-      # that can be recomputed from these artifacts; the artifacts cannot be
-      # recovered from anything. Upload first, analyse second.
-      #
-      # Teardown (Diagnose backend container failure, then Stop HFS server /
-      # Stop tgz bundle server / Stop ephemeral Postgres / Stop ephemeral
-      # MongoDB / Stop ephemeral Elasticsearch / Remove SQLite database
-      # files, below) is placed right after these uploads for the same
-      # reason. On run 33515369645 the runner was
-      # lost during "Attribute search latency per query shape", so every step
-      # after it — Generate step summary, Stop HFS server, Stop tgz bundle
-      # server, Stop ephemeral Postgres — was skipped, and its containers
-      # survived 6.4 days until the next reaper caught them. Diagnose and
-      # every Stop step now run immediately after the uploads, before any
-      # post-processing step (which only reads the files already on disk), so
-      # a runner lost during any later post-processing step still leaves
-      # diagnostics captured and cleanup done.
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
@@ -1882,6 +1860,7 @@ jobs:
             rm -f "$HFS_DATABASE_URL" "$HFS_DATABASE_URL-wal" "$HFS_DATABASE_URL-shm" "$HFS_DATABASE_URL-journal"
           fi
 
+      # ── Summary ──────────────────────────────────────────────────────────
       # ── Per-query-shape attribution ──────────────────────────────────────
       # Without this the search suite reports a single aggregate latency and we
       # cannot tell which of the ~21 query shapes is slow. Produces a table sorted
@@ -1938,6 +1917,9 @@ jobs:
           # below) — that script cannot use ${{ }} itself.
           BACKEND: ${{ matrix.backend }}
         run: |
+          # GitHub's default shell has no pipefail: without it the step status
+          # would be tee's, hiding a crash in the python summary below.
+          set -o pipefail
           {
             echo "## FHIR Benchmark — \`${{ github.ref_name }}\` (${{ matrix.backend }})"
             echo ""
@@ -2002,7 +1984,7 @@ jobs:
               except (KeyError, ValueError, ZeroDivisionError):
                   rate = None
               it = m.get('iteration_duration', {})
-              return rate, it.get('med', 0), it.get('p(95)', 0), it.get('p(99)', 0)
+              return rate, it.get('med'), it.get('p(95)'), it.get('p(99)')
 
           def bulk_import_row():
               kv = {}
@@ -2053,11 +2035,11 @@ jobs:
                   print(f"| {suite} | _parse error: {e}_ | | | | | |")
                   continue
               m = d.get('metrics', {})
-              rps = m.get('http_reqs', {}).get('rate', 0)
+              rps = m.get('http_reqs', {}).get('rate')
               dur = m.get('http_req_duration', {})
-              p50 = dur.get('med', 0)
-              p95 = dur.get('p(95)', 0)
-              p99 = dur.get('p(99)', 0)
+              p50 = dur.get('med')  # absent key -> None -> printed as n/a, not a fake 0
+              p95 = dur.get('p(95)')
+              p99 = dur.get('p(99)')
               # http_req_failed is a k6 Rate metric: the fraction lives in `value`,
               # NOT `rate` (which only exists on Counter metrics like http_reqs).
               err = m.get('http_req_failed', {}).get('value', 0) * 100
@@ -2072,7 +2054,8 @@ jobs:
                   rps, p50, p95, p99 = import_row(m)
                   has_import = True
               rps_fmt = "n/a" if rps is None else f"{rps:,.0f}"
-              print(f"| {label} | {rps_fmt} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
+              p50_f, p95_f, p99_f = ("n/a" if v is None else f"{v:.1f}" for v in (p50, p95, p99))
+              print(f"| {label} | {rps_fmt} | {p50_f} | {p95_f} | {p99_f} | {err_fmt} | {chk_fmt} |")
               if suite == "import":
                   # Bulk import is not a k6 suite: its result is bulk-import.txt (bulk_import.py).
                   # Row only for a complete job with a numeric resources_per_s (compare_legs.py
@@ -2317,6 +2300,8 @@ jobs:
         timeout-minutes: 5
         run: |
           mkdir -p report-input
+          # report_html.py finds comparison.md inside --run-dir (or its parent).
+          cp comparison.md report-input/ 2>/dev/null || true
           find bench-artifacts -name '*.zip' -print0 2>/dev/null | while IFS= read -r -d '' z; do
             n=$(basename "$z" .zip)
             case "$n" in fhir-benchmark-*) ;; *) n=$(basename "$(dirname "$z")") ;; esac
@@ -2328,9 +2313,13 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
+        env:
+          MATRIX_JSON: ${{ needs.setup.outputs.matrix }}
         run: |
+          EXPECT_LEGS=$(python3 -c 'import json,os;print(",".join(i["backend"] for i in json.loads(os.environ["MATRIX_JSON"])["include"]))' 2>/dev/null || true)
           python3 .github/scripts/fhir-bench/report_html.py \
             --run-dir report-input \
+            --expect-legs "$EXPECT_LEGS" \
             --run-id "$GITHUB_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
             --branch "$GITHUB_REF_NAME" \

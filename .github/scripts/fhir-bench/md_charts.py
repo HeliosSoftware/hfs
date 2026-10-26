@@ -198,8 +198,13 @@ def gtext(s):
 def bulk_gantt(rows):
     """rows: (leg, ingest_s, rebuild_s or None). Elapsed time since kick-off. A leg without a
     rebuild (indexing ran during ingest) gets the ingest bar only."""
+    # The axis is elapsed time since kick-off: minutes:seconds below one hour (a 210 s bar
+    # ends at 03:30), hours:minutes above. %H:%M alone read "00:03" for 210 s as "3".
+    longest = max([round(a) + round(b or 0) for _, a, b in rows] or [0])
+    # Units are literal characters in the format, so "03m 30s" cannot be read as 3.
+    axis = "%Mm %Ss" if longest < 3600 else "%Hh %Mm"
     out = ["```mermaid", "%%{init: " + json.dumps(gantt_init(150)) + "}%%", "gantt",
-           "    dateFormat YYYY-MM-DD HH:mm:ss", "    axisFormat %H:%M", "    todayMarker off"]
+           "    dateFormat YYYY-MM-DD HH:mm:ss", "    axisFormat " + axis, "    todayMarker off"]
     for n, (leg, a, b) in enumerate(rows):
         out.append("    section %s" % gtext(leg))
         out.append("    ingest %d s :i%d, 2000-01-01 00:00:00, 2000-01-01 %s" % (round(a), n, hms(round(a))))
@@ -282,7 +287,7 @@ def _rebuild_from_text(text):
 
 
 def bulk_phases_from_throughput(head, rows):
-    """[(leg, ingest_s, rebuild_s|None)] from the `↳ ingest` / `↳ search indexing` rows."""
+    """[(leg, ingest_s, rebuild_s|None)] from the `↳ ingest` / `↳ search indexing` rows; None without an ingest row."""
     ing = idx = None
     for row in rows:
         lab = row[0].replace("**", "")
@@ -294,9 +299,17 @@ def bulk_phases_from_throughput(head, rows):
         elif "index" in low:
             idx = row
     if not ing:
-        return []
+        return None  # no ingest row at all (old wording): the caller may try the Bulk import table
+    main_row = None
+    for row in rows:
+        lab = row[0].replace("**", "")
+        if lab.startswith("Bulk Import") and not lab.startswith("↳"):
+            main_row = row
+            break
     out = []
     for i, leg in enumerate(head[1:], start=1):
+        if main_row and re.match(r"^\s*n/a\b", main_row[i].replace("**", ""), re.I):
+            continue  # the leg's Bulk Import did not run or failed: no ingest bar
         a = _secs_in_parens(ing[i])
         if a is None:
             continue
@@ -318,12 +331,13 @@ def bulk_phases_from_table(head, rows):
     return out
 
 
-def bulk_gantt_block(phases):
+def bulk_gantt_block(phases, source="the table above"):
     any_rebuild = any(b for _, _, b in phases)
     how = ("Per leg, ingest until Completed (dark)"
            + (", then the deferred search-index rebuild (light) on the legs that run one; the others index during ingest"
               if any_rebuild else "; indexing runs during ingest on these legs, so each bar is the ingest alone")
-           + ", on elapsed time since kick-off; shorter is better; values in the table above.")
+           + ", on elapsed time since kick-off (axis: minutes and seconds, or hours and minutes from one hour); "
+           "shorter is better; values in %s." % source)
     title = ("Bulk Import: ingest until Completed, then search-index rebuild" if any_rebuild
              else "Bulk Import: ingest until Completed")
     return titled(title, how, bulk_gantt(phases))
@@ -376,7 +390,7 @@ def compare_section(lines, layout):
     r = find_table(lines, "### Throughput")
     if r:
         phases = bulk_phases_from_throughput(r[0], r[1])
-    if not phases:
+    if phases is None:
         r = find_table(lines, "### Bulk import")
         if r:
             phases, tname = bulk_phases_from_table(r[0], r[1]), "Bulk import"
@@ -431,12 +445,14 @@ def phases(d):
 
 def leg_bulk_phase(d, leg):
     kv = read_kv(os.path.join(d, "bulk-import.txt")) if d else {}
+    if kv.get("status", "complete") != "complete":
+        return []  # timeout / error / incomplete: no ingest time worth drawing
     try:
         a = float(kv["ingest_seconds"])
     except (KeyError, ValueError):
         return []
     b = None
-    if kv.get("index_status") != "inline":
+    if kv.get("index_status") == "completed":
         try:
             b = float(kv.get("index_seconds", ""))
         except ValueError:
@@ -462,7 +478,7 @@ def leg_section(lines, leg, run_dir, layout):
                        titled("%s: run phases (UTC)" % title_safe(leg), how, phase_gantt(ph)), "Results"))
     bp = leg_bulk_phase(d, leg)
     if bp:
-        blocks.append(("%s Bulk Import phases" % plain(leg), bulk_gantt_block(bp), "Results"))
+        blocks.append(("%s Bulk Import phases" % plain(leg), bulk_gantt_block(bp, "bulk-import.txt (seconds), not the Results table"), "Results"))
     if r:
         head, rows, _ = r
         col = {h: i for i, h in enumerate(head)}

@@ -292,6 +292,39 @@ class Leg(unittest.TestCase):
         g = [b for b in mermaid_blocks(real) if "ingest 210 s" in b][0]
         self.assertIn("rebuild 120 s", g)
 
+    def test_leg_bulk_status_and_index_status(self):
+        for st in ("timeout", "error", "incomplete"):
+            out = self.leg(LEG_BOX, bulk="status=%s\ningest_seconds=210.2\nindex_status=completed\nindex_seconds=9\n" % st)
+            self.assertFalse([b for b in mermaid_blocks(out) if "ingest " in b], st)
+        out = self.leg(LEG_BOX, bulk="status=complete\ningest_seconds=210.2\nindex_status=error\nindex_seconds=9\n")
+        g = [b for b in mermaid_blocks(out) if "ingest 210 s" in b][0]
+        self.assertNotIn("rebuild", g)
+
+    def test_gantt_axis_has_units(self):
+        out = self.leg(LEG_BOX, bulk="status=complete\ningest_seconds=210.2\nindex_status=completed\nindex_seconds=120\n")
+        g = [b for b in mermaid_blocks(out) if "ingest 210 s" in b][0]
+        self.assertIn("axisFormat %Mm %Ss", g)
+        self.assertIn("bulk-import.txt", out)
+        long = self.leg(LEG_BOX, bulk="status=complete\ningest_seconds=5000\nindex_status=completed\nindex_seconds=900\n")
+        self.assertIn("axisFormat %Hh %Mm", [b for b in mermaid_blocks(long) if "ingest 5000 s" in b][0])
+
+    def test_na_in_box_is_not_plotted(self):
+        box = LEG_BOX.replace("| insert | 1,425 |", "| insert | n/a |")
+        out = self.leg(box)
+        self.assertNotIn("insert", "".join(b for b in mermaid_blocks(out) if "k6 suites" in out and "2175" in b))
+        self.assertIn("bar [2175, 2186]", out)
+
+    def test_compare_skips_na_bulk_leg(self):
+        txt = many(["sqlite", "postgres"]).replace(
+            "(`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) | 1,000 | 2,000 |",
+            "(`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) | 1,000 | n/a (timeout) |")
+        self.assertIn("n/a (timeout)", txt)
+        g = [b for b in mermaid_blocks("\n".join(mc.compare_section(txt.split("\n"), "stacked"))) if "ingest " in b][0]
+        self.assertIn("section sqlite", g)
+        self.assertNotIn("section postgres", g)
+        both = txt.replace("| 1,000 | n/a (timeout) |", "| n/a (x) | n/a (timeout) |")
+        self.assertFalse([b for b in mermaid_blocks("\n".join(mc.compare_section(both.split("\n"), "stacked"))) if "ingest " in b])
+
     def test_missing_files_still_charts_from_table(self):
         out = self.leg(LEG_BOX)
         self.assertIn("throughput and latency", out)

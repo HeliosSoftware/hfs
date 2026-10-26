@@ -150,7 +150,8 @@ class T(unittest.TestCase):
                   "| ↳ search indexing (seconds) | 195 s (= ingest)")
         t = history.parse_tables(old)["throughput"]["rows"]
         self.assertIn(history.NEW_BATCH, [r[0] for r in t])
-        self.assertIn(history.NEW_INDEX, [r[0] for r in t])
+        self.assertIn(history.OLD_REBUILD, [r[0] for r in t])
+        self.assertNotIn(history.NEW_INDEX, [r[0] for r in t])
         self.assertEqual(history.parse_cell("195 s (= ingest)"), 195.0)
         runs = [run(1), run(2)]
         out = history.build(args(), lambda *a: runs,
@@ -159,6 +160,17 @@ class T(unittest.TestCase):
         self.assertNotIn("Bundles (resources/s)**\n\n| Leg" + "x", out)
         self.assertNotIn("**Batch/Transaction Import, `POST", out)
         self.assertIn("1,122 (", out)
+        # old rebuild row and new indexing row stay separate: no delta across them
+        self.assertIn("**" + history.OLD_REBUILD + "**", out)
+        self.assertIn("**" + history.NEW_INDEX + "**", out)
+        sec = out.split("**" + history.NEW_INDEX + "**")[1].split("**")[0]
+        self.assertIn("| `sqlite` | – | 195 | 195 (+0%) |", sec)  # delta only new vs new
+        self.assertNotIn("1,099", sec)
+
+    def test_pct_sign_and_missing(self):
+        self.assertEqual(history.pct(100, 80), "-20%")  # seconds: lower is better
+        self.assertEqual(history.pct(None, 5), "")
+        self.assertEqual(history.pct(0, 5), "")
 
     def test_truncation_keeps_fences_balanced(self):
         secs = ["head"] + ["```mermaid\nx\n```\n" + "y" * 300 for _ in range(50)]
@@ -209,6 +221,17 @@ class T(unittest.TestCase):
     def test_main_exit_zero(self):
         self.assertEqual(history.main(["--bogus"]), 0)
 
+
+
+class YAxisUnit(unittest.TestCase):
+    def test_unit_from_row_label(self):
+        for lab, u in (("Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources/s)", "resources/s"),
+                       ("insert (creates/s)", "creates/s"), ("crud", "requests/s"),
+                       ("x (seconds)", "seconds")):
+            c = history.render_chart(lab, "sqlite", [1.0, 2.0], ["#1", "#2"])
+            self.assertIn('y-axis "%s"' % u, c)
+            self.assertNotIn('y-axis "value"', c)
+            self.assertNotIn("`", c.split("title")[1].split("\n")[0])
 
 if __name__ == "__main__":
     unittest.main()

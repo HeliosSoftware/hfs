@@ -49,6 +49,7 @@ table{border-collapse:collapse;width:100%;font-size:.86rem;font-variant-numeric:
 th,td{padding:6px 8px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:top}
 th{font-weight:600;color:var(--ink-2);white-space:nowrap}
 td.n,th.n{text-align:right;white-space:nowrap}
+#full td:first-child{white-space:nowrap;min-width:9em}
 .st{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border-radius:6px;font-size:.82rem;white-space:nowrap;font-weight:500}
 .st i{font-style:normal;font-weight:800;width:1em;text-align:center}
 .st.ok{color:var(--good);background:var(--good-bg)}
@@ -58,6 +59,7 @@ td.n,th.n{text-align:right;white-space:nowrap}
 .validity td{min-width:110px}
 .validity td:first-child{min-width:0;font-weight:600}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:10px}
+.kpi{min-width:0;overflow-wrap:anywhere}
 .kpi .lbl{font-size:.82rem;color:var(--ink-2)}
 .kpi .val{font-size:1.9rem;font-weight:700;line-height:1.15;margin:2px 0}
 .kpi .unit{font-size:.85rem;font-weight:500;color:var(--ink-2)}
@@ -66,7 +68,8 @@ td.n,th.n{text-align:right;white-space:nowrap}
 .kpi .delta b{color:var(--ink)}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
 .grid2.wide{grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr))}
-.chart{min-height:40px}
+.chart{min-height:40px;min-width:0;overflow:hidden}
+.chart svg{max-width:100%;height:auto}
 .chart svg{display:block;overflow:visible}
 .chart text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
 .panel h4{margin:0 0 2px;font-size:.92rem}
@@ -129,7 +132,7 @@ figure{margin:0}
 <div class="wrap">
 <header>
   <div class="top">
-  <h1>FHIR Server Benchmark <span class="mono" style="font-weight:500;color:var(--ink-2)">#39657850695</span></h1>
+  <h1>FHIR Server Benchmark <span class="mono" style="font-weight:500;color:var(--ink-2)"></span></h1>
   <div class="theme noprint" role="group" aria-label="Theme"><button type="button" id="thDark" aria-pressed="true">&#9790; Dark</button><button type="button" id="thLight" aria-pressed="false">&#9728; Light</button></div>
   </div>
   <div class="meta" id="meta"></div>
@@ -188,7 +191,7 @@ figure{margin:0}
   <figure class="card chart" id="bulk"></figure>
 
   <h3>Batch/Transaction Import (/ui/batch, k6 <span class="mono">import</span>) by phase</h3>
-  <p class="how"><b>How to read this:</b> each bar is the whole k6 step; shorter is better. The solid part is the import scenario, which is what resources/s divides by; the light part is k6 <span class="mono">setup()</span>, which seeds the Bundles before the load starts. Below each bar: resources, resources/s, Bundles completed out of 1,000 (<span class="mk">†</span> if the corpus is incomplete) and the error rate (<span class="mk">‡</span> above the threshold).</p>
+  <p class="how"><b>How to read this:</b> each bar is the whole k6 step; shorter is better. The solid part is the import scenario, which is what resources/s divides by; the light part is k6 <span class="mono">setup()</span>, which seeds the Bundles before the load starts. Below each bar: resources, resources/s, Bundles completed out of <span id="proseTarget">the target</span> (<span class="mk">†</span> if the corpus is incomplete) and the error rate (<span class="mk">‡</span> above the threshold).</p>
   <div class="legend"><span><span class="sw neutral t"></span>k6 setup() (seed Bundles)</span><span><span class="sw neutral"></span>import scenario</span></div>
   <figure class="card chart" id="batch"></figure>
   <h4 style="margin:12px 0 2px;font-size:.92rem">Latency per Bundle (logarithmic scale)</h4>
@@ -199,7 +202,7 @@ figure{margin:0}
   <p class="how"><b>How to read this:</b> for each leg, the solid bar is the Batch/Transaction Import and the outlined bar is the Bulk Import; longer is faster.</p>
   <div class="legend"><span><span class="sw neutral"></span>Batch/Transaction (/ui/batch)</span><span><span class="sw neutral o"></span>Bulk (/ui/bulk-import)</span></div>
   <figure class="card chart" id="impcmp"></figure>
-  <p class="note">These are different workloads: the Batch/Transaction Import is 20 concurrent k6 clients posting Bundles, and the Bulk Import is a single <span class="mono">$bulk-submit</span> job; compare them as two ways to load data, not as the same test.</p>
+  <p class="note">These are different workloads: the Batch/Transaction Import is <span id="proseImpVus">concurrent</span> k6 clients posting Bundles, and the Bulk Import is a single <span class="mono">$bulk-submit</span> job; compare them as two ways to load data, not as the same test.</p>
 
   <div id="sqlBlock">
   <h3>SQL-on-FHIR <span class="mono">$sql-run</span> by view (logarithmic scale)</h3>
@@ -242,7 +245,7 @@ figure{margin:0}
   <h2>Glossary</h2>
   <div class="gloss card">
     <div><b>Leg</b>A storage combination tested separately (e.g. postgres + Elasticsearch).</div>
-    <div><b>VU (virtual user)</b>A simulated client with a single request in flight; 300 VUs are 300 clients at once, not 300 req/s.</div>
+    <div><b>VU (virtual user)</b>A simulated client with a single request in flight; <span id="proseVus">N VUs are N clients</span> at once, not N req/s.</div>
     <div><b>req/s</b>HTTP requests completed per second (more is better).</div>
     <div><b>resources/s</b>FHIR resources stored per second; used for Batch/Transaction Import and Bulk Import, where one request carries many resources.</div>
     <div><b>p50 / p95 / p99</b>Response time that 50 %, 95 % or 99 % of requests do not exceed (less is better).</div>
@@ -322,7 +325,7 @@ function renderHeader(){
   const runners = [...new Set(LEGS.map(l=>L[l].runner).filter(Boolean))];
   const any = LEGS.length ? L[LEGS[0]] : {};
   $("meta").innerHTML = [
-    `<span><b>Start</b> ${fdate(D.date,true)}</span>`,
+    `<span><b>Start</b> ${D.date?fdate(D.date,true):"unknown"}</span>`,
     `<span><b>Commit</b> <span class="mono">${esc(D.sha||"n/a")}</span> (${esc(D.ref||"n/a")})</span>`,
     D.repo && D.run ? `<span><b>Run</b> <a class="mono" href="https://github.com/${esc(D.repo)}/actions/runs/${esc(D.run)}" style="color:var(--accent)">${esc(D.repo)}</a></span>` : "",
     `<span><b>Runners</b> ${esc(runners.join(", ")||"n/a")}${any.cpus?" · "+esc(any.cpus)+" CPU / "+esc(any.ram):""}</span>`,
@@ -344,6 +347,12 @@ function renderHeader(){
   const src = LEGS.length ? L[LEGS[0]] : null;
   const vus = s => src && src.suites[s] && src.suites[s].vus ? src.suites[s].vus+" VUs" : "n/a";
   $("glossSuites").textContent = `Batch/Transaction Import ${vus("import")} · crud ${vus("crud")} · search ${vus("search")} · $sql-run ${vus("sql-run")} · insert ${vus("insert")} · Bulk Import: one $bulk-submit job, the clock runs until the data can be searched.`;
+  /* prose numbers come from the data, never from literals */
+  const sv = s => { const x = src && src.suites && src.suites[s]; return x && x.vus ? x.vus : null; };
+  const anyVus = sv("crud") || sv("import") || sv("search") || sv("sql-run") || sv("insert");
+  $("proseTarget").textContent = ok(TH.import_target) ? NF.format(TH.import_target) : "the target";
+  $("proseImpVus").textContent = sv("import") ? sv("import")+" concurrent" : "concurrent";
+  $("proseVus").textContent = anyVus ? anyVus+" VUs are "+anyVus+" clients" : "VUs are clients";
 }
 
 function renderValidity(){
@@ -406,7 +415,11 @@ const svg = (w,h,body,label) => `<svg xmlns="${NS}" width="${w}" height="${h}" v
 function txt(x,y,s,o={}){
   return `<text x="${x}" y="${y}" text-anchor="${o.anchor||"start"}" font-size="${o.size||12}" font-weight="${o.weight||400}" fill="${o.fill||"var(--ink-2)"}"${o.halo?' stroke="var(--surface)" stroke-width="4" stroke-linejoin="round" paint-order="stroke"':""}>${esc(s)}</text>`;
 }
-function widthOf(el){ return Math.max(260, Math.floor(el.clientWidth || (el.parentElement && el.parentElement.clientWidth) || 600)); }
+function widthOf(el){
+  const raw = el.clientWidth || (el.parentElement && el.parentElement.clientWidth) || 600;
+  const cs = getComputedStyle(el), pad = (parseFloat(cs.paddingLeft)||0)+(parseFloat(cs.paddingRight)||0);
+  return Math.max(260, Math.floor(raw - pad));
+}
 const tipAttr = t => ` data-tip="${esc(t)}" tabindex="0"`;
 function roundRight(x,y,w,h,r,fill,extra=""){
   if(!(w>0)) return "";

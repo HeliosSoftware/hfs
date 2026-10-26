@@ -173,7 +173,7 @@ def load_suite(d, suite, ic):
          "p50": rnd(fnum(g("http_req_duration", "med"))), "p95": rnd(fnum(g("http_req_duration", "p(95)"))),
          "p99": rnd(fnum(g("http_req_duration", "p(99)"))), "max": rnd(fnum(g("http_req_duration", "max"))),
          "err": rnd((fnum(g("http_req_failed", "value")) or 0) * 100, 3),
-         "ok": inum(g("checks", "passes")) or 0, "fail": inum(g("checks", "fails")) or 0,
+         "ok": inum(g("checks", "passes")), "fail": inum(g("checks", "fails")),
          "vus": inum(g("vus_max", "max")), "unit": "req/s"}
     if suite == "import":
         # resources/s = entries / scenario_seconds; latency per Bundle (iteration_duration)
@@ -236,9 +236,9 @@ def leg_start(d, pts):
                         break
         except OSError:
             pass
-    if day is None:
-        return None
-    return "%sT%sZ" % (day, pts[0]["t"] if pts else "00:00:00")
+    if day is None or not pts:
+        return None  # no host reading: the start is unknown, never T00:00:00Z
+    return "%sT%sZ" % (day, pts[0]["t"])
 
 
 def shape_stats(points_path):
@@ -340,7 +340,7 @@ def load_leg(leg, d):
                        "total": fnum(bi.get("total_seconds")),
                        "rps": fnum(bi.get("resources_per_s")), "ingest_rps": fnum(bi.get("ingest_resources_per_s")),
                        "ok": inum(bi.get("resources_ok")), "submitted": inum(bi.get("resources_submitted")),
-                       "failed": inum(bi.get("resources_failed")) or 0, "index_status": status,
+                       "failed": inum(bi.get("resources_failed")), "index_status": status,
                        "searchable": bi.get("searchable") == "yes",
                        "searchable_s": fnum(bi.get("searchable_seconds"))}
     dr = kv(os.path.join(d, "es-drain.txt"), "=") if leg.endswith("-elasticsearch") else {}
@@ -379,15 +379,15 @@ def markers(d):
                 inc = not d["drain"] or d["drain"]["status"] != "drained"
             if inc:
                 m += "†"
-        if v["err"] > ERR_PCT_HIGH or v["fail"] > 0:
+        if v["err"] > ERR_PCT_HIGH or (v["fail"] or 0) > 0:
             m += "‡"
-        if d["died"] or (s == "crud" and d["pg_ms"] is not None and d["pg_ms"] > PG_CONTENDED_MS):
+        if d["died"] or (s == "crud" and d["leg"] == "postgres" and d["pg_ms"] is not None and d["pg_ms"] > PG_CONTENDED_MS):
             m += "⚠"
         mk[s] = m
     b = d["bulk"]
     if b and b["status"] == "complete":
         m = "" if b["searchable"] else "†"
-        if b["submitted"] and (100.0 * b["failed"] / b["submitted"] > ERR_PCT_HIGH or b["failed"] > 0):
+        if b["failed"] is not None and b["submitted"] and (100.0 * b["failed"] / b["submitted"] > ERR_PCT_HIGH or b["failed"] > 0):
             m += "‡"
         if d["died"]:
             m += "⚠"
@@ -424,17 +424,21 @@ def leg_checks(d, cpus):
             continue
         if v["err"] > ERR_PCT_HIGH:
             hard.append("%s %s %%" % (s, fmt1(v["err"])))
+        elif v["fail"] is None:
+            nodata.append("%s checks n/a" % s)
         elif v["fail"] > 0:
             soft.append("%s %s ✗" % (s, fmt_int(v["fail"])))
     b = d["bulk"]
-    if b and b["failed"]:
+    if b and b["failed"] is None:
+        nodata.append("bulk failures n/a")
+    elif b and b["failed"]:
         hard.append("bulk %s failed" % fmt_int(b["failed"]))
     if not any(d["suites"].values()) and not b:
         c["err"] = ["na", "no data"]
     elif hard:
-        c["err"] = ["bad", ", ".join(hard + soft + ["%s no data" % s for s in nodata])]
+        c["err"] = ["bad", ", ".join(hard + soft + [x if x.endswith("n/a") else "%s no data" % x for x in nodata])]
     elif nodata:
-        c["err"] = ["na", ", ".join(soft + ["%s no data" % s for s in nodata])]
+        c["err"] = ["na", ", ".join(soft + [x if x.endswith("n/a") else "%s no data" % x for x in nodata])]
     elif soft:
         c["err"] = ["warn", ", ".join(soft) + " (<1 %)"]
     else:
@@ -457,7 +461,8 @@ def leg_checks(d, cpus):
         c["load"] = ["warn" if cpus and pk > cpus else ("ok" if cpus else "na"), "peak %s" % fmt1(pk)]
     if d["pg_ms"] is not None:
         c["load"][1] += " · pg %.2f ms/call" % d["pg_ms"]
-        if d["pg_ms"] > PG_CONTENDED_MS:
+        # compare_legs.py applies the contention rule to the leg named `postgres` only
+        if d["leg"] == "postgres" and d["pg_ms"] > PG_CONTENDED_MS:
             c["load"][0] = "bad"
     d["peak"] = pk
     return c

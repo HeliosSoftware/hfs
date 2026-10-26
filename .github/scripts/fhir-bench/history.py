@@ -24,14 +24,16 @@ NEW_BATCH = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources
 NEW_BULK = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s)"
 NEW_INGEST = "↳ ingest, until Completed (resources/s, seconds)"
 NEW_INDEX = "↳ search indexing (seconds)"
+OLD_REBUILD = "↳ search-index rebuild after Completed (seconds)"
 # older wordings of renamed rows -> canonical (new) wording, so they join into one row
 LABEL_ALIASES = {
     "Batch/Transaction Import, `POST /` Bundles (resources/s)": NEW_BATCH,
     "Bulk Import, `$bulk-submit` (resources/s)": NEW_BULK,
     "Bulk Import: ingest (resources/s, seconds)": NEW_INGEST,
     "↳ ingest (resources/s, seconds)": NEW_INGEST,
-    "Bulk Import: index rebuild (seconds)": NEW_INDEX,
-    "↳ search-index rebuild after Completed (seconds)": NEW_INDEX,
+    # a REAL deferred rebuild: a different measurement from NEW_INDEX (whose ES
+    # cells are "= ingest"), so it stays its own row and never joins NEW_INDEX
+    "Bulk Import: index rebuild (seconds)": OLD_REBUILD,
 }
 
 
@@ -211,6 +213,15 @@ def headline_leg(legs, data):
     return None
 
 
+def y_unit(label):
+    """Axis unit from the row label, e.g. '(resources/s)'; plain rows are requests/s."""
+    l = label.lower()
+    for u in ("resources/s", "creates/s", "rows/s", "req/s", "seconds", "ms"):
+        if u in l:
+            return "requests/s" if u == "req/s" else u
+    return "requests/s"
+
+
 def render_chart(label, leg, vals, xlabels):
     """Single-series trend chart; the title names the row and the leg."""
     if len(vals) < 2 or any(v is None for v in vals):
@@ -219,7 +230,7 @@ def render_chart(label, leg, vals, xlabels):
         "```mermaid", "xychart-beta",
         f'    title "{_clean(label)[:80]} - {_clean(leg)}"',
         "    x-axis [" + ", ".join(f'"{_clean(x)}"' for x in xlabels) + "]",
-        '    y-axis "value"',
+        f'    y-axis "{_clean(y_unit(label))}"',
         "    line [" + ", ".join(f"{v:.1f}" for v in vals) + "]",
         "```"]) + "\n"
 

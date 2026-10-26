@@ -126,6 +126,9 @@ class SyntheticRun(unittest.TestCase):
         self.assertNotRegex(self.html, r"(?i)indexing suite")
         self.assertNotIn("Bolivia", self.html)
 
+    def test_no_literal_run_id_from_a_past_run(self):
+        self.assertNotIn("39657850695", self.html)
+
     def test_docker_cpus_omitted_when_unknown(self):
         self.assertIsNone(self.data["docker_cpus"])
         self.assertNotIn("host CPUs\"", self.html.split("<script>")[-1].split("const D =")[0])
@@ -135,6 +138,89 @@ class SyntheticRun(unittest.TestCase):
         self.assertIn("sql_rows", pt["suites"])
         self.assertNotIn("shapes", self.data["legs"]["sqlite"])
         self.assertEqual(self.data["history_runs"], 0)
+
+
+class MissingInputs(unittest.TestCase):
+    def build(self, mutate, vus=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = make_leg(tmp.name, "sqlite", False)
+        mutate(d)
+        out, dump = os.path.join(tmp.name, "r.html"), os.path.join(tmp.name, "d.json")
+        p = run(["--run-dir", tmp.name, "--run-id", "777", "--out", out, "--dump-json", dump, "--no-shapes"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as fh:
+            html = fh.read()
+        with open(dump, encoding="utf-8") as fh:
+            return html, json.load(fh)
+
+    def leg(self, data):
+        return data["legs"]["sqlite"]
+
+    def test_missing_checks_is_na_not_ok(self):
+        def m(d):
+            put(d, "crud.json", json.dumps({"metrics": {k: v for k, v in json.loads(k6())["metrics"].items() if k != "checks"}}))
+        _, data = self.build(m)
+        self.assertIsNone(self.leg(data)["suites"]["crud"]["fail"])
+        st, txt = self.leg(data)["checks"]["err"]
+        self.assertEqual(st, "na")
+        self.assertIn("n/a", txt)
+        self.assertNotEqual(txt, "0 %")
+
+    def test_missing_resources_failed_is_na(self):
+        def m(d):
+            p = os.path.join(d, "bulk-import.txt")
+            with open(p) as fh:
+                t = fh.read().replace("resources_failed=0\n", "")
+            put(d, "bulk-import.txt", t)
+        _, data = self.build(m)
+        self.assertIsNone(self.leg(data)["bulk"]["failed"])
+        self.assertEqual(self.leg(data)["checks"]["err"][0], "na")
+
+    def test_measured_zero_checks_stay_ok(self):
+        _, data = self.build(lambda d: None)
+        self.assertEqual(self.leg(data)["suites"]["crud"]["fail"], 0)
+        self.assertEqual(self.leg(data)["checks"]["err"], ["ok", "0 %"])
+
+    def test_no_host_contention_no_fake_midnight(self):
+        _, data = self.build(lambda d: os.remove(os.path.join(d, "host-contention.txt")))
+        self.assertIsNone(self.leg(data)["start"])
+        self.assertIsNone(data["date"])
+        html, _ = self.build(lambda d: os.remove(os.path.join(d, "host-contention.txt")))
+        self.assertNotIn("T00:00:00Z", html)
+        self.assertIn('D.date?fdate(D.date,true):"unknown"', html)
+
+    def test_prose_numbers_not_literals(self):
+        html, data = self.build(lambda d: put(d, "import.json", k6(extra={"vus_max": {"max": 37}})))
+        self.assertEqual(self.leg(data)["suites"]["import"]["vus"], 37)
+        for lit in ("out of 1,000", "20 concurrent", "300 VUs"):
+            self.assertNotIn(lit, html)
+        self.assertIn('id="proseImpVus"', html)
+        self.assertIn("sv(\"import\")", html)
+
+
+class PgContention(unittest.TestCase):
+    PGSTAT = " total_s | mean_ms | calls\n 3500.0 | 1.0 | 1000000\n"
+
+    def test_rule_applies_only_to_leg_named_postgres(self):
+        with tempfile.TemporaryDirectory() as t:
+            for leg, es in (("postgres", False), ("postgres-elasticsearch", True)):
+                d = make_leg(t, leg, es)
+                put(d, "crud-pgstat.txt", self.PGSTAT)  # 3.5 ms/call
+            out, dump = os.path.join(t, "r.html"), os.path.join(t, "d.json")
+            p = run(["--run-dir", t, "--run-id", "777", "--out", out, "--dump-json", dump, "--no-shapes"])
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(dump, encoding="utf-8") as fh:
+                legs = json.load(fh)["legs"]
+            with open(out, encoding="utf-8") as fh:
+                html = fh.read()
+            self.assertNotIn("39657850695", html)
+            pg, pe = legs["postgres"], legs["postgres-elasticsearch"]
+            self.assertEqual(pg["checks"]["load"][0], "bad")
+            self.assertIn("⚠", pg["markers"].get("crud", ""))
+            self.assertIn("3.50 ms/call", pe["checks"]["load"][1])  # value still shown
+            self.assertNotEqual(pe["checks"]["load"][0], "bad")
+            self.assertNotIn("⚠", pe["markers"].get("crud", ""))
 
 
 class TrendAndFailures(unittest.TestCase):
