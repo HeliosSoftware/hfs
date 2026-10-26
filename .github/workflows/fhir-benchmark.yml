@@ -192,7 +192,7 @@ on:
         required: false
         default: "32"
       max_parallel:
-        description: "Backend legs running at once (1..2 — every leg shares one 4-CPU / 11 GB Docker host, so 2 skews both legs' numbers)"
+        description: "Backend legs running at once (1..2 — every leg shares one 4-CPU Docker host with the rest of CI (its memory is printed by the capacity gate), so 2 skews both legs' numbers)"
         type: number
         required: false
         default: 1
@@ -243,7 +243,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # Resolve the `backend` input into a job matrix. Each leg carries a fixed HFS
   # port (8081-8086), distinct per backend so legs never collide even with
-  # max_parallel > 1 (clamped to 1..2 below — the shared 4-CPU / 11 GB Docker
+  # max_parallel > 1 (clamped to 1..2 below — the shared 4-CPU Docker
   # host). Include order = intended run order: bare backends first. Also
   # validates the free-text tuning inputs here, in one place, before the
   # ~13-minute build.

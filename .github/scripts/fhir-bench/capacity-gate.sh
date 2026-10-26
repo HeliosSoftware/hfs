@@ -6,7 +6,7 @@
 #
 # `max_parallel`'s clamp (1..2, see the `setup` job / resolve-matrix.sh) only
 # bounds THIS run's own legs — it cannot see the rest of CI sharing the same
-# 4-CPU / 11 GB Docker host, which is exactly what has OOM-killed a mongod
+# 4-CPU Docker host (its MemTotal is printed below), which is exactly what has OOM-killed a mongod
 # here before. NEED_MB is a rough per-backend model, not a real cgroup
 # budget:
 #   postgres family: shared_buffers, +1.5G for the rest of the server
