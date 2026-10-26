@@ -297,6 +297,9 @@ impl SofTerminologyStore for SqliteBackend {
     }
 }
 
+// The store contract itself is the backend-agnostic suite in
+// `tests/common/sof_terminology_suite.rs`; these check what only this module
+// can see, that released relations drop their physical tables.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,67 +376,6 @@ mod tests {
             .unwrap();
         assert!(backend.load(&t, url).await.unwrap().is_none());
         assert_eq!(table_count(&backend), 0);
-    }
-
-    #[tokio::test]
-    async fn dropping_a_dependency_on_update_releases_it() {
-        let backend = backend();
-        let t = tenant("acme");
-        backend
-            .set_library_dependencies(
-                &t,
-                "lib",
-                vec![
-                    ("http://vs/1".into(), vs(&["a"])),
-                    ("http://vs/2".into(), vs(&["b"])),
-                ],
-            )
-            .await
-            .unwrap();
-        backend
-            .set_library_dependencies(&t, "lib", vec![("http://vs/2".into(), vs(&["b"]))])
-            .await
-            .unwrap();
-        assert!(backend.load(&t, "http://vs/1").await.unwrap().is_none());
-        assert!(backend.load(&t, "http://vs/2").await.unwrap().is_some());
-        assert_eq!(table_count(&backend), 1);
-    }
-
-    #[tokio::test]
-    async fn tenants_are_isolated() {
-        let backend = backend();
-        let url = "http://example.org/vs";
-        backend
-            .set_library_dependencies(&tenant("a"), "lib", vec![(url.into(), vs(&["a"]))])
-            .await
-            .unwrap();
-        assert!(backend.load(&tenant("b"), url).await.unwrap().is_none());
-        // Releasing the same Library id in another tenant leaves tenant a's alone.
-        backend
-            .set_library_dependencies(&tenant("b"), "lib", vec![])
-            .await
-            .unwrap();
-        assert!(backend.load(&tenant("a"), url).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn concept_map_rows_round_trip() {
-        let backend = backend();
-        let t = tenant("acme");
-        let row = json!({
-            "source_system": "http://a", "source_version": null, "source_code": "1",
-            "source_display": "One", "target_system": "http://b", "target_version": "2",
-            "target_code": null, "target_display": null, "relationship": null
-        });
-        let rel = TerminologyRelation {
-            kind: TerminologyKind::ConceptMap,
-            rows: vec![row],
-        };
-        backend
-            .set_library_dependencies(&t, "lib", vec![("http://cm".into(), rel.clone())])
-            .await
-            .unwrap();
-        assert_eq!(backend.load(&t, "http://cm").await.unwrap(), Some(rel));
     }
 
     #[tokio::test]

@@ -3,44 +3,35 @@
 //! Handlers for GET / POST / PUT / DELETE on CodeSystem, ValueSet, and
 //! ConceptMap resources.
 //!
-//! Raw FHIR JSON is stored and versioned via `helios-persistence`
-//! (`SqliteBackend`).  The HTS normalized terminology tables
+//! Raw FHIR JSON is stored and versioned via `helios-persistence`.
+//! The HTS normalized terminology tables
 //! (code_systems, concepts, value_sets, …) are kept in sync by the same
 //! import / delete helpers used by the `POST /import` pipeline.
 //!
 //! # ETag / versioning
 //!
-//! Every stored resource carries a `version_id` (starting at `"1"`, monotonically
-//! increasing).  GET responses include an `ETag: W/"<version_id>"` header.
+//! Persistence-managed resources carry a `version_id` and an `ETag` header.
+//! Imported-only reads have no ETag until a write establishes real history.
 //! PUT requests may include an `If-Match` header; when present, the handler
 //! returns **412 Precondition Failed** if the version no longer matches.
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod inner {
+    use crate::backends::resource_identity::ResourceKind;
+    use crate::operations::crud_transaction::{self, CrudTransaction, storage_error};
     use axum::{
         Json,
         extract::{Path, RawQuery, State},
         http::{HeaderMap, HeaderValue, StatusCode, header},
         response::{IntoResponse, Response},
     };
-    use helios_fhir::FhirVersion;
     use helios_persistence::tenant::TenantContext;
+    use helios_persistence::types::StoredResource;
     use serde_json::Value;
 
     use crate::error::HtsError;
     use crate::state::AppState;
     use crate::traits::TerminologyBackend;
-
-    #[cfg(feature = "sqlite")]
-    use crate::import::ImportStats;
-    #[cfg(feature = "sqlite")]
-    use crate::import::fhir_bundle::{
-        delete_code_system as hts_delete_cs, delete_concept_map as hts_delete_cm,
-        delete_value_set as hts_delete_vs, get_code_system_url as hts_get_cs_url,
-        import_code_system as hts_import_cs, import_concept_map as hts_import_cm,
-        import_value_set as hts_import_vs,
-        invalidate_expansion_cache_for_system as hts_invalidate_expansion_cache,
-    };
 
     use super::super::format::{ResponseFormat, fhir_respond, negotiate_format};
 
@@ -48,18 +39,6 @@ mod inner {
 
     fn ctx() -> TenantContext {
         TenantContext::system()
-    }
-
-    // ── Error helpers ──────────────────────────────────────────────────────────
-
-    /// Returns `true` if the storage error represents a resource that is
-    /// deleted (Gone) or never existed (NotFound).  Both cases map to HTTP 404.
-    fn is_gone_or_not_found(e: &helios_persistence::StorageError) -> bool {
-        use helios_persistence::error::{ResourceError, StorageError as SE};
-        matches!(
-            e,
-            SE::Resource(ResourceError::Gone { .. }) | SE::Resource(ResourceError::NotFound { .. })
-        )
     }
 
     // ── Cache invalidation seam ───────────────────────────────────────────────
@@ -89,7 +68,8 @@ mod inner {
     ///
     /// # Ordering
     ///
-    /// Callers evict *after* the storage write, never before. Evicting first
+    /// Callers evict after the shared transaction settles, never before.
+    /// Evicting first
     /// leaves a window in which a concurrent reader repopulates from pre-write
     /// state and that entry never expires. Evicting afterwards still leaves a
     /// narrow race — a reader that began its query before the write commits may
@@ -102,415 +82,296 @@ mod inner {
         state.backend().invalidate_caches();
     }
 
-    // ── HTS re-index helper (generic / async path) ────────────────────────────
-
-    /// Wrap `content` in a synthetic single-resource Bundle and call
-    /// `importer.import_bundle()` to (re-)index it into the HTS normalized tables.
-    ///
-    /// Used by the PostgreSQL CRUD path in place of the SQLite-specific `hts_pool`
-    /// spawn-blocking approach.
-    async fn hts_reindex_via_importer(
-        importer: &dyn crate::import::BundleImportBackend,
-        resource_type: &str,
-        content: Value,
-        ctx: &TenantContext,
-    ) -> Result<(), HtsError> {
-        if !matches!(resource_type, "CodeSystem" | "ValueSet" | "ConceptMap") {
-            return Err(HtsError::InvalidRequest(format!(
-                "Unsupported resource type for CRUD: {resource_type}"
-            )));
+    /// Settle the transaction explicitly. No raw resource, history entry or
+    /// normalized row is committed when any step of a CRUD request fails.
+    async fn finish<T>(
+        transaction: Box<dyn CrudTransaction>,
+        result: Result<T, HtsError>,
+    ) -> Result<T, HtsError> {
+        match result {
+            Ok(value) => {
+                transaction.commit().await.map_err(storage_error)?;
+                Ok(value)
+            }
+            Err(error) => {
+                transaction.rollback().await.map_err(|rollback| {
+                    HtsError::StorageError(format!("{error}; rollback failed: {rollback}"))
+                })?;
+                Err(error)
+            }
         }
-        let bundle = serde_json::json!({
-            "resourceType": "Bundle",
-            "type": "collection",
-            "entry": [{"resource": content}]
-        });
-        let bytes =
-            serde_json::to_vec(&bundle).expect("in-memory bundle serialization cannot fail");
-        importer
-            .import_bundle(ctx, &bytes)
-            .await
-            .map_err(|e| HtsError::StorageError(format!("HTS re-index failed: {e}")))?;
-        Ok(())
     }
 
-    /// (Re-)index `content` into the HTS normalized tables.
-    ///
-    /// Shared by create and update so both verbs cannot drift apart again.
-    /// `replace_id`, when supplied, names an existing resource whose normalized
-    /// rows are removed first — the update path, where the new content may have
-    /// *dropped* concepts that an upsert alone would leave behind.
-    ///
-    /// Two backend paths, matching how the state was wired:
-    ///
-    /// - SQLite: writes through `hts_pool` on a blocking thread, because
-    ///   `rusqlite` is synchronous.
-    /// - Everything else (PostgreSQL): wraps `content` in a one-entry Bundle and
-    ///   hands it to the async importer.
-    ///
-    /// This function does **not** evict caches — callers do that through
-    /// [`evict_caches_after_write`] on every exit path, including this one
-    /// failing. That split is deliberate: the SQLite update path deletes the old
-    /// normalized rows before re-importing, so a failure part-way through leaves
-    /// storage genuinely changed, and caches must be dropped anyway. The
-    /// invariant is that a cache may be colder than storage, never hotter.
-    // `replace_id` is consumed only by the SQLite delete-then-reimport branch;
-    // a postgres-only build would otherwise trip `unused_variables` under the
-    // workspace's deny-warnings clippy job.
-    #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
-    async fn hts_reindex<B: TerminologyBackend>(
-        state: &AppState<B>,
-        resource_type: &'static str,
-        content: Value,
-        ctx: &TenantContext,
-        replace_id: Option<String>,
-    ) -> Result<(), HtsError> {
-        #[cfg(feature = "sqlite")]
-        if let Some(pool) = state.hts_pool.clone() {
-            let joined = tokio::task::spawn_blocking(move || {
-                let conn = pool
-                    .get()
-                    .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
-
-                // Update path: drop the old normalized rows first (ON DELETE
-                // CASCADE propagates to concepts, designations, properties and
-                // hierarchy). For a CodeSystem, also evict the persistent
-                // expansion cache rows derived from it — those are DB state, not
-                // process memory, so no amount of in-process eviction covers them.
-                if let Some(ref resource_id) = replace_id {
-                    match resource_type {
-                        "CodeSystem" => {
-                            if let Some(url) = hts_get_cs_url(&conn, resource_id)? {
-                                hts_invalidate_expansion_cache(&conn, &url)?;
-                            }
-                            hts_delete_cs(&conn, resource_id)?;
-                        }
-                        "ValueSet" => hts_delete_vs(&conn, resource_id)?,
-                        "ConceptMap" => hts_delete_cm(&conn, resource_id)?,
-                        _ => {}
-                    }
-                }
-
-                let mut stats = ImportStats::default();
-                match resource_type {
-                    "CodeSystem" => hts_import_cs(&conn, &content, &mut stats),
-                    "ValueSet" => hts_import_vs(&conn, &content, &mut stats),
-                    "ConceptMap" => hts_import_cm(&conn, &content, &mut stats),
-                    _ => Err(HtsError::InvalidRequest(format!(
-                        "Unsupported resource type for CRUD: {resource_type}"
-                    ))),
-                }
-            })
-            .await
-            .map_err(|e| HtsError::Internal(e.to_string()))?;
-            return joined;
-        }
-
-        // PostgreSQL: `import_bundle` upserts by URL, so no explicit delete is
-        // needed for the update path.
-        if let Some(importer) = state.terminology_importer.clone() {
-            return hts_reindex_via_importer(&*importer, resource_type, content, ctx).await;
-        }
-
-        Ok(())
+    fn resource_kind(resource_type: &str) -> Result<ResourceKind, HtsError> {
+        ResourceKind::from_resource_type(resource_type).ok_or_else(|| {
+            HtsError::InvalidRequest(format!("Unsupported resource type: {resource_type}"))
+        })
     }
 
-    // ── Generic CRUD helpers ───────────────────────────────────────────────────
+    /// Imported resources acquire a history baseline before deletion.
+    async fn current_resource(
+        transaction: &mut dyn CrudTransaction,
+        kind: ResourceKind,
+        id: &str,
+    ) -> Result<StoredResource, HtsError> {
+        let resource_type = kind.resource_type();
+        if let Some(current) = transaction
+            .read(resource_type, id)
+            .await
+            .map_err(storage_error)?
+        {
+            return Ok(current);
+        }
+        let content = transaction
+            .normalized_resource(kind, id)
+            .await?
+            .ok_or_else(|| HtsError::NotFound(format!("{resource_type}/{id}")))?;
+        transaction
+            .create(resource_type, content)
+            .await
+            .map_err(storage_error)
+    }
 
-    /// POST /<ResourceType> — create a new resource.
-    ///
-    /// 1. Stores raw JSON in `helios-persistence` (auto-generates version / ETag).
-    /// 2. Indexes the stored content into the HTS normalized tables.
-    /// 3. Evicts every cache derived from terminology content.
-    /// 4. Returns **201 Created** with `Location` and `ETag` headers.
-    ///
-    /// Step 3 is not optional: creating a resource has to un-cache the *absence*
-    /// recorded for its URL by any earlier `$expand` / `$lookup` that 404'd, or
-    /// the server keeps denying that a resource it just returned `201` for
-    /// exists (issue #304).
+    /// Version metadata belongs to persistence, not to the submitted resource.
+    fn clear_server_meta(body: &mut Value) {
+        if let Some(meta) = body.get_mut("meta").and_then(Value::as_object_mut) {
+            meta.remove("versionId");
+            meta.remove("lastUpdated");
+        }
+    }
+
+    fn resource_response(
+        stored: &StoredResource,
+        format: ResponseFormat,
+        status: StatusCode,
+    ) -> Response {
+        let mut response = fhir_respond(stored.content_with_meta(), format);
+        *response.status_mut() = status;
+        if let Ok(value) = HeaderValue::from_str(stored.etag()) {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+        let modified = stored.last_modified().format("%a, %d %b %Y %H:%M:%S GMT");
+        if let Ok(value) = HeaderValue::from_str(&modified.to_string()) {
+            response.headers_mut().insert(header::LAST_MODIFIED, value);
+        }
+        if status == StatusCode::CREATED
+            && let Ok(value) = HeaderValue::from_str(&format!("/{}", stored.versioned_url()))
+        {
+            response.headers_mut().insert(header::LOCATION, value);
+        }
+        response
+    }
+
+    /// Create raw content and normalized terminology in one transaction.
     async fn create_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
-        body: Value,
+        mut body: Value,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        let store = state
-            .active_resource_store()
-            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
-
-        let ctx = ctx();
-
-        // 1. Persist raw FHIR JSON (version_id = "1", ETag = W/"1").
-        let stored = store
-            .create(&ctx, resource_type, body, FhirVersion::default_enabled())
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-        // 2. Index into HTS normalized tables using the canonical content
-        //    (persistence layer injects the correct `id` into the JSON).
-        let reindexed =
-            hts_reindex(&state, resource_type, stored.content().clone(), &ctx, None).await;
-
-        // 3. Evict regardless of whether the re-index succeeded: the resource is
-        //    already in the resource store, so any cached "does not exist" answer
-        //    is wrong either way.
+        let id = helios_persistence::types::new_resource_id();
+        body.as_object_mut()
+            .ok_or_else(|| HtsError::InvalidRequest("Resource must be a JSON object".into()))?
+            .insert("id".into(), Value::String(id.clone()));
+        clear_server_meta(&mut body);
+        crate::import::parse_crud_resource(resource_type, &body)?;
+        let kind = resource_kind(resource_type)?;
+        let mut transaction = crud_transaction::begin(&state, kind, &id).await?;
+        let result = async {
+            transaction.prepare(kind, &id, Some(&body)).await?;
+            if let Some(id) = body.get("id").and_then(Value::as_str)
+                && transaction.normalized_resource(kind, id).await?.is_some()
+            {
+                return Err(HtsError::InvalidRequest(format!(
+                    "{resource_type}/{id} already exists"
+                )));
+            }
+            let stored = transaction
+                .create(resource_type, body)
+                .await
+                .map_err(storage_error)?;
+            transaction
+                .normalize(kind, stored.content_with_meta(), false)
+                .await?;
+            Ok(stored)
+        }
+        .await;
+        let result = finish(transaction, result).await;
         evict_caches_after_write(&state);
-        reindexed?;
-
-        let etag = stored.etag().to_string();
-        let location = format!("/{}/{}", resource_type, stored.id());
-
-        let mut response = fhir_respond(stored.content().clone(), format);
-        *response.status_mut() = StatusCode::CREATED;
-        let headers = response.headers_mut();
-        if let Ok(v) = HeaderValue::from_str(&location) {
-            headers.insert(header::LOCATION, v);
-        }
-        if let Ok(v) = HeaderValue::from_str(&etag) {
-            headers.insert(header::ETAG, v);
-        }
-        Ok(response)
+        let stored = result?;
+        Ok(resource_response(&stored, format, StatusCode::CREATED))
     }
 
     /// GET /<ResourceType>/:id — read stored FHIR JSON.
     ///
-    /// Returns **200 OK** with `ETag` header, or **404 Not Found** if the
-    /// resource does not exist or has been deleted.
+    /// Returns **200 OK**, with an `ETag` for persistence-managed resources,
+    /// or **404 Not Found** if absent or deleted.
     async fn read_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        let store = state
-            .active_resource_store()
-            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
-        let ctx = ctx();
-
-        match store.read(&ctx, resource_type, &id).await {
-            Ok(Some(resource)) if !resource.is_deleted() => {
-                let etag = resource.etag().to_string();
-                let mut response = fhir_respond(resource.content().clone(), format);
-                if let Ok(v) = HeaderValue::from_str(&etag) {
-                    response.headers_mut().insert(header::ETAG, v);
+        if let Some(store) = state.active_resource_store() {
+            match store.read(&ctx(), resource_type, &id).await {
+                Ok(Some(resource)) if !resource.is_deleted() => {
+                    return Ok(resource_response(&resource, format, StatusCode::OK));
                 }
-                Ok(response)
+                Ok(Some(_)) => return Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
+                Ok(None) => {}
+                // A tombstone is authoritative. Never resurrect it from imports.
+                Err(helios_persistence::StorageError::Resource(
+                    helios_persistence::error::ResourceError::Gone { .. },
+                )) => return Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
+                Err(helios_persistence::StorageError::Resource(
+                    helios_persistence::error::ResourceError::NotFound { .. },
+                )) => {}
+                Err(error) => return Err(HtsError::StorageError(error.to_string())),
             }
-            Ok(Some(_)) | Ok(None) => Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
-            // The persistence layer returns Gone for soft-deleted resources;
-            // from the caller's perspective that is still a 404.
-            Err(e) if is_gone_or_not_found(&e) => {
-                Err(HtsError::NotFound(format!("{resource_type}/{id}")))
-            }
-            Err(e) => Err(HtsError::StorageError(e.to_string())),
         }
+        state
+            .backend()
+            .resource_by_id(resource_type, &id)?
+            .map(|resource| fhir_respond(resource, format))
+            .ok_or_else(|| HtsError::NotFound(format!("{resource_type}/{id}")))
     }
 
-    /// PUT /<ResourceType>/:id — update an existing resource.
-    ///
-    /// If the `If-Match` header is present it must match the current ETag;
-    /// a mismatch returns **412 Precondition Failed**.
-    ///
-    /// On success:
-    /// 1. Updates raw JSON in `helios-persistence` (version_id incremented).
-    /// 2. Deletes old HTS normalized data and re-imports the new content.
-    /// 3. Evicts every cache derived from terminology content.
-    /// 4. Returns **200 OK** with the updated `ETag`.
-    ///
-    /// Step 3 is not optional: without it a `PUT` is indexed into storage and
-    /// then shadowed by pre-update bytes held in the handler-level `$expand` /
-    /// `$lookup` / `$validate-code` caches and the backend's own response memos
-    /// (issue #304).
+    /// Read the named persistence revision, never substituting current or
+    /// import-only content for a version that has no history entry.
+    async fn read_resource_version<B: TerminologyBackend>(
+        resource_type: &'static str,
+        state: AppState<B>,
+        id: String,
+        version: String,
+        format: ResponseFormat,
+    ) -> Result<Response, HtsError> {
+        let identity = format!("{resource_type}/{id}/_history/{version}");
+        let store = state
+            .active_versioned_resource_store()
+            .ok_or_else(|| HtsError::NotFound(identity.clone()))?;
+        let stored = store
+            .vread(&ctx(), resource_type, &id, &version)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| HtsError::NotFound(identity.clone()))?;
+        if stored.is_deleted() {
+            return Err(HtsError::Gone(identity));
+        }
+        Ok(resource_response(&stored, format, StatusCode::OK))
+    }
+
+    /// Create, update or restore a logical resource atomically, retaining its
+    /// history and keeping normalized terminology in the same transaction.
     async fn update_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
         if_match: Option<String>,
-        body: Value,
+        mut body: Value,
         format: ResponseFormat,
     ) -> Result<Response, HtsError> {
-        let store = state
-            .active_resource_store()
-            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
-
-        let ctx = ctx();
-
-        // 1. Read current version.
-        let current = match store.read(&ctx, resource_type, &id).await {
-            Ok(Some(r)) if !r.is_deleted() => r,
-            Ok(_) => return Err(HtsError::NotFound(format!("{resource_type}/{id}"))),
-            Err(e) if is_gone_or_not_found(&e) => {
-                return Err(HtsError::NotFound(format!("{resource_type}/{id}")));
-            }
-            Err(e) => return Err(HtsError::StorageError(e.to_string())),
-        };
-
-        // 2. Check If-Match (optimistic concurrency).
-        if let Some(ref etag) = if_match {
-            if !current.matches_etag(etag) {
-                return Err(HtsError::PreconditionFailed(format!(
-                    "ETag mismatch: supplied {etag}, current {}",
-                    current.etag()
-                )));
-            }
+        if body.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+            return Err(HtsError::InvalidRequest(
+                "Body id must be present and match the request URL".into(),
+            ));
         }
-
-        // 3. Update raw JSON in persistence store (version incremented).
-        let updated = store
-            .update(&ctx, &current, body)
-            .await
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-        // 4. Re-index normalized HTS tables, replacing the previous rows.
-        let reindexed = hts_reindex(
-            &state,
-            resource_type,
-            updated.content().clone(),
-            &ctx,
-            Some(updated.id().to_string()),
-        )
+        clear_server_meta(&mut body);
+        crate::import::parse_crud_resource(resource_type, &body)?;
+        let kind = resource_kind(resource_type)?;
+        let mut transaction = crud_transaction::begin(&state, kind, &id).await?;
+        let result = async {
+            transaction.prepare(kind, &id, Some(&body)).await?;
+            let mut current = transaction
+                .read_including_deleted(resource_type, &id)
+                .await
+                .map_err(storage_error)?;
+            if let Some(etag) = if_match.as_deref() {
+                let live = current.as_ref().filter(|resource| !resource.is_deleted());
+                match live {
+                    Some(resource) if resource.matches_etag(etag) => {}
+                    Some(resource) => {
+                        return Err(HtsError::PreconditionFailed(format!(
+                            "ETag mismatch: supplied {etag}, current {}",
+                            resource.etag()
+                        )));
+                    }
+                    None => {
+                        return Err(HtsError::PreconditionFailed(
+                            "If-Match requires an existing resource with a persisted ETag".into(),
+                        ));
+                    }
+                }
+            }
+            // Import-only content establishes version 1 before the update,
+            // preserving the original resource in persistence history.
+            if current.is_none()
+                && let Some(original) = transaction.normalized_resource(kind, &id).await?
+            {
+                current = Some(
+                    transaction
+                        .create(resource_type, original)
+                        .await
+                        .map_err(storage_error)?,
+                );
+            }
+            let replace = current.is_some();
+            let (stored, status) = match current {
+                Some(current) if current.is_deleted() => (
+                    transaction
+                        .restore(&current, body)
+                        .await
+                        .map_err(storage_error)?,
+                    StatusCode::CREATED,
+                ),
+                Some(current) => (
+                    transaction
+                        .update(&current, body)
+                        .await
+                        .map_err(storage_error)?,
+                    StatusCode::OK,
+                ),
+                None => (
+                    transaction
+                        .create(resource_type, body)
+                        .await
+                        .map_err(storage_error)?,
+                    StatusCode::CREATED,
+                ),
+            };
+            transaction
+                .normalize(kind, stored.content_with_meta(), replace)
+                .await?;
+            Ok((stored, status))
+        }
         .await;
-
-        // 5. Evict regardless of the re-index outcome. The SQLite path deletes
-        //    the old normalized rows before re-importing, so a failure in
-        //    between leaves storage changed and every cached answer stale.
+        let result = finish(transaction, result).await;
         evict_caches_after_write(&state);
-        reindexed?;
-
-        let etag = updated.etag().to_string();
-        let mut response = fhir_respond(updated.content().clone(), format);
-        if let Ok(v) = HeaderValue::from_str(&etag) {
-            response.headers_mut().insert(header::ETAG, v);
-        }
-        Ok(response)
+        let (stored, status) = result?;
+        Ok(resource_response(&stored, format, status))
     }
 
-    /// DELETE /<ResourceType>/:id — soft-delete a resource.
-    ///
-    /// 1. Reads the current resource to extract its canonical URL (needed for
-    ///    HTS normalized-table cleanup).
-    /// 2. Soft-deletes the raw JSON in `helios-persistence`, if there is a live
-    ///    row. Content loaded through `POST /import` has none — that path writes
-    ///    only the normalized tables — so a missing row is not an error.
-    /// 3. Removes the resource's rows from HTS normalized tables:
-    ///    - SQLite path: via `hts_pool` spawn-blocking helpers (always by id).
-    ///    - PostgreSQL path: `terminology_importer.delete_normalized()` by the
-    ///      stored URL, or `delete_normalized_by_id()` when there was no store
-    ///      row to read one from.
-    /// 4. Returns **204 No Content**, also for an id that matches nothing, since
-    ///    FHIR DELETE is idempotent.
+    /// Delete the resource and its exact normalized identity in one transaction.
     async fn delete_resource<B: TerminologyBackend>(
         resource_type: &'static str,
         state: AppState<B>,
         id: String,
     ) -> Result<Response, HtsError> {
-        let store = state
-            .active_resource_store()
-            .ok_or_else(|| HtsError::Internal("Resource store not initialized".into()))?;
-
-        #[cfg(feature = "sqlite")]
-        let hts_pool = state.hts_pool.clone();
-        let terminology_importer = state.terminology_importer.clone();
-        let ctx = ctx();
-
-        // 1. Read the live store row, if any, for its URL. Not-found and gone
-        //    both mean "no row"; any other read error is a real failure.
-        let stored = match store.read(&ctx, resource_type, &id).await {
-            Ok(Some(r)) if !r.is_deleted() => Some(r),
-            Ok(_) => None,
-            Err(e) if is_gone_or_not_found(&e) => None,
-            Err(e) => return Err(HtsError::StorageError(e.to_string())),
-        };
-        let resource_url: Option<String> = stored.as_ref().and_then(|r| {
-            r.content()
-                .get("url")
-                .and_then(|u| u.as_str())
-                .map(str::to_owned)
-        });
-
-        // 2. Soft-delete in persistence store, when there is a row to delete.
-        //    A concurrent DELETE may remove it between the read and here; that
-        //    leaves the same end state, so tolerate it.
-        if stored.is_some() {
-            match store.delete(&ctx, resource_type, &id).await {
-                Ok(()) => {}
-                Err(e) if is_gone_or_not_found(&e) => {}
-                Err(e) => return Err(HtsError::StorageError(e.to_string())),
-            }
+        let kind = resource_kind(resource_type)?;
+        let mut transaction = crud_transaction::begin(&state, kind, &id).await?;
+        let result = async {
+            transaction.prepare(kind, &id, None).await?;
+            current_resource(&mut *transaction, kind, &id).await?;
+            transaction
+                .delete(resource_type, &id)
+                .await
+                .map_err(storage_error)?;
+            transaction.remove_normalized(kind, &id).await
         }
-
-        // 3. Delete from HTS normalized tables.
-        #[allow(unused_mut, unused_assignments)]
-        let mut removed: Result<(), HtsError> = Ok(());
-
-        #[cfg(feature = "sqlite")]
-        if let Some(pool) = hts_pool {
-            let resource_id = id.clone();
-            removed = tokio::task::spawn_blocking(move || {
-                let conn = pool
-                    .get()
-                    .map_err(|e| HtsError::StorageError(format!("HTS pool error: {e}")))?;
-                match resource_type {
-                    "CodeSystem" => {
-                        if let Some(url) = hts_get_cs_url(&conn, &resource_id)? {
-                            hts_invalidate_expansion_cache(&conn, &url)?;
-                        }
-                        hts_delete_cs(&conn, &resource_id)
-                    }
-                    "ValueSet" => hts_delete_vs(&conn, &resource_id),
-                    "ConceptMap" => hts_delete_cm(&conn, &resource_id),
-                    _ => Ok(()),
-                }
-            })
-            .await
-            .map_err(|e| HtsError::Internal(e.to_string()))?;
-        } else if let Some(importer) = terminology_importer.as_deref() {
-            removed = delete_normalized_via_importer(
-                importer,
-                resource_type,
-                &id,
-                resource_url.as_deref(),
-            )
-            .await;
-        }
-
-        #[cfg(not(feature = "sqlite"))]
-        if let Some(importer) = terminology_importer.as_deref() {
-            removed = delete_normalized_via_importer(
-                importer,
-                resource_type,
-                &id,
-                resource_url.as_deref(),
-            )
-            .await;
-        }
-
-        // Evict both cache tiers so a deleted ValueSet (and any CodeSystem whose
-        // concepts would otherwise linger in a cached expansion or response memo)
-        // stops being served from memory. Runs even when the normalized delete
-        // failed — the resource is already soft-deleted in the resource store, so
-        // holding on to cached answers about it is wrong either way.
+        .await;
+        let result = finish(transaction, result).await;
         evict_caches_after_write(&state);
-        removed?;
-
+        result?;
         Ok(StatusCode::NO_CONTENT.into_response())
-    }
-
-    /// Clean the normalized tables through a `BundleImportBackend` (the
-    /// PostgreSQL path): by the stored canonical URL when the persistence store
-    /// supplied one, otherwise by id. Without the id fallback, a resource loaded
-    /// through `POST /import` — which has no store row — would answer 204 and
-    /// keep serving `$lookup` / `$expand` (issue #2143).
-    async fn delete_normalized_via_importer(
-        importer: &dyn crate::import::BundleImportBackend,
-        resource_type: &str,
-        id: &str,
-        resource_url: Option<&str>,
-    ) -> Result<(), HtsError> {
-        match resource_url {
-            Some(url) => importer.delete_normalized(resource_type, url).await,
-            None => importer.delete_normalized_by_id(resource_type, id).await,
-        }
     }
 
     // ── Format negotiation helper ──────────────────────────────────────────────
@@ -547,6 +408,22 @@ mod inner {
             "CodeSystem",
             state,
             id,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
+    }
+
+    pub async fn read_code_system_version<B: TerminologyBackend>(
+        State(state): State<AppState<B>>,
+        Path((id, version)): Path<(String, String)>,
+        headers: HeaderMap,
+        RawQuery(raw): RawQuery,
+    ) -> Result<Response, HtsError> {
+        read_resource_version(
+            "CodeSystem",
+            state,
+            id,
+            version,
             crud_format(&headers, raw.as_deref()),
         )
         .await
@@ -598,6 +475,22 @@ mod inner {
         RawQuery(raw): RawQuery,
     ) -> Result<Response, HtsError> {
         read_resource("ValueSet", state, id, crud_format(&headers, raw.as_deref())).await
+    }
+
+    pub async fn read_value_set_version<B: TerminologyBackend>(
+        State(state): State<AppState<B>>,
+        Path((id, version)): Path<(String, String)>,
+        headers: HeaderMap,
+        RawQuery(raw): RawQuery,
+    ) -> Result<Response, HtsError> {
+        read_resource_version(
+            "ValueSet",
+            state,
+            id,
+            version,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
     }
 
     pub async fn update_value_set<B: TerminologyBackend>(
@@ -654,6 +547,22 @@ mod inner {
         .await
     }
 
+    pub async fn read_concept_map_version<B: TerminologyBackend>(
+        State(state): State<AppState<B>>,
+        Path((id, version)): Path<(String, String)>,
+        headers: HeaderMap,
+        RawQuery(raw): RawQuery,
+    ) -> Result<Response, HtsError> {
+        read_resource_version(
+            "ConceptMap",
+            state,
+            id,
+            version,
+            crud_format(&headers, raw.as_deref()),
+        )
+        .await
+    }
+
     pub async fn update_concept_map<B: TerminologyBackend>(
         State(state): State<AppState<B>>,
         Path(id): Path<String>,
@@ -693,6 +602,7 @@ mod tests {
         routing::{delete, get, post, put},
     };
     use serde_json::{Value, json};
+    use tempfile::TempDir;
     use tower::ServiceExt;
 
     use helios_persistence::backends::sqlite::SqliteBackend;
@@ -704,23 +614,22 @@ mod tests {
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    fn make_state() -> AppState<SqliteTerminologyBackend> {
-        let backend = SqliteTerminologyBackend::in_memory().expect("HTS in-memory backend");
-        let hts_pool = backend.pool().clone();
-
-        let resource_store = SqliteBackend::in_memory().expect("persistence in-memory backend");
+    fn make_state() -> (TempDir, AppState<SqliteTerminologyBackend>) {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let path = directory.path().join("crud.db");
+        let resource_store = SqliteBackend::open(&path).expect("open persistence store");
         resource_store
             .init_schema()
             .expect("init persistence schema");
-
-        AppState::new(backend)
-            .with_resource_store(resource_store)
-            .with_hts_pool(hts_pool)
+        let backend = SqliteTerminologyBackend::new(path.to_str().expect("UTF-8 database path"))
+            .expect("open terminology store");
+        let state = AppState::new(backend).with_resource_store(resource_store);
+        (directory, state)
     }
 
-    fn code_system_router() -> Router {
-        let state = make_state();
-        Router::new()
+    fn code_system_router() -> (TempDir, Router) {
+        let (directory, state) = make_state();
+        let router = Router::new()
             .route(
                 "/CodeSystem",
                 post(create_code_system::<SqliteTerminologyBackend>),
@@ -737,12 +646,13 @@ mod tests {
                 "/CodeSystem/{id}",
                 delete(delete_code_system::<SqliteTerminologyBackend>),
             )
-            .with_state(state)
+            .with_state(state);
+        (directory, router)
     }
 
-    fn value_set_router() -> Router {
-        let state = make_state();
-        Router::new()
+    fn value_set_router() -> (TempDir, Router) {
+        let (directory, state) = make_state();
+        let router = Router::new()
             .route(
                 "/ValueSet",
                 post(create_value_set::<SqliteTerminologyBackend>),
@@ -759,12 +669,13 @@ mod tests {
                 "/ValueSet/{id}",
                 delete(delete_value_set::<SqliteTerminologyBackend>),
             )
-            .with_state(state)
+            .with_state(state);
+        (directory, router)
     }
 
-    fn concept_map_router() -> Router {
-        let state = make_state();
-        Router::new()
+    fn concept_map_router() -> (TempDir, Router) {
+        let (directory, state) = make_state();
+        let router = Router::new()
             .route(
                 "/ConceptMap",
                 post(create_concept_map::<SqliteTerminologyBackend>),
@@ -781,7 +692,8 @@ mod tests {
                 "/ConceptMap/{id}",
                 delete(delete_concept_map::<SqliteTerminologyBackend>),
             )
-            .with_state(state)
+            .with_state(state);
+        (directory, router)
     }
 
     fn cs_body(id: &str) -> Value {
@@ -960,7 +872,7 @@ mod tests {
     /// that set.
     #[tokio::test]
     async fn create_value_set_evicts_the_expand_negative_cache() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         // A CodeSystem to include, so the post-create expansion is non-empty.
@@ -1030,14 +942,14 @@ mod tests {
     /// update adds — the `$lookup` twin of the `$expand` negative cache.
     #[tokio::test]
     async fn update_code_system_evicts_the_lookup_negative_cache() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         assert_eq!(
             send_json(
                 &app,
-                "POST",
-                "/CodeSystem",
+                "PUT",
+                "/CodeSystem/cs-lk",
                 cs_with("cs-lk", json!([{ "code": "A", "display": "Alpha" }]))
             )
             .await
@@ -1091,19 +1003,19 @@ mod tests {
     /// the handler recompute, and the recomputation is then served straight back
     /// from `SqliteTerminologyBackend::lookup_response_cache`, whose key
     /// (`system|code|version|lang|date|props`) is unchanged by a display edit.
-    /// The SQLite CRUD path writes through `hts_pool` and never reaches
-    /// `BundleImportBackend::import_bundle`, so before this fix nothing on any
-    /// CRUD verb cleared that memo. A Tier-1-only fix leaves this test red.
+    /// CRUD normalizes within the persistence transaction and does not call
+    /// `BundleImportBackend::import_bundle`. It must therefore invalidate the
+    /// backend memo explicitly as well as the handler-level cache.
     #[tokio::test]
     async fn update_code_system_evicts_the_backend_response_memo() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         assert_eq!(
             send_json(
                 &app,
-                "POST",
-                "/CodeSystem",
+                "PUT",
+                "/CodeSystem/cs-disp",
                 cs_with("cs-disp", json!([{ "code": "A", "display": "Alpha" }]))
             )
             .await
@@ -1160,7 +1072,7 @@ mod tests {
     /// this because its ValueSet fixtures carry no `version`.
     #[tokio::test]
     async fn deleting_a_versioned_value_set_stops_it_expanding() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         assert_eq!(
@@ -1172,8 +1084,8 @@ mod tests {
         assert_eq!(
             send_json(
                 &app,
-                "POST",
-                "/ValueSet",
+                "PUT",
+                "/ValueSet/vs-ver",
                 vs_including(
                     "vs-ver",
                     Some("1.0.0"),
@@ -1214,7 +1126,7 @@ mod tests {
     /// behaviour rather than either mechanism.
     #[tokio::test]
     async fn updating_a_value_set_refreshes_its_expansion() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = ops_router(state.clone());
 
         let system = "http://example.org/cs/cs-upd";
@@ -1227,8 +1139,8 @@ mod tests {
         assert_eq!(
             send_json(
                 &app,
-                "POST",
-                "/ValueSet",
+                "PUT",
+                "/ValueSet/vs-upd",
                 vs_including("vs-upd", Some("1.0.0"), system, &["A"])
             )
             .await
@@ -1266,7 +1178,7 @@ mod tests {
 
     #[tokio::test]
     async fn cs_create_returns_201_with_etag() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1281,12 +1193,22 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert!(resp.headers().contains_key(header::ETAG));
-        assert!(resp.headers().contains_key(header::LOCATION));
+        assert!(resp.headers().contains_key(header::LAST_MODIFIED));
+        let location = resp.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = json_body(resp).await;
+        let id = body["id"].as_str().unwrap();
+        assert_ne!(id, "cs1");
+        assert_eq!(body["meta"]["versionId"], "1");
+        assert!(body["meta"]["lastUpdated"].is_string());
+        assert_eq!(location, format!("/CodeSystem/{id}/_history/1"));
     }
 
     #[tokio::test]
     async fn cs_read_after_create_returns_200() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
         // POST
         let post_resp = app
             .clone()
@@ -1309,28 +1231,31 @@ mod tests {
             .unwrap()
             .to_string();
 
+        let created = json_body(post_resp).await;
+        let id = created["id"].as_str().unwrap();
+        assert_ne!(id, "cs-read");
+
         // GET
         let get_resp = app
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/CodeSystem/cs-read")
+                    .uri(format!("/CodeSystem/{id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::OK);
+        assert_eq!(get_resp.headers()[header::ETAG], etag);
         let body = json_body(get_resp).await;
-        assert_eq!(body["id"], "cs-read");
+        assert_eq!(body["id"], id);
         assert_eq!(body["resourceType"], "CodeSystem");
-        // ETag on GET should match the one from POST.
-        let _ = etag; // used for the assertion above via headers
     }
 
     #[tokio::test]
     async fn cs_get_nonexistent_returns_404() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1346,7 +1271,7 @@ mod tests {
 
     #[tokio::test]
     async fn cs_full_crud_round_trip() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
 
         // 1. POST → 201
         let post_resp = app
@@ -1370,13 +1295,17 @@ mod tests {
             .unwrap()
             .to_string();
 
+        let created = json_body(post_resp).await;
+        let id = created["id"].as_str().unwrap();
+        let uri = format!("/CodeSystem/{id}");
+
         // 2. GET → 200
         let get_resp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1387,7 +1316,7 @@ mod tests {
         // 3. PUT → 200 with incremented ETag
         let updated = json!({
             "resourceType": "CodeSystem",
-            "id": "cs-rt",
+            "id": id,
             "url": "http://example.org/cs/cs-rt",
             "name": "UpdatedCS",
             "status": "active",
@@ -1399,7 +1328,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .header("content-type", "application/json")
                     .header(header::IF_MATCH, &etag_v1)
                     .body(Body::from(updated.to_string()))
@@ -1423,7 +1352,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1439,7 +1368,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1452,7 +1381,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/CodeSystem/cs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1463,20 +1392,23 @@ mod tests {
 
     #[tokio::test]
     async fn cs_put_with_wrong_etag_returns_412() {
-        let app = code_system_router();
+        let (_directory, app) = code_system_router();
 
-        // POST first
-        app.clone()
+        // Create the exact ID before testing a live-resource precondition.
+        let created = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/CodeSystem")
+                    .method("PUT")
+                    .uri("/CodeSystem/cs-etag")
                     .header("content-type", "application/json")
                     .body(Body::from(cs_body("cs-etag").to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
+
+        assert_eq!(created.status(), StatusCode::CREATED);
 
         // PUT with wrong ETag
         let resp = app
@@ -1496,13 +1428,8 @@ mod tests {
 
     #[tokio::test]
     async fn cs_create_indexes_into_hts_tables() {
-        let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let hts_pool = backend.pool().clone();
-        let resource_store = SqliteBackend::in_memory().unwrap();
-        resource_store.init_schema().unwrap();
-        let state = AppState::new(backend)
-            .with_resource_store(resource_store)
-            .with_hts_pool(hts_pool.clone());
+        let (_directory, state) = make_state();
+        let hts_pool = state.backend().pool().clone();
 
         let app = Router::new()
             .route(
@@ -1524,20 +1451,21 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
 
+        let created = json_body(resp).await;
+        let public_id = created["id"].as_str().unwrap();
+
         // Verify HTS normalized tables were populated. The synthetic storage
         // id (`<fhir-id>|<version>`) is opaque, so we look up by URL.
         let conn = hts_pool.get().unwrap();
-        let storage_id: String = conn
+        let (storage_id, normalized_id): (String, String) = conn
             .query_row(
-                "SELECT id FROM code_systems WHERE url = 'http://example.org/cs/cs-index'",
+                "SELECT id, json_extract(resource_json, '$.id') FROM code_systems
+                 WHERE url = 'http://example.org/cs/cs-index'",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert!(
-            storage_id.starts_with("cs-index"),
-            "storage id should be derived from FHIR id, got {storage_id}"
-        );
+        assert_eq!(normalized_id, public_id);
 
         let concept_count: i64 = conn
             .query_row(
@@ -1551,13 +1479,8 @@ mod tests {
 
     #[tokio::test]
     async fn cs_delete_removes_hts_normalized_rows() {
-        let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let hts_pool = backend.pool().clone();
-        let resource_store = SqliteBackend::in_memory().unwrap();
-        resource_store.init_schema().unwrap();
-        let state = AppState::new(backend)
-            .with_resource_store(resource_store)
-            .with_hts_pool(hts_pool.clone());
+        let (_directory, state) = make_state();
+        let hts_pool = state.backend().pool().clone();
 
         let app = Router::new()
             .route(
@@ -1571,7 +1494,8 @@ mod tests {
             .with_state(state);
 
         // Create
-        app.clone()
+        let created = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1583,13 +1507,26 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = json_body(created).await;
+        let id = created["id"].as_str().unwrap();
+        let storage_id: String = hts_pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM code_systems WHERE url = 'http://example.org/cs/cs-del'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
         // Delete
         let del = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/CodeSystem/cs-del")
+                    .uri(format!("/CodeSystem/{id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1611,8 +1548,8 @@ mod tests {
 
         let concept_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM concepts WHERE system_id LIKE 'cs-del%'",
-                [],
+                "SELECT COUNT(*) FROM concepts WHERE system_id = ?1",
+                [&storage_id],
                 |r| r.get(0),
             )
             .unwrap();
@@ -1623,7 +1560,7 @@ mod tests {
 
     #[tokio::test]
     async fn vs_full_crud_round_trip() {
-        let app = value_set_router();
+        let (_directory, app) = value_set_router();
 
         // POST → 201
         let post_resp = app
@@ -1640,13 +1577,17 @@ mod tests {
             .unwrap();
         assert_eq!(post_resp.status(), StatusCode::CREATED);
 
+        let created = json_body(post_resp).await;
+        let id = created["id"].as_str().unwrap();
+        let uri = format!("/ValueSet/{id}");
+
         // GET → 200
         let get_resp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ValueSet/vs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1660,7 +1601,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/ValueSet/vs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1673,7 +1614,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ValueSet/vs-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1686,7 +1627,7 @@ mod tests {
 
     #[tokio::test]
     async fn cm_full_crud_round_trip() {
-        let app = concept_map_router();
+        let (_directory, app) = concept_map_router();
 
         // POST → 201
         let post_resp = app
@@ -1703,13 +1644,17 @@ mod tests {
             .unwrap();
         assert_eq!(post_resp.status(), StatusCode::CREATED);
 
+        let created = json_body(post_resp).await;
+        let id = created["id"].as_str().unwrap();
+        let uri = format!("/ConceptMap/{id}");
+
         // GET → 200
         let get_resp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ConceptMap/cm-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1723,7 +1668,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/ConceptMap/cm-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1736,7 +1681,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ConceptMap/cm-rt")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1753,14 +1698,7 @@ mod tests {
         use crate::types::LookupRequest;
         use helios_persistence::tenant::TenantContext;
 
-        let backend = SqliteTerminologyBackend::in_memory().unwrap();
-        let hts_pool = backend.pool().clone();
-        let resource_store = SqliteBackend::in_memory().unwrap();
-        resource_store.init_schema().unwrap();
-
-        let state = AppState::new(backend)
-            .with_resource_store(resource_store)
-            .with_hts_pool(hts_pool);
+        let (_directory, state) = make_state();
 
         let app = Router::new()
             .route(
@@ -1887,7 +1825,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_imported_resources_removes_them() {
-        let state = make_state();
+        let (_directory, state) = make_state();
         let app = import_delete_router(state.clone());
 
         assert_eq!(
@@ -1938,21 +1876,5 @@ mod tests {
             0,
             "imported ConceptMap must be gone"
         );
-    }
-
-    #[tokio::test]
-    async fn deleting_an_unknown_id_returns_204() {
-        let app = import_delete_router(make_state());
-        for path in [
-            "/CodeSystem/never-existed",
-            "/ValueSet/never-existed",
-            "/ConceptMap/never-existed",
-        ] {
-            assert_eq!(
-                send(&app, "DELETE", path).await.status(),
-                StatusCode::NO_CONTENT,
-                "DELETE {path} must be idempotent"
-            );
-        }
     }
 }

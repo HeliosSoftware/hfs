@@ -6,6 +6,7 @@ use std::env;
 use std::fmt;
 
 use crate::exclusion::ExclusionRule;
+use crate::sinks::QueueConfig;
 
 /// Which audit backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,27 @@ pub struct AuditConfig {
     pub cloudwatch_log_stream: Option<String>,
     /// AWS region override for CloudWatch Logs.
     pub cloudwatch_region: Option<String>,
+    /// Queue between the request path and the sink (`HFS_AUDIT_QUEUE_CAPACITY`,
+    /// `HFS_AUDIT_WRITERS`, `HFS_AUDIT_OVERFLOW`).
+    pub queue: QueueConfig,
+    /// Retries of a transient database-sink write (`HFS_AUDIT_WRITE_RETRIES`).
+    pub write_retries: u32,
+}
+
+/// Parse `key` with `FromStr`, falling back to `default` (with a warning)
+/// when it is set but invalid.
+fn env_parse<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr + fmt::Display,
+    T::Err: fmt::Display,
+{
+    match env::var(key) {
+        Ok(raw) => raw.trim().parse().unwrap_or_else(|e| {
+            tracing::warn!(%key, value = %raw, error = %e, %default, "Invalid audit setting; using the default");
+            default
+        }),
+        Err(_) => default,
+    }
 }
 
 impl AuditConfig {
@@ -100,6 +122,7 @@ impl AuditConfig {
             })
             .unwrap_or_default();
 
+        let defaults = Self::default();
         Self {
             backend,
             file_path: env::var("HFS_AUDIT_FILE_PATH").ok(),
@@ -118,6 +141,13 @@ impl AuditConfig {
             cloudwatch_log_group: env::var("HFS_AUDIT_CLOUDWATCH_LOG_GROUP").ok(),
             cloudwatch_log_stream: env::var("HFS_AUDIT_CLOUDWATCH_LOG_STREAM").ok(),
             cloudwatch_region: env::var("HFS_AUDIT_CLOUDWATCH_REGION").ok(),
+            queue: QueueConfig {
+                capacity: env_parse("HFS_AUDIT_QUEUE_CAPACITY", defaults.queue.capacity),
+                writers: env_parse("HFS_AUDIT_WRITERS", defaults.queue.writers),
+                overflow: env_parse("HFS_AUDIT_OVERFLOW", defaults.queue.overflow),
+                ..defaults.queue
+            },
+            write_retries: env_parse("HFS_AUDIT_WRITE_RETRIES", defaults.write_retries),
         }
     }
 }
@@ -140,6 +170,8 @@ impl fmt::Debug for AuditConfig {
             cloudwatch_log_group,
             cloudwatch_log_stream,
             cloudwatch_region,
+            queue,
+            write_retries,
         } = self;
         f.debug_struct("AuditConfig")
             .field("backend", backend)
@@ -155,6 +187,8 @@ impl fmt::Debug for AuditConfig {
             .field("cloudwatch_log_group", cloudwatch_log_group)
             .field("cloudwatch_log_stream", cloudwatch_log_stream)
             .field("cloudwatch_region", cloudwatch_region)
+            .field("queue", queue)
+            .field("write_retries", write_retries)
             .finish()
     }
 }
@@ -175,6 +209,8 @@ impl Default for AuditConfig {
             cloudwatch_log_group: None,
             cloudwatch_log_stream: None,
             cloudwatch_region: None,
+            queue: QueueConfig::default(),
+            write_retries: crate::sinks::database::RetryPolicy::default().max_retries,
         }
     }
 }
@@ -182,6 +218,7 @@ impl Default for AuditConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sinks::OverflowPolicy;
     use std::sync::{LazyLock, Mutex};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -213,6 +250,10 @@ mod tests {
         "HFS_AUDIT_CLOUDWATCH_LOG_GROUP",
         "HFS_AUDIT_CLOUDWATCH_LOG_STREAM",
         "HFS_AUDIT_CLOUDWATCH_REGION",
+        "HFS_AUDIT_QUEUE_CAPACITY",
+        "HFS_AUDIT_WRITERS",
+        "HFS_AUDIT_OVERFLOW",
+        "HFS_AUDIT_WRITE_RETRIES",
     ];
 
     fn clear_audit_env() {
@@ -308,6 +349,37 @@ mod tests {
         clear_audit_env();
         let config = AuditConfig::from_env();
         assert_eq!(config.backend, AuditBackend::None);
+    }
+
+    #[test]
+    fn test_from_env_queue_settings() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_audit_env();
+        let config = AuditConfig::from_env();
+        assert_eq!(config.queue, QueueConfig::default());
+        assert_eq!(config.queue.overflow, OverflowPolicy::Block);
+
+        unsafe {
+            env::set_var("HFS_AUDIT_QUEUE_CAPACITY", "500");
+            env::set_var("HFS_AUDIT_WRITERS", "2");
+            env::set_var("HFS_AUDIT_OVERFLOW", "drop");
+            env::set_var("HFS_AUDIT_WRITE_RETRIES", "0");
+        }
+        let config = AuditConfig::from_env();
+        assert_eq!(config.queue.capacity, 500);
+        assert_eq!(config.queue.writers, 2);
+        assert_eq!(config.queue.overflow, OverflowPolicy::Drop);
+        assert_eq!(config.write_retries, 0);
+
+        // Invalid values fall back to the defaults.
+        unsafe {
+            env::set_var("HFS_AUDIT_WRITERS", "many");
+            env::set_var("HFS_AUDIT_OVERFLOW", "spill");
+        }
+        let config = AuditConfig::from_env();
+        assert_eq!(config.queue.writers, QueueConfig::default().writers);
+        assert_eq!(config.queue.overflow, OverflowPolicy::Block);
+        clear_audit_env();
     }
 
     #[test]

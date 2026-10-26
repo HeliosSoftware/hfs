@@ -225,7 +225,8 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let mut props = req.properties.clone();
             props.sort();
             Some(format!(
-                "{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}",
+                req.selected_code_system_id.as_deref().unwrap_or(""),
                 req.system,
                 req.code,
                 req.version.as_deref().unwrap_or(""),
@@ -254,13 +255,27 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
-            let (system_id, cs_name, cs_version) = resolve_code_system(
-                &conn,
-                &resolved_cache,
-                &req.system,
-                req.version.as_deref(),
-                req.date.as_deref(),
-            )?;
+            let (system_id, cs_name, cs_version) =
+                if let Some(id) = req.selected_code_system_id.as_deref() {
+                    conn.query_row(
+                        "SELECT id, COALESCE(name, url), version FROM code_systems
+                     WHERE COALESCE(json_extract(resource_json, '$.id'), id) = ?1
+                       AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2)",
+                        rusqlite::params![id, req.date],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|error| HtsError::StorageError(error.to_string()))?
+                    .ok_or_else(|| HtsError::NotFound(format!("CodeSystem/{id}")))?
+                } else {
+                    resolve_code_system(
+                        &conn,
+                        &resolved_cache,
+                        &req.system,
+                        req.version.as_deref(),
+                        req.date.as_deref(),
+                    )?
+                };
 
             let (concept_id, display, definition) = find_concept(&conn, &system_id, &req.code)?;
 
@@ -319,7 +334,8 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             // ($expand and $validate-code already match designations
             // URL-wide via `concept_designations`).
             if let Some(lang) = req.display_language.as_deref() {
-                if req.version.is_none()
+                if req.selected_code_system_id.is_none()
+                    && req.version.is_none()
                     && !all_designations.iter().any(|d| {
                         d.language
                             .as_deref()
@@ -1195,7 +1211,8 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             {
                 let mut stmt = conn
                     .prepare_cached(
-                        "SELECT id, url, version, name, title, status
+                        "SELECT COALESCE(json_extract(resource_json, '$.id'), id), url, version, \
+                         name, title, status
                          FROM code_systems
                          WHERE (?1 IS NULL OR url = ?1)
                            AND (?2 IS NULL OR version = ?2)
@@ -1248,7 +1265,8 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
 
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, url, version, name, title, status, resource_json
+                    "SELECT COALESCE(json_extract(resource_json, '$.id'), id), url, version, name, \
+                     title, status, resource_json
                      FROM code_systems
                      WHERE (?1 IS NULL OR url = ?1)
                        AND (?2 IS NULL OR version = ?2)
@@ -1290,7 +1308,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 let (id, url, version, name, title, status, resource_json) =
                     row.map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-                let resource = resource_json
+                let mut resource = resource_json
                     .and_then(|j| serde_json::from_str(&j).ok())
                     .unwrap_or_else(|| {
                         build_synthetic_resource(
@@ -1303,6 +1321,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             &status,
                         )
                     });
+                resource["id"] = serde_json::Value::String(id);
                 results.push(resource);
             }
             Ok(results)

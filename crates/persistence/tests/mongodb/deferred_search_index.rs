@@ -67,6 +67,37 @@ pub(super) async fn deferred_backend(
     build_backend(config).await
 }
 
+/// Has `backend` record the `missing_params` fingerprints (#1999) of every
+/// type a [`patient_bundle`] writes, and waits until the catalog holds them.
+/// The first write of a type records its fingerprint with a background
+/// `update` upsert; an `update` failpoint enabled before that would be spent
+/// (or counted) on the catalog write instead of the post-commit batch. The
+/// resources go to a tenant of their own.
+async fn record_missing_fingerprints(backend: &MongoBackend) {
+    let tenant = create_tenant("missing-fp-record");
+    let resources = [
+        patient_json("Recorded", "MRN-RECORDED"),
+        observation_json("Patient/recorded", 0),
+        medication_request_json("Patient/recorded"),
+        json!({"resourceType": "Medication"}),
+    ];
+    for content in resources {
+        let resource_type = content["resourceType"].as_str().unwrap().to_string();
+        backend
+            .create(&tenant, &resource_type, content, FhirVersion::default())
+            .await
+            .expect("create a resource to record its fingerprint");
+    }
+    let waited = Instant::now();
+    while count_docs(backend, "missing_params_fingerprints", doc! {}).await < 4 {
+        assert!(
+            waited.elapsed() < Duration::from_secs(10),
+            "the missing_params fingerprints were never recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// A second backend on `backend`'s database under another `appName`, with the
 /// default config: a restarted server, or another instance, that runs the
 /// repair.
@@ -1430,6 +1461,7 @@ async fn interrupted_post_commit_indexing_is_repaired_at_startup() {
     };
     let tenant = create_tenant("def-startup");
     let tenant_id = tenant.tenant_id().as_str();
+    record_missing_fingerprints(&backend).await;
     let Some(fail_point) = FailPoint::enable(
         app,
         doc! { "failCommands": ["update"], "errorCode": 2 },
@@ -1531,6 +1563,7 @@ async fn dropping_the_request_during_post_commit_indexing_is_repaired() {
     let backend = Arc::new(backend);
     let tenant = create_tenant("def-drop");
     let tenant_id = tenant.tenant_id().as_str();
+    record_missing_fingerprints(&backend).await;
     let Some(fail_point) = FailPoint::enable(
         app,
         doc! { "failCommands": ["update"], "blockConnection": true, "blockTimeMS": 3000_i64 },
@@ -2091,6 +2124,7 @@ async fn the_live_step_does_not_outlive_the_bundle_deadline() {
     let tenant_id = tenant.tenant_id().as_str();
     // A POST-only Bundle sends no `update` of its own: the one the failpoint
     // blocks for ten seconds is the first batch's, clearing its markers.
+    record_missing_fingerprints(&backend).await;
     let Some(fail_point) = FailPoint::enable(
         app,
         doc! { "failCommands": ["update"], "blockConnection": true, "blockTimeMS": 10_000_i64 },
@@ -2741,6 +2775,7 @@ async fn a_concurrent_update_during_post_commit_indexing_leaves_only_current_row
     let backend_a = Arc::new(backend_a);
     let tenant = create_tenant("def-concurrent");
     let tenant_id = tenant.tenant_id().as_str();
+    record_missing_fingerprints(&backend_a).await;
     let Some(fail_point) = FailPoint::enable(
         app,
         doc! { "failCommands": ["update"], "blockConnection": true, "blockTimeMS": 2500_i64 },

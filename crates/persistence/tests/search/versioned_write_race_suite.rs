@@ -375,6 +375,121 @@ pub async fn concurrent_update_and_plain_delete_stay_consistent<S>(
     }
 }
 
+/// How many unconditional PUTs race onto one tombstone. `create_or_update`
+/// retries a lost race three times, and each lost attempt means another racer
+/// committed after this one's read — each racer commits once and then stops —
+/// so four racers are the most for which every PUT succeeding is guaranteed
+/// rather than likely.
+const RESTORE_WRITERS: usize = 4;
+
+/// `RESTORE_WRITERS` tasks race an unconditional `create_or_update` onto the
+/// same soft-deleted id (#2111). Every PUT succeeds: exactly one restores the
+/// tombstone (`created`, version 3) and the rest converge through the update
+/// arm, each under its own version. The history is contiguous with no
+/// duplicate, and its newest entry carries the live body. A restore that is a
+/// read-then-write instead lets two racers both compute version 3: the second
+/// history insert violates the primary key (an `Internal` error, a 500), and
+/// the live row and history version 3 hold different bodies.
+pub async fn concurrent_puts_onto_a_tombstone_all_succeed<S>(
+    backend: Arc<S>,
+    base: &str,
+    rounds: usize,
+) where
+    S: ResourceStorage + VersionedStorage + Send + Sync + 'static,
+{
+    let t = tenant(base, "restore-race");
+
+    for round in 0..rounds {
+        let id = format!("race-{round}");
+        seed(backend.as_ref(), &t, &id).await;
+        backend
+            .delete(&t, "Patient", &id)
+            .await
+            .expect("delete seeded patient");
+        assert_eq!(
+            backend
+                .list_versions(&t, "Patient", &id)
+                .await
+                .expect("list versions"),
+            vec!["1".to_string(), "2".to_string()],
+            "the tombstone is version 2"
+        );
+        let barrier = Arc::new(Barrier::new(RESTORE_WRITERS));
+
+        let mut tasks = Vec::new();
+        for n in 0..RESTORE_WRITERS {
+            let (backend, t, barrier, id) =
+                (backend.clone(), t.clone(), barrier.clone(), id.clone());
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                backend
+                    .create_or_update(
+                        &t,
+                        "Patient",
+                        &id,
+                        patient(&id, &format!("Writer{n}")),
+                        FhirVersion::default(),
+                    )
+                    .await
+            }));
+        }
+        let mut puts = Vec::new();
+        for task in tasks {
+            puts.push(task.await.expect("writer task"));
+        }
+        let context = format!("round {round}");
+
+        let puts: Vec<(StoredResource, bool)> = puts
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|e| panic!("{context}: every PUT must succeed: {e:?}")))
+            .collect();
+        assert_eq!(
+            puts.iter().filter(|(_, created)| *created).count(),
+            1,
+            "{context}: exactly one PUT restores the tombstone"
+        );
+        let mut versions: Vec<u64> = puts
+            .iter()
+            .map(|(stored, _)| stored.version_id().parse().expect("numeric version"))
+            .collect();
+        versions.sort_unstable();
+        let expected: Vec<u64> = (3..3 + RESTORE_WRITERS as u64).collect();
+        assert_eq!(
+            versions, expected,
+            "{context}: each PUT gets its own version, continuing the chain"
+        );
+
+        let newest = (2 + RESTORE_WRITERS).to_string();
+        let stored = backend
+            .read(&t, "Patient", &id)
+            .await
+            .expect("read after race")
+            .expect("live after restore");
+        assert_eq!(stored.version_id(), newest, "{context}");
+
+        let expected_versions: Vec<String> =
+            (1..=2 + RESTORE_WRITERS).map(|v| v.to_string()).collect();
+        assert_eq!(
+            backend
+                .list_versions(&t, "Patient", &id)
+                .await
+                .expect("list versions"),
+            expected_versions,
+            "{context}: history has no gap and no duplicate"
+        );
+        let latest = backend
+            .vread(&t, "Patient", &id, &newest)
+            .await
+            .expect("vread newest")
+            .expect("newest version exists");
+        assert_eq!(
+            latest.content(),
+            stored.content(),
+            "{context}: the newest history entry is the live body"
+        );
+    }
+}
+
 /// `delete_versioned` is a compare-and-swap on the *current* version: a stale
 /// version is refused and deletes nothing, the current one deletes, and a
 /// second delete of the same version finds nothing live.
