@@ -565,18 +565,23 @@ async fn mongodb_missing_metadata_failed_extraction_is_reported_by_reindex() {
         query.total = Some(TotalMode::Accurate);
         assert_results(&backend, &tenant, &query, &[]).await;
     }
+    let mut stats = helios_persistence::search::ReindexPageStats::default();
     let outcomes = backend
-        .write_search_entries_page(&tenant, &[resource])
+        .write_search_entries_page_timed(&tenant, &[resource], &mut stats)
         .await;
     assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].is_ok(), "{outcomes:?}");
+    let tally = stats
+        .parameter_failures
+        .get("failed-index")
+        .expect("the failing parameter is tallied");
+    assert_eq!(tally.resources, 1);
     assert!(
-        outcomes[0]
-            .as_ref()
-            .unwrap_err()
-            .to_string()
-            .contains("failed-index"),
-        "{outcomes:?}"
+        tally.sample_error.contains("single"),
+        "{:?}",
+        tally.sample_error
     );
+    assert_eq!(stats.parameter_failures.len(), 1, "{stats:?}");
     db.drop().await.unwrap();
 }
 
@@ -2922,3 +2927,134 @@ async fn mongodb_missing_conditional_criteria_cross_candidate_batches() {
         db.drop().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn mongodb_reindex_reports_parameter_extraction_failures_as_warnings() {
+    let Some(backend) = create_backend("missing_param_warnings").await else {
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant = create_tenant("missing-param-warnings");
+    register_parameters(&backend, &tenant).await;
+    backend
+        .create(
+            &tenant,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter", "id": "failed-index",
+                "url": "urn:hfs:test:failed-index", "name": "failed-index",
+                "status": "active", "code": "failed-index", "base": ["Observation"],
+                "type": "token", "expression": "Observation.identifier.single()",
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for number in 0..3 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("failing-{number}"),
+                    "status": "final", "code": {"text": "example"},
+                    "identifier": [{"value": "one"}, {"value": "two"}],
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("clean", vec![]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let op = helios_persistence::search::ReindexOperation::new(
+        backend.clone(),
+        backend.tenant_registries().clone(),
+    );
+    let job = op
+        .start(
+            tenant.clone(),
+            helios_persistence::search::ReindexRequest::for_types(["Observation"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = crate::reindex_id_walk::wait_for_terminal(&op, &job).await;
+
+    assert_eq!(
+        progress.status,
+        helios_persistence::search::ReindexStatus::Completed,
+        "{progress:?}"
+    );
+    assert!(progress.errors.is_empty(), "{progress:?}");
+    assert_eq!(progress.processed_resources, 4, "{progress:?}");
+    assert_eq!(progress.parameter_warnings.len(), 1, "{progress:?}");
+    let warning = progress.parameter_warnings.get("failed-index").unwrap();
+    assert_eq!(warning.resources, 3, "{progress:?}");
+    assert!(
+        warning.sample_error.contains("single"),
+        "{:?}",
+        warning.sample_error
+    );
+
+    let parameters = progress.to_parameters();
+    let warning_part = parameters["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "parameterWarning")
+        .expect("status lists the parameter warning");
+    let parts = warning_part["part"].as_array().unwrap();
+    assert!(
+        parts
+            .iter()
+            .any(|p| p["name"] == "parameter" && p["valueCode"] == "failed-index")
+    );
+    assert!(
+        parts
+            .iter()
+            .any(|p| p["name"] == "resources" && p["valueInteger"] == 3)
+    );
+
+    let db = backend.get_database().await.unwrap();
+    for number in 0..3 {
+        let names =
+            missing_parameters(&db, &tenant, "Observation", &format!("failing-{number}")).await;
+        assert!(
+            !names.iter().any(|name| name == "failed-index"),
+            "{names:?}"
+        );
+    }
+    let rows = db
+        .collection::<Document>("search_index")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "param_name": "missing-token",
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    let status_rows = db
+        .collection::<Document>("search_index")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "param_name": "status",
+        })
+        .await
+        .unwrap();
+    assert_eq!(status_rows, 4, "other parameters' rows are written");
+    db.drop().await.unwrap();
+}
+
+
+

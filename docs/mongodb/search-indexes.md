@@ -209,6 +209,22 @@ until a successful rewrite. Check job errors and repair failed resources;
 metadata is not proof that all value-index writes succeeded. Metadata-update
 time is included in the insert timing statistic.
 
+### Single-parameter extraction failures (#2002)
+
+A parameter that fails extraction on a resource — a custom SearchParameter
+whose expression errors, such as `.single()` over a repeating element — does
+not fail the resource. Every other parameter's rows and the resource's
+metadata are written (the failed parameter recorded neither as present nor as
+missing, as above), and `$reindex` reports the resource OK. Instead the job
+aggregates one warning per failing parameter: `GET /$reindex-status/{job_id}`
+lists a `parameterWarning` part carrying the parameter code, how many
+resources it failed on, and one example error, so an operator can fix or
+retire the definition without wading through per-resource errors. The
+warnings do not mark the job failed and do not appear in the terminal
+`AuditEvent`'s outcome. A whole-resource extraction failure (the resource
+could not be converted at all) still reports that resource as a job error,
+exactly as an insert failure does.
+
 ### Upgrade and definition maintenance
 
 1. Drain older writers before allowing metadata-aware writers to update the

@@ -154,7 +154,22 @@ pub struct ExtractionWithMissing {
     /// Parameters that support absence metadata and produced values.
     pub present: Vec<PresentParameter>,
     /// Extraction failures, retained for reindex reporting.
-    pub failures: Vec<String>,
+    pub failures: Vec<ExtractionFailure>,
+}
+
+/// One search parameter whose extraction failed on one resource (#2002).
+#[derive(Debug, Clone)]
+pub struct ExtractionFailure {
+    /// The failing parameter's code.
+    pub code: String,
+    /// The extraction error.
+    pub error: String,
+}
+
+impl std::fmt::Display for ExtractionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.error)
+    }
 }
 
 /// Removes the composite groups that can never match a composite search.
@@ -486,7 +501,10 @@ impl SearchParameterExtractor {
                 }
                 Err(e) => {
                     if let Some(extraction) = extraction.as_deref_mut() {
-                        extraction.failures.push(format!("{}: {e}", param.code));
+                        extraction.failures.push(ExtractionFailure {
+                            code: param.code.clone(),
+                            error: e.to_string(),
+                        });
                     }
                     // Log the error but continue with other parameters
                     tracing::warn!(
@@ -526,7 +544,10 @@ impl SearchParameterExtractor {
                     }
                     Err(e) => {
                         if let Some(extraction) = extraction.as_deref_mut() {
-                            extraction.failures.push(format!("{}: {e}", param.code));
+                            extraction.failures.push(ExtractionFailure {
+                                code: param.code.clone(),
+                                error: e.to_string(),
+                            });
                         }
                         tracing::warn!(
                             "Failed to extract values for common parameter '{}': {}",
@@ -1632,7 +1653,7 @@ mod tests {
                 extraction
                     .failures
                     .iter()
-                    .any(|error| error.starts_with(name)),
+                    .any(|failure| failure.code == name),
                 "extraction failure must remain visible: {name}"
             );
         }

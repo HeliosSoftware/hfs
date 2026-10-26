@@ -27,7 +27,7 @@ use crate::error::{BackendError, StorageError, StorageResult, classify_mongodb_e
 use crate::search::reindex::ReindexPageStats;
 use crate::types::StoredResource;
 
-use super::storage::{SearchIndexDocuments, internal_error};
+use super::storage::{ExtractionReport, SearchIndexDocuments, internal_error};
 
 /// A type's first page: too little is known yet to size from observation (#1403).
 pub(super) const REINDEX_SUBBATCH_FIRST: usize = 32;
@@ -312,8 +312,9 @@ async fn stored_missing_params(
 /// wasted work (#1403).
 fn flatten_sub_batch(
     start: usize,
-    prepared: Vec<(SearchIndexDocuments, Option<String>)>,
+    prepared: Vec<(SearchIndexDocuments, ExtractionReport)>,
     extract_failures: &mut [Option<String>],
+    parameter_failures: &mut Vec<crate::search::ExtractionFailure>,
     doc_counts: &mut [usize],
 ) -> SubBatchDocs {
     let mut batch = SubBatchDocs {
@@ -323,10 +324,14 @@ fn flatten_sub_batch(
         contained_docs: Vec::new(),
         missing_params: Vec::new(),
     };
-    for (offset, (docs, failure)) in prepared.into_iter().enumerate() {
+    for (offset, (docs, report)) in prepared.into_iter().enumerate() {
         let i = start + offset;
         doc_counts[i] = docs.own.len() + docs.contained.len();
-        extract_failures[i] = failure;
+        match report {
+            ExtractionReport::Clean => {}
+            ExtractionReport::FailedParameters(failures) => parameter_failures.extend(failures),
+            ExtractionReport::FailedResource(message) => extract_failures[i] = Some(message),
+        }
         batch
             .missing_params
             .push((i, docs.missing_params, docs.missing_fp));
@@ -535,13 +540,20 @@ impl PageFailure {
 
     /// [`Self::fan_out`] for a metadata-only page (#2008): every resource
     /// fails and none had its metadata written.
-    pub(super) fn fan_out_metadata(&self, n: usize) -> (Vec<StorageResult<()>>, u64) {
+    pub(super) fn fan_out_metadata(
+        &self,
+        n: usize,
+    ) -> (
+        Vec<StorageResult<()>>,
+        u64,
+        Vec<crate::search::ExtractionFailure>,
+    ) {
         let results = self
             .fan_out(n)
             .into_iter()
             .map(|outcome| outcome.map(|_| ()))
             .collect();
-        (results, 0)
+        (results, 0, Vec::new())
     }
 }
 
@@ -1615,24 +1627,32 @@ impl super::MongoBackend {
         &self,
         tenant_id: &str,
         r: &StoredResource,
-    ) -> (SearchIndexDocuments, Option<String>) {
+    ) -> (SearchIndexDocuments, ExtractionReport) {
         self.search_index_documents_checked(tenant_id, r.resource_type(), r.id(), r.content())
     }
 
     /// Metadata-only page write (#2008): extracts every resource exactly as a
     /// rebuild does, then writes only its `missing_params`, under the same
     /// version guard, and never touches `search_index` or
-    /// `search_index_contained`. A resource whose extraction failed has its
-    /// metadata removed rather than claimed, as in a rebuild, and is reported
-    /// as failed. Returns the per-resource outcomes and how many resources the
-    /// updates matched.
+    /// `search_index_contained`. A resource whose whole extraction failed has
+    /// its metadata removed rather than claimed, as in a rebuild, and is
+    /// reported as failed; a single failing parameter leaves the resource OK
+    /// and is tallied as a warning (#2002). Returns the per-resource outcomes,
+    /// how many resources the updates matched, and the parameter failures.
     pub(super) async fn write_metadata_page(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resources: &[StoredResource],
         skip_existing: bool,
-    ) -> Result<(Vec<StorageResult<()>>, u64), PageFailure> {
+    ) -> Result<
+        (
+            Vec<StorageResult<()>>,
+            u64,
+            Vec<crate::search::ExtractionFailure>,
+        ),
+        PageFailure,
+    > {
         let n = resources.len();
         let prepare = |i: usize| self.extract_one(tenant_id, &resources[i]);
         let pool = if tokio_multi_thread_runtime() && n >= REINDEX_SERIAL_POOL_MIN_PAGE {
@@ -1640,7 +1660,7 @@ impl super::MongoBackend {
         } else {
             None
         };
-        let prepared: Vec<(SearchIndexDocuments, Option<String>)> = if pool.is_some() {
+        let prepared: Vec<(SearchIndexDocuments, ExtractionReport)> = if pool.is_some() {
             let env = PrepareEnv {
                 pool,
                 gate: self.reindex_prepare_gate(),
@@ -1651,8 +1671,9 @@ impl super::MongoBackend {
         };
 
         let mut extract_failures: Vec<Option<String>> = Vec::with_capacity(n);
+        let mut parameter_failures: Vec<crate::search::ExtractionFailure> = Vec::new();
         let mut updates: Vec<(usize, Document)> = Vec::with_capacity(n);
-        for (i, (docs, failure)) in prepared.into_iter().enumerate() {
+        for (i, (docs, report)) in prepared.into_iter().enumerate() {
             updates.push((
                 i,
                 metadata_only_update(
@@ -1663,7 +1684,16 @@ impl super::MongoBackend {
                     skip_existing,
                 ),
             ));
-            extract_failures.push(failure);
+            match report {
+                ExtractionReport::Clean => extract_failures.push(None),
+                ExtractionReport::FailedParameters(failures) => {
+                    extract_failures.push(None);
+                    parameter_failures.extend(failures);
+                }
+                ExtractionReport::FailedResource(message) => {
+                    extract_failures.push(Some(message));
+                }
+            }
         }
 
         let (write_failures, matched) = update_missing_metadata_counted(db, &updates)
@@ -1673,7 +1703,7 @@ impl super::MongoBackend {
             .into_iter()
             .map(|outcome| outcome.map(|_| ()))
             .collect();
-        Ok((outcomes, matched))
+        Ok((outcomes, matched, parameter_failures))
     }
 
     /// Serial writer: extracts every resource, deletes the page's stale
@@ -1713,8 +1743,15 @@ impl super::MongoBackend {
             ((0..n).map(&prepare).collect(), false)
         };
         let mut extract_failures: Vec<Option<String>> = vec![None; n];
+        let mut parameter_failures: Vec<crate::search::ExtractionFailure> = Vec::new();
         let mut doc_counts: Vec<usize> = vec![0; n];
-        let mut batch = flatten_sub_batch(0, prepared, &mut extract_failures, &mut doc_counts);
+        let mut batch = flatten_sub_batch(
+            0,
+            prepared,
+            &mut extract_failures,
+            &mut parameter_failures,
+            &mut doc_counts,
+        );
         let missing_updates = batch.missing_updates(tenant_id, resources);
         stats.extract += started.elapsed();
         stats.sub_batches += 1;
@@ -1772,6 +1809,7 @@ impl super::MongoBackend {
 
         let docs: u64 = doc_counts.iter().sum::<usize>() as u64;
         record_page_perf(stats, stats.db_wait.unwrap_or_default(), docs);
+        stats.record_parameter_failures(parameter_failures);
         let mut outcomes = page_outcomes(extract_failures, insert_failures, &doc_counts);
         apply_verification_outcomes(&mut outcomes, verification_failures, resources);
         Ok(outcomes)
@@ -1822,6 +1860,7 @@ impl super::MongoBackend {
         let mut extract_failures: Vec<Option<String>> = vec![None; n];
         let mut doc_counts: Vec<usize> = vec![0; n];
         let mut insert_failures: HashMap<usize, String> = HashMap::new();
+        let mut parameter_failures: Vec<crate::search::ExtractionFailure> = Vec::new();
         let mut inserted = InsertedIds::default();
         let mut previous = PreviousIds::default();
         let mut in_flight: Option<AbortOnDrop<DbTask<SubBatchInsert>>> = None;
@@ -1837,6 +1876,7 @@ impl super::MongoBackend {
                 range.start,
                 prepared,
                 &mut extract_failures,
+                &mut parameter_failures,
                 &mut doc_counts,
             );
             missing_updates.extend(batch.missing_updates(tenant_id, resources));
@@ -1932,6 +1972,7 @@ impl super::MongoBackend {
             self.record_reindex_docs(t, n as u64, docs);
         }
         record_page_perf(stats, page_wait, docs);
+        stats.record_parameter_failures(parameter_failures);
         let mut outcomes = page_outcomes(extract_failures, insert_failures, &doc_counts);
         apply_verification_outcomes(&mut outcomes, verification_failures, resources);
         Ok(outcomes)
@@ -2238,7 +2279,8 @@ mod tests {
         permanent.insert(1, "metadata rejected".to_string());
         let failure =
             PageFailure::driver("metadata page", command_error(2)).with_permanent(permanent);
-        let (results, written) = failure.fan_out_metadata(3);
+        let (results, written, parameter_failures) = failure.fan_out_metadata(3);
+        assert!(parameter_failures.is_empty());
         assert_eq!(written, 0);
         assert_eq!(results.len(), 3);
         assert!(matches!(&results[0], Err(e) if e.to_string().contains("metadata page")));
@@ -2467,7 +2509,7 @@ mod tests {
                     missing_params: Some(vec!["absent".into()]),
                     missing_fp: Some("fp1".into()),
                 },
-                None,
+                ExtractionReport::Clean,
             ),
             (
                 SearchIndexDocuments {
@@ -2476,15 +2518,22 @@ mod tests {
                     missing_params: None,
                     missing_fp: None,
                 },
-                Some("boom".to_string()),
+                ExtractionReport::FailedResource("boom".to_string()),
             ),
         ];
         let mut extract_failures: Vec<Option<String>> = vec![None; 7];
+        let mut parameter_failures: Vec<crate::search::ExtractionFailure> = Vec::new();
         let mut doc_counts: Vec<usize> = vec![0; 7];
 
         // start = 5: this sub-batch is the third of a bigger page, so its
         // owners land at the page-wide indices 5 and 6, not 0 and 1.
-        let batch = flatten_sub_batch(5, prepared, &mut extract_failures, &mut doc_counts);
+        let batch = flatten_sub_batch(
+            5,
+            prepared,
+            &mut extract_failures,
+            &mut parameter_failures,
+            &mut doc_counts,
+        );
 
         assert_eq!(batch.own_owners, vec![5, 6]);
         assert_eq!(batch.own_docs, vec![own_a, own_b]);

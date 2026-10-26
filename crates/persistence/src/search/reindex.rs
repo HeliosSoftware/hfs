@@ -3,7 +3,7 @@
 //! Provides the ability to rebuild search indexes for existing resources
 //! when new SearchParameters are added or when indexes need to be repaired.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -126,7 +126,7 @@ pub struct SkippedResource {
 /// it as each phase completes, so a page that fails part-way still reports the
 /// phases it finished. A writer that does not measure leaves it zero; the driver
 /// still times the whole call itself.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReindexPageStats {
     /// Search-parameter extraction and building the page's index entries.
@@ -167,6 +167,8 @@ pub struct ReindexPageStats {
     /// value already matched; MongoDB's `missing_params` (#2005). Zero for a
     /// writer that keeps no such metadata.
     pub metadata_updates_skipped: u64,
+    /// Per-parameter extraction failures of the page's resources (#2002).
+    pub parameter_failures: BTreeMap<String, ParameterFailureTally>,
 }
 
 impl ReindexPageStats {
@@ -196,7 +198,16 @@ impl ReindexPageStats {
         self.stale_rows_found += other.stale_rows_found;
         self.stale_rows_remaining += other.stale_rows_remaining;
         self.metadata_updates_skipped += other.metadata_updates_skipped;
+        merge_parameter_tallies(&mut self.parameter_failures, &other.parameter_failures);
         self.db_wait = db_wait;
+    }
+
+    /// Tallies one page's per-parameter extraction failures (#2002).
+    pub fn record_parameter_failures(
+        &mut self,
+        failures: impl IntoIterator<Item = super::ExtractionFailure>,
+    ) {
+        tally_parameter_failures(&mut self.parameter_failures, failures);
     }
 }
 
@@ -596,7 +607,7 @@ pub trait ReindexTarget: Send + Sync {
         tenant: &TenantContext,
         resources: &[StoredResource],
         skip_existing: bool,
-    ) -> (Vec<StorageResult<()>>, u64) {
+    ) -> (Vec<StorageResult<()>>, u64, Vec<super::ExtractionFailure>) {
         let _ = (tenant, skip_existing);
         let results = resources
             .iter()
@@ -608,7 +619,7 @@ pub trait ReindexTarget: Send + Sync {
                 .into())
             })
             .collect();
-        (results, 0)
+        (results, 0, Vec::new())
     }
 }
 
@@ -957,6 +968,11 @@ pub struct ReindexProgress {
     /// Resources whose search metadata a metadata-only job wrote.
     #[serde(default)]
     pub metadata_updated: u64,
+    /// Per-parameter extraction-failure warnings, keyed by parameter code
+    /// (#2002). Warnings, not errors: the other parameters' rows were
+    /// written and the resource is reported OK.
+    #[serde(default)]
+    pub parameter_warnings: BTreeMap<String, ParameterFailureTally>,
 }
 
 /// An error encountered during reindexing.
@@ -1102,6 +1118,7 @@ impl ReindexProgress {
             resource_scoped: false,
             metadata_only: false,
             metadata_updated: 0,
+            parameter_warnings: BTreeMap::new(),
         }
     }
 
@@ -1178,7 +1195,53 @@ impl ReindexProgress {
                 "valueInteger": self.errors.len() - MAX_REPORTED_RESOURCE_ERRORS
             }));
         }
+        for (parameter_code, warning) in &self.parameter_warnings {
+            parameter.push(serde_json::json!({
+                "name": "parameterWarning",
+                "part": [
+                    {"name": "parameter", "valueCode": parameter_code},
+                    {"name": "resources", "valueInteger": warning.resources},
+                    {"name": "sampleError", "valueString": warning.sample_error}
+                ]
+            }));
+        }
         serde_json::json!({"resourceType": "Parameters", "parameter": parameter})
+    }
+}
+
+/// How many resources one parameter failed extraction on, with one example
+/// error (#2002).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterFailureTally {
+    /// Resources the parameter failed on.
+    pub resources: u64,
+    /// The first error seen, as an example.
+    pub sample_error: String,
+}
+
+pub(crate) fn tally_parameter_failures(
+    into: &mut BTreeMap<String, ParameterFailureTally>,
+    failures: impl IntoIterator<Item = super::ExtractionFailure>,
+) {
+    for failure in failures {
+        let tally = into.entry(failure.code).or_default();
+        tally.resources += 1;
+        if tally.sample_error.is_empty() {
+            tally.sample_error = failure.error;
+        }
+    }
+}
+
+pub(crate) fn merge_parameter_tallies(
+    into: &mut BTreeMap<String, ParameterFailureTally>,
+    from: &BTreeMap<String, ParameterFailureTally>,
+) {
+    for (code, other) in from {
+        let tally = into.entry(code.clone()).or_default();
+        tally.resources += other.resources;
+        if tally.sample_error.is_empty() {
+            tally.sample_error = other.sample_error.clone();
+        }
     }
 }
 
@@ -2531,6 +2594,10 @@ async fn write_resource_batch(
     if let Some(progress) = jobs_guard.get_mut(job_id) {
         progress.processed_resources += resources.len() as u64 + extra_processed;
         progress.entries_created += entries;
+        merge_parameter_tallies(
+            &mut progress.parameter_warnings,
+            &batch.writer.parameter_failures,
+        );
     }
     drop(jobs_guard);
 
@@ -2565,9 +2632,13 @@ async fn write_metadata_batch(
     if !resources.is_empty() {
         for writer in writers {
             let started = Instant::now();
-            let (outcomes, written) = writer
+            let (outcomes, written, page_parameter_failures) = writer
                 .write_search_metadata_page(tenant, resources, metadata.skip_existing)
                 .await;
+            tally_parameter_failures(
+                &mut batch.writer.parameter_failures,
+                page_parameter_failures,
+            );
             batch.write += started.elapsed();
             updated = updated.max(written);
             for (i, outcome) in outcomes.into_iter().enumerate() {
@@ -2591,6 +2662,10 @@ async fn write_metadata_batch(
     if let Some(progress) = jobs_guard.get_mut(job_id) {
         progress.processed_resources += resources.len() as u64 + extra_processed;
         progress.metadata_updated += updated;
+        merge_parameter_tallies(
+            &mut progress.parameter_warnings,
+            &batch.writer.parameter_failures,
+        );
     }
     drop(jobs_guard);
 
@@ -2669,7 +2744,7 @@ fn record_and_log_page(
     resource_type: &str,
     record: PageRecord,
 ) {
-    let recorded = stats.record_page(record, Instant::now());
+    let recorded = stats.record_page(record.clone(), Instant::now());
     log_page(tenant, job_id, resource_type, &recorded, &record);
     if let Some(p) = &recorded.progress {
         log_progress(tenant, job_id, p);
@@ -6469,7 +6544,11 @@ mod tests {
             _: &TenantContext,
             resources: &[StoredResource],
             skip_existing: bool,
-        ) -> (Vec<StorageResult<()>>, u64) {
+        ) -> (
+            Vec<StorageResult<()>>,
+            u64,
+            Vec<crate::search::ExtractionFailure>,
+        ) {
             self.pages.lock().push((
                 resources.iter().map(|r| r.id().to_string()).collect(),
                 skip_existing,
@@ -6489,7 +6568,7 @@ mod tests {
                 })
                 .collect();
             let written = results.iter().filter(|r| r.is_ok()).count() as u64;
-            (results, written)
+            (results, written, Vec::new())
         }
     }
 
@@ -6605,7 +6684,7 @@ mod tests {
             .await
             .unwrap()
             .resources;
-        let (results, written) = index
+        let (results, written, _) = index
             .write_search_metadata_page(&TenantContext::system(), &resources, false)
             .await;
         assert_eq!(written, 0);
