@@ -2556,13 +2556,17 @@ impl SearchIndexDocuments {
     }
 }
 
-/// Unknown extraction removes previous metadata rather than claiming known absence.
+/// How one resource's search-parameter extraction went (#2002).
 pub(super) enum ExtractionReport {
+    /// Every parameter extracted.
     Clean,
+    /// Some parameters failed; the rest were indexed and the resource is OK.
     FailedParameters(Vec<crate::search::ExtractionFailure>),
+    /// The resource could not be extracted at all; it is reported as failed.
     FailedResource(String),
 }
 
+/// Unknown extraction removes previous metadata rather than claiming known absence.
 pub(super) fn with_missing_metadata_update(
     mut update: Document,
     missing_params: Option<&[String]>,

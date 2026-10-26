@@ -3055,6 +3055,3 @@ async fn mongodb_reindex_reports_parameter_extraction_failures_as_warnings() {
     assert_eq!(status_rows, 4, "other parameters' rows are written");
     db.drop().await.unwrap();
 }
-
-
-
