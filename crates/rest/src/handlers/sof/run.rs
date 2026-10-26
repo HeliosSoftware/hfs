@@ -1265,9 +1265,13 @@ fn channel_body_response(
     content_type: &'static str,
     runner_label: Option<&str>,
 ) -> Response {
+    // `unfold` panics if polled again after it ends. The compression layer's
+    // body reader does exactly that when the client sends `Accept-Encoding`,
+    // which aborted the response with an empty gzip body — so fuse it.
     let body_stream = futures::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|chunk| (chunk, rx))
-    });
+    })
+    .fuse();
     let body = axum::body::Body::from_stream(body_stream);
 
     let mut response = Response::new(body);
