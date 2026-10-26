@@ -906,7 +906,7 @@ pub(crate) fn write_resource_in_transaction(
         .optional()
         .map_err(|error| HtsError::StorageError(error.to_string()))?;
     if owner.as_deref().is_some_and(|owner| owner != id) {
-        return Err(HtsError::InvalidRequest(
+        return Err(HtsError::Conflict(
             "Canonical URL and version already belong to another resource id".into(),
         ));
     }

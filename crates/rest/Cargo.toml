@@ -172,8 +172,8 @@ rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"]
 
 # Read streamed Parquet / Arrow IPC responses back in tests. Same versions as
 # helios-sof, which does the encoding.
-arrow = "54.0"
-parquet = "54.0"
+arrow = "60.0"
+parquet = "60.0"
 
 # Temp files
 tempfile = "3"
