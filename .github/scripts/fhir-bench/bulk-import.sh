@@ -129,7 +129,8 @@ case "$BACKEND" in
     export HFS_ELASTICSEARCH_REINDEX_REFRESH="${HFS_ELASTICSEARCH_REINDEX_REFRESH:-false}"
     # Indexing recipe per leg, from owner-reviewed measurements: on a 133,527-
     # resource slice HFS's defaults took ~82 s against 18-32 s for this recipe
-    # (index while ingesting, 4 files x 4 ES bulk workers, batches of 1000).
+    # (index while ingesting, 4 files x 4 ES bulk workers, batches of 1000; on
+    # sqlite-elasticsearch HFS ingests one file at a time whatever FILE_CONCURRENCY says).
     # No refresh interval is set: measured, no gain. Env vars from the caller win.
     export HFS_BULK_SUBMIT_DEFER_INDEXING="${HFS_BULK_SUBMIT_DEFER_INDEXING:-false}"
     export HFS_BULK_SUBMIT_FILE_CONCURRENCY="${HFS_BULK_SUBMIT_FILE_CONCURRENCY:-4}"

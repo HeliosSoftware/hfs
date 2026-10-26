@@ -158,16 +158,12 @@ def _is_chart_row(label):
 
 
 def _fill(vals):
-    """Fill gaps with nearest known value so the line stays continuous."""
-    known = [v for v in vals if v is not None]
-    if not known:
+    """The series as plotted: only a leg with a value in every run gets a line.
+    A gap is never filled with a neighbouring value (a renamed row or a leg that
+    did not run would otherwise draw a flat line); the tables show the gap as a dash."""
+    if not vals or any(v is None for v in vals):
         return None
-    out, last = [], None
-    for v in vals:
-        last = v if v is not None else last
-        out.append(last)
-    first = known[0]
-    return [first if v is None else v for v in out]
+    return list(vals)
 
 
 def _clean(s):

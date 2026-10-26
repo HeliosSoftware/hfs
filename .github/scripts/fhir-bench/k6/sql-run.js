@@ -66,7 +66,9 @@ const BASE_URL = __ENV.BASE_URL
 const JSON_HEADERS = { 'Accept': 'application/json', 'Content-Type': 'application/json' }
 const rows = new Counter('sql_run_rows')
 
-const FILTER_CODES = ['8302-2', '29463-7', '8867-4', '8480-6']
+// Top-level Observation.code values in the Synthea corpus (8480-6 is only a component
+// of the 85354-9 panel, so it would match no row and fail the rows > 0 check).
+const FILTER_CODES = ['8302-2', '29463-7', '8867-4', '39156-5']
 
 function view(name, resource, columns, where) {
   const vd = {

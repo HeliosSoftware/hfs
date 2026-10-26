@@ -69,8 +69,9 @@ name: FHIR Server Benchmark
 #     when HFS indexed while ingesting, HFS_BULK_SUBMIT_DEFER_INDEXING=false).
 #     Indexing mode per leg (bulk-import.sh sets it, a caller env var wins):
 #     standalone legs defer indexing (HFS_BULK_SUBMIT_DEFER_INDEXING=true);
-#     *-elasticsearch legs index inline with file concurrency 4, batch 1000 and
-#     ES bulk concurrency 4. Both are recorded in the leg configuration lines.
+#     *-elasticsearch legs index inline with file concurrency 4 (HFS uses 1 on
+#     sqlite-elasticsearch, whose primary is SQLite), batch 1000 and ES bulk
+#     concurrency 4. Both are recorded in the leg configuration lines.
 #     It starts no containers, so the capacity gate is unchanged. Logic in
 #     .github/scripts/fhir-bench/bulk-import.sh and bulk_import.py.
 #   • Every named volume this workflow creates is
@@ -2254,17 +2255,6 @@ jobs:
           fi
           cat comparison.md >> "$GITHUB_STEP_SUMMARY"
 
-      # Trend over the last runs of this branch. Display only: it can never
-      # fail the run (continue-on-error, and the summary append is guarded).
-      - name: Write run history
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs 5
-          if [ -f history.md ]; then cat history.md >> "$GITHUB_STEP_SUMMARY"; fi
-
       # Raw Markdown for pasting into an issue or PR (the summary page only
       # offers rendered tables). Named fhir-bench-*, NOT fhir-benchmark-*, so a
       # re-run of this job can never pick it up as a leg.
@@ -2277,3 +2267,16 @@ jobs:
           path: comparison.md
           retention-days: 90
           if-no-files-found: ignore
+
+      # Trend over the last runs of this branch. Display only: it can never
+      # fail the run (continue-on-error, a 5 minute timeout, and the summary append is guarded).
+      # It runs after "Upload comparison" so a slow `gh` call can never cost the run its artifact.
+      - name: Write run history
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs 5
+          if [ -f history.md ]; then cat history.md >> "$GITHUB_STEP_SUMMARY"; fi
