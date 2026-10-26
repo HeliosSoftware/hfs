@@ -142,6 +142,70 @@ class T(unittest.TestCase):
         self.assertIn("pre-1007", calls[0])
         self.assertIn("1007", calls[0])
 
+    def test_alias_join_and_cell(self):
+        old = FIXTURE
+        new = FIXTURE.replace(
+            "Batch/Transaction Import, `POST /` Bundles (resources/s)", history.NEW_BATCH
+        ).replace("| Bulk Import: index rebuild (seconds) | 1,099 s",
+                  "| ↳ search indexing (seconds) | 195 s (= ingest)")
+        t = history.parse_tables(old)["throughput"]["rows"]
+        self.assertIn(history.NEW_BATCH, [r[0] for r in t])
+        self.assertIn(history.NEW_INDEX, [r[0] for r in t])
+        self.assertEqual(history.parse_cell("195 s (= ingest)"), 195.0)
+        runs = [run(1), run(2)]
+        out = history.build(args(), lambda *a: runs,
+                            lambda repo, r, n: old if r["number"] == 1 else new, new)
+        self.assertEqual(out.count("**" + history.NEW_BATCH + "**"), 1)
+        self.assertNotIn("Bundles (resources/s)**\n\n| Leg" + "x", out)
+        self.assertNotIn("**Batch/Transaction Import, `POST", out)
+        self.assertIn("1,122 (", out)
+
+    def test_truncation_keeps_fences_balanced(self):
+        secs = ["head"] + ["```mermaid\nx\n```\n" + "y" * 300 for _ in range(50)]
+        text = history._finish(secs, max_bytes=3000)
+        self.assertEqual(text.count("```") % 2, 0)
+        self.assertIn("output cut", text)
+        self.assertTrue(text.rstrip().endswith("</details>"))
+        self.assertLess(len(text.encode()), 3000)
+        self.assertTrue(history._finish(["```a", "b"]).count("```") % 2 == 0)
+
+    def test_failed_run_with_artifact_included(self):
+        import unittest.mock as m
+        payload = {"workflow_runs": [
+            {"id": 5, "conclusion": "failure", "head_branch": "feat"},
+            {"id": 6, "conclusion": "cancelled", "head_branch": "feat"},
+            {"id": 7, "conclusion": "success", "head_branch": "feat"}]}
+        fake = lambda a: types.SimpleNamespace(returncode=0, stdout=__import__("json").dumps(payload))
+        with m.patch.object(history, "_gh", fake):
+            got = history._list_runs("o/r", "w.yml", "feat", 5)
+        self.assertEqual([x["id"] for x in got], [5, 7])
+
+    def test_suites_mismatch_skipped_unparseable_kept(self):
+        other = FIXTURE.replace("suites: all", "suites: crud")
+        fr = lambda *a: [run(1), run(2, branch="main"), run(3)]
+        fc = lambda repo, r, n: other if r["number"] != 3 else FIXTURE
+        out = history.build(args(), fr, fc, FIXTURE)
+        self.assertIn("last 3 runs", out)  # run 1 skipped, main kept, 3 + current
+        nohdr = FIXTURE.replace("suites: all", "")
+        out = history.build(args(), lambda *a: [run(1)], lambda *a: other, nohdr)
+        self.assertIn("last 2 runs", out)
+
+    def test_data_dir_downloads_each_run(self):
+        calls = []
+        fr, fc = self._fetch()
+        history.build(args(data_dir="D"), fr, fc, FIXTURE,
+                      lambda repo, r, d: calls.append((r["id"], d)))
+        self.assertEqual(calls, [(1001, "D"), (1002, "D"), (1003, "D")])
+
+    def test_single_series_chart_shape(self):
+        fr, fc = self._fetch()
+        out = history.build(args(), fr, fc, FIXTURE)
+        self.assertNotIn("Lines in order", out)
+        self.assertEqual(out.count("    line ["), out.count("```mermaid"))
+        self.assertIn('title "crud - sqlite"', out)
+        c = history.render_chart("r", "leg", [1.0, None], ["a", "b"])
+        self.assertEqual(c, "")
+
     def test_main_exit_zero(self):
         self.assertEqual(history.main(["--bogus"]), 0)
 

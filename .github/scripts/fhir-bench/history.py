@@ -20,6 +20,25 @@ MAX_BYTES = 200 * 1024
 NUM_RE = re.compile(r"^-?\d[\d,]*(?:\.\d+)?")
 
 
+NEW_BATCH = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources/s)"
+NEW_BULK = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s)"
+NEW_INGEST = "↳ ingest, until Completed (resources/s, seconds)"
+NEW_INDEX = "↳ search indexing (seconds)"
+# older wordings of renamed rows -> canonical (new) wording, so they join into one row
+LABEL_ALIASES = {
+    "Batch/Transaction Import, `POST /` Bundles (resources/s)": NEW_BATCH,
+    "Bulk Import, `$bulk-submit` (resources/s)": NEW_BULK,
+    "Bulk Import: ingest (resources/s, seconds)": NEW_INGEST,
+    "↳ ingest (resources/s, seconds)": NEW_INGEST,
+    "Bulk Import: index rebuild (seconds)": NEW_INDEX,
+    "↳ search-index rebuild after Completed (seconds)": NEW_INDEX,
+}
+
+
+def canon_label(label):
+    return LABEL_ALIASES.get(label.strip(), label)
+
+
 def parse_cell(cell):
     """Numeric value of a table cell, or None. Strips bold/markers/commas."""
     c = cell.strip().replace("**", "").replace("`", "").strip()
@@ -57,7 +76,10 @@ def parse_tables(md):
             i += 2  # skip separator
             while i < len(lines) and lines[i].strip().startswith("|"):
                 cells = _split_row(lines[i])
-                label = cells[0]
+                label = canon_label(cells[0])
+                if any(label == r[0] for r in rows):
+                    i += 1
+                    continue
                 vals = [parse_cell(c) for c in cells[1:1 + len(legs)]]
                 vals += [None] * (len(legs) - len(vals))
                 rows.append((label, vals))
@@ -84,10 +106,13 @@ def _gh(args):
 
 def _list_runs(repo, workflow, branch, per_page):
     r = _gh(["api", f"repos/{repo}/actions/workflows/{workflow}/runs"
-             f"?branch={branch}&status=success&per_page={per_page}"])
+             f"?branch={branch}&status=completed&per_page={per_page}"])
     if r.returncode != 0:
         return []
-    return json.loads(r.stdout).get("workflow_runs", [])
+    # a run with one failed matrix leg is "failure" yet may still have uploaded
+    # the comparison artifact; fetch_comparison skips it silently when it did not
+    return [x for x in json.loads(r.stdout).get("workflow_runs", [])
+            if x.get("conclusion") in ("success", "failure")]
 
 
 def _norm(run):
@@ -137,6 +162,22 @@ def fetch_comparison(repo, run, artifact_name):
         return None
 
 
+def fetch_data(repo, run, data_dir):
+    """Best effort: report-data.json artifact of a run into data_dir/<run id>."""
+    try:
+        _gh(["run", "download", str(run["id"]), "-R", repo,
+             "-n", f"fhir-bench-report-data-{run['id']}",
+             "-D", os.path.join(data_dir, str(run["id"]))])
+    except Exception as e:  # noqa: BLE001
+        print(f"history: data download failed for {run.get('id')}: {e}", file=sys.stderr)
+
+
+def suites_of(text):
+    """The `suites:` text of a comparison.md header, or None when not parseable."""
+    m = re.search(r"^.*\bsuites:\s*([^·\n]+?)\s*(?:·|$)", text or "", re.M)
+    return m.group(1).strip() if m else None
+
+
 # ---- rendering ----
 
 def fmt_num(v):
@@ -157,52 +198,57 @@ def _is_chart_row(label):
     return not (l.startswith("prewarm") or l.startswith("↳") or "seconds)" in l)
 
 
-def _fill(vals):
-    """The series as plotted: only a leg with a value in every run gets a line.
-    A gap is never filled with a neighbouring value (a renamed row or a leg that
-    did not run would otherwise draw a flat line); the tables show the gap as a dash."""
-    if not vals or any(v is None for v in vals):
-        return None
-    return list(vals)
-
-
 def _clean(s):
     return re.sub(r'["\[\]\n|`]', "", s).strip()
 
 
-def render_chart(label, legs, series, xlabels):
-    lines = ["```mermaid", "xychart-beta",
-             f'    title "{_clean(label)[:70]}"',
-             "    x-axis [" + ", ".join(f'"{x}"' for x in xlabels) + "]",
-             f'    y-axis "{_clean(label)[:20]}" 0']
-    # y-axis with only a label keeps min auto; drop the stray 0 form
-    lines[-1] = '    y-axis "value"'
-    used = []
-    for leg, vals in zip(legs, series):
-        f = _fill(vals)
-        if f is None:
-            continue
-        used.append(leg)
-        lines.append("    line [" + ", ".join(f"{v:.1f}" for v in f) + "]")
-    lines.append("```")
-    if not used:
+def headline_leg(legs, data):
+    """First leg with a value in every plotted run (never invent a point)."""
+    for lg in legs:
+        vs = data.get(lg) or []
+        if len(vs) >= 2 and all(v is not None for v in vs):
+            return lg
+    return None
+
+
+def render_chart(label, leg, vals, xlabels):
+    """Single-series trend chart; the title names the row and the leg."""
+    if len(vals) < 2 or any(v is None for v in vals):
         return ""
-    return "\n".join(lines) + "\n\nLines in order: " + ", ".join(f"`{u}`" for u in used) + "\n"
+    return "\n".join([
+        "```mermaid", "xychart-beta",
+        f'    title "{_clean(label)[:80]} - {_clean(leg)}"',
+        "    x-axis [" + ", ".join(f'"{_clean(x)}"' for x in xlabels) + "]",
+        '    y-axis "value"',
+        "    line [" + ", ".join(f"{v:.1f}" for v in vals) + "]",
+        "```"]) + "\n"
 
 
-def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None):
+def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_data_fn=None):
     try:
         runs = fetch_runs_fn(args.repo, args.workflow, args.branch,
                              args.run_id, args.max_runs)
     except Exception as e:  # noqa: BLE001
         print(f"history: listing failed: {e}", file=sys.stderr)
         runs = []
+    data_dir = getattr(args, "data_dir", None)
+    if data_dir and fetch_data_fn:
+        for run in runs:
+            try:
+                fetch_data_fn(args.repo, run, data_dir)
+            except Exception:  # noqa: BLE001
+                pass
+    cur_suites = suites_of(current_text)
     entries = []  # (run dict, tables)
     for run in sorted(runs, key=lambda r: (r.get("date", ""), r.get("id", 0))):
         try:
             text = fetch_comparison_fn(args.repo, run, args.artifact_name)
             if not text:
                 continue
+            run_suites = suites_of(text)
+            if (cur_suites and run_suites and run_suites != cur_suites
+                    and run.get("branch") != "main"):
+                continue  # a different suite selection is not comparable
             tabs = parse_tables(text)
             if "throughput" in tabs and tabs["throughput"]["rows"]:
                 entries.append((run, tabs))
@@ -263,9 +309,8 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None):
                 data[lg].append(v)
         if all(v is None for vs in data.values() for v in vs):
             continue
-        out.append(f"**{lab}**\n")
-        out.append("| Leg | " + " | ".join(xlabels) + " |")
-        out.append("|---|" + "---:|" * len(xlabels))
+        sec = [f"**{lab}**\n", "| Leg | " + " | ".join(xlabels) + " |",
+               "|---|" + "---:|" * len(xlabels)]
         for lg in legs:
             vs = data[lg]
             if all(v is None for v in vs):
@@ -275,22 +320,39 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None):
                 c = fmt_num(v)
                 d = pct(vs[i - 1], v) if i else ""
                 cells.append(f"{c} ({d})" if d else c)
-            out.append(f"| `{lg}` | " + " | ".join(cells) + " |")
-        out.append("")
+            sec.append(f"| `{lg}` | " + " | ".join(cells) + " |")
+        out.append("\n".join(sec) + "\n")
         if _is_chart_row(lab) and len(charts) < MAX_CHARTS:
-            c = render_chart(lab, legs, [data[g] for g in legs], xlabels)
+            lg = headline_leg(legs, data)
+            c = render_chart(lab, lg, data[lg], xlabels) if lg else ""
             if c:
                 charts.append(c)
 
     if charts:
-        out.append("Charts (one line per leg, runs oldest to newest):\n")
-        out.extend(c + "\n" for c in charts)
-    out.append("</details>\n")
-    text = "\n".join(out)
-    if len(text.encode("utf-8")) > MAX_BYTES:
-        text = text.encode("utf-8")[:MAX_BYTES - 200].decode("utf-8", "ignore")
-        text += "\n\n_(truncated)_\n</details>\n"
-    return text
+        out.append("Trend of the headline leg per row (runs oldest to newest; "
+                   "the other legs are in the tables above):\n")
+        out.extend(charts)
+    return _finish(out)
+
+
+def _finish(sections, max_bytes=None):
+    """Join atomic sections, cutting at a section boundary when over the limit,
+    then close any open fence and the <details> block."""
+    limit = (max_bytes or MAX_BYTES) - 400
+    kept, size, cut = [], 0, False
+    for sec in sections:
+        n = len(sec.encode("utf-8")) + 1
+        if size + n > limit and kept:
+            cut = True
+            break
+        kept.append(sec)
+        size += n
+    text = "\n".join(kept)
+    if text.count("```") % 2:
+        text += "\n```"
+    if cut:
+        text += "\n\n_(output cut here: the rest of the history was left out to stay within the size limit)_"
+    return text + "\n</details>\n"
 
 
 def main(argv=None):
@@ -303,6 +365,7 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-runs", type=int, default=5)
     ap.add_argument("--workflow", default="fhir-benchmark.yml")
+    ap.add_argument("--data-dir", default=None)
     try:
         args = ap.parse_args(argv)
     except SystemExit:
@@ -314,7 +377,8 @@ def main(argv=None):
         except OSError:
             cur = None
         text = build(args, lambda *a: fetch_runs(*a),
-                     lambda repo, run, name: fetch_comparison(repo, run, name), cur)
+                     lambda repo, run, name: fetch_comparison(repo, run, name), cur,
+                     fetch_data if args.data_dir else None)
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(text)
     except Exception as e:  # noqa: BLE001

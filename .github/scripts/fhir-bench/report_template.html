@@ -1,0 +1,966 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<script>(function(){var t="dark";try{if(localStorage.getItem("hfs-bench-theme")==="light")t="light";}catch(e){}document.documentElement.setAttribute("data-theme",t);})();</script>
+<title>FHIR Benchmark</title>
+<style>
+/* Theme tokens. Default = dark (GitHub Primer dark), regardless of the OS preference. */
+:root,:root[data-theme="dark"]{
+  color-scheme: dark;
+  --page:#0d1117; --surface:#161b22; --surface-2:#1c2128;
+  --ink:#e6edf3; --ink-2:#b1bac4; --muted:#8b949e;
+  --grid:#30363d; --axis:#484f58; --border:#30363d;
+  --accent:#58a6ff; --prev:#f0883e;
+  --band-a:#1c2128; --band-b:#242b33;
+  --good:#56d364; --good-bg:#12261e; --warn:#e3b341; --warn-bg:#2d2208;
+  --bad:#ff7b72; --bad-bg:#3a1618; --na:#8b949e; --na-bg:#21262d;
+  --cpu:#ff7b72; --tip-bg:#2d333b; --tip-fg:#e6edf3; --tip-bd:#545d68;
+  --btn-on:#1f6feb; --btn-on-fg:#ffffff; --shadow:0 0 0 1px #30363d;
+}
+/*__LIGHT_RULE__*/
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--page);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-text-size-adjust:100%}
+.wrap{max-width:1100px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:1.5rem;line-height:1.25;margin:0 0 4px}
+h2{font-size:1.2rem;margin:40px 0 4px;padding-top:8px;border-top:1px solid var(--grid)}
+h2 .num{color:var(--muted);font-weight:500;margin-right:6px}
+h3{font-size:1rem;margin:22px 0 2px}
+p{margin:4px 0 10px}
+.lead{color:var(--ink-2);margin-bottom:14px}
+.meta{color:var(--ink-2);font-size:.9rem;display:flex;flex-wrap:wrap;gap:4px 16px}
+.meta b{color:var(--ink);font-weight:600}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em}
+nav.toc{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0 0}
+nav.toc a{color:var(--ink-2);text-decoration:none;border:1px solid var(--border);border-radius:999px;padding:2px 10px;font-size:.85rem}
+nav.toc a:hover{color:var(--ink);border-color:var(--axis)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px}
+.verdict{margin-top:16px;border-left:6px solid var(--warn);background:var(--surface)}
+.verdict .title{font-weight:700;font-size:1.05rem}
+.verdict ul{margin:6px 0 0;padding-left:20px}
+.note{font-size:.85rem;color:var(--ink-2)}
+.how{font-size:.85rem;color:var(--ink-2);margin:6px 0 2px}
+.how b{color:var(--ink)}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{border-collapse:collapse;width:100%;font-size:.86rem;font-variant-numeric:tabular-nums}
+th,td{padding:6px 8px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:top}
+th{font-weight:600;color:var(--ink-2);white-space:nowrap}
+td.n,th.n{text-align:right;white-space:nowrap}
+.st{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border-radius:6px;font-size:.82rem;white-space:nowrap;font-weight:500}
+.st i{font-style:normal;font-weight:800;width:1em;text-align:center}
+.st.ok{color:var(--good);background:var(--good-bg)}
+.st.warn{color:var(--warn);background:var(--warn-bg)}
+.st.bad{color:var(--bad);background:var(--bad-bg)}
+.st.na{color:var(--na);background:var(--na-bg)}
+.validity td{min-width:110px}
+.validity td:first-child{min-width:0;font-weight:600}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:10px}
+.kpi .lbl{font-size:.82rem;color:var(--ink-2)}
+.kpi .val{font-size:1.9rem;font-weight:700;line-height:1.15;margin:2px 0}
+.kpi .unit{font-size:.85rem;font-weight:500;color:var(--ink-2)}
+.kpi .sub{font-size:.82rem;color:var(--ink-2)}
+.kpi .delta{font-size:.82rem;margin-top:6px;padding-top:6px;border-top:1px dashed var(--grid);color:var(--ink-2)}
+.kpi .delta b{color:var(--ink)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+.grid2.wide{grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr))}
+.chart{min-height:40px}
+.chart svg{display:block;overflow:visible}
+.chart text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+.panel h4{margin:0 0 2px;font-size:.92rem}
+.panel .u{font-size:.8rem;color:var(--muted);margin-bottom:4px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:.82rem;color:var(--ink-2);margin:6px 0}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px}
+.seg{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.seg button{font:inherit;font-size:.84rem;padding:3px 11px 3px 8px;border-radius:999px;border:2px solid var(--c,var(--border));background:var(--surface);color:var(--ink-2);cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+.seg button .dot{width:10px;height:10px;border-radius:50%;background:var(--c,var(--muted));flex:none}
+.seg button .dot.es{background:transparent;border:2px solid var(--c);}
+.seg button .dots{display:inline-flex;gap:2px}
+.seg button .dots i{width:7px;height:7px;border-radius:50%;display:block}
+.seg button:hover{color:var(--ink)}
+.seg button[aria-pressed="true"]{background:color-mix(in srgb,var(--c,var(--accent)) 28%,var(--surface));color:var(--ink);font-weight:600}
+.seg button:focus-visible,[data-tip]:focus-visible,.theme button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.legkey{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:.82rem;color:var(--ink-2);margin:12px 0 0;align-items:center}
+.legkey span{display:inline-flex;align-items:center;gap:6px}
+.legkey svg{display:block}
+.lsw{display:inline-block;width:10px;height:10px;border-radius:3px;background:var(--c);vertical-align:baseline;margin-right:6px}
+.sw.neutral{background:var(--muted)}
+.sw.neutral.t{background:color-mix(in srgb,var(--muted) 45%,#fff)}
+.sw.neutral.h{background:repeating-linear-gradient(45deg,var(--muted) 0 3px,color-mix(in srgb,var(--muted) 40%,#fff) 3px 6px)}
+.sw.neutral.o{background:transparent;border:2px solid var(--muted)}
+.lsw.es{background:transparent;border:2px solid var(--c);border-radius:50%}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.theme{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden;background:var(--surface);flex:none}
+.theme button{font:inherit;font-size:.82rem;border:0;background:transparent;color:var(--ink-2);padding:4px 12px;cursor:pointer}
+.theme button[aria-pressed="true"]{background:var(--btn-on);color:var(--btn-on-fg);font-weight:600}
+#tip{position:fixed;z-index:10;pointer-events:none;background:var(--tip-bg);color:var(--tip-fg);border:1px solid var(--tip-bd);box-shadow:0 4px 14px rgba(0,0,0,.35);font-size:.8rem;line-height:1.35;padding:6px 8px;border-radius:6px;max-width:280px;white-space:pre-line;opacity:0;transition:opacity .08s}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:after{content:" ↕";color:var(--muted);font-weight:400}
+th.sortable[aria-sort="ascending"]:after{content:" ↑";color:var(--ink)}
+th.sortable[aria-sort="descending"]:after{content:" ↓";color:var(--ink)}
+.gloss{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px 18px;font-size:.88rem}
+.gloss div b{display:block}
+.marks{font-size:.85rem;color:var(--ink-2)}
+.marks b{color:var(--ink)}
+footer{margin-top:40px;font-size:.8rem;color:var(--muted)}
+.mk{color:var(--bad);font-weight:700}
+@media (max-width:520px){
+  body{font-size:14px}
+  .kpi .val{font-size:1.6rem}
+  .grid2{grid-template-columns:1fr}
+}
+@media print{
+  body{background:#fff;font-size:11pt}
+  .wrap{max-width:none;padding:0}
+  nav.toc,.seg,#tip,.theme,.noprint{display:none!important}
+  h2{break-after:avoid;page-break-after:avoid}
+  .card,.panel,table,.kpi,figure{break-inside:avoid;page-break-inside:avoid}
+  .scroll{overflow:visible}
+  a{color:inherit}
+}
+figure{margin:0}
+/*__PRINT_RULE__*/
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="top">
+  <h1>FHIR Server Benchmark <span class="mono" style="font-weight:500;color:var(--ink-2)">#39657850695</span></h1>
+  <div class="theme noprint" role="group" aria-label="Theme"><button type="button" id="thDark" aria-pressed="true">&#9790; Dark</button><button type="button" id="thLight" aria-pressed="false">&#9728; Light</button></div>
+  </div>
+  <div class="meta" id="meta"></div>
+  <nav class="toc" aria-label="Sections">
+    <a href="#summary-section">Summary</a><a href="#validity-section">1 · Validity</a><a href="#results">2 · Results</a><a href="#detail">3 · Detail</a><a href="#data">4 · Data</a><a href="#glossary">Glossary</a>
+  </nav>
+  <div class="legkey" id="legkey" aria-label="Leg colours"></div>
+  <div class="card verdict" id="verdict" role="status"></div>
+</header>
+
+<section id="summary-section">
+  <h3 id="summaryTitle">Run summary</h3>
+  <p class="how"><b>How to read this:</b> the tables of the run's <span class="mono">comparison.md</span>, one column per leg; the same numbers appear in the charts below. Marks are explained in the glossary.</p>
+  <div id="summary"></div>
+</section>
+
+<section id="validity-section">
+  <h2><span class="num">1</span>Is this run valid?</h2>
+  <p class="lead">Before looking at speeds: every leg must have loaded the whole corpus, with no errors and with its containers alive.</p>
+  <div class="card scroll"><table class="validity" id="validity"></table></div>
+  <p class="how"><b>How to read this:</b> <span class="st ok"><i>✓</i>ok</span> met · <span class="st warn"><i>!</i>warning</span> use with care · <span class="st bad"><i>✗</i>fail</span> those numbers are not comparable · <span class="st na"><i>–</i></span> not applicable.</p>
+  <p class="note" id="loadNote"></p>
+</section>
+
+<section id="results">
+  <h2><span class="num">2</span>Results</h2>
+  <h3 id="headTitle">Headline numbers by leg</h3>
+  <p class="how"><b>How to read this:</b> pick a leg; every leg gets the same tiles. The comparison with the previous run appears only for legs that have data in that run.</p>
+  <div class="seg" role="group" aria-label="Leg" id="segKpi"></div>
+  <div class="kpis" id="kpis"></div>
+  <p class="how" id="prevNote"></p>
+
+  <h3>Throughput by suite, all legs</h3>
+  <p class="how"><b>How to read this:</b> longer bar = more per second (the search indexing panel is in seconds: shorter is better); each panel has its own scale, so compare legs within a panel, not across panels.</p>
+  <div class="legend"><span>† ‡ ⚠ validity marks (see glossary)</span></div>
+  <div class="grid2" id="thr"></div>
+
+  <h3>Latency by suite (logarithmic scale)</h3>
+  <p class="how"><b>How to read this:</b> the dot is the median (p50), the vertical tick is the p95 and the end of the line is the p99; further left is faster and each axis mark is 10 times the previous one.</p>
+  <div class="legend"><span>● p50 (typical)</span><span>┃ p95 (slowest 1 in 20)</span><span>┤ p99 (slowest 1 in 100)</span></div>
+  <div class="grid2 wide" id="lat"></div>
+</section>
+
+<section id="detail">
+  <h2><span class="num">3</span>Detail</h2>
+
+  <h3>Timeline and host load</h3>
+  <p class="how"><b>How to read this:</b> pick <b>All</b> to compare every leg at once: one line per leg in its own colour (dashed line and diamond markers = the leg with Elasticsearch), with the leg name at the end of the line and the phases of each leg in a lane below. Pick a single leg to see its phase bands. The line is the Docker host load (1-minute average); <span id="cpuHow"></span></p>
+  <div class="seg" role="group" aria-label="Leg or all legs" id="segTime"></div>
+  <figure class="card chart" id="timeline"></figure>
+  <p class="note">There is only one reading at the start and one at the end of each phase; between readings the line is an interpolation. Each band covers the whole suite step (k6 plus diagnostic captures), not just the load. In the <b>All</b> view the legs are aligned at their own start, not at the same clock time.</p>
+
+  <h3>Bulk Import (/ui/bulk-import, <span class="mono">$bulk-submit</span>) by phase</h3>
+  <p class="how"><b>How to read this:</b> each bar is the time until the data can be searched; shorter is better. The official clock adds ingest and search indexing; the NDJSON conversion beforehand is shown separately. Where indexing runs <b>inline (during ingest)</b>, as on the Elasticsearch legs, it has no bar of its own: its time is inside the ingest bar. The colour of each bar is the leg.</p>
+  <div class="legend"><span><span class="sw neutral t"></span>conversion (not in the total)</span><span><span class="sw neutral"></span>ingest</span><span><span class="sw neutral h"></span>search indexing (deferred rebuild)</span></div>
+  <figure class="card chart" id="bulk"></figure>
+
+  <h3>Batch/Transaction Import (/ui/batch, k6 <span class="mono">import</span>) by phase</h3>
+  <p class="how"><b>How to read this:</b> each bar is the whole k6 step; shorter is better. The solid part is the import scenario, which is what resources/s divides by; the light part is k6 <span class="mono">setup()</span>, which seeds the Bundles before the load starts. Below each bar: resources, resources/s, Bundles completed out of 1,000 (<span class="mk">†</span> if the corpus is incomplete) and the error rate (<span class="mk">‡</span> above the threshold).</p>
+  <div class="legend"><span><span class="sw neutral t"></span>k6 setup() (seed Bundles)</span><span><span class="sw neutral"></span>import scenario</span></div>
+  <figure class="card chart" id="batch"></figure>
+  <h4 style="margin:12px 0 2px;font-size:.92rem">Latency per Bundle (logarithmic scale)</h4>
+  <p class="how"><b>How to read this:</b> time of one whole Bundle (<span class="mono">iteration_duration</span>): the dot is p50, the vertical tick p95 and the end of the line p99; further left is faster.</p>
+  <figure class="card chart" id="batchLat"></figure>
+
+  <h3>Import: Batch/Transaction vs Bulk (resources/s)</h3>
+  <p class="how"><b>How to read this:</b> for each leg, the solid bar is the Batch/Transaction Import and the outlined bar is the Bulk Import; longer is faster.</p>
+  <div class="legend"><span><span class="sw neutral"></span>Batch/Transaction (/ui/batch)</span><span><span class="sw neutral o"></span>Bulk (/ui/bulk-import)</span></div>
+  <figure class="card chart" id="impcmp"></figure>
+  <p class="note">These are different workloads: the Batch/Transaction Import is 20 concurrent k6 clients posting Bundles, and the Bulk Import is a single <span class="mono">$bulk-submit</span> job; compare them as two ways to load data, not as the same test.</p>
+
+  <div id="sqlBlock">
+  <h3>SQL-on-FHIR <span class="mono">$sql-run</span> by view (logarithmic scale)</h3>
+  <p class="how"><b>How to read this:</b> one panel per ViewDefinition run by the <span class="mono">sql-run</span> suite; the dot is p50, the tick p95 and the end of the line p99 of the requests to that view; further left is faster.</p>
+  <div class="grid2 wide" id="sqlviews"></div>
+  </div>
+
+  <div id="shapeBlock">
+  <h3>Search by query shape</h3>
+  <p class="how"><b>How to read this:</b> the search average hides slow queries; here each row is a query type, the dark part reaches the median and the light part reaches the p95.</p>
+  <div class="seg" role="group" aria-label="Leg" id="segShape"></div>
+  <div class="legend" id="shapeLeg"></div>
+  <figure class="card chart" id="shapes"></figure>
+  <p class="note">Percentiles by index without interpolation, same as <span class="mono">search_by_shape.py</span> in CI; that is why they do not match k6 exactly.</p>
+  </div>
+
+  <h3 id="trendTitle"></h3>
+  <div class="seg" role="group" aria-label="Leg" id="segTrend"></div>
+  <p class="note" id="trendNote"></p>
+  <p class="how"><b>How to read this:</b> one point per run (leg colour = this run, orange = other runs), higher is better; with a single data point per date and different hosts, the line shows context, not a proven trend.</p>
+  <div class="grid2" id="trend"></div>
+  <div class="card scroll" style="margin-top:10px"><table id="trendCtx"></table></div>
+</section>
+
+<section id="data">
+  <h2><span class="num">4</span>Full data</h2>
+  <p class="lead">All the numbers of the run; tap a header to sort.</p>
+  <div class="card scroll"><table id="full"></table></div>
+  <p class="marks" id="marksNote"></p>
+
+  <h3>Health of each leg</h3>
+  <div class="card scroll"><table id="health"></table></div>
+
+  <h3>Result size cross-check</h3>
+  <p class="how"><b>How to read this:</b> totals each leg returned for the same queries; if they differ, the legs did not search over the same data.</p>
+  <div class="card scroll"><table id="counts"></table></div>
+</section>
+
+<section id="glossary">
+  <h2>Glossary</h2>
+  <div class="gloss card">
+    <div><b>Leg</b>A storage combination tested separately (e.g. postgres + Elasticsearch).</div>
+    <div><b>VU (virtual user)</b>A simulated client with a single request in flight; 300 VUs are 300 clients at once, not 300 req/s.</div>
+    <div><b>req/s</b>HTTP requests completed per second (more is better).</div>
+    <div><b>resources/s</b>FHIR resources stored per second; used for Batch/Transaction Import and Bulk Import, where one request carries many resources.</div>
+    <div><b>p50 / p95 / p99</b>Response time that 50 %, 95 % or 99 % of requests do not exceed (less is better).</div>
+    <div><b>Err%</b>Percentage of requests with an HTTP error; it does not check whether the content is correct.</div>
+    <div><b>Checks ✓/✗</b>k6 script verifications that passed or failed (e.g. "the Bundle was imported").</div>
+    <div><b>Load (load average)</b>Average number of processes wanting CPU; above the CPU count there is waiting.</div>
+    <div><b>† ‡ ⚠</b><span id="glossMarks"></span></div>
+    <div><b>Suites and concurrency</b><span id="glossSuites"></span></div>
+  </div>
+</section>
+
+<footer id="foot"></footer>
+</div>
+<div id="tip" role="tooltip"></div>
+
+<script>
+"use strict";
+const D = /*__DATA__*/null;
+const LEGS = D.order || [];
+const L = D.legs || {};
+const FIRST = LEGS.includes(D.headline) ? D.headline : LEGS[0];
+const TH = D.thresholds;
+/* Leg colours: one hue per backend, a lighter tint for the +Elasticsearch variant (dashed lines, diamond markers).
+   Validated with the dataviz validate_palette.js (see palette/validator-results.txt). */
+const LEGPAL = D.palette || {dark:{}, light:{}};
+const SURFHEX = {dark:"#161b22", light:"#ffffff"};
+let THEME = document.documentElement.getAttribute("data-theme")==="light" ? "light" : "dark";
+const legCol = l => (LEGPAL[THEME][l]) || (THEME==="dark"?"#8b949e":"#59636e");
+const isES = l => /-elasticsearch$/.test(l);
+const CSURF = () => SURFHEX[THEME];
+function hexRgb(h){ return [1,3,5].map(i=>parseInt(h.slice(i,i+2),16)); }
+function mix(a,b,t){ const A=hexRgb(a), B=hexRgb(b); return "#"+A.map((v,i)=>Math.round(v+(B[i]-v)*t).toString(16).padStart(2,"0")).join(""); }
+function relLum(h){ const [r,g,b]=hexRgb(h).map(v=>{v/=255; return v<=.04045?v/12.92:Math.pow((v+.055)/1.055,2.4);}); return .2126*r+.7152*g+.0722*b; }
+function contrastOf(a,b){ const x=relLum(a), y=relLum(b); return (Math.max(x,y)+.05)/(Math.min(x,y)+.05); }
+const onColor = h => contrastOf(h,"#ffffff") >= contrastOf(h,"#0d1117") ? "#ffffff" : "#0d1117";
+const NB = "Batch/Transaction Import (/ui/batch)", NK = "Bulk Import (/ui/bulk-import)", NKI = "↳ ingest, until Completed", NKX = "↳ search indexing (seconds)", NSQ = "SQL-on-FHIR $sql-run", NSR = "SQL-on-FHIR $sql-run (rows/s)";
+function legVars(){ const r = document.documentElement.style; Object.keys(LEGPAL.dark).forEach(l=>r.setProperty("--leg-"+l, legCol(l))); LEGS.forEach(l=>r.setProperty("--leg-"+l, legCol(l))); }
+legVars();
+const SUITES = ["prewarm","import","crud","search","sql-run","insert"];
+const NF = new Intl.NumberFormat("en-US",{maximumFractionDigits:0});
+const NF1 = new Intl.NumberFormat("en-US",{minimumFractionDigits:1,maximumFractionDigits:1});
+const NF2 = new Intl.NumberFormat("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+const ok = v => v!==null && v!==undefined && !Number.isNaN(v);
+const n0 = v => ok(v) ? NF.format(v) : "n/a";
+const n1 = v => ok(v) ? NF1.format(v) : "n/a";
+const thr = v => !ok(v) ? "n/a" : (v < 10 ? NF1.format(v) : NF.format(v));
+function ms(v){ if(!ok(v)) return "n/a"; if(v>=1000) return NF1.format(v/1000)+" s"; if(v<10) return NF1.format(v)+" ms"; return NF.format(v)+" ms"; }
+const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const $ = id => document.getElementById(id);
+const LBL = l => (L[l] && L[l].label) || l;
+const swatch = l => `<span class="lsw${isES(l)?" es":""}" style="--c:var(--leg-${esc(l)})" aria-hidden="true"></span>`;
+const legCell = l => swatch(l)+esc(LBL(l));
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function fdate(iso, withTime){
+  if(!iso) return "n/a";
+  const d = new Date(iso); if(isNaN(d)) return "n/a";
+  let s = d.getUTCDate()+"-"+MONTHS[d.getUTCMonth()]+"-"+d.getUTCFullYear();
+  if(withTime){
+    const p = x => String(x).padStart(2,"0");
+    s += " "+p(d.getUTCHours())+":"+p(d.getUTCMinutes())+" UTC";
+  }
+  return s;
+}
+const short = iso => { if(!iso) return "n/a"; const d=new Date(iso); return isNaN(d) ? "n/a" : d.getUTCDate()+"-"+MONTHS[d.getUTCMonth()]; };
+const MARK_TXT = {"†":"† incomplete corpus or ES not drained","‡":"‡ errors > "+TH.err_pct_high+" % or failed checks","⚠":"⚠ container down or Postgres contended"};
+const markTip = m => m ? "\n"+[...m].map(c=>MARK_TXT[c]).join("\n") : "";
+const NODATA = '<p class="note">No data.</p>';
+const suite = (l,s) => (L[l] && L[l].suites && L[l].suites[s]) || null;
+const mk = (l,s) => (L[l] && L[l].markers && L[l].markers[s]) || "";
+const ICON = {ok:"✓",warn:"!",bad:"✗",na:"–"};
+const WORD = {ok:"ok",warn:"warning",bad:"fail",na:"not applicable"};
+const st = s => `<span class="st ${s}" title="${WORD[s]}"><i aria-hidden="true">${ICON[s]}</i></span>`;
+function peak(l){ const h = (L[l]&&L[l].host)||[]; return h.length ? Math.max(...h.map(p=>p.la1)) : null; }
+
+/* ---------- header and verdict ---------- */
+function renderHeader(){
+  const runners = [...new Set(LEGS.map(l=>L[l].runner).filter(Boolean))];
+  const any = LEGS.length ? L[LEGS[0]] : {};
+  $("meta").innerHTML = [
+    `<span><b>Start</b> ${fdate(D.date,true)}</span>`,
+    `<span><b>Commit</b> <span class="mono">${esc(D.sha||"n/a")}</span> (${esc(D.ref||"n/a")})</span>`,
+    D.repo && D.run ? `<span><b>Run</b> <a class="mono" href="https://github.com/${esc(D.repo)}/actions/runs/${esc(D.run)}" style="color:var(--accent)">${esc(D.repo)}</a></span>` : "",
+    `<span><b>Runners</b> ${esc(runners.join(", ")||"n/a")}${any.cpus?" · "+esc(any.cpus)+" CPU / "+esc(any.ram):""}</span>`,
+    D.docker_cpus ? `<span><b>Docker host</b> ${D.docker_cpus} CPU${D.docker_ram_gb?" / "+D.docker_ram_gb+" GB":""}, shared</span>` : "",
+    `<span><b>Legs</b> ${LEGS.length}${D.missing.length?" (missing "+D.missing.length+")":""}</span>`
+  ].join("");
+  document.querySelector("h1 .mono").textContent = "#"+D.run;
+  document.title = "FHIR Benchmark · "+D.run;
+  $("loadNote").innerHTML = D.docker_cpus
+    ? `Load is measured on the shared Docker host (where the databases run), which has <b>${D.docker_cpus}</b> CPUs; a load above that number means queued work.`
+    : `Load is measured on the shared Docker host (where the databases run). Its CPU count is not recorded in the artifacts, so the load is shown without judgment.`;
+  $("cpuHow").textContent = D.docker_cpus ? `the dotted red line marks its ${D.docker_cpus} CPUs: above it, processes wait for a turn.` : "the host CPU count is not recorded, so no limit is drawn.";
+  $("trendTitle").textContent = "Trend by leg";
+  const v = D.verdict_all || D.verdict, col = {ok:"var(--good)",warn:"var(--warn)",bad:"var(--bad)",na:"var(--muted)"}[v.sev];
+  $("verdict").innerHTML = `<div class="title">Verdict: ${esc(v.title)}.</div><ul>`+
+    v.items.map(([s,t])=>`<li>${st(s)} ${esc(t)}</li>`).join("")+"</ul>";
+  $("verdict").style.borderLeftColor = col;
+  $("glossMarks").textContent = `† incomplete corpus (<${TH.import_target} Bundles) or ES not drained · ‡ more than ${TH.err_pct_high} % errors or failed checks · ⚠ container down or Postgres contended (>${TH.pg_contended_ms} ms/call in crud).`;
+  const src = LEGS.length ? L[LEGS[0]] : null;
+  const vus = s => src && src.suites[s] && src.suites[s].vus ? src.suites[s].vus+" VUs" : "n/a";
+  $("glossSuites").textContent = `Batch/Transaction Import ${vus("import")} · crud ${vus("crud")} · search ${vus("search")} · $sql-run ${vus("sql-run")} · insert ${vus("insert")} · Bulk Import: one $bulk-submit job, the clock runs until the data can be searched.`;
+}
+
+function renderValidity(){
+  const cols = [["corpus","Imported corpus"],["err","Errors"],["cont","Containers"],["es","ES drained"],["load","Host load"]];
+  let h = "<thead><tr><th>Leg</th>"+cols.map(c=>`<th>${c[1]}</th>`).join("")+"</tr></thead><tbody>";
+  for(const l of LEGS){
+    const c = L[l].checks;
+    h += `<tr><td>${legCell(l)}</td>`+cols.map(([k])=>`<td>${st(c[k][0])} <span>${esc(c[k][1])}</span></td>`).join("")+"</tr>";
+  }
+  for(const l of D.missing) h += `<tr><td>${esc(l)}</td>`+cols.map(()=>`<td>${st("bad")} no data</td>`).join("")+"</tr>";
+  $("validity").innerHTML = h+"</tbody>";
+}
+
+/* ---------- KPIs ---------- */
+function renderKpis(){
+  const leg = sel.kpi, H = L[leg] || null, P = H && H.prev;
+  $("prevNote").innerHTML = P
+    ? `<b>Indicative comparison</b> with the previous run <span class="mono">${esc(P.run)}</span> (${fdate(P.date)}, <span class="mono">${esc(P.branch||"")}</span>): a single run each, at a different time and with a different host load; it does not prove an improvement or a regression.`
+    : "";
+  if(!H){ $("kpis").innerHTML = NODATA; return; }
+  const ps = s => P && P.suites && P.suites[s] ? P.suites[s] : null;
+  const items = [["search","Search","req/s"],["crud","CRUD","req/s"],["insert","Insert","creates/s"],["sql-run",NSQ,"req/s"],["sql_rows",NSR,"rows/s"],
+    ["import",NB,"resources/s"],["bulk",NK,"resources/s"],["bulk_ingest",NKI,"resources/s"],["bulk_index",NKX,"s"]];
+  $("kpis").innerHTML = items.map(([k,name,unit])=>{
+    let v, p95, pv, pp95, sub = "", valTxt = null;
+    const b = H.bulk, bdone = b && b.status==="complete";
+    if(k==="bulk"||k==="bulk_ingest"||k==="bulk_index"){
+      pv = null;
+      if(k==="bulk"){ v = bdone ? b.rps : null; pv = P && P.bulk ? P.bulk.rps : null;
+        sub = b ? (bdone ? "total time "+n0(b.total)+" s"+(P&&P.bulk?" (was "+n0(P.bulk.total)+" s)":"") : esc(b.status)+": "+esc(b.reason||b.phase||"")) : ""; }
+      else if(k==="bulk_ingest"){ v = bdone ? b.ingest_rps : null; pv = P && P.bulk ? P.bulk.ingest_rps : null; sub = bdone && ok(b.ingest) ? n0(b.ingest)+" s from kick-off until Completed" : ""; }
+      else { v = bdone ? b.index_eff : null; pv = P && P.bulk ? P.bulk.index_eff : null;
+        if(bdone && b.index_inline){ valTxt = n0(b.index_eff)+' <span class="unit">s (= ingest)</span>'; sub = "inline (during ingest)"; }
+        else if(bdone){ sub = "deferred rebuild after Completed"; } }
+    } else if(k==="sql_rows"){
+      const s = H.suites["sql-run"], q = ps("sql_rows"); v = s ? s.rows_rps : null; pv = q ? q.rps : null;
+      sub = s && s.vus ? s.vus+" VUs · NDJSON rows returned" : "";
+    } else {
+      const s = H.suites[k]; v = s ? s.rps : null; p95 = s ? s.p95 : null;
+      const q = ps(k); pv = q ? q.rps : null; pp95 = q ? q.p95 : null;
+      sub = s && s.vus ? s.vus+" VUs"+(k==="import"?" · p95 per Bundle":"") : "";
+    }
+    const mkk = k==="sql_rows" ? "sql-run" : (k==="bulk_ingest"||k==="bulk_index") ? "bulk" : k;
+    if(!ok(v)) return `<div class="card kpi"><div class="lbl">${name}</div><div class="val">—</div><div class="sub">no data ${sub?"· "+sub:""}</div></div>`;
+    let delta = "";
+    if(ok(pv) && pv && !valTxt){
+      const pct = (v-pv)/pv*100;
+      delta = `<div class="delta">${pct>=0?"▲ up":"▼ down"} <b>${pct>=0?"+":""}${NF.format(pct)} %</b> vs ${short(P.date)} (${thr(pv)})</div>`;
+    }
+    const lat = ok(p95) ? `p95 ${ms(p95)}${ok(pp95)?` <span class="note">(was ${ms(pp95)})</span>`:""}<br>` : "";
+    return `<div class="card kpi"><div class="lbl">${name} <span class="mk">${mk(leg,mkk)}</span></div>
+      <div class="val">${valTxt || thr(v)+' <span class="unit">'+unit+'</span>'}</div>
+      <div class="sub">${lat}${sub}</div>${delta}</div>`;
+  }).join("");
+}
+
+/* ---------- SVG helpers ---------- */
+const NS = "http://www.w3.org/2000/svg";
+const svg = (w,h,body,label) => `<svg xmlns="${NS}" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(label)}">${body}</svg>`;
+function txt(x,y,s,o={}){
+  return `<text x="${x}" y="${y}" text-anchor="${o.anchor||"start"}" font-size="${o.size||12}" font-weight="${o.weight||400}" fill="${o.fill||"var(--ink-2)"}"${o.halo?' stroke="var(--surface)" stroke-width="4" stroke-linejoin="round" paint-order="stroke"':""}>${esc(s)}</text>`;
+}
+function widthOf(el){ return Math.max(260, Math.floor(el.clientWidth || (el.parentElement && el.parentElement.clientWidth) || 600)); }
+const tipAttr = t => ` data-tip="${esc(t)}" tabindex="0"`;
+function roundRight(x,y,w,h,r,fill,extra=""){
+  if(!(w>0)) return "";
+  r = Math.min(r, w, h/2);
+  return `<path d="M${x},${y}h${w-r}a${r},${r} 0 0 1 ${r},${r}v${h-2*r}a${r},${r} 0 0 1 -${r},${r}h-${w-r}z" fill="${fill}"${extra}/>`;
+}
+function panels(hostId, prefix, P){
+  const host = $(hostId);
+  if(!host.dataset.built){
+    host.innerHTML = P.map(([k,t,u])=>`<div class="card panel"><h4>${t}</h4><div class="u">${u}</div><div class="chart" id="${prefix}-${k}"></div></div>`).join("");
+    host.dataset.built = 1;
+  }
+}
+
+/* ---------- throughput ---------- */
+function thrRows(s){
+  return LEGS.map(l=>{
+    if(s==="bulk"||s==="bulk_ingest"||s==="bulk_index"){
+      const b = L[l].bulk;
+      if(!b || b.status!=="complete") return {leg:l, v:null, why: b ? b.status : "no data"};
+      if(s==="bulk") return {leg:l, v:b.rps, extra:"total "+n0(b.total)+" s · ingest "+thr(b.ingest_rps)+" res/s"};
+      if(s==="bulk_ingest") return {leg:l, v:b.ingest_rps, extra:n0(b.ingest)+" s from kick-off until Completed"};
+      if(!ok(b.index_eff)) return {leg:l, v:null, why:"n/a"};
+      return {leg:l, v:b.index_eff, txt: b.index_inline ? n0(b.index_eff)+" s (= ingest)" : null, extra: b.index_inline ? "inline (during ingest)" : "deferred rebuild after Completed"};
+    }
+    if(s==="sql_rows"){
+      const x = suite(l,"sql-run");
+      return x && ok(x.rows_rps) ? {leg:l, v:x.rows_rps, extra:n0(x.rows)+" rows returned · "+thr(x.rps)+" req/s"} : {leg:l, v:null, why:"no data"};
+    }
+    const x = suite(l,s);
+    if(!x) return {leg:l, v:null, why:"no data"};
+    return {leg:l, v:x.rps, extra:"p95 "+ms(x.p95)+" · Err "+n1(x.err)+" %"+(x.fail?" · "+n0(x.fail)+" checks ✗":"")};
+  });
+}
+function barPanel(el, s, title, unit){
+  const rows = thrRows(s);
+  if(!rows.some(r=>ok(r.v))){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el), lw = Math.min(110, w*0.32), vw = 118, rh = 24, top = 4, pw = w-lw-vw-4;
+  const max = Math.max(...rows.map(r=>r.v||0));
+  let b = `<line x1="${lw}" y1="${top}" x2="${lw}" y2="${top+rows.length*rh}" stroke="var(--axis)"/>`;
+  rows.forEach((r,i)=>{
+    const y = top+i*rh, isH = false, m = mk(r.leg, s==='sql_rows'?'sql-run':(s==='bulk_ingest'||s==='bulk_index')?'bulk':s);
+    b += txt(lw-8, y+rh/2+4, LBL(r.leg), {anchor:"end", fill:isH?"var(--ink)":"var(--ink-2)", weight:isH?600:400});
+    if(!ok(r.v)){ b += txt(lw+6, y+rh/2+4, r.why, {size:11, fill:"var(--muted)"}); return; }
+    const bw = Math.max(2, r.v/max*pw), shown = r.txt || thr(r.v);
+    b += roundRight(lw, y+4, bw, rh-8, 4, legCol(r.leg), tipAttr(`${LBL(r.leg)} · ${title}\n${shown} ${r.txt?"":unit}\n${r.extra}${markTip(m)}`));
+    b += txt(lw+bw+6, y+rh/2+4, shown+(m?" "+m:""), {fill:"var(--ink)", weight:isH?600:400});
+  });
+  el.innerHTML = svg(w, top+rows.length*rh+4, b, title+" by leg");
+}
+const THR_P = [["search","Search","req/s"],["crud","CRUD","req/s"],["insert","Insert","creates/s"],["sql-run",NSQ,"req/s"],["sql_rows",NSR,"rows/s"],["import",NB,"resources/s"],["bulk",NK,"resources/s"],["bulk_ingest",NKI,"resources/s"],["bulk_index",NKX,"seconds"]];
+function renderThr(){ panels("thr","thr",THR_P); THR_P.forEach(([k,t,u])=>barPanel($("thr-"+k), k, t, u)); }
+
+/* ---------- latency ---------- */
+function latPanel(el, s, title, getter){
+  const rows = LEGS.map(l=>({leg:l, x:getter ? getter(l) : suite(l,s)}));
+  const have = rows.filter(r=>r.x && ok(r.x.p50) && ok(r.x.p99) && r.x.p50>0);
+  if(!have.length){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el), lw = Math.min(110, w*0.32), rw = 70, rh = 26, top = 4, axisH = 22, pw = w-lw-rw-8;
+  const lo = Math.pow(10, Math.floor(Math.log10(Math.min(...have.map(r=>r.x.p50)))));
+  let hi = Math.pow(10, Math.ceil(Math.log10(Math.max(...have.map(r=>r.x.p99)))));
+  if(hi<=lo) hi = lo*10;
+  const X = v => lw + (Math.log10(Math.max(v,lo))-Math.log10(lo))/(Math.log10(hi)-Math.log10(lo))*pw;
+  let b = "";
+  const dec = Math.round(Math.log10(hi/lo)), every = Math.max(1, Math.ceil(44/(pw/dec)));
+  const tl = t => t<1000 ? NF.format(t)+" ms" : NF.format(t/1000)+" s";
+  for(let k=0, t=lo; k<=dec; k++, t*=10){
+    const x = X(t);
+    b += `<line x1="${x}" y1="${top}" x2="${x}" y2="${top+rows.length*rh}" stroke="var(--grid)"/>`;
+    if(k%every===0) b += txt(x, top+rows.length*rh+15, tl(t), {anchor:"middle", size:11, fill:"var(--muted)"});
+  }
+  rows.forEach((r,i)=>{
+    const y = top+i*rh+rh/2, isH = false, m = getter ? '' : mk(r.leg,s), col = legCol(r.leg);
+    b += txt(lw-8, y+4, LBL(r.leg), {anchor:"end", fill:isH?"var(--ink)":"var(--ink-2)", weight:isH?600:400});
+    const x = r.x;
+    if(!x || !ok(x.p50) || !ok(x.p99)){ b += txt(lw+6, y+4, "no data", {size:11, fill:"var(--muted)"}); return; }
+    const x50 = X(x.p50), x95 = X(x.p95), x99 = X(x.p99);
+    b += `<g${tipAttr(`${LBL(r.leg)} · ${title}\np50 ${ms(x.p50)} · p95 ${ms(x.p95)} · p99 ${ms(x.p99)}\nmax ${ms(x.max)}${markTip(m)}`)}>`+
+      `<rect x="${x50-6}" y="${y-10}" width="${x99-x50+12}" height="20" fill="transparent"/>`+
+      `<line x1="${x50}" y1="${y}" x2="${x99}" y2="${y}" stroke="${col}" stroke-width="2"/>`+
+      `<line x1="${x95}" y1="${y-8}" x2="${x95}" y2="${y+8}" stroke="${col}" stroke-width="3"/>`+
+      `<line x1="${x99}" y1="${y-4}" x2="${x99}" y2="${y+4}" stroke="${col}" stroke-width="2"/>`+
+      `<circle cx="${x50}" cy="${y}" r="5" fill="${col}" stroke="var(--surface)" stroke-width="2"/></g>`;
+    b += txt(w-2, y+4, "p95 "+ms(x.p95)+(m?" "+m:""), {anchor:"end", size:11, fill:"var(--ink)", weight:isH?600:400});
+  });
+  el.innerHTML = svg(w, top+rows.length*rh+axisH, b, title+": latency by leg");
+}
+const LAT_P = [["search","Search","per request"],["crud","CRUD","per request"],["insert","Insert","per request"],["sql-run",NSQ,"per request (all views)"],["import",NB,"per whole Bundle (download + POST)"]];
+function renderLat(){ panels("lat","lat",LAT_P); LAT_P.forEach(([k,t])=>latPanel($("lat-"+k), k, t)); }
+
+/* ---------- selectors ---------- */
+const sel = {kpi: FIRST, time: "all", shape: FIRST, trend: FIRST};
+function seg(id, key, render, withAll){
+  const btn = l => `<button type="button" data-leg="${esc(l)}" aria-pressed="${l===sel[key]}" style="--c:var(--leg-${esc(l)})"><span class="dot${isES(l)?" es":""}" aria-hidden="true"></span>${esc(LBL(l))}</button>`;
+  const all = withAll ? `<button type="button" data-leg="all" aria-pressed="${sel[key]==="all"}" style="--c:var(--accent)"><span class="dots" aria-hidden="true">${LEGS.map(l=>`<i style="background:var(--leg-${esc(l)})"></i>`).join("")}</span>All</button>` : "";
+  $(id).innerHTML = all+LEGS.map(btn).join("");
+  $(id).addEventListener("click", e=>{
+    const b = e.target.closest("button"); if(!b) return;
+    sel[key] = b.dataset.leg;
+    $(id).querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed", x===b));
+    render();
+  });
+}
+
+/* ---------- timeline ---------- */
+function secs(t){ const [h,m,s] = t.split(":").map(Number); return h*3600+m*60+s; }
+function legSeries(leg){
+  const pts = (L[leg]&&L[leg].host)||[];
+  if(pts.length<2) return null;
+  let prev = -1, add = 0;
+  const P = pts.map(p=>{ let s = secs(p.t)+add; if(s<prev){ add+=86400; s+=86400; } prev = s; return Object.assign({}, p, {s}); });
+  const phases = [];
+  P.forEach(p=>{ if(p.phase==="start") phases.push({suite:p.suite, a:p.s}); else { const f = phases.find(x=>x.suite===p.suite && x.b==null); if(f) f.b = p.s; }});
+  return {leg, P, t0:P[0].s, t1:P[P.length-1].s, phases:phases.filter(f=>f.b!=null)};
+}
+const phLabel = s => s==="bulk-import" ? "bulk" : s;
+function marker(x,y,leg,r,extra=""){
+  const c = legCol(leg);
+  if(isES(leg)) return `<path d="M${x},${y-r-1.5}L${x+r+1.5},${y}L${x},${y+r+1.5}L${x-r-1.5},${y}Z" fill="${c}" stroke="${CSURF()}" stroke-width="1.5"${extra}/>`;
+  return `<circle cx="${x}" cy="${y}" r="${r}" fill="${c}" stroke="${CSURF()}" stroke-width="1.5"${extra}/>`;
+}
+const dash = leg => isES(leg) ? ' stroke-dasharray="7 4"' : "";
+function timeAxis(X, t0, total, y){
+  const tstep = total>90?30:(total>60?15:(total>30?10:5));
+  let b = "";
+  for(let m=0; m<=total; m+=tstep) b += txt(X(t0+m*60), y, m+" min", {anchor:"middle", size:11, fill:"var(--muted)"});
+  return b;
+}
+function yAxis(ml, pw, mt, ph, ymax, Y){
+  let b = "";
+  const step = ymax>20?10:(ymax>10?5:2);
+  for(let v=0; v<=ymax; v+=step){
+    b += `<line x1="${ml}" y1="${Y(v)}" x2="${ml+pw}" y2="${Y(v)}" stroke="var(--grid)"${v?' stroke-dasharray="2 3"':""}/>`;
+    b += txt(ml-6, Y(v)+4, String(v), {anchor:"end", size:11, fill:"var(--muted)"});
+  }
+  return b;
+}
+function renderTimeline(){
+  if(sel.time==="all") return renderTimelineAll();
+  const el = $("timeline"), leg = sel.time, S = legSeries(leg);
+  if(!S){ el.innerHTML = NODATA; return; }
+  const {P, t0, phases} = S, t1 = Math.max(S.t1, t0+60);
+  const w = widthOf(el)-28, ml = 34, mr = 8, mt = 30, ph = 190, mb = 34, pw = w-ml-mr;
+  const cpus = D.docker_cpus;
+  const ymax = Math.max(cpus?cpus*2:8, Math.ceil(Math.max(...P.map(p=>p.la1))/5)*5);
+  const X = s => ml+(s-t0)/(t1-t0)*pw, Y = v => mt+ph-v/ymax*ph;
+  let b = "";
+  phases.forEach((f,i)=>{
+    const x = X(f.a), bw = Math.max(1, X(f.b)-x), lab = phLabel(f.suite);
+    b += `<rect x="${x}" y="${mt}" width="${bw}" height="${ph}" fill="${i%2?"var(--band-b)":"var(--band-a)"}"${tipAttr(`${lab}: ${NF1.format((f.b-f.a)/60)} min`)}/>`;
+    b += bw > lab.length*6.5+4 ? txt(x+bw/2, mt-8, lab, {anchor:"middle", size:11}) : txt(x+bw/2, mt-8, lab.slice(0,2), {anchor:"middle", size:10, fill:"var(--muted)"});
+  });
+  b += yAxis(ml, pw, mt, ph, ymax, Y);
+  if(cpus){
+    b += `<line x1="${ml}" y1="${Y(cpus)}" x2="${ml+pw}" y2="${Y(cpus)}" stroke="var(--cpu)" stroke-width="2" stroke-dasharray="2 4"/>`;
+    b += txt(ml+pw*0.5, Y(cpus)+15, cpus+" host CPUs", {anchor:"middle", size:11, fill:"var(--cpu)", weight:600});
+  }
+  b += timeAxis(X, t0, (t1-t0)/60, mt+ph+16);
+  b += txt(ml, mt+ph+31, "start "+P[0].t+" UTC", {size:10, fill:"var(--muted)"});
+  b += `<polyline points="${P.map(p=>X(p.s)+","+Y(p.la1)).join(" ")}" fill="none" stroke="${legCol(leg)}" stroke-width="2.5" stroke-linejoin="round"${dash(leg)}/>`;
+  P.forEach(p=>{
+    b += marker(X(p.s), Y(p.la1), leg, 4, tipAttr(`${LBL(leg)} · ${p.t} UTC · ${phLabel(p.suite)} ${p.phase==="start"?"start":"end"}\nload 1 min ${n1(p.la1)} (5 min ${n1(p.la5)})${ok(p.containers)?"\n"+p.containers+" containers":""}${ok(p.mem_mb)?" · "+n0(p.mem_mb)+" MB free":""}`));
+  });
+  const mx = P.reduce((a,p)=>p.la1>a.la1?p:a, P[0]);
+  b += txt(Math.min(Math.max(X(mx.s), ml+30), ml+pw-30), Y(mx.la1)-11, "peak "+n1(mx.la1), {anchor:"middle", size:11, fill:"var(--ink)", weight:600});
+  el.innerHTML = svg(w, mt+ph+mb+4, b, "Host load during leg "+LBL(leg));
+}
+function spread(items, minGap, lo, hi){
+  /* items: [{y}] -> adds .ly; keeps order, enforces minGap, stays in [lo,hi] */
+  const a = items.slice().sort((p,q)=>p.y-q.y);
+  a.forEach((it,i)=>{ it.ly = i===0 ? Math.max(lo,it.y) : Math.max(it.y, a[i-1].ly+minGap); });
+  if(a.length && a[a.length-1].ly>hi){ for(let i=a.length-1;i>=0;i--){ const lim = i===a.length-1 ? hi : a[i+1].ly-minGap; a[i].ly = Math.min(a[i].ly, lim); } }
+  return a;
+}
+function renderTimelineAll(){
+  const el = $("timeline"), S = LEGS.map(legSeries).filter(Boolean);
+  if(!S.length){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el)-28, wide = w >= 600, ml = 34, mr = wide ? 128 : 8, mt = 12, ph = 210, pw = w-ml-mr;
+  const cpus = D.docker_cpus;
+  const tot = Math.max(60, ...S.map(s=>s.t1-s.t0));
+  const peakAll = Math.max(...S.map(s=>Math.max(...s.P.map(p=>p.la1))));
+  const ymax = Math.max(cpus?cpus*2:8, Math.ceil(peakAll/5)*5);
+  const X = (s,t0) => ml+(s-t0)/tot*pw, Y = v => mt+ph-v/ymax*ph;
+  let b = yAxis(ml, pw, mt, ph, ymax, Y);
+  if(cpus){
+    b += `<line x1="${ml}" y1="${Y(cpus)}" x2="${ml+pw}" y2="${Y(cpus)}" stroke="var(--cpu)" stroke-width="2" stroke-dasharray="2 4"/>`;
+    b += txt(ml+pw*0.5, Y(cpus)+15, cpus+" host CPUs", {anchor:"middle", size:11, fill:"var(--cpu)", weight:600, halo:true});
+  }
+  b += timeAxis(s=>ml+s/tot*pw, 0, tot/60, mt+ph+16);
+  b += txt(ml, mt+ph+31, "minutes since the start of each leg", {size:10, fill:"var(--muted)"});
+  const labels = [];
+  S.forEach(s=>{
+    const leg = s.leg, pk = s.P.reduce((a,p)=>p.la1>a.la1?p:a, s.P[0]);
+    const pts = s.P.map(p=>X(p.s,s.t0)+","+Y(p.la1)).join(" ");
+    const sum = `${LBL(leg)}\npeak load ${n1(pk.la1)} (${phLabel(pk.suite)} ${pk.phase==="start"?"start":"end"})\nduration ${NF1.format((s.t1-s.t0)/60)} min`;
+    b += `<polyline points="${pts}" fill="none" stroke="${legCol(leg)}" stroke-width="2.25" stroke-linejoin="round" stroke-linecap="round"${dash(leg)}/>`;
+    b += `<polyline points="${pts}" fill="none" stroke="transparent" stroke-width="12"${tipAttr(sum)}/>`;
+    s.P.forEach(p=>{ b += marker(X(p.s,s.t0), Y(p.la1), leg, 3, tipAttr(`${LBL(leg)} · ${p.t} UTC · ${phLabel(p.suite)} ${p.phase==="start"?"start":"end"}\nminute ${NF1.format((p.s-s.t0)/60)} · load 1 min ${n1(p.la1)}`)); });
+    const last = s.P[s.P.length-1];
+    labels.push({leg, x:X(last.s,s.t0), y:Y(last.la1)});
+  });
+  if(wide){
+    spread(labels, 14, mt+6, mt+ph-2).forEach(it=>{
+      const x = it.x+10;
+      b += `<polyline points="${it.x+3},${it.y} ${x},${it.ly} ${x+14},${it.ly}" fill="none" stroke="${legCol(it.leg)}" stroke-width="1.5"/>`;
+      b += txt(x+18, it.ly+4, LBL(it.leg), {size:11, fill:"var(--ink)"});
+    });
+  }
+  const H1 = mt+ph+38;
+  /* phase lanes: one compact lane per leg, same x axis */
+  const lh = 15, lg = 19, ltop = H1+34;
+  b += txt(ml, H1+8, (wide ? "Phases of each leg (consecutive phases alternate solid and light; two letters = short phase, hover for details)" : "Phases of each leg (hover for details)"), {size:11, fill:"var(--muted)"});
+  S.forEach((s,i)=>{
+    const y = ltop+i*(lh+lg);
+    b += txt(ml, y-4, LBL(s.leg), {size:11, fill:"var(--ink-2)"});
+    b += `<rect x="${ml}" y="${y}" width="${pw}" height="${lh}" rx="3" fill="var(--band-a)"/>`;
+    s.phases.forEach((f,k)=>{
+      const x = X(f.a,s.t0), bw = Math.max(1, X(f.b,s.t0)-x-1), lab = phLabel(f.suite);
+      const fill = k%2 ? mix(legCol(s.leg), "#ffffff", .45) : legCol(s.leg);
+      b += `<rect x="${x}" y="${y}" width="${bw}" height="${lh}" rx="2" fill="${fill}"${tipAttr(`${LBL(s.leg)} · ${lab}\n${NF1.format((f.b-f.a)/60)} min (minute ${NF1.format((f.a-s.t0)/60)} to ${NF1.format((f.b-s.t0)/60)})`)}/>`;
+      const sh = bw > lab.length*6+8 ? lab : (bw >= 15 ? lab.slice(0,2) : "");
+      if(sh) b += txt(x+bw/2, y+11, sh, {anchor:"middle", size:10.5, fill:onColor(fill), weight:600});
+    });
+  });
+  const lgd = wide ? "" : `<div class="legend" style="margin:0 0 6px">`+S.map(s=>`<span><svg width="24" height="10" aria-hidden="true"><line x1="1" y1="5" x2="23" y2="5" stroke="${legCol(s.leg)}" stroke-width="3"${dash(s.leg)}/></svg>${esc(LBL(s.leg))}</span>`).join("")+`</div>`;
+  el.innerHTML = lgd+svg(w, ltop+S.length*(lh+lg), b, "Host load of every leg together, and the phases of each leg");
+}
+
+/* ---------- import charts (Bulk, Batch/Transaction, comparison) ---------- */
+function hatchDefs(legs){
+  return "<defs>"+legs.map(l=>{
+    const c = legCol(l), id = "hx-"+l.replace(/[^a-z0-9]/gi,"");
+    return `<pattern id="${id}" patternUnits="userSpaceOnUse" width="7" height="7" patternTransform="rotate(45)"><rect width="7" height="7" fill="${c}"/><rect width="3" height="7" fill="${mix(c,"#ffffff",.5)}"/></pattern>`;
+  }).join("")+"</defs>";
+}
+const hatchRef = l => `url(#hx-${l.replace(/[^a-z0-9]/gi,"")})`;
+const tintOf = l => mix(legCol(l), "#ffffff", .5);
+/* Bulk Import by phase: light = conversion (not in the total), solid = ingest, hatched = search index build */
+function renderBulk(){
+  const el = $("bulk"), rows = LEGS.map(l=>({leg:l, b:L[l].bulk}));
+  const good = rows.filter(r=>r.b && r.b.status==="complete" && ok(r.b.total));
+  if(!good.length){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el)-28, narrow = w<560, lw = narrow?0:Math.min(110, w*0.2), rh = narrow?82:62, top = 4, pw = w-lw-8;
+  const max = Math.max(...good.map(r=>(r.b.convert||0)+r.b.total));
+  const X = v => (v||0)/max*pw, by = narrow?22:4;
+  let b = hatchDefs(LEGS);
+  rows.forEach((r,i)=>{
+    const y = top+i*rh, bk = r.b;
+    b += txt(narrow?0:lw-8, narrow?y+13:y+19, LBL(r.leg), {anchor:narrow?"start":"end", fill:"var(--ink)", weight:600});
+    if(!bk || bk.status!=="complete"){ b += txt(lw, narrow?y+37:y+19, bk ? bk.status+": "+(bk.reason||bk.phase||"") : "no data", {size:11, fill:"var(--muted)"}); return; }
+    let x = lw;
+    [["convert","conversion"],["ingest","ingest"],["index","search indexing"]].forEach(([k,name])=>{
+      const sw = X(bk[k]);
+      const fill = k==="convert" ? tintOf(r.leg) : (k==="ingest" ? legCol(r.leg) : hatchRef(r.leg));
+      if(sw>0) b += `<rect x="${x}" y="${y+by}" width="${Math.max(1,sw-2)}" height="22" rx="3" fill="${fill}" stroke="${legCol(r.leg)}" stroke-width="${k==="convert"?1:0}"${tipAttr(`${LBL(r.leg)} · ${name}\n${n0(bk[k])} s`+(k==="convert"?" (not counted in the total)":""))}/>`;
+      if(sw > 46 && k!=="index") b += txt(x+5, y+by+15, n0(bk[k])+" s", {size:11, fill:onColor(fill), weight:600});
+      x += sw;
+    });
+    const m = mk(r.leg,"bulk");
+    b += txt(lw, y+by+38, `total ${n0(bk.total)} s · ${thr(bk.rps)} res/s · searchable ${bk.searchable?"✓":"✗"}${m?" "+m:""}`, {size:11.5, fill:"var(--ink)", weight:600});
+    b += txt(lw, y+by+52, `conversion ${n0(bk.convert)} s (not in the total) · ingest ${n0(bk.ingest)} s · search indexing ${bk.index_inline ? "inline (during ingest)" : n0(bk.index)+" s"}`, {size:11, fill:"var(--muted)"});
+  });
+  el.innerHTML = svg(w, top+rows.length*rh, b, "Bulk Import by phase");
+}
+const impMark = l => { const ic = L[l].ic; return mk(l,"import")+(ic && ok(ic.bundles_ok) && ic.bundles_ok<TH.import_target && !mk(l,"import").includes("†") ? "†" : ""); };
+/* Batch/Transaction Import: light = k6 setup() (seed Bundles), solid = import scenario; scale = wall seconds */
+function renderBatch(){
+  const el = $("batch"), rows = LEGS.map(l=>({leg:l, ic:L[l].ic, s:suite(l,"import")}));
+  const good = rows.filter(r=>r.ic && ok(r.ic.scenario));
+  if(!good.length){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el)-28, narrow = w<560, lw = narrow?0:Math.min(110, w*0.2), rh = narrow?96:62, top = 4, pw = w-lw-8;
+  const wallOf = ic => ok(ic.wall) ? ic.wall : (ic.scenario||0)+(ic.setup||0);
+  const max = Math.max(...good.map(r=>wallOf(r.ic)));
+  const X = v => (v||0)/max*pw, by = narrow?22:4;
+  let b = "";
+  rows.forEach((r,i)=>{
+    const y = top+i*rh, ic = r.ic, s = r.s;
+    b += txt(narrow?0:lw-8, narrow?y+13:y+19, LBL(r.leg), {anchor:narrow?"start":"end", fill:"var(--ink)", weight:600});
+    if(!ic || !ok(ic.scenario)){ b += txt(lw, narrow?y+37:y+19, "no data", {size:11, fill:"var(--muted)"}); return; }
+    const m = impMark(r.leg), x2 = lw+X(ic.setup);
+    const sw1 = X(ic.setup), sw2 = X(ic.scenario);
+    const tip = tail => `${LBL(r.leg)} · ${tail}`;
+    if(sw1>0) b += `<rect x="${lw}" y="${y+by}" width="${Math.max(1,sw1-2)}" height="22" rx="3" fill="${tintOf(r.leg)}" stroke="${legCol(r.leg)}"${tipAttr(tip("k6 setup(): seed Bundles\n"+n1(ic.setup)+" s (not counted in resources/s)"))}/>`;
+    if(sw1>46) b += txt(lw+5, y+by+15, n0(ic.setup)+" s", {size:11, fill:onColor(tintOf(r.leg)), weight:600});
+    b += `<rect x="${x2}" y="${y+by}" width="${Math.max(1,sw2)}" height="22" rx="3" fill="${legCol(r.leg)}"${tipAttr(tip("import scenario\n"+n1(ic.scenario)+" s · "+n0(ic.entries)+" resources"+markTip(m)))}/>`;
+    if(sw2>46) b += txt(x2+5, y+by+15, n0(ic.scenario)+" s", {size:11, fill:onColor(legCol(r.leg)), weight:600});
+    const inc = ic.bundles_ok<TH.import_target;
+    const l1 = `${esc(n0(ic.entries))} resources · ${esc(s?thr(s.rps):"n/a")} res/s`, l2 = `Bundles <tspan fill="${inc?"var(--warn)":"var(--ink)"}">${esc(n0(ic.bundles_ok))}/${esc(n0(TH.import_target))}</tspan> · errors ${esc(s?n1(s.err):"n/a")} %${m?" "+esc(m):""}`;
+    const ex = narrow ? 14 : 0;
+    if(narrow){
+      b += `<text x="${lw}" y="${y+by+38}" font-size="11.5" font-weight="600" fill="var(--ink)">${l1}</text><text x="${lw}" y="${y+by+52}" font-size="11.5" font-weight="600" fill="var(--ink)">${l2}</text>`;
+    } else b += `<text x="${lw}" y="${y+by+38}" font-size="11.5" font-weight="600" fill="var(--ink)">${l1} · ${l2}</text>`;
+    b += txt(lw, y+by+52+ex, `setup() ${n0(ic.setup)} s (seed Bundles) · scenario ${n0(ic.scenario)} s · wall ${n0(wallOf(ic))} s`, {size:11, fill:"var(--muted)"});
+  });
+  el.innerHTML = svg(w, top+rows.length*rh, b, "Batch/Transaction Import: setup versus scenario time, by leg");
+}
+function renderBatchLat(){ latPanel($("batchLat"), "import", NB+": latency per Bundle"); }
+/* Comparison: resources/s of both import processes, per leg */
+function renderImpCmp(){
+  const el = $("impcmp"), rows = LEGS.map(l=>{
+    const s = suite(l,"import"), bk = L[l].bulk;
+    return {leg:l, bat:s?s.rps:null, bul:bk && bk.status==="complete" ? bk.rps : null, bs: bk?bk.status:"no data"};
+  });
+  if(!rows.some(r=>ok(r.bat)||ok(r.bul))){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el)-28, lw = Math.min(110, w*0.28), vw = 92, bh = 17, gh = 50, top = 4, pw = w-lw-vw-4;
+  const max = Math.max(...rows.map(r=>Math.max(r.bat||0, r.bul||0)));
+  let b = "";
+  rows.forEach((r,i)=>{
+    const y = top+i*gh, c = legCol(r.leg);
+    b += txt(lw-8, y+bh+4, LBL(r.leg), {anchor:"end", fill:"var(--ink)", weight:600});
+    [["bat","Batch",y,impMark(r.leg)],["bul","Bulk",y+bh+3,mk(r.leg,"bulk")]].forEach(([k,nm,yy,m])=>{
+      const v = r[k];
+      if(!ok(v)){ b += txt(lw+6, yy+bh-4, nm+": "+(k==="bul"?r.bs:"no data"), {size:11, fill:"var(--muted)"}); return; }
+      const bw = Math.max(2, v/max*pw);
+      const tip = tipAttr(`${LBL(r.leg)} · ${k==="bat"?NB:NK}\n${thr(v)} resources/s${markTip(m)}`);
+      if(k==="bat") b += roundRight(lw, yy, bw, bh, 4, c, tip);
+      else b += `<rect x="${lw+1}" y="${yy+1}" width="${Math.max(2,bw-2)}" height="${bh-2}" rx="4" fill="${c}" fill-opacity=".25" stroke="${c}" stroke-width="2"${tip}/>`;
+      if(bw>58) b += txt(lw+6, yy+bh-4, nm, {size:10.5, fill:k==="bat"?onColor(c):"var(--ink)", weight:600});
+      b += txt(lw+bw+6, yy+bh-4, thr(v)+(m?" "+m:""), {fill:"var(--ink)", size:11.5});
+    });
+  });
+  el.innerHTML = svg(w, top+rows.length*gh, b, "Resources per second of the Batch/Transaction Import and the Bulk Import, by leg");
+}
+
+/* ---------- sql-run by view ---------- */
+function renderSqlViews(){
+  const names = [];
+  LEGS.forEach(l=>{ const x = suite(l,"sql-run"); ((x&&x.views)||[]).forEach(v=>{ if(!names.includes(v.name)) names.push(v.name); }); });
+  $("sqlBlock").style.display = names.length ? "" : "none";
+  if(!names.length) return;
+  const idOf = n => "sv-"+n.replace(/[^a-z0-9_-]/gi,"_");
+  const host = $("sqlviews");
+  host.innerHTML = names.map(n=>`<div class="card panel"><h4>${esc(n)}</h4><div class="u">per request · p50, p95, p99</div><div class="chart" id="${idOf(n)}"></div></div>`).join("");
+  names.forEach(n=>latPanel($(idOf(n)), null, "$sql-run · "+n, l=>{ const x = suite(l,"sql-run"); return x && x.views ? x.views.find(v=>v.name===n) || null : null; }));
+}
+
+/* ---------- query shapes ---------- */
+function renderShapes(){
+  $('shapeBlock').style.display = D.has_shapes ? '' : 'none';
+  if(!D.has_shapes) return;
+  const el = $("shapes"), leg = sel.shape, src = L[leg] && L[leg].shapes;
+  if(!src || !src.length){ el.innerHTML = '<p class="note">No per-shape data for '+esc(LBL(leg))+'.</p>'; return; }
+  const rows = src.slice().sort((a,b)=>b.p95-a.p95);
+  const w = widthOf(el)-28, rh = 36, top = 2, pw = w-130;
+  const max = Math.max(...rows.map(r=>r.p95)) || 1, X = v => v/max*pw;
+  let b = "";
+  rows.forEach((r,i)=>{
+    const y = top+i*rh;
+    b += `<text x="0" y="${y+12}" font-size="12" fill="var(--muted)">${esc(r.type)} <tspan fill="var(--ink)" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11.5">${esc(r.q)}</tspan></text>`;
+    b += `<g${tipAttr(`${r.type} ${r.q}\nn ${n0(r.n)} · p50 ${ms(r.p50)} · p95 ${ms(r.p95)} · max ${ms(r.max)}`)}><rect x="0" y="${y+16}" width="${pw}" height="16" fill="transparent"/>`+
+         roundRight(0, y+18, Math.max(2,X(r.p95)), 12, 3, mix(legCol(leg),CSURF(),.55))+
+         `<rect x="0" y="${y+18}" width="${Math.max(2,X(r.p50))}" height="12" fill="${legCol(leg)}"/></g>`;
+    b += txt(w-2, y+29, `p50 ${ms(r.p50)} · p95 ${ms(r.p95)}`, {anchor:"end", size:11, fill:"var(--ink)"});
+  });
+  const m = mk(leg,"search");
+  const lg = $("shapeLeg"); if(lg) lg.innerHTML = `<span><span class="sw" style="background:${legCol(leg)}"></span>up to p50</span><span><span class="sw" style="background:${mix(legCol(leg),CSURF(),.55)}"></span>p50 → p95</span>`;
+  el.innerHTML = `<div class="note" style="margin-bottom:6px">${esc(LBL(leg))}: ${rows.length} shapes, ${n0(rows.reduce((a,r)=>a+r.n,0))} searches measured${m?" · "+esc(m)+markTip(m).replace(/\n/g," "):""}.</div>`+svg(w, top+rows.length*rh, b, "Latency by query shape, "+LBL(leg));
+}
+
+/* ---------- trend ---------- */
+function trendPanel(el, key, title, unit){
+  const T = trendOf();
+  const vals = T.map(t => key==="bulk" ? (t.bulk?t.bulk.rps:null) : key==="bulk_ingest" ? (t.bulk?t.bulk.ingest_rps:null) : key==="bulk_index" ? (t.bulk?t.bulk.index_eff:null) : (t.suites[key]?t.suites[key].rps:null));
+  if(!vals.some(ok)){ el.innerHTML = NODATA; return; }
+  const w = widthOf(el), ml = 8, mr = 8, mt = 18, ph = 90, mb = 24, pw = w-ml-mr;
+  const max = Math.max(...vals.filter(ok))*1.15;
+  const X = i => T.length===1 ? ml+pw/2 : ml+30+i*(pw-60)/(T.length-1), Y = v => mt+ph-v/max*ph;
+  let b = `<line x1="${ml}" y1="${mt+ph}" x2="${ml+pw}" y2="${mt+ph}" stroke="var(--axis)"/>`;
+  for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--prev)" stroke-width="2"/>`;
+  T.forEach((t,i)=>{
+    const cur = String(t.run)===String(D.run), br = D.ref && t.branch!==D.ref;
+    b += txt(X(i), mt+ph+15, short(t.date)+(br?" *":""), {anchor:"middle", size:11, fill:cur?"var(--ink)":"var(--muted)", weight:cur?600:400});
+    if(!ok(vals[i])){ b += txt(X(i), mt+ph-6, "no data", {anchor:"middle", size:10, fill:"var(--muted)"}); return; }
+    const col = cur?legCol(sel.trend):"var(--prev)";
+    const shape = br ? `<rect x="${X(i)-5}" y="${Y(vals[i])-5}" width="10" height="10" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
+                     : `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`;
+    const m = (t.markers||{})[key]||"";
+    b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}`)}>${shape}</g>`;
+    b += txt(X(i), Y(vals[i])-10, thr(vals[i])+(m?" "+m:""), {anchor:"middle", size:11, fill:"var(--ink)", weight:cur?600:400});
+  });
+  el.innerHTML = svg(w, mt+ph+mb, b, "Trend "+title);
+}
+const trendOf = () => (L[sel.trend] && L[sel.trend].trend) || [];
+function renderTrend(){
+  const TT = trendOf();
+  $("trendTitle").textContent = "Trend of "+LBL(sel.trend)+" ("+TT.length+" run"+(TT.length===1?"":"s")+")";
+  $("trend").dataset.built = ""; $("trendCtx").dataset.built = "";
+  $("trendNote").textContent = TT.length < 2
+    ? "Only "+TT.length+" data point"+(TT.length===1?"":"s")+" for this leg ("+(D.history_runs||0)+" earlier run"+(D.history_runs===1?"":"s")+" found): a trend needs at least 2 runs, so the charts below show what exists without drawing a line."
+    : "";
+  if(!TT.length){ $("trend").innerHTML = NODATA; $("trendCtx").innerHTML = ""; return; }
+  const P = THR_P.map(([k,t,u])=>[k,t,u.split(" ")[0]+" · "+LBL(sel.trend)]);
+  panels("trend","tr",P);
+  if(!$("trendCtx").dataset.built){
+    let h = `<thead><tr><th>Run</th><th>Start</th><th>Branch</th><th>Runner</th><th class="n">Load at crud start</th><th class="n">pg ms/call in crud</th><th>Notes</th></tr></thead><tbody>`;
+    TT.forEach(t=>{
+      const notes = [];
+      if(D.ref && t.branch!==D.ref) notes.push("* different branch than this run");
+      if(!t.suites.import) notes.push("no import");
+      if(!t.suites.search) notes.push("no search");
+      if(String(t.run)===String(D.run)) notes.push("this run");
+      h += `<tr><td class="mono">${esc(t.run)}</td><td>${fdate(t.date)}</td><td class="mono">${esc(t.branch||"n/a")}</td><td>${esc(t.runner||"n/a")}</td><td class="n">${n1(t.crud_load)}</td><td class="n">${ok(t.pg_ms)?NF2.format(t.pg_ms):"n/a"}</td><td>${notes.join("; ")}</td></tr>`;
+    });
+    $("trendCtx").innerHTML = h+"</tbody>"; $("trendCtx").dataset.built = 1;
+  }
+  P.forEach(([k,t,u])=>trendPanel($("tr-"+k), k, t, u.split(" ")[0]));
+}
+
+/* ---------- tables ---------- */
+function sortable(table){
+  const ths = [...table.querySelectorAll("th.sortable")];
+  ths.forEach(th=>{
+    th.tabIndex = 0;
+    th.addEventListener("keydown",e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); th.click(); }});
+    th.addEventListener("click",()=>{
+      const idx = [...th.parentElement.children].indexOf(th);
+      const dir = th.getAttribute("aria-sort")==="ascending" ? "descending" : "ascending";
+      ths.forEach(x=>x.removeAttribute("aria-sort")); th.setAttribute("aria-sort",dir);
+      const tb = table.tBodies[0], rows = [...tb.rows];
+      rows.sort((a,b)=>{
+        const A = a.children[idx].dataset.v, B = b.children[idx].dataset.v;
+        const na = A===""?NaN:parseFloat(A), nb = B===""?NaN:parseFloat(B);
+        let c;
+        if(!isNaN(na)&&!isNaN(nb)) c = na-nb; else if(isNaN(na)&&isNaN(nb)) c = String(A).localeCompare(String(B)); else c = isNaN(na)?1:-1;
+        return dir==="ascending"?c:-c;
+      });
+      rows.forEach(r=>tb.appendChild(r));
+    });
+  });
+}
+const td = (v, shown, num=true) => `<td class="${num?"n":""}" data-v="${ok(v)||typeof v==="string"?esc(v):""}">${shown}</td>`;
+function renderFull(){
+  const cols = ["Leg","Suite","Throughput","Unit","p50","p95","p99","Err %","Checks ✓","Checks ✗","VUs","Marks"];
+  let h = "<thead><tr>"+cols.map((c,i)=>`<th class="sortable ${[2,4,5,6,7,8,9,10].includes(i)?"n":""}">${c}</th>`).join("")+"</tr></thead><tbody>";
+  const SN = {"import":NB, "sql-run":NSQ};
+  LEGS.forEach((l,li)=>{
+    const d = L[l], cls = "";
+    const none = (lead, txt) => lead+`<td class="n" data-v="">${txt}</td>`+"<td></td>".repeat(9)+"</tr>";
+    const lead0 = (si, name) => `<tr class="${cls}"><td data-v="${li}">${legCell(l)}</td><td data-v="${si}">${name}</td>`;
+    SUITES.forEach((s,si)=>{
+      const v = d.suites[s], m = mk(l,s);
+      const lead = lead0(si, (SN[s]||s)+(s==="import"?" <span class='note'>(latency per Bundle)</span>":""));
+      if(!v){ h += none(lead, "no data"); return; }
+      h += lead+td(v.rps, thr(v.rps))+td(v.unit, v.unit, false)+td(v.p50, ms(v.p50))+td(v.p95, ms(v.p95))+td(v.p99, ms(v.p99))+
+        td(v.err, n1(v.err))+td(v.ok, n0(v.ok))+td(v.fail, n0(v.fail))+td(v.vus, n0(v.vus))+td(m, `<span class="mk">${m}</span>`, false)+"</tr>";
+      if(s==="sql-run" && ok(v.rows_rps)) h += lead0(si+0.5, NSR)+td(v.rows_rps, thr(v.rows_rps))+td("rows/s","rows/s",false)+td(null,"—")+td(null,"—")+td(null,"—")+td(null,"—")+td(null,"—")+td(null,"—")+td(null,"—")+td(null,"",false)+"</tr>";
+    });
+    const bk = d.bulk, m = mk(l,"bulk");
+    const lead = lead0(6, NK+(bk&&ok(bk.total)?` <span class='note'>(${n0(bk.total)} s)</span>`:""));
+    if(!bk || bk.status!=="complete"){ h += none(lead, bk?esc(bk.status):"no data"); return; }
+    const e = bk.submitted ? bk.failed/bk.submitted*100 : null;
+    h += lead+td(bk.rps, thr(bk.rps))+td("resources/s","resources/s",false)+td(null,"—")+td(null,"—")+td(null,"—")+
+      td(e, n1(e))+td(bk.ok, n0(bk.ok))+td(bk.failed, n0(bk.failed))+td(null,"1 job")+td(m, `<span class="mk">${m}</span>`, false)+"</tr>";
+    h += lead0(6.1, NKI+` <span class='note'>(${n0(bk.ingest)} s)</span>`)+td(bk.ingest_rps, thr(bk.ingest_rps))+td("resources/s","resources/s",false)+"<td></td>".repeat(8)+"</tr>";
+    const ix = bk.index_inline ? `inline (during ingest)` : n0(bk.index);
+    h += lead0(6.2, NKX)+`<td class="n" data-v="${ok(bk.index_eff)?bk.index_eff:""}">${bk.index_inline ? n0(bk.index_eff)+" (= ingest)" : ix}</td>`+td("seconds","seconds",false)+"<td></td>".repeat(8)+"</tr>";
+  });
+  $("full").innerHTML = h+"</tbody>";
+  sortable($("full"));
+  const runners = new Set(LEGS.map(l=>L[l].runner+"|"+L[l].cpus+"|"+L[l].ram));
+  $("marksNote").innerHTML = `<b>Marks:</b> † incomplete corpus (&lt;${TH.import_target} Bundles) or ES not drained · ‡ more than ${TH.err_pct_high} % errors or any failed check · ⚠ container down or Postgres with more than ${TH.pg_contended_ms} ms per call in crud. Throughput in req/s, except import, bulk import, ingest (resources/s), $sql-run rows (rows/s) and search indexing (seconds; <b>inline (during ingest)</b> when HFS indexed while ingesting, so that time is the ingest time). No value is marked as "best"${runners.size>1?": the legs ran on different hardware":""}.`;
+}
+function renderHealth(){
+  let h = `<thead><tr><th>Leg</th><th>Runner</th><th class="n">Bundles</th><th class="n">Entries imported</th><th class="n">Import scenario</th><th>ES</th><th class="n">Load at crud start</th><th class="n">Peak load</th><th class="n">crud residue</th><th>Containers</th></tr></thead><tbody>`;
+  LEGS.forEach(l=>{
+    const d = L[l], cs = d.host.find(p=>p.suite==="crud"&&p.phase==="start"), ic = d.ic;
+    const es = d.drain ? `${esc(d.drain.status)} · missing ${esc(d.drain.missing)} · ${esc(d.drain.sync)}` : (l.endsWith("-elasticsearch")?"no data":"—");
+    h += `<tr><td>${legCell(l)}</td><td>${esc(d.runner||"n/a")}</td>`+
+      `<td class="n">${ic?n0(ic.bundles_ok)+"/"+n0(TH.import_target)+(ic.bundles_ok<TH.import_target?" †":""):"no data"}</td>`+
+      `<td class="n">${ic?n0(ic.entries):"n/a"}</td><td class="n">${ic?n0(ic.scenario)+" s + "+n0(ic.setup)+" s setup":"n/a"}</td><td>${es}</td>`+
+      `<td class="n">${cs?n1(cs.la1)+(ok(cs.containers)?" · "+cs.containers+" cont.":""):"n/a"}</td><td class="n">${n1(peak(l))}</td>`+
+      `<td class="n">${ok(d.residue)?d.residue:"n/a"}</td><td class="note">${d.containers.length?d.containers.map(c=>{ const p=c.split(" "), kind=(p[0].match(/^hfs-bench-([a-z]+)-/)||[,p[0]])[1], stt=((c.match(/Status=(\S+)/)||[,"?"])[1]), oom=/OOMKilled=true/.test(c); return `<span title="${esc(c)}">${esc(kind)}: ${esc(stt)}${oom?" (OOM)":""}</span>`; }).join("<br>"):(d.containers_known?"no backend":"no data")}</td></tr>`;
+  });
+  $("health").innerHTML = h+"</tbody>";
+}
+function renderCounts(){
+  const qs = [];
+  LEGS.forEach(l=>L[l].counts.forEach(c=>{ if(!qs.includes(c.q)) qs.push(c.q); }));
+  if(!qs.length){ $("counts").outerHTML = NODATA; return; }
+  const refLeg = LEGS.find(l=>L[l].counts.length);
+  let h = "<thead><tr><th>Query</th>"+LEGS.map(l=>`<th class="n">${legCell(l)}</th>`).join("")+"</tr></thead><tbody>";
+  qs.forEach(q=>{
+    const r = L[refLeg].counts.find(c=>c.q===q), ref = r ? r.total : null;
+    h += `<tr><td class="mono" style="word-break:break-all;min-width:200px">${esc(q.replace("&_summary=count",""))}</td>`+LEGS.map(l=>{
+      const c = L[l].counts.find(x=>x.q===q);
+      if(!c) return `<td class="n">n/a</td>`;
+      const diff = ref!==null && c.total!==ref;
+      return `<td class="n">${diff?"<b>":""}${isNaN(+c.total)?esc(c.total):NF.format(+c.total)}${diff?"</b> ≠":""}${c.http!=="200"?" (HTTP "+esc(c.http)+")":""}</td>`;
+    }).join("")+"</tr>";
+  });
+  $("counts").innerHTML = h+"</tbody>";
+}
+
+/* ---------- tooltip ---------- */
+(function(){
+  const tip = $("tip");
+  function show(t, x, y){
+    tip.textContent = t; tip.style.opacity = 1;
+    const r = tip.getBoundingClientRect();
+    let left = x+14, top = y+14;
+    if(left+r.width > innerWidth-8) left = Math.max(8, x-r.width-14);
+    if(top+r.height > innerHeight-8) top = Math.max(8, y-r.height-14);
+    tip.style.left = left+"px"; tip.style.top = top+"px";
+  }
+  document.addEventListener("pointermove", e=>{
+    const el = e.target.closest && e.target.closest("[data-tip]");
+    if(el) show(el.dataset.tip, e.clientX, e.clientY); else tip.style.opacity = 0;
+  });
+  document.addEventListener("focusin", e=>{
+    const el = e.target.closest && e.target.closest("[data-tip]");
+    if(el){ const r = el.getBoundingClientRect(); show(el.dataset.tip, r.left+r.width/2, r.bottom); } else tip.style.opacity = 0;
+  });
+  document.addEventListener("scroll", ()=>{ tip.style.opacity = 0; }, {passive:true});
+})();
+
+/* ---------- summary (comparison.md) ---------- */
+function renderSummary(){
+  const C = D.comparison, el = $("summary");
+  if(!C || !C.tables || !C.tables.length){ $("summary-section").style.display = "none"; return; }
+  if(C.head) $("summaryTitle").textContent = "Run summary · "+C.head;
+  const tbl = t => `<div class="card scroll"><table><thead><tr>${t.header.map((c,i)=>`<th class="${i?"n":""}">${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
+    t.rows.map(r=>`<tr>${r.map((c,i)=>`<td class="${i?"n":""}">${esc(c)}</td>`).join("")}</tr>`).join("")+"</tbody></table></div>";
+  el.innerHTML = C.tables.map((t,i)=> i===0 ? `<h4 style="margin:10px 0 4px">${esc(t.title)}</h4>`+tbl(t)
+    : `<details style="margin-top:8px"><summary>${esc(t.title)}</summary>${tbl(t)}</details>`).join("");
+}
+
+/* ---------- startup ---------- */
+function safe(f){ try{ f(); }catch(e){ console.error(e); } }
+function renderLegKey(){
+  $("legkey").innerHTML = LEGS.map(l=>`<span><svg width="26" height="10" aria-hidden="true"><line x1="1" y1="5" x2="25" y2="5" stroke="var(--leg-${esc(l)})" stroke-width="3"${isES(l)?' stroke-dasharray="6 3"':""}/></svg>${esc(LBL(l))}</span>`).join("")+
+    `<span class="note">Each leg keeps its colour everywhere; dashed line = with Elasticsearch.</span>`;
+}
+function drawCharts(){ legVars(); [renderLegKey, renderThr, renderLat, renderTimeline, renderBulk, renderBatch, renderBatchLat, renderImpCmp, renderSqlViews, renderShapes, renderTrend].forEach(safe); }
+[renderHeader, renderSummary, renderValidity, renderKpis].forEach(safe);
+if(LEGS.length){ seg("segKpi","kpi",renderKpis); seg("segTime","time",renderTimeline,true); seg("segShape","shape",renderShapes); seg("segTrend","trend",renderTrend); }
+drawCharts();
+[renderFull, renderHealth, renderCounts].forEach(safe);
+$("foot").innerHTML = `Generated by <span class="mono">report_html.py</span> from the artifacts of run <span class="mono">${esc(D.run)}</span>${D.ref?" on <span class='mono'>"+esc(D.ref)+"</span>":""} (k6 <span class="mono">--summary-export</span>, the <span class="mono">*.txt</span> files of each leg and, if present, <span class="mono">search-points.json</span> read as a stream). Numbers use a comma for thousands and a dot for decimals, as in the GitHub summary. Works offline.`;
+let rt, lastW = innerWidth;
+addEventListener("resize", ()=>{ if(innerWidth===lastW) return; lastW = innerWidth; clearTimeout(rt); rt = setTimeout(drawCharts, 120); });
+/* theme toggle: dark by default; the choice is remembered (localStorage may be blocked in a sandbox) */
+function setTheme(t, persist){
+  THEME = t; document.documentElement.setAttribute("data-theme", t);
+  $("thDark").setAttribute("aria-pressed", t==="dark"); $("thLight").setAttribute("aria-pressed", t==="light");
+  if(persist){ try{ localStorage.setItem("hfs-bench-theme", t); }catch(e){} }
+  drawCharts(); safe(renderKpis);
+}
+$("thDark").addEventListener("click", ()=>setTheme("dark", true));
+$("thLight").addEventListener("click", ()=>setTheme("light", true));
+$("thDark").setAttribute("aria-pressed", THEME==="dark"); $("thLight").setAttribute("aria-pressed", THEME==="light");
+/* print is always light */
+let beforePrintTheme = null;
+addEventListener("beforeprint", ()=>{ beforePrintTheme = THEME; THEME = "light"; document.documentElement.setAttribute("data-theme","light"); drawCharts(); });
+addEventListener("afterprint", ()=>{ if(beforePrintTheme){ THEME = beforePrintTheme; document.documentElement.setAttribute("data-theme", THEME); beforePrintTheme = null; } drawCharts(); });
+</script>
+</body>
+</html>

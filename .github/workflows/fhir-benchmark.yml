@@ -10,6 +10,11 @@ name: FHIR Server Benchmark
 # (which drives the terminology `tx-benchmark` suite against HTS). It reuses the
 # same self-hosted-runner + remote-Docker plumbing.
 #
+# Artifacts: fhir-benchmark-<leg>-<run id> (results per leg),
+# fhir-bench-comparison-<run id> (comparison.md), fhir-bench-report-<run id>
+# (single dark HTML report, not zipped) and fhir-bench-report-data-<run id>
+# (report-data.json, read by later runs for the trend).
+#
 # Topology (mirrors hts-benchmark.yml — HFS and k6 run natively ON the runner;
 # only the stateful dependencies live in containers on the REMOTE Docker daemon):
 #
@@ -2135,7 +2140,19 @@ jobs:
                   print(f"\n**Environment:** crud Postgres cost **{per_call:.2f} ms/call** "
                         f"({exec_s:,.0f} s over {calls:,} statements{load}).{flag}")
           PYEOF
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee "$RUNNER_TEMP/leg-box.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # Charts for this leg, from the box captured above and the results dir.
+      # Display only: guarded so it can never fail the job.
+      - name: Leg charts
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          LEG: ${{ matrix.backend }}
+        run: |
+          RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/$LEG"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/md_charts.py" leg --box "$RUNNER_TEMP/leg-box.md" --leg "$LEG" --run-dir "$RESULTS_DIR" --layout sidebyside >> "$GITHUB_STEP_SUMMARY" || true
 
       # ── Final verification ───────────────────────────────────────────────
       # The only way to confirm cleanup actually reclaimed this leg's
@@ -2207,7 +2224,11 @@ jobs:
     needs: [setup, benchmark]
     if: ${{ always() && needs.benchmark.result != 'skipped' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 20, was 10: the steps added after the summary (unzip the leg results,
+    # history, the HTML report) can take a few minutes on top of the original
+    # summary + uploads. All of them are continue-on-error with their own
+    # timeouts, so this is headroom, not a new way to fail the run.
+    timeout-minutes: 20
     continue-on-error: true
     permissions:
       contents: read
@@ -2254,6 +2275,9 @@ jobs:
             printf '## FHIR Benchmark — leg comparison\n\n_Not available: the comparison script could not be checked out._\n' > comparison.md
           fi
           cat comparison.md >> "$GITHUB_STEP_SUMMARY"
+          # Collapsed "### Charts" section, appended right after the tables.
+          # Display only: never fails the step.
+          python3 .github/scripts/fhir-bench/md_charts.py compare --in comparison.md --layout sidebyside >> "$GITHUB_STEP_SUMMARY" || true
 
       # Raw Markdown for pasting into an issue or PR (the summary page only
       # offers rendered tables). Named fhir-bench-*, NOT fhir-benchmark-*, so a
@@ -2271,6 +2295,9 @@ jobs:
       # Trend over the last runs of this branch. Display only: it can never
       # fail the run (continue-on-error, a 5 minute timeout, and the summary append is guarded).
       # It runs after "Upload comparison" so a slow `gh` call can never cost the run its artifact.
+      # history.md is NOT appended here any more: the last step does it, so the
+      # report link lands after it. --data-dir receives the report-data.json of
+      # earlier runs (artifact fhir-bench-report-data-<run id>) for the HTML trend.
       - name: Write run history
         if: always()
         continue-on-error: true
@@ -2278,5 +2305,75 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs 5
+          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs 5 --data-dir "$RUNNER_TEMP/trend"
+
+      # The leg artifacts were downloaded as zips (skip-decompress above). Unzip
+      # each into report-input/<artifact name>/ (the layout report_html.py reads:
+      # fhir-benchmark-<leg>-<id>/<leg>/...), leaving out search-points.json,
+      # which can be hundreds of MB and which the report does not use.
+      - name: Unpack leg results for the report
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          mkdir -p report-input
+          find bench-artifacts -name '*.zip' -print0 2>/dev/null | while IFS= read -r -d '' z; do
+            n=$(basename "$z" .zip)
+            case "$n" in fhir-benchmark-*) ;; *) n=$(basename "$(dirname "$z")") ;; esac
+            unzip -q -o "$z" -x '*search-points.json' -d "report-input/$n" || echo "::warning::could not unzip $z"
+          done
+          ls report-input
+
+      - name: Build HTML report
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          python3 .github/scripts/fhir-bench/report_html.py \
+            --run-dir report-input \
+            --run-id "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --branch "$GITHUB_REF_NAME" \
+            --sha "$GITHUB_SHA" \
+            --out "fhir-bench-report-$GITHUB_RUN_ID.html" \
+            --dump-json report-data.json \
+            --trend-dir "$RUNNER_TEMP/trend" \
+            --no-shapes
+
+      # archive: false uploads the single .html as-is (not zipped), so it opens
+      # in the browser from the artifact link.
+      - name: Upload HTML report
+        id: report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-bench-report-${{ github.run_id }}
+          path: fhir-bench-report-${{ github.run_id }}.html
+          archive: false
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # The data the next runs read through history.py --data-dir.
+      - name: Upload report data
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-bench-report-data-${{ github.run_id }}
+          path: report-data.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # LAST on purpose: history table, then the link to the full report.
+      # The artifact link works for signed-in viewers of the repository only.
+      - name: Append history and report link
+        if: always()
+        continue-on-error: true
+        env:
+          REPORT_URL: ${{ steps.report.outputs.artifact-url }}
+        run: |
           if [ -f history.md ]; then cat history.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -n "$REPORT_URL" ]; then
+            printf '\n[Full report (HTML)](%s)\n' "$REPORT_URL" >> "$GITHUB_STEP_SUMMARY"
+          fi
