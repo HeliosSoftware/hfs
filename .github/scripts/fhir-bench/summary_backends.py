@@ -2,7 +2,7 @@
 #
 # Per-leg benchmark diagnostics for the step summary: tuning table, import
 # completeness and throughput (resources/s), bulk-import ($bulk-submit)
-# result, ES drain status, the indexing suite (timed `$reindex`), host load at
+# result, ES drain status, host load at
 # crud start, "how to read this leg" guidance, the result-size cross-check +
 # crud-residue caption, the insert suite's per-type line, Mongo
 # transaction-error heuristic, composite ES sync-failure count, and
@@ -40,7 +40,7 @@
 # bench-results/<backend>/ — runner-info.txt, import-completeness.txt,
 # bulk-import.txt, es-drain.txt, host-contention.txt, search-counts.txt, crud-residue.txt,
 # import-mongo-txn-errors.txt, es-sync-metrics-after-drain.txt,
-# containers-state.txt, indexing.txt, indexing-hfs-log.txt, plus insert.json
+# containers-state.txt, plus insert.json
 # (the insert suite's k6 --summary-export). Each section below is skipped,
 # not fatal, when its file is absent (e.g. a leg that died before that file
 # was ever written).
@@ -215,63 +215,6 @@ if drain:
           f"es_live={drain.get('es_live', '?')} missing={d_missing} "
           f"needs_reindex={drain.get('needs_reindex_after', '?')}.{d_warn}")
 
-# Indexing suite (opt-in: only when tests names it): one timed `POST /<type>/$reindex` after search
-# (run_indexing_suite in suite-lib.sh documents what it measures and why it
-# is comparable across legs). indexing-hfs-log.txt holds the job's own
-# `reindex job finished` line from the HFS log: where the time went.
-ix = read_kv(f"{results_dir}/indexing.txt", "=")
-if ix:
-    ix_status = ix.get("status", "?")
-    ix_type = ix.get("resource_type", "?")
-    if ix_status == "kickoff-failed":
-        print(f"\n**Indexing:** `POST /{ix_type}/$reindex` answered HTTP "
-              f"{ix.get('kickoff_http', '?')} — no indexing number for this leg. ⚠")
-    else:
-        def ix_int(key):
-            try:
-                return f"{int(ix.get(key, '')):,}"
-            except ValueError:
-                return "?"
-        try:
-            ix_rate = f"{float(ix.get('resources_per_s', '')):,.0f}"
-        except ValueError:
-            ix_rate = "?"
-        try:
-            ix_secs = f"{float(ix.get('seconds', '')):.1f}"
-        except ValueError:
-            ix_secs = "?"
-        ix_line = (f"\n**Indexing (`$reindex` of {ix_type}):** {ix_status} — "
-                   f"{ix_int('processed')}/{ix_int('total')} resources in "
-                   f"{ix_secs} s = **{ix_rate} resources/s**; "
-                   f"{ix_int('entries')} index entries ({ix.get('entries_per_resource', '?')}/resource), "
-                   f"{ix.get('errors', '?')} errors; batchSize {ix.get('batch_size', '?')}, "
-                   f"budget {ix.get('budget_s', '?')} s")
-        if ix.get("es_refresh", "n/a") != "n/a":
-            ix_line += f", Elasticsearch refresh `{ix['es_refresh']}`"
-        ix_line += "."
-        if ix_status == "partial":
-            ix_line += (f" ⚠ partial ({ix.get('reason', '?')}): the job was cancelled at the budget; "
-                        "the rate covers the part that ran.")
-        elif ix_status == "failed":
-            ix_line += f" ⚠ the job failed: {ix.get('reason', '?')}."
-        if ix.get("errors", "0") not in ("0", "unknown"):
-            ix_line += " ⚠ resources left unindexed (indexing-status.txt lists them)."
-        print(ix_line)
-        ix_log = f"{results_dir}/indexing-hfs-log.txt"
-        if os.path.exists(ix_log):
-            fin = [l for l in open(ix_log) if "reindex job finished" in l]
-            if fin:
-                fin_kv = dict(re.findall(r"(\w+)=(\S+)", fin[-1]))
-                def ix_s(key):
-                    try:
-                        return f"{int(fin_kv[key]) / 1000:.1f} s"
-                    except (KeyError, ValueError):
-                        return "?"
-                print(f"\n_HFS reindex phases (job): fetch {ix_s('fetch_ms')} · write "
-                      f"{ix_s('write_ms')} (extract {ix_s('extract_ms')} · database/Elasticsearch "
-                      f"wait {ix_s('db_wait_ms')}) · other {ix_s('other_ms')} of "
-                      f"{ix_s('elapsed_ms')}; a writer that does not time a phase reports 0._")
-
 # Host load (F9), every leg — not just Postgres ones (see the
 # Environment paragraph further below, which stays Postgres-only).
 contention_path = f"{results_dir}/host-contention.txt"
@@ -405,6 +348,57 @@ if isinstance(ins, dict) and isinstance(ins.get("metrics"), dict):
               _fmt_or_q(_ins_metric("http_reqs", "rate"), ",.0f"),
               " · ".join(ins_parts),
               (" · ⚠ **{:,} failed**".format(ins_failed) if ins_failed > 0 else "")))
+
+# sql-run suite: HFS's own k6/sql-run.js. Per-view requests and latency from
+# the http_req_duration{view:<name>} submetrics (exported because sql-run.js
+# names them in always-passing thresholds), rows from the sql_run_rows counter.
+# k6's --summary-export gives avg/min/med/max/p(90)/p(95) per trend (p(99) only
+# if --summary-trend-stats asked for it); a column is shown only if some view
+# has it. Requests per view come from the submetric's `count` (older exports
+# lack it: shown as ?).
+SQL_RUN_VIEWS = ("observation_page", "observation_large", "observation_filter", "claim", "eob")
+try:
+    with open(f"{results_dir}/sql-run.json") as fh:
+        sqr = json.load(fh)
+except (OSError, ValueError):
+    sqr = None
+if isinstance(sqr, dict) and isinstance(sqr.get("metrics"), dict):
+    sm = sqr["metrics"]
+    schecks = (sqr.get("root_group") or {}).get("checks") if isinstance(sqr.get("root_group"), dict) else None
+    if not isinstance(schecks, dict):
+        schecks = {}
+
+    def _sm(name, key):
+        m = sm.get(name)
+        return m.get(key) if isinstance(m, dict) else None
+
+    def _num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    lat_cols = [(lbl, key) for lbl, key in (("avg", "avg"), ("p50", "med"), ("p90", "p(90)"),
+                                             ("p95", "p(95)"), ("p99", "p(99)"), ("max", "max"))
+                if any(_num(_sm("http_req_duration{view:%s}" % v, key)) for v in SQL_RUN_VIEWS)]
+    print("\n**SQL-on-FHIR `$sql-run` by view**\n")
+    print("| View | Requests | " + " | ".join(l + " ms" for l, _ in lat_cols) + " |")
+    print("|---|---:|" + "---:|" * len(lat_cols))
+    for v in SQL_RUN_VIEWS:
+        d = "http_req_duration{view:%s}" % v
+        cnt = _sm(d, "count")
+        cells = [_fmt_or_q(_sm(d, k), ".1f") for _, k in lat_cols]
+        print("| %s | %s | %s |" % (v, _fmt_or_q(cnt, ","), " | ".join(cells)))
+    srows_n, srows_r = _sm("sql_run_rows", "count"), _sm("sql_run_rows", "rate")
+    sfail = _sm("http_req_failed", "value")
+    sbad = []
+    for cn in ("sql-run 200", "sql-run rows > 0"):
+        c = schecks.get(cn)
+        f = c.get("fails") if isinstance(c, dict) else None
+        sbad.append("%s ✓" % cn if f == 0 else "%s ✗ %s" % (cn, _fmt_or_q(f, ",")))
+    print("\nRows returned: %s total, %s rows/s · errors %s%% · checks: %s" % (
+        _fmt_or_q(srows_n, ","), _fmt_or_q(srows_r, ",.0f"),
+        _fmt_or_q(sfail * 100 if _num(sfail) else None, ".2f"), "; ".join(sbad)))
+    print("\n_The first two views read the first rows of a flat view (warm cache, LIMIT stops "
+          "early); the filtered view is the scan; Mongo returns unsorted rows; *-elasticsearch "
+          "legs use the primary store's runner._")
 
 # Mongo transaction-abort count (F8): this counts matching HFS log
 # LINES across the whole log (startup, prewarm and import), not

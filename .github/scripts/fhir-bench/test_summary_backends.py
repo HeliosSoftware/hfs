@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Unit tests for summary_backends.py's indexing-suite and bulk-import lines: stdlib unittest,
+# Unit tests for summary_backends.py's bulk-import lines: stdlib unittest,
 # synthetic bench-results/<leg>/ files built in code, the script run as the
 # workflow runs it (its own python process, GITHUB_WORKSPACE + BACKEND set).
 # Not wired into CI. Run from the repo root:
@@ -13,12 +13,6 @@ import tempfile
 import unittest
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "summary_backends.py")
-FINISHED = ("2026-10-09T13:19:08.201143Z  INFO helios_persistence::search::reindex: reindex job "
-            "finished tenant=default job_id=j outcome=completed types_done=1 types=1 "
-            "processed=5000 total=5000 elapsed_ms=8018 resources_per_s=623.6 entries=45000 "
-            "failed=0 pages=6 fetch_ms=512 write_ms=7401 extract_ms=0 delete_ms=0 insert_ms=0 "
-            "writer_other_ms=7401 yield_ms=31 other_ms=74 db_wait_ms=0\n")
-
 
 class SummaryRunMixin(object):
     def summary(self, files, backend="sqlite"):
@@ -68,46 +62,45 @@ class SummaryBulkImportTest(SummaryRunMixin, unittest.TestCase):
         self.assertNotIn("search-index rebuild", out)
 
 
-class SummaryIndexingTest(SummaryRunMixin, unittest.TestCase):
-    def test_completed_with_phase_split(self):
-        out = self.summary({
-            "indexing.txt": "status=completed\nreason=\nresource_type=Encounter\ntotal=5000\n"
-                            "processed=5000\nentries=45000\nerrors=0\nseconds=8.028\n"
-                            "resources_per_s=622.8\nentries_per_resource=9.00\nbatch_size=1000\n"
-                            "budget_s=180\nes_refresh=n/a\n",
-            "indexing-hfs-log.txt": FINISHED})
-        self.assertIn("**Indexing (`$reindex` of Encounter):** completed — 5,000/5,000 resources "
-                      "in 8.0 s = **623 resources/s**", out)
-        self.assertIn("fetch 0.5 s · write 7.4 s", out)
-        self.assertIn("budget 180 s", out)
-        self.assertNotIn("⚠", out)
+def sql_run_json(views=("observation_page", "observation_large", "observation_filter", "claim"),
+                 fails=0):
+    """A small sql-run.json (k6 --summary-export); `eob` has no samples by default."""
+    import json
+    m = {"sql_run_rows": {"count": 120000, "rate": 2000.0},
+         "http_req_failed": {"value": 0.0125, "passes": 1, "fails": 80}}
+    for v in views:
+        m["http_req_duration{view:%s}" % v] = {"avg": 10.0, "min": 1.0, "med": 8.5,
+                                                "max": 99.0, "p(90)": 20.0, "p(95)": 30.25,
+                                                "count": 500}
+    checks = {"sql-run 200": {"passes": 500, "fails": fails},
+              "sql-run rows > 0": {"passes": 500, "fails": 0}}
+    return json.dumps({"metrics": m, "root_group": {"checks": checks}})
 
-    def test_partial_es_and_failed_kickoff(self):
-        out = self.summary({
-            "indexing.txt": "status=partial\nreason=time-cap\nresource_type=Encounter\n"
-                            "total=67692\nprocessed=30000\nentries=450000\nerrors=0\n"
-                            "seconds=180.4\nresources_per_s=166.3\nentries_per_resource=15.00\n"
-                            "batch_size=1000\nbudget_s=180\nes_refresh=wait_for\n"},
-            backend="sqlite-elasticsearch")
-        self.assertIn("30,000/67,692", out)
-        self.assertIn("Elasticsearch refresh `wait_for`", out)
-        self.assertIn("⚠ partial (time-cap)", out)
-        self.assertIn("budget 180 s", out)
-        out = self.summary({"indexing.txt": "status=kickoff-failed\nreason=http-501\n"
-                                            "resource_type=Encounter\nkickoff_http=501\n"})
-        self.assertIn("answered HTTP 501", out)
 
-    def test_no_indexing_file_prints_nothing(self):
-        out = self.summary({"runner-info.txt": "runner_name:  agent-sqlite\nrunner_cpus:  8\n"})
-        self.assertNotIn("Indexing", out)
+class SummarySqlRunTest(SummaryRunMixin, unittest.TestCase):
+    def test_section_absent_without_file(self):
+        self.assertNotIn("$sql-run", self.summary({}))
 
-    def test_budget_other_value(self):
-        out = self.summary({"indexing.txt": "status=completed\nresource_type=Encounter\n"
-                                            "total=10\nprocessed=10\nentries=90\nerrors=0\n"
-                                            "seconds=1.0\nresources_per_s=10.0\n"
-                                            "entries_per_resource=9.00\nbatch_size=1000\n"
-                                            "budget_s=240\nes_refresh=n/a\n"})
-        self.assertIn("budget 240 s", out)
+    def test_table_rows_and_totals(self):
+        out = self.summary({"sql-run.json": sql_run_json()})
+        self.assertIn("**SQL-on-FHIR `$sql-run` by view**", out)
+        self.assertIn("| View | Requests | avg ms | p50 ms | p90 ms | p95 ms | max ms |", out)
+        self.assertIn("| observation_filter | 500 | 10.0 | 8.5 | 20.0 | 30.2 | 99.0 |", out)
+        self.assertNotIn("p99", out)
+        self.assertIn("Rows returned: 120,000 total, 2,000 rows/s · errors 1.25%", out)
+        self.assertIn("sql-run 200 ✓; sql-run rows > 0 ✓", out)
+        self.assertIn("the filtered view is the scan", out)
+
+    def test_view_without_samples(self):
+        out = self.summary({"sql-run.json": sql_run_json()})
+        self.assertIn("| eob | ? | ? | ? | ? | ? | ? |", out)
+
+    def test_failed_check_flagged(self):
+        out = self.summary({"sql-run.json": sql_run_json(fails=7)})
+        self.assertIn("sql-run 200 ✗ 7", out)
+
+    def test_invalid_json_omits_section(self):
+        self.assertNotIn("$sql-run", self.summary({"sql-run.json": "{not json"}))
 
 
 if __name__ == "__main__":

@@ -127,6 +127,19 @@ case "$BACKEND" in
     # otherwise; HFS's documented import setting is no per-request refresh
     # (bulk-data-submit SKILL.md, "Rebuild knobs").
     export HFS_ELASTICSEARCH_REINDEX_REFRESH="${HFS_ELASTICSEARCH_REINDEX_REFRESH:-false}"
+    # Indexing recipe per leg, from owner-reviewed measurements: on a 133,527-
+    # resource slice HFS's defaults took ~82 s against 18-32 s for this recipe
+    # (index while ingesting, 4 files x 4 ES bulk workers, batches of 1000).
+    # No refresh interval is set: measured, no gain. Env vars from the caller win.
+    export HFS_BULK_SUBMIT_DEFER_INDEXING="${HFS_BULK_SUBMIT_DEFER_INDEXING:-false}"
+    export HFS_BULK_SUBMIT_FILE_CONCURRENCY="${HFS_BULK_SUBMIT_FILE_CONCURRENCY:-4}"
+    export HFS_BULK_SUBMIT_BATCH_SIZE="${HFS_BULK_SUBMIT_BATCH_SIZE:-1000}"
+    export HFS_ELASTICSEARCH_BULK_CONCURRENCY="${HFS_ELASTICSEARCH_BULK_CONCURRENCY:-4}"
+    ;;
+  *)
+    # Standalone legs (sqlite, postgres, mongodb): deferred indexing was 26-27%
+    # faster on postgres and sqlite and a tie on mongodb (same slice).
+    export HFS_BULK_SUBMIT_DEFER_INDEXING="${HFS_BULK_SUBMIT_DEFER_INDEXING:-true}"
     ;;
 esac
 
