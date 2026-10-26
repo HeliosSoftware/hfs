@@ -1568,6 +1568,102 @@ async fn bulk_export_key_cursor_reads_each_object_once() {
     assert_eq!(legacy.next_cursor.as_deref(), Some("8"));
 }
 
+/// #2140: deciding whether a requested `_type` has anything to export stops at
+/// the first live object instead of reading the whole type one GET at a time
+/// (35 minutes for 11,704 Patients against real S3). A type is kept on any
+/// live resource, window or not, as the SQL and MongoDB backends decide it:
+/// the batches apply `_since` / `_until`.
+#[tokio::test]
+async fn bulk_export_requested_types_probe_stops_at_first_live_object() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    for i in 0..50 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("p{i:02}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    for i in 0..3 {
+        let id = format!("o{i}");
+        backend
+            .create(
+                &tenant,
+                "Organization",
+                json!({"resourceType":"Organization","id":id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Organization", &id).await.unwrap();
+    }
+
+    let types = vec![
+        "Patient".to_string(),
+        "Organization".to_string(),
+        "Location".to_string(),
+    ];
+    let gets_before = mock.get_count();
+    let found = backend
+        .list_export_types(&tenant, &ExportRequest::system().with_types(types.clone()))
+        .await
+        .unwrap();
+    assert_eq!(found, vec!["Patient".to_string()]);
+    // One GET finds a live Patient; the three deleted Organizations are each
+    // read once to rule the type out; Location has nothing to read.
+    let gets = mock.get_count() - gets_before;
+    assert!(
+        gets <= 1 + 3,
+        "{gets} GETs to probe 50 Patients and 3 Organizations"
+    );
+
+    // Out of the window still counts as present: the batches filter it.
+    let past = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let request = ExportRequest::system()
+        .with_types(vec!["Patient".to_string()])
+        .with_until(past);
+    assert_eq!(
+        backend.list_export_types(&tenant, &request).await.unwrap(),
+        vec!["Patient".to_string()]
+    );
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 100)
+        .await
+        .unwrap();
+    assert!(batch.lines.is_empty() && batch.is_last);
+    assert_eq!(
+        backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A live object behind a run of deleted ones is still found.
+    backend.delete(&tenant, "Patient", "p00").await.unwrap();
+    backend.delete(&tenant, "Patient", "p01").await.unwrap();
+    let found = backend
+        .list_export_types(&tenant, &ExportRequest::system().with_types(types))
+        .await
+        .unwrap();
+    assert_eq!(found, vec!["Patient".to_string()]);
+    assert_eq!(
+        backend
+            .count_export_resources(&tenant, &ExportRequest::system(), "Patient")
+            .await
+            .unwrap(),
+        48
+    );
+}
+
 /// #1273: every exported NDJSON line carries the server's `meta.versionId`
 /// and `meta.lastUpdated` (the same `meta` a read returns) while keeping
 /// client-supplied `meta` members, on both the type-level and the
@@ -9232,6 +9328,44 @@ mod scan_read_limit {
         assert_eq!(backend.scan_limit.available_permits(), 3);
     }
 
+    /// #2140: the export count and the Patient-id listing read a type's
+    /// objects concurrently under the read limit, not one GET at a time.
+    #[tokio::test(start_paused = true)]
+    async fn export_count_and_patient_ids_overlap_gets() {
+        let (backend, client) = gauged_backend(4);
+        let t = tenant("tenant-a");
+        seed_patients(&backend, &client, &t, 20).await;
+        backend.delete(&t, "Patient", "p07").await.unwrap();
+        client.peak.store(0, Ordering::SeqCst);
+
+        let request = ExportRequest::system();
+        let count = backend
+            .count_export_resources(&t, &request, "Patient")
+            .await
+            .unwrap();
+        assert_eq!(count, 19);
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!((2..=4).contains(&peak), "count: peak {peak} GETs in flight");
+
+        client.peak.store(0, Ordering::SeqCst);
+        let (ids, next) = backend
+            .list_patient_ids(&t, &request, None, 100)
+            .await
+            .unwrap();
+        let expected: Vec<String> = (0..20)
+            .filter(|i| *i != 7)
+            .map(|i| format!("p{i:02}"))
+            .collect();
+        assert_eq!(ids, expected, "sorted, deleted one left out");
+        assert!(next.is_none());
+        let peak = client.peak.load(Ordering::SeqCst);
+        assert!(
+            (2..=4).contains(&peak),
+            "patient ids: peak {peak} GETs in flight"
+        );
+        assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
+    }
+
     /// The setting really bounds a single call, and a limit of one still lets
     /// the scan finish.
     #[tokio::test(start_paused = true)]
@@ -9390,5 +9524,144 @@ mod scan_read_limit {
         assert!(peak >= 2, "peak {peak}: the test never overlapped any GETs");
         assert_eq!(client.in_flight.load(Ordering::SeqCst), 0);
         assert_eq!(backend.scan_limit.available_permits(), 2);
+    }
+}
+
+/// The SQL-on-FHIR terminology store on S3 (#2185). The store contract runs
+/// against MinIO in `tests/minio_s3_tests.rs`; these pin what only the mock
+/// can show: where the objects live, that released generations are deleted,
+/// and that a lost registry swap never drops a concurrent reference.
+mod sof_terminology {
+    use super::*;
+    use crate::core::sof_terminology::SofTerminologyStore;
+    use helios_sof::sqlquery::{TerminologyKind, TerminologyRelation};
+
+    const BUCKET: &str = "test-bucket";
+    const URL: &str = "http://example.org/vs";
+
+    fn tenant(id: &str) -> TenantContext {
+        TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
+    }
+
+    fn vs(codes: &[&str]) -> TerminologyRelation {
+        TerminologyRelation {
+            kind: TerminologyKind::ValueSet,
+            rows: codes.iter().map(|c| json!({"code": c})).collect(),
+        }
+    }
+
+    fn setup() -> (Arc<MockS3Client>, S3Backend) {
+        let mock = Arc::new(MockS3Client::with_buckets(&[BUCKET]));
+        let backend = make_prefix_backend(mock.clone());
+        (mock, backend)
+    }
+
+    fn terminology_keys(mock: &MockS3Client) -> Vec<String> {
+        mock.keys(BUCKET)
+            .into_iter()
+            .filter(|k| k.contains("sof-terminology"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn objects_live_under_the_tenants_bulk_root_and_go_with_the_last_reference() {
+        let (mock, backend) = setup();
+        let t = tenant("acme");
+        backend
+            .set_library_dependencies(&t, "a", vec![(URL.into(), vs(&["1"]))])
+            .await
+            .unwrap();
+        backend
+            .set_library_dependencies(&t, "b", vec![(URL.into(), vs(&["1", "2"]))])
+            .await
+            .unwrap();
+        let keys = terminology_keys(&mock);
+        assert_eq!(
+            keys.len(),
+            2,
+            "registry + the one current generation: {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .all(|k| k.starts_with("acme/bulk/sof-terminology/")),
+            "{keys:?}"
+        );
+
+        backend
+            .set_library_dependencies(&t, "a", vec![])
+            .await
+            .unwrap();
+        backend
+            .set_library_dependencies(&t, "b", vec![])
+            .await
+            .unwrap();
+        assert!(backend.load(&t, URL).await.unwrap().is_none());
+        assert_eq!(
+            terminology_keys(&mock),
+            vec!["acme/bulk/sof-terminology/registry.json".to_string()],
+            "only the (empty) registry remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_deletes_every_terminology_object_of_the_tenant() {
+        let (mock, backend) = setup();
+        for id in ["acme", "other"] {
+            backend
+                .set_library_dependencies(&tenant(id), "a", vec![(URL.into(), vs(&["1"]))])
+                .await
+                .unwrap();
+        }
+        backend.purge_tenant_data("acme").await.unwrap();
+        let keys = terminology_keys(&mock);
+        assert!(keys.iter().all(|k| k.starts_with("other/")), "{keys:?}");
+        assert!(backend.load(&tenant("other"), URL).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_conditional_write_is_retried() {
+        let (mock, backend) = setup();
+        mock.conflict_puts_at("acme/bulk/sof-terminology/registry.json", 3);
+        backend
+            .set_library_dependencies(&tenant("acme"), "a", vec![(URL.into(), vs(&["1"]))])
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.load(&tenant("acme"), URL).await.unwrap(),
+            Some(vs(&["1"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_swap_keeps_the_winners_reference() {
+        let (mock, backend) = setup();
+        let t = tenant("acme");
+        let registry_key = "acme/bulk/sof-terminology/registry.json";
+        backend
+            .set_library_dependencies(&t, "a", vec![(URL.into(), vs(&["1"]))])
+            .await
+            .unwrap();
+
+        // A concurrent writer adds Library b's reference to the same relation
+        // between our read of the registry and our swap.
+        let mut stolen: Value =
+            serde_json::from_slice(&mock.object_body(BUCKET, registry_key).unwrap()).unwrap();
+        stolen["version"] = json!(stolen["version"].as_u64().unwrap() + 1);
+        stolen["registry"]["entries"][0]["libraries"] = json!(["a", "b"]);
+        mock.steal_once(BUCKET, registry_key, serde_json::to_vec(&stolen).unwrap());
+
+        // Releasing a must lose the swap, re-read, and leave b's reference.
+        backend
+            .set_library_dependencies(&t, "a", vec![])
+            .await
+            .unwrap();
+        assert_eq!(backend.load(&t, URL).await.unwrap(), Some(vs(&["1"])));
+        let puts = mock.recorded_puts();
+        assert!(
+            puts.iter()
+                .filter(|p| p.key == registry_key)
+                .all(|p| p.if_match.is_some() || p.if_none_match.as_deref() == Some("*")),
+            "every registry write is conditional"
+        );
     }
 }

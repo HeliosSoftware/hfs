@@ -366,7 +366,6 @@ impl TestAppPg {
     async fn connect(url: &str) -> Self {
         use helios_hts::backends::PostgresTerminologyBackend;
         use helios_persistence::backends::postgres::PostgresBackend;
-        use std::sync::Arc;
 
         let backend = PostgresTerminologyBackend::new(url)
             .await
@@ -376,9 +375,7 @@ impl TestAppPg {
             .await
             .expect("Failed to open PostgreSQL resource store");
 
-        let state = PgAppState::new(backend.clone())
-            .with_resource_store_pg(resource_store)
-            .with_terminology_importer(Arc::new(backend));
+        let state = PgAppState::new(backend).with_resource_store_pg(resource_store);
 
         let config = PgHtsConfig::default();
         let router = helios_hts::server::create_app(&config, state);

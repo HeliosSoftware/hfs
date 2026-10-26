@@ -49,6 +49,9 @@ mod tenant_id_fidelity_suite;
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 
+#[path = "common/sof_terminology_suite.rs"]
+mod sof_terminology_suite;
+
 /// The backend-agnostic full-text purge-completeness scenarios (issue #386),
 /// shared verbatim with the SQLite suite that owns the file.
 ///
@@ -2037,6 +2040,26 @@ mod postgres_integration {
         .await;
     }
 
+    mod index_pending_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/index_pending_contract.rs"
+        ));
+    }
+
+    /// See `index_pending_contract::marked_manifest_is_listed_until_cleared` (#1283).
+    #[tokio::test]
+    async fn postgres_bulk_submit_marked_manifest_is_listed_until_cleared() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        index_pending_contract::marked_manifest_is_listed_until_cleared(
+            &create_backend().await,
+            &create_tenant("submit-index-pending"),
+            true,
+        )
+        .await;
+    }
+
     mod claim_contract {
         use helios_persistence as persistence;
         include!(concat!(
@@ -2857,6 +2880,47 @@ mod postgres_integration {
         PostgresBackend::new(config)
             .await
             .expect("Failed to create PostgresBackend")
+    }
+
+    /// Default-sized pools share half of the server's `max_connections` (100 on
+    /// this stock container, so 50) instead of each taking half; an explicit size
+    /// is used as given (#2216).
+    #[tokio::test]
+    async fn postgres_2216_default_pools_share_half_of_the_server_and_explicit_sizes_are_kept() {
+        let pg = shared_pg().await;
+        let config_with = |max_connections: usize, limit_pool_to_server: bool| PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections,
+            limit_pool_to_server,
+            ..Default::default()
+        };
+        let size = |backend: &PostgresBackend| backend.pool_status().max_size;
+
+        // Two pools that each want everything, like `hfs` with the database
+        // audit sink. Pools of concurrent tests in this binary only shrink what
+        // is left, so the two never exceed half together; each keeps at least one.
+        let first = PostgresBackend::new(config_with(64, true))
+            .await
+            .expect("Failed to create PostgresBackend");
+        assert!((1..=50).contains(&size(&first)), "{}", size(&first));
+        let second = PostgresBackend::new(config_with(64, true))
+            .await
+            .expect("Failed to create PostgresBackend");
+        let (a, b) = (size(&first), size(&second));
+        assert!(a >= 1 && b >= 1, "{a} + {b}");
+        assert!(a + b <= 50 || a + b == 2, "{a} + {b} exceed half of 100");
+
+        // An explicit size is kept, even above what the budget leaves (it only
+        // warns once the pools add up to more than the server accepts).
+        let explicit = PostgresBackend::new(config_with(51, false))
+            .await
+            .expect("Failed to create PostgresBackend");
+        assert_eq!(size(&explicit), 51);
+        assert_eq!(explicit.config().max_connections, 51);
     }
 
     /// Creates a tenant with a unique ID suffix to isolate tests sharing the same database.
@@ -32755,6 +32819,103 @@ mod postgres_integration {
             &unique_base("fidelity_purge"),
         )
         .await;
+    }
+
+    /// #2185: the SQL-on-FHIR terminology store contract, with the tenant's
+    /// remaining relation, chunk and reference rows as the residue.
+    #[tokio::test]
+    async fn postgres_integration_sof_terminology_store_suite() {
+        let backend = create_backend().await;
+        let base = unique_base("sof_term");
+        let client = std::sync::Arc::new(backend.get_client().await.unwrap());
+        let residue = move |tenant: String| {
+            let client = std::sync::Arc::clone(&client);
+            Box::pin(async move {
+                let row = client
+                    .query_one(
+                        "SELECT (SELECT COUNT(*) FROM sof_terminology_relations WHERE tenant_id = $1)
+                              + (SELECT COUNT(*) FROM sof_terminology_refs WHERE tenant_id = $1)
+                              + (SELECT COUNT(*) FROM sof_terminology_chunks c
+                                   JOIN sof_terminology_relations r ON r.id = c.relation_id
+                                  WHERE r.tenant_id = $1)",
+                        &[&tenant],
+                    )
+                    .await
+                    .unwrap();
+                row.get::<_, i64>(0) as usize
+            }) as futures::future::BoxFuture<'static, usize>
+        };
+        super::sof_terminology_suite::run_all(&backend, &base, Some(&residue)).await;
+    }
+
+    /// #2185: a Library write with no terminology to record or release must
+    /// not queue on the tenant's terminology lock, which another Library's
+    /// materialization holds while it writes a large relation.
+    #[tokio::test]
+    async fn postgres_integration_sof_terminology_noop_release_skips_the_tenant_lock() {
+        use helios_sof::sqlquery::{TerminologyKind, TerminologyRelation};
+        use std::time::Duration;
+
+        let backend = create_backend().await;
+        let tenant_id = unique_base("sof_term_lock");
+        let tenant =
+            TenantContext::new(TenantId::new(&tenant_id), TenantPermissions::full_access());
+        let store = backend.sof_terminology_store().expect("terminology store");
+        store
+            .set_library_dependencies(
+                &tenant,
+                "holder",
+                vec![(
+                    "http://example.org/vs".to_string(),
+                    TerminologyRelation {
+                        kind: TerminologyKind::ValueSet,
+                        rows: vec![serde_json::json!({"code": "a"})],
+                    },
+                )],
+            )
+            .await
+            .unwrap();
+
+        // Hold the lock `set_library_dependencies` takes (see
+        // `SOF_TERMINOLOGY_LOCK_NAMESPACE`), as a long materialization would.
+        let mut holder = backend.get_client().await.unwrap();
+        let txn = holder.transaction().await.unwrap();
+        txn.execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            &[&0x4853_5454_i32, &tenant_id],
+        )
+        .await
+        .unwrap();
+
+        // A Library that never held terminology: nothing to wait for.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            store.set_library_dependencies(&tenant, "plain", vec![]),
+        )
+        .await
+        .expect("a no-op release must not wait for the tenant lock")
+        .unwrap();
+
+        // A Library that holds a reference still serializes on the lock.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            store.set_library_dependencies(&tenant, "holder", vec![]),
+        )
+        .await;
+        assert!(blocked.is_err(), "a real release must take the tenant lock");
+
+        txn.rollback().await.unwrap();
+        store
+            .set_library_dependencies(&tenant, "holder", vec![])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load(&tenant, "http://example.org/vs")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// #1912: the tenant-scoped existence probe answers as `count_by_tenant`

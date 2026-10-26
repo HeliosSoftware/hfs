@@ -1,7 +1,14 @@
 //! Axum middleware for recording FHIR operation audit events.
 //!
-//! Intercepts HTTP requests, executes the handler, then records an
-//! `AuditEvent` asynchronously via `tokio::spawn` (fire-and-forget).
+//! Intercepts HTTP requests, executes the handler, then hands an `AuditEvent`
+//! to the sink before returning the response.
+//!
+//! The server's sink is a [`QueuedSink`](crate::sinks::QueuedSink), so handing
+//! the event over only queues it; the write happens on the queue's writers.
+//! When the queue is full and its overflow policy is `block`, the response
+//! waits for room, which is the backpressure that keeps events from being lost
+//! (#2234). This used to spawn one detached task per request, which put no
+//! bound on outstanding writes.
 
 use std::sync::Arc;
 
@@ -111,61 +118,55 @@ pub async fn audit_middleware(
     let status = response.status().as_u16();
     let audit_ctx = response.extensions().get::<AuditResponseContext>().cloned();
 
-    // Fire-and-forget audit recording
-    let sink = Arc::clone(&state.sink);
-    let source_observer = state.config.source_observer.clone();
+    let mut resource_type = resource_type;
+    let mut resource_id = resource_id;
+    let mut patient_ref_from_response = None;
 
-    tokio::spawn(async move {
-        let mut resource_type = resource_type;
-        let mut resource_id = resource_id;
-        let mut patient_ref_from_response = None;
-
-        if let Some(ctx) = &audit_ctx {
-            if resource_id.is_none() {
-                resource_id = ctx.resource_id.clone();
-            }
-            if resource_type.is_none() {
-                resource_type = ctx.resource_type.clone();
-            }
-            patient_ref_from_response = ctx.patient_reference.clone();
+    if let Some(ctx) = &audit_ctx {
+        if resource_id.is_none() {
+            resource_id = ctx.resource_id.clone();
         }
-
-        let action = balp::detect_interaction(
-            &method,
-            &path,
-            resource_type.as_deref(),
-            resource_id.as_deref(),
-        );
-        let outcome = if status < 400 { "0" } else { "8" };
-
-        let mut patient_ref = PatientResolver::resolve(
-            resource_type.as_deref().unwrap_or(""),
-            resource_id.as_deref(),
-            None, // body not available post-response
-            query_params.as_deref(),
-        );
-        if patient_ref_from_response.is_some() {
-            patient_ref = patient_ref_from_response;
+        if resource_type.is_none() {
+            resource_type = ctx.resource_type.clone();
         }
+        patient_ref_from_response = ctx.patient_reference.clone();
+    }
 
-        let mut builder = AuditEventBuilder::new(&source_observer)
-            .action(action)
-            .outcome(outcome);
+    let action = balp::detect_interaction(
+        &method,
+        &path,
+        resource_type.as_deref(),
+        resource_id.as_deref(),
+    );
+    let outcome = if status < 400 { "0" } else { "8" };
 
-        if let Some(rt) = &resource_type {
-            if let Some(rid) = &resource_id {
-                builder = builder.resource(rt, rid);
-            }
-        }
-        if let Some(pr) = patient_ref {
-            builder = builder.patient(pr);
-        }
-        if let Some(a) = &agent {
-            builder = builder.agent(&a.0, None, true);
-        }
+    let mut patient_ref = PatientResolver::resolve(
+        resource_type.as_deref().unwrap_or(""),
+        resource_id.as_deref(),
+        None, // body not available post-response
+        query_params.as_deref(),
+    );
+    if patient_ref_from_response.is_some() {
+        patient_ref = patient_ref_from_response;
+    }
 
-        sink.record(builder.build()).await;
-    });
+    let mut builder = AuditEventBuilder::new(&state.config.source_observer)
+        .action(action)
+        .outcome(outcome);
+
+    if let Some(rt) = &resource_type {
+        if let Some(rid) = &resource_id {
+            builder = builder.resource(rt, rid);
+        }
+    }
+    if let Some(pr) = patient_ref {
+        builder = builder.patient(pr);
+    }
+    if let Some(a) = &agent {
+        builder = builder.agent(&a.0, None, true);
+    }
+
+    state.sink.record(builder.build()).await;
 
     response
 }

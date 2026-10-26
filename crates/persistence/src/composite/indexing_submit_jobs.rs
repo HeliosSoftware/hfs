@@ -806,8 +806,18 @@ impl SubmitWorkerStorage for IndexingSubmitJobs {
     // trait defaults are no-ops, so without these forwards a marker set when
     // the sink rejected a type would be dropped, and a restart would never
     // re-fire that rebuild (#1161).
-    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
-        self.inner.mark_manifest_index_pending(lease).await
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        self.inner
+            .mark_manifest_index_pending(lease, resource_types)
+            .await
+    }
+
+    fn records_index_pending(&self) -> bool {
+        self.inner.records_index_pending()
     }
 
     async fn clear_manifest_index_pending(
@@ -1114,7 +1124,10 @@ mod tests {
             "nothing is pending before the marker is set"
         );
 
-        h.jobs.mark_manifest_index_pending(&h.lease).await.unwrap();
+        h.jobs
+            .mark_manifest_index_pending(&h.lease, &[])
+            .await
+            .unwrap();
         let pending = h.jobs.list_manifests_awaiting_reindex(16).await.unwrap();
         assert_eq!(pending.len(), 1, "the marker reached the inner store");
         assert_eq!(pending[0].manifest_id, h.lease.manifest_id);
