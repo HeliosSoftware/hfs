@@ -111,7 +111,9 @@ pub use date_value::{
     validate_date_values,
 };
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
-pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
+pub use extractor::{
+    ContainedExtraction, ExtractedValue, ExtractionFailure, SearchParameterExtractor,
+};
 pub use in_resolver::{query_has_in, resolve_in};
 pub use list_resolver::{query_has_list, resolve_list};
 pub use loader::SearchParameterLoader;

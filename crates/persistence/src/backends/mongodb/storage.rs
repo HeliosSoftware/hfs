@@ -2556,6 +2556,16 @@ impl SearchIndexDocuments {
     }
 }
 
+/// How one resource's search-parameter extraction went (#2002).
+pub(super) enum ExtractionReport {
+    /// Every parameter extracted.
+    Clean,
+    /// Some parameters failed; the rest were indexed and the resource is OK.
+    FailedParameters(Vec<crate::search::ExtractionFailure>),
+    /// The resource could not be extracted at all; it is reported as failed.
+    FailedResource(String),
+}
+
 /// Unknown extraction removes previous metadata rather than claiming known absence.
 pub(super) fn with_missing_metadata_update(
     mut update: Document,
@@ -3586,9 +3596,9 @@ impl MongoBackend {
         resource_type: &str,
         resource_id: &str,
         resource: &Value,
-    ) -> (SearchIndexDocuments, Option<String>) {
+    ) -> (SearchIndexDocuments, ExtractionReport) {
         let extractor = self.tenant_extractor(tenant_id);
-        let (own, mut missing_params, failure) = match extractor
+        let (own, mut missing_params, report) = match extractor
             .extract_with_missing(resource, resource_type)
         {
             Ok(extraction) => {
@@ -3625,11 +3635,12 @@ impl MongoBackend {
                         .filter(|name| super::search_impl::records_missing_metadata(name))
                         .collect::<Vec<_>>()
                 });
-                (
-                    own,
-                    missing,
-                    (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
-                )
+                let report = if extraction.failures.is_empty() {
+                    ExtractionReport::Clean
+                } else {
+                    ExtractionReport::FailedParameters(extraction.failures)
+                };
+                (own, missing, report)
             }
             Err(e) => {
                 tracing::warn!(
@@ -3646,7 +3657,9 @@ impl MongoBackend {
                         resource,
                     ),
                     None,
-                    Some(format!("Search parameter extraction failed: {e}")),
+                    ExtractionReport::FailedResource(format!(
+                        "Search parameter extraction failed: {e}"
+                    )),
                 )
             }
         };
@@ -3687,7 +3700,7 @@ impl MongoBackend {
                 missing_params,
                 missing_fp,
             },
-            failure,
+            report,
         )
     }
 
@@ -7973,9 +7986,13 @@ impl ReindexTarget for MongoBackend {
         tenant: &TenantContext,
         resources: &[StoredResource],
         skip_existing: bool,
-    ) -> (Vec<StorageResult<()>>, u64) {
+    ) -> (
+        Vec<StorageResult<()>>,
+        u64,
+        Vec<crate::search::ExtractionFailure>,
+    ) {
         if resources.is_empty() {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, Vec::new());
         }
         let n = resources.len();
         let db = match self.get_database().await {
