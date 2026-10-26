@@ -1,0 +1,61 @@
+name: FHIR benchmark scripts
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Unit tests and a syntax gate for the FHIR Server Benchmark helper scripts
+# (.github/scripts/fhir-bench/). Runs on pull requests that touch them so a
+# change cannot silently break the benchmark report.
+#
+# Kept out of ci.yml on purpose: ci.yml has no per-path filter, and a
+# workflow-level `paths:` there would restrict the whole CI.
+#
+# stdlib unittest only; no Docker, no network, runs in about a second. The
+# real-data smoke tests read ~/tmp/ci-bench/... and skip on a clean runner.
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    paths:
+      - ".github/scripts/fhir-bench/**"
+      - ".github/workflows/fhir-benchmark.yml"
+      - ".github/workflows/fhir-bench-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench-scripts:
+    name: Benchmark script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python version
+        run: python3 --version
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s .github/scripts/fhir-bench -p 'test_*.py' -v
+
+      - name: Syntax gate
+        run: |
+          set -euo pipefail
+          for f in .github/scripts/fhir-bench/*.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+          for f in .github/scripts/fhir-bench/*.py; do
+            echo "py_compile $f"
+            python3 -m py_compile "$f"
+          done
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+          python3 - <<'PY'
+          import yaml
+          yaml.safe_load(open(".github/workflows/fhir-benchmark.yml"))
+          print("fhir-benchmark.yml: YAML OK")
+          PY

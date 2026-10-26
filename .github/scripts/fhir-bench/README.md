@@ -43,6 +43,38 @@ Each run produces, in this order:
 
 All four artifacts and the summary are best effort (`continue-on-error`); a failure here never fails the benchmark.
 
+## Run time
+
+`run_timing.py` splits the wall-clock of a run per leg (jobs API plus `runner-info.txt`):
+
+- **Waiting for resources**: runner queue, the Docker host capacity gate (`capacity_wait_s`) and, if a leg records `host_wait_s`, a wait for a quiet host.
+- **Behind earlier legs**: queue time spent because `max_parallel` sequences the legs.
+- **Working**: the rest.
+
+Outputs: `run-time.md` and `run-timing.json`. `compare_legs.py --timing run-time.md` inserts the Markdown under the header; `report_html.py --timing-json run-timing.json` draws the HTML tile and timeline. A failure leaves the report unchanged.
+
+## Build job
+
+`build_features.py '<matrix json>'` derives the `cargo build --features` list from the selected legs: `R4` always, plus only the backends needed (`sqlite`, `postgres`, `mongodb`; `elasticsearch` for any `*-elasticsearch` leg), in fixed order. The workflow builds `helios-hfs` in release mode with `--no-default-features --features <list>`.
+
+Rust cache: `actions/cache@v5` stores the cargo registry/git data and `target/release/{deps,build,.fingerprint}`. Key = runner OS + feature list + `Cargo.lock` hash, with restore-keys falling back to the same features, then any bench cache. The first run per key is cold.
+
+## Docker host
+
+Every leg uses the remote Docker daemon from the `DOCKER_HOST` secret, shared with the rest of CI (18 workflows use it). The capacity gate (`capacity-gate.sh`) prints the host `MemTotal` (20000 MB in run 40385370213) and waits for enough `MemAvailable` only at the start of a leg; it does not give exclusive use. Overlapping CI jobs can halve crud/search results (run 40353889556), so check running workflows before dispatching.
+
+## Run workflow form
+
+`Use workflow from` selects the branch whose workflow and scripts run. Fields: `backend`, `tests`, `vus`, `duration`, `run_id`, `log_level`; Postgres: `pg_shared_buffers`, `pg_effective_cache_size`, `pg_work_mem`, `pg_max_wal_size`, `pg_min_wal_size`, `pg_wal_buffers`, `pg_checkpoint_timeout`, `hfs_pg_max_connections`; `max_parallel` (1..2); `es_heap`, `es_sync_mode`; `mongo_wt_cache_gb`, `hfs_mongo_max_connections`. The indexing recipes are fixed per leg type in `bulk-import.sh` (see above) and are deliberately not form fields.
+
+## Tests
+
+`.github/workflows/fhir-bench-tests.yml` runs on pull requests touching `.github/scripts/fhir-bench/**`, `fhir-benchmark.yml` or itself (and on manual dispatch): the unit tests, `bash -n` / `py_compile` on every script, and a YAML check of `fhir-benchmark.yml`. Locally:
+
+```bash
+cd .github/scripts/fhir-bench && python3 -m unittest discover -s . -p 'test_*.py'
+```
+
 ## Run the generators locally
 
 ```bash

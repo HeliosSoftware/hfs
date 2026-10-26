@@ -297,10 +297,10 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Compile one debug `hfs` binary with every benchmarked backend (sqlite,
-  # postgres, mongodb, elasticsearch) linked in — the backend is selected at
-  # runtime via HFS_STORAGE_BACKEND, so a single build serves every matrix
-  # leg. `ui` is dropped so the benchmark exercises the FHIR API only.
+  # Compile one release `hfs` binary with the backends the selected legs need
+  # (sqlite, postgres, mongodb, elasticsearch) linked in — the backend is
+  # selected at runtime via HFS_STORAGE_BACKEND, so a single build serves every
+  # matrix leg. `ui` is dropped so the benchmark exercises the FHIR API only.
   # ────────────────────────────────────────────────────────────────────────────
   build:
     name: Build HFS binary
@@ -342,11 +342,53 @@ jobs:
       # mongodb pulls in mongocrypt-sys (native libmongocrypt, needs cmake);
       # these runners already build it via ci.yml's --all-features. s3 is not
       # compiled: no s3 leg is benchmarked (see header).
-      - name: Build release binary (R4 + sqlite + postgres + mongodb + elasticsearch)
+      # Compile only the backends the selected legs need (FHIR R4 only, always).
+      # build_features.py maps the setup job's matrix to the feature list:
+      # sqlite -> sqlite, postgres -> postgres, mongodb -> mongodb,
+      # <x>-elasticsearch -> x + elasticsearch; core/all gives the full set.
+      - name: Resolve build features
+        id: features
+        env:
+          MATRIX: ${{ needs.setup.outputs.matrix }}
+        run: |
+          FEATURES=$(python3 .github/scripts/fhir-bench/build_features.py "$MATRIX")
+          echo "features=$FEATURES" >> "$GITHUB_OUTPUT"
+          echo "Building with features: $FEATURES"
+
+      # Rust cache. The repo has no cache action; its convention is a warm
+      # target/ kept on the self-hosted runner (checkout clean: false plus
+      # .github/actions/cargo-target-gc). That never helped this job: ci.yml
+      # builds the debug profile, so the release profile starts cold on every
+      # runner that has not built it (485 crates, 14 min). actions/cache is the
+      # first-party action (pinned by major tag like the others). Key = lockfile
+      # + feature list (different features compile different crates); the
+      # restore-keys fallbacks reuse a close cache and cargo rebuilds only the
+      # difference. Saved after a successful build on any branch (keys are
+      # immutable, so no clash); a branch reads its own and main's caches.
+      # Only target/release/{deps,build,.fingerprint} are cached, not
+      # incremental/ or the linked binary. The first run per key is still cold.
+      - name: Cache Rust build (release)
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+          key: bench-release-${{ runner.os }}-${{ steps.features.outputs.features }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            bench-release-${{ runner.os }}-${{ steps.features.outputs.features }}-
+            bench-release-${{ runner.os }}-
+
+      - name: Build release binary
+        env:
+          FEATURES: ${{ steps.features.outputs.features }}
         run: |
           cargo build --release -p helios-hfs \
             --no-default-features \
-            --features "R4,sqlite,postgres,mongodb,elasticsearch"
+            --features "$FEATURES"
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
