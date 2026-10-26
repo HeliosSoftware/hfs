@@ -1175,7 +1175,7 @@ def _notes(loaded):
     return notes
 
 
-def _render(root, env, warn, zips):
+def _render(root, env, warn, zips, timing=None):
     run_id = (env.get("BENCH_RUN_ID") or "").strip()
     sources, unreadable = _discover(root, warn, zips)
     found = _group(sources, unreadable, run_id, warn)
@@ -1251,6 +1251,8 @@ def _render(root, env, warn, zips):
     parts.append("%d of %d legs have results" % (k, len(datas)))
 
     lines = [_header(env), "", " · ".join(parts), ""]
+    if timing:
+        lines += timing.strip("\n").split("\n") + [""]
     outcome = (env.get("DOWNLOAD_OUTCOME") or "").strip()
     if outcome and outcome != "success":
         lines += ["> ⚠ The artifact download step ended with `%s`; legs shown as n/a may have "
@@ -1279,7 +1281,7 @@ def _render(root, env, warn, zips):
     return lines, k, len(datas)
 
 
-def render(root, env):
+def render(root, env, timing=None):
     """Pure: (markdown, workflow-command lines) for the downloaded artifacts."""
     annotations = []
     seen = set()
@@ -1291,7 +1293,7 @@ def render(root, env):
 
     zips = []
     try:
-        lines, k, n = _render(root, env, warn, zips)
+        lines, k, n = _render(root, env, warn, zips, timing)
     finally:
         for zf in zips:
             try:
@@ -1313,13 +1315,28 @@ def main(argv=None):
             except Exception:
                 pass
     argv = sys.argv if argv is None else argv
-    root = argv[1] if len(argv) > 1 else "bench-artifacts"
+    pos, timing_path, i = [], None, 1
+    while i < len(argv):
+        if argv[i] == "--timing" and i + 1 < len(argv):
+            timing_path = argv[i + 1]
+            i += 2
+        else:
+            pos.append(argv[i])
+            i += 1
+    root = pos[0] if pos else "bench-artifacts"
+    timing = None
+    if timing_path:
+        try:
+            with open(timing_path, encoding="utf-8") as f:
+                timing = f.read() or None
+        except Exception:
+            timing = None
     env = {}
     for key in ("BENCH_RUN_ID", "BENCH_MATRIX", "BENCH_IN_TESTS", "BENCH_REF_NAME", "BENCH_SHA",
               "DOWNLOAD_OUTCOME"):
         env[key] = os.environ.get(key, "")
     try:
-        markdown, annotations = render(root, env)
+        markdown, annotations = render(root, env, timing)
     except Exception as e:
         msg = ("%s: %s" % (type(e).__name__, e)).replace("\r", " ").replace("\n", " ")[:200]
         markdown = "%s\n\n_Leg comparison failed: %s. The per-leg summaries are unaffected._\n" % (

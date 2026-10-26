@@ -468,7 +468,66 @@ def leg_checks(d, cpus):
     return c
 
 
-def verdict_all(legs, order, cpus, missing):
+def hum(s):
+    """Humanised duration in English: 11 s, 53 min 15 s, 1 h 05 min."""
+    s = int(max(0, s))
+    if s < 60:
+        return "%d s" % s
+    if s < 3600:
+        m, r = divmod(s, 60)
+        return "%d min" % m + (" %02d s" % r if r else "")
+    h, r = divmod(s, 3600)
+    return "%d h %02d min" % (h, r // 60)
+
+
+WAIT_WARN_FRACTION = 0.10
+_TIMING_INTS = ("total_s", "waiting_s", "working_s")
+_JOB_INTS = ("queued_s", "behind_legs_s", "capacity_wait_s", "host_wait_s", "waiting_s", "working_s")
+_JOB_KINDS = ("setup", "build", "leg", "compare", "other")
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def load_timing(path):
+    """Validated run_timing.py JSON, or None (absent or invalid: the report is then as without it)."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            t = json.load(fh)
+        ok_ = (isinstance(t, dict) and isinstance(t.get("run_id"), str)
+               and all(_is_int(t.get(k)) for k in _TIMING_INTS) and isinstance(t.get("jobs"), list))
+        if ok_:
+            for j in t["jobs"]:
+                if not (isinstance(j, dict) and isinstance(j.get("name"), str) and j.get("kind") in _JOB_KINDS
+                        and (j.get("leg") is None or isinstance(j.get("leg"), str))
+                        and all(_is_int(j.get(k)) for k in _JOB_INTS)):
+                    ok_ = False
+                    break
+        if not ok_:
+            print("report_html: --timing-json %s is not a valid timing file; ignored" % path, file=sys.stderr)
+            return None
+        return t
+    except Exception as e:  # noqa: BLE001
+        print("report_html: --timing-json unreadable (%s); ignored" % e, file=sys.stderr)
+        return None
+
+
+def timing_view(t):
+    """Texts for the tile, derived from the data only."""
+    if not t:
+        return None
+    warn = t["total_s"] > 0 and t["waiting_s"] >= WAIT_WARN_FRACTION * t["total_s"]
+    return {"label": "Waiting vs working",
+            "value": "Waiting %s \u00b7 Working %s" % (hum(t["waiting_s"]), hum(t["working_s"])),
+            "sub": "of %s total" % hum(t["total_s"]), "warn": warn,
+            "sentence": ("This run waited %s for resources: it is slower to finish, not slower to run."
+                         % hum(t["waiting_s"])) if warn else None}
+
+
+def verdict_all(legs, order, cpus, missing, timing=None):
     """Verdict for the HTML: every leg is judged alike."""
     items = []
     four = ("corpus", "err", "cont", "es")
@@ -497,6 +556,9 @@ def verdict_all(legs, order, cpus, missing):
             fmt1(min(peaks)), fmt1(max(peaks))), "load"])
     if missing:
         items.append(["bad", "Legs without artifacts: %s." % ", ".join(label(l) for l in missing)])
+    tv = timing_view(timing)
+    if tv and tv["warn"]:
+        items.append(["warn", tv["sentence"]])
     runners = sorted({legs[l]["runner"] for l in order if legs[l]["runner"]})
     items.append(["na", "This is a single run on a shared host%s: it is a sample, not proof." % (
         " and the legs used %d different runners" % len(runners) if len(runners) > 1 else "")])
@@ -703,13 +765,15 @@ def build_data(a):
     head = a.headline_leg if a.headline_leg in legs else (next((l for l in order if any(legs[l]["suites"].values())
                                                                  or legs[l]["bulk"]), order[0] if order else None))
     starts = sorted(legs[l]["start"] for l in order if legs[l]["start"])
+    timing = load_timing(getattr(a, "timing_json", None))
     sha = (a.sha or first.get("sha") or "")[:9] or None
-    return {"run": run, "date": starts[0] if starts else None, "sha": sha, "sha_full": a.sha or None,
+    extra = {"timing": timing, "timing_view": timing_view(timing)} if timing else {}
+    return {**extra, "run": run, "date": starts[0] if starts else None, "sha": sha, "sha_full": a.sha or None,
             "ref": a.branch or first.get("ref"), "repo": a.repo, "docker_cpus": docker_cpus,
             "docker_ram_gb": docker_ram, "headline": head, "order": order, "missing": missing, "legs": legs,
             "has_shapes": any(legs[l].get("shapes") for l in order), "history_runs": len(history),
             "palette": palette(order), "comparison": parse_comparison(find_comparison(a.run_dir)),
-            "verdict_all": verdict_all(legs, order, docker_cpus, missing),
+            "verdict_all": verdict_all(legs, order, docker_cpus, missing, timing),
             "thresholds": {"import_target": IMPORT_TARGET, "err_pct_high": ERR_PCT_HIGH,
                            "pg_contended_ms": PG_CONTENDED_MS}}
 
@@ -762,6 +826,7 @@ def main(argv=None):
     ap.add_argument("--out", default="fhir-bench-report.html")
     ap.add_argument("--dump-json")
     ap.add_argument("--trend-dir")
+    ap.add_argument("--timing-json", default=None, help="run_timing.py output: waiting vs working time")
     ap.add_argument("--no-shapes", action="store_true", help="do not read the heavy search-points.json")
     ap.add_argument("--headline-leg", default=None, help="leg preselected in the tiles (default: first leg with results)")
     ap.add_argument("--docker-cpus", type=int, default=None, help="override; normally read from runner-info")
@@ -772,7 +837,7 @@ def main(argv=None):
     except SystemExit:
         a = argparse.Namespace(run_dir="", run_id="", repo="", branch="", sha="", out="fhir-bench-report.html",
                                dump_json=None, trend_dir=None, no_shapes=True, headline_leg=None,
-                               docker_cpus=None, docker_ram_gb=None, expect_legs="")
+                               docker_cpus=None, docker_ram_gb=None, expect_legs="", timing_json=None)
     text, data, size_legs = None, None, 0
     try:
         data = build_data(a)
@@ -784,6 +849,7 @@ def main(argv=None):
     if a.dump_json:
         try:
             dump = dict(data) if data else {"run": a.run_id, "legs": {}, "order": []}
+            dump.pop("timing_view", None)
             dump["legs"] = {l: {k: v for k, v in lg.items() if k not in ("shapes", "trend", "prev")}
                             for l, lg in dump["legs"].items()}
             with open(a.dump_json, "w", encoding="utf-8") as fh:

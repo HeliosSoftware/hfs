@@ -2239,6 +2239,34 @@ jobs:
           path: bench-artifacts
           skip-decompress: true
 
+      # The leg artifacts were downloaded as zips (skip-decompress above). Unzip
+      # each into report-input/<artifact name>/ (the layout report_html.py reads:
+      # fhir-benchmark-<leg>-<id>/<leg>/...), leaving out search-points.json,
+      # which can be hundreds of MB and which the report does not use.
+      - name: Unpack leg results for the report
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          mkdir -p report-input
+          find bench-artifacts -name '*.zip' -print0 2>/dev/null | while IFS= read -r -d '' z; do
+            n=$(basename "$z" .zip)
+            case "$n" in fhir-benchmark-*) ;; *) n=$(basename "$(dirname "$z")") ;; esac
+            unzip -q -o "$z" -x '*search-points.json' -d "report-input/$n" || echo "::warning::could not unzip $z"
+          done
+          ls report-input
+
+      # Wall-clock of the run (jobs API + capacity_wait_s from the unpacked legs).
+      # Display only; a missing run-time.md leaves the comparison unchanged.
+      - name: Compute run time
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/fhir-bench/run_timing.py --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --run-dir report-input --out run-time.md --dump-json run-timing.json
+
       - name: Write comparison summary
         if: always()
         env:
@@ -2250,8 +2278,10 @@ jobs:
           DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
         run: |
           PY="$GITHUB_WORKSPACE/.github/scripts/fhir-bench/compare_legs.py"
+          TIMING_ARGS=()
+          if [ -s run-time.md ]; then TIMING_ARGS=(--timing run-time.md); fi
           if [ -f "$PY" ]; then
-            python3 "$PY" bench-artifacts > comparison.md \
+            python3 "$PY" bench-artifacts "${TIMING_ARGS[@]}" > comparison.md \
               || echo "::warning::compare_legs.py exited non-zero"
           else
             echo "::warning::compare_legs.py missing (checkout failed); no comparison written"
@@ -2290,24 +2320,14 @@ jobs:
         run: |
           python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs 5 --data-dir "$RUNNER_TEMP/trend"
 
-      # The leg artifacts were downloaded as zips (skip-decompress above). Unzip
-      # each into report-input/<artifact name>/ (the layout report_html.py reads:
-      # fhir-benchmark-<leg>-<id>/<leg>/...), leaving out search-points.json,
-      # which can be hundreds of MB and which the report does not use.
-      - name: Unpack leg results for the report
+      # comparison.md exists only after the summary step, so it is staged here.
+      - name: Stage comparison for the report
         if: always()
         continue-on-error: true
-        timeout-minutes: 5
         run: |
           mkdir -p report-input
           # report_html.py finds comparison.md inside --run-dir (or its parent).
           cp comparison.md report-input/ 2>/dev/null || true
-          find bench-artifacts -name '*.zip' -print0 2>/dev/null | while IFS= read -r -d '' z; do
-            n=$(basename "$z" .zip)
-            case "$n" in fhir-benchmark-*) ;; *) n=$(basename "$(dirname "$z")") ;; esac
-            unzip -q -o "$z" -x '*search-points.json' -d "report-input/$n" || echo "::warning::could not unzip $z"
-          done
-          ls report-input
 
       - name: Build HTML report
         if: always()
@@ -2317,7 +2337,10 @@ jobs:
           MATRIX_JSON: ${{ needs.setup.outputs.matrix }}
         run: |
           EXPECT_LEGS=$(python3 -c 'import json,os;print(",".join(i["backend"] for i in json.loads(os.environ["MATRIX_JSON"])["include"]))' 2>/dev/null || true)
+          TIMING_JSON_ARGS=()
+          if [ -s run-timing.json ]; then TIMING_JSON_ARGS=(--timing-json run-timing.json); fi
           python3 .github/scripts/fhir-bench/report_html.py \
+            "${TIMING_JSON_ARGS[@]}" \
             --run-dir report-input \
             --expect-legs "$EXPECT_LEGS" \
             --run-id "$GITHUB_RUN_ID" \
@@ -2350,7 +2373,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: fhir-bench-report-data-${{ github.run_id }}
-          path: report-data.json
+          path: |
+            report-data.json
+            run-timing.json
           retention-days: 90
           if-no-files-found: ignore
 

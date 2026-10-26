@@ -569,6 +569,32 @@ class CompareLegsTest(unittest.TestCase):
         self.assertIn("Leg comparison failed", out.getvalue())
         self.assertIn("::warning", err.getvalue())
 
+    def _main_out(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cl.main(["x", self.root] + list(args)), 0)
+        return out.getvalue()
+
+    def test_timing_block(self):
+        self.two_legs()
+        base = self._main_out()
+        gone = os.path.join(self.root, "no-such-timing.md")
+        empty = os.path.join(self.root, "empty-timing.md")
+        open(empty, "w").close()
+        self.assertEqual(self._main_out("--timing", gone), base)
+        self.assertEqual(self._main_out("--timing", empty), base)
+        block = "\n### Run time\n\n| Phase | Seconds |\n|---|---|\n| total | 12 |\n"
+        path = os.path.join(self.root, "timing.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(block)
+        md = self._main_out("--timing", path)
+        self.assertEqual(md.count("### Run time"), 1)
+        head, rest = md.split("### Run time", 1)
+        self.assertIn("legs have results", head)
+        self.assertNotIn("###", head)
+        self.assertIn("| total | 12 |", rest.split("### Throughput", 1)[0])
+        self.assertEqual(md.replace(block.strip("\n") + "\n\n", "", 1), base)
+
 
 if __name__ == "__main__":
     unittest.main()

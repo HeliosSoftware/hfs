@@ -63,6 +63,8 @@ td.n,th.n{text-align:right;white-space:nowrap}
 .kpi .lbl{font-size:.82rem;color:var(--ink-2)}
 .kpi .val{font-size:1.9rem;font-weight:700;line-height:1.15;margin:2px 0}
 .kpi .unit{font-size:.85rem;font-weight:500;color:var(--ink-2)}
+.kpi.warn{border-left:6px solid var(--warn);background:var(--warn-bg)}
+.kpi.warn .val{color:var(--warn)}
 .kpi .sub{font-size:.82rem;color:var(--ink-2)}
 .kpi .delta{font-size:.82rem;margin-top:6px;padding-top:6px;border-top:1px dashed var(--grid);color:var(--ink-2)}
 .kpi .delta b{color:var(--ink)}
@@ -373,10 +375,12 @@ function renderKpis(){
     ? `<b>Indicative comparison</b> with the previous run <span class="mono">${esc(P.run)}</span> (${fdate(P.date)}, <span class="mono">${esc(P.branch||"")}</span>): a single run each, at a different time and with a different host load; it does not prove an improvement or a regression.`
     : "";
   if(!H){ $("kpis").innerHTML = NODATA; return; }
+  const TV = D.timing_view, timingTile = TV
+    ? `<div class="card kpi${TV.warn?" warn":""}"><div class="lbl">${esc(TV.label)}</div><div class="val" style="font-size:1.25rem">${esc(TV.value)}</div><div class="sub">${esc(TV.sub)}</div></div>` : "";
   const ps = s => P && P.suites && P.suites[s] ? P.suites[s] : null;
   const items = [["search","Search","req/s"],["crud","CRUD","req/s"],["insert","Insert","creates/s"],["sql-run",NSQ,"req/s"],["sql_rows",NSR,"rows/s"],
     ["import",NB,"resources/s"],["bulk",NK,"resources/s"],["bulk_ingest",NKI,"resources/s"],["bulk_index",NKX,"s"]];
-  $("kpis").innerHTML = items.map(([k,name,unit])=>{
+  $("kpis").innerHTML = timingTile + items.map(([k,name,unit])=>{
     let v, p95, pv, pp95, sub = "", valTxt = null;
     const b = H.bulk, bdone = b && b.status==="complete";
     if(k==="bulk"||k==="bulk_ingest"||k==="bulk_index"){
@@ -525,6 +529,7 @@ function seg(id, key, render, withAll){
 }
 
 /* ---------- timeline ---------- */
+function hum(s){ s = Math.max(0, Math.round(s)); if(s<60) return s+" s"; if(s<3600){ const m = Math.floor(s/60), r = s%60; return m+" min"+(r?" "+String(r).padStart(2,"0")+" s":""); } return Math.floor(s/3600)+" h "+String(Math.floor(s%3600/60)).padStart(2,"0")+" min"; }
 function secs(t){ const [h,m,s] = t.split(":").map(Number); return h*3600+m*60+s; }
 function legSeries(leg){
   const pts = (L[leg]&&L[leg].host)||[];
@@ -644,8 +649,24 @@ function renderTimelineAll(){
       if(sh) b += txt(x+bw/2, y+11, sh, {anchor:"middle", size:10.5, fill:onColor(fill), weight:600});
     });
   });
+  /* time not working before each leg's work: hatched grey = waiting for resources, faint dotted = behind earlier legs */
+  let tEnd = ltop+S.length*(lh+lg);
+  const TJ = (D.timing && D.timing.jobs || []).filter(j=>j.kind==="leg" && S.some(s=>s.leg===j.leg));
+  if(TJ.length){
+    const wmax = Math.max(1, ...TJ.map(j=>j.waiting_s+j.behind_legs_s)), sc = (pw-60)/wmax;
+    b += `<defs><pattern id="wait-hatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)"><rect width="6" height="6" fill="var(--na-bg)"/><rect width="2.5" height="6" fill="var(--axis)"/></pattern></defs>`;
+    b += txt(ml, tEnd+6, "Time not working before each leg's work starts (bars end where the work starts; hover for details)", {size:11, fill:"var(--muted)"});
+    TJ.forEach((j,i)=>{
+      const y = tEnd+24+i*(lh+lg), bw = j.behind_legs_s*sc, ww = j.waiting_s*sc, x0 = ml+(wmax*sc-bw-ww);
+      b += txt(ml, y-4, LBL(j.leg), {size:11, fill:"var(--ink-2)"});
+      if(bw>0) b += `<rect x="${x0}" y="${y}" width="${Math.max(1,bw)}" height="${lh}" rx="2" fill="none" stroke="var(--axis)" stroke-width="1.5" stroke-dasharray="1 3" opacity=".7"${tipAttr(`${LBL(j.leg)} · behind earlier legs\n${hum(j.behind_legs_s)} (sequencing, not a resource wait)`)}/>`;
+      if(ww>0) b += `<rect x="${x0+bw}" y="${y}" width="${Math.max(1,ww)}" height="${lh}" rx="2" fill="url(#wait-hatch)" stroke="var(--axis)"${tipAttr(`${LBL(j.leg)} · waiting\n${hum(j.waiting_s)} (queue ${hum(j.queued_s)}, capacity ${hum(j.capacity_wait_s)}, host ${hum(j.host_wait_s)})`)}/>`;
+      b += txt(ml+wmax*sc+8, y+11, `${hum(j.waiting_s)} waiting`+(bw>0?` · ${hum(j.behind_legs_s)} behind earlier legs`:""), {size:10.5, fill:"var(--muted)"});
+    });
+    tEnd += 24+TJ.length*(lh+lg);
+  }
   const lgd = wide ? "" : `<div class="legend" style="margin:0 0 6px">`+S.map(s=>`<span><svg width="24" height="10" aria-hidden="true"><line x1="1" y1="5" x2="23" y2="5" stroke="${legCol(s.leg)}" stroke-width="3"${dash(s.leg)}/></svg>${esc(LBL(s.leg))}</span>`).join("")+`</div>`;
-  el.innerHTML = lgd+svg(w, ltop+S.length*(lh+lg), b, "Host load of every leg together, and the phases of each leg");
+  el.innerHTML = lgd+svg(w, tEnd, b, "Host load of every leg together, and the phases of each leg");
 }
 
 /* ---------- import charts (Bulk, Batch/Transaction, comparison) ---------- */

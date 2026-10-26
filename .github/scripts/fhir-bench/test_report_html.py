@@ -293,5 +293,65 @@ class RealRun(unittest.TestCase):
             self.assertLess(len(html), 400_000)
 
 
+class Timing(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.t = cls.tmp.name
+        make_leg(cls.t, "sqlite", False)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def timing(self, waiting, working):
+        job = {"name": "leg sqlite", "kind": "leg", "leg": "sqlite", "queued_s": 5, "behind_legs_s": 77,
+               "capacity_wait_s": 3, "host_wait_s": 0, "waiting_s": waiting, "working_s": working,
+               "created": "2026-10-26T10:00:00Z", "started": "2026-10-26T10:01:00Z",
+               "completed": "2026-10-26T11:00:00Z", "running": False}
+        return {"run_id": "777", "total_s": waiting + working, "waiting_s": waiting, "working_s": working,
+                "jobs": [job]}
+
+    def build(self, tag, timing=None, raw=None):
+        out, dump = os.path.join(self.t, tag + ".html"), os.path.join(self.t, tag + ".json")
+        args = ["--run-dir", self.t, "--run-id", "777", "--out", out, "--dump-json", dump, "--no-shapes"]
+        if timing is not None or raw is not None:
+            tj = os.path.join(self.t, tag + "-t.json")
+            with open(tj, "w", encoding="utf-8") as fh:
+                fh.write(raw if raw is not None else json.dumps(timing))
+            args += ["--timing-json", tj]
+        r = run(args)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return open(out, encoding="utf-8").read(), json.load(open(dump))
+
+    def test_tile_from_data(self):
+        html, d = self.build("ok", self.timing(11, 3195))
+        self.assertIn("Waiting 11 s", html)
+        self.assertIn("Working 53 min 15 s", html)
+        self.assertIn("of 53 min 26 s total", html)
+        self.assertEqual(d["timing"]["waiting_s"], 11)
+        self.assertNotIn("waited", json.dumps(d["verdict_all"]))
+        self.assertNotIn("timing_view", d)
+
+    def test_warning_sentence(self):
+        html, d = self.build("warn", self.timing(3900, 3195))
+        self.assertIn("This run waited 1 h 05 min for resources: it is slower to finish, not slower to run.", html)
+        self.assertTrue(any("waited 1 h 05 min" in i[1] for i in d["verdict_all"]["items"]))
+
+    def test_invalid_or_absent_is_identical(self):
+        base, bd = self.build("base")
+        for tag, raw in (("bad1", "{not json"), ("bad2", json.dumps({"run_id": "1"}))):
+            html, d = self.build(tag, raw=raw)
+            self.assertEqual(html, base)
+            self.assertNotIn("timing", d)
+        self.assertNotIn("timing", bd)
+
+    def test_template_has_no_fixture_numbers(self):
+        with open(os.path.join(HERE, "report_template.html"), encoding="utf-8") as fh:
+            tpl = fh.read()
+        for lit in ("3195", "3206", "53 min", "1 h 05", "Waiting 11"):
+            self.assertNotIn(lit, tpl)
+
+
 if __name__ == "__main__":
     unittest.main()
