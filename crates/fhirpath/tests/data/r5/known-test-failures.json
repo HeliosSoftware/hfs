@@ -18,6 +18,11 @@
       "reason": "conformsTo not yet implemented. The server answers 501, so these tests are absent from the results JSON rather than recorded as failures."
     },
     {
+      "groupName": "documentFunctions",
+      "testName": "*",
+      "reason": "section()/entry()/entryIn()/resources()/resourcesIn()/sameSubject() not yet implemented. Upstream fhir-test-cases added this mode=\"custom\" group on 2026-10-25/26, and its own description says the functions are an extension of the HL7 Java reference implementation, not part of FHIRPath or of the FHIR specification's additional functions, so other engines implement them by choice. The server answers 501, so these tests are absent from the results JSON. See #2245."
+    },
+    {
       "groupName": "HTMLChecks",
       "testName": "*",
       "reason": "htmlChecks() not yet implemented. The server answers 501, so these tests are absent from the results JSON rather than recorded as failures. Previously undeclared: they were invisible because the runner's exit code ignores not-implemented tests (#287)."

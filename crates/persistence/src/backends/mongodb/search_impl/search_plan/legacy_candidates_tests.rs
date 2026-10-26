@@ -16,19 +16,9 @@ fn result_ids(result: &crate::core::SearchResult) -> Vec<String> {
 }
 
 async fn profile_start(db: &mongodb::Database) {
-    db.run_command(doc! { "profile": 0 }).await.unwrap();
-    db.collection::<Document>("system.profile")
-        .drop()
-        .await
-        .unwrap();
     // Exact counts record several 4096-ID commands after the page. The
     // default 1 MiB profiler can evict its early sparse-fallback evidence.
-    db.create_collection("system.profile")
-        .capped(true)
-        .size(32 * 1024 * 1024)
-        .await
-        .unwrap();
-    db.run_command(doc! { "profile": 2 }).await.unwrap();
+    restart_profiling(db, 32 * 1024 * 1024).await;
 }
 
 async fn profile_rows(db: &mongodb::Database, filter: Document) -> Vec<Document> {

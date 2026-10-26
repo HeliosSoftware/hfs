@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 52;
+pub const SCHEMA_VERSION: i32 = 53;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -527,6 +527,7 @@ async fn migrate_schema(
                 version += 1;
                 continue;
             }
+            52 => migrate_v52_to_v53(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4914,6 +4915,126 @@ async fn migrate_v51_to_v52(client: &mut deadpool_postgres::Client) -> StorageRe
     Ok(())
 }
 
+/// The two denormalized composite indexes v53 rebuilds, with the v28 key and
+/// payload unchanged and `is_contained = FALSE` added to the partial predicate.
+/// The build is not date-specific; it reuses the v43 machinery as v50 does.
+const COMPOSITE_UNCONTAINED_INDEXES: [DateIndexSpec; 2] = [
+    DateIndexSpec {
+        name: "idx_search_composite_token_quantity",
+        temp_name: "idx_search_composite_token_quantity_v53_new",
+        create: "(tenant_id, resource_type, param_name, value_token_code,
+                  last_updated DESC, resource_id ASC)
+                 INCLUDE (value_quantity_value, value_token_system)
+                 WHERE is_contained = FALSE AND composite_group IS NOT NULL
+                   AND value_quantity_value IS NOT NULL",
+        definition: "USING btree (tenant_id, resource_type, param_name, value_token_code, last_updated DESC, resource_id) INCLUDE (value_quantity_value, value_token_system) WHERE ((is_contained = false) AND (composite_group IS NOT NULL) AND (value_quantity_value IS NOT NULL))",
+    },
+    DateIndexSpec {
+        name: "idx_search_composite_token_token",
+        temp_name: "idx_search_composite_token_token_v53_new",
+        create: "(tenant_id, resource_type, param_name, value_token_code,
+                  value_token_code_2, last_updated DESC, resource_id ASC)
+                 INCLUDE (value_token_system, value_token_system_2)
+                 WHERE is_contained = FALSE AND composite_group IS NOT NULL
+                   AND (value_token_code_2 IS NOT NULL OR value_token_system_2 IS NOT NULL)",
+        definition: "USING btree (tenant_id, resource_type, param_name, value_token_code, value_token_code_2, last_updated DESC, resource_id) INCLUDE (value_token_system, value_token_system_2) WHERE ((is_contained = false) AND (composite_group IS NOT NULL) AND ((value_token_code_2 IS NOT NULL) OR (value_token_system_2 IS NOT NULL)))",
+    },
+];
+
+/// v52 -> v53: the denormalized composite indexes become partial on
+/// `is_contained = FALSE` (#1952).
+///
+/// #1886 (v48) added `is_contained = FALSE` to `build_composite_condition`, so
+/// a container no longer matches through its contained resources' composite
+/// rows. That predicate is right, but neither v28 index stores
+/// `is_contained`, so the planner has to fetch every candidate row from the
+/// heap to test it. The composite fast path stops being index-only: each
+/// candidate costs a random heap page, including candidates the quantity range
+/// then rejects. On the 1000/1000 benchmark corpus composite p95 went from
+/// 13-18 ms to 39-126 ms.
+///
+/// With `is_contained = FALSE` in the partial predicate, the query's own
+/// conjunct proves the predicate and nothing is left to filter from the heap.
+/// The scan is index-only again (`Heap Fetches: 0`). The indexes also drop
+/// contained composite rows, which no query reads through them: `_contained`
+/// searches use `idx_search_contained`.
+///
+/// Key and payload are v28's, so the per-row write cost is unchanged. Like v50
+/// this runs in autocommit with `statement_timeout` disabled and builds each
+/// index `CONCURRENTLY` under a temporary name before a short swap. Writes
+/// continue during the build, and a failure leaves the version unstamped so the
+/// next startup retries. A pre-v18 (legacy) database is left alone, as v28
+/// left it: the legacy composite query reads neither index.
+async fn migrate_v52_to_v53(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    if read_index_layout(client).await != IndexLayout::Denormalized {
+        tracing::info!(
+            "search_index predates v18; the composite fast-path indexes are not rebuilt"
+        );
+        return Ok(());
+    }
+    let previous_timeout: String = client
+        .query_one("SELECT current_setting('statement_timeout')", &[])
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v52->v53 failed: read statement_timeout: {e}"
+            ))
+        })?
+        .get(0);
+    client
+        .batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v52->v53 failed: disable statement_timeout: {e}"
+            ))
+        })?;
+    let mut result = Ok(());
+    for spec in &COMPOSITE_UNCONTAINED_INDEXES {
+        tracing::info!(
+            index = spec.name,
+            "Migration v52->v53: rebuilding the index CONCURRENTLY (startup waits for it; large search_index tables take a while)"
+        );
+        let started = std::time::Instant::now();
+        result = rebuild_date_index(client, spec, "v52->v53").await;
+        let elapsed_s = started.elapsed().as_secs_f64();
+        match &result {
+            Ok(()) => tracing::info!(
+                index = spec.name,
+                elapsed_s,
+                "Migration v52->v53: index ready"
+            ),
+            Err(error) => {
+                tracing::error!(
+                    index = spec.name,
+                    elapsed_s,
+                    %error,
+                    "Migration v52->v53: index build failed; it is retried at the next startup"
+                );
+                break;
+            }
+        }
+    }
+    let restore = client
+        .execute(
+            "SELECT set_config('statement_timeout', $1, false)",
+            &[&previous_timeout],
+        )
+        .await;
+    if let Err(error) = result {
+        if let Err(restore_error) = restore {
+            tracing::warn!(%restore_error, "Could not restore statement_timeout after v53 failure");
+        }
+        return Err(error);
+    }
+    restore.map_err(|e| {
+        pg_error(format!(
+            "Migration v52->v53 failed: restore statement_timeout: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
 /// Fresh denormalized databases do not create ordinary legacy probes. Legacy
 /// writers populate slots; its nullable rows may be folded during a transition,
 /// so family-specific predicates distinguish those from ambiguous unfolded rows.
@@ -8037,7 +8158,7 @@ mod postgres_integration_migrations {
             )
             .await
             .expect("remove delayed v52 CREATE INDEX injection");
-        assert_eq!(get_schema_version(&client).await.unwrap(), 52);
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(statement_timeout(&client).await, "50ms");
         let definition = index_definition(&client, "idx_bulk_manifests_index_pending")
             .await
@@ -8052,7 +8173,7 @@ mod postgres_integration_migrations {
         initialize_schema(&mut client)
             .await
             .expect("re-run v52 over an applied schema");
-        assert_eq!(get_schema_version(&client).await.unwrap(), 52);
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
     }
 
     /// Seeds live and soft-deleted rows for two tenants.
@@ -8118,7 +8239,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 52);
+        assert_eq!(SCHEMA_VERSION, 53);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)
@@ -8327,6 +8448,108 @@ mod postgres_integration_migrations {
 
         set_schema_version(&client, 49).await.unwrap();
         initialize_schema(&mut client).await.expect("repeat v50");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+    }
+
+    /// v52 -> v53 makes both composite indexes partial on `is_contained = FALSE`
+    /// (#1952), on a fresh database and over the v28 shape, and the composite
+    /// fast path is index-only against them again.
+    #[tokio::test]
+    async fn postgres_integration_v52_to_v53_composite_indexes_exclude_contained_rows() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_v53_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("fresh database reaches the current schema");
+        for spec in &COMPOSITE_UNCONTAINED_INDEXES {
+            let fresh = index_definition(&client, spec.name)
+                .await
+                .expect("a fresh database has the index");
+            assert!(fresh.ends_with(spec.definition), "{fresh}");
+        }
+
+        // Put back the v28 shapes, which do not store `is_contained`.
+        client
+            .batch_execute(
+                "DROP INDEX idx_search_composite_token_quantity;
+                 CREATE INDEX idx_search_composite_token_quantity ON search_index
+                   (tenant_id, resource_type, param_name, value_token_code,
+                    last_updated DESC, resource_id ASC)
+                   INCLUDE (value_quantity_value, value_token_system)
+                   WHERE composite_group IS NOT NULL AND value_quantity_value IS NOT NULL;
+                 DROP INDEX idx_search_composite_token_token;
+                 CREATE INDEX idx_search_composite_token_token ON search_index
+                   (tenant_id, resource_type, param_name, value_token_code,
+                    value_token_code_2, last_updated DESC, resource_id ASC)
+                   INCLUDE (value_token_system, value_token_system_2)
+                   WHERE composite_group IS NOT NULL
+                     AND (value_token_code_2 IS NOT NULL OR value_token_system_2 IS NOT NULL);
+                 SET statement_timeout = '777ms'",
+            )
+            .await
+            .unwrap();
+        set_schema_version(&client, 52).await.unwrap();
+        initialize_schema(&mut client).await.expect("v52 to v53");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(statement_timeout(&client).await, "777ms");
+        for spec in &COMPOSITE_UNCONTAINED_INDEXES {
+            let rebuilt = index_definition(&client, spec.name)
+                .await
+                .expect("v53 rebuilds the index");
+            assert!(rebuilt.ends_with(spec.definition), "{rebuilt}");
+        }
+
+        // The statement `build_composite_condition` feeds the fast path, which
+        // filters `is_contained = FALSE`. It must not need the heap for it.
+        let explain = |sql: &str| {
+            format!(
+                "EXPLAIN (FORMAT TEXT) SELECT DISTINCT resource_id, last_updated FROM search_index \
+                 WHERE tenant_id = 't' AND resource_type = 'Observation' \
+                 AND param_name = 'p' AND is_contained = FALSE \
+                 AND composite_group IS NOT NULL AND {sql} \
+                 ORDER BY last_updated DESC, resource_id ASC LIMIT 21"
+            )
+        };
+        client
+            .batch_execute("SET enable_seqscan = off; SET enable_bitmapscan = off")
+            .await
+            .unwrap();
+        for (index, predicate) in [
+            (
+                "idx_search_composite_token_quantity",
+                "(value_token_code = 'A') AND (value_quantity_value > 5)",
+            ),
+            (
+                "idx_search_composite_token_token",
+                "(value_token_code = 'A') AND (value_token_code_2 = 'B')",
+            ),
+        ] {
+            let plan: Vec<String> = client
+                .query(&explain(predicate), &[])
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            let plan = plan.join("\n");
+            assert!(
+                plan.contains(&format!("Index Only Scan using {index}")),
+                "{plan}"
+            );
+            assert!(!plan.contains("is_contained"), "{plan}");
+        }
+        client
+            .batch_execute("RESET enable_seqscan; RESET enable_bitmapscan")
+            .await
+            .unwrap();
+
+        set_schema_version(&client, 52).await.unwrap();
+        initialize_schema(&mut client).await.expect("repeat v53");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
     }
 

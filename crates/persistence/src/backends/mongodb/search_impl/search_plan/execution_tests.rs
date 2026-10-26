@@ -439,6 +439,37 @@ fn failpoint_hits(reply: &Document) -> i64 {
         .expect("configureFailPoint must return its hit count")
 }
 
+/// Restarts the profiler on an empty capped `system.profile` of `size` bytes.
+///
+/// An operation that began while the previous capture was profiling still
+/// writes its profile entry when it finishes, and that write recreates the
+/// default 1 MiB collection between our drop and create (NamespaceExists).
+async fn restart_profiling(db: &mongodb::Database, size: u64) {
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
+    let profile = db.collection::<Document>("system.profile");
+    for attempt in 1.. {
+        profile.drop().await.unwrap();
+        match db
+            .create_collection("system.profile")
+            .capped(true)
+            .size(size)
+            .await
+        {
+            Ok(()) => break,
+            Err(error) if attempt < 10 && is_namespace_exists(&error) => {}
+            Err(error) => panic!("recreate system.profile: {error}"),
+        }
+    }
+    db.run_command(doc! { "profile": 2 }).await.unwrap();
+}
+
+fn is_namespace_exists(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Command(command) if command.code == 48
+    )
+}
+
 async fn disable_failpoint(session: &FailpointSession) -> Document {
     session
         .admin
