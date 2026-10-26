@@ -357,6 +357,9 @@ jobs:
         run: |
           FEATURES=$(python3 .github/scripts/fhir-bench/build_features.py "$MATRIX")
           echo "features=$FEATURES" >> "$GITHUB_OUTPUT"
+          # actions/cache keys cannot contain commas (run 40415264411 failed with
+          # "Key Validation Error"), so the cache key uses the list joined with +.
+          echo "key=${FEATURES//,/+}" >> "$GITHUB_OUTPUT"
           echo "Building with features: $FEATURES"
 
       # Rust cache. The repo has no cache action; its convention is a warm
@@ -378,16 +381,16 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
+            ${{ env.CARGO_HOME }}/registry/index
+            ${{ env.CARGO_HOME }}/registry/cache
+            ${{ env.CARGO_HOME }}/git/db
             target/release/deps
             target/release/build
             target/release/.fingerprint
-          key: bench-release-${{ runner.os }}-${{ steps.features.outputs.features }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          key: bench-release-${{ runner.os }}-${{ steps.features.outputs.key }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            bench-release-${{ runner.os }}-${{ steps.features.outputs.features }}-${{ steps.rust.outputs.cachekey }}-
-            bench-release-${{ runner.os }}-${{ steps.features.outputs.features }}-
+            bench-release-${{ runner.os }}-${{ steps.features.outputs.key }}-${{ steps.rust.outputs.cachekey }}-
+            bench-release-${{ runner.os }}-${{ steps.features.outputs.key }}-
             bench-release-${{ runner.os }}-
 
       - name: Build release binary
