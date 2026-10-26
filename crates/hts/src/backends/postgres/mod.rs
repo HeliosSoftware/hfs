@@ -906,7 +906,7 @@ pub(crate) async fn write_resource_in_transaction(
         .await
         .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
     if owner.is_some_and(|row| row.get::<_, String>(0) != id) {
-        return Err(HtsError::InvalidRequest(
+        return Err(HtsError::Conflict(
             "Canonical URL and version already belong to another resource id".into(),
         ));
     }

@@ -1307,10 +1307,11 @@ async fn post_identity_contract(app: IdentityApp) {
                 "POST",
                 &format!("/{resource_type}"),
                 Some(original.clone()),
-                StatusCode::BAD_REQUEST,
+                StatusCode::CONFLICT,
             )
             .await;
         assert_eq!(collision["resourceType"], "OperationOutcome");
+        assert_eq!(collision["issue"][0]["code"], "conflict");
         assert_eq!(
             app.snapshot().await,
             before,
@@ -1496,6 +1497,22 @@ async fn put_creation_contract(app: IdentityApp) {
             .await;
         assert_eq!(status, StatusCode::PRECONDITION_FAILED);
         assert_eq!(app.snapshot().await, before);
+        let mut taken = original.clone();
+        taken["id"] = json!("taken");
+        let conflict = app
+            .expect(
+                "PUT",
+                &format!("/{kind}/taken"),
+                Some(taken),
+                StatusCode::CONFLICT,
+            )
+            .await;
+        assert_eq!(conflict["issue"][0]["code"], "conflict");
+        assert_eq!(
+            app.snapshot().await,
+            before,
+            "PUT to a new id cannot take another resource's canonical identity"
+        );
 
         // Use a separate identity to pin create v1 → delete v2 → recreate v3.
         let mut restored = original.clone();
@@ -1587,13 +1604,8 @@ async fn put_creation_contract(app: IdentityApp) {
             )
             .await;
         let before = app.snapshot().await;
-        app.expect(
-            "PUT",
-            &restored_path,
-            Some(restored),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
+        app.expect("PUT", &restored_path, Some(restored), StatusCode::CONFLICT)
+            .await;
         assert_eq!(
             app.snapshot().await,
             before,
@@ -1931,7 +1943,7 @@ async fn imported_write_contract(app: IdentityApp) {
 
         let mut collision = replacement.clone();
         collision["version"] = json!("2");
-        app.expect("PUT", &path, Some(collision), StatusCode::BAD_REQUEST)
+        app.expect("PUT", &path, Some(collision), StatusCode::CONFLICT)
             .await;
         assert_eq!(
             app.snapshot().await,
@@ -1969,7 +1981,7 @@ async fn imported_write_contract(app: IdentityApp) {
         let after_update = app.snapshot().await;
         let mut collision = updated.clone();
         collision["version"] = json!("2");
-        app.expect("PUT", &path, Some(collision), StatusCode::BAD_REQUEST)
+        app.expect("PUT", &path, Some(collision), StatusCode::CONFLICT)
             .await;
         assert_eq!(
             app.snapshot().await,

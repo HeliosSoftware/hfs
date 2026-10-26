@@ -251,7 +251,7 @@ async fn rest_ownership_contract(app: WriteApp) {
         app.request("POST", "/ConceptMap", Some(conflicting))
             .await
             .0,
-        StatusCode::BAD_REQUEST
+        StatusCode::CONFLICT
     );
     // Source-ID collision must not bypass canonical ownership by changing URL.
     let mut moved = resource("ConceptMap", "conceptmap", "replacement");
@@ -602,8 +602,8 @@ async fn postgres_opposite_canonical_replacements_conflict_without_deadlocking()
     })
     .await
     .expect("opposite lock sets are acquired in one consistent order");
-    assert_eq!(one.0, StatusCode::BAD_REQUEST, "{}", one.1);
-    assert_eq!(two.0, StatusCode::BAD_REQUEST, "{}", two.1);
+    assert_eq!(one.0, StatusCode::CONFLICT, "{}", one.1);
+    assert_eq!(two.0, StatusCode::CONFLICT, "{}", two.1);
     assert_eq!(app.request("GET", "/CodeSystem/first", None).await.1, first);
     assert_eq!(
         app.request("GET", "/CodeSystem/second", None).await.1,
@@ -756,7 +756,7 @@ async fn postgres_concurrent_posts_for_one_canonical_leave_one_owner() {
     let (first_status, first_body) = first.await.unwrap();
     let (second_status, second_body) = second.await.unwrap();
     assert_eq!(first_status, StatusCode::CREATED, "{first_body}");
-    assert_eq!(second_status, StatusCode::BAD_REQUEST, "{second_body}");
+    assert_eq!(second_status, StatusCode::CONFLICT, "{second_body}");
     assert_eq!(second_body["resourceType"], "OperationOutcome");
     let rows = app.search("CodeSystem", url).await;
     assert_eq!(rows.len(), 1);
