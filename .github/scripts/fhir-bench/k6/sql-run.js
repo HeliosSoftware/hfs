@@ -36,6 +36,11 @@
 // would otherwise look very fast. setup() creates the ViewDefinitions and
 // teardown() deletes them, so they do not appear in the result-size counts.
 //
+// The request asks for gzip like any real client. HFS used to answer a gzip-encoded
+// `_format=ndjson` run with 200 and an empty body (k6 reported status 0, "error
+// decompressing response body"); the body fix in channel_body_response
+// (crates/rest/src/handlers/sof/run.rs) removed that.
+//
 // Never pass `patient` or `group`: on the *-elasticsearch legs the primary's
 // search index is not written, so a compartment filter would return no rows.
 // It is read-only, so it runs before insert (after search).
