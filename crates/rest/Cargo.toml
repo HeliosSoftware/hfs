@@ -51,19 +51,19 @@ otel = ["helios-observability/otel"]
 
 [dependencies]
 # Core dependencies
-helios-fhir = { path = "../fhir", version = "0.2.5", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.2.5", default-features = false }
-helios-serde = { path = "../serde", version = "0.2.5", optional = true, default-features = false }
-helios-sof = { path = "../sof", version = "0.2.5", default-features = false }
-helios-auth = { path = "../auth", version = "0.2.5" }
+helios-fhir = { path = "../fhir", version = "0.2.6", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.2.6", default-features = false }
+helios-serde = { path = "../serde", version = "0.2.6", optional = true, default-features = false }
+helios-sof = { path = "../sof", version = "0.2.6", default-features = false }
+helios-auth = { path = "../auth", version = "0.2.6" }
 # `SearchProvider::search_param_registry` returns a `parking_lot::RwLock`; the
 # patient-compartment confinement (#1618) names it, as do the batch unit
 # tests' mock storage.
 parking_lot = "0.12"
-helios-audit = { path = "../audit", version = "0.2.5", default-features = false }
-helios-subscriptions = { path = "../subscriptions", version = "0.2.5", optional = true, default-features = false }
-helios-fhir-validator = { path = "../fhir-validator", version = "0.2.5", default-features = false, features = ["fhirpath"] }
-helios-observability = { path = "../observability", version = "0.2.5" }
+helios-audit = { path = "../audit", version = "0.2.6", default-features = false }
+helios-subscriptions = { path = "../subscriptions", version = "0.2.6", optional = true, default-features = false }
+helios-fhir-validator = { path = "../fhir-validator", version = "0.2.6", default-features = false, features = ["fhirpath"] }
+helios-observability = { path = "../observability", version = "0.2.6" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

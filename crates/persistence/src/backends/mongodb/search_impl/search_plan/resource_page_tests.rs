@@ -1461,17 +1461,7 @@ fn result_ids(result: &crate::core::SearchResult) -> Vec<String> {
 }
 
 async fn start_profiling(db: &mongodb::Database) {
-    db.run_command(doc! { "profile": 0 }).await.unwrap();
-    db.collection::<Document>("system.profile")
-        .drop()
-        .await
-        .unwrap();
-    db.create_collection("system.profile")
-        .capped(true)
-        .size(32 * 1024 * 1024)
-        .await
-        .unwrap();
-    db.run_command(doc! { "profile": 2 }).await.unwrap();
+    restart_profiling(db, 32 * 1024 * 1024).await;
 }
 
 async fn profiled_operations(db: &mongodb::Database, filter: Document) -> Vec<Document> {
