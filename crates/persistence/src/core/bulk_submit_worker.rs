@@ -694,11 +694,28 @@ pub trait SubmitWorkerStorage: Send + Sync {
 
     /// Records that this manifest's resources were ingested with indexing
     /// deferred, so the search-index rebuild they still owe survives a restart
-    /// (#1125). The default does nothing: a backend that cannot record it
-    /// behaves exactly as before.
-    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
-        let _ = lease;
+    /// (#1125). `resource_types` are the types the rebuild covers; a backend
+    /// may store them or derive them again in
+    /// [`Self::list_manifests_awaiting_reindex`]. The default does nothing: a
+    /// backend that cannot record it behaves exactly as before, and says so
+    /// through [`Self::records_index_pending`].
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        let _ = (lease, resource_types);
         Ok(())
+    }
+
+    /// Whether this store keeps the #1125 marker, i.e. overrides
+    /// [`Self::mark_manifest_index_pending`] and
+    /// [`Self::list_manifests_awaiting_reindex`]. A store that does not can
+    /// still ingest with indexing deferred, but a restart before the rebuild
+    /// ends leaves the manifest unsearchable until an operator runs
+    /// `$reindex`; startup warns about it (#1283).
+    fn records_index_pending(&self) -> bool {
+        false
     }
 
     /// Clears the marker [`Self::mark_manifest_index_pending`] set, once the
@@ -2757,7 +2774,7 @@ where
             (Some(hook), false) => {
                 // Recorded before the hook runs: a crash between here and the
                 // end of the rebuild leaves the marker, and startup re-fires it.
-                if let Err(e) = self.jobs.mark_manifest_index_pending(lease).await {
+                if let Err(e) = self.jobs.mark_manifest_index_pending(lease, &types).await {
                     tracing::warn!(
                         submission = %lease.submission_id,
                         manifest = %lease.manifest_id,

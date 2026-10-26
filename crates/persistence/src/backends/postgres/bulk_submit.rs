@@ -26,8 +26,8 @@ use crate::core::bulk_submit_publication::{
 };
 use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
-    ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
-    SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex, PollTokenTarget,
+    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
 use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -2438,6 +2438,87 @@ impl SubmitClaimStrategy for PostgresBackend {
 
 #[async_trait]
 impl SubmitWorkerStorage for PostgresBackend {
+    /// #1125: the marker that says this manifest still owes a search-index
+    /// rebuild, with the types it covers (#1283). It lives on the manifest
+    /// row, so it survives a restart that loses the in-process job map.
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE bulk_manifests SET index_pending = TRUE, index_pending_types = $5
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &resource_types,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("mark index pending: {e}")))?;
+        Ok(())
+    }
+
+    fn records_index_pending(&self) -> bool {
+        true
+    }
+
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE bulk_manifests SET index_pending = FALSE, index_pending_types = '{}'
+                 WHERE tenant_id = $1 AND manifest_id = $2 AND index_pending",
+                &[&tenant.tenant_id().as_str(), &manifest_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("clear index pending: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT tenant_id, submitter, submission_id, manifest_id, index_pending_types
+                 FROM bulk_manifests
+                 WHERE index_pending ORDER BY added_at LIMIT $1",
+                &[&i64::from(limit)],
+            )
+            .await
+            .map_err(|e| internal_error(format!("query pending reindex: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let mut resource_types: Vec<String> = row.get(4);
+                resource_types.sort();
+                resource_types.dedup();
+                PendingReindex {
+                    tenant: TenantContext::new(
+                        TenantId::new(row.get::<_, String>(0)),
+                        TenantPermissions::full_access(),
+                    ),
+                    submission: SubmissionId::new(row.get::<_, String>(1), row.get::<_, String>(2)),
+                    manifest_id: row.get(3),
+                    resource_types,
+                }
+            })
+            .collect())
+    }
+
     async fn get_manifest_for_worker(
         &self,
         lease: &ManifestLease,

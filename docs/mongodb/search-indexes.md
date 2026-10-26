@@ -97,7 +97,21 @@ Other parameters can still produce rows and metadata, so a present field does
 not prove that every parameter extracted successfully. Affected missing-field
 results can remain incomplete until the extraction problem is corrected and
 the resource is rewritten or reindexed. This metadata describes top-level
-resources; it does not add contained `:missing` support.
+resources; it does not add contained `:missing` support. Transaction and
+batch conditional criteria (`ifNoneExist`, conditional update/delete URLs)
+evaluate `:missing=true` with the same semantics inside the transaction's
+session (#2003): the metadata predicate with the value-index fallback when
+the fingerprint is fresh, the absence of a value row otherwise. As in search
+(#2004), the check runs on each batch of candidates the other criteria
+produced, so its cost follows the candidates, not the resource type; criteria
+with nothing else to drive from (only `_id`, `_lastUpdated` and
+`:missing=true`) scan the type in batches and stop at the second match.
+`ifNoneExist` sees resources written earlier in the same bundle; URL-borne
+criteria are resolved before any write, as the R4 overlap rule requires.
+
+Next to the array, `missing_params_fp` stamps the definition fingerprint it
+was computed from, and the `idx_resources_missing_params_fp` index serves the
+per-search staleness probe — see "Definition changes" below.
 
 The shared `idx_resources_missing_params` multikey index has this key order:
 
@@ -106,10 +120,18 @@ The shared `idx_resources_missing_params` multikey index has this key order:
   missing_params: 1, last_updated: 1, id: 1 }
 ```
 
-On an existing deployment its first build scans every `resources` document
-(about 10.5 GB at 12M resources), so HFS builds it after boot under
-`HFS_MONGODB_INDEX_BUILD`, in its own task beside the `search_index` builder
-(#2001):
+The probe's index is scalar and partial, holding only documents that carry
+the array:
+
+```javascript
+{ tenant_id: 1, resource_type: 1, is_deleted: 1, missing_params_fp: 1 }
+// partialFilterExpression: { missing_params: { $exists: true } }
+```
+
+On an existing deployment the first build of either index scans every
+`resources` document (about 10.5 GB at 12M resources), so HFS builds both
+after boot under `HFS_MONGODB_INDEX_BUILD`, in their own task beside the
+`search_index` builder (#2001):
 
 | value | behaviour |
 |---|---|
@@ -126,9 +148,14 @@ db.resources.createIndex(
     missing_params: 1, last_updated: 1, id: 1 },
   { name: "idx_resources_missing_params" }
 );
+db.resources.createIndex(
+  { tenant_id: 1, resource_type: 1, is_deleted: 1, missing_params_fp: 1 },
+  { name: "idx_resources_missing_params_fp",
+    partialFilterExpression: { missing_params: { $exists: true } } }
+);
 ```
 
-Until the builder has seen the index built and visible, every
+Until the builder has seen both indexes built and visible, every
 `:missing=true` and `:missing=false` search uses the value-index route that
 unsupported parameters use, and never names the index in a hint. Results are
 the same on both routes; only the plan differs. HFS checks once per boot: an
@@ -193,36 +220,110 @@ time is included in the insert timing statistic.
    before judging `:missing=true` latency. Existing resources without metadata
    remain searchable through the compatibility path while their value indexes
    remain valid.
-3. Run the tenant's `POST /$reindex` to populate metadata for existing resources.
-   Poll `GET /$reindex-status/{job_id}` on the same node and resolve reported
-   failures before treating the rebuild as complete.
+3. Populate metadata for existing resources with a metadata-only reindex
+   (#2008), which writes `missing_params` and leaves `search_index` and
+   `search_index_contained` untouched:
 
-There is no definition fingerprint or automatic metadata invalidation when a
-SearchParameter is added, changed or removed. Coordinate definition
-maintenance across all nodes serving the affected tenant:
+   ```http
+   POST /$reindex
+   Content-Type: application/fhir+json
 
-1. Pause affected searches and drain writers, including background indexing.
-2. Apply the definition change and refresh or restart every affected node so
-   they use the same definitions.
-3. Remove the complete `missing_params` field for the affected tenant and
-   resource types, using an explicitly scoped MongoDB update, for example:
-
-   ```javascript
-   db.resources.updateMany(
-     { tenant_id: "TENANT_ID", resource_type: { $in: ["Observation"] } },
-     { $unset: { missing_params: "" } }
-   );
+   {"resourceType": "Parameters", "parameter": [
+     {"name": "metadataOnly", "valueBoolean": true},
+     {"name": "skipExistingMetadata", "valueBoolean": true}
+   ]}
    ```
 
-4. Reindex the affected resources with the new definitions, check job errors,
-   and resume requests after the rebuild succeeds.
+   Poll `GET /$reindex-status/{job_id}` on the same node and resolve reported
+   failures before treating the backfill as complete. A full `POST /$reindex`
+   (no parameters) populates metadata too, but also deletes and rewrites every
+   value-index row.
 
-Do not merely remove one parameter name from the array: a present array would
-still be trusted, so that would claim the parameter is not absent instead of
-marking its state unknown. Unsetting the field restores compatibility checks,
-but those checks cannot repair value-index rows extracted from old definitions;
-the rebuild is still required. Include every affected type when a definition
-applies to an abstract base or multiple resource types.
+### Metadata-only reindex
+
+`metadataOnly` runs the same walk, extraction and version guard as a rebuild:
+each page's resources are extracted exactly as a rebuild would extract them,
+and `missing_params` is written only where the stored version is still the
+one the page read. It writes nothing to `search_index` or
+`search_index_contained`. Because the metadata comes from the same extraction
+that produced the value-index rows, `:missing=true` results are unchanged by
+the backfill as long as those rows were written under the current
+definitions; only the plan moves from the compatibility path to
+`idx_resources_missing_params`.
+
+| Parameter | Effect |
+|---|---|
+| `metadataOnly` | Write only `missing_params`. Cannot be combined with `clearExisting`, `clearOnly` or a bulk index rebuild. Combines with a resource type (`POST /{type}/$reindex`) and with `idStart`/`idEnd`. |
+| `skipExistingMetadata` | With `metadataOnly`, leave alone resources whose `missing_params` already carries the current `missing_params_fp`. Resources without the array, with an unstamped array (written before #1999) or with a stale stamp are written. Every resource in scope is still read and extracted; only the write is skipped. |
+
+`$reindex-status` reports `metadataOnly: true` and `metadataUpdated`, the
+number of resources whose metadata was written; `entriesCreated` stays `0`.
+A resource whose extraction fails has its metadata removed, as in a rebuild,
+and is listed as an error. On a deployment where Elasticsearch owns search
+(`mongodb-elasticsearch`), `missing_params` is never read and
+`metadataOnly` is `501 Not Implemented`, as it is on every other backend.
+
+### Definition changes (#1999)
+
+Every writer stamps `missing_params_fp` next to `missing_params`: a
+deterministic fingerprint of the tenant's active definitions for the resource
+type (and its abstract bases) at write time. The first time a process stamps
+a fingerprint it records, in the `missing_params_fingerprints` collection,
+one digest per parameter code under that fingerprint. The collection holds
+one small document per distinct set of definitions and is never rewritten.
+
+Before each `:missing=true` search or count the server probes
+`idx_resources_missing_params_fp` for the live resources of the tenant and
+type whose array is unstamped or whose stamp differs from the current
+registry's fingerprint. The probe reads one key when it finds an unstamped
+array and otherwise one key per distinct stale stamp, never one per resource.
+Then, per parameter:
+
+- no stale or unstamped array: the metadata route answers;
+- only stamps whose recorded digest for this parameter equals the current
+  one: the metadata route answers — those arrays were computed from the same
+  definition, so an unrelated SearchParameter change leaves the parameter on
+  its fast path;
+- otherwise (a new or changed parameter, a stamp missing from the catalog,
+  any unstamped array, more than 32 stale stamps, or a failed probe): the
+  value-index route answers.
+
+Creating, changing or retiring a SearchParameter therefore gives correct
+results immediately, on every node, with no manual steps: a node still
+holding the older registry stamps its writes with the older fingerprint,
+which the other nodes compare parameter by parameter. A search path that did
+not probe, or a definition change since the probe, takes the value-index
+route.
+
+The stamp cannot repair value-index rows: after changing an existing
+definition's *expression*, resources written under the old expression answer
+from their old rows (exactly as ordinary value searches do) until a
+`POST /$reindex` of the affected types rewrites them. `$reindex` also
+restamps the metadata, which restores the metadata route for the new or
+changed parameter; until then `:missing=true` on that parameter pays the
+value-index route, which is about the cost it had before #1984.
+
+Resources written before the stamp existed (or by a node that predates it)
+carry `missing_params` without `missing_params_fp`. The probe finds them in
+one key and every `:missing=true` on the type takes the value-index route, so
+results are correct after an upgrade without any manual step. Run the
+metadata-only reindex from the upgrade steps above (`metadataOnly`, with
+`skipExistingMetadata`) to stamp them and restore the metadata route without
+rewriting the value index.
+
+Recovery, when metadata is suspected wrong despite the stamp (a restore from
+backup, a manual edit): `$unset` both fields together for the affected tenant
+and resource types and `$reindex`. Do not merely remove one parameter name
+from the array, and do not unset one field without the other: a present array
+with a current stamp is trusted. Include every affected type when a
+definition applies to an abstract base or multiple resource types.
+
+```javascript
+db.resources.updateMany(
+  { tenant_id: "TENANT_ID", resource_type: { $in: ["Observation"] } },
+  { $unset: { missing_params: "", missing_params_fp: "" } }
+);
+```
 
 ## Composite parameters
 

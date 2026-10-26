@@ -874,7 +874,7 @@ impl CompositeStorage {
     /// Syncs bundle results to secondaries by extracting resource info from responses.
     ///
     /// Entries are grouped by resource type and synced as batches
-    /// ([`Self::sync_creates_to_secondaries`]) rather than one event each: a
+    /// ([`SyncManager::sync_events`]) rather than one event each: a
     /// transaction Bundle's entries each waited on the secondary in turn, and
     /// under Elasticsearch `refresh=wait_for` (one refresh interval per write)
     /// a bundle of a few dozen entries outran the 30s request timeout.
@@ -941,30 +941,32 @@ impl CompositeStorage {
         // Deletes go first, in the primary's own processing order: a create
         // that preceded a delete of the same resource was dropped from
         // `by_type` above, so what remains there is still live.
-        for (resource_type, resource_id) in deletes {
-            if let Err(e) = self
-                .sync_to_secondaries(SyncEvent::Delete {
-                    resource_type: resource_type.clone(),
-                    resource_id: resource_id.clone(),
-                    tenant_id: tenant.tenant_id().clone(),
-                })
-                .await
-            {
-                warn!(
-                    error = %e,
-                    resource_type = resource_type,
-                    resource_id = resource_id,
-                    "Failed to sync bundle entry delete to secondaries"
-                );
-            }
-        }
-        for (resource_type, resources) in by_type {
-            // The bundle path has no per-entry receipt to correct on a
-            // rejection; the per-backend statuses are for callers that do
-            // (bulk-submit), so this one discards them.
-            let _ = self
-                .sync_creates_to_secondaries(tenant, &resource_type, resources)
-                .await;
+        let mut events: Vec<SyncEvent> = deletes
+            .into_iter()
+            .map(|(resource_type, resource_id)| SyncEvent::Delete {
+                resource_type,
+                resource_id,
+                tenant_id: tenant.tenant_id().clone(),
+            })
+            .collect();
+        events.extend(
+            by_type
+                .into_iter()
+                .flat_map(|(_, resources)| resources.into_iter().map(SyncEvent::created)),
+        );
+        let Some(ref sync_manager) = self.sync_manager else {
+            return;
+        };
+        // One hand-off for the whole bundle: in asynchronous mode a single
+        // queue item, so a request dropped while the queue is full cannot
+        // leave part of the committed bundle queued and the rest unrecorded
+        // (#1545). The bundle path has no per-entry receipt to correct on a
+        // rejection, so the per-backend statuses are not needed here.
+        if let Err(e) = sync_manager.sync_events(events, &self.secondaries).await {
+            warn!(
+                error = %e,
+                "Failed to sync transaction bundle results to secondaries"
+            );
         }
     }
 

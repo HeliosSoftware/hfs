@@ -1096,6 +1096,12 @@ impl ResourceStorage for PostgresBackend {
         true
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::postgres::PgInDbRunner;
         let fhir_version = self.config().fhir_version;
@@ -2108,6 +2114,8 @@ impl ResourceStorage for PostgresBackend {
         )
         .await
         .or_query_error("purge provider submissions")?;
+        // SQL query terminology relations are tenant-keyed rows (#2185).
+        super::sof_terminology::purge_tenant_in_txn(&tx, id).await?;
         let settings = PostgresBackend::purge_tenant_settings_in_txn(&tx, id).await?;
         tx.commit().await.or_query_error("purge commit")?;
         client.mark_settled();
@@ -5217,9 +5225,12 @@ impl PostgresBackend {
                         resource_with_id["id"] = serde_json::json!(id);
                         // A deleted id is restored, as the same PUT outside a
                         // Bundle is; only an id never stored creates (#2145).
-                        if let Some(restored) =
-                            tx.restore(&resource_type, &id, &resource_with_id).await?
+                        if let Some(deleted) = tx
+                            .read_including_deleted(&resource_type, &id)
+                            .await?
+                            .filter(|r| r.is_deleted())
                         {
+                            let restored = tx.restore(&deleted, resource_with_id).await?;
                             return Ok(BundleEntryResult::created(restored));
                         }
                         let created = tx.create(&resource_type, resource_with_id).await?;

@@ -2376,8 +2376,13 @@ impl SubmitClaimStrategy for SqliteBackend {
 impl SubmitWorkerStorage for SqliteBackend {
     /// #1125: the marker that says this manifest still owes a search-index
     /// rebuild. It lives on the manifest row, so it survives a restart that
-    /// loses the in-process job map.
-    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
+    /// loses the in-process job map. The types are not stored: the listing
+    /// derives them from `bulk_entry_results`.
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        _resource_types: &[String],
+    ) -> StorageResult<()> {
         let conn = self.get_connection()?;
         conn.execute(
             "UPDATE bulk_manifests SET index_pending = 1
@@ -2391,6 +2396,10 @@ impl SubmitWorkerStorage for SqliteBackend {
         )
         .map_err(|e| internal_error(format!("mark index pending: {e}")))?;
         Ok(())
+    }
+
+    fn records_index_pending(&self) -> bool {
+        true
     }
 
     async fn clear_manifest_index_pending(
@@ -5785,7 +5794,10 @@ mod tests {
                 .unwrap();
             }
         }
-        backend.mark_manifest_index_pending(&lease).await.unwrap();
+        backend
+            .mark_manifest_index_pending(&lease, &[])
+            .await
+            .unwrap();
 
         let pending = backend.list_manifests_awaiting_reindex(10).await.unwrap();
         assert_eq!(pending.len(), 1);

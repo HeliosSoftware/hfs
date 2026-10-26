@@ -1489,7 +1489,7 @@ async fn mongodb_missing_metadata_definition_maintenance_restores_fallback_and_r
 }
 
 #[tokio::test]
-async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
+async fn mongodb_missing_conditional_transactions_match_absence() {
     let Some(backend) = create_backend("missing_conditional").await else {
         return;
     };
@@ -1541,30 +1541,103 @@ async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
                 },
             )
         };
-        let error = backend
+        assert_results(
+            &backend,
+            &tenant,
+            &missing_query(&PARAMETERS[1], true),
+            &["absent"],
+        )
+        .await;
+        let result = backend
             .process_transaction(
                 &tenant,
                 vec![put.clone(), delete(true)],
                 FhirVersion::default(),
             )
             .await
-            .unwrap_err();
-        assert!(format!("{error}").contains("missing=true"), "{error:?}");
+            .unwrap();
+        assert_eq!(result.entries[0].status, 201);
+        assert_eq!(result.entries[1].status, 204);
+        assert!(
+            matches!(
+                backend.read(&tenant, "Observation", "absent").await,
+                Err(StorageError::Resource(ResourceError::Gone { .. }))
+            ),
+            "absence criteria must delete the resource GET would have matched"
+        );
         assert!(
             backend
                 .read(&tenant, "Observation", "present")
                 .await
                 .unwrap()
-                .is_none(),
-            "unsupported absence criteria must roll back the preceding write"
-        );
-        assert!(
-            backend
-                .read(&tenant, "Observation", "absent")
-                .await
-                .unwrap()
                 .is_some()
         );
+
+        let bare_put = BundleEntry {
+            method: BundleMethod::Put,
+            url: "Observation/bare".into(),
+            resource: Some(observation("bare", vec![])),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+            criteria: None,
+        };
+        let absent_conditional_create = BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".into(),
+            resource: Some(observation("never-created", extensions(false))),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some("missing-token:missing=true".into()),
+            full_url: None,
+            criteria: None,
+        };
+        let result = backend
+            .process_transaction(
+                &tenant,
+                vec![bare_put, absent_conditional_create],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].status, 201);
+        assert_eq!(
+            result.entries[1].status, 200,
+            "ifNoneExist absence must match the resource written earlier in the same bundle"
+        );
+        assert_eq!(
+            result.entries[1].reference().as_deref(),
+            Some("Observation/bare")
+        );
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                observation("bare2", vec![]),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .process_transaction(&tenant, vec![delete(true)], FhirVersion::default())
+            .await
+            .unwrap_err();
+        for id in ["bare", "bare2"] {
+            assert!(
+                backend
+                    .read(&tenant, "Observation", id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "a multi-match conditional delete must change nothing"
+            );
+        }
+        backend
+            .delete(&tenant, "Observation", "bare2")
+            .await
+            .unwrap();
         // Presence reads the value rows written earlier in the same transaction.
         let conditional_create = BundleEntry {
             method: BundleMethod::Post,
@@ -1603,7 +1676,7 @@ async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
         );
         assert!(
             backend
-                .read(&tenant, "Observation", "absent")
+                .read(&tenant, "Observation", "bare")
                 .await
                 .unwrap()
                 .is_some()
@@ -1612,7 +1685,7 @@ async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
             &backend,
             &tenant,
             &missing_query(&PARAMETERS[1], true),
-            &["absent"],
+            &["bare"],
         )
         .await;
     }
@@ -1792,16 +1865,21 @@ async fn mongodb_missing_index_follows_index_build_mode() {
     };
     let db_name = build_test_database_name("missing_index_mode");
     let index = "idx_resources_missing_params".to_string();
+    let fp_index = "idx_resources_missing_params_fp".to_string();
 
     let off = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
     assert_eq!(
         off.wait_for_missing_index_build().await,
         Some(BuildOutcome::Skipped {
-            missing: vec![index.clone()]
+            missing: vec![index.clone(), fp_index.clone()]
         })
     );
     let db = off.get_database().await.unwrap();
-    assert!(!resources_index_names(&db).await.contains(&index));
+    let names = resources_index_names(&db).await;
+    assert!(
+        !names.contains(&index) && !names.contains(&fp_index),
+        "{names:?}"
+    );
     off.readiness_check()
         .await
         .expect("ready while the missing_params index is absent");
@@ -1843,11 +1921,15 @@ async fn mongodb_missing_index_follows_index_build_mode() {
     assert_eq!(
         inline.wait_for_missing_index_build().await,
         Some(BuildOutcome::Built {
-            created: vec![index.clone()],
+            created: vec![index.clone(), fp_index.clone()],
             dropped: vec![],
         })
     );
-    assert!(resources_index_names(&db).await.contains(&index));
+    let names = resources_index_names(&db).await;
+    assert!(
+        names.contains(&index) && names.contains(&fp_index),
+        "{names:?}"
+    );
     inline.readiness_check().await.expect("ready once built");
     for parameter in &PARAMETERS {
         assert_results(
@@ -1902,5 +1984,941 @@ async fn mongodb_missing_index_follows_index_build_mode() {
             &["absent", "null"],
         )
         .await;
+    }
+}
+
+#[tokio::test]
+async fn mongodb_missing_results_survive_searchparameter_create_update_delete() {
+    let Some(backend) = create_backend("missing_fp_lifecycle").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-fp-lifecycle");
+    register_parameters(&backend, &tenant).await;
+    let full = backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("lifecycle-full", extensions(false)),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let empty = backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("lifecycle-empty", vec![]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = backend.get_database().await.unwrap();
+    let stamped = db
+        .collection::<Document>("resources")
+        .find_one(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "id": "lifecycle-full",
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let stamp = stamped.get_str("missing_params_fp").unwrap();
+    assert_eq!(stamp.len(), 16, "{stamp}");
+    assert!(stamp.bytes().all(|b| b.is_ascii_hexdigit()), "{stamp}");
+
+    let token = &PARAMETERS[1];
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(token, true),
+        &["lifecycle-empty"],
+    )
+    .await;
+
+    let added = TypedParameter {
+        name: "fp-added",
+        kind: SearchParamType::Token,
+        fhir_type: "token",
+        extension_field: "valueCode",
+        index_field: "value_token_code",
+    };
+    backend
+        .create(
+            &tenant,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter", "id": added.name,
+                "url": format!("urn:hfs:test:{}", added.name),
+                "name": added.name, "status": "active", "code": added.name,
+                "base": ["Observation"], "type": added.fhir_type,
+                "expression": format!(
+                    "Observation.extension.where(url = 'urn:hfs:test:{}').value",
+                    added.name
+                )
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(&added, true),
+        &["lifecycle-empty", "lifecycle-full"],
+    )
+    .await;
+    assert_results(&backend, &tenant, &missing_query(&added, false), &[]).await;
+
+    let rewritten = backend
+        .write_search_entries_page(&tenant, &[full.clone(), empty.clone()])
+        .await;
+    assert!(rewritten.iter().all(Result::is_ok), "{rewritten:?}");
+    assert_missing_metadata(&db, &tenant, "lifecycle-empty", &added, true).await;
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(&added, true),
+        &["lifecycle-empty", "lifecycle-full"],
+    )
+    .await;
+
+    let current = backend
+        .read(&tenant, "SearchParameter", "missing-string")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &current,
+            json!({
+                "resourceType": "SearchParameter", "id": "missing-string",
+                "url": "urn:hfs:test:missing-string",
+                "name": "missing-string", "status": "active", "code": "missing-string",
+                "base": ["Observation"], "type": "string",
+                "expression":
+                    "Observation.extension.where(url = 'urn:hfs:test:missing-string-v2').value"
+            }),
+        )
+        .await
+        .unwrap();
+    let string = &PARAMETERS[0];
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(string, true),
+        &["lifecycle-empty"],
+    )
+    .await;
+    let rewritten = backend
+        .write_search_entries_page(&tenant, &[full.clone(), empty.clone()])
+        .await;
+    assert!(rewritten.iter().all(Result::is_ok), "{rewritten:?}");
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(string, true),
+        &["lifecycle-empty", "lifecycle-full"],
+    )
+    .await;
+
+    backend
+        .delete(&tenant, "SearchParameter", "fp-added")
+        .await
+        .unwrap();
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(&added, true),
+        &["lifecycle-empty", "lifecycle-full"],
+    )
+    .await;
+    db.drop().await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_missing_metadata_stamped_by_another_registry_is_distrusted() {
+    let Some(backend) = create_backend("missing_fp_foreign_stamp").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-fp-foreign");
+    register_parameters(&backend, &tenant).await;
+    let original = backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("node-a", vec![]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let token = &PARAMETERS[1];
+    assert_results(&backend, &tenant, &missing_query(token, true), &["node-a"]).await;
+
+    let db = backend.get_database().await.unwrap();
+    db.collection::<Document>("resources")
+        .update_one(
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "id": "node-a",
+            },
+            doc! { "$set": {
+                "missing_params": Vec::<String>::new(),
+                "missing_params_fp": "0000000000000000",
+            } },
+        )
+        .await
+        .unwrap();
+    assert_results(&backend, &tenant, &missing_query(token, true), &["node-a"]).await;
+    assert_results(&backend, &tenant, &missing_query(token, false), &[]).await;
+
+    let rewritten = backend
+        .write_search_entries_page(&tenant, std::slice::from_ref(&original))
+        .await;
+    assert!(rewritten.iter().all(Result::is_ok), "{rewritten:?}");
+    assert_missing_metadata(&db, &tenant, "node-a", token, true).await;
+    assert_results(&backend, &tenant, &missing_query(token, true), &["node-a"]).await;
+    db.drop().await.unwrap();
+}
+
+const UNSTAMPED_ADDED: TypedParameter = TypedParameter {
+    name: "fp-unstamped-added",
+    kind: SearchParamType::Token,
+    fhir_type: "token",
+    extension_field: "valueCode",
+    index_field: "value_token_code",
+};
+
+async fn add_token_parameter(backend: &MongoBackend, tenant: &TenantContext, name: &str) {
+    backend
+        .create(
+            tenant,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter", "id": name,
+                "url": format!("urn:hfs:test:{name}"),
+                "name": name, "status": "active", "code": name,
+                "base": ["Observation"], "type": "token",
+                "expression": format!("Observation.extension.where(url = 'urn:hfs:test:{name}').value")
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+}
+
+/// Removes the stamps, as arrays written before #1999 (or by a node that
+/// predates it) have none.
+async fn unstamp(db: &mongodb::Database, tenant: &TenantContext) {
+    db.collection::<Document>("resources")
+        .update_many(
+            doc! { "tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation" },
+            doc! { "$unset": { "missing_params_fp": "" } },
+        )
+        .await
+        .unwrap();
+}
+
+/// Runs `query` under the profiler and returns the result ids and the
+/// profiled operations on `resources` and `search_index`.
+async fn profiled_resource_operations(
+    backend: &MongoBackend,
+    db: &mongodb::Database,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> (Vec<String>, Vec<Document>) {
+    use futures::TryStreamExt;
+    clear_profile(db).await;
+    db.run_command(doc! {"profile": 2}).await.unwrap();
+    let result = backend.search(tenant, query).await;
+    db.run_command(doc! {"profile": 0}).await.unwrap();
+    let ids = result
+        .unwrap()
+        .resources
+        .items
+        .iter()
+        .map(|row| row.id().to_string())
+        .collect();
+    let operations = db
+        .collection::<Document>("system.profile")
+        .find(doc! { "ns": {
+            "$in": [format!("{}.resources", db.name()), format!("{}.search_index", db.name())]
+        } })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    (ids, operations)
+}
+
+/// Whether the search read the value index: the metadata route answers from
+/// `resources` alone.
+fn reads_search_index(operations: &[Document]) -> bool {
+    operations.iter().any(|operation| {
+        operation
+            .get_str("ns")
+            .is_ok_and(|ns| ns.ends_with(".search_index"))
+    })
+}
+
+/// #1999 on an upgraded tenant: arrays without a stamp predate the
+/// fingerprint, so a parameter defined after them is not known absent from
+/// them; they answer from the value index until rewritten.
+#[tokio::test]
+async fn mongodb_missing_metadata_without_a_stamp_is_distrusted() {
+    let Some(backend) = create_backend("missing_fp_unstamped").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-fp-unstamped");
+    register_parameters(&backend, &tenant).await;
+    let mut written = Vec::new();
+    for (id, values) in [
+        ("unstamped-empty", vec![]),
+        ("unstamped-full", extensions(false)),
+    ] {
+        written.push(
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    observation(id, values),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let db = backend.get_database().await.unwrap();
+    unstamp(&db, &tenant).await;
+    add_token_parameter(&backend, &tenant, UNSTAMPED_ADDED.name).await;
+
+    let token = &PARAMETERS[1];
+    let expected = ["unstamped-empty", "unstamped-full"];
+    let (ids, operations) = profiled_resource_operations(
+        &backend,
+        &db,
+        &tenant,
+        &missing_query(&UNSTAMPED_ADDED, true),
+    )
+    .await;
+    assert_eq!(ids, expected);
+    assert!(
+        reads_search_index(&operations),
+        "value-index route: {operations:?}"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &missing_query(&UNSTAMPED_ADDED, true))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_results(
+        &backend,
+        &tenant,
+        &missing_query(token, true),
+        &["unstamped-empty"],
+    )
+    .await;
+
+    // Rewriting stamps them under the current definitions: the metadata
+    // route is back, with the same answers.
+    let rewritten = backend.write_search_entries_page(&tenant, &written).await;
+    assert!(rewritten.iter().all(Result::is_ok), "{rewritten:?}");
+    let (ids, operations) = profiled_resource_operations(
+        &backend,
+        &db,
+        &tenant,
+        &missing_query(&UNSTAMPED_ADDED, true),
+    )
+    .await;
+    assert_eq!(ids, expected);
+    assert!(
+        !reads_search_index(&operations),
+        "metadata route: {operations:?}"
+    );
+    db.drop().await.unwrap();
+}
+
+/// After a SearchParameter is added, the arrays stamped under the previous
+/// definitions still describe every parameter whose definition did not
+/// change, so those keep the metadata route; the new one does not.
+#[tokio::test]
+async fn mongodb_missing_metadata_of_unchanged_parameters_survives_a_definition_change() {
+    let Some(backend) = create_backend("missing_fp_unchanged").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-fp-unchanged");
+    register_parameters(&backend, &tenant).await;
+    for (id, values) in [
+        ("unchanged-empty", vec![]),
+        ("unchanged-full", extensions(false)),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                observation(id, values),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = backend.get_database().await.unwrap();
+    let token = &PARAMETERS[1];
+    let (ids, operations) =
+        profiled_resource_operations(&backend, &db, &tenant, &missing_query(token, true)).await;
+    assert_eq!(ids, ["unchanged-empty"]);
+    assert!(
+        !reads_search_index(&operations),
+        "metadata route: {operations:?}"
+    );
+
+    add_token_parameter(&backend, &tenant, "fp-unchanged-added").await;
+    let added = TypedParameter {
+        name: "fp-unchanged-added",
+        ..UNSTAMPED_ADDED
+    };
+    let (ids, operations) =
+        profiled_resource_operations(&backend, &db, &tenant, &missing_query(token, true)).await;
+    assert_eq!(ids, ["unchanged-empty"]);
+    assert!(
+        !reads_search_index(&operations),
+        "an unchanged parameter keeps the metadata route: {operations:?}"
+    );
+    let (ids, operations) =
+        profiled_resource_operations(&backend, &db, &tenant, &missing_query(&added, true)).await;
+    assert_eq!(ids, ["unchanged-empty", "unchanged-full"]);
+    assert!(
+        reads_search_index(&operations),
+        "value-index route: {operations:?}"
+    );
+    db.drop().await.unwrap();
+}
+
+/// The staleness probe is bounded by the distinct stamps it finds, not by
+/// the size of the type: an unstamped array is found in one key, each stamp
+/// costs one covered seek, and a fully stamped type reads no document.
+#[tokio::test]
+async fn mongodb_missing_staleness_probe_reads_one_key_per_stamp() {
+    let Some(backend) = create_backend("missing_fp_probe_cost").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-fp-probe-cost");
+    register_parameters(&backend, &tenant).await;
+    for i in 0..50 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                observation(&format!("probe-{i:02}"), vec![]),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = backend.get_database().await.unwrap();
+    let token = &PARAMETERS[1];
+    let probes = |operations: &[Document]| -> Vec<(i64, i64)> {
+        operations
+            .iter()
+            .filter(|operation| {
+                operation.get_document("command").is_ok_and(|command| {
+                    command.get_str("hint") == Ok("idx_resources_missing_params_fp")
+                })
+            })
+            .map(|operation| {
+                let read = |field| {
+                    operation
+                        .get_i64(field)
+                        .or_else(|_| operation.get_i32(field).map(i64::from))
+                        .unwrap_or(0)
+                };
+                (read("keysExamined"), read("docsExamined"))
+            })
+            .collect()
+    };
+
+    let (_, operations) =
+        profiled_resource_operations(&backend, &db, &tenant, &missing_query(token, true)).await;
+    // The unstamped seek, then the stamp seeks: the current one, then none.
+    let stamped = probes(&operations);
+    assert_eq!(stamped.len(), 3, "{operations:?}");
+    assert!(
+        stamped.iter().all(|&(keys, docs)| keys <= 1 && docs == 0),
+        "{stamped:?}"
+    );
+
+    unstamp(&db, &tenant).await;
+    let (_, operations) =
+        profiled_resource_operations(&backend, &db, &tenant, &missing_query(token, true)).await;
+    let unstamped = probes(&operations);
+    assert_eq!(
+        unstamped.len(),
+        1,
+        "an unstamped array ends the probe: {operations:?}"
+    );
+    assert!(unstamped[0].0 <= 1 && unstamped[0].1 <= 1, "{unstamped:?}");
+    db.drop().await.unwrap();
+}
+
+/// #2004: a count that combines a broad positive predicate with metadata
+/// `:missing=true` streams the positive index rows in batches. It must not
+/// read the larger missing population, and resources without metadata still
+/// consult their value index.
+#[tokio::test]
+async fn mongodb_missing_metadata_count_drives_from_selective_positive_filter() {
+    use futures::TryStreamExt;
+    let Some(backend) = create_backend("missing_positive_count").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-positive-count");
+    register_parameters(&backend, &tenant).await;
+    let token = &PARAMETERS[1];
+    let present = || {
+        vec![json!({
+            "url": format!("urn:hfs:test:{}", token.name), "valueCode": "present",
+        })]
+    };
+    // 300 positive matches above the selective-candidate limit; every third
+    // lacks the token. 2000 resources of another code all lack it.
+    for number in 0..300 {
+        let values = if number % 3 == 0 { vec![] } else { present() };
+        let mut resource = observation(&format!("common-{number:04}"), values);
+        resource["code"] = json!({"coding": [{"code": "common"}]});
+        backend
+            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    for number in 0..2000 {
+        let mut resource = observation(&format!("other-{number:04}"), vec![]);
+        resource["code"] = json!({"coding": [{"code": "other"}]});
+        backend
+            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let db = backend.get_database().await.unwrap();
+    // Every fifth positive match predates the metadata.
+    for number in (0..300).step_by(5) {
+        db.collection::<Document>("resources")
+            .update_one(
+                doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation",
+                "id": format!("common-{number:04}")},
+                doc! {"$unset": {"missing_params": ""}},
+            )
+            .await
+            .unwrap();
+    }
+    let code = SearchParameter {
+        name: "code".to_owned(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("common")],
+        chain: vec![],
+        components: vec![],
+    };
+    for missing in [true, false] {
+        let query = SearchQuery::new("Observation")
+            .with_parameter(code.clone())
+            .with_parameter(missing_condition(token, missing));
+        let expected = if missing { 100 } else { 200 };
+        clear_profile(&db).await;
+        db.run_command(doc! {"profile": 2}).await.unwrap();
+        let count = backend.search_count(&tenant, &query).await;
+        db.run_command(doc! {"profile": 0}).await.unwrap();
+        assert_eq!(count.unwrap(), expected, "missing={missing}");
+        if missing {
+            let operations: Vec<Document> = db
+                .collection("system.profile")
+                .find(doc! { "ns": format!("{}.resources", db.name()) })
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let examined: i64 = operations
+                .iter()
+                .filter_map(|operation| {
+                    operation
+                        .get_i64("docsExamined")
+                        .or_else(|_| operation.get_i32("docsExamined").map(i64::from))
+                        .ok()
+                })
+                .sum();
+            assert!(
+                examined < 1000,
+                "count must not read the 2100-resource missing population: {examined}"
+            );
+        }
+        let mut summary = query.clone();
+        summary.summary = Some(helios_persistence::types::SummaryMode::Count);
+        for total in [TotalMode::Accurate, TotalMode::Estimate] {
+            summary.total = Some(total);
+            let result = backend.search(&tenant, &summary).await.unwrap();
+            assert_eq!(result.total, Some(expected), "missing={missing}, {total:?}");
+        }
+    }
+    db.drop().await.unwrap();
+}
+
+/// `_id` and `_lastUpdated` are columns of every resource document and
+/// `:missing` on them never reads `missing_params`, so they are not recorded
+/// even though Synthea-style resources carry no `meta.lastUpdated` (#2006).
+#[tokio::test]
+async fn mongodb_missing_metadata_omits_resource_columns() {
+    let Some(backend) = create_backend("missing_columns").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-columns");
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation("no-meta", vec![]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = backend.get_database().await.unwrap();
+    let names = missing_parameters(&db, &tenant, "Observation", "no-meta").await;
+    assert!(
+        names.iter().any(|name| name == "_tag"),
+        "other absent meta parameters are still recorded: {names:?}"
+    );
+    for column in ["_id", "_lastUpdated"] {
+        assert!(
+            !names.iter().any(|name| name == column),
+            "{column}: {names:?}"
+        );
+    }
+}
+
+/// `missing_metadata: false` (#2006): writes leave no `missing_params` and
+/// clear what an enabled writer left, the index is not built, and
+/// `:missing` answers exactly as with metadata.
+#[tokio::test]
+async fn mongodb_missing_metadata_disabled_keeps_missing_results() {
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        return;
+    };
+    let database_name = build_test_database_name("missing_disabled");
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: database_name.clone(),
+        data_dir: Some(repo_data_dir()),
+        ..Default::default()
+    };
+    let tenant = create_tenant("missing-disabled");
+
+    // An enabled writer first, as on a deployment that later opts out.
+    let Some(enabled) = build_backend(config.clone()).await else {
+        return;
+    };
+    register_parameters(&enabled, &tenant).await;
+    enabled
+        .create(
+            &tenant,
+            "Observation",
+            observation("written-enabled", vec![]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = enabled.get_database().await.unwrap();
+    assert!(
+        !missing_parameters(&db, &tenant, "Observation", "written-enabled")
+            .await
+            .is_empty()
+    );
+    db.collection::<Document>("resources")
+        .drop_index("idx_resources_missing_params")
+        .await
+        .unwrap();
+    drop(enabled);
+
+    let Some(disabled) = build_backend(MongoBackendConfig {
+        missing_metadata: false,
+        ..config
+    })
+    .await
+    else {
+        return;
+    };
+    assert!(matches!(
+        disabled.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+    let listed = db
+        .collection::<Document>("resources")
+        .list_index_names()
+        .await
+        .unwrap();
+    assert!(
+        !listed
+            .iter()
+            .any(|name| name == "idx_resources_missing_params"),
+        "the disabled backend must not build the index: {listed:?}"
+    );
+
+    for (id, values) in [
+        ("absent", vec![]),
+        ("null", extensions(true)),
+        ("present", extensions(false)),
+    ] {
+        disabled
+            .create(
+                &tenant,
+                "Observation",
+                observation(id, values),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let current = disabled
+        .read(&tenant, "Observation", "written-enabled")
+        .await
+        .unwrap()
+        .unwrap();
+    disabled
+        .update(
+            &tenant,
+            &current,
+            observation("written-enabled", extensions(false)),
+        )
+        .await
+        .unwrap();
+    let without_metadata = db
+        .collection::<Document>("resources")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation",
+            "missing_params": { "$exists": false },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        without_metadata, 4,
+        "no Observation may keep missing_params"
+    );
+
+    for parameter in &PARAMETERS {
+        for missing in [true, false] {
+            let expected: &[&str] = if missing {
+                &["absent", "null"]
+            } else {
+                &["present", "written-enabled"]
+            };
+            let mut query = missing_query(parameter, missing);
+            for total in [TotalMode::Accurate, TotalMode::Estimate] {
+                query.total = Some(total);
+                assert_results(&disabled, &tenant, &query, expected).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn mongodb_missing_conditional_matches_same_bundle_write_on_empty_tenant() {
+    let Some(backend) = create_backend("missing_conditional_empty").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-conditional-empty");
+    register_parameters(&backend, &tenant).await;
+    let bare_put = BundleEntry {
+        method: BundleMethod::Put,
+        url: "Observation/only".into(),
+        resource: Some(observation("only", vec![])),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: None,
+        criteria: None,
+    };
+    let conditional = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".into(),
+        resource: Some(observation("never", extensions(false))),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("missing-token:missing=true".into()),
+        full_url: None,
+        criteria: None,
+    };
+    let result = backend
+        .process_transaction(&tenant, vec![bare_put, conditional], FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(
+        result.entries[1].status, 200,
+        "empty tenant: ifNoneExist absence must match the same-bundle write"
+    );
+
+    let spec_tenant = create_tenant("missing-conditional-spec");
+    let put = BundleEntry {
+        method: BundleMethod::Put,
+        url: "Patient/m2".into(),
+        resource: Some(json!({"resourceType": "Patient", "id": "m2", "active": true})),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: None,
+        criteria: None,
+    };
+    let conditional = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".into(),
+        resource: Some(json!({"resourceType": "Patient", "gender": "other"})),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("gender:missing=true".into()),
+        full_url: None,
+        criteria: None,
+    };
+    let result = backend
+        .process_transaction(&spec_tenant, vec![put, conditional], FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(
+        result.entries[1].status, 200,
+        "spec param: ifNoneExist absence must match the same-bundle write"
+    );
+    let db = backend.get_database().await.unwrap();
+    db.drop().await.unwrap();
+}
+
+/// #2003: `:missing=true` in conditional criteria is applied per candidate
+/// batch, after the other criteria narrow it, on both routes: metadata and,
+/// with metadata disabled, the value index. The absent resource is written
+/// after 600 present ones, so it lies beyond the first batch of the
+/// index-driven pager (128) and of the resource scan (512).
+#[tokio::test]
+async fn mongodb_missing_conditional_criteria_cross_candidate_batches() {
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        return;
+    };
+    for metadata in [true, false] {
+        let database_name = build_test_database_name(if metadata {
+            "missing_cond_batches_md"
+        } else {
+            "missing_cond_batches_vi"
+        });
+        let Some(backend) = build_backend(MongoBackendConfig {
+            connection_string: connection_string.clone(),
+            database_name,
+            data_dir: Some(repo_data_dir()),
+            missing_metadata: metadata,
+            ..Default::default()
+        })
+        .await
+        else {
+            return;
+        };
+        let tenant = create_tenant("missing-cond-batches");
+        register_parameters(&backend, &tenant).await;
+        let put = |id: String, values: Vec<Value>| BundleEntry {
+            method: BundleMethod::Put,
+            url: format!("Observation/{id}"),
+            resource: Some(observation(&id, values)),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+            criteria: None,
+        };
+        for chunk in 0..6 {
+            let entries = (0..100)
+                .map(|i| put(format!("present-{}", chunk * 100 + i), extensions(false)))
+                .collect();
+            backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        backend
+            .process_transaction(
+                &tenant,
+                vec![put("absent-a".into(), vec![])],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let conditional = |criteria: &str| BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".into(),
+            resource: Some(observation("conditional", extensions(false))),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some(criteria.to_owned()),
+            full_url: None,
+            criteria: None,
+        };
+        let run = |criteria: &'static str| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .process_transaction(
+                        tenant,
+                        vec![conditional(criteria)],
+                        FhirVersion::default(),
+                    )
+                    .await
+            }
+        };
+        for criteria in [
+            "missing-token:missing=true",
+            "code=fixture&missing-token:missing=true",
+            "_id=absent-a&missing-token:missing=true",
+            "missing-token:missing=true&missing-string:missing=true",
+        ] {
+            let result = run(criteria).await.unwrap();
+            assert_eq!(
+                (result.entries[0].status, result.entries[0].reference()),
+                (200, Some("Observation/absent-a".to_owned())),
+                "metadata={metadata} criteria={criteria}"
+            );
+        }
+
+        backend
+            .process_transaction(
+                &tenant,
+                vec![put("absent-b".into(), vec![])],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_results(
+            &backend,
+            &tenant,
+            &missing_query(&PARAMETERS[1], true),
+            &["absent-a", "absent-b"],
+        )
+        .await;
+        for criteria in [
+            "missing-token:missing=true",
+            "code=fixture&missing-token:missing=true",
+        ] {
+            let error = run(criteria).await.unwrap_err();
+            assert!(
+                format!("{error}").contains("412"),
+                "metadata={metadata} criteria={criteria}: {error}"
+            );
+        }
+        // A present resource does not match, so the entry creates.
+        let result = run("_id=present-3&missing-token:missing=true")
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].status, 201, "metadata={metadata}");
+
+        let db = backend.get_database().await.unwrap();
+        db.drop().await.unwrap();
     }
 }

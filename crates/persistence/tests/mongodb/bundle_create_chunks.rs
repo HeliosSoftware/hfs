@@ -99,11 +99,26 @@ async fn backend_or_skip(test: &str, mode: Mode) -> Option<MongoBackend> {
 async fn start_profiling(db: &mongodb::Database) -> bool {
     let started = async {
         db.run_command(doc! { "profile": 0_i32 }).await?;
-        db.collection::<Document>("system.profile").drop().await?;
-        db.create_collection("system.profile")
-            .capped(true)
-            .size(16 * 1024 * 1024)
-            .await?;
+        // An operation still in flight from an earlier capture recreates the
+        // default collection when it finishes; drop it again and retry.
+        for attempt in 1.. {
+            db.collection::<Document>("system.profile").drop().await?;
+            match db
+                .create_collection("system.profile")
+                .capped(true)
+                .size(16 * 1024 * 1024)
+                .await
+            {
+                Ok(()) => break,
+                Err(e)
+                    if attempt < 10
+                        && matches!(
+                            e.kind.as_ref(),
+                            mongodb::error::ErrorKind::Command(c) if c.code == 48
+                        ) => {}
+                Err(e) => return Err(e),
+            }
+        }
         db.run_command(doc! { "profile": 2_i32 }).await
     }
     .await;

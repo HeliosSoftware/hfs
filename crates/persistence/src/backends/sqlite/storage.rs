@@ -151,7 +151,8 @@ const RECENT_WRITES_SQL: &str = "SELECT COUNT(*) FROM (SELECT 1 FROM resource_hi
 
 /// One type's bucketed history deltas (`count_deltas_by_bucket`): `?1`
 /// tenant, `?2` type, `?3` window bound, `?4` bucket width. The unary `+` keeps
-/// the planner off `idx_history_resource`, whose `(tenant_id, resource_type)`
+/// the planner off `idx_history_resource` (present on databases created before
+/// schema v45, which drops it), whose `(tenant_id, resource_type)`
 /// equality looks better unanalysed but visits every version of the type with
 /// a table read each; `idx_history_updated` covers the query (schema v40,
 /// #2107), so it reads only the window, from the index alone.
@@ -304,7 +305,7 @@ impl ResourceStorage for SqliteBackend {
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Create, resource_type)?;
 
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
         // Extract or generate ID
@@ -313,22 +314,6 @@ impl ResourceStorage for SqliteBackend {
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or_else(crate::types::new_resource_id);
-
-        // Check if resource already exists
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
-                params![tenant_id, resource_type, id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if exists {
-            return Err(StorageError::Resource(ResourceError::AlreadyExists {
-                resource_type: resource_type.to_string(),
-                id: id.clone(),
-            }));
-        }
 
         // Ensure the resource has correct type and id
         let mut resource = resource;
@@ -344,13 +329,50 @@ impl ResourceStorage for SqliteBackend {
         let data = serde_json::to_vec(&resource)
             .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
 
-        let now = Utc::now();
-        let last_updated = now.to_rfc3339();
+        // Extract the search values before taking the write lock: it is pure
+        // CPU, and SQLite has one writer.
+        let prepared = (!self.is_search_offloaded())
+            .then(|| self.prepare_index(tenant_id, resource_type, &id, &resource));
+
         let version_id = "1";
         let fhir_version_str = fhir_version.as_mime_param();
 
+        // The resource row, its history row and its search index (with the
+        // full-text rows) are ONE transaction, as update and delete already
+        // are. This used to be ~17 auto-committed statements: each its own
+        // WAL commit (+34% WAL per create, and one fsync per statement under
+        // `synchronous=FULL`: 46 ms against 6 ms), and a failure part-way
+        // left a resource with no, or half, of its search index.
+        // IMMEDIATE takes the write lock up front, where the busy handler
+        // applies, so the existence check below cannot race another create.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin create: {}", e)))?;
+
+        // Check if resource already exists
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+                params![tenant_id, resource_type, id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if exists {
+            return Err(StorageError::Resource(ResourceError::AlreadyExists {
+                resource_type: resource_type.to_string(),
+                id: id.clone(),
+            }));
+        }
+
+        // Stamped with the write lock held, so a create queued behind another
+        // writer cannot commit with an earlier `last_updated` than one that
+        // committed before it (`_since`, `_lastUpdated`, bulk export).
+        let now = Utc::now();
+        let last_updated = now.to_rfc3339();
+
         // Insert the resource
-        conn.execute(
+        tx.execute(
             "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![tenant_id, resource_type, id, version_id, data, last_updated, fhir_version_str],
@@ -358,7 +380,7 @@ impl ResourceStorage for SqliteBackend {
         .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
 
         // Insert into history
-        conn.execute(
+        tx.execute(
             "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![tenant_id, resource_type, id, version_id, data, last_updated, fhir_version_str],
@@ -366,7 +388,12 @@ impl ResourceStorage for SqliteBackend {
         .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
 
         // Index the resource for search
-        self.index_resource(&conn, tenant_id, resource_type, &id, &resource)?;
+        if let Some(prepared) = prepared {
+            self.write_prepared_index(&tx, tenant_id, resource_type, &id, &resource, prepared)?;
+        }
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit create: {}", e)))?;
 
         // An overlay-affecting SearchParameter write changes this tenant's
         // registry — drop the cached copy so the next access rebuilds from
@@ -401,32 +428,65 @@ impl ResourceStorage for SqliteBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        match self.read(tenant, resource_type, id).await {
-            // Update existing (preserves original FHIR version)
-            Ok(Some(current)) => {
-                let updated = self.update(tenant, &current, resource).await?;
-                Ok((updated, false))
-            }
-            // Create new with specific ID
-            Ok(None) => {
-                let mut resource = resource;
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+        // Every branch below is a check-then-act on the `read`: another writer
+        // can create, bump, delete or restore the row in between. Each write is
+        // a compare-and-swap, so a lost race surfaces as a typed error — and
+        // because this method decides existence itself, none of those errors is
+        // a legitimate answer from it: `VersionConflict` from `update`,
+        // `AlreadyExists` from `create`, and `NotFound` from `update` (deleted
+        // underneath it) or `restore_deleted` (another PUT restored the
+        // tombstone first) all mean "re-read and go again". The retries are
+        // bounded, the same as PostgreSQL's and MongoDB's, so the last attempt's
+        // error propagates rather than spinning forever.
+        const MAX_CAS_RETRIES: usize = 3;
+        let mut attempts = 0;
+        let mut resource = resource;
+        loop {
+            // Each attempt consumes a body; keep a copy only while a retry is
+            // still possible so the final attempt moves rather than clones.
+            let body = if attempts < MAX_CAS_RETRIES {
+                resource.clone()
+            } else {
+                std::mem::take(&mut resource)
+            };
+
+            let result = match self.read(tenant, resource_type, id).await {
+                // Update existing (preserves original FHIR version)
+                Ok(Some(current)) => self
+                    .update(tenant, &current, body)
+                    .await
+                    .map(|updated| (updated, false)),
+                // Create new with specific ID
+                Ok(None) => {
+                    let mut body = body;
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(id.to_string()));
+                    }
+                    self.create(tenant, resource_type, body, fhir_version)
+                        .await
+                        .map(|created| (created, true))
                 }
-                let created = self
-                    .create(tenant, resource_type, resource, fhir_version)
-                    .await?;
-                Ok((created, true))
+                // A deleted resource is brought back to life by a subsequent
+                // update (FHIR http.html#delete), continuing the existing
+                // version chain rather than being rejected with `Gone`.
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => self
+                    .restore_deleted(tenant, resource_type, id, body)
+                    .map(|restored| (restored, true)),
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+                    | StorageError::Resource(
+                        ResourceError::NotFound { .. } | ResourceError::AlreadyExists { .. },
+                    ),
+                ) if attempts < MAX_CAS_RETRIES => {
+                    attempts += 1;
+                    continue;
+                }
+                other => return other,
             }
-            // A deleted resource is brought back to life by a subsequent update
-            // (FHIR http.html#delete), continuing the existing version chain
-            // rather than being rejected with `Gone`.
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
-                let restored = self.restore_deleted(tenant, resource_type, id, resource)?;
-                Ok((restored, true))
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -1495,7 +1555,17 @@ impl SqliteBackend {
     /// FHIR version the resource was originally stored under.
     ///
     /// Returns `NotFound` if no deleted row is present — the caller has already
-    /// established one exists, so that only happens under a concurrent write.
+    /// established one exists, so that only happens under a concurrent write,
+    /// and `create_or_update` retries it from a fresh read.
+    ///
+    /// The tombstone read, the `UPDATE`, the history row and the search index
+    /// share one `IMMEDIATE` transaction. They used to be auto-committed
+    /// statements on a pooled connection: two PUTs onto the same tombstone both
+    /// read version N, the second `UPDATE` overwrote the first, and the second
+    /// history `INSERT` hit `PRIMARY KEY (…, version_id)` — a 500, with the live
+    /// row and history version N+1 holding different bodies (#2111). Under the
+    /// write lock the read is of the row the `UPDATE` then restores, so a racer
+    /// that loses finds no tombstone and leaves nothing behind.
     fn restore_deleted(
         &self,
         tenant: &TenantContext,
@@ -1505,10 +1575,35 @@ impl SqliteBackend {
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Update, resource_type)?;
 
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let row: Result<(String, String), _> = conn.query_row(
+        // Ensure the resource has correct type and id
+        let mut resource = resource;
+        if let Some(obj) = resource.as_object_mut() {
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+
+        let data = serde_json::to_vec(&resource)
+            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
+
+        // Extract the search values before taking the write lock: it is pure
+        // CPU, and SQLite has one writer.
+        let prepared = (!self.is_search_offloaded())
+            .then(|| self.prepare_index(tenant_id, resource_type, id, &resource));
+
+        // One IMMEDIATE transaction, as update and delete: the restored row,
+        // its history entry and its rebuilt search index land together or not
+        // at all.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin restore: {}", e)))?;
+
+        let row: Result<(String, String), _> = tx.query_row(
             "SELECT version_id, fhir_version FROM resources
              WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 1",
             params![tenant_id, resource_type, id],
@@ -1534,23 +1629,10 @@ impl SqliteBackend {
         let new_version: u64 = deleted_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
-        // Ensure the resource has correct type and id
-        let mut resource = resource;
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-        }
-
-        let data = serde_json::to_vec(&resource)
-            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
-
         let now = Utc::now();
         let last_updated = now.to_rfc3339();
 
-        conn.execute(
+        tx.execute(
             "UPDATE resources
              SET version_id = ?1, data = ?2, last_updated = ?3, is_deleted = 0, deleted_at = NULL
              WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6",
@@ -1565,7 +1647,7 @@ impl SqliteBackend {
         )
         .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![tenant_id, resource_type, id, new_version_str, data, last_updated, fhir_version_str],
@@ -1574,8 +1656,13 @@ impl SqliteBackend {
 
         // The delete dropped the search index entries; rebuild them for the
         // resource that is live again.
-        self.delete_search_index(&conn, tenant_id, resource_type, id)?;
-        self.index_resource(&conn, tenant_id, resource_type, id, &resource)?;
+        if let Some(prepared) = prepared {
+            self.delete_search_index(&tx, tenant_id, resource_type, id)?;
+            self.write_prepared_index(&tx, tenant_id, resource_type, id, &resource, prepared)?;
+        }
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit restore: {}", e)))?;
 
         // A restored overlay-affecting SearchParameter re-enters this tenant's
         // overlay.
@@ -1816,33 +1903,24 @@ impl SqliteBackend {
         }
         match prepared.rows {
             Ok(rows) => {
-                // Rows are written eight at a time: a single-row INSERT stepped
-                // once per row spends a measurable share of its time entering
-                // and leaving the statement, and every resource writes ~10-30
-                // rows. The B-tree work is unchanged; only the per-statement
-                // overhead is amortized (measured +9% bulk-ingest throughput
-                // on the real 31 GB manifest).
+                // One multi-row INSERT carries the resource's whole index: a
+                // single-row INSERT stepped once per row spends a measurable
+                // share of its time entering and leaving the statement, and
+                // every resource writes ~10-30 rows (eight at a time left up
+                // to seven single-row steps behind). The rows, their order
+                // and the B-tree work are unchanged; only the per-statement
+                // overhead is amortized.
                 let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
-                let mut i = 0;
-                while i + 8 <= rows.len() {
-                    let refs: Vec<&dyn ToSql> = rows[i..i + 8]
+                for chunk in rows.chunks(SqliteSearchIndexWriter::MAX_ROWS_PER_INSERT) {
+                    let refs: Vec<&dyn ToSql> = chunk
                         .iter()
                         .flatten()
                         .map(|p| self.sql_value_to_ref(p))
                         .collect();
-                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows8())
+                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows(chunk.len()))
                         .and_then(|mut s| s.execute(refs.as_slice()))
                         .map_err(|e| internal_error(format!("multi-row index insert: {e}")))?;
-                    i += 8;
-                    count += 8;
-                }
-                for row in &rows[i..] {
-                    let refs: Vec<&dyn ToSql> =
-                        row.iter().map(|p| self.sql_value_to_ref(p)).collect();
-                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
-                        .and_then(|mut s| s.execute(refs.as_slice()))
-                        .map_err(|e| internal_error(format!("index insert: {e}")))?;
-                    count += 1;
+                    count += chunk.len();
                 }
                 for row in &prepared.contained_rows {
                     let refs: Vec<&dyn ToSql> =
@@ -3897,9 +3975,12 @@ impl SqliteBackend {
                         resource_with_id["id"] = serde_json::json!(id);
                         // A deleted id is restored, as the same PUT outside a
                         // Bundle is; only an id never stored creates (#2145).
-                        if let Some(restored) =
-                            tx.restore(&resource_type, &id, &resource_with_id).await?
+                        if let Some(deleted) = tx
+                            .read_including_deleted(&resource_type, &id)
+                            .await?
+                            .filter(|r| r.is_deleted())
                         {
+                            let restored = tx.restore(&deleted, resource_with_id).await?;
                             return Ok(BundleEntryResult::created(restored));
                         }
                         let created = tx.create(&resource_type, resource_with_id).await?;
@@ -4988,6 +5069,138 @@ mod tests {
         )
     }
 
+    /// A create is one transaction: when the search index cannot be written,
+    /// neither the resource nor its history row survives (a create used to
+    /// auto-commit each statement and left a resource with no index). The same
+    /// holds for the restore of a deleted resource.
+    #[tokio::test]
+    async fn create_and_restore_roll_back_when_indexing_fails() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let patient =
+            |id: &str| json!({"resourceType": "Patient", "id": id, "name": [{"family": "Smith"}]});
+
+        backend
+            .create(&tenant, "Patient", patient("gone"), FhirVersion::default())
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Patient", "gone").await.unwrap();
+        let counts = |conn: &rusqlite::Connection, id: &str| -> (i64, i64, i64, String) {
+            conn.query_row(
+                "SELECT (SELECT count(*) FROM resources WHERE id = ?1), \
+                        (SELECT count(*) FROM resource_history WHERE id = ?1), \
+                        (SELECT count(*) FROM search_index WHERE resource_id = ?1), \
+                        COALESCE((SELECT version_id || '/' || is_deleted FROM resources WHERE id = ?1), '-')",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_index BEFORE INSERT ON search_index \
+                 BEGIN SELECT RAISE(ABORT, 'index write failed'); END;",
+            )
+            .unwrap();
+        }
+        let created = backend
+            .create(&tenant, "Patient", patient("new"), FhirVersion::default())
+            .await;
+        assert!(created.is_err());
+        let restored = backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "gone",
+                patient("gone"),
+                FhirVersion::default(),
+            )
+            .await;
+        assert!(restored.is_err());
+        let conn = backend.get_connection().unwrap();
+        assert_eq!(counts(&conn, "new"), (0, 0, 0, "-".to_string()));
+        // The deleted resource is still deleted, at version 2, with its history.
+        assert_eq!(counts(&conn, "gone"), (1, 2, 0, "2/1".to_string()));
+
+        conn.execute_batch("DROP TRIGGER fail_index").unwrap();
+        drop(conn);
+        backend
+            .create(&tenant, "Patient", patient("new"), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "gone",
+                patient("gone"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let conn = backend.get_connection().unwrap();
+        assert_eq!(counts(&conn, "new").0, 1);
+        assert!(counts(&conn, "new").2 > 0);
+        assert_eq!(counts(&conn, "gone").3, "3/0");
+        assert!(counts(&conn, "gone").2 > 0);
+    }
+
+    /// A create commits once: the statements of one create are a single
+    /// `BEGIN IMMEDIATE … COMMIT`, not one commit per statement.
+    #[tokio::test]
+    async fn create_commits_once() {
+        thread_local! {
+            static STMTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn record(event: rusqlite::trace::TraceEvent<'_>) {
+            if let rusqlite::trace::TraceEvent::Stmt(statement, _) = event
+                && let Some(sql) = statement.expanded_sql()
+            {
+                STMTS.with(|s| s.borrow_mut().push(sql));
+            }
+        }
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record),
+        );
+        drop(conn);
+        // The in-memory pool may hand the same connection back; if not, the
+        // trace is on another and the assertion below says so.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "one", "name": [{"family": "Smith"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // FTS5 reports its own internal statements (`-- …`), some of them while
+        // the COMMIT runs; only the application's statements count here.
+        let log: Vec<String> = STMTS
+            .with(|s| s.borrow().clone())
+            .into_iter()
+            .filter(|s| !s.starts_with("--"))
+            .collect();
+        let begins = log.iter().filter(|s| s.starts_with("BEGIN")).count();
+        let commits = log.iter().filter(|s| s.starts_with("COMMIT")).count();
+        assert!(!log.is_empty(), "no statements traced");
+        assert_eq!((begins, commits), (1, 1), "{log:?}");
+        assert!(
+            log.first()
+                .is_some_and(|s| s.starts_with("BEGIN IMMEDIATE")),
+            "{log:?}"
+        );
+        assert!(
+            log.last().is_some_and(|s| s.starts_with("COMMIT")),
+            "{log:?}"
+        );
+    }
+
     /// #1078: SQLite's `count_all_types` / `count_deltas_by_bucket` are real
     /// aggregates, so it opts in to `supports_type_counts`.
     #[test]
@@ -5225,7 +5438,8 @@ mod tests {
 
     /// #2107: the dashboard's bucketed history counts read only the window,
     /// from `idx_history_updated` alone — never a table row per version, and
-    /// never every version of a type through `idx_history_resource`.
+    /// never every version of a type through `idx_history_resource` (databases
+    /// below schema v45 still have it).
     #[test]
     fn test_count_deltas_query_plans_are_covered_by_the_history_index() {
         let backend = create_test_backend();

@@ -41,7 +41,9 @@ const SORT_ID_CHUNK: usize = 10_000;
 /// Page size when the query carries no `_count`.
 const DEFAULT_PAGE_SIZE: u32 = 100;
 
+mod search_access;
 mod search_plan;
+use search_access::{CandidateSource, PredicateAccess, matching_index_ids, with_hint_fallback};
 pub(super) use search_plan::DEFAULT_PROBE_TIMEOUT_MS;
 use search_plan::{
     BatchSelection, NoTotalPagePolicy, PageTotalExecution, ProbeFacts, SearchFilterPlan,
@@ -653,7 +655,7 @@ fn missing_metadata_hint(filter: &Document) -> Option<Hint> {
     has_missing.then(|| Hint::Name(super::schema::RESOURCES_MISSING_INDEX.to_owned()))
 }
 
-fn missing_resource_condition(name: &str) -> Document {
+pub(super) fn missing_resource_condition(name: &str) -> Document {
     doc! { "$or": [
         { "missing_params": name },
         { "missing_params": { "$exists": false } },
@@ -970,6 +972,8 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
         let Some(timeout) = self
             .config()
             .search_timeout_ms
@@ -985,6 +989,8 @@ impl SearchProvider for MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
         let Some(timeout) = self
             .config()
             .search_timeout_ms
@@ -1037,6 +1043,7 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
+        let missing_support = self.classify_missing(tenant_id, &query.resource_type, query);
 
         let cursor = if let Some(cursor_str) = &query.cursor {
             Some(PageCursor::decode(cursor_str).map_err(|_| {
@@ -1078,7 +1085,14 @@ impl MongoBackend {
             }
             self.build_sort_document(query, previous_mode)?;
             let total = self
-                .count_standard_with_facts(tenant, query, facts.count_selection(), &mut probe_facts)
+                .count_standard_with_facts(
+                    tenant,
+                    &db,
+                    query,
+                    &missing_support,
+                    facts.count_selection(),
+                    &mut probe_facts,
+                )
                 .await?;
             probe_facts.record();
             return Ok(
@@ -1095,6 +1109,7 @@ impl MongoBackend {
                 &db,
                 tenant_id,
                 query,
+                &missing_support,
                 execution.filter_purpose,
                 execution.page_policy,
                 index_cursor_filter.as_ref(),
@@ -1102,7 +1117,7 @@ impl MongoBackend {
             )
             .await?;
         let (filter_plan, matched_ids) = self
-            .plan_or_matching_ids(&db, tenant_id, query, filter_plan)
+            .plan_or_matching_ids(&db, tenant_id, query, &missing_support, filter_plan)
             .await?;
         record_filter_strategy(
             "filter_strategy",
@@ -1153,6 +1168,7 @@ impl MongoBackend {
                 .search_param_sorted(
                     tenant,
                     query,
+                    &missing_support,
                     &db,
                     tenant_id,
                     matched_ids,
@@ -1169,6 +1185,7 @@ impl MongoBackend {
             tenant_id,
             &query.resource_type,
             query,
+            &missing_support,
             matched_ids.as_ref(),
             None,
         )?;
@@ -1193,6 +1210,7 @@ impl MongoBackend {
                 &db,
                 tenant_id,
                 query,
+                &missing_support,
                 plan,
                 scope_filter,
                 cursor_condition,
@@ -1206,7 +1224,14 @@ impl MongoBackend {
                 internal_error("Batched page requires an ID sort direction".to_owned())
             })?;
             let match_filter = if combine_total {
-                self.build_resource_filter(tenant_id, &query.resource_type, query, None, None)?
+                self.build_resource_filter(
+                    tenant_id,
+                    &query.resource_type,
+                    query,
+                    &missing_support,
+                    None,
+                    None,
+                )?
             } else {
                 filter.clone()
             };
@@ -1269,7 +1294,7 @@ impl MongoBackend {
                 ));
             }
             let source = db.collection::<Document>(collection);
-            let cursor = search_plan::with_hint_fallback(hint, |hint| {
+            let cursor = with_hint_fallback(hint, |hint| {
                 let aggregate = source.aggregate(pipeline.clone()).allow_disk_use(true);
                 match hint {
                     Some(hint) => aggregate.hint(hint),
@@ -1334,7 +1359,9 @@ impl MongoBackend {
             Some(
                 self.count_standard_with_facts(
                     tenant,
+                    &db,
                     query,
+                    &missing_support,
                     facts.count_selection(),
                     &mut probe_facts,
                 )
@@ -1626,50 +1653,123 @@ fn contained_composite_value_stages(
     Ok(first)
 }
 
-impl MongoBackend {
-    fn supports_indexed_missing(
-        &self,
-        tenant_id: &str,
-        resource_type: &str,
-        param: &SearchParameter,
-    ) -> bool {
-        // Until `idx_resources_missing_params` is built (#2001) every
-        // parameter takes the value-index route, as an unsupported one does:
-        // same results, no full `resources` scan, and no hint naming an
-        // index that does not exist yet.
-        if !self.missing_params_index_ready() {
-            return false;
-        }
-        let registry = self.tenant_registry(tenant_id);
-        let definition = {
-            let registry = registry.read();
-            registry.get_param(resource_type, &param.name).or_else(|| {
-                helios_fhir::search::ABSTRACT_BASE_TYPES
-                    .iter()
-                    .find_map(|base| registry.get_param(base, &param.name))
-            })
-        };
-        definition.is_some_and(|definition| {
-            definition.param_type == param.param_type
-                && self
-                    .tenant_extractor(tenant_id)
-                    .supports_missing(resource_type, &definition)
-        })
+/// Whether `missing_params` records `name` when absent. `_id` and
+/// `_lastUpdated` live on every resource document and `:missing` on them
+/// never reads the array, so recording them would only add index keys
+/// (#2006).
+pub(super) fn records_missing_metadata(name: &str) -> bool {
+    !matches!(name, "_id" | "_lastUpdated")
+}
+
+/// Which `:missing` parameters of one query `missing_params` answers.
+///
+/// Classified once per query by [`MongoBackend::classify_missing`] and passed
+/// through planning and execution, so every stage reads the same answer: one
+/// registry read and one extractor per query instead of one per check, and a
+/// registry reload mid-query cannot make the planner and the executor
+/// disagree (#2007). The set holds the `(name, type)` pairs that pass both
+/// the definition check and the pre-search freshness probe for the resource
+/// type (#1999).
+#[derive(Debug, Clone, Default)]
+pub(super) struct MissingSupport {
+    indexed: HashSet<(String, SearchParamType)>,
+}
+
+impl MissingSupport {
+    /// For a query with no `:missing` parameter, or one whose parameters are
+    /// all `_id` / `_lastUpdated`: nothing is answered from `missing_params`.
+    pub(super) fn none() -> Self {
+        Self::default()
     }
 
-    fn is_missing_resource_parameter(
-        &self,
-        tenant_id: &str,
-        resource_type: &str,
-        param: &SearchParameter,
-    ) -> bool {
-        !matches!(param.name.as_str(), "_id" | "_lastUpdated")
+    /// Whether `param`'s `:missing` is answered from `missing_params`, for
+    /// either value.
+    pub(super) fn supports(&self, param: &SearchParameter) -> bool {
+        self.indexed
+            .contains(&(param.name.clone(), param.param_type))
+    }
+
+    /// Whether `param` is a `:missing=true` that `missing_params` answers on
+    /// the resource document.
+    pub(super) fn is_resource_parameter(&self, param: &SearchParameter) -> bool {
+        records_missing_metadata(&param.name)
             && matches!(param.modifier, Some(SearchModifier::Missing))
             && param
                 .values
                 .first()
                 .is_some_and(|value| value.value == "true")
-            && self.supports_indexed_missing(tenant_id, resource_type, param)
+            && self.supports(param)
+    }
+}
+
+/// True when the query carries a predicate that lives on the resource
+/// document rather than in the search index.
+fn has_resource_level_params(query: &SearchQuery, missing_support: &MissingSupport) -> bool {
+    query.parameters.iter().any(|p| {
+        matches!(p.name.as_str(), "_id" | "_lastUpdated")
+            || missing_support.is_resource_parameter(p)
+    })
+}
+
+impl MongoBackend {
+    /// Classifies `query`'s `:missing` parameters against `resource_type` once.
+    pub(super) fn classify_missing(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        query: &SearchQuery,
+    ) -> MissingSupport {
+        // Until `idx_resources_missing_params` is built (#2001) every
+        // parameter takes the value-index route, as an unsupported one does:
+        // same results, no full `resources` scan, and no hint naming an
+        // index that does not exist yet.
+        if !self.missing_params_index_ready() {
+            return MissingSupport::none();
+        }
+        let params: Vec<&SearchParameter> = query
+            .parameters
+            .iter()
+            .filter(|param| matches!(param.modifier, Some(SearchModifier::Missing)))
+            .collect();
+        if params.is_empty() {
+            return MissingSupport::none();
+        }
+        let definitions: Vec<_> = {
+            let registry = self.tenant_registry(tenant_id);
+            let registry = registry.read();
+            params
+                .into_iter()
+                .filter_map(|param| {
+                    registry
+                        .get_param(resource_type, &param.name)
+                        .or_else(|| {
+                            helios_fhir::search::ABSTRACT_BASE_TYPES
+                                .iter()
+                                .find_map(|base| registry.get_param(base, &param.name))
+                        })
+                        .filter(|definition| definition.param_type == param.param_type)
+                        .map(|definition| (param, definition))
+                })
+                .collect()
+        };
+        if definitions.is_empty() {
+            return MissingSupport::none();
+        }
+        // Only parameters the pre-search probe found fresh (#1999).
+        let Some(freshness) = self.missing_freshness(tenant_id, resource_type) else {
+            return MissingSupport::none();
+        };
+        let extractor = self.tenant_extractor(tenant_id);
+        MissingSupport {
+            indexed: definitions
+                .into_iter()
+                .filter(|(param, definition)| {
+                    freshness.allows(&param.name)
+                        && extractor.supports_missing(resource_type, definition)
+                })
+                .map(|(param, _)| (param.name.clone(), param.param_type))
+                .collect(),
+        }
     }
 
     /// Chooses between `plan` and the candidate id set. `IndexIntersection`
@@ -1682,6 +1782,7 @@ impl MongoBackend {
         db: &mongodb::Database,
         tenant_id: &str,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
         plan: Option<SearchFilterPlan>,
     ) -> StorageResult<(Option<SearchFilterPlan>, Option<HashSet<String>>)> {
         match plan {
@@ -1690,14 +1791,15 @@ impl MongoBackend {
             // ID set; ordinary type scans retain the upstream selection below.
             Some(plan)
                 if !plan.scans_type()
-                    || query.parameters.iter().any(|param| {
-                        self.is_missing_resource_parameter(tenant_id, &query.resource_type, param)
-                    }) =>
+                    || query
+                        .parameters
+                        .iter()
+                        .any(|param| missing_support.is_resource_parameter(param)) =>
             {
                 Ok((Some(plan), None))
             }
             plan => match self
-                .matching_resource_ids(db, tenant_id, &query.resource_type, query)
+                .matching_resource_ids(db, tenant_id, &query.resource_type, query, missing_support)
                 .await
             {
                 // Complement sets are not capped while they are collected;
@@ -1714,17 +1816,17 @@ impl MongoBackend {
         }
     }
 
-    /// Serves a resource-order page. The first batch decides: a complete page
-    /// returns, a dense one finishes the scan, and a sparse one comes from the
-    /// capped id set instead of reading most of the type for a few rows. Pages
-    /// with `:missing` or `:not` conditions keep scanning, because their id set
-    /// is collected uncapped; the scan also resumes when the set is too large.
+    /// Serves a resource-order page. Dense pages keep scanning; sparse positive
+    /// pages first continue within a fixed candidate budget, then try the capped
+    /// ID set if still incomplete. Pages with `:missing` or `:not` keep scanning
+    /// because their ID set is uncapped; oversized ID sets also resume the scan.
     #[allow(clippy::too_many_arguments)]
     async fn resource_order_page(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
         plan: search_plan::ResourceBatchPlan,
         scope_filter: Document,
         cursor_condition: Option<Document>,
@@ -1752,32 +1854,40 @@ impl MongoBackend {
                 run.finish(db).await?
             }
             search_plan::ResourcePageSample::Sparse { live_matches } => {
-                match self.sparse_page_id_set(db, tenant_id, query).await? {
-                    Some(id_set) => {
-                        search_plan::record_resource_page_fallback(live_matches, id_set.len());
-                        let filter = with_cursor_condition(
-                            self.build_resource_filter(
-                                tenant_id,
-                                &query.resource_type,
-                                query,
-                                Some(&id_set),
-                                None,
-                            )?,
-                            cursor_condition,
-                        );
-                        return collect_documents(
-                            resources
-                                .find(filter)
-                                .search_deadline()?
-                                .sort(sort)
-                                .skip(u64::from(offset))
-                                .limit((page_size + 1) as i64)
-                                .await
-                                .or_query_error("Failed to fetch resource-filtered page")?,
-                        )
-                        .await;
+                if let Some(ids) = run.try_finish_sparse_page(db).await? {
+                    ids
+                } else {
+                    match self
+                        .sparse_page_id_set(db, tenant_id, query, missing_support)
+                        .await?
+                    {
+                        Some(id_set) => {
+                            run.record_fallback(live_matches, id_set.len());
+                            let filter = with_cursor_condition(
+                                self.build_resource_filter(
+                                    tenant_id,
+                                    &query.resource_type,
+                                    query,
+                                    missing_support,
+                                    Some(&id_set),
+                                    None,
+                                )?,
+                                cursor_condition,
+                            );
+                            return collect_documents(
+                                resources
+                                    .find(filter)
+                                    .search_deadline()?
+                                    .sort(sort)
+                                    .skip(u64::from(offset))
+                                    .limit((page_size + 1) as i64)
+                                    .await
+                                    .or_query_error("Failed to fetch resource-filtered page")?,
+                            )
+                            .await;
+                        }
+                        None => run.finish(db).await?,
                     }
-                    None => run.finish(db).await?,
                 }
             }
         };
@@ -1803,9 +1913,10 @@ impl MongoBackend {
         db: &mongodb::Database,
         tenant_id: &str,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
     ) -> StorageResult<Option<HashSet<String>>> {
         match self
-            .matching_resource_ids(db, tenant_id, &query.resource_type, query)
+            .matching_resource_ids(db, tenant_id, &query.resource_type, query, missing_support)
             .await
         {
             Ok(Some(ids)) if search_plan::id_set_fits_a_page_filter(&ids) => Ok(Some(ids)),
@@ -1857,8 +1968,11 @@ impl MongoBackend {
     ) -> StorageResult<u64> {
         let selection = self.execution_facts(query).count_selection();
         let mut facts = ProbeFacts::default();
+        let db = self.get_database().await?;
+        let missing_support =
+            self.classify_missing(tenant.tenant_id().as_str(), &query.resource_type, query);
         let result = self
-            .count_standard_with_facts(tenant, query, selection, &mut facts)
+            .count_standard_with_facts(tenant, &db, query, &missing_support, selection, &mut facts)
             .await;
         facts.record();
         result
@@ -1868,19 +1982,21 @@ impl MongoBackend {
     async fn count_standard_with_facts(
         &self,
         tenant: &TenantContext,
+        db: &mongodb::Database,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
         selection: BatchSelection,
         facts: &mut ProbeFacts,
     ) -> StorageResult<u64> {
-        let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
 
         let filter_plan = self
             .resource_filter_plan(
-                &db,
+                db,
                 tenant_id,
                 query,
+                missing_support,
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
                 None,
@@ -1888,7 +2004,7 @@ impl MongoBackend {
             )
             .await?;
         let (filter_plan, matched_ids) = self
-            .plan_or_matching_ids(&db, tenant_id, query, filter_plan)
+            .plan_or_matching_ids(db, tenant_id, query, missing_support, filter_plan)
             .await?;
         record_filter_strategy(
             "total_filter_strategy",
@@ -1900,6 +2016,7 @@ impl MongoBackend {
             tenant_id,
             &query.resource_type,
             query,
+            missing_support,
             matched_ids.as_ref(),
             None,
         )?;
@@ -1911,7 +2028,7 @@ impl MongoBackend {
                 BatchSelection::EstimatedCount => "index_estimate",
                 _ => "exact_batches",
             });
-            return Ok(plan.execute(&db, filter, None, selection).await?.count);
+            return Ok(plan.execute(db, filter, None, selection).await?.count);
         }
         if let Some(plan) = filter_plan {
             record_total_strategy("exact_aggregation");
@@ -1922,7 +2039,7 @@ impl MongoBackend {
             } = plan.pipeline(filter, None, None)?;
             pipeline.push(doc! { "$count": "total" });
             let source = db.collection::<Document>(collection);
-            let cursor = search_plan::with_hint_fallback(hint, |hint| {
+            let cursor = with_hint_fallback(hint, |hint| {
                 let aggregate = source.aggregate(pipeline.clone()).allow_disk_use(true);
                 match hint {
                     Some(hint) => aggregate.hint(hint),
@@ -2074,13 +2191,22 @@ impl MongoBackend {
                 // just the current top-level page, so the contained pipeline
                 // can discard overlaps before its offset and count stages.
                 let top_filter = if query.contained_return == ContainedReturn::Container {
+                    let missing_support =
+                        self.classify_missing(tenant_id, contained_type, &top_query);
                     let matched_ids = self
-                        .matching_resource_ids(&db, tenant_id, contained_type, &top_query)
+                        .matching_resource_ids(
+                            &db,
+                            tenant_id,
+                            contained_type,
+                            &top_query,
+                            &missing_support,
+                        )
                         .await?;
                     Some(self.build_resource_filter(
                         tenant_id,
                         contained_type,
                         &top_query,
+                        &missing_support,
                         matched_ids.as_ref(),
                         None,
                     )?)
@@ -2675,6 +2801,7 @@ impl MongoBackend {
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
         db: &mongodb::Database,
         tenant_id: &str,
         matched_ids: Option<HashSet<String>>,
@@ -2690,12 +2817,26 @@ impl MongoBackend {
         let allowed: Option<HashSet<String>> = match matched_ids {
             Some(set) if set.is_empty() => Some(set),
             Some(set) => Some(
-                self.resource_level_ids(db, tenant_id, &query.resource_type, query, Some(&set))
-                    .await?,
+                self.resource_level_ids(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    query,
+                    missing_support,
+                    Some(&set),
+                )
+                .await?,
             ),
-            None if self.has_resource_level_params(tenant_id, query) => Some(
-                self.resource_level_ids(db, tenant_id, &query.resource_type, query, None)
-                    .await?,
+            None if has_resource_level_params(query, missing_support) => Some(
+                self.resource_level_ids(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    query,
+                    missing_support,
+                    None,
+                )
+                .await?,
             ),
             None => None,
         };
@@ -2733,6 +2874,7 @@ impl MongoBackend {
             tenant_id,
             &query.resource_type,
             query,
+            missing_support,
             Some(&id_set),
             None,
         )?;
@@ -2807,15 +2949,6 @@ impl MongoBackend {
         })
     }
 
-    /// True when the query carries a predicate that lives on the resource
-    /// document rather than in the search index.
-    fn has_resource_level_params(&self, tenant_id: &str, query: &SearchQuery) -> bool {
-        query.parameters.iter().any(|p| {
-            matches!(p.name.as_str(), "_id" | "_lastUpdated")
-                || self.is_missing_resource_parameter(tenant_id, &query.resource_type, p)
-        })
-    }
-
     /// Ids of the live resources that satisfy the resource-level predicates
     /// (`_id`, `_lastUpdated`) within `matched_ids` — also the liveness
     /// filter for every filtered parameter sort. This is the same predicate
@@ -2827,10 +2960,17 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
         matched_ids: Option<&HashSet<String>>,
     ) -> StorageResult<HashSet<String>> {
-        let filter =
-            self.build_resource_filter(tenant_id, resource_type, query, matched_ids, None)?;
+        let filter = self.build_resource_filter(
+            tenant_id,
+            resource_type,
+            query,
+            missing_support,
+            matched_ids,
+            None,
+        )?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let cursor = resources
             .find(filter)
@@ -3048,6 +3188,7 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
     ) -> StorageResult<Option<HashSet<String>>> {
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
 
@@ -3192,6 +3333,7 @@ impl MongoBackend {
                 }
                 return self
                     .seeded_matching_resource_ids(
+                        db,
                         &search_index,
                         tenant_id,
                         resource_type,
@@ -3199,6 +3341,7 @@ impl MongoBackend {
                         &HashMap::new(),
                         &missing,
                         &not_params,
+                        missing_support,
                         compartment,
                         seed,
                     )
@@ -3213,6 +3356,7 @@ impl MongoBackend {
                     resource_type,
                     &missing,
                     &not_params,
+                    missing_support,
                     query,
                 )
                 .await;
@@ -3236,11 +3380,13 @@ impl MongoBackend {
                 };
             }
         }
-        let normal_filter = |i: usize| -> StorageResult<Document> {
-            match identifier_filters.get(&i) {
-                Some(filter) => Ok(filter.clone()),
-                None => self.build_search_index_filter(tenant_id, resource_type, normal[i]),
-            }
+        let normal_predicate = |i: usize| -> StorageResult<(Document, PredicateAccess)> {
+            let filter = match identifier_filters.get(&i) {
+                Some(filter) => filter.clone(),
+                None => self.build_search_index_filter(tenant_id, resource_type, normal[i])?,
+            };
+            let access = PredicateAccess::new(&filter, normal[i], self.search_indexes_ready());
+            Ok((filter, access))
         };
 
         // #1206: a composite's probe must run over its component filters
@@ -3282,13 +3428,18 @@ impl MongoBackend {
             // one query per 512-id chunk even when the sibling parameter is
             // far more selective).
             (Some(seed), true) => {
-                let filter = normal_filter(0)?;
-                let count = search_index
-                    .count_documents(filter)
-                    .search_deadline()?
-                    .limit(seed.len() as u64 + 1)
-                    .await
-                    .or_query_error("Failed to probe search_index against the _id seed")?;
+                let (filter, access) = normal_predicate(0)?;
+                let count = with_hint_fallback(access.discovery_hint(), |hint| {
+                    let probe = search_index
+                        .count_documents(filter.clone())
+                        .limit(seed.len() as u64 + 1);
+                    match hint {
+                        Some(hint) => probe.hint(hint),
+                        None => probe,
+                    }
+                })
+                .await?
+                .or_query_error("Failed to probe search_index against the _id seed")?;
                 if count == 0 {
                     return Ok(Some(HashSet::new()));
                 }
@@ -3357,13 +3508,18 @@ impl MongoBackend {
                             }
                         }
                     } else {
-                        let filter = normal_filter(i)?;
-                        let count = search_index
-                            .count_documents(filter)
-                            .search_deadline()?
-                            .limit(probe_limit)
-                            .await
-                            .or_query_error("Failed to probe search_index for driver selection")?;
+                        let (filter, access) = normal_predicate(i)?;
+                        let count = with_hint_fallback(access.discovery_hint(), |hint| {
+                            let probe = search_index
+                                .count_documents(filter.clone())
+                                .limit(probe_limit);
+                            match hint {
+                                Some(hint) => probe.hint(hint),
+                                None => probe,
+                            }
+                        })
+                        .await?
+                        .or_query_error("Failed to probe search_index for driver selection")?;
                         if count == 0 {
                             return Ok(Some(HashSet::new()));
                         }
@@ -3385,6 +3541,7 @@ impl MongoBackend {
                 let seed = id_seed.expect("Driver::Seed implies a positive _id seed");
                 return self
                     .seeded_matching_resource_ids(
+                        db,
                         &search_index,
                         tenant_id,
                         resource_type,
@@ -3392,6 +3549,7 @@ impl MongoBackend {
                         &identifier_filters,
                         &missing,
                         &not_params,
+                        missing_support,
                         compartment,
                         seed,
                     )
@@ -3404,18 +3562,24 @@ impl MongoBackend {
         // result cached, so `driver_idx` pointing at a composite always finds
         // an entry here; a plain param never has one and falls through to
         // the ordinary per-value filter builder.
-        let driver_filter = if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
-            filter
-        } else {
-            normal_filter(driver_idx)?
-        };
+        let (driver_filter, access) =
+            if let Some((filter, _)) = composite_probes.remove(&driver_idx) {
+                (filter, PredicateAccess::default())
+            } else {
+                normal_predicate(driver_idx)?
+            };
 
-        let mut driver_cursor = search_index
-            .find(driver_filter)
-            .search_deadline()?
-            .projection(doc! { "resource_id": 1, "_id": 0 })
-            .await
-            .or_query_error("Failed to open driver cursor")?;
+        let mut driver_cursor = with_hint_fallback(access.discovery_hint(), |hint| {
+            let find = search_index
+                .find(driver_filter.clone())
+                .projection(doc! { "resource_id": 1, "_id": 0 });
+            match hint {
+                Some(hint) => find.hint(hint),
+                None => find,
+            }
+        })
+        .await?
+        .or_query_error("Failed to open driver cursor")?;
 
         let mut confirmed: HashSet<String> = HashSet::new();
 
@@ -3445,6 +3609,7 @@ impl MongoBackend {
 
             let candidates = self
                 .retain_matching_candidates(
+                    db,
                     &search_index,
                     tenant_id,
                     resource_type,
@@ -3452,9 +3617,9 @@ impl MongoBackend {
                     &identifier_filters,
                     &missing,
                     &not_params,
+                    missing_support,
                     compartment,
                     Some(driver_idx),
-                    false,
                     candidates,
                 )
                 .await?;
@@ -3476,31 +3641,14 @@ impl MongoBackend {
         Ok(Some(confirmed))
     }
 
-    /// The per-batch body every check in `matching_resource_ids` shares:
-    /// intersects `candidates` against every normal parameter other than
-    /// `skip_idx` (already proven by whichever cursor selected them — a
-    /// normal parameter's driver cursor, or a chunk of the `_id` seed),
-    /// every `:missing`/`:not` parameter, and the compartment membership
-    /// filter, bounded to `candidates` throughout.
-    ///
-    /// `hint` selects the query shape (#1528): `false` reproduces exactly
-    /// the unhinted `distinct` shape every driver-selected normal parameter
-    /// has used since #1040/#1083. That shape is left unchanged here by
-    /// scope decision — the driver path itself is out of scope for this fix
-    /// and stays as today pending a follow-up, not because there is nothing
-    /// for the planner to get wrong. `true` is used only when the `_id` seed
-    /// itself drives (`seeded_matching_resource_ids`): `distinct` cannot take
-    /// a hint, and this same shape — a candidate chunk checked against a
-    /// sibling predicate — measured 1,655,936 keys examined unhinted against
-    /// 8,191 hinted onto `idx_search_composite`, against the real
-    /// 11.2M-resource corpus (#999) — so this shape lifts
-    /// `tenant_id`/`resource_type`/`resource_id: {"$in": …}` to the top
-    /// level (required so the date `$or` shape from `scoped_date_alternatives`
-    /// still has a fully-bound prefix in every arm) and hints
-    /// `idx_search_composite` explicitly.
+    /// Checks a bounded batch using the same membership access as batched plans.
+    /// An explicit `_id` seed takes the conservative first-predicate path.
+    /// The plain driver is already proven; a composite driver still needs its
+    /// grouped pair check because its cursor proves only one component.
     #[allow(clippy::too_many_arguments)]
     async fn retain_matching_candidates(
         &self,
+        db: &mongodb::Database,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
         resource_type: &str,
@@ -3508,25 +3656,21 @@ impl MongoBackend {
         identifier_filters: &HashMap<usize, Document>,
         missing: &[&SearchParameter],
         not_params: &[&SearchParameter],
+        missing_support: &MissingSupport,
         compartment: Option<&CompartmentMembership>,
         skip_idx: Option<usize>,
-        hint: bool,
         mut candidates: HashSet<String>,
     ) -> StorageResult<HashSet<String>> {
         search_deadline::check()?;
+        let source = if skip_idx.is_some() {
+            CandidateSource::IndexedPredicate
+        } else {
+            CandidateSource::Unfiltered
+        };
         for (i, param) in normal.iter().enumerate() {
             if candidates.is_empty() {
-                continue;
+                break;
             }
-            // A composite's driver arm only proves ONE component matched
-            // (its most selective one) — every composite in `normal`,
-            // including the driver, still needs the grouped pair check to
-            // confirm every component matched within the same
-            // `composite_group` (#1206). This already queries `find` bounded
-            // to `candidates`, never `distinct`, but (#1528 review finding 5)
-            // still takes the same `idx_search_composite` hint as every other
-            // check here when `hint` is set, for the same planner-risk reason
-            // (#999) documented on this function's `hint` parameter.
             if param.param_type == SearchParamType::Composite {
                 let passing = self
                     .composite_pair_check(
@@ -3535,7 +3679,7 @@ impl MongoBackend {
                         resource_type,
                         param,
                         &candidates,
-                        hint.then_some(SEARCH_COMPOSITE_INDEX),
+                        Some(SEARCH_COMPOSITE_INDEX),
                         None,
                     )
                     .await?;
@@ -3545,223 +3689,81 @@ impl MongoBackend {
             if Some(i) == skip_idx {
                 continue;
             }
-            let param_filter = match identifier_filters.get(&i) {
+            let filter = match identifier_filters.get(&i) {
                 Some(filter) => filter.clone(),
                 None => self.build_search_index_filter(tenant_id, resource_type, param)?,
             };
-            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-            let passing: HashSet<String> = if hint {
-                let bounded = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": candidate_ids },
-                    "$and": [ param_filter ],
-                };
-                let cursor = search_index
-                    .find(bounded)
-                    .search_deadline()?
-                    .projection(doc! { "resource_id": 1, "_id": 0 })
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error("Failed to intersect search_index against the _id seed")?;
-                collect_documents(cursor)
-                    .await?
-                    .into_iter()
-                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
-                    .collect()
-            } else {
-                let bounded = doc! {
-                    "$and": [
-                        param_filter,
-                        { "resource_id": { "$in": candidate_ids } }
-                    ]
-                };
-                search_index
-                    .distinct("resource_id", bounded)
-                    .search_deadline()?
-                    .await
-                    .or_query_error("Failed to intersect search_index")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect()
-            };
+            let access = PredicateAccess::new(&filter, param, self.search_indexes_ready());
+            let passing = matching_index_ids(
+                search_index,
+                &candidates,
+                &filter,
+                source.membership_hint(access, i),
+            )
+            .await?;
             candidates.retain(|id| passing.contains(id));
         }
 
-        // :missing — check per batch against surviving candidates.
         for param in missing {
             if candidates.is_empty() {
                 break;
             }
-            if self.is_missing_resource_parameter(tenant_id, resource_type, param) {
-                let db = self.get_database().await?;
+            if missing_support.is_resource_parameter(param) {
                 candidates = self
-                    .metadata_missing_ids(&db, tenant_id, resource_type, param, Some(&candidates))
+                    .metadata_missing_ids(
+                        db,
+                        tenant_id,
+                        resource_type,
+                        param,
+                        Some(&candidates),
+                        None,
+                    )
                     .await?;
                 continue;
             }
             let wants_missing = param
                 .values
                 .first()
-                .map(|v| v.value == "true")
-                .unwrap_or(false);
-            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-            let with_entry: HashSet<String> = if hint {
-                let bounded = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": candidate_ids },
-                    "$and": [missing_presence_filter(tenant_id, resource_type, param)],
-                };
-                let cursor = search_index
-                    .find(bounded)
-                    .search_deadline()?
-                    .projection(doc! { "resource_id": 1, "_id": 0 })
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error("Failed to check :missing against the _id seed")?;
-                collect_documents(cursor)
-                    .await?
-                    .into_iter()
-                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
-                    .collect()
-            } else {
-                search_index
-                    .distinct(
-                        "resource_id",
-                        doc! {
-                            "tenant_id": tenant_id,
-                            "resource_type": resource_type,
-                            "resource_id": { "$in": candidate_ids },
-                            "$and": [missing_presence_filter(tenant_id, resource_type, param)],
-                        },
-                    )
-                    .search_deadline()?
-                    .await
-                    .or_query_error("Failed to check :missing")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect()
-            };
-            if wants_missing {
-                candidates.retain(|id| !with_entry.contains(id));
-            } else {
-                candidates.retain(|id| with_entry.contains(id));
-            }
+                .is_some_and(|value| value.value == "true");
+            let with_entry = matching_index_ids(
+                search_index,
+                &candidates,
+                &missing_presence_filter(tenant_id, resource_type, param),
+                Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned())),
+            )
+            .await?;
+            candidates.retain(|id| with_entry.contains(id) != wants_missing);
         }
 
-        // :not — per the spec, includes resources with no value for the
-        // parameter at all (#881). Check per batch against surviving candidates.
+        // :not includes resources with no value for the parameter.
         for param in not_params {
             if candidates.is_empty() {
                 break;
             }
             let mut positive = (*param).clone();
             positive.modifier = None;
-            let pos_filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
-            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-            let matching: HashSet<String> = if hint {
-                let bounded = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": candidate_ids },
-                    "$and": [ pos_filter ],
-                };
-                let cursor = search_index
-                    .find(bounded)
-                    .search_deadline()?
-                    .projection(doc! { "resource_id": 1, "_id": 0 })
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error("Failed to check :not against the _id seed")?;
-                collect_documents(cursor)
-                    .await?
-                    .into_iter()
-                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
-                    .collect()
-            } else {
-                let bounded = doc! {
-                    "$and": [
-                        pos_filter,
-                        { "resource_id": { "$in": candidate_ids } }
-                    ]
-                };
-                search_index
-                    .distinct("resource_id", bounded)
-                    .search_deadline()?
-                    .await
-                    .or_query_error("Failed to check :not")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect()
-            };
+            let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+            let matching = matching_index_ids(
+                search_index,
+                &candidates,
+                &filter,
+                Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned())),
+            )
+            .await?;
             candidates.retain(|id| !matching.contains(id));
         }
 
-        // Compartment — checked per batch against surviving candidates.
         if let Some(comp) = compartment
             && !candidates.is_empty()
         {
-            let base = strip_reference_version(&comp.reference);
-            let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
-            let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-            let in_comp: HashSet<String> = if hint {
-                let bounded = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": candidate_ids },
-                    "param_name": { "$in": Bson::Array(params) },
-                    "$or": [
-                        { "value_reference": &base },
-                        { "value_reference": {
-                            "$regex": format!("^{}/_history/", regex_escape(base))
-                        }},
-                    ],
-                };
-                let cursor = search_index
-                    .find(bounded)
-                    .search_deadline()?
-                    .projection(doc! { "resource_id": 1, "_id": 0 })
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error(
-                        "Failed to check compartment membership against the _id seed",
-                    )?;
-                collect_documents(cursor)
-                    .await?
-                    .into_iter()
-                    .filter_map(|d| d.get_str("resource_id").ok().map(ToString::to_string))
-                    .collect()
-            } else {
-                let comp_filter = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "param_name": { "$in": Bson::Array(params) },
-                    "resource_id": { "$in": candidate_ids },
-                    "$or": [
-                        { "value_reference": &base },
-                        { "value_reference": {
-                            "$regex": format!("^{}/_history/", regex_escape(base))
-                        }},
-                    ],
-                };
-                search_index
-                    .distinct("resource_id", comp_filter)
-                    .search_deadline()?
-                    .await
-                    .or_query_error("Failed to check compartment membership")?
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(ToString::to_string))
-                    .collect()
-            };
+            let filter = compartment_membership_filter(tenant_id, resource_type, comp);
+            let in_comp = matching_index_ids(
+                search_index,
+                &candidates,
+                &filter,
+                Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned())),
+            )
+            .await?;
             candidates.retain(|id| in_comp.contains(id));
         }
 
@@ -3773,13 +3775,14 @@ impl MongoBackend {
     /// `_id=X&code:missing=true`, a compartment-only query — `normal` is
     /// `&[]` there) and when the driver competition in `matching_resource_ids`
     /// picks it over every normal parameter's own probe. Every check runs in
-    /// chunks of `CANDIDATE_BATCH_SIZE`, hinted onto `idx_search_composite`
-    /// (see `retain_matching_candidates`), so a seed of hundreds of thousands
-    /// of ids — realistic once a chain, `_has` or `_list` resolves to one
-    /// (#1528) — never falls back to an unindexed scan.
+    /// chunks of `CANDIDATE_BATCH_SIZE`. The first predicate uses candidate-ID
+    /// access; later eligible tokens share the batched planner's value-index
+    /// policy. Every check stays bounded to that chunk, even for a large seed
+    /// resolved by a chain, `_has` or `_list`.
     #[allow(clippy::too_many_arguments)]
     async fn seeded_matching_resource_ids(
         &self,
+        db: &mongodb::Database,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
         resource_type: &str,
@@ -3787,6 +3790,7 @@ impl MongoBackend {
         identifier_filters: &HashMap<usize, Document>,
         missing: &[&SearchParameter],
         not_params: &[&SearchParameter],
+        missing_support: &MissingSupport,
         compartment: Option<&CompartmentMembership>,
         seed: HashSet<String>,
     ) -> StorageResult<HashSet<String>> {
@@ -3798,6 +3802,7 @@ impl MongoBackend {
             let candidates: HashSet<String> = chunk.iter().map(|id| (*id).clone()).collect();
             let candidates = self
                 .retain_matching_candidates(
+                    db,
                     search_index,
                     tenant_id,
                     resource_type,
@@ -3805,9 +3810,9 @@ impl MongoBackend {
                     identifier_filters,
                     missing,
                     not_params,
+                    missing_support,
                     compartment,
                     None,
-                    true,
                     candidates,
                 )
                 .await?;
@@ -3834,6 +3839,7 @@ impl MongoBackend {
         resource_type: &str,
         missing: &[&SearchParameter],
         not_params: &[&SearchParameter],
+        missing_support: &MissingSupport,
         query: &SearchQuery,
     ) -> StorageResult<Option<HashSet<String>>> {
         let has_compartment = query
@@ -3843,9 +3849,16 @@ impl MongoBackend {
         let mut matched: Option<HashSet<String>> = None;
 
         for param in missing {
-            if self.is_missing_resource_parameter(tenant_id, resource_type, param) {
+            if missing_support.is_resource_parameter(param) {
                 let ids = self
-                    .metadata_missing_ids(db, tenant_id, resource_type, param, matched.as_ref())
+                    .metadata_missing_ids(
+                        db,
+                        tenant_id,
+                        resource_type,
+                        param,
+                        matched.as_ref(),
+                        None,
+                    )
                     .await?;
                 matched = Some(ids);
                 continue;
@@ -3943,13 +3956,14 @@ impl MongoBackend {
         ))
     }
 
-    async fn metadata_missing_ids(
+    pub(super) async fn metadata_missing_ids(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         param: &SearchParameter,
         candidates: Option<&HashSet<String>>,
+        session: Option<&mut mongodb::ClientSession>,
     ) -> StorageResult<HashSet<String>> {
         let mut scope =
             doc! { "tenant_id": tenant_id, "resource_type": resource_type, "is_deleted": false };
@@ -3967,12 +3981,49 @@ impl MongoBackend {
             param,
         )));
         stages.push(doc! { "$project": { "_id": 0, "id": 1 } });
-        let cursor = db
-            .collection::<Document>(Self::RESOURCES_COLLECTION)
-            .aggregate(stages)
-            .await
-            .or_query_error("Failed to check missing resource metadata")?;
-        collect_id_set(cursor, "id").await
+        let collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        // A bounded candidate set is a few identity seeks; left to itself the
+        // planner may walk the shared `missing_params` index instead, reading
+        // every absent key of the type for each batch (#2233).
+        let options = mongodb::options::AggregateOptions::builder()
+            .hint(
+                candidates
+                    .is_some()
+                    .then(|| Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned())),
+            )
+            .build();
+        match session {
+            Some(session) => {
+                let mut cursor = collection
+                    .aggregate(stages)
+                    .with_options(options)
+                    .session(&mut *session)
+                    .await
+                    .or_query_error("Failed to check missing resource metadata")?;
+                let mut ids = HashSet::new();
+                while cursor
+                    .advance(&mut *session)
+                    .await
+                    .or_query_error("Failed to advance missing metadata cursor")?
+                {
+                    let doc = cursor.deserialize_current().map_err(|e| {
+                        internal_error(format!("Failed to deserialize missing metadata: {e}"))
+                    })?;
+                    if let Ok(id) = doc.get_str("id") {
+                        ids.insert(id.to_string());
+                    }
+                }
+                Ok(ids)
+            }
+            None => {
+                let cursor = collection
+                    .aggregate(stages)
+                    .with_options(options)
+                    .await
+                    .or_query_error("Failed to check missing resource metadata")?;
+                collect_id_set(cursor, "id").await
+            }
+        }
     }
 
     pub(super) fn build_search_index_filter(
@@ -4483,12 +4534,9 @@ impl MongoBackend {
     /// ifNoneExist matcher in `storage.rs` (with a transaction session).
     ///
     /// `hint` (#1528 review finding 5) names an index to force via
-    /// `Hint::Name` — passed as `Some("idx_search_composite")` only when this
-    /// is called from the `_id`-seeded path (`retain_matching_candidates`
-    /// with `hint: true`), where an unhinted planner risk is already measured
-    /// (#999) for this same "bounded batch check" query shape; `None`
-    /// everywhere else (the driver-path call here and the `storage.rs`
-    /// ifNoneExist call), unchanged.
+    /// `Hint::Name`. Candidate membership uses `idx_search_composite` to
+    /// seek through the bounded IDs; transactional conditional matching
+    /// retains its own access selection.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn composite_pair_check(
         &self,
@@ -5248,6 +5296,7 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         query: &SearchQuery,
+        missing_support: &MissingSupport,
         matched_ids: Option<&HashSet<String>>,
         cursor: Option<(&PageCursor, &CursorKeyset)>,
     ) -> StorageResult<Document> {
@@ -5271,7 +5320,7 @@ impl MongoBackend {
         }
 
         for param in &query.parameters {
-            if self.is_missing_resource_parameter(tenant_id, resource_type, param) {
+            if missing_support.is_resource_parameter(param) {
                 conditions.push(missing_resource_condition(&param.name));
                 continue;
             }
@@ -6856,7 +6905,7 @@ mod value_list_tests {
         });
 
         let filter = backend
-            .build_resource_filter("t1", "Patient", &query, None, None)
+            .build_resource_filter("t1", "Patient", &query, &MissingSupport::none(), None, None)
             .expect("valid filter");
 
         let and_arms = filter.get_array("$and").expect("$and array");
@@ -6900,7 +6949,7 @@ mod value_list_tests {
             });
 
         let filter = backend
-            .build_resource_filter("t1", "Patient", &query, None, None)
+            .build_resource_filter("t1", "Patient", &query, &MissingSupport::none(), None, None)
             .expect("valid filter");
 
         let and_arms = filter.get_array("$and").expect("$and array");
@@ -7499,7 +7548,7 @@ mod metadata_param_modifier_tests {
     fn condition(backend: &MongoBackend, param: SearchParameter) -> Document {
         let query = SearchQuery::new("Patient").with_parameter(param);
         let filter = backend
-            .build_resource_filter("t", "Patient", &query, None, None)
+            .build_resource_filter("t", "Patient", &query, &MissingSupport::none(), None, None)
             .expect("filter should build");
         filter.get_array("$and").expect("$and array")[1]
             .as_document()
