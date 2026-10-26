@@ -9,7 +9,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "report_html.py")
-REAL = os.path.expanduser("~/tmp/ci-bench/40335047310")
+REAL = os.environ.get("FHIR_BENCH_REAL_RUN_DIR", "")
 
 
 def k6(rps=100.0, extra=None):
@@ -274,7 +274,8 @@ class TrendAndFailures(unittest.TestCase):
         self.assertTrue(page.rstrip().endswith("</html>"))
 
 
-@unittest.skipUnless(os.path.isdir(REAL), "real CI run not downloaded")
+@unittest.skipUnless(bool(REAL) and os.path.isdir(REAL),
+                     "set FHIR_BENCH_REAL_RUN_DIR to a downloaded CI run directory")
 class RealRun(unittest.TestCase):
     def test_smoke(self):
         with tempfile.TemporaryDirectory() as t:

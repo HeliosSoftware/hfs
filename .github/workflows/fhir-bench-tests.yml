@@ -9,7 +9,7 @@ name: FHIR benchmark scripts
 # workflow-level `paths:` there would restrict the whole CI.
 #
 # stdlib unittest only; no Docker, no network, runs in about a second. The
-# real-data smoke tests read ~/tmp/ci-bench/... and skip on a clean runner.
+# real-data smoke tests read local sample data and skip on a clean runner.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -53,7 +53,7 @@ jobs:
             echo "py_compile $f"
             python3 -m py_compile "$f"
           done
-          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --break-system-packages pyyaml
           python3 - <<'PY'
           import yaml
           yaml.safe_load(open(".github/workflows/fhir-benchmark.yml"))

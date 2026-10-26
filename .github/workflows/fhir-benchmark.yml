@@ -60,7 +60,7 @@ name: FHIR Server Benchmark
 #     hfs_bulk_import, the mongo database <db>_bulk_import, or the ES index
 #     prefix hfsbulk. So crud/search, the result-size counts and the crud
 #     residue are untouched, and the bulk load starts from the same empty
-#     state import does. The per-leg indexing recipe above
+#     state import does. The per-leg indexing recipe below
 #     replaces HFS's bulk defaults; the clock runs from kick-off until the deferred
 #     search-index rebuild has finished, capped by BULK_IMPORT_TIMEOUT_S and by
 #     what is left of the leg budget; the bulk database is dropped afterwards.
@@ -93,7 +93,10 @@ name: FHIR Server Benchmark
 #
 # Two suites are HFS's own. `sql-run` (.github/scripts/fhir-bench/k6/sql-run.js,
 # 10 VUs x 1 min) runs SQL-on-FHIR ViewDefinitions (GET /$sql-run):
-# read-only, five views, never patient/group; it writes sql-run.json into the
+# read-only, five views, never patient/group. With tests=all it runs after
+# search (CANONICAL order); with an explicit tests list it runs where listed,
+# and on an empty database (no import/search before it) it returns nothing useful.
+# It writes sql-run.json into the
 # leg artifact like the other suites. The other is `insert`
 # (.github/scripts/fhir-bench/k6/insert.js, 50 VUs / 2m). It measures single-resource creates (per iteration POST
 # Patient, then four POST Observation referencing it), which crud's mixed
@@ -140,7 +143,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' = prewarm,import,crud,search,sql-run,insert,bulk-import | comma-separated from those. sql-run is HFS's own read-only SQL-on-FHIR suite (10 VUs x 1 min, five views, never patient/group). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and search-index rebuild rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,sql-run,insert' skips it"
+        description: "Suites to run: 'all' = prewarm,import,crud,search,sql-run,insert,bulk-import | comma-separated from those. sql-run is HFS's own read-only SQL-on-FHIR suite (10 VUs x 1 min, five views, never patient/group); it follows search only with 'all', and with an explicit list it runs where listed (useless on an empty database). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and search-index rebuild rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,sql-run,insert' skips it"
         required: false
         default: "all"
       vus:
@@ -315,6 +318,7 @@ jobs:
           clean: false
 
       - name: Install Rust toolchain
+        id: rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -367,6 +371,9 @@ jobs:
       # immutable, so no clash); a branch reads its own and main's caches.
       # Only target/release/{deps,build,.fingerprint} are cached, not
       # incremental/ or the linked binary. The first run per key is still cold.
+      # Key includes the rustc version (steps.rust.outputs.cachekey) so a toolchain
+      # bump gets a fresh key. This job does not run cargo-target-gc and release
+      # deps/ can be 2-3.5 GB, so key churn can evict other entries.
       - name: Cache Rust build (release)
         uses: actions/cache@v5
         with:
@@ -377,8 +384,9 @@ jobs:
             target/release/deps
             target/release/build
             target/release/.fingerprint
-          key: bench-release-${{ runner.os }}-${{ steps.features.outputs.features }}-${{ hashFiles('Cargo.lock') }}
+          key: bench-release-${{ runner.os }}-${{ steps.features.outputs.features }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            bench-release-${{ runner.os }}-${{ steps.features.outputs.features }}-${{ steps.rust.outputs.cachekey }}-
             bench-release-${{ runner.os }}-${{ steps.features.outputs.features }}-
             bench-release-${{ runner.os }}-
 
@@ -1737,7 +1745,7 @@ jobs:
           # The plan capture above runs before the load, so its idx_scan counters
           # only reflect import. This one runs after every suite, so a zero here
           # means no shape in the whole run touched that index — while every
-          # write still maintained it and it still occupied cache on an 11G host.
+          # write still maintained it and it still occupied cache on the shared Docker host.
           # Evidence for the next round of index pruning; nothing reads it in
           # this run.
           if [ "$BACKEND" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
@@ -1781,6 +1789,29 @@ jobs:
           write_containers_state
           check_leg_containers_alive
 
+      # ── Artifacts ────────────────────────────────────────────────────────
+      # Deliberately placed immediately after the suites and BEFORE the
+      # post-processing steps below. When run 30550776427's runner was killed
+      # during per-shape attribution, these steps — which sat after it — never
+      # ran, so the server log and raw results were lost precisely for the run
+      # that most needed diagnosing. Everything after this point is derived data
+      # that can be recomputed from these artifacts; the artifacts cannot be
+      # recovered from anything. Upload first, analyse second.
+      # The shape-attribution step must stay after this upload, never before it.
+      #
+      # Teardown (Diagnose backend container failure, then Stop HFS server /
+      # Stop tgz bundle server / Stop ephemeral Postgres / Stop ephemeral
+      # MongoDB / Stop ephemeral Elasticsearch / Remove SQLite database
+      # files, below) is placed right after these uploads for the same
+      # reason. On run 33515369645 the runner was
+      # lost during "Attribute search latency per query shape", so every step
+      # after it — Generate step summary, Stop HFS server, Stop tgz bundle
+      # server, Stop ephemeral Postgres — was skipped, and its containers
+      # survived 6.4 days until the next reaper caught them. Diagnose and
+      # every Stop step now run immediately after the uploads, before any
+      # post-processing step (which only reads the files already on disk), so
+      # a runner lost during any later post-processing step still leaves
+      # diagnostics captured and cleanup done.
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
@@ -1902,7 +1933,6 @@ jobs:
             rm -f "$HFS_DATABASE_URL" "$HFS_DATABASE_URL-wal" "$HFS_DATABASE_URL-shm" "$HFS_DATABASE_URL-journal"
           fi
 
-      # ── Summary ──────────────────────────────────────────────────────────
       # ── Per-query-shape attribution ──────────────────────────────────────
       # Without this the search suite reports a single aggregate latency and we
       # cannot tell which of the ~21 query shapes is slow. Produces a table sorted
@@ -2223,9 +2253,9 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
-  # errors; the Batch/Transaction Import, and Bulk Import rows name the
+  # errors; the Batch/Transaction Import and Bulk Import rows name the
   # operation each times and sit together; the Throughput table also splits
-  # Bulk Import into its ingest and index-rebuild rows right under it) and a leg-health table, so
+  # Bulk Import into its ingest and search-indexing rows right under it) and a leg-health table, so
   # a reader does not have to scroll six stacked per-leg summaries.
   # Display only: the job is continue-on-error and
   # compare_legs.py always exits 0, so it can never change the run's
