@@ -266,6 +266,54 @@ pub async fn two_puts_on_one_id_roll_back<B: BundleProvider>(backend: &B, tenant
     assert_eq!(count(backend, tenant, "Patient").await, 0);
 }
 
+/// A PUT to the id of a soft-deleted resource restores it, as the same PUT
+/// outside a Bundle does (FHIR http.html#delete): the entry answers 201, the
+/// version chain continues (create 1, delete 2, restore 3) and the resource
+/// counts as live again. Every backend used to create instead and collide with
+/// the tombstone's row, failing the whole Bundle as "already exists" (#2145).
+pub async fn put_over_a_deleted_id_restores_it<B: BundleProvider>(
+    backend: &B,
+    tenant: &TenantContext,
+) {
+    backend
+        .create(
+            tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "restored", "gender": "male"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed");
+    backend
+        .delete(tenant, "Patient", "restored")
+        .await
+        .expect("soft delete");
+
+    let result = backend
+        .process_transaction(
+            tenant,
+            vec![put(
+                "restored",
+                json!({"resourceType": "Patient", "id": "restored", "gender": "female"}),
+                None,
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the PUT restores the deleted id");
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(result.entries[0].effect.live_count_delta(), 1);
+
+    let restored = backend
+        .read(tenant, "Patient", "restored")
+        .await
+        .expect("read")
+        .expect("the restored resource is live");
+    assert_eq!(restored.version_id(), "3", "the version chain continues");
+    assert_eq!(restored.content()["gender"], "female");
+    assert_eq!(count(backend, tenant, "Patient").await, 1);
+}
+
 /// A conditional DELETE that matched nothing answers 204 but reports that
 /// nothing was deleted, so no live count moves (#1078).
 pub async fn conditional_delete_without_a_match_reports_not_found<B: BundleProvider>(

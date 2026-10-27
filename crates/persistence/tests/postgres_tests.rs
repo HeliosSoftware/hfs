@@ -31657,6 +31657,10 @@ mod postgres_integration {
         postgres_integration_changed_conditional_target_after_a_written_reference_rolls_back,
         changed_conditional_target_after_a_written_reference_rolls_back
     );
+    pg_bundle_identity_test!(
+        postgres_integration_put_over_a_deleted_id_restores_it,
+        put_over_a_deleted_id_restores_it
+    );
 
     pg_if_match_test!(
         postgres_integration_multi_valued_if_match_matches_any_member,

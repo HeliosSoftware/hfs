@@ -3971,9 +3971,18 @@ impl SqliteBackend {
                         Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
-                        // Create new resource with specified ID
                         let mut resource_with_id = resource;
                         resource_with_id["id"] = serde_json::json!(id);
+                        // A deleted id is restored, as the same PUT outside a
+                        // Bundle is; only an id never stored creates (#2145).
+                        if let Some(deleted) = tx
+                            .read_including_deleted(&resource_type, &id)
+                            .await?
+                            .filter(|r| r.is_deleted())
+                        {
+                            let restored = tx.restore(&deleted, resource_with_id).await?;
+                            return Ok(BundleEntryResult::created(restored));
+                        }
                         let created = tx.create(&resource_type, resource_with_id).await?;
                         Ok(BundleEntryResult::created(created))
                     }
