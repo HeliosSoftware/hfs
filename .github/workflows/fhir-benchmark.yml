@@ -300,8 +300,8 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Compile one release `hfs` binary with the backends the selected legs need
-  # (sqlite, postgres, mongodb, elasticsearch) linked in — the backend is
+  # Compile one release `hfs` binary with all four backends (sqlite, postgres,
+  # mongodb, elasticsearch) always linked in — the backend is
   # selected at runtime via HFS_STORAGE_BACKEND, so a single build serves every
   # matrix leg. `ui` is dropped so the benchmark exercises the FHIR API only.
   # ────────────────────────────────────────────────────────────────────────────
@@ -313,8 +313,8 @@ jobs:
     env:
       # Raised for this job only (the workflow default of 2 applies elsewhere): the
       # runners have 8 CPUs and the compile is CPU-bound. Cold builds took 13-15 min
-      # with 2 jobs, 7 min with 4 and 4 min 40 s with 8 at the same ~7.5 GB peak
-      # memory; see the "Build job" section of .github/scripts/fhir-bench/README.md.
+      # with 2 jobs, 7 min with 4 and 4 min 40 s with 8; 4 and 8 jobs lowered
+      # MemAvailable by the same 7.2-7.4 GiB (2 jobs not measured); see the "Build job" section of .github/scripts/fhir-bench/README.md.
       CARGO_BUILD_JOBS: 8
 
     steps:
@@ -354,7 +354,7 @@ jobs:
       # The binary is ALWAYS built with the full feature set (FHIR R4 only), and this
       # is the only `cargo build` of the workflow: every leg downloads the artifact
       # and picks its backend at runtime via HFS_STORAGE_BACKEND. Narrowing the set
-      # per leg saved only 2-4 min on a cold build and made the binary differ
+      # per leg saved only about 1-3.5 min on a cold build and made the binary differ
       # between dispatches (a build without `sqlite` has no bulk-export job store
       # for mongodb-based servers), so it was dropped; an actions/cache of the
       # release build was dropped too (a hit from another runner still rebuilt the
